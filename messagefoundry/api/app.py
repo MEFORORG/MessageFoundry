@@ -68,7 +68,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
 from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
-from messagefoundry.api.approvals import ApprovalError, ApprovalGate, IdentityResolver
+from messagefoundry.api.approvals import (
+    DEFAULT_CLAIM_OWNER,
+    ApprovalError,
+    ApprovalGate,
+    IdentityResolver,
+)
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import (
@@ -799,6 +804,53 @@ def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
     return _resolve
 
 
+async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
+    """Run :meth:`ApprovalGate.reconcile_after_restart` and never fail the start on it.
+
+    A store that cannot answer here leaves this process's leftover rows ``executing``, which is what
+    they were before; the next start tries again. Refusing to start would cost more than that."""
+    try:
+        await gate.reconcile_after_restart()
+    except Exception:
+        _log.exception(
+            "approval gate: the startup reconcile of 'executing' releases failed; they stay "
+            "'executing' until a later start"
+        )
+
+
+async def _drain_approval_gate(app: FastAPI) -> None:
+    """Let approval outcome writes still running land before the store closes (BACKLOG #2087).
+
+    A write whose caller was cancelled, such as by a request timeout, finishes on its own, and would
+    otherwise meet a closed store. ``drain()`` is bounded, and a failure is logged rather than
+    raised, so the teardown steps after it still run. The gate is read through getattr
+    because a startup that failed early may not have built one."""
+    gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
+    if gate is None:
+        return
+    try:
+        await gate.drain()
+    except Exception:
+        _log.exception("approval gate: the shutdown drain failed; continuing the teardown")
+
+
+@asynccontextmanager
+async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """The lifespan :func:`create_app` gives an app built around a caller's engine.
+
+    The caller starts and stops the engine; this runs only the approval gate's own steps, which the
+    managed lifespan runs too. At start, :meth:`ApprovalGate.reconcile_after_restart`, before the
+    app serves an approval. At shutdown, :meth:`ApprovalGate.drain` (BACKLOG #2087), so a caller
+    that stops its engine after the app has shut down loses no outcome write. A caller that passes
+    its own ``lifespan`` replaces this one and runs these steps itself, with the store open."""
+    # create_app installs this only beside an engine, and always builds the gate then.
+    await _reconcile_approvals_after_restart(app.state.approval_gate)
+    try:
+        yield
+    finally:
+        await _drain_approval_gate(app)
+
+
 def _build_approval_gate(
     engine: Engine,
     settings: ApprovalsSettings,
@@ -815,7 +867,13 @@ def _build_approval_gate(
     pair in step with the route that raises the request: the route checks at request time, the gate
     at release, and a divergence would let one of the two pass what the other refuses."""
     gate = ApprovalGate(
-        engine.store, settings, resolve_identity=resolve_identity, alert_sink=alert_sink
+        engine.store,
+        settings,
+        resolve_identity=resolve_identity,
+        alert_sink=alert_sink,
+        # BACKLOG #1562: read on the gate's first claim or reconcile, not here, because the shard
+        # id is known only once the engine holds its graph.
+        claim_owner=lambda: engine.instance_identity or DEFAULT_CLAIM_OWNER,
     )
     # A released reload runs inside the approve request, so it outlives that request's deadline the
     # way the inline route's does (vault BACKLOG #2753). Required, so the lifespan's drain sees it.
@@ -2342,6 +2400,11 @@ def create_app(
     # whose X-Forwarded-Proto is not trusted or not sent, that scheme is http, so the redirect would
     # point the client at an http:// URL. A trailing-slash miss is now a 404.
     # tests/test_api_redirect_slashes.py pins that no route ends in "/" and no mount redirects.
+    if engine is not None and lifespan is None:
+        # The embedded path: the caller owns the engine, and this app still owns its approval
+        # gate's start and stop (BACKLOG #1562). A caller passing its own lifespan runs those
+        # steps itself; _embedded_approvals_lifespan names them.
+        lifespan = _embedded_approvals_lifespan
     app = FastAPI(
         title="MessageFoundry",
         version=__version__,
@@ -4493,15 +4556,16 @@ def create_app(
 
     @app.get("/approvals", response_model=ApprovalList)
     async def list_approvals(
-        _: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
+        identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalList:
         """Open high-value actions: ``pending`` ones awaiting a second approver, then ``interrupted``
-        releases awaiting a resolve (BACKLOG #1562). Each row carries its ``status``."""
+        releases awaiting a resolve (BACKLOG #1562). Each row carries its ``status``, and
+        ``caller_is_requester`` marks the caller's own requests (BACKLOG #2460)."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
-        pending = await gate.list_pending()
-        interrupted = await gate.list_interrupted()
+        pending = await gate.list_pending(caller_user_id=identity.user_id)
+        interrupted = await gate.list_interrupted(caller_user_id=identity.user_id)
         # Two reads, so a release cut off between them can appear in both. The interrupted read is
         # the later one and a row never returns to pending, so that status wins. A row released and
         # settled between the reads still shows as pending; approving it then answers 409.
@@ -4562,8 +4626,8 @@ def create_app(
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalResolveResult:
         """Record what an ``interrupted`` release did: ``effects_applied`` or ``effects_not_applied``
-        (BACKLOG #1562 part B). Audited as ``approval.resolve_attempted`` before the row moves and
-        ``approval.resolved`` after; the operation is never re-run. The
+        (BACKLOG #1562 part B). Audited as ``approval.resolved``, written with the move in one
+        transaction (vault BACKLOG #2255); the operation is never re-run. The
         requester cannot resolve their own request, and a row not ``interrupted`` answers 409."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
@@ -7941,6 +8005,7 @@ def create_app(
                 list_approvals=list_approvals,
                 approve_action=approve_action,
                 reject_action=reject_action,
+                resolve_action=resolve_action,
             ),
             admin=admin,
         )
@@ -9174,6 +9239,9 @@ def create_managed_app(
                 alert_sink=notifier,  # None -> the gate's own LoggingAlertSink default
                 outliving=app.state.outliving_operations,
             )
+            # BACKLOG #1562: before the API serves an approval, so no claim of this life can be
+            # mistaken for a leftover of the last one.
+            await _reconcile_approvals_after_restart(app.state.approval_gate)
             # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
             # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
             # UploadStore lives (built in create_app from store_settings). None when [store].uploads_dir is
@@ -9338,87 +9406,78 @@ def create_managed_app(
                     )
             yield
         finally:
-            if upload_retention_runner is not None:
-                await upload_retention_runner.stop()
-            if reconciler is not None:
-                reconciler.cancel()
-                await asyncio.gather(reconciler, return_exceptions=True)
-            if reaper is not None:
-                reaper.cancel()
+            # BACKLOG #2087: every step before engine.stop() sits in this try, so a cancel delivered
+            # to the lifespan mid-teardown, or a step that raises, still stops the engine. Without
+            # it the store's non-daemon worker keeps the process alive. The three store-reading tasks
+            # are cancelled first, before any await, so a step that raises or a cancel cannot leave
+            # one running when engine.stop() closes the store.
+            background = [t for t in (reconciler, reaper, credential_reminder) if t is not None]
+            for task in background:
+                task.cancel()
+            try:
+                if upload_retention_runner is not None:
+                    await upload_retention_runner.stop()
                 # gather(return_exceptions): absorbs both our cancellation AND any exception a
-                # previously-died reaper stored, so it can't propagate here and skip engine.stop()
-                # (review M-33).
-                await asyncio.gather(reaper, return_exceptions=True)
-            if credential_reminder is not None:
-                credential_reminder.cancel()
-                await asyncio.gather(credential_reminder, return_exceptions=True)
-            # vault BACKLOG #2751-#2753: a DR activate or release, or a config reload, whose caller
-            # was cancelled is still running on its own. Let it finish, or cancel it so its own
-            # rollback arm restores state and records 'interrupted', while the store is open.
-            # Before the approval drain: a released reload's outcome write follows it.
-            try:
-                await app.state.outliving_operations.drain()
-            except Exception:
-                _log.exception(
-                    "long operations: the shutdown drain failed; continuing the teardown"
-                )
-            # BACKLOG #2087: let approval outcome writes still running land before the store closes.
-            # A write whose caller was cancelled, such as by a request timeout, finishes on its own,
-            # and would otherwise meet a closed store. drain() is bounded, and it is guarded like the
-            # flush below, so neither a failure nor the deadline skips engine.stop(). The gate is
-            # read through getattr because a startup that failed early may not have built one.
-            approval_gate = getattr(app.state, "approval_gate", None)
-            if approval_gate is not None:
+                # previously-died task stored, so it can't skip the steps below (review M-33).
+                await asyncio.gather(*background, return_exceptions=True)
+                # vault BACKLOG #2751-#2753: a DR activate or release, or a config reload, whose
+                # caller was cancelled is still running on its own. Let it finish, or cancel it so
+                # its own rollback arm restores state and records 'interrupted', while the store is
+                # open. Before the approval drain: a released reload's outcome write follows it.
                 try:
-                    await approval_gate.drain()
+                    await app.state.outliving_operations.drain()
                 except Exception:
                     _log.exception(
-                        "approval gate: the shutdown drain failed; continuing the teardown"
+                        "long operations: the shutdown drain failed; continuing the teardown"
                     )
-            # BACKLOG #2216: a lock notice still in flight reads and writes the audit log, then
-            # hands its mail to the security notifier, so it drains before engine.stop() closes the
-            # store and before that notifier stops below. Bounded, and it logs and cancels what it
-            # cannot finish; guarded like the drain above so a failure cannot skip engine.stop().
-            if auth is not None:
+                # BACKLOG #2087: let approval outcome writes still running land before the store closes.
+                await _drain_approval_gate(app)
+                # BACKLOG #2216: a lock notice still in flight reads and writes the audit log, then
+                # hands its mail to the security notifier, so it drains before engine.stop() closes
+                # the store and before that notifier stops in the finally below. Bounded, and it logs
+                # and cancels what it cannot finish; guarded like the drains above so a failure
+                # cannot skip a later step.
+                if auth is not None:
+                    try:
+                        await auth.close_background()
+                    except Exception:
+                        _log.exception(
+                            "auth: the shutdown drain of background notices failed; continuing the "
+                            "teardown"
+                        )
+                # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
+                # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
+                # called it, so every clean restart dropped the open hour's PHI-summary access audit --
+                # the rows the control exists to produce, lost exactly when an operator restarts after a
+                # bulk census fetch.
+                #
+                # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
+                # Guarded like the reaper above, so a store error here is logged rather than raised
+                # out of the teardown. Read directly, not through getattr: create_app always sets the
+                # auditor, so a rename should fail loudly inside this guard rather than silently skip
+                # the flush.
                 try:
-                    await auth.close_background()
+                    await app.state.summary_auditor.flush(store)
                 except Exception:
                     _log.exception(
-                        "auth: the shutdown drain of background notices failed; continuing the "
-                        "teardown"
+                        "summary-access coalescer: the shutdown flush failed, so at least one open "
+                        "window's audit row is lost; continuing the teardown"
                     )
-            # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
-            # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
-            # called it, so every clean restart dropped the open hour's PHI-summary access audit --
-            # the rows the control exists to produce, lost exactly when an operator restarts after a
-            # bulk census fetch.
-            #
-            # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
-            # Guarded like the reaper above: a store error here must not skip engine.stop(), or the
-            # non-daemon aiosqlite worker keeps the process alive and a lost audit row becomes a hung
-            # service. Read directly, not through getattr: create_app always sets the auditor, so a
-            # rename should fail loudly inside this guard rather than silently skip the flush.
-            try:
-                await app.state.summary_auditor.flush(store)
-            except Exception:
-                _log.exception(
-                    "summary-access coalescer: the shutdown flush failed, so at least one open "
-                    "window's audit row is lost; continuing the teardown"
-                )
-            await engine.stop()
-            # B11: shut down the harness-only instrumented executor (None in production / other tests).
-            # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
-            shim_executor = getattr(app.state, "connscale_executor", None)
-            if shim_executor is not None:
-                shim_executor.shutdown(wait=False)
-            if security_notifier is not None:
-                await (
-                    security_notifier.aclose()
-                )  # drain queued user emails, bounded by SMTP timeout
-            if notifier is not None:
-                # Stop accepting alerts last (after the engine quiesces) so any final
-                # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
-                await notifier.aclose()
+            finally:
+                await engine.stop()
+                # B11: shut down the harness-only instrumented executor (None in production / other tests).
+                # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
+                shim_executor = getattr(app.state, "connscale_executor", None)
+                if shim_executor is not None:
+                    shim_executor.shutdown(wait=False)
+                if security_notifier is not None:
+                    await (
+                        security_notifier.aclose()
+                    )  # drain queued user emails, bounded by SMTP timeout
+                if notifier is not None:
+                    # Stop accepting alerts last (after the engine quiesces) so any final
+                    # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
+                    await notifier.aclose()
 
     # Settings never select the open mode: only the caller's opt-in, checked at the top, does
     # (vault BACKLOG #2611, #2825).

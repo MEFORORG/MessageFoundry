@@ -653,13 +653,18 @@ _SCHEMA: list[str] = [
         status       TEXT NOT NULL DEFAULT 'pending',
         approver     TEXT,
         decided_at   DOUBLE PRECISION,
-        expires_at   DOUBLE PRECISION
+        expires_at   DOUBLE PRECISION,
+        -- BACKLOG #1562: the engine process that claimed the release. See the Store protocol's
+        -- decide_pending_approval.
+        claim_owner  TEXT
     )""",
     # BACKLOG #1540: the immutable requester id for a pre-existing pending_approvals table; a no-op on
     # a fresh DB (the CREATE above has it). Lives in _SCHEMA (hash-gated, ADR 0064) so it runs once
     # per schema version rather than taking ACCESS EXCLUSIVE on every open, and so adding it moves
     # _schema_hash() automatically — no _MIGRATION_REV bump is needed or wanted.
     "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS requester_user_id TEXT",
+    # BACKLOG #1562: the claim owner for a pre-existing table, in _SCHEMA for the reason above.
+    "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS claim_owner TEXT",
     "CREATE INDEX IF NOT EXISTS ix_pending_approvals_status"
     " ON pending_approvals(status, requested_at)",
     """CREATE TABLE IF NOT EXISTS users (
@@ -7264,12 +7269,23 @@ class PostgresStore:
         requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None:
-        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
-        await self._execute(
+        audit: AuditAppend | None = None,
+        on_repeat: Callable[[str], AuditAppend] | None = None,
+    ) -> str:
+        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned.
+
+        With ``on_repeat`` the open-request read runs under the audit-chain advisory lock (vault
+        BACKLOG #2445), because READ COMMITTED lets two transactions both find none and both insert.
+        Every request takes that lock anyway, for its audit row, and it is re-entrant within a
+        transaction, so this adds no lock and no lock order. Each later statement sees every request
+        committed before it."""
+        insert = (
             "INSERT INTO pending_approvals "
             "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
-            " VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)",
+            " VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)"
+        )
+        args = (
             approval_id,
             operation,
             params,
@@ -7277,6 +7293,51 @@ class PostgresStore:
             requester_user_id,
             requested_at,
             expires_at,
+        )
+        if audit is None and on_repeat is None:
+            await self._execute(insert, *args)
+            return approval_id
+        now = time.time()
+        held, append = approval_id, audit
+        # vault BACKLOG #2255. The audit row joins the INSERT's transaction, so a failed append
+        # rolls the request back. `record=False` as `_execute` passes: not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            existing = None
+            if on_repeat is not None:
+                await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+                # The open-request rule is the Store protocol's; the SQLite and SQL Server
+                # twins state it in their own SQL, and the shared repeat contract checks all three.
+                existing = await conn.fetchval(
+                    "SELECT id FROM pending_approvals WHERE operation = $1 AND params = $2"
+                    " AND requester_user_id = $3 AND status = 'pending'"
+                    " AND (expires_at IS NULL OR expires_at > $4)"
+                    " ORDER BY requested_at ASC LIMIT 1",
+                    operation,
+                    params,
+                    requester_user_id,
+                    requested_at,
+                )
+            if existing is None:
+                await conn.execute(insert, *args)
+            elif on_repeat is not None:  # always, since `existing` is read only with on_repeat
+                held = str(existing)
+                append = on_repeat(held)
+            appended = None if append is None else await self._append_audit(conn, append, now)
+        if append is not None and appended is not None:
+            append.tee(ts=now, row=appended)
+        return held
+
+    async def _append_audit(self, conn: Any, audit: AuditAppend, now: float) -> AppendedAuditRow:
+        """:meth:`_append_audit_row` for an :class:`AuditAppend` a write carries into its own
+        transaction on ``conn`` (BACKLOG #2100). The caller commits, then tees."""
+        return await self._append_audit_row(
+            conn,
+            audit.action,
+            actor=audit.actor,
+            channel_id=None,
+            detail=audit.detail,
+            client=audit.client,
+            now=now,
         )
 
     async def get_pending_approval(self, approval_id: str) -> Row | None:
@@ -7290,9 +7351,9 @@ class PostgresStore:
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         return await self._fetchall(
-            # No requester_user_id here — see the SQLite twin.
-            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-            " expires_at FROM pending_approvals"
+            # requester_user_id: see the SQLite twin (BACKLOG #2460).
+            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+            " approver, decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > $1)"
             " ORDER BY requested_at DESC LIMIT $2",
             now,
@@ -7303,8 +7364,8 @@ class PostgresStore:
         """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
         order: the Store protocol says why."""
         return await self._fetchall(
-            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-            " expires_at FROM pending_approvals"
+            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+            " approver, decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'interrupted'"
             " ORDER BY requested_at ASC LIMIT $1",
             limit,
@@ -7318,20 +7379,51 @@ class PostgresStore:
         approver: str | None,
         decided_at: float,
         from_status: str = "pending",
+        audit: AuditAppend | None = None,
+        claim_owner: str | None = None,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
-        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3)."""
-        result = await self._pool.execute(
-            "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3"
-            " WHERE id = $4 AND status = $5",
-            status,
-            approver,
-            decided_at,
-            approval_id,
-            from_status,
+        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3); the Store protocol
+        states the ``audit`` and ``claim_owner`` contracts (vault BACKLOG #2255, BACKLOG #1562)."""
+        sql = (
+            "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3,"
+            " claim_owner = COALESCE($6, claim_owner) WHERE id = $4 AND status = $5"
         )
-        return _rowcount(result) > 0
+        args = (status, approver, decided_at, approval_id, from_status, claim_owner)
+        if audit is None:
+            result = await self._pool.execute(sql, *args)
+            return _rowcount(result) > 0
+        now = time.time()
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            moved = _rowcount(await conn.execute(sql, *args)) > 0
+            # Inside the transaction, so a failed append rolls the transition back. A transition
+            # that matched no row writes no audit row.
+            appended = await self._append_audit(conn, audit, now) if moved else None
+        if appended is not None:
+            audit.tee(ts=now, row=appended)
+        return moved
+
+    async def list_executing_approvals(
+        self, *, claim_owner: str | None = None, limit: int = 1000
+    ) -> Sequence[Row]:
+        """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
+        The Store protocol says who reads it, why, and what ``claim_owner`` filters."""
+        if claim_owner is None:
+            return await self._fetchall(
+                "SELECT id, operation, requester, approver, decided_at, claim_owner"
+                " FROM pending_approvals WHERE status = 'executing'"
+                " ORDER BY decided_at ASC LIMIT $1",
+                limit,
+            )
+        return await self._fetchall(
+            "SELECT id, operation, requester, approver, decided_at, claim_owner"
+            " FROM pending_approvals WHERE status = 'executing'"
+            " AND (claim_owner = $1 OR claim_owner IS NULL)"
+            " ORDER BY decided_at ASC LIMIT $2",
+            claim_owner,
+            limit,
+        )
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 
@@ -7546,15 +7638,7 @@ class PostgresStore:
         # account back. `record=False` as `_execute` passes: a sign-in is not a pipeline borrow.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await conn.execute(sql, *params)
-            appended = await self._append_audit_row(
-                conn,
-                audit.action,
-                actor=audit.actor,
-                channel_id=None,
-                detail=audit.detail,
-                client=audit.client,
-                now=now,
-            )
+            appended = await self._append_audit(conn, audit, now)
         audit.tee(ts=now, row=appended)
 
     async def get_user(self, user_id: str) -> UserRecord | None:

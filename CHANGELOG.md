@@ -7,16 +7,53 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **An engine that restarts settles the dual-control releases it left `executing`.** The claim now
+  records which engine process owns the release, in a new `pending_approvals.claim_owner` column on
+  all three store backends. At its next start, before the API serves an approval, that process moves
+  each `executing` row it owns to `interrupted` with an `approval.interrupted` audit row, `reason`
+  `engine_restart`, in the same write. Nothing re-runs; resolve the row as for any interrupted
+  release. A row another engine shard or cluster node owns is left alone and logged at WARNING. A
+  cluster node keeps its owner across a restart only when `[cluster].node_id` is pinned. This also
+  gives a row left `executing` by a twice-failed outcome write a way out. (vault `BACKLOG #1562`,
+  `BACKLOG #2087`)
+- **A shutdown cancelled partway through still stops the engine.** A cancel delivered while the
+  managed lifespan drained approval writes, or flushed the summary-access audit, used to skip
+  `engine.stop()`, so the store's worker could keep the process alive. An app built with
+  `create_app(engine=...)` now drains approval outcome writes at its own shutdown too, instead of
+  relying on the caller to. (vault `BACKLOG #2087`)
 - **A held config reload whose directory vanished, or that named a directory outside the reload
   roots, is refused on release instead of answering 500.** The approve route answers 422 with the
   inline route's detail, and writes the `config_reload_failed` or `config_reload_denied` row the
   inline route writes. A refused reload's own audit row no longer raises during an audit outage.
   (vault `BACKLOG #2459`)
 - **The approval gate answers a mapped status during an audit or store outage, and pages.** A
-  too-early or stale-requester refusal whose audit row fails still answers 409. A claim, rejection
-  or resolution whose status write fails answers 503. A request whose `approval.requested` row
-  fails is withdrawn. A new `audit_write_failed` alert, keyed `approval:<id>`, fires for every
-  audit row the gate loses. Store reads on these routes are not covered. (vault `BACKLOG #2255`)
+  too-early, stale-requester or no-longer-gated refusal whose audit row fails still answers 409. A
+  claim, rejection or resolution that cannot be written with its audit row answers 503. A new
+  `audit_write_failed` alert, keyed `approval:<id>`, fires for every audit write that fails with an
+  error; a cancelled call raises none. Store reads on these routes are not covered. Nor is a failed
+  request write, which still answers 500, or 503 if the request times out. (vault `BACKLOG #2255`)
+- **Each approval state change and its audit row are now one write.** The request and
+  `approval.requested`, the claim and `approval.release_attempted`, a rejection, each release
+  outcome and a resolve each commit or roll back together, on all three store backends. A request
+  whose audit row fails is no longer written and then withdrawn; it rolls back with the row. Some
+  failures can still hold the request while the call fails, such as a lost COMMIT reply or a
+  cancel during the COMMIT. docs/SECURITY.md names at least these cases. It also says when a retry
+  then files a second request. A rejection whose `approval.rejected` row fails now answers 503 and
+  stays pending. A claim that loses a race writes
+  no release row. The resolve no longer writes `approval.resolve_attempted`; its `approval.resolved`
+  row goes with the move. After an operation has run, an outcome that cannot be written with its row
+  is written alone, so the request never stays `executing` for that reason. (vault `BACKLOG #2255`)
+- **A repeat of an open dual-control request no longer files a second one.** When the same
+  requester asks again for the same operation with the same parameters while the first request is
+  pending, the route answers the same 202 with the first request's id and writes an
+  `approval.request_repeated` audit row. Concurrent repeats file one request between them, on all
+  three store backends. A different requester still gets a request of their own. (vault
+  `BACKLOG #2445`)
+- **A held request is no longer released after dual control stops applying to it.** Before, a
+  request held while `[approvals]` gated its operation could still be approved, and run, after
+  `[approvals].enabled` was turned off or the operation left `[approvals].operations`. The approve
+  now answers 409 with an `approval.no_longer_gated` audit row, runs nothing, and leaves the
+  request pending for an approver to reject.
 
 ## [0.5.1] — 2026-10-01 — Early Access
 

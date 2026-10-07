@@ -1142,6 +1142,22 @@ class Engine:
 
     # --- lifecycle -----------------------------------------------------------
 
+    @property
+    def instance_identity(self) -> str | None:
+        """Which engine process this is, among those sharing one store: ``node:<node_id>`` on a
+        cluster node, ``shard:<id>`` on an engine shard of a multi-shard config (the same shard id
+        :meth:`_owned_lanes` scopes recovery by), and ``None`` for a lone engine that owns its store.
+
+        A cluster node's id is the same after a restart only when ``[cluster].node_id`` is pinned.
+        The shard id is known once the engine holds its graph (:meth:`start` or ``add_registry``).
+        Read by the approval gate to mark the releases it claims (BACKLOG #1562)."""
+        if self._coordinator.is_clustered():
+            return f"node:{self._coordinator.node_id}"
+        runner = self._registry_runner
+        if runner is not None and runner.registry.shard_id is not None:
+            return f"shard:{runner.registry.shard_id}"
+        return None
+
     def _owned_lanes(self) -> OwnedLanes | None:
         """The ADR 0073 ownership scope for crash recovery — ``None`` (recover globally) unless this
         process runs a SHARDED registry (a >1-shard config filtered by ``--shard``). Channel-keyed
