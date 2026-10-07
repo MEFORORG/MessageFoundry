@@ -1203,6 +1203,7 @@ def require_ui_step_up_action(
     phi: bool = False,
     reauth_next: Callable[[Request], str] | None = None,
     spend: bool = True,
+    repeat: Callable[[Request], Awaitable[bool]] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_ui_step_up`, but the step-up must be a fresh proof **bound to** ``action``
     (single-use, ADR 0077 / ASVS 7.5.1), not the shared session window. Keeps the MFA gate — used for
@@ -1217,7 +1218,16 @@ def require_ui_step_up_action(
     ``spend=False`` asks only that the grant is HELD, and leaves it for a later request to spend.
     It is for a page that opens an action without performing it, so the operator proves who they
     are before doing work a re-auth would throw away. The route that performs the action must
-    still spend it, either through its own gate or through :func:`spend_ui_action_step_up`."""
+    still spend it, either through its own gate or through :func:`spend_ui_action_step_up`.
+
+    ``repeat`` answers whether the request repeats one that already RAN under the same idempotency
+    key (vault BACKLOG #2625). When it does, the gate asks for no proof: a repeat queues nothing,
+    and the route answers it as a duplicate. Everything else the gate checks still runs, and only
+    with ``spend=False``, so a request that is not a repeat is still spent in the route before it
+    acts. Without it, a double-click spent the proof on the first submit and sent the second to
+    re-authenticate, onto a confirm page with a fresh key."""
+    if repeat is not None and spend:
+        raise ValueError("repeat needs spend=False: the route must spend the proof itself")
     # mfa_refusal, NOT allow_mfa_pending: the base's gate refuses and audits a pending session, and
     # the hook only points it at /ui/reauth with the continuation. See require_ui_step_up for why.
     base = require_ui(
@@ -1238,7 +1248,11 @@ def require_ui_step_up_action(
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-        if new_ip or not await _ui_action_step_up_ok(auth, token, action, spend=spend):
+        if new_ip:
+            raise _reauth_redirect(request, nxt)
+        if repeat is not None and await repeat(request):
+            return identity
+        if not await _ui_action_step_up_ok(auth, token, action, spend=spend):
             raise _reauth_redirect(request, nxt)
         return identity
 

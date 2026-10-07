@@ -302,3 +302,26 @@ async def test_the_org_opt_out_puts_the_bound_routes_back_on_the_window(
         for _action, method, path, body, query in BOUND:
             r = await _call(c, token, method, path, body, query)
             assert _past_the_step_up(r), (path, r.status_code, dict(r.headers), r.text)
+
+
+async def test_prior_resend_answers_only_a_repeat_of_the_same_request(engine: Engine) -> None:
+    """The web console asks this before it demands a proof, so it must name a repeat of the SAME
+    request and nothing else: an unused key, another message, another target and the other kind of
+    request (a resend versus an edit-and-resubmit re-ingress) all answer None."""
+    mid = await engine.store.enqueue_message(
+        channel_id="IB_A", raw=ADT, deliveries=[], message_type="ADT^A01", control_id="MSG1"
+    )
+    other = await engine.store.enqueue_message(
+        channel_id="IB_A", raw=ADT, deliveries=[], message_type="ADT^A01", control_id="MSG2"
+    )
+    assert await engine.store.get_resend_record("k-reingress") is None  # control: unused
+    outcome = await engine.store.reingress(
+        origin_message_id=mid, raw=ADT, idempotency_key="k-reingress"
+    )
+    record = await engine.store.get_resend_record("k-reingress")
+    assert record is not None and record.message_id == mid
+    assert record.outbox_id == outcome.new_message_id  # the child the first call created
+    assert await engine.prior_resend("k-reingress", message_id=mid, to=None) == record
+    assert await engine.prior_resend("k-reingress", message_id=other, to=None) is None
+    assert await engine.prior_resend("k-reingress", message_id=mid, to="OB_X") is None
+    assert await engine.prior_resend("unused", message_id=mid, to=None) is None

@@ -431,6 +431,35 @@ def test_a_refused_connect_ends_the_session_the_sign_in_left(
         panel.shutdown()
 
 
+class _SignedInClient(_RefusedClient):
+    """Signed in already (``me`` answers), and its polling client cannot be built."""
+
+    def me(self) -> None:
+        self.calls.append("me")
+
+    def for_polling(self) -> None:
+        self.calls.append("for_polling")
+        raise ApiError("cannot load TLS material")
+
+
+def test_a_connect_whose_polling_client_fails_ends_its_session(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2625 built the message panels' polling client during connect. When that fails,
+    the panel stays disconnected, and the session the sign-in left is ended before the client is
+    dropped, as the must-change refusal does (BACKLOG #2091)."""
+    client = _SignedInClient("tok-live", logout_fails=False)
+    monkeypatch.setattr(monitor, "EngineClient", lambda *args, **kwargs: client)
+    panel = MonitorPanel()
+    try:
+        panel._connect()
+        assert client.calls == ["health", "me", "for_polling", "logout", "close"]
+        assert panel._client is None and panel._poll_client is None
+        assert "cannot load TLS material" in panel._status.text()
+    finally:
+        panel.shutdown()
+
+
 class _LoginClient:
     """Answers the dialog's two calls: no provider list, then a must-change sign-in."""
 

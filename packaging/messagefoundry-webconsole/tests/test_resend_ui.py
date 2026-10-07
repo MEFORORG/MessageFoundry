@@ -578,13 +578,36 @@ async def test_a_refreshed_outcome_page_sends_nothing(engine: Engine, tmp_path: 
     assert len(rows) == 1
 
 
-async def test_a_double_submit_queues_once_and_sends_the_repeat_to_the_re_auth(
+async def test_a_double_submit_with_one_proof_resends_once_and_says_so(
     engine: Engine, tmp_path: Path
 ) -> None:
-    """What a double-click does since vault BACKLOG #2625, pinned as it is. The first POST spends
-    the proof and queues; the repeat, with the same key and no proof, meets the gate rather than the
-    idempotent handler and is sent to /ui/reauth. It queues nothing. The operator is not told there
-    that a resend already ran, which is the open part (see the PR's open items)."""
+    """Vault BACKLOG #2625. A double-click sends two POSTs with the same key and ONE proof. The
+    first spends the proof and queues. The second repeats a resend that already ran, so it asks for
+    no proof: it reaches the idempotent handler and is answered "already resent", with no re-auth
+    in between and nothing queued. The audit count is the control: one real resend, one row."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        await _mint(c, mid)  # the one proof
+        answers = [await _post_resend(c, mid, mint=False) for _ in range(2)]
+        assert answers[0].status_code == 200 and "Resend queued" in answers[0].text
+        assert answers[1].status_code == 200 and "Already resent" in answers[1].text
+        # Control: the repeat really did ride on no proof. A NEW key now has none to spend.
+        fresh = await _post_resend(c, mid, key="k2", mint=False)
+        assert fresh.status_code == 303 and fresh.headers["location"].startswith("/ui/reauth?")
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert len(rows) == 1
+
+
+async def test_a_key_used_for_another_target_is_not_a_repeat(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Only the SAME resend skips the proof. The same key aimed at another outbound is the store's
+    conflict, not a duplicate, so it is spent like any first resend and needs a proof."""
     engine.add_registry(_registry(tmp_path))
     await engine.start()
     service = await _service(engine)
@@ -594,10 +617,23 @@ async def test_a_double_submit_queues_once_and_sends_the_repeat_to_the_re_auth(
         await _login(c, "op")
         first = await _post_resend(c, mid)
         assert first.status_code == 200 and "Resend queued" in first.text
-        repeat = await _post_resend(c, mid, mint=False)
-        assert repeat.status_code == 303 and repeat.headers["location"].startswith("/ui/reauth?")
-    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
-    assert len(rows) == 1
+        other = await _post_resend(c, mid, to="OB3", mint=False)
+        assert other.status_code == 303 and other.headers["location"].startswith("/ui/reauth?")
+
+
+async def test_the_outcome_page_echoes_only_connection_names(engine: Engine) -> None:
+    """The resend-done page names a target from its query, so the query must pass the
+    connection-name rule: markup or a space is refused there, not rendered."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        for bad in ({"to": "<b>x</b>"}, {"to": "OB2", "source": "has space"}):
+            r = await c.get(f"/ui/messages/{mid}/resend-done", params=bad)
+            assert r.status_code == 422, (bad, r.status_code)
+        ok = await c.get(f"/ui/messages/{mid}/resend-done", params={"to": "OB2"})
+        assert ok.status_code == 200  # control: a name and no source renders
 
 
 async def test_a_malformed_name_costs_no_proof(engine: Engine) -> None:

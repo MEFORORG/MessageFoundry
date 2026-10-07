@@ -813,6 +813,20 @@ class ResendOutcome:
     outbox_id: str | None
 
 
+@dataclass(frozen=True)
+class ResendKeyRecord:
+    """What a ``resend_log`` row records for one idempotency key (ADR 0090 §4), as read back by
+    :meth:`QueueStore.get_resend_record`. ``to_destination`` is the outbound name, or
+    :data:`REINGRESS_TARGET_PREFIX` plus the channel for an edit-and-resubmit re-ingress;
+    ``outbox_id`` is the row (or, for a re-ingress, the child message) the first call created.
+    Ids and names only, never a body."""
+
+    message_id: str
+    to_destination: str
+    from_destination: str
+    outbox_id: str | None
+
+
 class ReingressOriginMissing(ResendError):
     """The origin message named by an edit-and-resubmit re-ingress (:meth:`QueueStore.reingress`,
     ADR 0090 §9 / BACKLOG #153) no longer exists — the store cannot resolve the channel to re-enter
@@ -9775,6 +9789,28 @@ class MessageStore:
             await self._append_operator_audit(written, audit, count)
             await self._commit()
         return count
+
+    async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None:
+        """The ``resend_log`` row an idempotency key claimed, or ``None`` when the key is unused.
+
+        Read-only. For a caller that answers a repeat of an already-run resend before it asks for
+        anything a first resend needs (vault BACKLOG #2625: the console's step-up proof). Ids and
+        names only, never a body."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
+                " WHERE resend_key=?",
+                (resend_key,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return ResendKeyRecord(
+            message_id=row["message_id"],
+            to_destination=row["to_destination"],
+            from_destination=row["from_destination"] or "",
+            outbox_id=row["outbox_id"],
+        )
 
     async def resend_to(
         self,

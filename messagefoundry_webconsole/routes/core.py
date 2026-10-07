@@ -10,7 +10,7 @@ import logging
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import uuid4
 
@@ -1104,6 +1104,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # renders is the operator's own query echoed back through the escaping builders, so it asserts
     # nothing about whether the message exists; the engine handler behind the POST is the single
     # authority on that and 404s outside the caller's channel scope.
+    async def _prior_resend(request: Request) -> Any:
+        """The resend this POST's key already ran, when it is the same resend; else ``None``."""
+        key = request.query_params.get("idempotency_key", "")
+        to = request.query_params.get("to", "")
+        if not key or not to:
+            return None
+        engine = await deps.get_engine(request)
+        return await engine.prior_resend(key, message_id=request.path_params["message_id"], to=to)
+
+    async def _resend_is_repeat(request: Request) -> bool:
+        return await _prior_resend(request) is not None
+
     @app.get("/ui/messages/{message_id}/resend-confirm", response_class=HTMLResponse)
     async def ui_message_resend_confirm(
         message_id: str,
@@ -1133,15 +1145,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.get("/ui/messages/{message_id}/resend-done", response_class=HTMLResponse)
     async def ui_message_resend_done(
         message_id: str,
-        # Echoed from the engine's answer, not from a form, so bounded by the connection-name rule's
-        # own 256 rather than _RESEND_NAME_MAX. `source` may be empty: a duplicate of a key first
-        # used over the JSON API without one reports the prior row's empty source.
-        to: str = Query(..., min_length=1, max_length=256),
-        source: str = Query("", max_length=256),
+        # Echoed from the engine's answer and checked against the connection-name rule, so the
+        # page names only what could name a connection. `source` may be absent: a duplicate of a
+        # key first used over the JSON API without one reports the prior row's empty source.
+        to: Annotated[ConnectionName, Query()],
+        source: ConnectionName | None = Query(None),
         duplicate: bool = Query(False),
         _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
     ) -> HTMLResponse:
-        return HTMLResponse(pages.message_resend_done(message_id, to, source, duplicate=duplicate))
+        return HTMLResponse(
+            pages.message_resend_done(message_id, to, source or "", duplicate=duplicate)
+        )
 
     # NEITHER OUTCOME GOES TO THE MESSAGE DETAIL PAGE. That page is `require_ui(MESSAGES_VIEW_RAW)`,
     # so redirecting there handed a resend-without-read role a raw JSON 403 in place of every
@@ -1169,6 +1183,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # selection. The stale key is not carried: the confirm page mints a fresh one.
                 reauth_next=_resend_confirm_next,
                 spend=False,
+                # A repeat of a resend that already ran asks for no proof (vault BACKLOG #2625):
+                # it is answered below as a duplicate, from resend_log, and queues nothing.
+                repeat=_resend_is_repeat,
             )
         ),
     ) -> Response:
@@ -1196,9 +1213,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return _refused(RESEND_MALFORMED_NOTICE, status=400)
         # The engine handler's own action-bound gate does not run on a direct call, so the proof
         # the gate above only checked is spent here, immediately before the resend.
-        await spend_ui_action_step_up(
-            request, STEP_UP_ACTION_MESSAGE_RESEND, reauth_next=_resend_confirm_next
-        )
+        # A same-key repeat of a resend that already ran is the one request that needs no proof
+        # (vault BACKLOG #2625): the store claimed the key with the first resend, in the same
+        # transaction, and never deletes a resend_log row, so the handler can only answer it as
+        # ADR 0090 §4's duplicate. It still runs, for the channel-scope checks, the duplicate's own
+        # audit row (BACKLOG #2624) and a truthful outcome. Anything else spends the proof here.
+        if not await _resend_is_repeat(request):
+            await spend_ui_action_step_up(
+                request, STEP_UP_ACTION_MESSAGE_RESEND, reauth_next=_resend_confirm_next
+            )
         try:
             result = await core.resend_message(
                 message_id, body=body, request=request, engine=engine, identity=identity
@@ -1214,12 +1237,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return _refused(notice, status=exc.status_code)
         # `duplicate` means the key was already used and NOTHING was queued (ADR 0090 §4). Reporting
         # it as a send would be the same lie as answering a refusal with the success response.
+        echo = {"to": result.to, "source": result.source} if result.source else {"to": result.to}
         outcome = urlencode(
-            {
-                "to": result.to,
-                "source": result.source,
-                "duplicate": "true" if result.status == "duplicate" else "false",
-            }
+            {**echo, "duplicate": "true" if result.status == "duplicate" else "false"}
         )
         return RedirectResponse(
             f"/ui/messages/{_seg(message_id)}/resend-done?{outcome}", status_code=303
@@ -1267,6 +1287,24 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # rejection path as an unauthorized read of exactly the body the GET now refuses. phi=True for the
     # same reason — otherwise the reject path is an UNTHROTTLED channel for re-reading stored bodies
     # while the equivalent GET is throttled.
+    async def _prior_resubmit(request: Request) -> Any:
+        """The resubmit this POST's key already ran, when it is the same one; else ``None``. The
+        form is read here as the route reads it; Starlette caches the body, so the route reads it
+        again for free."""
+        form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
+        key = str(form.get("idempotency_key", "")).strip()
+        if not key:
+            return None
+        direct = str(form.get("mode", "reroute")) == "direct"
+        to = str(form.get("to", "")).strip() if direct else None
+        if direct and not to:
+            return None
+        engine = await deps.get_engine(request)
+        return await engine.prior_resend(key, message_id=request.path_params["message_id"], to=to)
+
+    async def _resubmit_is_repeat(request: Request) -> bool:
+        return await _prior_resubmit(request) is not None
+
     @app.post("/ui/messages/{message_id}/edit-resend")
     async def ui_message_edit_resend(
         message_id: str,
@@ -1286,6 +1324,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # POST path (a re-POST would drop the edited body).
                 reauth_next=_edit_page,
                 spend=False,
+                # A repeat of a resubmit that already ran asks for no proof (vault BACKLOG #2625).
+                repeat=_resubmit_is_repeat,
             )
         ),
     ) -> Response:
@@ -1334,11 +1374,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return await _reject("invalid input")
         # The engine handler's own action-bound gate does not run on a direct call, so the grant
         # the gate above only checked is spent here, immediately before the resubmit.
-        await spend_ui_action_step_up(
-            request,
-            STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
-            reauth_next=_edit_page,
-        )
+        # A same-key repeat of a resubmit that already ran is the one request that needs no proof
+        # (vault BACKLOG #2625): the store claimed the key with the first resend, in the same
+        # transaction, and never deletes a resend_log row, so the handler can only answer it as
+        # ADR 0090 §4's duplicate. It still runs, for the channel-scope checks, the duplicate's own
+        # audit row (BACKLOG #2624) and a truthful outcome. Anything else spends the proof here.
+        if not await _resubmit_is_repeat(request):
+            await spend_ui_action_step_up(
+                request,
+                STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
+                reauth_next=_edit_page,
+            )
         try:
             result = await core.edit_resend_message(
                 message_id, body=body, engine=engine, identity=identity, request=request

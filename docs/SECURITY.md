@@ -2089,7 +2089,10 @@ when it continues to the action's confirm page, editor or auto-retry. The messag
 grant before it opens and the resubmit spends it after its own input checks, so a re-auth no longer
 drops an edit the operator is about to type, and a refusal of the console's own input costs no proof.
 A refusal from the engine handler comes after the spend: the next submit asks again and re-opens the
-editor from the stored body, as an expired grant (300 s by default) does. One grant covers one request, and a bulk purge from the console is one request. The
+editor from the stored body, as an expired grant (300 s by default) does. The console resend checks
+its own input before it spends the proof too. On both, a same-key repeat of a request that already
+ran asks for no proof: the key is bound to that request in `resend_log`, so the handler can only
+answer it as ADR 0090's duplicate, and a double-click lands on "already resent". One grant covers one request, and a bulk purge from the console is one request. The
 grant is keyed on the session and the action, not on a target. The rest of the step-up surface keeps
 the shared window on purpose: a bound proof is a typed password per action, and an operator replaying
 dead letters during an incident would type it per message. `[auth].require_action_step_up = false`

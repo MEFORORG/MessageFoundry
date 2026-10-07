@@ -291,6 +291,11 @@ class MonitorPanel(QWidget):
         try:
             poll_client = client.for_polling()
         except ApiError as exc:
+            # End the session the sign-in just made before dropping the client, as the must-change
+            # refusal above does, or it stays live until it expires (BACKLOG #2091).
+            if client.token is not None:
+                with contextlib.suppress(ApiError):
+                    client.logout()
             client.close()
             self._set_status(str(exc), error=True)
             return

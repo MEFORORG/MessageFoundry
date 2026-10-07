@@ -154,6 +154,52 @@ async def test_the_editor_asks_before_it_opens_and_the_resubmit_spends_it(engine
         assert _reauth_next(await c.get(editor)) == editor
 
 
+async def test_an_edit_resubmit_repeated_with_one_proof_lands_once(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #2625, the edit-resend twin of the resend double-submit. Two re-route POSTs
+    with the same key and one proof: the first re-ingresses a child, the second repeats it and asks
+    for no proof, so both land on the same child and only one child exists."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+
+    (tmp_path / "in").mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "ch1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    mid = await seed_message(engine)
+    editor = f"/ui/messages/{mid}/edit"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        await mint_bound_proof(c, editor)  # the one proof
+        form = {"raw": EDITED, "idempotency_key": "k1", "mode": "reroute"}
+        answers = [
+            await c.post(f"/ui/messages/{mid}/edit-resend", data=form, headers=SAME_ORIGIN)
+            for _ in range(2)
+        ]
+        assert [a.status_code for a in answers] == [303, 303]
+        assert (
+            answers[0].headers["location"]
+            == answers[1].headers["location"]
+            != f"/ui/messages/{mid}"
+        )
+    rows = await engine.store.list_messages(limit=50, allowed_channels=None)
+    children = [m for m in rows if m["id"] != mid]
+    assert len(children) == 1
+
+
 async def test_a_replay_still_opens_on_the_window(engine: Engine) -> None:
     """The row's own limit: replay is a step-up write outside the injection and bulk set, so a
     fresh window still opens it, twice, with no typed proof per message."""

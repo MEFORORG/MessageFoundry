@@ -194,6 +194,7 @@ from messagefoundry.store.store import (
     ReingressOutcome,
     ReplyWaitState,
     ResendKeyConflict,
+    ResendKeyRecord,
     ResendOutcome,
     ResendSourceAmbiguous,
     ResendSourceEmpty,
@@ -6243,6 +6244,26 @@ class PostgresStore:
                 await self._event(conn, message_id, "replayed", None, f"{count} row(s)", now)
             await self._append_operator_audit(conn, written, audit, count)
         return count
+
+    async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None:
+        """The ``resend_log`` row an idempotency key claimed, or ``None`` when the key is unused.
+
+        Read-only. For a caller that answers a repeat of an already-run resend before it asks for
+        anything a first resend needs (vault BACKLOG #2625: the console's step-up proof). Ids and
+        names only, never a body."""
+        row = await self._fetchone(
+            "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
+            " WHERE resend_key=$1",
+            resend_key,
+        )
+        if row is None:
+            return None
+        return ResendKeyRecord(
+            message_id=row["message_id"],
+            to_destination=row["to_destination"],
+            from_destination=row["from_destination"] or "",
+            outbox_id=row["outbox_id"],
+        )
 
     async def resend_to(
         self,
