@@ -221,6 +221,8 @@ async def test_the_lockout_row_is_written_when_a_notifier_is_wired_too() -> None
             await service.login("bob", WRONG_PASSWORD)
         feed = await service.security_events_for("bob")
         assert len(_actions(feed, "auth.account_locked")) == 1
+        # The lock notice runs as a background task (BACKLOG #2216); finish it, never sleep.
+        await service.drain_background()
         notices = [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
         assert len(notices) == 1
         # The count stays in the notice, beside the lock kind and its cycle count (ADR 0197).
