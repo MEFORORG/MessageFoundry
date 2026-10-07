@@ -774,6 +774,15 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 _PENDING_STOP_SETTLE_SECONDS = 10.0
 
 
+class DrIntakeState(NamedTuple):
+    """A runner's DR intake state before a release parks it (vault BACKLOG #3140), for
+    :meth:`RegistryRunner.restore_dr_intake` to put back if the release fails."""
+
+    threshold: Priority | None
+    standby: Priority | None
+    inbound_markers: dict[str, str]
+
+
 class _IngressFields(NamedTuple):
     """The peek reads an ingress commit records, taken once (see :func:`_read_ingress_fields`)."""
 
@@ -2554,19 +2563,15 @@ class RegistryRunner:
         a running box. Without it the threshold stayed at its construction value, so an activation
         reload parked nothing on a box built passive (vault BACKLOG #3067).
 
-        The ``filtered`` markers stay until that reload, which drops them when no threshold is set.
-        Until then a released box keeps a parked feed parked: the scheduler skips it, and its
-        status says why its outbound has no connector. A ``standby`` also parks, at once, each
-        inbound that would bind and is not listening, which after a release is every one, so the
-        scheduler or an alert rule's restart cannot bind it before that reload (vault BACKLOG
-        #3140). Leaving the standby swaps its markers for the profile's, at once, for the same
-        reason."""
+        The outbound ``filtered`` markers stay until that reload, which drops them when no
+        threshold is set. Until then a released box keeps a parked outbound parked: the scheduler
+        skips it, and its status says why it has no connector. The inbound markers change at once,
+        because the scheduler and an alert rule's restart read them before that reload (vault
+        BACKLOG #3140). A ``standby`` parks each inbound that would bind and is not listening,
+        which after a release is every one. Leaving the standby swaps those markers for the
+        profile's, so a tick before an activation's reload binds no feed below the threshold."""
         leaving = standby is None and self._dr_standby is not None
         if leaving:
-            # The standby's markers park every inbound. The profile's, written below, park only the
-            # ones under its threshold. The scheduler and an alert rule read them, so without them a
-            # box still active after a failed release bound a below-threshold feed (vault BACKLOG
-            # #3140), and so could a tick before an activation's reload.
             for key in [k for k in self._filtered if k[0] == "inbound"]:
                 del self._filtered[key]
         self._dr_threshold = threshold
@@ -2575,6 +2580,27 @@ class RegistryRunner:
             for name, ic in self.registry.inbound.items():
                 if name not in self._sources and inbound_listener_starts(ic):
                     self._dr_filters_out(name, ic.priority, kind="inbound")
+
+    def dr_intake_state(self) -> DrIntakeState:
+        """What :meth:`restore_dr_intake` puts back: the DR thresholds and the inbound markers.
+        The engine reads it before a release parks intake (vault BACKLOG #3140)."""
+        markers = {name: why for (kind, name), why in self._filtered.items() if kind == "inbound"}
+        return DrIntakeState(self._dr_threshold, self._dr_standby, markers)
+
+    def restore_dr_intake(self, state: DrIntakeState) -> None:
+        """Undo :meth:`park_intake` for a release that failed, so the box is as active as the DR
+        coordinator says (vault BACKLOG #3140). The profile's markers come back as they were,
+        including one a reload wrote for an ``auto_start = false`` feed, so the scheduler and an
+        alert rule still leave a feed below the threshold down. A marker is not restored for an
+        inbound that is listening now. Nothing is bound here: the listeners the park unbound come
+        back on the next reload, as before the release began."""
+        for key in [k for k in self._filtered if k[0] == "inbound"]:
+            del self._filtered[key]
+        self._dr_threshold = state.threshold
+        self._dr_standby = state.standby
+        for name, why in state.inbound_markers.items():
+            if name not in self._sources:
+                self._filtered[("inbound", name)] = why
 
     async def park_intake(self, standby: Priority) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the

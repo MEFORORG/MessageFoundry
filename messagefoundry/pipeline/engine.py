@@ -938,7 +938,7 @@ class Engine:
         # can bind one while the drain runs (vault BACKLOG #3140). The threshold stays, so the
         # outbounds the profile parks hold their rows through the drain.
         standby = self._dr_settings.priority_threshold
-        was_active = self._dr_active
+        before = rr.dr_intake_state()
         try:
             await rr.park_intake(standby)
             rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
@@ -947,9 +947,9 @@ class Engine:
             await rr.park_intake(standby)
         except BaseException:
             # The coordinator keeps the box active, so the runner leaves the standby with it. The
-            # profile's markers come back with it, so the feeds below the threshold stay parked,
-            # and the next reload binds the critical set again, as before the release began.
-            self._set_dr_active(was_active)
+            # profile's markers come back as they were, so the feeds below the threshold stay
+            # parked, and the next reload binds the critical set again.
+            rr.restore_dr_intake(before)
             raise
         self._set_dr_active(False)
         return {"depth_left": depth, "drained": depth <= held, "held_on_parked_outbounds": held}

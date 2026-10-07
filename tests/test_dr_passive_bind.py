@@ -21,6 +21,7 @@ import pytest
 
 from messagefoundry.api import create_managed_app
 from messagefoundry.api.app import _alert_control_action
+from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests.test_dr_running_config_dir import _CRIT, _NORM
@@ -162,57 +163,67 @@ async def test_no_engine_door_binds_a_listener_while_a_release_drains(
         assert _CRIT in rr.filtered_inbound()
 
 
-async def test_a_release_whose_drain_fails_keeps_the_profile_parking_the_normal_feed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("norm_auto_start", [True, False], ids=["auto_start", "operator_started"])
+@pytest.mark.parametrize("fails_at", ["first_park", "drain", "drain_cancelled", "second_park"])
+async def test_a_failed_release_leaves_the_box_active_with_the_profile_parks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails_at: str, norm_auto_start: bool
 ) -> None:
-    """A failed drain leaves the box active, so the profile still parks the normal feed. Red at
-    ``dcbeb5de0b``: leaving the standby purged every inbound marker, and an alert rule's restart
-    then bound the below-threshold listener on a box that was still serving the DR profile."""
+    """The coordinator keeps a box active when its release fails, so the profile's parks stay:
+    the normal feed keeps its marker, an alert rule's restart leaves it down, and the operator's
+    reload binds the critical set and nothing else.
+
+    Red at ``dcbeb5de0b``. A failed drain or second park purged every inbound marker, so the
+    alert rule bound the normal feed. A failed first park ran outside the guard, so the runner
+    kept the standby on an active box and the reload bound nothing, not even the critical feed.
+    The ``operator_started`` case is an ``auto_start = false`` feed whose marker a reload wrote;
+    rebuilding the markers from ``auto_start`` alone lost it."""
     cfg = tmp_path / "cfg"
-    crit_port, norm_port = _write_graph(cfg, tmp_path)
+    crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=norm_auto_start)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
         rr = engine.registry_runner
         assert rr is not None
         await engine._dr_activate_profile()
+        if not norm_auto_start:
+            # An operator start, then a reload: the reload parks the feed with the profile's marker.
+            await rr.start_inbound(_NORM, operator=True)
+            assert await _accepts(norm_port)  # control: the probe sees a bound feed
+            await engine.reload_detail(cfg)
+        assert rr.inbound_filtered(_NORM) is not None and not await _accepts(norm_port)
 
-        async def failing_drain() -> tuple[int, int]:
-            raise RuntimeError("drain query failed")
+        if fails_at == "first_park":
+            source = rr._sources[_CRIT]
+            real_stop = source.stop
 
-        monkeypatch.setattr(engine, "_drain_pipeline", failing_drain)
-        with pytest.raises(RuntimeError, match="drain query failed"):
+            async def stop_then_raise() -> None:
+                await real_stop()
+                raise OSError("injected release failure")
+
+            source.stop = stop_then_raise  # type: ignore[method-assign]
+        elif fails_at == "second_park":
+            real_park = rr.park_intake
+            parks: list[object] = []
+
+            async def park_then_raise_once_drained(standby: Priority) -> None:
+                await real_park(standby)
+                parks.append(standby)
+                if len(parks) == 2:
+                    raise OSError("injected release failure")
+
+            monkeypatch.setattr(rr, "park_intake", park_then_raise_once_drained)
+        else:
+            failure: BaseException = (
+                asyncio.CancelledError()
+                if fails_at == "drain_cancelled"
+                else OSError("injected release failure")
+            )
+
+            async def failing_drain() -> tuple[int, int]:
+                raise failure
+
+            monkeypatch.setattr(engine, "_drain_pipeline", failing_drain)
+        with pytest.raises((OSError, asyncio.CancelledError)):
             await engine._dr_release_drain()
-        assert engine.dr_active and rr.dr_standby is None
-        assert rr.inbound_filtered(_NORM) is not None
-        await _alert_control_action(engine, "restart_inbound", _NORM)
-        assert not await _accepts(norm_port)
-        # Still active, so the operator's reload binds the critical set again and nothing else.
-        await engine.reload_detail(cfg)
-        assert await _accepts(crit_port) and not await _accepts(norm_port)
 
-
-async def test_a_release_whose_first_park_fails_leaves_the_box_active_and_reloadable(
-    tmp_path: Path,
-) -> None:
-    """The first park is inside the release's guard, so its failure leaves the state a failed
-    drain leaves: active, out of the standby, the normal feed parked by the profile. Red at
-    ``dcbeb5de0b``: the park ran outside the guard, so the runner kept the standby on an active
-    box and the operator's reload bound nothing, not even the critical feed."""
-    cfg = tmp_path / "cfg"
-    crit_port, norm_port = _write_graph(cfg, tmp_path)
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
-        rr = engine.registry_runner
-        assert rr is not None
-        await engine._dr_activate_profile()
-        source = rr._sources[_CRIT]
-        real_stop = source.stop
-
-        async def stop_then_raise() -> None:
-            await real_stop()
-            raise OSError("listener close failed")
-
-        source.stop = stop_then_raise  # type: ignore[method-assign]
-        with pytest.raises(OSError, match="listener close failed"):
-            await engine._dr_release_drain()
         assert engine.dr_active and rr.dr_standby is None
         assert rr.inbound_filtered(_NORM) is not None
         await _alert_control_action(engine, "restart_inbound", _NORM)

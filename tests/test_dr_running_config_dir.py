@@ -99,10 +99,16 @@ _NEVER = (
 
 
 def _write_tiered_graph(
-    cfg: Path, tmp_path: Path, *, norm_schedule: str | None = None, norm_auto_start: bool = True
+    cfg: Path,
+    tmp_path: Path,
+    *,
+    norm_schedule: str | None = None,
+    norm_auto_start: bool = True,
+    norm_inbound_auto_start: bool = True,
 ) -> tuple[int, int]:
     """One critical and one normal MLLP inbound, each with an outbound of the same tier. Returns
-    the two ports, critical first."""
+    the two ports, critical first. ``norm_auto_start`` is the normal OUTBOUND's flag and
+    ``norm_inbound_auto_start`` the normal inbound's."""
     cfg.mkdir(parents=True, exist_ok=True)
     out_crit, out_norm = tmp_path / "out-crit", tmp_path / "out-norm"
     out_crit.mkdir(exist_ok=True)
@@ -113,7 +119,8 @@ def _write_tiered_graph(
         "from datetime import time\n"
         "from messagefoundry.config.models import ActiveWindow, Priority, Schedule\n"
         f"inbound({_CRIT!r}, MLLP(port={crit_port}), router='r', priority=Priority.CRITICAL)\n"
-        f"inbound({_NORM!r}, MLLP(port={norm_port}), router='r', priority=Priority.NORMAL)\n"
+        f"inbound({_NORM!r}, MLLP(port={norm_port}), router='r', priority=Priority.NORMAL"
+        f"{'' if norm_inbound_auto_start else ', auto_start=False'})\n"
         f"outbound('OB_CRIT_ADT', File(directory={str(out_crit)!r}), "
         "priority=Priority.CRITICAL)\n"
         f"outbound('OB_NORM_ADT', File(directory={str(out_norm)!r}), priority=Priority.NORMAL"
