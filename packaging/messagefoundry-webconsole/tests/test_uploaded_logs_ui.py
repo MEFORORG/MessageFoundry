@@ -943,7 +943,7 @@ async def test_a_stale_step_up_window_injects_nothing(engine: Engine, tmp_path: 
         # THE ASSERTION THE ITEM ACTUALLY ASKS FOR. These are the two direct products of the handler
         # this route reaches -- the ingress enqueue and the audit row -- so a zero on both is the
         # only evidence that the refusal happened BEFORE the injection rather than after it.
-        assert await engine.store.count_messages(channel_id="in1") == 0
+        assert await engine.store.count_messages(channel_id="in1", allowed_channels=None) == 0
         assert list(await engine.store.list_audit(action="upload.resend", limit=200)) == []
 
     # POSITIVE CONTROL, same store, same inbound, same POST -- a FRESH window. Without this the two
@@ -958,7 +958,7 @@ async def test_a_stale_step_up_window_injects_nothing(engine: Engine, tmp_path: 
         )
         assert allowed.status_code == 303, allowed.text
         assert allowed.headers["location"] == f"/ui/uploaded-logs/file/{own}"
-        assert await engine.store.count_messages(channel_id="in1") == 1
+        assert await engine.store.count_messages(channel_id="in1", allowed_channels=None) == 1
         assert len(await engine.store.list_audit(action="upload.resend", limit=200)) == 1
 
 
@@ -1208,7 +1208,7 @@ async def test_resend_refused_by_the_target_inbounds_guards_names_its_own_cause(
         assert refused.headers["location"] == "/ui/uploaded-logs?e=resend_refused"
         landed = await c.get(refused.headers["location"], follow_redirects=False)
         assert landed.status_code == 200 and "declared content type" in landed.text
-    assert await engine.store.list_messages(channel_id="in1") == []
+    assert await engine.store.list_messages(channel_id="in1", allowed_channels=None) == []
 
 
 async def test_a_refused_upload_is_explained_rather_than_answered_as_json(

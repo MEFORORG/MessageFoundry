@@ -68,8 +68,13 @@ _LOCK_THRESHOLD = 3
 
 
 def _lock_settings() -> AuthSettings:
+    # The login-to-MFA floor is off: _totp_admin enrols on the session it just signed in, and the
+    # floor covers that enrolment (BACKLOG #2389). These tests are about the combined sign-in.
     return AuthSettings(
-        lockout_threshold=_LOCK_THRESHOLD, lockout_minutes=15, mfa_recovery_code_count=1
+        lockout_threshold=_LOCK_THRESHOLD,
+        lockout_minutes=15,
+        mfa_recovery_code_count=1,
+        mfa_verify_min_elapsed_seconds=0,
     )
 
 

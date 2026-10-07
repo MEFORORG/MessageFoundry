@@ -74,6 +74,7 @@ from typing import (
     Protocol,
     Self,
     TypedDict,
+    assert_never,
     cast,
     runtime_checkable,
 )
@@ -1149,7 +1150,20 @@ class ConnectionEventWrite(TypedDict):
 # The one sessions INSERT, shared by MessageStore.create_session's guarded and unguarded paths.
 _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-    " revoked_at, client, reauth_at, auth_mechanism) VALUES (?,?,?,?,?,NULL,?,?,?)"
+    " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
+    " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
+)
+
+
+# BACKLOG #2143: the IdP step-up's write-back of the auth_time it accepted, in the `?` dialect SQLite
+# and SQL Server share. Bind the new value three times. It only ever moves FORWARD, so two step-ups on
+# one session that land out of order cannot leave the older value behind for a replay to pass. A
+# NULL (every password re-proof) leaves the stored value as it was. Each placeholder is CAST, because
+# inside an expression SQL Server has no column to infer a NULL parameter's type from.
+_IDP_AUTH_TIME_FORWARD_SQL: Final = (
+    "CASE WHEN CAST(? AS FLOAT) IS NOT NULL"
+    " AND (idp_auth_time IS NULL OR CAST(? AS FLOAT) > idp_auth_time)"
+    " THEN CAST(? AS FLOAT) ELSE idp_auth_time END"
 )
 
 
@@ -1431,6 +1445,37 @@ ChannelScopeSource = Literal["ad", "manual"]
 SCOPE_SOURCE_AD: Final[ChannelScopeSource] = "ad"
 SCOPE_SOURCE_MANUAL: Final[ChannelScopeSource] = "manual"
 
+
+class AdminRemoval(StrEnum):
+    """A change that can take the Administrator role away from one account (vault BACKLOG #2779).
+
+    ``remove_unless_last_admin`` applies one, on every backend, and refuses it when it would leave
+    no enabled administrator."""
+
+    DISABLE = "disable"
+    DELETE = "delete"
+    SET_ROLES = "set_roles"
+
+    def takes_role(self, admin_role_id: str, role_ids: Sequence[str]) -> bool:
+        """Whether the account lacks ``admin_role_id`` once this change is applied. Disabling and
+        deleting always take it; a role write takes it unless ``role_ids`` names it."""
+        return self is not AdminRemoval.SET_ROLES or admin_role_id not in role_ids
+
+
+#: The last-administrator guard's read (vault BACKLOG #2779): among enabled accounts holding the
+#: role, how many are the target and how many are not. Binds: user id, user id, role id. The ids
+#: are compared in SQL rather than in Python so the guard matches ids exactly as the write's
+#: ``WHERE id=?`` does, under the database's own collation. SQL Server runs it as is; Postgres
+#: carries a ``$n``/boolean twin. One more copy of "enabled administrator" beside the service's
+#: enumerations (``AuthService.has_notifiable_admin`` lists them); a condition added to one belongs
+#: in all.
+_SQL_ADMIN_GUARD_COUNTS = (
+    "SELECT COALESCE(SUM(CASE WHEN u.id = ? THEN 1 ELSE 0 END), 0),"
+    " COALESCE(SUM(CASE WHEN u.id <> ? THEN 1 ELSE 0 END), 0)"
+    " FROM users u JOIN user_roles r ON r.user_id = u.id"
+    " WHERE r.role_id = ? AND u.disabled = 0"
+)
+
 #: The compare-and-set behind ``withdraw_ad_channel_scope`` on SQLite. Postgres carries a ``$n``
 #: twin and SQL Server a collation-pinned one. Binds: new source, now, user id, the expected scope,
 #: the manual marker.
@@ -1692,6 +1737,12 @@ class SessionRecord:
     #: leg runs. Set once at mint and carried forward by ``rotate_session``. NULL on a row written
     #: before the column existed, which takes the non-federated step-up.
     auth_mechanism: str | None = None
+    #: The IdP's ``auth_time`` for this session, as the IdP stated it (BACKLOG #2143): set at an
+    #: ``oidc`` mint and moved forward by each IdP step-up that succeeds. The step-up requires a
+    #: later one, IdP clock against IdP clock. NULL on every other session, and on an ``oidc`` row
+    #: written before the column existed, which the IdP step-up refuses as
+    #: ``step_up_idp_auth_time_missing``.
+    idp_auth_time: float | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -1706,6 +1757,7 @@ class SessionRecord:
             reauth_at=_opt_float(d.get("reauth_at")),
             mfa_verified_at=_opt_float(d.get("mfa_verified_at")),
             auth_mechanism=d.get("auth_mechanism"),
+            idp_auth_time=_opt_float(d.get("idp_auth_time")),
         )
 
     def is_live(self, *, now: float, idle_seconds: float) -> bool:
@@ -3205,6 +3257,7 @@ def delivery_key(
     *,
     control_id: str | None,
     message_id: str,
+    outbox_id: str,
     destination_name: str,
     handler_name: str | None,
     delivery_seq: int,
@@ -3212,21 +3265,33 @@ def delivery_key(
     """The idempotency-ledger key for one **completed** outbound delivery (H2) — a SHA-256 digest of
     re-run-stable, **non-PHI** identifiers only (ids + a counter; **never a body**).
 
-    Folds in the inbound control id (MSH-10) when present, else the internal ``message_id`` (so two
-    messages that happen to share a control id across channels stay distinct via the destination +
-    seq), the destination, the handler that produced the delivery (NULL → empty), and ``delivery_seq``
-    — ``1 + COUNT(prior ledger rows for this (message_id, destination))``, the same monotonic,
-    replay-stable counter shape as ``response_seq`` (ADR 0013). The seq is what distinguishes an
-    **operator replay** (a fresh, higher-seq delivery → a new key → re-sends, never deduped) from a
-    **crash-re-run** (the same row instance recovered before its completion committed — its prior
-    ledger row, if any, is keyed by ``outbox_id`` and caught at claim time, not by this hash).
+    Folds in the internal ``message_id``, the ``outbox_id`` of the queue row that delivered, the
+    inbound control id (MSH-10, NULL when absent), the destination, the handler that produced the
+    delivery (NULL → empty), and ``delivery_seq`` — ``1 + COUNT(prior ledger rows for this
+    (message_id, destination))``. A crash re-run re-derives every input (its prior completion rolled
+    back, so the COUNT is unchanged), so it re-derives the same key.
 
-    Shared verbatim by all three store backends so the digest is byte-identical across SQLite/Postgres/
-    SQL Server. control_id is a peek-derived MSH field — included as an *operator-facing correlation
-    aid* in the digest input only; it is hashed, never stored or logged in the clear here."""
+    **The ids are what make the key unique, never the control id or the seq** (vault BACKLOG #2768).
+    The callers write at most one ledger row per ``outbox_id`` (they return early when one exists),
+    so with the outbox id in the hash no two ledger rows can share a key. Neither weaker input is
+    unique on its own. A control id is sender-assigned: a retransmit recorded as a new message, or a
+    counter that restarts, gives two messages one control id, and a key that hashed it IN PLACE OF the
+    message id collided at the same destination, handler and seq. The seq is a COUNT, not a MAX: a
+    replay DELETEs the ledger rows of the rows it re-pends, so it can recompute an earlier seq, and a
+    scoped delete that keeps a sibling row's entry can recompute the sibling's seq. Every backend
+    INSERT ignores a key conflict, so a collision silently drops a ledger row rather than failing.
+
+    The claim-time skip looks the ledger up by ``outbox_id``; nothing recomputes this key to find a
+    row. Shared verbatim by all three store backends so the digest is byte-identical across SQLite/
+    Postgres/SQL Server. control_id adds no uniqueness and no correlation (nothing recomputes the key);
+    it stays an input only because #2768 kept it as an extra component. Dropping it would also drop the
+    per-delivery ``SELECT control_id`` its callers run, which the ADR 0071 statement inventory pins.
+    It is hashed, never stored or logged in the clear here."""
     canonical = json.dumps(
         [
-            control_id if control_id is not None else message_id,
+            message_id,
+            outbox_id,
+            control_id,
             destination_name,
             handler_name or "",
             delivery_seq,
@@ -4000,10 +4065,10 @@ def seed_notify_email(email: str | None) -> str | None:
 class AuditAppend:
     """One audit row a write appends in its OWN transaction, on all three backends (BACKLOG #2100).
 
-    For a record that must not outlive, or be outlived by, the row it describes. ``create_user``
-    takes one for a directory birth whose ``mail`` was not adopted. Written as a second call, a
-    crash between the two kept the account and lost the record of why it has no address. The row
-    joins the hash chain :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
+    For a record that must not outlive, or be outlived by, the row it describes. Written as a
+    second call, a crash between the two kept the change and lost its record. ``create_user`` and
+    ``update_user_profile`` take them (BACKLOG #2221). Each joins the hash chain
+    :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
     """
 
     action: str
@@ -4024,6 +4089,17 @@ class AuditAppend:
             seq=row.seq,
             row_hash=row.row_hash,
         )
+
+
+def tee_audits(
+    audits: Sequence[AuditAppend], rows: Sequence[AppendedAuditRow], *, ts: float
+) -> None:
+    """Tee each committed row of a write's ``audits`` off-box, after its commit (BACKLOG #2221).
+
+    Shared by all three backends. ``rows`` is what the appends returned, one per audit, in order.
+    """
+    for audit, row in zip(audits, rows, strict=True):
+        audit.tee(ts=ts, row=row)
 
 
 def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
@@ -4555,7 +4631,7 @@ CREATE INDEX IF NOT EXISTS ix_response_message ON response(message_id);
 -- is stored in the clear (nothing to decrypt; it is not part of the `_cipher` seam). A deliberate
 -- operator `replay` DELETEs the affected rows so the re-send is NOT deduped (replay-distinguishes).
 CREATE TABLE IF NOT EXISTS delivered_keys (
-    delivery_key     TEXT PRIMARY KEY,    -- sha256(control_id|message_id, dest, handler, seq) — no PHI
+    delivery_key     TEXT PRIMARY KEY,    -- sha256 of non-PHI ids, see delivery_key()
     outbox_id        TEXT NOT NULL,       -- the queue row that delivered (claim-time dedup lookup key)
     message_id       TEXT NOT NULL,
     destination_name TEXT NOT NULL,
@@ -4825,7 +4901,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     client       TEXT,
     reauth_at    REAL,                         -- last credential re-verification (login / /me/reauth)
     mfa_verified_at REAL,                      -- when the 2nd factor was satisfied; NULL = unsatisfied (WP-14)
-    auth_mechanism TEXT                        -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
+    auth_mechanism TEXT,                       -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
+    idp_auth_time REAL                         -- the IdP's auth_time for an oidc session (BACKLOG #2143)
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
@@ -6460,6 +6537,11 @@ class MessageStore:
         # non-federated step-up; nothing is backfilled, because nothing recorded the mechanism.
         if "auth_mechanism" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
+        # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with. Pre-existing
+        # rows get NULL, because nothing recorded the value to backfill. The IdP step-up refuses a
+        # NULL as step_up_idp_auth_time_missing.
+        if "idp_auth_time" not in session_cols:
+            await db.execute("ALTER TABLE sessions ADD COLUMN idp_auth_time REAL")
         # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing
         # DB's response table predates the three columns — ALTER them in (existing rows backfill
         # kind='response' via the DEFAULT). Metadata-only on SQLite (no table rewrite). Idempotent.
@@ -10157,7 +10239,7 @@ class MessageStore:
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -10196,7 +10278,7 @@ class MessageStore:
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int:
@@ -10224,7 +10306,7 @@ class MessageStore:
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): pre-filter on the indexed metadata, then
         decrypt + match each candidate body **in memory** (a plain SQL ``LIKE`` is impossible while the
@@ -10293,7 +10375,7 @@ class MessageStore:
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[dict[str, Any]]:
         """Dead-lettered deliveries (one row per failed message→destination), newest first, joined
         with message metadata for the dead-letter view. Bodies (``raw``) are omitted (metadata only,
@@ -10325,7 +10407,7 @@ class MessageStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int:
         """Total dead-lettered deliveries matching the same filters as :meth:`list_dead`."""
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
@@ -10339,7 +10421,7 @@ class MessageStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
         narrowed by the two clauses :meth:`replay_dead` applies, so every pair names rows a replay
@@ -10541,7 +10623,7 @@ class MessageStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(
             1, min(limit, 1000)
@@ -10644,7 +10726,7 @@ class MessageStore:
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         # The read accessor for GET /alerts/active: open + acknowledged instances, newest last_seen
         # first. Runs on the lockfree read path. `allowed_channels` applies the SAME per-channel RBAC
@@ -10668,7 +10750,7 @@ class MessageStore:
             return [self._alert_instance_row(r) for r in await cur.fetchall()]
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         # BACKLOG #1564: the nav bell's count + worst severity over EVERY active instance in scope, not
         # over a page of them. Same predicate and same RBAC scope as list_active_alert_instances above —
@@ -10689,7 +10771,7 @@ class MessageStore:
         return _alert_summary(row)
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         # Read one instance by id (any status) — the API echo for ack/resolve. RBAC-scoped exactly like
         # list_active_alert_instances (a scoped caller can't read an instance outside its channels).
@@ -10789,7 +10871,7 @@ class MessageStore:
             await self._commit()
             if cur.rowcount == 0:
                 return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
         self, alert_id: int, *, now: float | None = None
@@ -10804,7 +10886,7 @@ class MessageStore:
             await self._commit()
             if cur.rowcount == 0:
                 return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         # Back ConnectionRow.alerts_active (ADR 0044 D4): the OPEN (not acknowledged, not resolved)
@@ -10982,6 +11064,17 @@ class MessageStore:
             row_id = int(ins.lastrowid or 0)  # read INSIDE the lock: another append would move it
             return AppendedAuditRow(row_id, seq, row_hash)
         raise AssertionError("unreachable: the second attempt returns or raises")
+
+    async def _append_audits(
+        self, audits: Sequence[AuditAppend], *, now: float
+    ) -> list[AppendedAuditRow]:
+        """Append each of a write's ``audits``, in order, inside its writer transaction (#2100)."""
+        return [
+            await self._append_audit_row(
+                a.action, actor=a.actor, channel_id=None, detail=a.detail, client=a.client, now=now
+            )
+            for a in audits
+        ]
 
     @staticmethod
     def _audit_where(
@@ -11471,7 +11564,7 @@ class MessageStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -11498,19 +11591,10 @@ class MessageStore:
                     1 if password_generated else 0,
                 ),
             )
-            if audit is not None:
-                # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
-                appended = await self._append_audit_row(
-                    audit.action,
-                    actor=audit.actor,
-                    channel_id=None,
-                    detail=audit.detail,
-                    client=audit.client,
-                    now=now,
-                )
+            # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
-        if audit is not None:
-            audit.tee(ts=now, row=appended)
+        tee_audits(audits, appended, ts=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         async with self._read() as db:
@@ -11658,18 +11742,22 @@ class MessageStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits``: see
+        ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
                 (display_name, email, now, user_id),
             )
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
+        tee_audits(audits, appended, ts=now)
 
     async def set_user_notify_email(
         self, user_id: str, *, email: str, now: float | None = None
@@ -11732,6 +11820,63 @@ class MessageStore:
             written = cur.rowcount > 0
             await self._commit()
         return written
+
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> int | None:
+        """Swap an ENABLED TOTP enrolment for a new secret, end the account's sessions and append
+        ``audit``, all in ONE transaction (ADR 0171 Amendment B, BACKLOG #2226). Returns the number
+        of sessions ended, or ``None`` when nothing was written.
+
+        The secret, the recovery codes and the step high-water mark change together, and TOTP stays
+        on throughout, so no reader ever sees the account without a factor. ``step`` is the step of
+        the code that proved the new secret, so that code is spent. The write matches only a row
+        where TOTP is on, with a seed, and still enrolled at ``expected_enrolled_at``: a removal or a
+        re-enrolment that landed after the caller read the row is never overwritten, and TOTP can
+        never be turned on for an account that did not have it. The audit row and the session sweep
+        commit or roll back with the swap, so a refused audit append leaves the old seed in place."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE users SET totp_secret=?, totp_enrolled_at=?, totp_recovery_codes=?,"
+                " last_totp_step=?, updated_at=?"
+                " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
+                " AND totp_enrolled_at IS ?",
+                (
+                    self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+                    now,
+                    json.dumps(recovery_code_hashes),
+                    step,
+                    now,
+                    user_id,
+                    expected_enrolled_at,
+                ),
+            )
+            if int(cur.rowcount) <= 0:
+                # Nothing written, so nothing is revoked or audited. The commit ends the empty
+                # transaction, as set_user_federated_subject does.
+                await self._commit()
+                return None
+            revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+            appended = await self._append_audit_row(
+                audit.action,
+                actor=audit.actor,
+                channel_id=None,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
+            await self._commit()
+        audit.tee(ts=now, row=appended)
+        return int(revoked.rowcount)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""
@@ -11937,19 +12082,60 @@ class MessageStore:
 
     async def delete_user(self, user_id: str) -> None:
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-            await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-            await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
-            # vault BACKLOG #2145: the account's known sign-in addresses go with it.
-            await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
-            # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
-            # FK cascade on this table, so without this DELETE the rows outlive the account —
-            # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
-            # and counted by nothing. `owner` holds the user_id, not the username, which is what
-            # makes this a single keyed DELETE rather than a name lookup.
-            await self._db.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
-            await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
+            await self._delete_user_rows(user_id)
             await self._commit()
+
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
+        ``AuthStore``. The writer lock serializes it against every other writer in this process,
+        which is every writer this file has."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            if change.takes_role(admin_role_id, role_ids):
+                cur = await self._db.execute(
+                    _SQL_ADMIN_GUARD_COUNTS, (user_id, user_id, admin_role_id)
+                )
+                target, others = await cur.fetchone() or (0, 0)
+                if target and not others:
+                    await self._db.rollback()
+                    return False
+            if change is AdminRemoval.DISABLE:
+                await self._db.execute(
+                    "UPDATE users SET disabled=1, updated_at=? WHERE id=?", (now, user_id)
+                )
+            elif change is AdminRemoval.DELETE:
+                await self._delete_user_rows(user_id)
+            elif change is AdminRemoval.SET_ROLES:
+                await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
+            else:
+                assert_never(change)
+            await self._commit()
+        return True
+
+    async def _delete_user_rows(self, user_id: str) -> None:
+        """Delete the account and every row keyed to it. Commits nothing: the caller holds the
+        writer transaction."""
+        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+        # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+        await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+        # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
+        # FK cascade on this table, so without this DELETE the rows outlive the account —
+        # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
+        # and counted by nothing. `owner` holds the user_id, not the username, which is what
+        # makes this a single keyed DELETE rather than a name lookup.
+        await self._db.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
+        await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -12206,14 +12392,21 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-            for role_id in role_ids:
-                await self._db.execute(
-                    "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                    " VALUES (?,?,?,?)",
-                    (user_id, role_id, now, assigned_by),
-                )
+            await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
             await self._commit()
+
+    async def _replace_user_roles(
+        self, user_id: str, role_ids: Sequence[str], *, assigned_by: str | None, now: float
+    ) -> None:
+        """Replace the account's role rows. Commits nothing: the caller holds the writer
+        transaction."""
+        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        for role_id in role_ids:
+            await self._db.execute(
+                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
+                " VALUES (?,?,?,?)",
+                (user_id, role_id, now, assigned_by),
+            )
 
     async def set_user_channel_scope(
         self,
@@ -12429,6 +12622,7 @@ class MessageStore:
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for an
@@ -12443,6 +12637,7 @@ class MessageStore:
             client,
             now if seed_reauth else None,
             auth_mechanism,
+            idp_auth_time,
         )
         if require_federated_subject is None:
             async with _writer_guard(self._db, self._lock):
@@ -12505,15 +12700,21 @@ class MessageStore:
             await self._commit()
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
             # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
             await self._db.execute(
-                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client) WHERE token_hash=?",
-                (now, client, token_hash),
+                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
+                f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
+                (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
             )
             await self._commit()
 
@@ -13530,16 +13731,16 @@ class MessageStore:
 
         Only outbound rows deliver; ingress/routed rows (``destination_name`` NULL) own no external send
         and are skipped. ``delivery_seq`` is ``1 + COUNT`` of this row's prior ledger entries for the
-        ``(message_id, destination_name)`` pair — the same replay-stable counter shape as
-        ``response_seq``. The stored row carries hashes + ids only — never a body/PHI. The INSERT keys on
-        the content hash; a re-run that reaches here only after the prior completion rolled back finds
-        ``COUNT=0`` again and re-derives the same key (idempotent), while the claim-time skip
+        ``(message_id, destination_name)`` pair. It is a counter, not a unique id: a replay's DELETE can
+        make it repeat, and :func:`delivery_key` takes its uniqueness from the ids instead. The stored
+        row carries hashes + ids only — never a body/PHI. A re-run that reaches here only after the
+        prior completion rolled back re-derives the same key (idempotent), while the claim-time skip
         (:meth:`claim_next_fifo`) is what actually prevents the duplicate *send*."""
         if destination_name is None:
             return  # ingress/routed completions own no external delivery — nothing to dedupe
         # One ledger row per outbox row INSTANCE: a double mark_done of the same row (a re-completion, a
         # belt-and-suspenders re-call) must not accumulate a second entry. A deliberate replay re-send
-        # DELETEs this row's entry first, so its re-delivery is recorded fresh (a new, higher seq).
+        # DELETEs this row's entry first, so its re-delivery is recorded fresh (a new ledger row).
         cur = await self._db.execute(
             "SELECT 1 FROM delivered_keys WHERE outbox_id=? LIMIT 1", (outbox_id,)
         )
@@ -13557,6 +13758,7 @@ class MessageStore:
         key = delivery_key(
             control_id=control_id,
             message_id=message_id,
+            outbox_id=outbox_id,
             destination_name=destination_name,
             handler_name=handler_name,
             delivery_seq=seq,

@@ -371,7 +371,7 @@ async def test_dead_letter_now_fails_fast_without_consuming_a_retry(store: Messa
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ERROR.value
-    assert len(await store.list_dead(channel_id="c1")) == 1
+    assert len(await store.list_dead(channel_id="c1", allowed_channels=None)) == 1
 
 
 async def test_dead_letter_now_on_missing_row_is_a_noop(store: MessageStore) -> None:
@@ -499,23 +499,23 @@ async def _dead_delivery(
 async def test_list_and_count_dead_with_filters(store: MessageStore) -> None:
     await _dead_delivery(store, "c1", "d1", now=10.0)
     await _dead_delivery(store, "c2", "d2", now=20.0)
-    assert await store.count_dead() == 2
-    rows = await store.list_dead()
+    assert await store.count_dead(allowed_channels=None) == 2
+    rows = await store.list_dead(allowed_channels=None)
     assert [r["destination_name"] for r in rows] == ["d2", "d1"]  # newest-failed first
     assert rows[0]["channel_id"] == "c2"
     assert rows[0]["attempts"] == 1 and rows[0]["last_error"] == "boom"
     # scoping filters
-    assert await store.count_dead(destination_name="d1") == 1
-    assert await store.count_dead(channel_id="c2") == 1
-    assert len(await store.list_dead(channel_id="c2")) == 1
+    assert await store.count_dead(destination_name="d1", allowed_channels=None) == 1
+    assert await store.count_dead(channel_id="c2", allowed_channels=None) == 1
+    assert len(await store.list_dead(channel_id="c2", allowed_channels=None)) == 1
 
 
 async def test_list_dead_excludes_done_and_pending(store: MessageStore) -> None:
     mid = await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p")], now=0.0)
     await store.mark_done((await store.claim_ready(now=0.0))[0].id, now=1.0)
     await store.enqueue_message(channel_id="c1", raw="y", deliveries=[("d1", "p2")], now=0.0)
-    assert await store.count_dead() == 0
-    assert list(await store.list_dead()) == []
+    assert await store.count_dead(allowed_channels=None) == 0
+    assert list(await store.list_dead(allowed_channels=None)) == []
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.PROCESSED.value
@@ -541,7 +541,7 @@ async def test_replay_dead_requeues_only_dead_rows(store: MessageStore) -> None:
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ROUTED.value
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
     assert any(e["event"] == "replayed" for e in await store.events_for(mid))
 
 
@@ -550,8 +550,8 @@ async def test_replay_dead_scoped_by_destination(store: MessageStore) -> None:
     await _dead_delivery(store, "c1", "d2", now=0.0)
     requeued = await store.replay_dead(destination_name="d1", now=5.0)
     assert requeued == 1
-    assert await store.count_dead() == 1  # d2 left dead
-    assert (await store.list_dead())[0]["destination_name"] == "d2"
+    assert await store.count_dead(allowed_channels=None) == 1  # d2 left dead
+    assert (await store.list_dead(allowed_channels=None))[0]["destination_name"] == "d2"
 
 
 async def test_replay_dead_none_returns_zero(store: MessageStore) -> None:
@@ -571,7 +571,7 @@ async def test_replay_dead_rolls_back_on_partial_failure(
         await store.replay_dead(now=5.0)
 
     # The batch rolled back: the row is still DEAD (not half-flipped to PENDING)...
-    assert await store.count_dead() == 1
+    assert await store.count_dead(allowed_channels=None) == 1
     # ...and the shared connection is left usable (no dangling open transaction).
     mid = await store.enqueue_message(channel_id="c2", raw="x", deliveries=[("d2", "p")], now=6.0)
     fetched = await store.get_message(mid)
@@ -701,7 +701,7 @@ async def test_enqueue_stores_summary_and_metadata(store: MessageStore) -> None:
     await store.enqueue_message(
         channel_id="c1", raw="x", deliveries=[("d1", "p1")], summary="MRN 1 · DOE", now=100.0
     )
-    rows = await store.list_messages()
+    rows = await store.list_messages(allowed_channels=None)
     assert rows[0]["summary"] == "MRN 1 · DOE"
     assert rows[0]["metadata"] is None
     assert rows[0]["last_event"] == "received"  # only event so far
@@ -713,7 +713,7 @@ async def test_list_messages_last_event_reflects_latest(store: MessageStore) -> 
     )
     item = (await store.claim_ready(now=100.0))[0]
     await store.mark_done(item.id, now=101.0)
-    rows = await store.list_messages()
+    rows = await store.list_messages(allowed_channels=None)
     assert rows[0]["last_event"] == "delivered"
     assert mid
 
@@ -723,13 +723,23 @@ async def test_list_messages_received_at_range(store: MessageStore) -> None:
     for ts in (1000.0, 2000.0, 3000.0):
         await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=ts)
     got = sorted(
-        r["received_at"] for r in await store.list_messages(received_from=1500, received_to=2500)
+        r["received_at"]
+        for r in await store.list_messages(
+            received_from=1500, received_to=2500, allowed_channels=None
+        )
     )
     assert got == [2000.0]  # lower inclusive, upper exclusive
-    assert await store.count_messages(received_from=1500, received_to=2500) == 1
-    open_ended = sorted(r["received_at"] for r in await store.list_messages(received_from=2000.0))
+    assert (
+        await store.count_messages(received_from=1500, received_to=2500, allowed_channels=None) == 1
+    )
+    open_ended = sorted(
+        r["received_at"]
+        for r in await store.list_messages(received_from=2000.0, allowed_channels=None)
+    )
     assert open_ended == [2000.0, 3000.0]  # open upper bound
-    assert await store.count_messages() == 3  # no filter = all (regression guard)
+    assert (
+        await store.count_messages(allowed_channels=None) == 3
+    )  # no filter = all (regression guard)
 
 
 async def test_db_status_reports_counts_journal_size(store: MessageStore) -> None:
@@ -899,6 +909,76 @@ async def test_mark_done_writes_one_ledger_row(store: MessageStore) -> None:
     assert "p1" not in str(rows[0].values())
     assert "MSH" not in str(rows[0].values())
     assert len(rows[0]["delivery_key"]) == 64  # sha256 hex
+
+
+def test_delivery_key_is_keyed_on_the_message_and_outbox_ids() -> None:
+    # vault BACKLOG #2768: the key used to hash the MSH-10 control id IN PLACE OF the message id, so two
+    # messages sharing a control id (a retransmit recorded as a new message, a restarted counter)
+    # collided at the same destination, handler and seq. Both ids are now always components.
+    from messagefoundry.store.store import delivery_key
+
+    def key(message_id: str, outbox_id: str) -> str:
+        return delivery_key(
+            control_id="CTRL1",
+            message_id=message_id,
+            outbox_id=outbox_id,
+            destination_name="d1",
+            handler_name="h",
+            delivery_seq=1,
+        )
+
+    assert key("m-1", "q-1") != key("m-2", "q-1")  # one control id, two messages: two keys
+    assert key("m-1", "q-1") != key("m-1", "q-2")  # one message, two outbound rows, same seq
+
+
+async def test_two_messages_sharing_a_control_id_each_get_a_ledger_row(store: MessageStore) -> None:
+    # vault BACKLOG #2768: both messages compute delivery_seq=1 (the count is per message id), so a
+    # key that ignored the message id made the second INSERT OR IGNORE a silent no-op.
+    mids = [
+        await store.enqueue_message(
+            channel_id="c1",
+            raw="MSH|x",
+            deliveries=[("d1", f"p{i}")],
+            control_id="CTRL1",
+            now=100.0,
+        )
+        for i in range(2)
+    ]
+    for t in (101.0, 102.0):
+        item = await store.claim_next_fifo("d1", now=t)
+        assert item is not None
+        await store.mark_done(item.id, now=t)
+    rows = await _ledger_rows(store)
+    assert sorted(r["message_id"] for r in rows) == sorted(mids)
+    assert [r["delivery_seq"] for r in rows] == [1, 1]
+    assert rows[0]["delivery_key"] != rows[1]["delivery_key"]
+
+
+async def test_a_seq_gap_does_not_collide_two_rows_of_one_message(store: MessageStore) -> None:
+    # Two outbound rows of ONE message to ONE destination take seq 1 and 2. Dropping only the seq-1
+    # row's ledger entry leaves COUNT=1, so its re-delivery recomputes seq 2 -- the sibling's seq. The
+    # state is built directly (DELETE + re-pend) to pin the KEY property, not a replay path; the outbox
+    # id in the key keeps the two keys apart, so the ledger row is written instead of silently ignored.
+    await store.enqueue_message(
+        channel_id="c1", raw="MSH|x", deliveries=[("d1", "p1"), ("d1", "p2")], now=100.0
+    )
+    first = await store.claim_next_fifo("d1", now=101.0)
+    assert first is not None
+    await store.mark_done(first.id, now=101.0)
+    second = await store.claim_next_fifo("d1", now=102.0)
+    assert second is not None
+    await store.mark_done(second.id, now=102.0)
+    await store._db.execute("DELETE FROM delivered_keys WHERE outbox_id=?", (first.id,))
+    await store._db.execute(
+        "UPDATE queue SET status=? WHERE id=?", (OutboxStatus.PENDING.value, first.id)
+    )
+    await store._db.commit()
+    again = await store.claim_next_fifo("d1", now=200.0)
+    assert again is not None and again.id == first.id
+    await store.mark_done(again.id, now=201.0)
+    rows = await _ledger_rows(store)
+    assert sorted(r["outbox_id"] for r in rows) == sorted([first.id, second.id])
+    assert len({r["delivery_key"] for r in rows}) == 2
 
 
 async def test_ledger_at_rest_carries_no_phi(tmp_path) -> None:

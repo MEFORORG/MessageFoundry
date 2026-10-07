@@ -11,8 +11,10 @@ import { configDir, workspaceDir } from "./cli";
 import { watchableConfigDir } from "./configRefresh";
 
 /** What in the config dir feeds the tree/validator: config modules, the data-authored connections
- *  (ADR 0007), and code sets. A brace glob keeps it to ONE watcher. */
-const CONFIG_GLOB = "{**/*.py,connections.toml,codesets/**/*.csv}";
+ *  (ADR 0007), and code sets (.csv and .toml, policy sidecars included). A brace glob keeps it
+ *  to ONE watcher. Code sets are one level deep, as the loader lists them, so an editor's
+ *  candidate under codesets/.<name>.<random>.edit/ is not an event. */
+const CONFIG_GLOB = "{**/*.py,connections.toml,codesets/*.csv,codesets/*.toml}";
 
 /**
  * Watch the resolved config dir and call `onEvent` on every create/change/delete. Rebuilds the

@@ -9,9 +9,9 @@ would. It speaks the length-prefixed **MFW2** codec
 decode path cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
 direction, in either process.
 
-1. **Bootstrap** — reads one ``boot`` frame ``{config_dir, forbidden, cpu_seconds, mem_mb,
-   code_sets}``, loads the message :class:`~messagefoundry.config.wiring.Registry` from ``config_dir``
-   (the same loader the engine uses — it executes admin config under the unchanged safe-source gate),
+1. **Bootstrap** — reads one ``boot`` frame ``{config_dir, forbidden, mem_mb, code_sets}``, loads
+   the message :class:`~messagefoundry.config.wiring.Registry` from ``config_dir`` (the same loader
+   the engine uses — it executes admin config under the unchanged safe-source gate),
    **adopts the engine's code-set tables** from the frame in place of its own re-read of ``codesets/``
    (when the parent published any — a session constructed without them leaves the child on its own
    load), applies the POSIX resource caps where available, installs the forbidden-import guard, and
@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import math
 import sys
 from dataclasses import replace
 from typing import Any
@@ -103,29 +102,18 @@ class _ForbiddenImportFinder:
         return None
 
 
-def _apply_resource_caps(cpu_seconds: float, mem_mb: int | None) -> None:
-    """Best-effort POSIX ``RLIMIT_CPU`` / ``RLIMIT_AS`` backstop (a no-op on Windows). The parent's
-    wall-clock cap is the authoritative bound on every platform; this just lets the OS reap a runaway
-    child sooner where the ``resource`` module exists."""
+def _apply_resource_caps(mem_mb: int | None) -> None:
+    """Best-effort POSIX ``RLIMIT_AS`` backstop (a no-op on Windows). The parent's wall-clock cap is
+    the authoritative bound on every platform. There is deliberately no ``RLIMIT_CPU``, so CPU spent
+    outside a call has no bound (ADR 0087, amendment of 2026-10-07)."""
     try:
         import resource
     except ImportError:
         return  # Windows / no rlimit support — wall cap governs
     with contextlib.suppress(ValueError, OSError):
-        # No core file of a worker that holds message bodies: SIGXCPU's default action dumps one.
+        # No core file of a worker that holds message bodies: a crash signal such as SIGSEGV or
+        # SIGABRT would otherwise dump one.
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # type: ignore[attr-defined,unused-ignore]
-    try:
-        # RLIMIT_CPU counts the whole process life, and this runs AFTER the config load, so the
-        # budget starts from the CPU the bootstrap already spent; measured 2026-10-06, that was about
-        # 0.6 s on an idle box, and more on a slow runner, where it left a busy loop to hit the CPU
-        # limit before the wall cap. Hard is one second above soft, so the kill arrives as SIGXCPU,
-        # which the parent reports as the CPU cap (at soft == hard Linux sends an anonymous SIGKILL).
-        # The worker cannot raise the hard limit, so code that ignores SIGXCPU is SIGKILLed a second on.
-        usage = resource.getrusage(resource.RUSAGE_SELF)  # type: ignore[attr-defined,unused-ignore]
-        cpu = max(1, math.ceil(usage.ru_utime + usage.ru_stime + cpu_seconds))
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))  # type: ignore[attr-defined,unused-ignore]
-    except (ValueError, OSError):
-        pass
     if mem_mb is not None:
         try:
             limit = int(mem_mb) * 1024 * 1024
@@ -279,7 +267,7 @@ def main() -> int:
         import messagefoundry.config.fhir_lookup  # noqa: F401
         import messagefoundry.config.run_context  # noqa: F401
 
-        _apply_resource_caps(boot.cpu_seconds, boot.mem_mb)
+        _apply_resource_caps(boot.mem_mb)
         _install_import_guard(boot.forbidden)
     except Exception as exc:  # noqa: BLE001 — report a bootstrap failure, do not crash silently
         try:  # noqa: SIM105

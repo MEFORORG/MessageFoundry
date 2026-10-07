@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from messagefoundry.auth.trust_anchors import LaneAnchorCheck
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -260,6 +261,7 @@ class Engine:
         log_dir: str | None = None,
         registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
         settings_preflight: Callable[[], Awaitable[None]] | None = None,
+        lane_anchor_check: LaneAnchorCheck | None = None,
     ) -> None:
         self.store = store
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
@@ -283,6 +285,10 @@ class Engine:
         # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
         # (BACKLOG #1142, slice 3); None = no preflight.
         self._registry_preflight = registry_preflight
+        # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check the runner
+        # awaits for each lane it builds, at start, at an operator start and before a reload. `serve`
+        # passes it; None = no check. Not handed to a dry-run checker, which builds nothing live.
+        self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
         # Dry runs skip it, because it writes audit rows. It raises WiringError to refuse. `serve`
@@ -524,8 +530,9 @@ class Engine:
         # Serializes ALL console→connections.toml writes (#131/#136 review): the read-modify-write of the
         # config file is not atomic on its own, so two concurrent config:deploy writers could lose an
         # update. A single engine-level lock guarding every such write (a future console→TOML writer must
-        # take it too) keeps them serial; the writer's unique-temp + os.replace (connections_edit) guards
-        # against a DIFFERENT process (the `connection` CLI) writing concurrently.
+        # take it too) keeps them serial. It is in-process only, so the write also holds
+        # `connections_edit.locked`, an OS file lock the `connection` CLI in another process takes too
+        # (vault BACKLOG #2782); that one is blocking and is only ever taken in a worker thread.
         self._toml_write_lock = asyncio.Lock()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
@@ -776,7 +783,17 @@ class Engine:
         rest report ``status:"filtered"``). A reload (not a cold start) so a box already serving its
         full graph drops to the critical set in place, with in-flight rows preserved (the reload is
         quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
-        from :meth:`_dr_config_drift`."""
+        from :meth:`_dr_config_drift`.
+
+        It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
+        (vault BACKLOG #2184, engine PR 2070). The preflight reads anchor files, which can change
+        after the graph loaded. The guard ``serve`` wires, the static-credential guard, judges only
+        the graph and the startup settings, and neither has changed. It already judged this graph
+        when it loaded, through :meth:`reload_detail` or the managed app's first load, over the
+        whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
+        filtered graph, so a guard here would judge less than that load did. A graph an embedder
+        hands to :meth:`add_registry` meets neither check at load. That is a fact about embedding,
+        and an activation is not where it changes."""
         was_active = self._dr_active
         rr = self._registry_runner
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
@@ -786,8 +803,8 @@ class Engine:
         # dir, so a dir on a share at the failed site cannot refuse it after the takeover hook moved
         # the VIP. The settings and registry preflights are the trust-anchor checks reload_detail
         # runs before a swap; they read anchor files and write audit rows, and they refuse before
-        # anything changes. The graph guard and the env-values re-read are not repeated: the graph
-        # is unchanged, and the values are the ones the runner holds. rr.reload still runs
+        # anything changes. The graph guard is not repeated; the docstring says why. Nor is the
+        # env-values re-read: the values are the ones the runner holds. rr.reload still runs
         # build_check, so the egress and exposure gates still run. The threshold goes to the runner
         # after the preflights and before the reload, which is where the runner re-evaluates every
         # connection. rr.reload() re-applies whichever graph is current once it holds the reload
@@ -960,7 +977,6 @@ class Engine:
         sandbox_policy = SandboxPolicy(
             mode=SandboxMode(_sb.mode),
             wall_seconds=_sb.wall_seconds,
-            cpu_seconds=_sb.cpu_seconds,
             mem_mb=_sb.mem_mb,
             startup_seconds=_sb.startup_seconds,
             pass_environment=_sb.pass_environment,
@@ -992,6 +1008,7 @@ class Engine:
             egress=self._egress_settings,
             hop_posture=self._hop_posture,
             trust_anchor_policy=self._trust_anchor_policy,
+            lane_anchor_check=self._lane_anchor_check,
             simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             active_environment=self._active_environment,
@@ -2069,23 +2086,58 @@ class Engine:
 
             connections_edit.upsert_connection(cfg_dir, match, validate=validate)
 
+        def _digest() -> dict[str, object] | None:
+            # Already on a worker thread and holding the lock, so the blocking twin of
+            # `fingerprint_bundle`: the same best-effort rule, with no hop back through the loop
+            # or a second executor thread while the lock is held.
+            digest, _reason = self.fingerprint_bundle_blocking(cfg_dir)
+            return digest
+
+        def _locked_write(loaded_fp: object) -> tuple[dict[str, object] | None, bool]:
+            """The write and both digests, all under the cross-process lock (vault BACKLOG #2782).
+
+            The lock spans the list as well as the upsert: the entry is read and written back whole,
+            so a `connection` CLI edit of the same entry landing between the two would otherwise be
+            overwritten. It spans the digests too, so neither can take in a CLI edit this engine
+            never loaded. Re-entrant, so the upsert's own acquisition nests. Returns ``(after,
+            vouched)``; ``vouched`` is False when the toggle was not the one change."""
+            with connections_edit.locked(cfg_dir):
+                # vault BACKLOG #2597: whether the directory still holds the bytes the running
+                # graph loaded, read before this write changes it. With no loaded digest there is
+                # nothing to vouch against, so the two reads are skipped.
+                before = _digest() if isinstance(loaded_fp, str) else None
+                _write()
+                # The digest covers the whole directory, so it may vouch for this toggle only when
+                # the toggle is the one change since the load. Otherwise another edit is on disk
+                # that the running graph never loaded, and the row keeps the loaded digest, so the
+                # next start reports it.
+                if (
+                    before is None
+                    or not isinstance(loaded_fp, str)
+                    or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
+                ):
+                    return None, False
+                # The write has landed, so an unexpected failure here is logged and costs the
+                # digest, never the answer: a raise would report a landed write as failed, with
+                # no audit row.
+                try:
+                    after = _digest()
+                except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
+                    log.exception("connection flag written; its config fingerprint was not taken")
+                    after = None
+                return after, True
+
         # Serialize the whole read-modify-write + live reflect under the engine-level TOML-write lock so
         # two concurrent config:deploy flag toggles can't interleave (lost update / racing temp files);
         # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
         async with self._toml_write_lock:
-            # vault BACKLOG #2597: whether the directory still holds the bytes the running graph
-            # loaded, read before this write changes it. See the return below. With no loaded
-            # digest there is nothing to vouch against, so the two reads are skipped.
             loaded = self.loaded_config_fingerprint
             loaded_fp = loaded.get("fingerprint") if loaded is not None else None
-            before = None
-            if isinstance(loaded_fp, str):
-                before, _reason = await self.fingerprint_bundle(cfg_dir)
             # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so
             # the runner's listening set is snapshotted here, on the loop. None = the offline test.
             live = self._registry_runner
             binds_listener = live.listener_bind_predicate() if live is not None else None
-            await asyncio.to_thread(_write)
+            after, vouched = await asyncio.to_thread(_locked_write, loaded_fp)
 
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
             # Best-effort: the durable connections.toml is the source of truth, so a concurrent reload
@@ -2098,23 +2150,8 @@ class Engine:
                     rr.registry.outbound[name] = replace(
                         rr.registry.outbound[name], flagged=flagged
                     )
-            # Still under the lock, so no second toggle lands between the write and its digest. The
-            # digest covers the whole directory, so it may vouch for this toggle only when the toggle
-            # is the one change since the load. Otherwise another edit is on disk that the running
-            # graph never loaded, and the row keeps the loaded digest, so the next start reports it.
-            if (
-                before is None
-                or not isinstance(loaded_fp, str)
-                or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
-            ):
+            if not vouched:
                 return loaded
-            # The write has landed, so an unexpected failure here is logged and costs the digest,
-            # never the answer: a raise would report a landed write as failed, with no audit row.
-            try:
-                after, _reason = await self.fingerprint_bundle(cfg_dir)
-            except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
-                log.exception("connection flag written; its config fingerprint was not taken")
-                after = None
             if after is None:
                 # No digest of what is on disk now. The loaded one would read as a change at the
                 # next start, so the row records none and that start compares nothing.
@@ -2140,12 +2177,21 @@ class Engine:
         OSError is an unreadable file; ValueError is a VCS head that is not UTF-8
         (UnicodeDecodeError). Anything else, such as an ImportError of the fingerprint module, still
         raises. The reason is a :func:`safe_exc` rendering, logged here at WARNING."""
+        return await asyncio.to_thread(self.fingerprint_bundle_blocking, path)
+
+    def fingerprint_bundle_blocking(
+        self, path: Path
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """:meth:`fingerprint_bundle` for a caller already on a worker thread, under the same rule.
+
+        :meth:`set_connection_flag` takes its digests here while it holds the cross-process
+        config edit lock (vault BACKLOG #2782)."""
         from messagefoundry.config.fingerprint import config_fingerprint_detail
 
         try:
-            # A lambda, and not the bare function: the crypto inventory scanner follows a call it
-            # can see and not a function passed as a value, so this keeps the hash on its record.
-            return await asyncio.to_thread(lambda: config_fingerprint_detail(path)), None
+            # A direct call, so the crypto inventory scanner, which follows a call it can see,
+            # keeps the hash on its record.
+            return config_fingerprint_detail(path), None
         except (OSError, ValueError) as exc:
             reason = safe_exc(exc)
             log.warning("config fingerprint failed for %s: %s", path, reason)

@@ -118,7 +118,7 @@ async def test_release_drains_then_hands_back(engine: Engine, tmp_path: Path) ->
     assert await engine.store.in_pipeline_depth() == 0
     assert (outdir / "FBMSG1.hl7").exists()
     processed = await engine.store.list_messages(
-        channel_id="in_crit", status=MessageStatus.PROCESSED.value
+        channel_id="in_crit", status=MessageStatus.PROCESSED.value, allowed_channels=None
     )
     assert len(processed) == 1  # delivered exactly the once (idempotent outbound, no dup-drop)
     assert engine.dr_active is False  # the run-profile is latched off after a clean hand-back

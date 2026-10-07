@@ -11,9 +11,10 @@ list / show / upsert / rename / remove those tables. The on-disk authored format
 The writer mirrors the loader's rules **exactly** so a file it produces always loads: the first
 column is the lookup key, at least one value column is required, no duplicate keys, and a stem that
 collides with an existing ``.toml`` is rejected (the same ambiguity the loader fails loud on). The
-final authority is the loader itself — after an atomic, owner-only write, the candidate file is
-re-loaded via :func:`~messagefoundry.config.code_sets.load_code_set`; any failure rolls the prior
-content back (or unlinks a brand-new file), so a bad edit never lands.
+final authority is the loader itself — the new table is written to an owner-only candidate beside the
+live file and loaded via :func:`~messagefoundry.config.code_sets.load_code_set` BEFORE it replaces the
+live file, so a bad edit never touches it, and the write holds a cross-process lock
+(:mod:`messagefoundry.config.atomic_edit`, vault BACKLOG #2782).
 
 The post-write check is injected as a ``validate`` callback (so the CLI passes the *real* loader and
 this module stays trivially testable), exactly as ``connections_edit`` does. The name-safety,
@@ -27,14 +28,17 @@ import io
 import ntpath
 import os
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
+from messagefoundry.config import atomic_edit
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
     CodeSet,
     CodeSetError,
     UnmappedPolicy,
+    _policy_sidecar_path,
     is_policy_sidecar,
     load_code_set,
     load_code_sets,
@@ -52,8 +56,9 @@ def _policy_detail(policy: UnmappedPolicy) -> dict[str, Any]:
     return {"kind": policy.kind.value, "default_value": policy.default_value}
 
 
-#: Run after a write to prove the file loads; the CLI passes the real loader. It receives the written
-#: ``.csv`` path and raises on any problem (which triggers a rollback).
+#: Run before a write to prove the file loads; the CLI passes the real loader. It receives the
+#: CANDIDATE ``.csv`` (the live file's name, in a private directory beside it, with the policy sidecar
+#: copied next to it) and raises on any problem, which leaves the live file untouched.
 Validate = Callable[[Path], None]
 
 
@@ -129,9 +134,10 @@ def upsert_code_set(
 
     Validates the name (safety), the structure (>=1 value column, unique non-empty headers, no
     duplicate keys; a blank-key row carrying data is rejected, a fully-blank row dropped), and the
-    stem (no colliding ``.toml``) **before** writing. Writes atomically with owner-only perms, then re-loads the file via ``validate`` as the
-    final authority; on any failure the prior content is restored (or a brand-new file unlinked).
-    Raises :class:`WiringError` on bad input or a file that wouldn't load.
+    stem (no colliding ``.toml``) **before** writing. Loads an owner-only candidate via ``validate`` as
+    the final authority and only then replaces the live file, so on any failure the live file is
+    untouched (and a brand-new one never created). Raises :class:`WiringError` on bad input or a file
+    that wouldn't load.
 
     ``create`` distinguishes a *create*-flavored save from an *edit* (#240). When ``create`` is True
     the save refuses if **any** supported file already exists for the stem (a ``.csv`` OR ``.toml``) —
@@ -142,21 +148,22 @@ def upsert_code_set(
     emitted = _validate_rows(name, headers, rows)
     codesets_dir = _codesets_dir(config_dir)
     _validate_name(codesets_dir, name)
-    if create and _existing_path_or_none(codesets_dir, name) is not None:
-        # A create must not silently overwrite an existing code set — refuse loud (mirrors the wizard/
-        # form collision refusal, PR #1081). An edit (create=False) overwrites the same-stem .csv.
-        raise WiringError(_create_collision_message(name, codesets_dir))
-    _reject_toml_collision(codesets_dir, name)
-
     path = codesets_dir / f"{name}.csv"
-    # Capture prior content as BYTES so a rollback restores the file byte-for-byte (CSV line
-    # terminators are \r\n; a text round-trip through universal-newline translation would not).
-    original = path.read_bytes() if path.is_file() else None
-    text = _build_csv_text(headers, emitted)
-    _write_validated(path, text, original, validate)
+    codesets_dir.mkdir(parents=True, exist_ok=True)
+    # The existence checks sit inside the lock with the write, so a concurrent create of the same stem
+    # cannot pass the check between them.
+    with _directory_lock(codesets_dir):
+        if create and _existing_path_or_none(codesets_dir, name) is not None:
+            # A create must not silently overwrite an existing code set — refuse loud (mirrors the
+            # wizard/form collision refusal, PR #1081). An edit (create=False) overwrites the .csv.
+            raise WiringError(_create_collision_message(name, codesets_dir))
+        _reject_toml_collision(codesets_dir, name)
 
-    # The written file is now proven loadable; count its keys for the RESULT.
-    entries = len(_load_one(path))
+        text = _build_csv_text(headers, emitted)
+        _write_validated(path, text, validate)
+
+        # The written file is now proven loadable; count its keys for the RESULT.
+        entries = len(_load_one(path))
     return {"op": "upsert", "name": name, "format": "csv", "entries": entries}
 
 
@@ -180,29 +187,37 @@ def rename_code_set(
     # file in, contents intact. Kept after the empty-argument checks so the `--name is required`
     # wording still wins for an empty name (``_validate_name`` has its own, less specific message).
     _validate_name(codesets_dir, old)
-    src = _existing_path(codesets_dir, old)
+    _existing_path(codesets_dir, old)
     _validate_name(codesets_dir, new)
-    # For a rename, ANY supported file for the new stem is a collision (unlike upsert, which may
-    # overwrite the same-stem .csv).
-    if _existing_path_or_none(codesets_dir, new) is not None:
-        raise WiringError(_collision_message(new, codesets_dir))
+    # One lock for the directory covers both names, so a concurrent upsert or remove of either stem
+    # cannot land between the checks and the move (vault BACKLOG #2782). The source is looked up
+    # again under it, since it may have gone while this waited.
+    with _directory_lock(codesets_dir):
+        src = _existing_path(codesets_dir, old)
+        # For a rename, ANY supported file for the new stem is a collision (unlike upsert, which may
+        # overwrite the same-stem .csv).
+        if _existing_path_or_none(codesets_dir, new) is not None:
+            raise WiringError(_collision_message(new, codesets_dir))
 
-    dest = codesets_dir / f"{new}{src.suffix}"
-    # Referent pre-flight (#152): a code set is named by string literals in the Router/Handler modules
-    # that call code_set("old"). PLAN the referent rewrite BEFORE moving the file — the plan is built
-    # from the loaded graph while "old" still resolves (the loader would otherwise fail on a
-    # code_set("old") capture whose table just vanished). impact.py owns the tokenize-safe rewriter, so
-    # it is never duplicated here. Best-effort + additive: the file rename is the core operation, so a
-    # config that doesn't load leaves the result byte-identical to the pre-#152 shape.
-    plan = _plan_code_set_referents(config_dir, old, new)
-    os.replace(src, dest)
-    result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
-    if plan is not None:
-        from messagefoundry.config import impact
+        dest = codesets_dir / f"{new}{src.suffix}"
+        # Referent pre-flight (#152): a code set is named by string literals in the Router/Handler
+        # modules that call code_set("old"). PLAN the referent rewrite BEFORE moving the file — the
+        # plan is built from the loaded graph while "old" still resolves (the loader would otherwise
+        # fail on a code_set("old") capture whose table just vanished). impact.py owns the
+        # tokenize-safe rewriter, so it is never duplicated here. Best-effort + additive: the file
+        # rename is the core operation, so a config that doesn't load leaves the result
+        # byte-identical to the pre-#152 shape.
+        plan = _plan_code_set_referents(config_dir, old, new)
+        os.replace(src, dest)
+        result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
+        # The referent rewrite stays under the lock: a second rename planned between the move
+        # and the rewrite would read literals naming a table that is already gone.
+        if plan is not None:
+            from messagefoundry.config import impact
 
-        rewritten = len(impact.apply_rename(plan))
-        if rewritten:
-            result["referents_rewritten"] = rewritten
+            rewritten = len(impact.apply_rename(plan))
+            if rewritten:
+                result["referents_rewritten"] = rewritten
     return result
 
 
@@ -219,14 +234,19 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
     # The operator-supplied name is untrusted: a delete path must reject traversal (`../../x`, drive,
     # embedded ext) BEFORE building a filesystem path, or a `remove` could unlink any file on disk.
     _validate_name(codesets_dir, name)
-    path = _existing_path(codesets_dir, name)
-    # Delete pre-flight (#152): surface the live Router/Handler referents that will now dangle (a
-    # code_set("name") that no longer resolves). Computed BEFORE the unlink — while "name" still
-    # resolves — because the reverse index only builds a code_set edge for a *registered* table, so a
-    # reload after the file is gone would find no referrers. Mirrors the rename path (plan-before-move).
-    # Best-effort + additive: the delete is the core op, so an unloadable graph yields no referrers.
-    dangling = _code_set_referrers(config_dir, name)
-    path.unlink()
+    # Under the directory lock, so an upsert of the same stem cannot re-create it mid-remove
+    # (vault BACKLOG #2782).
+    _existing_path(codesets_dir, name)
+    with _directory_lock(codesets_dir):
+        path = _existing_path(codesets_dir, name)
+        # Delete pre-flight (#152): surface the live Router/Handler referents that will now dangle
+        # (a code_set("name") that no longer resolves). Computed BEFORE the unlink — while "name"
+        # still resolves — because the reverse index only builds a code_set edge for a *registered*
+        # table, so a reload after the file is gone would find no referrers. Mirrors the rename path
+        # (plan-before-move). Best-effort + additive: the delete is the core op, so an unloadable
+        # graph yields no referrers.
+        dangling = _code_set_referrers(config_dir, name)
+        path.unlink()
     result: dict[str, Any] = {"op": "remove", "name": name}
     if dangling:
         result["referrers"] = dangling
@@ -365,6 +385,15 @@ def _create_collision_message(name: str, codesets_dir: Path) -> str:
 
 def _codesets_dir(config_dir: str | Path) -> Path:
     return Path(config_dir) / CODESETS_DIR_NAME
+
+
+def _directory_lock(codesets_dir: Path) -> AbstractContextManager[None]:
+    """The cross-process edit lock for every code set in ``codesets_dir`` (vault BACKLOG #2782).
+
+    It is the CONFIG directory's lock, the one ``connections_edit`` takes, because the engine's
+    flag toggle holds it across two digests of the whole bundle, code sets included. Keyed on
+    the directory, never on an operator-supplied name, so no name can steer the lock file."""
+    return atomic_edit.edit_lock(codesets_dir, busy_error=WiringError)
 
 
 def _iter_code_set_files(codesets_dir: Path) -> list[Path]:
@@ -561,37 +590,18 @@ def _build_csv_text(headers: list[str], rows: list[list[str]]) -> str:
     return buf.getvalue()
 
 
-def _write_validated(path: Path, new_text: str, original: bytes | None, validate: Validate) -> None:
-    """Atomically write ``new_text``, run ``validate`` (the real loader), roll back on failure.
+def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
+    """Load ``new_text`` as a candidate via ``validate`` (the real loader), then replace ``path``.
 
-    ``original`` is the prior file's exact bytes (``None`` for a brand-new file); a rollback restores
-    them byte-for-byte, or unlinks a file that didn't exist before."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(path, new_text.encode("utf-8"))
-    try:
-        validate(path)
-    except BaseException:
-        if original is None:
-            path.unlink(missing_ok=True)
-        else:
-            _atomic_write(path, original)
-        raise
-    _secure_file(path)
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    # Write bytes verbatim (no newline translation) so CSV \r\n terminators survive a write/rollback.
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
-
-
-def _secure_file(path: Path) -> None:
-    # Owner-only permissions (defence in depth; a code set can carry sensitive mappings). Reuse the
-    # store's primitive, identical to connections_edit.
-    from messagefoundry.store.store import _secure_file as _secure
-
-    _secure(path)
+    The candidate carries the live file's name, so the loader reads the same code-set name and format,
+    and the ``<name>.policy.toml`` sidecar is copied beside it, so the candidate loads exactly as the
+    live file would, policy included. Bytes go out verbatim, so CSV ``\r\n`` terminators survive."""
+    atomic_edit.replace_validated(
+        path,
+        new_text.encode("utf-8"),
+        validate,
+        companions=(_policy_sidecar_path(path),),
+    )
 
 
 # --- #152 referent pre-flight composition ------------------------------------

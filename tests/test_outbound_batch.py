@@ -219,7 +219,7 @@ async def test_n_rows_one_envelope(store: Any) -> None:
     # store-wide cross-check they always were, no longer as the proof of completion.
     assert await _states(store, mids) == [DELIVERED] * 3
     depth, _ = await store.pending_depth(DEST)
-    assert depth == 0 and await store.count_dead() == 0
+    assert depth == 0 and await store.count_dead(allowed_channels=None) == 0
 
 
 # --- AC2: a crash mid-batch loses no message and reorders none -----------------------------------
@@ -235,7 +235,9 @@ async def test_crash_midbatch_no_loss_no_reorder(store: Any) -> None:
     assert depth == 0  # in flight, not pending
     await store.reset_stale_inflight()  # as if after a restart (recovered rows become due now)
     depth, _ = await store.pending_depth(DEST)
-    assert depth == 3 and await store.count_dead() == 0  # all three recovered, none lost
+    assert (
+        depth == 3 and await store.count_dead(allowed_channels=None) == 0
+    )  # all three recovered, none lost
     # Recovery has to RE-QUEUE them, not merely stop counting them as in flight (#1582).
     assert await _states(store, mids) == [QUEUED] * 3
 
@@ -255,7 +257,9 @@ async def test_crash_midbatch_no_loss_no_reorder(store: Any) -> None:
     _outcome, retry_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
     assert retry_until is not None  # rescheduled, not dead-lettered
     depth, _ = await store.pending_depth(DEST)
-    assert depth == 3 and await store.count_dead() == 0  # all three back, none lost
+    assert (
+        depth == 3 and await store.count_dead(allowed_channels=None) == 0
+    )  # all three back, none lost
     assert await _states(store, mids) == [QUEUED] * 3  # re-pended, not abandoned INFLIGHT
 
     # Slept out rather than claimed with a future `now`: the batch body claims the coalesced members
@@ -312,7 +316,7 @@ async def test_permanent_reject_deadletters_all(store: Any) -> None:
     head = await store.claim_next_fifo(DEST)
     _outcome, retry_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
     assert retry_until is None
-    assert await store.count_dead() == 3  # all three dead-lettered atomically
+    assert await store.count_dead(allowed_channels=None) == 3  # all three dead-lettered atomically
     # WHICH three: a count alone cannot say the dead rows are these messages' rows (#1582).
     assert await _states(store, mids) == [DEAD_LETTERED] * 3
     depth, _ = await store.pending_depth(DEST)
@@ -357,7 +361,7 @@ async def test_a_credential_fault_on_a_batch_stops_the_lane_and_keeps_every_row(
 
     assert outcome is wiring_runner._ItemOutcome.STOPPED
     assert retry_until is None
-    assert await store.count_dead() == 0  # nothing dead-lettered
+    assert await store.count_dead(allowed_channels=None) == 0  # nothing dead-lettered
     assert await _states(store, mids) == [QUEUED] * 3  # every member back PENDING, in place
     rows = [r for mid in mids for r in await store.outbox_for(mid)]
     assert [r["attempts"] for r in rows] == [0, 0, 0]  # the claim's attempt was given back
@@ -463,7 +467,7 @@ async def test_unparseable_head_dead_letters_not_strands(store: Any) -> None:
     await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
     assert rec.sent == []  # nothing framed/sent
     assert (
-        await store.count_dead() == 2
+        await store.count_dead(allowed_channels=None) == 2
     )  # both dead-lettered (CONTINUE policy), none stranded INFLIGHT
     # "None stranded INFLIGHT" named per id, which a zero depth cannot say on its own (#1582).
     assert await _states(store, mids) == [DEAD_LETTERED] * 2
@@ -815,7 +819,9 @@ async def test_completion_fault_repends_every_member_per_lane(
     finally:
         await _drain_worker(runner, worker)
     assert depth == 3  # the head (#1611) AND both coalesced members (#1579)
-    assert await store.count_dead() == 0  # a store fault is not the message's fault
+    assert (
+        await store.count_dead(allowed_channels=None) == 0
+    )  # a store fault is not the message's fault
     # The envelope did go out. At-least-once permits the re-send the recovery costs (ADR 0082);
     # exactly-once is explicitly NOT promised here.
     assert len(rec.sent) == 1 and "BTS|3" in rec.sent[0]
@@ -841,7 +847,7 @@ async def test_coalescing_fault_repends_the_claimed_extras_per_lane(
     finally:
         await _drain_worker(runner, worker)
     assert depth == 3
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
     assert rec.sent == []  # the fault landed before framing, so nothing was sent
 
 
@@ -867,5 +873,5 @@ async def test_completion_fault_repends_every_member_pooled(
         runner._stop.set()
         await dispatcher.stop()
     assert depth == 3
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
     assert len(rec.sent) == 1 and "BTS|3" in rec.sent[0]

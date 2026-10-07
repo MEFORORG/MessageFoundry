@@ -215,7 +215,7 @@ def build_ack(
     from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
 
     if code not in _CODES[AckMode.ORIGINAL]:
-        raise ValueError(f"unknown ack code {code!r} (expected AA, AE or AR)")
+        raise ValueError(f"unknown ack code {code!r} (expected one of AA/AE/AR)")
     timestamp = timestamp or hl7_now(with_offset=True)
     msa1 = _CODES[ack_mode if ack_mode is not AckMode.NONE else AckMode.ORIGINAL][code]
 

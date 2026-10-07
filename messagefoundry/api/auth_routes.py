@@ -125,6 +125,7 @@ from messagefoundry.auth.service import (
     FederatedBindingChanged,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
+    LastAdministratorRefused,
     NotifyEmailAlreadySet,
     TemporaryPasswordUnavailable,
     UsernameTaken,
@@ -292,7 +293,8 @@ def _federated_identity_view(user: UserRecord, service: AuthService) -> Federate
     """Project one account's federated binding for the console (BACKLOG #1143, ADR 0184 slice B).
 
     Sync, like :func:`_user_summary`, so the console never reads a ``UserRecord`` attribute itself.
-    Only the console's users:manage pages call it; no JSON route returns this view."""
+    The console's users:manage pages call it, and so does ``GET /users/{id}/federated-identity``
+    (BACKLOG #2331), so a JSON caller reads the same pair the console shows."""
     return FederatedIdentityView(
         user_id=user.id,
         username=user.username,
@@ -626,12 +628,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             if elevation.idp_step_up_required:
                 # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up
-                # at the IdP, which needs a browser redirect this JSON route cannot perform. Nothing
-                # was checked or charged, so the message names the leg that works.
+                # at the IdP, which needs a browser redirect this JSON route cannot perform. No
+                # credential was checked, though the per-actor ceremony budget above was drawn, so
+                # the message names the leg that works. The header is the one the step-up gates
+                # send such a session (BACKLOG #2158), so a client branches on it here too rather
+                # than parsing the detail. No X-Step-Up-Required: this is the step-up itself.
+                # Typed out because api/security.py keeps its constant private; a test pins the
+                # name and the value to what the gates send.
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
                     "this session was signed in through the identity provider; re-authenticate"
                     " there through the web console at /ui/reauth, not with a password",
+                    headers={"X-Step-Up-Via": "idp"},
                 )
             if elevation.directory_unconfirmed:
                 # BACKLOG #2027: the directory could not judge the password, so "failed" would
@@ -1099,20 +1107,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         current = await service.store.get_user(user_id)
         if current is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        if body.disabled and user_id == identity.user_id:
+        # The stored id, not the path's spelling: a store whose id column compares case-insensitively
+        # (SQL Server) finds the row from another spelling, and the console seam passes a plain str.
+        if body.disabled and current.id == identity.user_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot disable your own account")
-        # SEC-015: disabling is a lock-out path equivalent to stripping the admin role — apply the
-        # same last-admin guard the roles endpoint enforces, so an admin can't disable every other
-        # admin and erase the dual-admin safeguard. (is_last_enabled_admin only fires when the target
-        # IS the sole enabled admin, so this no-ops for non-admins and non-last admins.)
-        if (
-            "disabled" in body.model_fields_set
-            and body.disabled
-            and await service.is_last_enabled_admin(user_id)
-        ):
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "cannot disable the last administrator"
-            )
+        # SEC-015: disabling is a lock-out path equivalent to stripping the admin role, so it carries
+        # the same last-admin guard. The guard is inside service.update_user now, in one store
+        # transaction with the write (vault BACKLOG #2779); LastAdministratorRefused is mapped below.
         # PATCH is partial: only fields actually present in the body should change. Omitted
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
@@ -1140,6 +1141,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # Raised before any write, so this refuses the whole save. The message names the rule
             # and never echoes the value.
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except LastAdministratorRefused as exc:
+            # Ordinarily raised before any write. When a concurrent removal got past the service's
+            # early read, the profile edit has landed (audited, with disable_refused) and only the
+            # disable was refused; see AuthService.update_user.
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="updated")
 
     @app.delete("/users/{user_id}", response_model=SimpleMessage)
@@ -1148,15 +1154,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        if user_id == identity.user_id:
+        target = await service.store.get_user(user_id)
+        # Compared on the stored id as well as the path's, for the reason update_user gives.
+        if user_id == identity.user_id or (target is not None and target.id == identity.user_id):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot delete your own account")
-        if await service.store.get_user(user_id) is None:
+        if target is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        # SEC-015: deleting the last enabled admin is the same lock-out path — guard it for symmetry
-        # with the roles/disable endpoints (no-ops unless the target is the sole enabled admin).
-        if await service.is_last_enabled_admin(user_id):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot delete the last administrator")
-        await service.delete_user(user_id, actor=identity.username)
+        # SEC-015: deleting the last enabled admin is the same lock-out path. service.delete_user
+        # checks and deletes in one store transaction (vault BACKLOG #2779).
+        try:
+            await service.delete_user(user_id, actor=identity.username)
+        except LastAdministratorRefused as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="deleted")
 
     @app.delete("/users/{user_id}/sessions", response_model=SimpleMessage)
@@ -1186,17 +1195,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD users get roles from the AD-group map"
             )
-        if Role.ADMINISTRATOR.value not in body.roles and await service.is_last_enabled_admin(
-            user_id
-        ):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot remove the last administrator")
         # BACKLOG #315: promotion mints an approver exactly as creation does, so it pages too. Only a
         # GRANT pages: re-saving an existing Administrator's roles changes nothing.
         granted = (
             Role.ADMINISTRATOR.value in body.roles
             and Role.ADMINISTRATOR.value not in await service.store.get_user_role_ids(user_id)
         )
-        await service.set_roles(user_id, body.roles, actor=identity.username)
+        try:
+            # The last-administrator guard is inside, in one store transaction with the role write
+            # (vault BACKLOG #2779).
+            await service.set_roles(user_id, body.roles, actor=identity.username)
+        except LastAdministratorRefused as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         if granted:
             _alert_administrator_granted(
                 app, f"user:{user.username}", via="roles_changed", granted_by=identity.username
@@ -1332,10 +1342,33 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     # that refusal, never before it: while login still bound on first presentation, an unbind here
     # would have let the next login bind whatever subject then presented.
     #
-    # Action-bound, single-use and MFA-gated, like the password reset: which IdP identity may sign in
-    # as an account is an attribute that affects authentication (ASVS 7.5.1). The console leg (ADR
-    # 0184 slice B, /ui/users/{id}/federated-identity) calls both handlers BY REFERENCE through
-    # AdminHandlers, which skips the Depends below, so it re-asserts the same action-bound gate.
+    # The PUT and DELETE are action-bound, single-use and MFA-gated, like the password reset: which
+    # IdP identity may sign in as an account is an attribute that affects authentication (ASVS
+    # 7.5.1). The console leg (ADR 0184 slice B, /ui/users/{id}/federated-identity) calls those two
+    # handlers BY REFERENCE through AdminHandlers, which skips the Depends below, so it re-asserts the
+    # same action-bound gate. The GET (BACKLOG #2331) is JSON only; the console reads the same view
+    # through its own page.
+
+    @app.get("/users/{user_id}/federated-identity", response_model=FederatedIdentityView)
+    async def get_user_federated_identity(
+        user_id: ResourceId,
+        service: AuthService = Depends(_service),
+        _: Identity = Depends(require(Permission.USERS_MANAGE)),
+    ) -> FederatedIdentityView:
+        """The account's stored federated pair, as the console's federated-identity screen shows it
+        (BACKLOG #2331). A JSON caller reads it here and sends it back as ``expected_issuer`` and
+        ``expected_subject``. Before this route it had to guess, and each wrong guess was a 409
+        that spent the single-use grant.
+
+        Gated and audited like ``GET /users/{id}/channel-scope``: ``users:manage`` through
+        :func:`require`, whose ``auth.permission_granted`` row is the read's only audit row, and no
+        step-up, so it spends no grant. The console's page of the same pair asks for the step-up
+        window (``require_ui_step_up``) because it offers the link and unlink forms; this read
+        offers neither. 404 for an unknown user."""
+        user = await service.store.get_user(user_id)
+        if user is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        return _federated_identity_view(user, service)
 
     @app.put("/users/{user_id}/federated-identity", response_model=SimpleMessage)
     async def bind_user_federated_identity(

@@ -318,7 +318,7 @@ async def test_direct_edit_is_idempotent(store: MessageStore) -> None:
     # and exactly ONE correlated child message was minted
     children = [
         r
-        for r in await store.list_messages(limit=100)
+        for r in await store.list_messages(limit=100, allowed_channels=None)
         if r["id"] != origin and r["channel_id"] == "in1"
     ]
     assert len(children) == 1

@@ -23,13 +23,13 @@ from typing import Any
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_chosen
+from _ui_clients import create_local_user_chosen, held_totp_code
 from fastapi import Request, WebSocket
 
 import messagefoundry_webconsole._auth as ui_auth
 from messagefoundry.api import create_app
 from messagefoundry.api.security import client_ip
-from messagefoundry.auth import Role, totp
+from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -463,9 +463,8 @@ async def _enroll_totp(service: AuthService, username: str = "op") -> None:
     outcome = await service.login(username, PW)
     assert outcome.ok and outcome.token is not None
     enrollment = await service.begin_mfa_enrollment(identity)
-    confirmed = await service.confirm_mfa_enrollment(
-        identity, totp.totp(enrollment.secret), token=outcome.token
-    )
+    with held_totp_code(enrollment.secret) as code:  # no step boundary between code and check
+        confirmed = await service.confirm_mfa_enrollment(identity, code, token=outcome.token)
     assert confirmed.ok  # `.ok`: an Elevation is a frozen dataclass and always truthy
 
 
@@ -524,7 +523,9 @@ async def test_the_older_mfa_denial_rows_read_the_client_through_client_ip(
     An address check alone cannot see the inline read: both reads return the same peer today. With
     ``client_ip`` answering a value no transport reports, only a row written through it carries it.
     """
-    service = await _service(engine, require_mfa=True)
+    # The floor is off: _enroll_totp confirms at once on the session it signed in, which the
+    # login-to-MFA floor covers (BACKLOG #2389).
+    service = await _service(engine, require_mfa=True, mfa_verify_min_elapsed_seconds=0)
     await _add(service, "op", Role.OPERATOR)
     await _enroll_totp(service)
 
@@ -574,7 +575,8 @@ async def test_a_denial_behind_a_trusted_proxy_records_the_forwarded_client(
     """
     from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-    service = await _service(engine, require_mfa=True)
+    # The floor is off, as in the test above (BACKLOG #2389).
+    service = await _service(engine, require_mfa=True, mfa_verify_min_elapsed_seconds=0)
     await _add(service, "op", Role.OPERATOR)
     await _enroll_totp(service)
     # Any, as in tests/test_client_network_allowlist.py: uvicorn's typed ASGI signatures and

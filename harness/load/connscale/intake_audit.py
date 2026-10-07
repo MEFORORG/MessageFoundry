@@ -610,13 +610,13 @@ async def sweep_store(store: Any, *, row_cap: int) -> StoreSnapshot:
     diagnostic rather than a defect, and a live finding that the post-mortem does not reproduce is
     itself evidence about timing.
     """
-    total = int(await store.count_messages())
+    total = int(await store.count_messages(allowed_channels=None))
     if total > row_cap:
         return StoreSnapshot(frozenset(), total, truncated=True)
     ids: set[str] = set()
     offset = 0
     while offset < total:
-        rows = await store.list_messages(limit=_PAGE, offset=offset)
+        rows = await store.list_messages(limit=_PAGE, offset=offset, allowed_channels=None)
         if not rows:
             # Fewer rows than COUNT(*) promised. Report TRUNCATED rather than returning a short set
             # that would read as absence for every row the sweep never reached.

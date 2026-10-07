@@ -410,6 +410,34 @@ def _check_tls_ca_file(factory: str, value: Any, *, unread: str | None = None) -
         raise ValueError(f"{factory} tls_ca_file would never be read: {unread}.")
 
 
+def _check_tls_ca_pin(factory: str, pin: Any, ca: Any) -> None:
+    """Refuse a ``tls_ca_pin`` that is malformed or that nothing would check (vault BACKLOG #2371).
+
+    The pin is the SHA-256 of ``tls_ca_file``; ``auth/trust_anchors.py``, module item 9, says when
+    the engine checks it. A literal is refused here if it is blank or not a SHA-256 hex digest, so
+    ``messagefoundry check`` and a dry run catch it; an ``env()`` value is checked once it resolves.
+    With no ``tls_ca_file`` there is nothing to check, so the config would read as pinned while
+    nothing is. :meth:`Registry.dialling_pin_problems` refuses a pin whose hop never reads the CA,
+    once a token hop can no longer be composed on. Raises ``ValueError`` for the reason
+    :func:`_check_tls_ca_file` does."""
+    if pin is None:
+        return
+    if isinstance(pin, str):
+        from messagefoundry.auth.trust_anchors import TrustAnchorError, _normalize_pin
+        from messagefoundry.config.settings import refuse_a_blank_anchor_pin
+
+        refuse_a_blank_anchor_pin(pin, f"{factory} tls_ca_pin")
+        try:
+            _normalize_pin(pin)
+        except TrustAnchorError as exc:
+            raise ValueError(f"{factory} tls_ca_pin: {exc}") from exc
+    if ca is None or (isinstance(ca, str) and not ca.strip()):
+        raise ValueError(
+            f"{factory} tls_ca_pin is set without a tls_ca_file, so nothing would check it. It "
+            "pins the connection's tls_ca_file. Remove it, or set tls_ca_file"
+        )
+
+
 def _reject_envref_headers(factory: str, headers: Any) -> None:
     """Refuse an ``env()`` reference inside a ``headers`` table (BACKLOG #1649).
 
@@ -996,6 +1024,7 @@ def FhirLookup(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     # ADR 0153 decision 2 — the same per-connection cleartext declaration an outbound carries. It must
     # be authorable HERE: the read executor honours the pair, so leaving it to a hand-mutated
@@ -1066,6 +1095,7 @@ def FhirLookup(
     # does for an outbound, so the declaration cannot reach the read executor unvalidated.
     try:
         _check_tls_ca_file("FhirLookup", tls_ca_file)
+        _check_tls_ca_pin("FhirLookup", tls_ca_pin, tls_ca_file)
         _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
         _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
@@ -1080,6 +1110,7 @@ def FhirLookup(
         "timeout_seconds": timeout_seconds,
         "verify_tls": verify_tls,
         "tls_ca_file": tls_ca_file,
+        "tls_ca_pin": tls_ca_pin,
         "encoding": encoding,
     }
     # The cleartext and revocation declarations are NOT written into `settings`: they are the spec's
@@ -1731,7 +1762,7 @@ def MLLP(
     tls_ca_file: str
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
     tls_ca_pin: str
-    | None = None,  # INBOUND: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
+    | None = None,  # BOTH: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142, #2371)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
@@ -2734,6 +2765,7 @@ def Rest(
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the HTTP response body as a reply (ADR 0013)
     capture_response_headers: list[str]
@@ -2769,6 +2801,7 @@ def Rest(
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("Rest", headers)
     _check_tls_ca_file("Rest", tls_ca_file)
+    _check_tls_ca_pin("Rest", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists(
         "Rest",
         capture_response_headers=capture_response_headers,
@@ -2788,6 +2821,7 @@ def Rest(
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -2830,6 +2864,7 @@ def FHIR(
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the server reply / OperationOutcome (ADR 0013)
     capture_response_headers: list[str]
@@ -2883,6 +2918,7 @@ def FHIR(
         )
     _reject_envref_headers("FHIR", headers)
     _check_tls_ca_file("FHIR", tls_ca_file)
+    _check_tls_ca_pin("FHIR", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists(
         "FHIR",
         capture_response_headers=capture_response_headers,
@@ -2906,6 +2942,7 @@ def FHIR(
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -2932,6 +2969,7 @@ def Email(
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_verify: bool = True,  # verify the server cert (#323); False (dev only) needs the escape
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP server against (not a secret)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
@@ -2958,6 +2996,8 @@ def Email(
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""
     _reject_envref_in_lists("Email", recipients=recipients)
+    _check_tls_ca_file("Email", tls_ca_file)
+    _check_tls_ca_pin("Email", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.EMAIL,
         {
@@ -2971,6 +3011,7 @@ def Email(
             "use_tls": use_tls,
             "tls_verify": tls_verify,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
@@ -3001,6 +3042,7 @@ def Direct(
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) needs the escape
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP/HISP relay against
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
@@ -3033,6 +3075,8 @@ def Direct(
     the pinned ``cryptography`` exposes no OAEP alternative on ``PKCS7EnvelopeBuilder``, so this
     setting does not make the whole message OAEP-clean."""
     _reject_envref_in_lists("Direct", recipients=recipients)
+    _check_tls_ca_file("Direct", tls_ca_file)
+    _check_tls_ca_pin("Direct", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.DIRECT,
         {
@@ -3052,6 +3096,7 @@ def Direct(
             "use_tls": use_tls,
             "tls_verify": tls_verify,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
@@ -3085,7 +3130,7 @@ def DICOM(
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
     tls_ca_pin: str
     | EnvRef
-    | None = None,  # SCP: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
+    | None = None,  # SCP and SCU: SHA-256 of tls_ca_file; a mismatch refuses (#1142, #2371)
     tls_crl_file: str
     | EnvRef
     | None = None,  # opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
@@ -3206,6 +3251,7 @@ def DICOMweb(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the STOW-RS dicom+json response as a reply (ADR 0013)
     reingress_to: str
@@ -3247,6 +3293,7 @@ def DICOMweb(
         if verify_tls
         else "verify_tls=False verifies nothing, and DICOMweb has no token hop",
     )
+    _check_tls_ca_pin("DICOMweb", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists("DICOMweb", proxy_no_proxy=proxy_no_proxy)
     return ConnectionSpec(
         ConnectorType.DICOMWEB,
@@ -3260,6 +3307,7 @@ def DICOMweb(
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
@@ -3607,6 +3655,7 @@ def Soap(
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the SOAP response envelope as a reply (ADR 0013)
     capture_response_headers: list[str]
@@ -3670,6 +3719,7 @@ def Soap(
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("Soap", headers)
     _check_tls_ca_file("Soap", tls_ca_file)
+    _check_tls_ca_pin("Soap", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists(
         "Soap",
         capture_response_headers=capture_response_headers,
@@ -3689,6 +3739,7 @@ def Soap(
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -3794,9 +3845,11 @@ def Ftp(
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
-    # unless a hand-built spec sets tls_check_hostname=False.
+    # unless a hand-built spec sets tls_check_hostname=False. That key, and tls_verify=False, are
+    # refused outright when a username or password is set (vault BACKLOG #2636).
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     remote_dir: str | EnvRef,
@@ -3820,9 +3873,11 @@ def Ftp(
     destination (stdlib ``ftplib`` — no extra). Same poll/upload shape as :func:`Sftp`.
 
     Plain ``ftp`` transmits credentials in **cleartext**: supplying a ``username``/``password`` over
-    plain ``ftp`` is **refused** unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (use ``tls=True`` for FTPS,
-    or :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there. Put
-    secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
+    plain ``ftp`` is **refused** outright, with no escape (use ``tls=True`` for FTPS, or
+    :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there while
+    the server certificate is verified, name included: a hand-built spec that sets
+    ``tls_verify=False`` or ``tls_check_hostname=False`` with a ``username`` or ``password`` is
+    refused outright, with no escape (vault BACKLOG #2636). Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
     directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
     ``poll_max_files`` behave exactly as they do on :func:`Sftp`.
 
@@ -3831,6 +3886,7 @@ def Ftp(
     _check_tls_ca_file(
         "Ftp", tls_ca_file, unread=None if tls else "plain FTP (tls=False) builds no TLS context"
     )
+    _check_tls_ca_pin("Ftp", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -3839,6 +3895,7 @@ def Ftp(
             "port": port,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "username": username,
             "password": password,
             "remote_dir": remote_dir,
@@ -4400,6 +4457,7 @@ class OutboundConnection:
 # statically — Registry.port_collisions at validate/check/load (literal ports), inbound_binding_conflicts
 # (env-resolved + reserved-port aware) at the runner's start/reload — and the RegistryRunner also
 # classifies the runtime bind failure, so a conflict always names the connection(s) + the contended port.
+# A configured ``port = 0`` is never compared; see _EPHEMERAL_PORT.
 
 #: Connector types that bind a local listening port (so a port conflict is possible). File/Timer/
 #: Loopback/RemoteFile sources never bind a listening port. A DATABASE poll source carries a ``port``
@@ -4464,12 +4522,27 @@ def _hosts_overlap(a: str | None, b: str | None) -> bool:
     return a == b
 
 
+#: ``port = 0`` asks the OS to choose the port at bind time, so two listeners configured with it do
+#: not contend with each other, and treating the 0 as a concrete port refused a valid graph. Every
+#: comparison below therefore skips it; a non-zero pair is compared exactly as before. What this
+#: does NOT cover: the port the OS hands out is unknown until the bind, so a concrete-port listener
+#: that happens to name it is not caught here, and the runner's bind reports it as an ordinary
+#: EADDRINUSE conflict. This is the one statement of the rule; the docstrings below point here.
+_EPHEMERAL_PORT = 0
+
+
+def _ports_contend(port_a: int, port_b: int) -> bool:
+    """Whether two configured listener ports name the same socket port: equal and not ephemeral."""
+    return port_a == port_b and port_a != _EPHEMERAL_PORT
+
+
 def _binding_conflicts(bindings: list[_Binding]) -> list[tuple[_Binding, _Binding]]:
-    """Every pair of bindings sharing a port on overlapping interfaces, in declaration order."""
+    """Every pair of bindings sharing a non-ephemeral port on overlapping interfaces, in declaration
+    order."""
     out: list[tuple[_Binding, _Binding]] = []
     for i, a in enumerate(bindings):
         for b in bindings[i + 1 :]:
-            if a.port == b.port and _hosts_overlap(a.host, b.host):
+            if _ports_contend(a.port, b.port) and _hosts_overlap(a.host, b.host):
                 out.append((a, b))
     return out
 
@@ -4525,8 +4598,9 @@ def resolve_listener_binding(
 
 def bindings_overlap(host_a: str | None, port_a: int, host_b: str | None, port_b: int) -> bool:
     """Whether two resolved ``(host, port)`` listener bindings contend for the same socket. Hosts are
-    (re-)normalized defensively, so a caller may pass a raw reserved host (e.g. ``"0.0.0.0"``)."""
-    return port_a == port_b and _hosts_overlap(
+    (re-)normalized defensively, so a caller may pass a raw reserved host (e.g. ``"0.0.0.0"``). A
+    configured port 0 is skipped (:data:`_EPHEMERAL_PORT`)."""
+    return _ports_contend(port_a, port_b) and _hosts_overlap(
         _normalize_bind_host(host_a), _normalize_bind_host(host_b)
     )
 
@@ -4545,7 +4619,8 @@ def inbound_binding_conflicts(
     ports and the EFFECTIVE bind host (a connection's ``bind_address`` else the service ``bind_host``),
     and checks each listener against the ``reserved`` service bindings — each a ``(label, host, port)``,
     e.g. the engine's API listener — so an inbound that would steal the API's port is caught here rather
-    than as a bare bind failure. Returns ``[]`` when there is no conflict."""
+    than as a bare bind failure. A ``port = 0`` listener is skipped (:data:`_EPHEMERAL_PORT`).
+    Returns ``[]`` when there is no conflict."""
     listeners: list[_Binding] = []
     for conn in registry.inbound.values():
         binding = resolve_listener_binding(conn, bind_host=bind_host, env_values=env_values)
@@ -4924,8 +4999,36 @@ class Registry:
             except WiringError as exc:
                 yield str(exc)
         yield from self.encoding_problems()
+        yield from self.dialling_pin_problems()
         for port, first, second in self.port_collisions():  # low-13
             yield f"inbound connections {first!r} and {second!r} both bind port {port}"
+
+    def dialling_pin_problems(self) -> list[str]:
+        """A ``tls_ca_pin`` on a connection that dials out, whose hop never reads ``tls_ca_file``
+        (vault BACKLOG #2371). Such a pin reads as pinned while nothing checks it.
+
+        Here and not in the factories: a SMART or OAuth2 token hop, which reads the CA, is composed
+        onto a spec after its factory returns. The reasons are those of ``unread_ca_reason`` in
+        ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems`: an ``env()``
+        value reads as unknown, and the check after resolution refuses it then."""
+        from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
+
+        dialling = [
+            ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
+        ]
+        dialling += [
+            ("inbound connection", c.name, c.spec.settings)
+            for c in self.inbound.values()
+            if c.spec.type is ConnectorType.REMOTEFILE
+        ]
+        dialling += [("fhir lookup", s.name, s.settings) for s in self.fhir_lookups.values()]
+        problems: list[str] = []
+        for kind, name, settings in dialling:
+            if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
+                continue
+            if (unread := unread_ca_reason(settings)) is not None:
+                problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
+        return problems
 
     def port_collisions(self) -> list[tuple[int, str, str]]:
         """Inbound listeners that bind a shared literal port on overlapping interfaces, as
@@ -4939,7 +5042,8 @@ class Registry:
         port, and only an ``int`` literal is checkable (an ``EnvRef`` port resolves per environment —
         the runner's :func:`inbound_binding_conflicts` covers those, plus the reserved API port, at
         start/reload). A ``deployed=False`` inbound (#233, ADR 0111) is excluded: it never binds, so it
-        cannot collide — see :func:`resolve_listener_binding`, which excludes it on the resolved path."""
+        cannot collide — see :func:`resolve_listener_binding`, which excludes it on the resolved path.
+        A ``port = 0`` listener is skipped too (:data:`_EPHEMERAL_PORT`)."""
         bindings = [
             _Binding(conn.name, _normalize_bind_host(conn.bind_address), port)
             for conn in self.inbound.values()
@@ -7218,11 +7322,13 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
     # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
     # duplicate WiringError via add_inbound/add_outbound (no silent precedence).
     from messagefoundry.config.connections_file import (
-        CONNECTIONS_FILE_NAME,
+        connections_file_path,
         load_connections_file,
     )
 
-    conn_file = directory / CONNECTIONS_FILE_NAME
+    # The live file, or the candidate a `connections_edit` write is validating before it replaces the
+    # live one (vault BACKLOG #2782).
+    conn_file = connections_file_path(directory)
     if conn_file.is_file():
         load_connections_file(conn_file, registry)
     registry.validate(allow_empty=allow_empty)
@@ -8056,10 +8162,13 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     # *.py ones and the router/port checks below cover TOML-authored connections. Lazy import (cycle).
     from messagefoundry.config.connections_file import (
         CONNECTIONS_FILE_NAME,
+        connections_file_path,
         load_connections_file,
     )
 
-    conn_file = directory / CONNECTIONS_FILE_NAME
+    # The candidate a `connections_edit` write is validating, when this runs inside one (vault
+    # BACKLOG #2782), as `load_config` does.
+    conn_file = connections_file_path(directory)
     if conn_file.is_file():
         try:
             load_connections_file(conn_file, registry)

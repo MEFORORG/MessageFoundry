@@ -443,5 +443,5 @@ def test_the_step_is_last_survives_an_earlier_red_and_is_bounded() -> None:
     assert steps[-1] is step or steps[-1] == step
     assert "!cancelled()" in str(step["if"])
     # It runs after a pytest step that may have used its whole cap, so it must fit what the ubuntu
-    # job cap leaves: 43 - 31 leaves 12 minutes, about 5.5 of which setup already spends.
+    # job cap leaves: 46 - 34 leaves 12 minutes, about 5.5 of which setup already spends.
     assert step.get("timeout-minutes") == 5

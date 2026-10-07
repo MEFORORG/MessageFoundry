@@ -144,7 +144,7 @@ async def test_an_attachment_read_fault_re_pends_with_backoff_and_the_row_is_ret
 
     assert calls == [1]
     assert outcome is _ItemOutcome.PROCESSED and retry_until is not None
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
     assert await _status(store, mid) == OutboxStatus.PENDING.value
     assert sender.sent == []
     last_error, attempts = await _last_error_and_attempts(store, mid)
@@ -180,7 +180,7 @@ async def test_a_metadata_read_fault_re_pends_instead_of_dead_lettering(
     assert item is not None
     outcome, retry_until = await runner._process_delivery_item(DEST, item)
     assert outcome is _ItemOutcome.PROCESSED and retry_until is not None
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
     assert await _status(store, mid) == OutboxStatus.PENDING.value
     assert sender.sent == []
 
@@ -302,7 +302,7 @@ async def test_control_a_missing_attachment_is_still_a_retryable_delivery_error(
 
     assert outcome is _ItemOutcome.PROCESSED and retry_until is not None
     assert await _status(store, mid) == OutboxStatus.PENDING.value
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
     assert sender.sent == []
 
 
@@ -394,7 +394,7 @@ async def test_a_batch_member_read_fault_re_pends_the_batch_and_dead_letters_not
     outcome, retry_until = await runner._process_delivery_batch(DEST, head, cfg)
 
     assert outcome is _ItemOutcome.PROCESSED and retry_until is not None
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
     assert sender.sent == []
     assert await _status(store, first) == OutboxStatus.PENDING.value
     assert await _status(store, second) == OutboxStatus.PENDING.value

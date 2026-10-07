@@ -266,8 +266,8 @@ async def test_send_into_another_shards_pt_is_delivered(
         await _until(_delivered)
         assert "MSG2755" in collector.deliveries[0]
 
-        parents = await store.list_messages(channel_id="in_a")
-        children = await store.list_messages(channel_id="PT_X")
+        parents = await store.list_messages(channel_id="in_a", allowed_channels=None)
+        children = await store.list_messages(channel_id="PT_X", allowed_channels=None)
         assert len(parents) == 1 and len(children) == 1
 
         async def _settled() -> bool:

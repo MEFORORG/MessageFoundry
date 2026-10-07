@@ -44,6 +44,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_UNBOUND,
 )
 from messagefoundry.auth.service import (
+    DIRECTORY_OBJECT_ID_MISSING,
     FEDERATED_BINDING_CHANGED,
     FEDERATED_SUBJECT_NOT_BOUND,
     AuthService,
@@ -297,6 +298,12 @@ def _stub_exchange(monkeypatch: pytest.MonkeyPatch, id_token: str) -> list[dict[
 
 async def _audit_rows(store: MessageStore, action: str) -> list[Row]:
     return [a for a in await store.list_audit() if a["action"] == action]
+
+
+async def _refusal_reasons(store: MessageStore) -> list[str]:
+    """The ``reason`` of each ``auth.federated_bind_refused`` row, oldest first (BACKLOG #2331)."""
+    rows = await _audit_rows(store, "auth.federated_bind_refused")
+    return [json.loads(r["detail"])["reason"] for r in reversed(rows)]
 
 
 async def _oidc_login(
@@ -1679,6 +1686,18 @@ async def test_a_first_bind_losing_to_another_bind_is_the_changed_pair_refusal(
         assert after is not None and after.oidc_subject == "S-1-other", "the other bind was lost"
         for action in ("bound", "rebound", "unbound"):
             assert await _audit_rows(store, f"auth.federated_subject_{action}") == [], action
+        # BACKLOG #2331: the refusal itself is audited, with the pair the caller expected.
+        [refused] = await _audit_rows(store, "auth.federated_bind_refused")
+        assert refused["actor"] == "admin"
+        assert json.loads(refused["detail"]) == {
+            "user_id": user_id,
+            "issuer": "https://idp.example",
+            "subject": "S-1-mine",
+            "username": "jdoe",
+            "expected_issuer": None,
+            "expected_subject": None,
+            "reason": FEDERATED_BINDING_CHANGED,
+        }
         # Nothing written means nothing told and nobody signed out.
         assert notifier.events == []
         session = await store.get_session("t-jdoe")
@@ -1707,7 +1726,9 @@ async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
             await service.bind_federated_subject(
                 user_id, "S-1-new", expected_issuer=None, expected_subject=None, actor="admin"
             )
-        assert await _audit_rows(store, "auth.federated_bind_refused") == []
+        # BACKLOG #2331: the stale refusal is audited too, under its own reason. What matters here
+        # is that no row carries the directory-id reason the later check would have written.
+        assert await _refusal_reasons(store) == [FEDERATED_BINDING_CHANGED]
 
         with pytest.raises(DirectoryObjectIdMissing):
             await service.bind_federated_subject(
@@ -1717,7 +1738,10 @@ async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
                 expected_subject="S-1-legacy",
                 actor="admin",
             )
-        assert len(await _audit_rows(store, "auth.federated_bind_refused")) == 1
+        assert await _refusal_reasons(store) == [
+            FEDERATED_BINDING_CHANGED,
+            DIRECTORY_OBJECT_ID_MISSING,
+        ]
     finally:
         await store.close()
 
@@ -1788,18 +1812,24 @@ def _verified(
 
 
 async def _callback(
-    service: AuthService, *, flow_id: str | None = None, state: str | None = None
+    service: AuthService,
+    *,
+    flow_id: str | None = None,
+    state: str | None = None,
+    client: str = "127.0.0.1",
 ) -> LoginOutcome:
     """Drive the callback leg the way ``GET /ui/oidc/callback`` does: stage a flow, then redeem it."""
+    # The start leg comes from a different address, so a refusal row that recorded the staged
+    # flow's address instead of the callback's would fail an assertion on ``client``.
     staged_id, url = await service.begin_oidc_login(
-        client="127.0.0.1", public_origin="https://ops.example"
+        client="198.51.100.1", public_origin="https://ops.example"
     )
     staged_state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
     return await service.complete_oidc_login(
         flow_id=staged_id if flow_id is None else flow_id,
         state=staged_state if state is None else state,
         code=AUTH_CODE,
-        client="127.0.0.1",
+        client=client,
         public_origin="https://ops.example",
     )
 
@@ -1812,6 +1842,7 @@ async def _callback(
         ("not_bound", FEDERATED_SUBJECT_NOT_BOUND),
         ("not_in_directory", "not_in_directory"),
         ("idp_down", "idp_unavailable"),
+        ("claims", "bad_signature"),
     ],
 )
 async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
@@ -1820,7 +1851,11 @@ async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
     """The branches span both sides of the token exchange, which is the split #1947 is about.
 
     Exactly ONE pad per challenge: the callback's inner leg calls ``_authenticate_oidc`` and not the
-    public wrapper, so a second pad cannot stack inside the first."""
+    public wrapper, so a second pad cannot stack inside the first.
+
+    Every refusal row also records the client address (BACKLOG #2132): a spray of forged callbacks
+    shows as a run of these rows, and the operator needs its source. ``claims`` stands for every
+    ``ClaimsError`` reason, which share one arm."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap(None if branch == "not_in_directory" else PRINCIPAL)
@@ -1830,6 +1865,8 @@ async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
         def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
             if branch == "idp_down":
                 raise urllib.error.URLError("idp down")
+            if branch == "claims":
+                raise oidc.ClaimsError("bad_signature")
             return _verified("S-1-nobody" if branch == "not_bound" else DEFAULT_SUB)
 
         monkeypatch.setattr(service, "_exchange_and_validate", exchange)
@@ -1837,9 +1874,13 @@ async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
             service,
             flow_id="no-such-flow" if branch == "flow_unknown" else None,
             state="wrong-state" if branch == "state_mismatch" else None,
+            client="192.0.2.44",
         )
         assert not out.ok and out.reason == reason
         assert spy.seams == ["oidc"]
+        rows = await _audit_rows(store, "auth.login_failed")
+        rows += await _audit_rows(store, "auth.login_error")
+        assert rows and all(r["client"] == "192.0.2.44" for r in rows), rows
     finally:
         await store.close()
 

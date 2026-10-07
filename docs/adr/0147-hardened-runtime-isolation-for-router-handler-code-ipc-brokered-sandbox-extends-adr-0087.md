@@ -1,6 +1,9 @@
 # 0147 — Hardened runtime isolation for Router/Handler code: IPC-brokered sandbox (extends ADR 0087)
 
-- **Status:** Proposed  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Status:** **Accepted (2026-10-07) as a direction, with Amendment A.** The owner accepted it in
+  session on 2026-10-07, adding the two criteria in *Amendment A* below. **Code waits on the four
+  build questions under *To resolve on acceptance*,** which the acceptance did not answer. Vault
+  BACKLOG #3131 tracks the build. This line read *"Proposed"* until 2026-10-07.  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-21
 - **Related:** [ADR 0087](0087-sandbox-subprocess-isolation.md) (the subprocess worker this extends) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup` — the sanctioned reads to re-enable) · [ADR 0144](0144-security-lint-gate-over-admin-authored-router-handler-config.md) (the *static* half of the 15.2.5 defense) · HANDLER-CODE-SHARED-RESPONSIBILITY.md · ASVS risk-acceptance register (`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`) theme 6 (15.2.5) · BACKLOG #197 · CLAUDE.md §2 · the 2026-07-21 runtime-isolation research pass
 
@@ -99,6 +102,36 @@ egress/filesystem/imports), per platform.** Proposed (design only — no code in
 - **AC-5** — IF a confinement or broker fault occurs, THEN THE SYSTEM SHALL route the message to
   `ERROR`/dead-letter post-ACK (never NAK, never crash the connection).
 
+## Amendment A (2026-10-07) -- accepted with two added criteria
+
+**The owner accepted this ADR's direction on 2026-10-07, in session.** The question put was whether
+to accept OS confinement plus a parent-side lookup broker, with two additions, and the answer was
+*"Accept with additions"*. The additions came out of the adversarial reviews of
+[ADR 0187](0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md),
+which accepted a shared worker pool the same day.
+
+- **AC-6** -- THE SYSTEM SHALL tie every brokered `db_lookup`/`fhir_lookup` request to the dispatch
+  it belongs to, using the per-dispatch id the codec already binds, and SHALL scope the lookup to the
+  lane that dispatch serves. *Why:* a per-inbound worker gets lane scoping for free, but a pooled
+  worker (ADR 0187 option 1) serves many lanes, so without the tie a worker could ask on one lane's
+  behalf while serving another.
+- **AC-7** -- WHERE the worker is confined, THE SYSTEM SHALL deny it the right to open or signal its
+  parent process or any sibling worker. *Why:* this ADR's confinement was written about egress and
+  the filesystem and never about availability; the words *availab*, *kill*, *signal* and
+  *terminate* each had zero hits in it. A reviewer measured, on a stand-in, that an unconfined child
+  can kill its parent on both Windows and Linux, so a breached worker could stop the engine.
+
+**A reading from vault BACKLOG #1194 is narrower now.** That row said a broker validating against
+`[egress]` would pass unrestricted egress on the shipped default. `[egress].deny_by_default` defaults
+to `True` on `main` (`EgressSettings` in `messagefoundry/config/settings.py`). A broker validating
+against `[egress]` would therefore refuse unlisted destinations on the shipped default. The gap
+remains only where an operator sets the audited opt-out `[security].block_unlisted_outbound = false`.
+AC-2 should still say what the broker does there.
+
+**What the acceptance did not settle.** The four items under *To resolve on acceptance* stay open
+and gate the build. One addition belongs with them: the Windows AppContainer spawn must fit the
+suspended-start-then-join-job order vault BACKLOG #3065 introduces for the worker.
+
 ## Options considered
 
 1. **IPC request-broker + per-platform OS confinement — CHOSEN.** The only clean cross-platform
@@ -143,4 +176,6 @@ unresearched.
 - [ ] A **throughput benchmark** of the broker round-trip + confinement vs the ADR 0087 subprocess baseline.
 - [ ] Whether this ships as `[sandbox].mode=isolated` (a third mode above `subprocess`) or a sub-flag on
       `subprocess`.
+- [ ] (Added 2026-10-07, Amendment A.) How the AppContainer spawn fits the worker's suspended start and
+      kill-on-close job (vault BACKLOG #3065).
 - [ ] A **WASI / CPython-on-WASM feasibility spike** (C-extension deps, throughput) before re-scoring option 3.

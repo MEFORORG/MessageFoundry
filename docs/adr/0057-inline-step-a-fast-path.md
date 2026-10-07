@@ -35,7 +35,7 @@
 > the store's ~27–29k commits/s ceiling, **the whole Phase-4 premise is dead and we stop.**
 
 **Status:** Accepted (built, ships `default-OFF` **permanently**; the F2/F3 promote is **DECLINED** on the
-pre-registered A/B null -- see the banner above and [ADR 0107](0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)) · **Date:** 2026-06-30 · **Supersedes/Amends:** ADR 0001 (staged pipeline), builds on ADR 0055 (group-commit durable-write). **ADR number to use: 0057** (next free; 0056 is the highest present).
+pre-registered A/B null -- see the banner above and [ADR 0107](0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md); **G1 amended 2026-10-07** -- a `store.handoff` fault is INFRA, see the amendment at the end) · **Date:** 2026-06-30 · **Supersedes/Amends:** ADR 0001 (staged pipeline), builds on ADR 0055 (group-commit durable-write). **ADR number to use: 0057** (next free; 0056 is the highest present).
 
 This is the chosen design out of three candidates. It is the **smallest, default-OFF, byte-identical-when-OFF** lever that meaningfully cuts the 7-deep commit chain, and it survives adversarial review **with a fixed set of guardrails** (all of which are cheap, code-local, and verified against the checkout below). The two rejected alternatives and why are in *Consequences → Alternatives*.
 
@@ -66,6 +66,10 @@ The codebase already contains a **dormant, built, tested, all-three-backends-mir
 3. **Inlining the transform on the loop** (the originally-proposed "no `to_thread`, wall-clock budget" variant) re-opens **SEC-013/CWE-1322**: a post-hoc budget cannot stop the *first* ReDoS/O(n²) message from freezing the single loop for its full runtime.
 
 The guardrails below neutralize all three by **narrowing the eligible class** (single-handler, all-deliver, no-lookup), **keeping the `to_thread` hop**, and **moving the handoff call inside the inner try**.
+
+*Amended 2026-10-07: defect 2's concern was a Handler raise landing in the retry-forever slot, and G1 still sends
+that raise to the `internal_error` policy. The `handoff` call itself no longer sits inside the inner try; see
+"Amendment (2026-10-07)" at the end.*
 
 ---
 
@@ -102,6 +106,8 @@ If `inline_ok[name]` is False, the worker runs **today's** `claim_next_fifo(ingr
 ### Mandatory guardrails (from adversarial review — all required)
 
 - **G1 — handoff inside the inner try.** Wrap steps 2–6 in the **same** inner `try/except` that today guards `route_only` (`wiring_runner.py:1822–1875`), so a raise from `transform_one` *or* from `handoff` routes to the **internal_error policy** (`dead_letter_now` on CONTINUE / `mark_failed`+`connection_stopped` on STOP), exactly as the transform worker does at `:2064–2091` — **not** the outer retry-forever `except` at `:1896`.
+  *Amended 2026-10-07: G1 now covers Router and Handler code only. A `handoff` raise is an infrastructure fault and
+  re-pends the row; see "Amendment (2026-10-07)" at the end. The sentence above is kept as the original decision.*
 - **G2 — never call `handoff` with empty deliveries** (M-deliver). `handoff` lacks the `_maybe_finalize` that `transform_handoff` has (`:1445`), so a zero-delivery fused message would strand non-terminal. Filtering handlers take the split path (where `transform_handoff(deliveries=[])` → `_maybe_finalize` → `FILTERED`).
 - **G3 — single-handler only** (M-single) so partial-handler delivery loss is impossible (there is no sibling to lose) and the disposition passed to `handoff` (`ROUTED`) is always correct (the later `mark_done`→`_maybe_finalize` reaches `PROCESSED`).
 - **G4 — keep the `to_thread` hop.** `route_only` and `transform_one` run off the loop (SEC-013). The fusion saves the *handoff commits*, not the off-loop hop; the hop is **not** a commit. No wall-clock-budget inline-on-loop variant.
@@ -123,6 +129,8 @@ All seven, against the verified code. "Survives" / "held" are the adversary's ow
 
 **INV-3 — poison-guard (ADR 0055 AC-2), THE central tension.** C2 commits `attempts+1` (INFLIGHT) **standalone, before** any work; CF shares a rollback fate **only with itself**. So:
 - *Deterministic exception in `transform_one`/`handoff`:* caught by the inner try (**G1**) → `dead_letter_now` (CONTINUE) terminally dead-letters it immediately, or STOP halts the lane preserving the row — **no loop.**
+  *Amended 2026-10-07: this still holds for `transform_one`. For `handoff` it no longer does, and G6 does not take
+  its place; the amendment at the end states the bound that applies instead.*
 - *Deterministic process-crash (segfault/OOM) inside the work:* no exception to catch, but C2 already durably bumped `attempts`; `reset_stale_inflight` re-pends **without resetting attempts**; the next `claim_next_fifo` bumps again → attempts climbs monotonically. **Guardrail G6 (see residual risk):** because `mark_failed`'s ceiling (`:2813`) is consulted **only on the delivery lane**, the router worker must dead-letter a re-claimed ingress row once `item.attempts >= delivery_defaults.max_attempts` (when finite). This closes the crash-loop ceiling on the ingress lane. *Without G6 the loop is bounded only if a finite cap is wired and checked — see Residual Risk.*
 
 **INV-4 — off-loop purity / no txn across `to_thread`.** `route_only` and `transform_one` run via `asyncio.to_thread` (**G4**) with **no** connection held (**G5**); CF opens a fresh txn only after the thread returns; the row X-lock window is the brief DELETE+INSERTs, identical to today's `handoff`/`transform_handoff`. A slow/pathological body cannot freeze the loop, pin a pooled connection, or hold the FIFO-head lock. *Adversary: HOLDS if enforced (G4/G5).*
@@ -143,6 +151,7 @@ All seven, against the verified code. "Survives" / "held" are the adversary's ow
 
 **Alternatives rejected.**
 - *Design A "fuse claim+inline-work+handoff, run transform on-loop with a wall-clock budget"* — **rejected**: reopens SEC-013 (first ReDoS message freezes the loop before the post-hoc budget can fire) and moved transform failures into the retry-forever slot. The chosen design keeps the `to_thread` hop (G4) and fixes the error slot (G1).
+  *(Amended 2026-10-07: "fixes the error slot (G1)" now means the Handler raise only; see the amendment at the end.)*
 - *Design B "fold downstream claims by pre-seeding next-stage rows INFLIGHT-leased"* (remove C4/C6) — **viable but deferred**: adversary rated it *safe-with-guardrails* for the C4-only half, but it requires a combined `(INFLIGHT owner=me) OR (PENDING)` drain query to preserve FIFO, lease-epoch fencing, and re-homing the H2 skip-and-complete dedup for the C6 half. It is **complementary** to this ADR (it cuts claim *frequency*; this cuts stage *depth*) and is filed as the next increment. We ship the smaller, lower-risk lever first.
 
 ---
@@ -169,6 +178,8 @@ Ordered; default-OFF; byte-identical when OFF.
    - Compute `inline_ok[name]` at graph-build: `inbound.transform.inline AND self._lookup_executor is None AND self._fhir_lookup_executor is None AND ack_after==ingest`. Cache on the runner.
    - In **`_router_worker`** (`:1790`), after the C2 claim (`:1808`), branch on `inline_ok[name]`:
      - **Inline branch** — **inside the inner `try`** (extend the block that today closes at `:1875`, **G1**): `to_thread(route_only)` (`:1846` pattern) → if `len(names) != 1` **fall back** to `route_handoff`; else `to_thread(transform_one)` (`:2057` pattern, **no** lookup-runner ExitStack) → split `deliveries`/`pt`/`state` (`:2097–2099` pattern) → if `not deliveries OR state_ops OR pt_deliveries` **fall back** to `route_handoff`; else `await self.store.handoff(ingress_id=item.id, message_id=item.message_id, channel_id=name, deliveries=deliveries, disposition=MessageStatus.ROUTED)`; on success `self._work.set()` to wake delivery workers.
+       *Amended 2026-10-07: as built now, `route_only` and `transform_one` stay inside the inner `try`, and the `handoff` call
+       and its wakes run after it, so a store fault re-pends the row. See the amendment at the end.*
      - **G5 assert** — no open connection between C2 commit and the `handoff` call.
      - **G6** — before processing a re-claimed ingress item, if `delivery_defaults.max_attempts` is finite and `item.attempts >= max_attempts`, `dead_letter_now(item.id, "ingress attempts exhausted")` and `continue` (closes the hard-crash-loop ceiling on the ingress lane).
    - **Else branch** = today's `route_handoff` path verbatim.
@@ -217,3 +228,62 @@ All run on **SQLite + SQL Server + Postgres** (`handoff` exists in all three; th
 5. **Backend parity is asserted, not assumed.** SQLite routes `handoff` through the group committer (`_run_grouped`, `store.py:2461`); SQL Server commits directly. The test matrix runs all three legs; the SQL Server leg is PR-blocking.
 
 **Key files/lines (ground-truth):** `sqlserver.py` `handoff:1259` (hard-sets status, no `_maybe_finalize` :1287–1290), `transform_handoff:1346` (`_maybe_finalize` :1445), `route_handoff:1305`, `claim_next_fifo:2633`, `mark_failed:2795` (ceiling :2813, delivery-only), `reset_stale_inflight:2837` (no attempts touch :2856); `wiring_runner.py` `_router_worker:1790` (inner try :1822–1875, **`route_handoff` outside it at :1877**, outer retry-forever :1896), `_transform_worker` inner try :2026–2091 (handoff inside, :2100), lookup-executor gate :299–303/:885–886/:2051–2056.
+
+---
+
+## Amendment (2026-10-07) — G1 covers Router and Handler code only; a `store.handoff` fault is INFRA
+
+**Source.** ADR 0057 G1 amendment (2026-10-02 full review, decision 9), settled by the Manager's adversarial review
+of 2026-10-06 with a recommendation to narrow G1. The original G1 bullet and the INV-3 bullet above are kept as
+written; each carries a pointer here.
+
+**What changed.** The inline fast-path in `_process_ingress_item` (`pipeline/wiring_runner.py`, located by the
+`ADR 0057 inline Step-A fast-path` comment) still runs `route_only` and the inline `transform_one` inside the
+content `try`, so a Router or Handler raise still reaches the `internal_error` policy: dead-letter under CONTINUE,
+`mark_failed` plus `connection_stopped` under STOP. The fused `store.handoff` and the outbound wakes that depend on
+it now run **after** that `try`. A raise from the handoff propagates to the caller's fault arm, which re-pends the
+ingress row PENDING: `_repend_claimed_on_fault` on a per-lane worker (#1611), the ADR 0070 T17 head re-pend on a
+pooled lane. It is never dead-lettered as `router error`.
+
+**Why.** The original G1 put two failure classes in one slot. `transform_one` is the operator's Handler; a raise
+there is content and is deterministic for that payload. `store.handoff` is the store; a fault there is in the
+common case transient (a deadlock victim, a lock or pool-acquire timeout, a failover). Dead-lettering an
+already-ACKed, correctly transformed message on a transient store fault turns a self-healing condition into
+operator replay work, and its `router error` reason blames the Router for an infrastructure fault. Every other path
+already classifies the store write as INFRA: the split path's `route_handoff` and `transform_handoff` sit outside
+their content `try` (section 1, defect 2, records that `route_handoff` sits outside it; that defect's concern was a
+Handler raise reaching the retry slot, which amended G1 still prevents), and
+[ADR 0071](0071-cut-executor-round-trips-b5.md)'s fused path splits `route_exc` (CONTENT, to the `internal_error`
+policy) from `handoff_exc` (INFRA, re-raised to T17). The inline path was the only one of the four that treated a
+store fault as content.
+
+**What bounds a store fault that never clears. G6 does not.** The 2026-10-06 review text cited G6 as a bound;
+measured against the tree it is not one for this case, and is recorded here so nobody relies on it. Both fault arms
+re-pend through `reschedule_claimed`, which undoes the claim's `attempts` increment, so `attempts` does not climb
+across exception-path re-pends and G6 never fires. G6 still bounds the hard-crash shape it was written for
+(`reset_stale_inflight` leaves `attempts` alone). The bound that applies is the one the split path's
+`route_handoff` already lives with:
+
+- **pooled** (the default `claim_mode`): T17 counts the fault toward `infra_fault_stop_after` (default 10) and, under
+  `infra_fault_policy = "stop"` (the default), STOPs the lane with a `connection_stopped` alert, preserving the
+  message; under `retry_forever` it raises a throttled `lane_stuck` alert instead;
+- **per_lane**: the worker re-pends and retries at its fixed backoff (`_WORKER_ERROR_BACKOFF_SECONDS`) with no
+  ceiling, exactly as a failing `route_handoff` or `transform_handoff` does there. It raises no
+  `connection_stopped` alert, under either `internal_error` policy, and the ingress buildup check runs only after
+  a pass that succeeds, so the signal is the rate-limited worker fault log. Before this amendment a per_lane STOP
+  policy halted the lane and alerted on the first handoff fault.
+
+A store fault that is deterministic for one payload would therefore retry rather than dead-letter at once. That is
+the same exposure the split path accepts for the same payload, which `transform_handoff` writes. The case that
+matters is a Handler output the store can never write (for example one it cannot encode, or one over a backend
+length limit): it now holds its lane, under the bound above, where it used to dead-letter one message. No code
+classifies such an exception as content on either path; if one is wanted it belongs in the store, for both paths.
+
+**Unchanged.** G2 to G6, the eligibility predicate, the default-OFF status and the DO-NOT-PROMOTE banner. The
+`SandboxSessionClosed` arm (a dispatch that did not run) still re-raises past the `internal_error` policy.
+
+**Tests** (`tests/test_inline_fast_path.py`): `test_inline_handler_raises_dead_letters_via_internal_error_policy`
+and `test_inline_handler_raises_stop_policy_halts_lane` pin the unchanged Handler half;
+`test_inline_handoff_store_fault_repends_not_dead_lettered` (per_lane and pooled, under CONTINUE and STOP) pins the re-pend and the recovery
+to PROCESSED with one outbound row; `test_inline_persistent_handoff_store_fault_counts_toward_pooled_infra_stop`
+pins the pooled T17 bound.

@@ -251,7 +251,7 @@ async def test_error_and_event_detail_encrypted_at_rest_and_decrypt(tmp_path: Pa
         fetched = await store.get_message(mid)
         assert fetched is not None
         assert fetched["error"] == PHI_ERR
-        assert any(m["error"] == PHI_ERR for m in await store.list_messages())
+        assert any(m["error"] == PHI_ERR for m in await store.list_messages(allowed_channels=None))
         assert any(e["detail"] == PHI_ERR for e in await store.events_for(mid))
     finally:
         await store.close()
@@ -267,7 +267,7 @@ async def test_last_error_encrypted_at_rest_and_decrypts(tmp_path: Path) -> None
         await store.dead_letter_now(row["id"], PHI_ERR)
         at_rest = _raw_at_rest(db, column="last_error", table="queue")
         assert at_rest.startswith(MARKER_PREFIX) and "SECRET" not in at_rest
-        dead = await store.list_dead()
+        dead = await store.list_dead(allowed_channels=None)
         assert dead and dead[0]["last_error"] == PHI_ERR  # dead-letter view decrypts
         assert (await store.outbox_for(mid))[0]["last_error"] == PHI_ERR  # detail view decrypts
     finally:
@@ -327,7 +327,7 @@ async def test_summary_and_metadata_encrypted_at_rest_and_decrypt(tmp_path: Path
         # ...and decrypt on the detail + tracking-list read paths.
         rec = await store.get_message(mid)
         assert rec is not None and rec["summary"] == EF3_SUMMARY and rec["metadata"] == EF3_METADATA
-        listed = await store.list_messages()
+        listed = await store.list_messages(allowed_channels=None)
         assert any(m["summary"] == EF3_SUMMARY and m["metadata"] == EF3_METADATA for m in listed)
     finally:
         await store.close()
@@ -343,7 +343,7 @@ async def test_summary_in_dead_letter_view_decrypts(tmp_path: Path) -> None:
         [row] = await store.outbox_for(mid)
         await store.claim_ready()
         await store.dead_letter_now(row["id"], "boom")
-        dead = await store.list_dead()
+        dead = await store.list_dead(allowed_channels=None)
         assert dead and dead[0]["summary"] == EF3_SUMMARY  # dead-letter view decrypts summary
     finally:
         await store.close()
@@ -364,7 +364,7 @@ async def test_migration_encrypts_existing_summary_metadata(tmp_path: Path) -> N
     try:
         assert _raw_at_rest(db, column="summary").startswith(MARKER_PREFIX)  # migrated on disk
         assert _raw_at_rest(db, column="metadata").startswith(MARKER_PREFIX)
-        [m] = await encrypted.list_messages()
+        [m] = await encrypted.list_messages(allowed_channels=None)
         assert m["summary"] == EF3_SUMMARY and m["metadata"] == EF3_METADATA  # still readable
     finally:
         await encrypted.close()

@@ -49,6 +49,7 @@ from messagefoundry.pki import (
     read_soonest_crl_facts,
     soonest_crl,
 )
+from messagefoundry.redaction import log_timestamp
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings
@@ -568,7 +569,7 @@ def _judge_crl(
                 len(copies),
                 ", ".join(holders),
                 oldest.issuer,
-                oldest.next_update_iso,
+                log_timestamp(oldest.next_update_iso),
                 remedy,
             )
     except Exception:

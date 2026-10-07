@@ -54,6 +54,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 logger = logging.getLogger(__name__)
@@ -571,7 +572,7 @@ def judge_crl_bytes(
     if facts.expired:
         raise ValueError(
             f"{label} holds a CRL (issuer {facts.issuer!r}) that expired at "
-            f"{facts.next_update_iso} ({-facts.days_remaining} day(s) ago); an expired CRL "
+            f"{_crl_time(facts.next_update_iso)} ({-facts.days_remaining} day(s) ago); an expired CRL "
             "refuses EVERY peer certificate it judges, not only revoked ones. Refresh it, or "
             "remove it if a newer CRL for that issuer is already in the file"
         )
@@ -581,7 +582,7 @@ def judge_crl_bytes(
     if (first := crl_not_in_effect(blocks, now=now)) is not None:
         raise CrlNotInEffect(
             f"{label} holds a CRL (issuer {first.issuer!r}) that does not take effect until "
-            f"{first.this_update.isoformat()}, and no CRL from that issuer that is in effect now. "
+            f"{_crl_time(first.this_update)}, and no CRL from that issuer that is in effect now. "
             "Loaded now, it would refuse EVERY peer certificate it judges with 'CRL is not yet "
             "valid'. Give a CRL that is in effect now, or wait until then"
         )
@@ -593,7 +594,7 @@ def judge_crl_bytes(
             "fails with 'CRL is not yet valid'",
             label,
             early.issuer,
-            early.this_update.isoformat(),
+            _crl_time(early.this_update),
         )
     return facts, blocks
 
@@ -618,6 +619,16 @@ class CrlNotInEffect(ValueError):
 def crl_in_effect(block: CrlBlock, *, now: float, skew: float = CRL_CLOCK_SKEW_SECONDS) -> bool:
     """Whether ``block`` is in effect at ``now``, allowing ``skew`` seconds."""
     return block.this_update.timestamp() <= now + skew
+
+
+def _crl_time(when: datetime | str) -> str:
+    """:func:`messagefoundry.redaction.log_timestamp`, imported here at call time like this module's
+    other engine imports. ``isoformat()`` is the obvious spelling and the wrong one: the PHI date
+    pass reads an ISO date-time as a possible date of birth (vault BACKLOG #2784), so the time a CRL
+    takes effect or lapses would reach the log redacted."""
+    from messagefoundry.redaction import log_timestamp
+
+    return log_timestamp(when)
 
 
 def crl_not_in_effect(
@@ -729,9 +740,12 @@ def warn_hostname_check_off(*, connector: str, name: str, host: str) -> None:
     sibling of ``tls_allow_expired`` (:func:`relax_verify_expiry`) and is treated the same way: a
     WARNING at every construction, an advisory ``messagefoundry check`` line, and a
     ``security_loosenings()`` entry. It is NOT refused under ``[security].enforcement = enforce``,
-    because ``tls_allow_expired`` is not either. CORRECTED (ASVS 12.3.2 re-read, 2026-10-01): before
-    this, the MLLP, FTPS, Email and Direct hops accepted it with no line at all, which the owner's
-    answer to vault #2006 calls a silent weakening.
+    because ``tls_allow_expired`` is not either. A credentialed Email, Direct or FTPS hop never
+    reaches this line: they refuse the name check off outright, with no escape, when they carry a
+    login credential (BACKLOG #1314; vault BACKLOG #2636 for FTPS). The ``[alerts]`` SMTP sink
+    exposes no name-check setting, so it does not reach this line either. CORRECTED (ASVS 12.3.2 re-read, 2026-10-01):
+    before this, the MLLP, FTPS, Email and Direct hops accepted it with no line at all, which the
+    owner's answer to vault #2006 calls a silent weakening.
 
     ``connector`` is the operator-recognisable cell (``"MLLP destination"``), ``name`` the connection
     name (``""`` where the build has none), ``host`` the peer. Never a credential or a body. Call it
@@ -898,7 +912,7 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     if non_fs:
         raise ValueError(
             "tls_ciphers must resolve to forward-secret (EC)DHE suites only (ASVS 11.6.2); "
-            f"these admit a non-forward-secret key exchange: {', '.join(non_fs)}"
+            f"these admit a non-forward-secret key exchange: {':'.join(non_fs)}"
         )
     # BACKLOG #1317. Forward secrecy was historically the ONLY property checked here, and it is not
     # sufficient: ECDHE-RSA-NULL-SHA (forward-secret, authenticated, PLAINTEXT) and
@@ -907,13 +921,13 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     if plaintext:
         raise ValueError(
             "tls_ciphers must resolve to suites that ENCRYPT (ASVS 12.1.2); these are NULL ciphers "
-            f"and would transmit plaintext: {', '.join(plaintext)}"
+            f"and would transmit plaintext: {':'.join(plaintext)}"
         )
     anonymous = sorted({str(c.get("name", "?")) for c in resolved if not _is_peer_authenticated(c)})
     if anonymous:
         raise ValueError(
             "tls_ciphers must resolve to suites that authenticate the peer (ASVS 12.1.2); these are "
-            f"anonymous key exchanges and are trivially intercepted: {', '.join(anonymous)}"
+            f"anonymous key exchanges and are trivially intercepted: {':'.join(anonymous)}"
         )
     # BACKLOG #1166. The fourth property, and the one the other three cannot see (_is_strong_enough
     # explains why). Placed before the allow-list so the reason an operator gets is the strength, not
@@ -924,7 +938,7 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     if weak:
         raise ValueError(
             f"tls_ciphers must resolve only to suites of at least {_MIN_TLS_STRENGTH_BITS} bits of "
-            f"security (ASVS 11.2.3); these are rated below it: {', '.join(weak)}. A truncated "
+            f"security (ASVS 11.2.3); these are rated below it: {':'.join(weak)}. A truncated "
             "authentication tag weakens a suite whose cipher and key length look fine."
         )
     # BACKLOG #2106. A directive changes no suite name, so every check above passes it, and
@@ -935,7 +949,7 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     if directives:
         raise ValueError(
             f"tls_ciphers must name cipher suites only; it carries the OpenSSL directive(s) "
-            f"{', '.join(directives)}. A directive changes how OpenSSL applies the list, not which "
+            f"{':'.join(directives)}. A directive changes how OpenSSL applies the list, not which "
             "suites it holds, so the checks here cannot see it, and @SECLEVEL=0 lets a peer present "
             "an RSA-1024 certificate that the default security level refuses (BACKLOG #2106). "
             "Remove each directive and list the suite names only."
@@ -954,7 +968,7 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     if unlisted:
         raise ValueError(
             "tls_ciphers must resolve only to suites on the approved list (ASVS 12.1.2, BACKLOG "
-            f"#1317); these are not on it: {', '.join(unlisted)}. The list is AEAD-only and excludes "
+            f"#1317); these are not on it: {':'.join(unlisted)}. The list is AEAD-only and excludes "
             "the CBC-SHA2 suites the interpreter default enables, and since owner ruling R4 of "
             "2026-09-26 (BACKLOG #2042) the AES-128-GCM suites too; widening it for a legacy peer is a "
             "deliberate change to _APPROVED_TLS_SUITES, not a configuration override."
@@ -999,7 +1013,7 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     if non_fs:
         raise ValueError(
             f"{connector}: the TLS context would negotiate non-forward-secret suite(s) "
-            f"{', '.join(non_fs)} (ASVS 12.1.2). Forward secrecy is required on every hop; a suite "
+            f"{':'.join(non_fs)} (ASVS 12.1.2). Forward secrecy is required on every hop; a suite "
             f"list that admits static RSA/DH key exchange lets a future key compromise decrypt "
             f"recorded PHI traffic."
         )
@@ -1071,14 +1085,14 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     if plaintext:
         raise ValueError(
             f"{connector}: the TLS context would negotiate NULL-cipher suite(s) "
-            f"{', '.join(plaintext)} (ASVS 12.1.2), which transmit plaintext. A NULL cipher is "
+            f"{':'.join(plaintext)} (ASVS 12.1.2), which transmit plaintext. A NULL cipher is "
             f"forward-secret and authenticated, so the forward-secrecy check above cannot see it."
         )
     anonymous = sorted({str(c.get("name", "?")) for c in resolved if not _is_peer_authenticated(c)})
     if anonymous:
         raise ValueError(
             f"{connector}: the TLS context would negotiate anonymous suite(s) "
-            f"{', '.join(anonymous)} (ASVS 12.1.2), which authenticate no peer and are trivially "
+            f"{':'.join(anonymous)} (ASVS 12.1.2), which authenticate no peer and are trivially "
             f"intercepted."
         )
     # BACKLOG #1166, ASVS 11.2.3. Same move again: an inherited property becomes a checked one. The
@@ -1089,7 +1103,7 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     if weak:
         raise ValueError(
             f"{connector}: the TLS context would negotiate suite(s) below "
-            f"{_MIN_TLS_STRENGTH_BITS} bits of security (ASVS 11.2.3): {', '.join(weak)}. Forward "
+            f"{_MIN_TLS_STRENGTH_BITS} bits of security (ASVS 11.2.3): {':'.join(weak)}. Forward "
             f"secrecy, encryption and peer authentication all hold for these, so none of the checks "
             f"above can see them."
         )
@@ -1717,7 +1731,7 @@ def _hold_to_approved_list(ctx: ssl.SSLContext, *, connector: str, hop: str) -> 
     if not tls12 or unlisted:
         raise ValueError(
             f"{connector}: {hop} is not narrowed to the approved list (ASVS 12.1.2, BACKLOG "
-            f"#300). TLS 1.2 suites: {len(tls12)}. Unlisted: {', '.join(unlisted) or 'none'}."
+            f"#300). TLS 1.2 suites: {len(tls12)}. Unlisted: {':'.join(unlisted) or 'none'}."
         )
 
 
@@ -3098,7 +3112,7 @@ def smtp_login_approved(
         # on the instance and still be refused here -- remediation advice resting on a false premise.
         raise InsecureHopRefused(
             f"{cell}: refusing SMTP authentication over an unencrypted channel. The approved mechanisms "
-            f"({', '.join(APPROVED_SMTP_AUTH_MECHANISMS)}) send the password, so authenticating "
+            f"({'/'.join(APPROVED_SMTP_AUTH_MECHANISMS)}) send the password, so authenticating "
             "without TLS would put it on the wire in clear -- which is why the mechanism restriction "
             "and this refusal ship together. Enable STARTTLS for this connection, or drop the "
             "username/password to send unauthenticated. There is no escape for this one: it is the "
@@ -3113,7 +3127,7 @@ def smtp_login_approved(
     if not usable:
         raise InsecureHopRefused(
             f"{cell}: the server offers AUTH {advertised or '(none)'}, none of which is approved here "
-            f"({', '.join(APPROVED_SMTP_AUTH_MECHANISMS)}). CRAM-MD5 is an HMAC over MD5 and is "
+            f"({'/'.join(APPROVED_SMTP_AUTH_MECHANISMS)}). CRAM-MD5 is an HMAC over MD5 and is "
             "refused (ASVS 11.4.1; Appendix C marks MD5 disallowed)."
         )
     # THE AUTH OBJECTS READ THESE OFF THE CONNECTION, and omitting them fails only against a real

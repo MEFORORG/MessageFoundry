@@ -483,7 +483,11 @@ async def test_verify_mfa_reanchors_session_to_the_new_ip(
     an MFA-required admin who roamed clears the new-IP signal with one credential proof, not two."""
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        # The login-to-MFA floor is off: this enrols on the session it just signed in, which the floor
+        # covers (BACKLOG #2389), and the test is about the re-anchor, not the floor.
+        service = AuthService(
+            store, AuthSettings(admin_new_ip_step_up=True, mfa_verify_min_elapsed_seconds=0)
+        )
         admin = await create_admin(service)
         out = await service.login(admin.username, admin.password, client="10.1.1.1")
         assert out.ok and out.identity is not None and out.token is not None

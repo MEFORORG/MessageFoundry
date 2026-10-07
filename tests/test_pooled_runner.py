@@ -238,7 +238,7 @@ async def test_pooled_sqlite_end_to_end_smoke(store: MessageStore, tmp_path: Pat
         assert len(collector.deliveries) == 1
 
         async def _processed() -> bool:
-            msgs = await store.list_messages()
+            msgs = await store.list_messages(allowed_channels=None)
             return len(msgs) == 1 and msgs[0]["status"] == MessageStatus.PROCESSED.value
 
         await _until(_processed)

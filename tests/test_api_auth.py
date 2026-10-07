@@ -350,7 +350,11 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
     # factor must NOT be locked out — the enroll/confirm routes are gated by an action-bound PASSWORD
     # step-up, never by the MFA gate, so there is no chicken-and-egg deadlock. Drive the whole escape
     # path end-to-end under the DEFAULT settings and confirm the admin ends up MFA-enrolled + satisfied.
-    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))  # require_mfa on
+    # require_mfa on. The login-to-MFA floor is off, since the confirm below runs at once on the
+    # session it signed in and the floor covers it (BACKLOG #2389); the floor has its own suite.
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         lr = (await _login(c, "adm")).json()
@@ -378,6 +382,53 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         # marked the session second-factor-satisfied — the session is now usable. No lockout occurred.
         status = (await c.get("/me/mfa", headers=_auth(tok))).json()
         assert status["enabled"] is True and status["required"] is True
+
+
+async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_code(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2389, at the route. The floor's refusal must reach the caller exactly as a wrong code
+    # does, a 400 "invalid code", or the status would tell a script about timing. The route spends
+    # its single-use password step-up before the service runs, so the retry needs a fresh one, which
+    # is what docs/SECURITY.md says. The service-level cases are in test_second_step_time_floors.py.
+    #
+    # A 30 s floor on the real clock, rather than a faked one held just inside 1 s: a session whose
+    # clock steps BACK behind its own stamps is ended, so the clock here only ever moves forward.
+    floor = 30.0
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=floor, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        # The TOTP clock is pinned, so one code stays good across the re-proofs below however slow
+        # the runner is. Strict skew 0 would otherwise fail it at a 30 s step boundary.
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        good = totp.totp(secret, now=t0)
+
+        early = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
+        assert (early.status_code, early.json()) == (400, {"detail": "invalid code"})
+        retry = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
+        assert retry.status_code == 403 and retry.headers.get("X-Step-Up-Required") == "1"
+
+        # Past the floor: a genuinely wrong code gets the very answer the early good code got.
+        monkeypatch.setattr(
+            "messagefoundry.auth.service.time",
+            SimpleNamespace(time=lambda: time.time() + floor, monotonic=time.monotonic),
+        )
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        wrong = str((int(good) + 1) % 1_000_000).zfill(6)
+        refused = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": wrong})
+        assert (refused.status_code, refused.json()) == (early.status_code, early.json())
+
+        # CONTROL: the same good code now activates MFA, so the early refusal spent no TOTP step.
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        served = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
+        assert served.status_code == 200 and served.json()["recovery_codes"]
 
 
 async def test_security_events_feed_payload_is_phi_free(engine: Engine) -> None:
@@ -1413,7 +1464,13 @@ async def test_require_paced_inherits_the_mfa_access_gate(engine: Engine) -> Non
     # the gate: once the second factor is satisfied, the paced route passes while the step-up route
     # keeps demanding a fresh password proof. Pinning it there keeps the original intent testable
     # instead of deleting the coverage.
-    service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
+    # The floor is off: the confirm below runs at once on the signed-in session (BACKLOG #2389).
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=True, mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False
+        ),
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)  # second factor not enrolled
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
@@ -2337,7 +2394,10 @@ async def test_disabling_the_LAST_second_factor_is_a_400_not_a_500(
     ``/me/mfa/confirm`` route already mapped ValueError to 400; this one did not, so adding the guard
     without touching the route would have turned a refusal into an internal error.
     """
-    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
+    # The floor is off: the confirm below runs at once on the signed-in session (BACKLOG #2389).
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]

@@ -87,6 +87,8 @@ from messagefoundry.api.header_floor import (
     hsts_notable,
     refuse_websocket,
 )
+from messagefoundry.api.message_scope import audit_channel_denied as _audit_channel_denied
+from messagefoundry.api.message_scope import get_scoped_message, read_scoped_message
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
     MetricsHistory,
@@ -257,6 +259,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
+    make_lane_anchor_check,
     make_registry_anchor_preflight,
     make_settings_anchor_preflight,
     run_anchor_preflight,
@@ -2041,24 +2044,6 @@ async def _guard_resubmission(
     raise HTTPException(_INGRESS_GUARD_STATUS[phase], reason)
 
 
-async def _audit_channel_denied(
-    engine: Engine, identity: Identity, channel: str | None, client: str | None = None
-) -> None:
-    """Audit a per-channel RBAC denial (mirrors auth.permission_denied).
-
-    ``client`` (ADR 0150) is the caller's address — a denial is exactly the record an investigator
-    wants a host for. It is OPTIONAL because this helper is also handed to the console seam as a bare
-    callback (``audit_channel_denied=``), which has no request in hand; there it stays NULL rather than
-    inheriting some other caller's address."""
-    await engine.store.record_audit(
-        "auth.channel_denied",
-        actor=identity.username,
-        channel_id=channel,
-        detail=json.dumps({"channel": channel}),
-        client=client,
-    )
-
-
 async def _record_control_audit(
     engine: Engine,
     identity: Identity,
@@ -2156,6 +2141,8 @@ async def _run_connection_test(
         )
 
     try:
+        # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
+        await rr.check_test_anchor(name)
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
@@ -3449,6 +3436,7 @@ def create_app(
         want_out = role in (None, "destination")
         if rr is not None and want_in and name in rr.registry.inbound:
             await _control_guard(engine, identity, name, client)
+            anchor_refused = False
             try:
                 if action == "start":
                     await rr.start_inbound(name)
@@ -3461,6 +3449,16 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
+            except TrustAnchorError:
+                # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
+                # and logged why. Raised below, outside this handler, so the refusal, which names
+                # the CA's path and SHA-256, is not left on the 409's __context__.
+                anchor_refused = True
+            if anchor_refused:
+                await _record_control_audit(
+                    engine, identity, name, action, role="source", running=False, client=client
+                )
+                raise HTTPException(409, _ANCHOR_REFUSED_DETAIL)
             running = rr.inbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="source", running=running, client=client
@@ -5019,15 +5017,10 @@ def create_app(
 
         async def _iter_ndjson() -> AsyncIterator[bytes]:
             for mid in selected:
-                row = await engine.store.get_message(mid)
-                if row is None:
-                    continue
                 # Per-row channel scope on EVERY streamed body (load-bearing for the ids path); an
                 # out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors get_message).
-                if not identity.can_access_channel(row["channel_id"]):
-                    await _audit_channel_denied(
-                        engine, identity, row["channel_id"], client_ip(request)
-                    )
+                row = await read_scoped_message(engine, identity, mid, request)
+                if row is None:
                     continue
                 yield _export_ndjson_line(row)
 
@@ -5129,13 +5122,9 @@ def create_app(
         whole-value mask on the error-tier text: the message's ``error``, each delivery's
         ``last_error`` and each event's ``detail``. Left out, those come back as a fixed mask. Both
         flags only lift a mask; a caller without ``messages:view_summary`` still gets nulls."""
-        row = await engine.store.get_message(message_id)
         # 404 (not 403) when the message is outside the caller's channel scope — don't reveal that a
         # message exists in another tenant's channel (per-channel RBAC).
-        if row is None or not identity.can_access_channel(row["channel_id"]):
-            if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
-            raise HTTPException(404, f"no such message: {message_id}")
+        row = await get_scoped_message(engine, identity, message_id, request)
         # Opening a message is PHI access even without its body: status, errors, deliveries and events
         # can carry identifiers, and a revealed summary does. record_view writes the `viewed` event
         # for the per-message timeline FIRST, so the events this open returns include it. The
@@ -5271,12 +5260,8 @@ def create_app(
         recorded: AuditedBodySurface = (
             "console" if (_matched_route_path(request) or "").startswith("/ui/") else surface
         )
-        row = await engine.store.get_message(message_id)
         # 404 (not 403) outside the caller's channel scope, mirroring get_message.
-        if row is None or not identity.can_access_channel(row["channel_id"]):
-            if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
-            raise HTTPException(404, f"no such message: {message_id}")
+        row = await get_scoped_message(engine, identity, message_id, request)
         # Audit BEFORE the body leaves: record_view for the per-message timeline, and a dedicated
         # action in the tamper-evident chain so a body read never collapses into a message_view row.
         await engine.store.record_view(message_id, actor=identity.username)
@@ -5318,13 +5303,9 @@ def create_app(
         Every download is audited (``record_view`` + an
         ``attachment_download`` row in the tamper-evident chain, docs/PHI.md §6) BEFORE the bytes leave.
         The document bytes/base64 are **never logged**."""
-        row = await engine.store.get_message(message_id)
         # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
         # channel (per-channel RBAC), mirroring get_message.
-        if row is None or not identity.can_access_channel(row["channel_id"]):
-            if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
-            raise HTTPException(404, f"no such message: {message_id}")
+        row = await get_scoped_message(engine, identity, message_id, request)
         # SECURITY CRUX: only serve an attachment that is LINKED to this message. Content-addressing
         # shares one physical blob across messages/tenants, so the linkage + the channel guard above are
         # what scope access — a guessed content address unlinked to an in-scope message is a 404.
@@ -5417,13 +5398,9 @@ def create_app(
         request the reveal act only for a ``view_summary`` holder. Minting refuses a custom role
         holding ``view_raw`` alone and no built-in role has that shape, so this is the second line;
         such a caller gets a null ``body``, the same answer as a caller without ``view_raw``."""
-        row = await engine.store.get_message(message_id)
         # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
         # channel (per-channel RBAC), mirroring get_message.
-        if row is None or not identity.can_access_channel(row["channel_id"]):
-            if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
-            raise HTTPException(404, f"no such message: {message_id}")
+        row = await get_scoped_message(engine, identity, message_id, request)
         captured = await engine.store.correlate_response(message_id)
         include_body = identity.has(Permission.MESSAGES_VIEW_RAW) and identity.has(
             Permission.MESSAGES_VIEW_SUMMARY
@@ -5482,13 +5459,9 @@ def create_app(
         both simulate/shadow and live runs — the transformed payload is retained on the done outbound
         row in either mode. Every access is audited (``outbound.read`` + a per-message ``viewed``
         event when bodies are returned)."""
-        row = await engine.store.get_message(message_id)
         # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
         # channel (per-channel RBAC), mirroring get_message.
-        if row is None or not identity.can_access_channel(row["channel_id"]):
-            if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
-            raise HTTPException(404, f"no such message: {message_id}")
+        row = await get_scoped_message(engine, identity, message_id, request)
         payload_rows = await engine.store.outbox_payloads_for(message_id)
         # Returning transformed bodies is PHI access — audit the read, and (when bodies are actually
         # returned) record the per-message PHI view timeline, exactly like opening a raw body.
@@ -5520,11 +5493,7 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_REPLAY)),
     ) -> ReplayResult:
-        row = await engine.store.get_message(message_id)
-        if row is None or not identity.can_access_channel(row["channel_id"]):
-            if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
-            raise HTTPException(404, f"no such message: {message_id}")
+        row = await get_scoped_message(engine, identity, message_id, request)
         requeued = await engine.replay(message_id)
         if requeued == 0:
             # The message exists (checked above) but has no re-queueable outbox rows — it errored,
@@ -5562,13 +5531,9 @@ def create_app(
         channel AND the alternate outbound's channel, so PHI can't be diverted to a partner the caller
         otherwise can't reach. The alternate outbound must be a registered, owned-by-this-shard, running
         connection. Audited (``message.resend``, actor + from→to) — never the body."""
-        row = await engine.store.get_message(message_id)
         # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
         # channel (mirrors replay/get_message).
-        if row is None or not identity.can_access_channel(row["channel_id"]):
-            if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
-            raise HTTPException(404, f"no such message: {message_id}")
+        row = await get_scoped_message(engine, identity, message_id, request)
         # Cross-channel authorization: the caller must ALSO be scoped to the alternate outbound (its name
         # is treated as a channel for per-channel RBAC), so a channel-scoped operator cannot push PHI to
         # an outbound they can't reach. 403 (not 404) — the message IS visible; the target is denied.
@@ -5647,12 +5612,8 @@ def create_app(
         correlated message. Requires ``MESSAGES_EDIT`` step-up (implies ``MESSAGES_VIEW_RAW``); the direct
         path additionally requires access to the alternate outbound's channel. Audited
         (``message.edit_resend``, actor + original→new correlation) — NEVER the edited body."""
-        row = await engine.store.get_message(message_id)
         # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
-        if row is None or not identity.can_access_channel(row["channel_id"]):
-            if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
-            raise HTTPException(404, f"no such message: {message_id}")
+        row = await get_scoped_message(engine, identity, message_id, request)
 
         if body.to is not None:
             # DIRECT power-path: deliver the edited body straight to an alternate outbound. Same cross-
@@ -8964,11 +8925,17 @@ def create_managed_app(
             registry_guard=registry_guard,
             # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
             # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
-            # every real reload. Each connector's own build then enforces again and loads the bytes
-            # it read. Dormant when no inbound names a CA: no store call, no audit row.
+            # every real reload. Each listener's own build then enforces again and loads the bytes
+            # it read. Since vault BACKLOG #2371 it also checks each FhirLookup's CA; the lane
+            # CAs are the runner's, below. Module item 9 of auth/trust_anchors.py says when.
+            # Dormant when no connection names a CA: no store call, no audit row.
             registry_preflight=make_registry_anchor_preflight(
                 store, enforcing=trust_anchors_enforcing
             ),
+            # vault BACKLOG #2371: the same check, per lane, as the runner builds an outbound or
+            # binds an Ftp poller, so a refused CA fails that lane only (ADR 0031), and before a
+            # reload for each lane that reload builds or keeps running.
+            lane_anchor_check=make_lane_anchor_check(store, enforcing=trust_anchors_enforcing),
             # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA), re-verified by
             # the engine on EVERY real reload, not only the direct /config/reload route. None when
             # no settings anchor is configured.

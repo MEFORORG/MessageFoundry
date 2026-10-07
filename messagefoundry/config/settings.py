@@ -16,7 +16,8 @@ synchronous), ``[api]`` (host/port), and ``[logging]`` (level + structured-JSON 
 
 An unrecognized **key in the TOML file** is **refused** at load (:func:`_reject_unknown_file_keys`) — a
 silently-dropped key leaves the setting it was meant to apply un-applied, with nothing anywhere
-reporting a problem. An unknown top-level **section** is still tolerated.
+reporting a problem. An unknown top-level **section**, or a top-level key outside any section, is
+refused the same way and for the same reason: a misspelt ``[integrty]`` drops every key under it.
 
 The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
 oversight: the **env** layer and the ``cli`` mapping still drop an unrecognized key silently. Env
@@ -441,7 +442,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
     ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
-    and FTPS ``tls_verify=false`` contexts and the credentialed plain-``ftp`` guard, **and — since #329 —**
+    and the anonymous FTPS ``tls_verify=false`` context (a credential on FTPS verify-off or on plain
+    ``ftp`` is refused outright, vault BACKLOG #2636), **and — since #329 —**
     the LDAPS ``ad_tls_verify=false`` bind (:mod:`messagefoundry.auth.ldap`), the SFTP unknown-host-key
     acceptance (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
     cleartext-``http`` hops. Pass the construction-time
@@ -1362,8 +1364,10 @@ class ApiSettings(_Section):
 
     @property
     def is_loopback(self) -> bool:
-        """Whether the API binds a loopback host — i.e. is **not** exposed off-box, so the exposed-bind
-        TLS gate and the MFA-at-exposure advisory (``serve``) don't apply. The host set is
+        """Whether the API binds a loopback host, so the exposed-bind TLS gate (``serve``) does not
+        apply. It is not the whole exposure test: ``serve``'s MFA-at-exposure, dual-control and ADR 0152
+        arms read :attr:`host_is_browser_origin`, which also counts a declared or trusted proxy in front
+        of a loopback bind (vault BACKLOG #2251). The host set is
         :data:`_LOOPBACK_HOSTS`, shared with the ``[security]`` desugar so one definition serves every
         off-box decision."""
         return self.host in _LOOPBACK_HOSTS
@@ -1371,8 +1375,10 @@ class ApiSettings(_Section):
     @property
     def host_is_browser_origin(self) -> bool:
         """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
-        engine off-box or through a proxy, which is also what ``serve``'s console exposure checks
-        test (BACKLOG #2218)."""
+        engine off-box or through a proxy. ``serve`` reads it for the console exposure checks
+        (BACKLOG #2218) and as ``instance_exposed``, the single exposure test its refusing arms read:
+        MFA-at-exposure, dual-control and the ADR 0152 declaration (vault BACKLOG #2251). A change to
+        :func:`request_host_is_browser_origin` therefore moves those security refusals too."""
         return request_host_is_browser_origin(
             loopback=self.is_loopback,
             trusted_proxies=self.trusted_proxies,
@@ -2055,8 +2061,7 @@ class SandboxSettings(_Section):
     * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
       ``mode="subprocess"`` the parent kills a worker that overruns and dead-letters that message
       post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
-      to finish now dead-letters. ``startup_seconds`` and the POSIX ``cpu_seconds``/``mem_mb`` arm
-      with it.
+      to finish now dead-letters. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
     * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
       marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
       per-interface bound. **One message is not one dispatch:** a message routed to one handler with
@@ -2066,8 +2071,8 @@ class SandboxSettings(_Section):
       stderr relay), three parent pipe fds, and on Windows a job-object handle.
     * **The pre-deploy gate does not learn this setting.** ``messagefoundry check`` and ``dryrun``
       always run in-process (:func:`messagefoundry.pipeline.dryrun.dry_run` takes no ``sandbox``
-      argument), so a Handler calling ``db_lookup``/``fhir_lookup`` passes the gate green and then
-      fails closed at ``serve``.
+      argument). ``docs/CONFIGURATION.md``, section ``[sandbox]``, lists where the preview and
+      ``serve`` then differ, and why a ``db_lookup``/``fhir_lookup`` Handler is not one of them.
 
     Reliability-core + read ONCE at engine construction (a ``/config/reload`` does NOT re-read it —
     **restart to change**, exactly like ``claim_mode``)."""
@@ -2078,10 +2083,8 @@ class SandboxSettings(_Section):
     mode: Literal["off", "subprocess"] = Field(default="off")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
+    # There is no RLIMIT_CPU, so CPU spent outside a call has no bound (ADR 0087, 2026-10-07).
     wall_seconds: float = Field(default=5.0, gt=0)
-    # POSIX-only RLIMIT_CPU backstop (seconds) inside the child (a no-op on Windows, where wall_seconds
-    # governs). Kept <= wall_seconds in spirit; the OS reaps a CPU-bound child sooner where supported.
-    cpu_seconds: float = Field(default=2.0, gt=0)
     # POSIX-only RLIMIT_AS address-space cap (MiB) inside the child (no-op on Windows). None disables it.
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
@@ -2382,9 +2385,7 @@ class LoggingSettings(_Section):
     def _normalize_level(cls, value: str) -> str:
         upper = value.upper()
         if upper not in LOG_LEVELS:
-            raise ValueError(
-                f"invalid log level {value!r}; expected one of {', '.join(LOG_LEVELS)}"
-            )
+            raise ValueError(f"invalid log level {value!r}; expected one of {'/'.join(LOG_LEVELS)}")
         return upper
 
     @field_validator("forward_port")
@@ -2748,6 +2749,10 @@ EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 #: real directory round trip and far below the point where a socket timeout overflows.
 _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
+#: The widest ``[auth].oidc_issuer`` the engine loads, in UTF-16 units (BACKLOG #2331): the width of
+#: the narrowest issuer column a federated binding is stored in, SQL Server ``NVARCHAR(256)``.
+_OIDC_ISSUER_MAX = 256
+
 
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
@@ -2868,6 +2873,8 @@ class AuthSettings(_Section):
     # session was minted is refused with the leg's ordinary failure, so the refusal says nothing about
     # timing. It is audited with reason "too_early", charges no lockout and spends no code. Only the
     # PENDING session is floored; a step-up code on a session whose factor is already satisfied is not.
+    # An enrolment that would satisfy a pending session, POST /me/mfa/confirm or a passkey
+    # registration, is floored the same way (BACKLOG #2389).
     # Sized from the keystroke-level model (Card, Moran and Newell, "The keystroke-level model for user
     # performance time with interactive systems", Communications of the ACM 23(7), 1980, pp. 396-410):
     #   M   take in a prompt the person has not seen, and decide    1.35 s
@@ -3057,7 +3064,10 @@ class AuthSettings(_Section):
     # principal with no on-prem AD object is refused. Endpoints are operator-pinned (no .well-known
     # discovery), so no attacker-influenced URL exists.
     oidc_enabled: bool = False
-    oidc_issuer: str | None = None  # https; exact-matched against the id_token `iss`
+    # https; exact-matched against the id_token `iss`. At most 256 UTF-16 units, refused at load
+    # (_issuer_fits_the_column): a bind stores it, and the narrowest issuer column is SQL Server
+    # NVARCHAR(256), so a longer one could be configured and never bound (BACKLOG #2331).
+    oidc_issuer: str | None = None
     oidc_client_id: str | None = None  # also the required `aud`/`azp`
     # The confidential-client secret. ENV ONLY (MEFOR_AUTH_OIDC_CLIENT_SECRET) — never the config file
     # (_FILE_SECRET_KEYS warns) — or via a [secrets].provider reference in oidc_client_secret_ref. The
@@ -3519,6 +3529,23 @@ class AuthSettings(_Section):
         return (
             self.ad_enabled and self.ad_server is not None and not is_ldaps_address(self.ad_server)
         )
+
+    @field_validator("oidc_issuer")
+    @classmethod
+    def _issuer_fits_the_column(cls, value: str | None) -> str | None:
+        """BACKLOG #2331. Counted in UTF-16 units, not code points: the column this protects, SQL
+        Server ``NVARCHAR(256)``, counts units, and a character outside the Basic Multilingual Plane
+        takes two. ``surrogatepass`` so a lone surrogate is counted rather than raising an encoding
+        error that quotes it. The message names the limit, never the value."""
+        if (
+            value is not None
+            and len(value.encode("utf-16-le", "surrogatepass")) // 2 > _OIDC_ISSUER_MAX
+        ):
+            raise ValueError(
+                f"[auth].oidc_issuer must be at most {_OIDC_ISSUER_MAX} UTF-16 code units, the"
+                " width of the column a federated binding stores it in"
+            )
+        return value
 
     @model_validator(mode="after")
     def _require_ad_fields(self) -> AuthSettings:
@@ -6218,7 +6245,13 @@ class SecuritySettings(_Section):
 
 
 class ServiceSettings(_InputHidingModel):
-    model_config = ConfigDict(extra="ignore")  # tolerate forward-looking/unknown sections
+    # extra="ignore" does NOT mean an unknown section is tolerated: the LOADER refuses an unknown
+    # top-level section or key in the FILE (_reject_unknown_file_keys), naming it and a near-name and
+    # never its value. The refusal lives there, not here, so it has one home and one wording: the env
+    # overlay (_env_overrides, filtered to _SECTIONS) and the CLI merge write only modelled sections
+    # already, so a forbidding model would add nothing for them, and for the file it would raise a
+    # second, less helpful pydantic error beside the loader's own.
+    model_config = ConfigDict(extra="ignore")
 
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     store: StoreSettings = Field(default_factory=StoreSettings)
@@ -6488,7 +6521,8 @@ def _unknown_key_report(items: Sequence[tuple[str, str, str | None]]) -> str:
     (``_FILE_SECRET_KEYS`` exists because secrets land in this file), and the CLI prints a load failure
     verbatim to stderr, which the service captures to a log file."""
     return ", ".join(
-        f"[{section}].{key}" + (f" (did you mean '{suggestion}'?)" if suggestion else "")
+        f"[{_printable(section)}].{_printable(key)}"
+        + (f" (did you mean '{suggestion}'?)" if suggestion else "")
         for section, key, suggestion in items
     )
 
@@ -6511,8 +6545,64 @@ def _unknown_keys(
             yield from _unknown_keys(f"{table}.{key}", sub, value)
 
 
+def _printable(name: str) -> str:
+    """``name`` with any non-printable character escaped. A quoted TOML key may hold a newline, and the
+    refusal is printed to stderr, which the service captures to a log file: an unescaped key could
+    forge a log line."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in name)
+
+
+#: ``[[inbound]]`` / ``[[outbound]]`` in the service file are almost always connections.toml content
+#: pasted into the wrong file (ADR 0007), so say that rather than offering a section name.
+_CONNECTIONS_FILE_TABLES = frozenset({"inbound", "outbound"})
+
+
+def _stray_key_home(name: str, models: Mapping[str, type[BaseModel]]) -> str | None:
+    """The one ``[section].key`` a top-level key plausibly belongs in, or ``None`` when there is no safe
+    answer. No suggestion when several sections define the key (picking one would move it into the
+    wrong section, where it loads clean), when the key MOVED to ``[security]`` (the suggestion would be
+    a spelling the loader refuses), or when it is a secret (the file is not the place for it at all)."""
+    secrets = {key for _section, key in (*_FILE_SECRET_KEYS, *_FILE_INLINE_PEM_KEYS)}
+    owners = [section for section, model in models.items() if name in model.model_fields]
+    if len(owners) != 1 or name in secrets or (owners[0], name) in _RELOCATED_TO_SECURITY:
+        return None
+    return f"[{owners[0]}].{name}"
+
+
+def _top_level_offender(
+    name: str, values: Any, models: Mapping[str, type[BaseModel]]
+) -> tuple[bool, str] | None:
+    """How the file's top-level entry ``name`` fails, as ``(is_stray_key, rendered)``, or ``None`` when
+    it is a modelled section written as one table.
+
+    Names the entry and **never its value**, which may be a secret (see :func:`_unknown_key_report`).
+    A known section given a NON-table value is an offender too: :func:`_merge` copies only tables, so
+    ``store = "x.db"`` above the first header, or ``[[integrity]]``, would otherwise be dropped silently
+    rather than reported by pydantic."""
+    sections = ServiceSettings.model_fields
+    shown = _printable(name)
+    if isinstance(values, list) and values and all(isinstance(v, dict) for v in values):
+        if name in _CONNECTIONS_FILE_TABLES:
+            hint: str | None = "connection entries belong in connections.toml, not this file"
+        elif name in sections:
+            hint = f"a section is one [{shown}] table, not an array of tables"
+        else:
+            hint = None
+        return False, f"[[{shown}]]" + (f" ({hint})" if hint else "")
+    if isinstance(values, dict):
+        if name in sections:
+            return None
+        near = _near_field(ServiceSettings, name)
+        return False, f"[{shown}]" + (f" (did you mean '[{near}]'?)" if near else "")
+    if name in sections:
+        return True, f"top-level key '{shown}' (a section: write it as a [{shown}] table)"
+    home = _stray_key_home(name, models)
+    return True, f"top-level key '{shown}'" + (f" (did you mean '{home}'?)" if home else "")
+
+
 def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
-    """Raise ``ValueError`` if the config FILE sets a key its section does not define.
+    """Raise ``ValueError`` if the config FILE sets a section, or a key in a section, that the settings
+    model does not define.
 
     Owner ruling, 2026-08-16: refuse unknown keys. A key the engine does not recognize used to load
     clean, do nothing, and say nothing — so a mistyped ``[egress].deny_by_defalt`` left the operator
@@ -6520,25 +6610,43 @@ def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
     is the only way that failure surfaces at all: nothing downstream can distinguish "not set" from
     "set, misspelt, dropped".
 
+    The 2026-10-02 full review (decision 10) extended the ruling one level up, to top-level SECTIONS and
+    to a top-level key outside any section. It is the same failure, worse: ``[integrty]`` with
+    ``fail_closed_on_drift = true`` dropped the whole section, so the opt-in tripwire stayed alert-only
+    while the operator believed it failed closed. Nothing reads a section of this file that the model
+    does not define, so there is no legitimate unmodelled section to spare.
+
     Scoped to the FILE deliberately. The env layer (:func:`_env_overrides`) scrapes any
     ``MEFOR_<section>_<key>`` into its section dict, including a dozen documented variables that their
     consuming module reads straight from ``os.environ`` and that are not fields here — refusing there
-    would refuse a variable the shipped docs tell operators to set. The CLI layer and the ``[security]``
-    desugar write only real fields, and the file is the surface the ruling names. Unknown top-level
-    **sections** stay tolerated (``ServiceSettings`` is ``extra="ignore"``) — a separate question."""
+    would refuse a variable the shipped docs tell operators to set. It drops a variable naming no
+    modelled section before this point, so it never reaches the section check either. The CLI layer and
+    the ``[security]`` desugar write only real fields, and the file is the surface the ruling names."""
     models = _section_models()
+    sections: list[str] = []
+    stray = False
     offenders: list[tuple[str, str, str | None]] = []
     for section, values in file_data.items():
+        offender = _top_level_offender(section, values, models)
+        if offender is not None:
+            stray = stray or offender[0]
+            sections.append(offender[1])
+            continue
         model = models.get(section)
-        if model is None or not isinstance(values, dict):
-            continue  # unknown SECTION (tolerated) or a non-table value (pydantic reports the type)
-        offenders.extend(_unknown_keys(section, model, values))
-    if offenders:
+        if model is not None:
+            offenders.extend(_unknown_keys(section, model, values))
+    if sections or offenders:
+        found = []
+        if sections:
+            found.append(f"unrecognized config section(s): {', '.join(sections)}")
+        if offenders:
+            found.append(f"unrecognized config key(s): {_unknown_key_report(offenders)}")
         raise ValueError(
-            f"unrecognized config key(s): {_unknown_key_report(offenders)}. An unrecognized key is "
-            "REFUSED, not ignored — a dropped key leaves the setting it was meant to apply silently "
-            "un-applied. Check the spelling against docs/CONFIGURATION.md; a key that MOVED to another "
-            "section is reported by name instead."
+            f"{'; '.join(found)}. An unrecognized section or key is REFUSED, not ignored — a dropped "
+            "one leaves the setting it was meant to apply silently un-applied."
+            + (" A key above the first [section] header belongs to no section." if stray else "")
+            + " Check the spelling against docs/CONFIGURATION.md; a key that MOVED to another section "
+            "is reported by name instead."
         )
 
 
@@ -7706,9 +7814,10 @@ def security_loosenings(
         out.append(
             (
                 "ad_allow_insecure_ldap",
-                "AD binds over plain ldap:// -- the service-account password and every signing-in "
-                "user's password cross the network in cleartext, and nothing authenticates the "
-                "domain controller",
+                "AD binds over plain ldap:// -- the service-account password, and the password a "
+                "directory user types to step up a Windows SSO (Kerberos) session, cross the network "
+                "in cleartext, and nothing authenticates the domain controller (an OIDC session steps "
+                "up at the identity provider and sends no password here)",
             )
         )
     # BACKLOG #288: the new-client-IP step-up defaults ON.

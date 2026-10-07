@@ -342,8 +342,13 @@ async def test_end_to_end_an_ingress_commit_failure_reaches_the_sender_as_ae(
             await writer.wait_closed()
         finally:
             await asyncio.wait_for(runner.stop(), timeout=5.0)
-        assert await store.count_messages() == 0
-        kinds = {e.kind for e in await store.list_connection_events(connection="IB_T_ADT")}
+        assert await store.count_messages(allowed_channels=None) == 0
+        kinds = {
+            e.kind
+            for e in await store.list_connection_events(
+                connection="IB_T_ADT", allowed_channels=None
+            )
+        }
         assert "handler_error" in kinds and "framing_error" not in kinds, kinds
     finally:
         await store.close()

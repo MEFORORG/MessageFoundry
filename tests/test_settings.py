@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -218,16 +219,184 @@ def test_cli_overrides_env_and_file(tmp_path: Path) -> None:
     assert s.store.path == "cli.db"  # CLI is highest precedence
 
 
-def test_unknown_section_is_still_tolerated(tmp_path: Path) -> None:
-    # An as-yet-unmodelled top-level SECTION still loads. Unknown KEYS are refused (below); sections
-    # are a separate tolerance (ServiceSettings is extra="ignore") and were not changed with them.
+def test_unknown_section_is_refused(tmp_path: Path) -> None:
+    # 2026-10-02 full review, decision 10, extending the 2026-08-16 owner ruling: a misspelt SECTION
+    # used to drop every key under it silently. The motivating case: the integrity tripwire is opt-in,
+    # so `[integrty]` left it alert-only while the operator believed it failed closed.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
-        '[store]\nbackend = "sqlite"\n[telemetry]\nendpoint = "x"\n',
+        '[store]\nbackend = "sqlite"\n[integrty]\nfail_closed_on_drift = true\n',
     )
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    message = str(excinfo.value)
+    assert message.startswith("unrecognized config section(s): ")
+    assert "[integrty] (did you mean '[integrity]'?)" in message
+    assert "docs/CONFIGURATION.md" in message
+
+
+def test_an_unmodelled_section_with_no_near_name_is_refused(tmp_path: Path) -> None:
+    # Not only typos: a section the engine has no model for (the old docs' `[engine]`, a section from
+    # newer docs) is refused too, with no suggestion when nothing is close.
+    cfg = _write(tmp_path / "messagefoundry.toml", '[telemetry]\nendpoint = "x"\n')
+    with pytest.raises(ValueError, match=r"section\(s\): \[telemetry\]\. "):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_a_top_level_key_outside_any_section_is_refused(tmp_path: Path) -> None:
+    # A key written above the first [section] header belongs to no section and was dropped silently.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        "fail_closed_on_drift = true\n[integrity]\nenabled = true\n",
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    message = str(excinfo.value)
+    # The suggestion names the section that DEFINES the key, not a section whose name looks like it.
+    assert (
+        "top-level key 'fail_closed_on_drift' (did you mean '[integrity].fail_closed_on_drift'?)"
+        in message
+    )
+    assert "belongs to no section" in message
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "port",  # defined by more than one section: a guess would move it into the wrong one
+        "require_mfa",  # moved to [security]: the old home is a spelling the loader refuses
+        "password",  # a secret: it belongs in env, not in any section of this file
+    ],
+)
+def test_a_stray_key_gets_no_suggestion_when_none_is_safe(tmp_path: Path, key: str) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", f'{key} = "v-9f3a"\n')
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    message = str(excinfo.value)
+    assert f"top-level key '{key}'. " in message  # named, with no "(did you mean" after it
+    assert "v-9f3a" not in message
+
+
+def test_a_control_character_in_a_refused_name_is_escaped(tmp_path: Path) -> None:
+    # The refusal reaches the service log; a quoted TOML key holding a newline must not forge a line.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '"x\\n2026-10-07 INFO started" = 1\n[store]\n"y\\rz" = 1\n',
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    message = str(excinfo.value)
+    assert "\n" not in message and "\r" not in message
+    assert "top-level key 'x\\n2026-10-07 INFO started'" in message
+    assert "[store].y\\rz" in message
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            'store = "elsewhere.db"\n',
+            "top-level key 'store' (a section: write it as a [store] table)",
+        ),
+        (
+            "[[integrity]]\nfail_closed_on_drift = true\n",
+            "[[integrity]] (a section is one [integrity] table, not an array of tables)",
+        ),
+        (
+            '[[outbound]]\nname = "x"\n',
+            "[[outbound]] (connection entries belong in connections.toml, not this file)",
+        ),
+    ],
+)
+def test_a_known_or_unknown_name_that_is_not_a_table_is_refused(
+    tmp_path: Path, body: str, expected: str
+) -> None:
+    # A modelled section given a non-table value is dropped by the merge (it copies tables only), so
+    # pydantic never sees it: without this arm `[[integrity]]` loads clean with the tripwire alert-only.
+    cfg = _write(tmp_path / "messagefoundry.toml", body)
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    assert expected in str(excinfo.value)
+    assert "elsewhere.db" not in str(excinfo.value)
+
+
+def test_the_stray_key_hint_is_only_given_for_a_stray_key(tmp_path: Path) -> None:
+    # A misspelt key INSIDE a section is a spelling problem, not a placement one.
+    cfg = _write(tmp_path / "messagefoundry.toml", "[egress]\ndeny_by_defalt = true\n")
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    assert "belongs to no section" not in str(excinfo.value)
+
+
+def test_the_section_refusal_never_echoes_a_value(tmp_path: Path) -> None:
+    # The file carries secrets (_FILE_SECRET_KEYS exists because they land here), and a load failure is
+    # printed verbatim to stderr, which the service captures to a log file.
+    secret = "not-a-real-secret-4f1c"
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        f'token = "{secret}"\n[scerets]\nvault_token = "{secret}"\n[store]\nregion = "{secret}"\n',
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    message = str(excinfo.value)
+    assert secret not in message
+    # Unknown sections and unknown keys are reported together. (A MOVED or REMOVED key is still
+    # refused first, by its own specific message.)
+    assert "[scerets] (did you mean '[secrets]'?)" in message
+    assert "top-level key 'token'" in message
+    assert "[store].region" in message
+
+
+def test_the_section_refusal_is_scoped_to_the_file(tmp_path: Path) -> None:
+    # The env layer is exempt, as it is for keys under the 2026-08-16 ruling: a MEFOR_* variable naming
+    # no modelled section is dropped by the env scrape, so a documented out-of-band variable such as
+    # MEFOR_ALLOW_INSECURE_TLS, whose first segment is no section, keeps loading. The cost is that an
+    # env-side section typo stays silent; this pins the scope as decided, not as a desired outcome.
+    cfg = _write(tmp_path / "messagefoundry.toml", '[store]\nbackend = "sqlite"\n')
+    s = load_settings(
+        config_path=cfg,
+        environ={"MEFOR_INTEGRTY_FAIL_CLOSED_ON_DRIFT": "1", "MEFOR_ALLOW_INSECURE_TLS": "1"},
+    )
+    assert s.store.backend is StoreBackend.SQLITE
+    assert s.integrity.fail_closed_on_drift is False
+
+
+def test_every_modelled_section_still_loads(tmp_path: Path) -> None:
+    # The control: the refusal must spare every section the model defines, derived from the model so a
+    # section added later is covered without editing this test. It shares that derivation with the
+    # refusal, so it pins the sparing, not the set; the next assertion pins that every section's KEYS
+    # are checked too (_section_models would skip a field with a non-model annotation).
+    body = "".join(f"[{name}]\n" for name in sorted(ServiceSettings.model_fields))
+    assert set(_section_models()) == set(ServiceSettings.model_fields)
+    assert "[integrity]\n" in body and "[cluster]\n" in body  # the derivation found the sections
+    cfg = _write(tmp_path / "messagefoundry.toml", body)
     s = load_settings(config_path=cfg, environ={})
     assert s.store.backend is StoreBackend.SQLITE
-    assert not hasattr(s, "telemetry")
+
+
+def test_the_configuration_doc_examples_name_only_modelled_sections() -> None:
+    # The settings catalogue is where an operator copies a section from, so an example naming a section
+    # the loader now refuses would hand out a file that fails to start. EVERY fenced TOML block in this
+    # doc is held to that, including one inside a blockquote (its "> " prefix is stripped) and one
+    # naming no modelled section at all, which is the case worth catching. A block that does not parse
+    # fails too, rather than being skipped. The scaffold's messagefoundry.toml is loaded whole in
+    # tests/test_scaffold.py.
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md").read_text(
+        encoding="utf-8"
+    )
+    sections = set(ServiceSettings.model_fields)
+    # Not tests/_docs_toml.TOML_FENCE_RE: that one does not reach a fence inside a blockquote, and two of
+    # this doc's [security] examples sit in one.
+    fence = re.compile(r"^(>?[ \t]*)```toml[^\n]*\n(.*?)^\1```[ \t]*$", flags=re.S | re.M)
+    checked = 0
+    for match in fence.finditer(doc):
+        prefix = match.group(1)
+        block = "\n".join(line.removeprefix(prefix) for line in match.group(2).splitlines())
+        names = set(tomllib.loads(block))
+        assert names <= sections, f"unmodelled section(s) {sorted(names - sections)} in:\n{block}"
+        checked += 1
+    # Positive control: the scan reached the blockquoted [security] examples and the full example file.
+    assert checked >= 8
 
 
 def test_unknown_key_in_a_known_section_is_refused(tmp_path: Path) -> None:

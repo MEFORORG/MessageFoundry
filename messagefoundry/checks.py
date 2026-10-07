@@ -22,17 +22,12 @@ checks). Two checks are **required** (they can block a commit):
   **THAT PREVIEW GUARANTEE IS SCOPED TO ``snapshot_on_send``, AND ONE OTHER SETTING BREAKS IT.** The
   dry run ALWAYS executes Routers/Handlers **in-process**: :func:`messagefoundry.pipeline.dryrun.dry_run`
   takes no ``sandbox`` argument, so it never consults ``[sandbox].mode``. On the shipped default
-  (``off``) that costs nothing, because ``serve`` runs them in-process too — but a site that has
-  turned ``[sandbox].mode=subprocess`` on gets two consequences a reader must not have to infer. A
-  Handler calling the live ``db_lookup``/``fhir_lookup`` bridges **passes this gate green and then
-  fails closed at** ``serve``, because those bridges re-enter the event loop and the child refuses
-  them. And ``[sandbox].wall_seconds`` is not enforced here either, so a Handler slow enough to be
-  killed and dead-lettered at ``serve`` finishes clean in the preview. Neither is a gate defect to
-  route around: **the fix for both is to run the feed under ``serve``**, or to set
-  ``[sandbox].mode=off`` for a Handler that genuinely needs live enrichment — noting that
-  ``[sandbox]`` is a single **engine-wide** section (one ``SandboxPolicy`` is rendered for the whole
-  graph and a connection carries no per-connection sandbox field), so that ``off`` takes every Router
-  and Handler in the process out of the sandbox, not just the one that needs enrichment.
+  (``off``) that costs nothing, because ``serve`` runs them in-process too. At
+  ``[sandbox].mode=subprocess`` the preview stops matching ``serve`` in at least two ways
+  (``wall_seconds`` and the worker's environment allowlist); ``docs/CONFIGURATION.md``, section
+  ``[sandbox]``, states them once. A Handler reaching ``db_lookup``/``fhir_lookup`` is not one of
+  them. The dry run has no lookup runner, so the call raises here in every mode. Unless the Handler
+  catches it, this gate fails unless the fixture's ``.expect`` declares ``ERROR``.
 
 A third required check, ``posture``, is **best-effort**: when a ``messagefoundry.toml`` is present
 (searched from ``config_dir`` upward + the CWD) it loads the service settings and — if an active
@@ -2533,8 +2528,10 @@ def _check_hostname_unchecked(config_dir: str | Path) -> CheckResult:
     that chains to the anchor is accepted whatever host it names.
 
     Advisory (``required=False``) on the ``tls_allow_expired`` precedent: a per-connection TLS
-    relaxation is reported, not refused, under any ``[security].enforcement``. SKIPs when the graph
-    will not load, the same convention as its siblings."""
+    relaxation is reported, not refused, under any ``[security].enforcement``. A credentialed SMTP or
+    FTPS hop that declares it is refused at its own construction instead (#1314, vault BACKLOG
+    #2636); this line does not repeat that refusal. SKIPs when the graph will not load, the same
+    convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, hostname_unchecked_hops, load_config
 
     name = "tls-check-hostname"

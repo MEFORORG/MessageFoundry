@@ -150,7 +150,7 @@ async def test_charset_refusal_through_the_real_worker_logs_one_content_free_war
     finally:
         await runner.stop()
 
-    (msg,) = await store.list_messages(channel_id="file_in")
+    (msg,) = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert msg["status"] == MessageStatus.ERROR.value  # the dead-letter itself is unchanged
     (line,) = _refusal_lines(caplog)
     text = line.getMessage()
@@ -296,7 +296,7 @@ async def test_a_permanently_refused_batch_logs_one_content_free_warning(
     runner = _batch_runner(store, _Refuses())
     head_id = await _run_one_batch(store, runner, [_adt(n) for n in (1, 2, 3)])
 
-    assert await store.count_dead() == 3  # the batch dead-letter is unchanged
+    assert await store.count_dead(allowed_channels=None) == 3  # the batch dead-letter is unchanged
     (line,) = _refusal_lines(caplog)
     text = line.getMessage()
     assert repr(OUT) in text and "a batch of 3" in text and head_id in text
@@ -330,7 +330,7 @@ async def test_a_batch_member_the_frame_refuses_logs_the_same_content_free_warni
     bad = _adt(2, name=TOKEN + chr(0x1C))
     await _run_one_batch(store, runner, [_adt(1, name="DOE"), bad, _adt(3, name="DOE")])
 
-    assert len(rec.sent) == 1 and await store.count_dead() == 1
+    assert len(rec.sent) == 1 and await store.count_dead(allowed_channels=None) == 1
     (line,) = _refusal_lines(caplog)
     text = line.getMessage()
     assert repr(OUT) in text and "batch member" in text and "dead-lettered alone" in text
@@ -367,7 +367,7 @@ async def test_a_refused_member_sent_back_with_its_batch_is_not_logged_as_dead_l
     runner = _batch_runner(store, rec)
     await _run_one_batch(store, runner, [_adt(n) for n in (1, 2, 3)])
 
-    assert rec.sent == [] and await store.count_dead() == 0
+    assert rec.sent == [] and await store.count_dead(allowed_channels=None) == 0
     assert (await store.pending_depth(OUT))[0] == 3  # the whole batch went back, member 2 too
     assert _refusal_lines(caplog) == []
 

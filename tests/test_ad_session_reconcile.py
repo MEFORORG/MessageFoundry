@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 import uuid
 from dataclasses import replace
 from typing import Any
@@ -200,6 +201,8 @@ async def _signed_in_ad_user(
             "session_mechanism": SessionMechanism.OIDC,
             "mech": "oidc",
             "federated_subject": (row.oidc_issuer, row.oidc_subject),
+            # A federated mint must carry the IdP auth_time it verified (BACKLOG #2143).
+            "idp_auth_time": time.time(),
         }
     if principal.directory_object_id is None:
         # BACKLOG #2027: a sign-in no longer mints a row with no id, so a principal with none is

@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -302,6 +303,75 @@ def test_the_provision_admin_help_does_not_say_nobody_can_sign_in(
     text = rejoin_wrapped_hyphens(capsys.readouterr().out)
     assert "creates no account on its own" in text, "control: this is provision-admin's help"
     assert not SIGN_IN_CLAIM.search(text), f"provision-admin's help says nobody can sign in: {text}"
+
+
+#: The IDE files that described a start with no Administrator (vault BACKLOG #3035). The doc guards in
+#: tests/test_docs_security_pathways.py read Markdown only, so these TypeScript strings are read here.
+_IDE_START_FILES = (
+    "ide/src/statusBar.ts",
+    "ide/src/engineControlModel.ts",
+    "ide/src/test/suite/engine-control.test.ts",
+)
+
+
+def _ide_prose(text: str) -> str:
+    """``text`` with split string literals and wrapped ``//`` comments joined, so a claim the source
+    wraps across lines still reads as one clause."""
+    joined = re.sub(r"\"\s*\+\s*\n\s*\"", "", text)
+    joined = re.sub(r"\n\s*(?://|\*)\s*", " ", joined)
+    return " ".join(joined.split())
+
+
+#: Sign-in turned off, in the spellings the IDE used ("sign-in off", "sign-in is off", "signin off").
+_SIGN_IN_OFF = re.compile(r"\bsign[- ]?in(?: is)? off\b", re.IGNORECASE)
+#: A clause that says sign-in off is impossible is true, so it is not the claim.
+_NEGATED = re.compile(r"\b(?:cannot|can't|can not|never|refuses?|no (?:setting|switch))\b", re.I)
+
+
+def _sign_in_off_offers(text: str) -> list[str]:
+    """Clauses that present sign-in off as a posture a start can use. ``serve`` has none (vault
+    BACKLOG #2719), so any such clause is false; one that says it is impossible is kept out."""
+    return [
+        c.strip()
+        for c in re.split(r"[.;]", text)
+        if _SIGN_IN_OFF.search(c) and not _NEGATED.search(c)
+    ]
+
+
+def test_the_ide_start_dialog_does_not_say_nobody_can_sign_in() -> None:
+    """BACKLOG #3035: the IDE Start dialog said a store with no Administrator meant nobody could sign
+    in, and offered a start "only if sign-in is off". A Windows sign-in still creates a directory
+    account with no role, and ``serve`` cannot run with sign-in off (vault BACKLOG #2719)."""
+    texts = {rel: _ide_prose((_REPO / rel).read_text(encoding="utf-8")) for rel in _IDE_START_FILES}
+    assert "no enabled administrator" in texts["ide/src/statusBar.ts"], (
+        "control: this is the dialog"
+    )
+    for rel, text in texts.items():
+        assert not SIGN_IN_CLAIM.search(text), f"{rel} says nobody can sign in again"
+        offers = _sign_in_off_offers(text)
+        assert not offers, f"{rel} offers a sign-in-off start: {offers}"
+    # The controls that make the zeros mean something. Each wording the IDE shipped is caught: the
+    # old dialog, and the two comments that said a sign-in-off posture needs no Administrator.
+    old = (
+        '"so nobody can sign in to it. Provision one now? " +\n      "Start without one only if '
+        'sign-in is off for this engine."'
+    )
+    assert SIGN_IN_CLAIM.search(_ide_prose(old))
+    for shipped in (
+        old,
+        "// A posture with sign-in off needs none; at the shipped posture serve refuses.",
+        " *   3. No Administrator: a posture with sign-in off\n *      needs none.",
+    ):
+        assert _sign_in_off_offers(_ide_prose(shipped)), shipped
+    # The true sentence is not the claim.
+    assert not _sign_in_off_offers("`serve` cannot run with sign-in off.")
+    # A phrase split across a string-literal break, or a wrapped comment, is joined first. Without
+    # the join neither raw text reads as one clause.
+    split = '"Start without one only if sign-in is " +\n      "off for this engine."'
+    wrapped = "// Start without one only if sign-in is\n    // off for this engine."
+    for raw in (split, wrapped):
+        assert not _SIGN_IN_OFF.search(raw), "control: the raw text is split"
+        assert _sign_in_off_offers(_ide_prose(raw)), raw
 
 
 def test_the_help_reader_survives_a_hyphen_wrap() -> None:

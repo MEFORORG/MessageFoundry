@@ -716,12 +716,12 @@ async def test_kerberos_reject_is_audited() -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings())  # kerberos disabled
-        out = await service.authenticate_kerberos(b"sometoken")
+        out = await service.authenticate_kerberos(b"sometoken", client="192.0.2.45")
         assert not out.ok
-        audit = await store.list_audit()
-        assert any(
-            a["action"] == "auth.login_failed" and "kerberos" in (a["detail"] or "") for a in audit
-        )
+        [row] = await store.list_audit(action="auth.login_failed")
+        assert '"mech": "kerberos"' in (row["detail"] or "")
+        # BACKLOG #2132: the row records where the attempt came from.
+        assert row["client"] == "192.0.2.45"
     finally:
         await store.close()
 

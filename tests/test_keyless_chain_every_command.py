@@ -117,6 +117,8 @@ def _argv(command: str, db: Path, tmp: Path) -> list[str]:
         return ["admin-unlock", "--username", "ops", "--db", str(db), "--json"]
     if command == "audit-anchor":
         return ["audit-anchor", "--db", str(db), "--json"]
+    if command == "admin-reset-totp":
+        return ["admin-reset-totp", "--username", "ops", "--db", str(db), "--json"]
     if command == "admin-set-notify-email":
         return [
             "admin-set-notify-email",
@@ -140,6 +142,7 @@ _STORE_OPENING_COMMANDS = (
     "backup",
     "admin-unlock",
     "admin-set-notify-email",
+    "admin-reset-totp",
     "audit-anchor",
     "audit-verify",
 )
@@ -782,6 +785,9 @@ _BACKEND_OPEN_OUTSIDE_THE_SEAM = {
 _CLI_OPENERS = {
     "_admin_unlock.run",
     "_admin_set_notify_email.run",
+    # ADR 0171 Amendment B: one opener, shared by the refusal checks before the key is shown and
+    # by the write
+    "_admin_reset_totp.opened",
     "_provision_admin.run",
     # the read-only "an Administrator exists" probe before the prompt: at the refusing default it
     # would refuse an existing empty store even under the opt-out the CLI gate already accepted

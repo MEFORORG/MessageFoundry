@@ -242,3 +242,36 @@ a surprise.
 **Also amended:** [ADR 0143](0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)
 carries a cross-reference noting that its in-place `serve_ui = False` flips no longer feed any exposure
 predicate.
+
+## Amendment (2026-10-06) — a set `[api].trusted_proxies` counts as exposure (vault BACKLOG #2251)
+
+The 2026-08-04 amendment above stays as written. It records the predicate of that day.
+
+**Corrected keying.** `instance_exposed` now reads `not settings.api.host_is_browser_origin`. That
+is true for an off-loopback bind, a declared terminator, **or** a set `[api].trusted_proxies`. It is
+the same rule the console flags read (BACKLOG #2218). The owner made this edit by hand and gave the
+go on 2026-09-28.
+
+**Why the old predicate was short.** The settings model admits `trusted_proxies` on a loopback bind
+with no terminator only when an operator `[api].tls_cert_file` is set (BACKLOG #2055). That shape is a
+proxy re-encrypting to the engine. It puts the JSON operator API on the network exactly as a
+terminator does, yet `not is_loopback or tls_terminated_upstream` called it unexposed.
+
+**What changes on that shape.** At least these three arms now see it:
+
+1. The MFA-at-exposure arm refuses under `enforce` with `require_mfa` off, unless
+   `allow_single_factor_admin_when_exposed` is set. Its message names `[api].trusted_proxies`.
+2. The #189 dual-control advisory warns when `[approvals].enabled` is off.
+3. The ADR 0152 arm warns when no in-use protection is declared, and refuses under the
+   `require_memory_encryption_declaration` opt-in.
+
+The undeclared-proxy warning no longer fires when `trusted_proxies` is set, because the refusal above
+now covers that case. It still fires when `public_origin` is set and no proxy is named at all.
+
+**This is a tightening, under the same ruling as above.** A configuration of that shape that starts
+today would refuse on first deployment under `enforce`, when it also sets `require_mfa = false` or
+opts in to the memory declaration. There are no deployments, so it ships as a refusal with no new opt-in.
+
+**The second residual above is closed.** The auth-disabled refusal it describes no longer exists.
+`serve` always requires sign-in (vault BACKLOG #2719), and `[auth].enabled` is refused at load
+(vault BACKLOG #2825).

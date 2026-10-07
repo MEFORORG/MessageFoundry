@@ -37,6 +37,10 @@ from tests._root_logging import root_logging_restored
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinConfigSourceProbes
 
+# A helper module holding the content-free asserts several connector tests share. pytest rewrites
+# asserts only in test modules unless told, and an unrewritten assert vanishes under `python -O`.
+pytest.register_assert_rewrite("tests._content_free")
+
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
 #
@@ -816,7 +820,7 @@ def _provision_admin_enrols_a_synthetic_authenticator() -> Iterator[None]:
     import messagefoundry.__main__ as cli
     from tests._admin_account import provision_totp
 
-    def _stub(*, username: str, skew_steps: int) -> tuple[str, str, float]:
+    def _stub(*, username: str, skew_steps: int, **_wording: str) -> tuple[str, str, float]:
         kw = provision_totp()
         return kw["totp_secret"], kw["totp_code"], kw["totp_code_read_at"]
 

@@ -612,7 +612,13 @@ async def test_a_sign_in_that_still_owed_a_factor_marks_nothing_known() -> None:
         await _operator(baseline)
         assert (await baseline.login("oper", PW, client="10.1.1.1")).ok
         notifier = _FakeNotifier()
-        owed = AuthService(store, AuthSettings(require_mfa=True), security_notifier=notifier)
+        # The floor is off: the enrolment below runs at once on the session it signed in, which the
+        # login-to-MFA floor covers (BACKLOG #2389).
+        owed = AuthService(
+            store,
+            AuthSettings(require_mfa=True, mfa_verify_min_elapsed_seconds=0),
+            security_notifier=notifier,
+        )
         await owed.initialize()
         first = await owed.login("oper", PW, client="203.0.113.5")
         assert first.ok and first.mfa_required
@@ -902,9 +908,13 @@ async def test_an_enrolment_baseline_outlives_the_lookback(monkeypatch: pytest.M
     another address is judged NEW, not failed open as a first sign-in."""
     store = await MessageStore.open(":memory:")
     try:
+        # The floor is off: the enrolment below runs at once on the session it signed in, which the
+        # login-to-MFA floor covers (BACKLOG #2389).
         owed = AuthService(
             store,
-            AuthSettings(require_mfa=True, mfa_recovery_code_count=1),
+            AuthSettings(
+                require_mfa=True, mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1
+            ),
             security_notifier=_FakeNotifier(),
         )
         await owed.initialize()

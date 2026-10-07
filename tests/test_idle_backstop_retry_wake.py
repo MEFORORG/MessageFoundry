@@ -172,7 +172,7 @@ async def test_transient_failure_on_idle_lane_retries_on_schedule(
         deadline = asyncio.get_running_loop().time() + 6.0
         while True:
             msgs = await store.list_messages(
-                channel_id="file_in", status=MessageStatus.PROCESSED.value
+                channel_id="file_in", status=MessageStatus.PROCESSED.value, allowed_channels=None
             )
             if msgs:
                 break

@@ -553,15 +553,17 @@ class Counts(NamedTuple):
 async def _counts(target: IngressTarget, plane: str) -> Counts:
     store, name = target.engine.store, PLANES[plane]
     return Counts(
-        await store.count_messages(channel_id=name),
-        await store.count_messages(channel_id=name, status=MessageStatus.ERROR.value),
+        await store.count_messages(channel_id=name, allowed_channels=None),
+        await store.count_messages(
+            channel_id=name, status=MessageStatus.ERROR.value, allowed_channels=None
+        ),
     )
 
 
 async def _oversize_events(target: IngressTarget, plane: str) -> int:
     """Read only for a case that overflows: most cases never need it."""
     events = await target.engine.store.list_connection_events(
-        connection=PLANES[plane], kinds=["frame_oversize"], limit=1000
+        connection=PLANES[plane], kinds=["frame_oversize"], limit=1000, allowed_channels=None
     )
     return len(events)
 

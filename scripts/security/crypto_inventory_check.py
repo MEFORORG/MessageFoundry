@@ -952,9 +952,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # The reload preflight also reaches anchor_cadata's cadata= trial load (BACKLOG #2025), but
     # through asyncio.to_thread, a reference this scanner does not follow as a call.
     # BACKLOG #1167 (ASVS 11.2.4): the config-provenance drift compare, via fingerprint_matches.
+    # Vault BACKLOG #2371: the SHA-256 of a dialling CA file, via make_lane_anchor_check. It
+    # fingerprints the file to tell a repeated refusal from a changed one. A digest, not a key.
     "messagefoundry/api/app.py": frozenset(
         {
             "compare:via messagefoundry.config.fingerprint",
+            "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
@@ -1209,8 +1212,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #2597: set_connection_flag compares two public config digests with
             # fingerprint_matches (constant time), as the provenance route in api/app.py does.
             "compare:via messagefoundry.config.fingerprint",
-            # Vault BACKLOG #2839: fingerprint_bundle calls config_fingerprint_detail inside a
-            # lambda handed to asyncio.to_thread, so this scanner still sees the fold.
+            # Vault BACKLOG #2839: fingerprint_bundle_blocking calls config_fingerprint_detail
+            # directly (fingerprint_bundle runs it in asyncio.to_thread), so this scanner sees the fold.
             "hash:via messagefoundry.config.fingerprint",
             "mac:via messagefoundry.pipeline.secret_rotation",
         }
