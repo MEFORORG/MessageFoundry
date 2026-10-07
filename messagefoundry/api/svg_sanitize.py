@@ -410,6 +410,8 @@ def _gunzip_bounded(body: bytes, limit: int) -> tuple[bytes, bool]:
         try:
             out += inflater.decompress(rest, limit + 1 - len(out))
         except zlib.error:
+            # The refusal is raised after the except ends, so the zlib error stays off its chain,
+            # as in sanitize_svg (BACKLOG #1796).
             corrupt = True
         else:
             corrupt = False
@@ -447,12 +449,15 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
     not sound is refused by :func:`_gunzip_bounded` before anything is judged.
 
     The head is cleared without reading the rest of the body, so damage past the head is not seen.
-    That cannot hide an SVG: a document whose first byte is not ``<`` is not one, whatever follows."""
-    head, _ = _gunzip_bounded(body, _GZIP_SNIFF_BYTES)
+    That cannot hide an SVG from a browser: no browser renders a document as SVG when its first
+    byte past that noise is not ``<``. A reader that autodetects EBCDIC could, which is the same
+    assumption :func:`may_be_svg` makes for plain bytes."""
+    head, head_whole = _gunzip_bounded(body, _GZIP_SNIFF_BYTES)
     first = _FIRST_CONTENT_BYTE_RE.search(head)
     if first is not None and first.group() != b"<":
         return body
-    inner, whole = _gunzip_bounded(body, _MAX_SVG_BYTES)
+    # A body that inflated whole within the head is not inflated a second time.
+    inner, whole = (head, True) if head_whole else _gunzip_bounded(body, _MAX_SVG_BYTES)
     first = _FIRST_CONTENT_BYTE_RE.search(inner)
     if first is not None and first.group() != b"<":
         return body

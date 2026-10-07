@@ -676,9 +676,11 @@ real detach and the download, and fails against the sanitizer this correction re
    The Lander found it on PR 2158.
 3. The first 64 KiB is inflated first. If its first byte past leading whitespace, NUL and
    byte-order-mark bytes is not `<`, the body is served as stored without reading the rest. Damage
-   past that head is not seen. That cannot hide an SVG, since a document whose first byte is not
-   `<` is not one. Bytes that are only that noise up to the bound do not clear the body: a reader
-   that inflates further may find an SVG there.
+   past that head is not seen. That cannot hide an SVG from a browser, since no browser renders a
+   document as SVG when its first byte past that noise is not `<`. A reader that autodetects EBCDIC
+   could; plain bytes rest on the same assumption. Bytes that are only that noise for the whole head
+   do not clear the body: it is inflated up to the bound, and the same first-byte rule then applies
+   to the whole output.
 4. Markup that passes the bound is refused, since it cannot be vetted.
 5. Otherwise the inflated document is judged like plain bytes. A sanitized SVG is gzipped again, so
    the served copy keeps the stored representation. The audit row says `sanitized-svg`.

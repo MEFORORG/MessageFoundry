@@ -658,8 +658,9 @@ or compression library:
 - `api/svg_sanitize.py` inflates a gzip attachment on download, since an SVGZ file is a gzipped SVG
   (BACKLOG #2391). ADR 0105's correction of 2026-10-07 states the bounds and the rules; read them
   there. In short, the inflate is bounded as it goes, so it never expands in memory past the bound,
-  but a small stored gzip can still drive an inflate and a parse of nearly that much. A head that
-  shows a first content byte other than `<` clears the body, which is then served as stored. The
+  but a small stored gzip can still drive an inflate and a parse of nearly that much. A first
+  content byte other than `<`, in the head or in the whole output, clears the body, which is then
+  served as stored. The
   route refuses with HTTP 422 in at least these cases: damage the inflate reaches, such as a corrupt
   block, a failed check, a member cut short, too many members, or stray bytes between or after
   members; markup larger than the bound; SVG it cannot sanitize; and SVG below a root that is not
