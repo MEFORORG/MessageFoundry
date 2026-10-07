@@ -383,6 +383,49 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         assert status["enabled"] is True and status["required"] is True
 
 
+async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_code(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2389, at the route. The floor's refusal must reach the caller exactly as a wrong code
+    # does, a 400 "invalid code", or the status would tell a script about timing. The route spends
+    # its single-use password step-up before the service runs, so the retry needs a fresh one, which
+    # is what docs/SECURITY.md says. The service-level cases are in test_second_step_time_floors.py.
+    #
+    # A 30 s floor on the real clock, rather than a faked one held just inside 1 s: a session whose
+    # clock steps BACK behind its own stamps is ended, so the clock here only ever moves forward.
+    floor = 30.0
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=floor, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        good = fresh_totp(secret)
+
+        early = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
+        assert (early.status_code, early.json()) == (400, {"detail": "invalid code"})
+        retry = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
+        assert retry.status_code == 403 and retry.headers.get("X-Step-Up-Required") == "1"
+
+        # Past the floor: a genuinely wrong code gets the very answer the early good code got.
+        monkeypatch.setattr(
+            "messagefoundry.auth.service.time",
+            SimpleNamespace(time=lambda: time.time() + floor, monotonic=time.monotonic),
+        )
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        wrong = str((int(good) + 1) % 1_000_000).zfill(6)
+        refused = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": wrong})
+        assert (refused.status_code, refused.json()) == (early.status_code, early.json())
+
+        # CONTROL: the same good code now activates MFA, so the early refusal spent no TOTP step.
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        served = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
+        assert served.status_code == 200 and served.json()["recovery_codes"]
+
+
 async def test_security_events_feed_payload_is_phi_free(engine: Engine) -> None:
     # The feed carries only non-PHI audit metadata (ts/action/detail) — never message bodies or
     # credential material. Mirrors the PHI-free assertion already made on the email-notification body.

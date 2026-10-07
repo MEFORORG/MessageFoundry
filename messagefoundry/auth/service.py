@@ -9164,6 +9164,7 @@ class AuthService:
         *,
         event: str,
         client: str | None,
+        phase: str | None = None,
     ) -> bool:
         """Whether a second factor arrived too soon after sign-in, auditing the refusal if so.
 
@@ -9184,12 +9185,10 @@ class AuthService:
             return False
         if now - session.created_at >= floor:
             return False
-        await self._audit(
-            event,
-            actor=user.username,
-            detail=_json({"reason": TOO_EARLY}),
-            client=client,
-        )
+        # An enrolment leg names its phase, as its own wrong-code row does, so an investigator can
+        # tell someone binding a NEW authenticator from someone proving an enrolled one.
+        detail = {"reason": TOO_EARLY} if phase is None else {"reason": TOO_EARLY, "phase": phase}
+        await self._audit(event, actor=user.username, detail=_json(detail), client=client)
         return True
 
     async def _enrolment_too_early(
@@ -9202,24 +9201,37 @@ class AuthService:
         client: str | None,
     ) -> bool:
         """Whether an enrolment leg would satisfy a PENDING session too soon after sign-in
-        (BACKLOG #2389), auditing the refusal if so.
+        (BACKLOG #2389), auditing the refusal if so, with ``phase=enroll``.
 
         An enrolment stamps the session MFA-verified, so on a session that still owes its factor it
         completes the same login-then-MFA pair :meth:`_second_factor_too_early` floors on the verify
         legs. Unlike a verify leg, an enrolment can also run on a session that carries no stamp yet
-        owes NO factor: a Kerberos session always mints unstamped, and owes nothing once
-        ``[security].require_mfa`` is off. That session is already satisfied, so the floor has
-        nothing to guard and is skipped, as the floor's own rule skips a stamped session. "Owes a
+        owes NO factor. A Kerberos session always mints unstamped, and with ``[security].require_mfa``
+        off it owes nothing while its account has no factor. A local session of an account the
+        ``require_mfa_scope`` dial leaves out is the same. Such a session already passes every gate
+        that reads :meth:`mfa_satisfied`, so a fast enrolment on it gains nothing the floor exists to
+        stop, and the floor is skipped, as the floor's own rule skips a stamped session. "Owes a
         factor" is :meth:`_unverified_session_owes_factor`, the one rule the access gate reads.
 
-        A missing or revoked session is not refused here: the leg then fails the way it always
-        did. The caller answers a refusal with its ordinary failure and charges nothing."""
+        The cheap checks run first, so an enrolment that comes after the floor, or on a site with the
+        floor at ``0``, pays one session read and nothing else. A missing or revoked session is not
+        refused here: the leg then fails the way it always did. The caller answers a refusal with
+        its ordinary failure and the service charges nothing. The route in front of
+        ``POST /me/mfa/confirm`` has already spent its single-use password step-up, exactly as it
+        has for a wrong code, so a refusal there costs the person one password re-proof."""
+        floor = self._settings.mfa_verify_min_elapsed_seconds
+        if floor <= 0:
+            return False
         session = await self._store.get_session(hash_token(token))
         if session is None or session.revoked_at is not None or session.mfa_verified_at is not None:
             return False
+        if now - session.created_at >= floor:
+            return False
         if not await self._unverified_session_owes_factor(user):
             return False
-        return await self._second_factor_too_early(session, user, now, event=event, client=client)
+        return await self._second_factor_too_early(
+            session, user, now, event=event, client=client, phase="enroll"
+        )
 
     async def _mfa_lapsed(
         self,

@@ -720,7 +720,10 @@ This section is kept rather than deleted, because the claim it used to make is t
 > skips the check at `0`, so a floor below its default of `1.0` s is named as looser and `0` as off. A
 > higher floor refuses more and is not named.
 - **What you lose:** the MFA floor refuses a code or passkey that completes an MFA-pending session too
-  soon after sign-in. It applies to any account with a factor, whether or not `require_mfa` is on. The
+  soon after sign-in. It applies to any account with a factor, whether or not `require_mfa` is on. It
+  also refuses a first TOTP or passkey enrolment that would complete a pending session that soon
+  ([BACKLOG #2389](BACKLOG.md)). Below the default, a script holding only a password may enrol its
+  own authenticator on a covered account at machine speed. The
   callback floor refuses a federated step-up, or a sign-in whose `auth_time` falls inside the flow, that
   returns too soon after it started. Below the default, a script holding a password, or driving a flow,
   may finish the second step faster than a person could read the prompt and answer it. The floors bound

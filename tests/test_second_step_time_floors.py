@@ -76,6 +76,10 @@ def _reasons(rows: list[Any]) -> list[str | None]:
     return [json.loads(str(r["detail"])).get("reason") if r["detail"] else None for r in rows]
 
 
+def _phases(rows: list[Any]) -> list[str | None]:
+    return [json.loads(str(r["detail"])).get("phase") if r["detail"] else None for r in rows]
+
+
 # --- settings -------------------------------------------------------------------------------------
 
 
@@ -167,7 +171,9 @@ async def test_a_code_just_inside_the_floor_is_refused_like_a_wrong_one(
         # The SAME outcome a wrong code gets, so the caller learns nothing about timing.
         assert early == Elevation()
         assert not await service.mfa_satisfied(token)
-        assert _reasons(await _audit_rows(store, "auth.mfa_failed")) == [TOO_EARLY]
+        failed = await _audit_rows(store, "auth.mfa_failed")
+        assert _reasons(failed) == [TOO_EARLY]
+        assert _phases(failed) == [None], "a verify-leg refusal must not read as an enrolment"
         pending = await store.get_session(hash_token(token))
         assert pending is not None
         user = await store.get_user(pending.user_id)
@@ -332,7 +338,11 @@ async def test_a_totp_enrolment_just_inside_the_floor_is_refused_and_spends_no_s
         # The SAME outcome a wrong code gets, so the caller learns nothing about timing.
         assert early == Elevation()
         assert not await service.mfa_satisfied(token)
-        assert _reasons(await _audit_rows(store, "auth.mfa_failed")) == [TOO_EARLY]
+        failed = await _audit_rows(store, "auth.mfa_failed")
+        assert _reasons(failed) == [TOO_EARLY]
+        # Named as an enrolment, as the leg's own wrong-code row is, so an investigator can tell
+        # someone binding a new authenticator from someone proving an enrolled one.
+        assert _phases(failed) == ["enroll"]
         user = await store.get_user(identity.user_id)
         assert user is not None and not user.totp_enabled
         assert user.second_step_failed_attempts == 0, "it charged the second-step lockout"
@@ -351,7 +361,8 @@ async def test_an_enrolment_on_a_session_that_owes_no_factor_is_not_floored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A session minted with no stamp can still owe nothing: a Kerberos session always mints
-    # unstamped, and owes nothing once require_mfa is off. Enrolling by choice there completes no
+    # unstamped, and with require_mfa off it owes nothing while its account has no factor. Such a
+    # session already passes every gate that reads mfa_satisfied. Enrolling by choice there completes no
     # login-then-MFA pair, so the floor has nothing to hold apart. Built here by turning require_mfa
     # off under a session minted while it was on, which leaves the same unstamped, owing-nothing row.
     store = await MessageStore.open(":memory:")
@@ -380,8 +391,9 @@ async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps
     from tests._soft_webauthn import SoftAuthenticator
 
     rp, origin = "t", "http://t"
-    # An account with TOTP, signed in again, so its session OWES the factor. A registration needs
-    # TOTP first under the shipped require_mfa (ADR 0197 Amendment A), so this is the pending case.
+    # An account with TOTP, signed in again, so its session OWES the factor. The service floor is
+    # tested on this state directly; the routes refuse to begin a registration here until the TOTP
+    # is proven, so the directory test below is the case a route can reach.
     store, service, token, _code, minted = await _pending_totp_session(monkeypatch)
     try:
         pending = await store.get_session(hash_token(token))
@@ -406,7 +418,8 @@ async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps
 
         assert early == Elevation()
         assert not await service.mfa_satisfied(token)
-        assert _reasons(await _audit_rows(store, "auth.webauthn_failed")) == [TOO_EARLY]
+        failed = await _audit_rows(store, "auth.webauthn_failed")
+        assert _reasons(failed) == [TOO_EARLY] and _phases(failed) == ["enroll"]
         assert await store.list_webauthn_credentials(identity.user_id) == []
         user = await store.get_user(identity.user_id)
         assert user is not None and user.second_step_failed_attempts == 0, "it charged the lockout"
@@ -415,6 +428,64 @@ async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps
         now[0] = minted + MFA_FLOOR + 0.001
         served = await service.finish_webauthn_registration(
             identity, response, label="key", token=token, rp_id=rp, origin=origin
+        )
+        assert served.ok and served.token is not None
+        assert await service.mfa_satisfied(served.token)
+    finally:
+        await store.close()
+
+
+async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The case a route can reach. A directory account is never "covered" in the ADR 0197 sense, so
+    # it may begin a first passkey with no factor at all, and under require_mfa its Kerberos session
+    # mints unstamped and owes a factor through the directory floor. Without the floor, a script
+    # holding only the directory password could bind its own passkey at the instant of sign-in.
+    pytest.importorskip("webauthn")
+    from webauthn.helpers import base64url_to_bytes
+
+    from tests._soft_webauthn import SoftAuthenticator
+    from tests.test_mfa_access_gate import _principal
+
+    rp, origin = "t", "http://t"
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())  # require_mfa on, the shipped default
+        await service.initialize()
+        out = await service._complete_ad_login(_principal("adfloor"), None, mfa_verified=False)
+        assert out.ok and out.token is not None
+        session = await store.get_session(hash_token(out.token))
+        assert session is not None and session.mfa_verified_at is None
+        assert not await service.mfa_satisfied(out.token), "the session must owe its factor"
+        identity = await service.identity_for_user_id(session.user_id)
+        assert identity is not None
+        auth = SoftAuthenticator(rp_id=rp, origin=origin)
+        options = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=out.token, rp_id=rp, rp_name="MessageFoundry"
+            )
+        )
+        response = auth.create_response(
+            base64url_to_bytes(options["challenge"]), transports=["usb"]
+        )
+
+        now = [session.created_at + MFA_FLOOR - 0.001]
+        _fake_service_wall_clock(monkeypatch, now)
+        early = await service.finish_webauthn_registration(
+            identity, response, label="key", token=out.token, rp_id=rp, origin=origin
+        )
+
+        assert early == Elevation()
+        assert not await service.mfa_satisfied(out.token)
+        failed = await _audit_rows(store, "auth.webauthn_failed")
+        assert _reasons(failed) == [TOO_EARLY] and _phases(failed) == ["enroll"]
+        assert await store.list_webauthn_credentials(identity.user_id) == []
+
+        # CONTROL: past the floor, the SAME response binds the passkey and satisfies the session.
+        now[0] = session.created_at + MFA_FLOOR + 0.001
+        served = await service.finish_webauthn_registration(
+            identity, response, label="key", token=out.token, rp_id=rp, origin=origin
         )
         assert served.ok and served.token is not None
         assert await service.mfa_satisfied(served.token)
