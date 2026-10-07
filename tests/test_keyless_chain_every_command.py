@@ -567,10 +567,14 @@ def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
 _KEY_REFUSING_COMMANDS = ["audit-verify", "audit-anchor", "admin-unlock", "admin-set-notify-email"]
 
 
+#: The commands `_argv` runs with no --json, so their refusal is a line on stderr.
+_TEXT_COMMANDS = {"audit-verify", "rotate-key"}
+
+
 def _refusal_text(command: str, out: str, err: str) -> str:
-    """The refusal line: `audit-verify` has no --json and writes it to stderr; the rest, as `_argv`
-    runs them, write a JSON error to stdout."""
-    return err if command == "audit-verify" else str(json.loads(out)["error"])
+    """The refusal line: the commands `_argv` runs without --json write it to stderr; the rest write
+    a JSON error to stdout."""
+    return err if command in _TEXT_COMMANDS else str(json.loads(out)["error"])
 
 
 #: Not base64, so the key fails to decode. The text a refusal may print is the setting's name.
@@ -594,7 +598,7 @@ def test_a_key_that_does_not_resolve_exits_2(
     assert "MEFOR_STORE_TRANSIT_KEY" in text, text
 
 
-@pytest.mark.parametrize("command", _KEY_REFUSING_COMMANDS)
+@pytest.mark.parametrize("command", [*_KEY_REFUSING_COMMANDS, "admin-reset-totp", "rotate-key"])
 def test_a_malformed_key_exits_2_and_never_prints_it(
     command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -614,7 +618,7 @@ def test_a_malformed_key_exits_2_and_never_prints_it(
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
     text = _refusal_text(command, captured.out, captured.err)
-    assert "MEFOR_STORE_ENCRYPTION_KEY must be valid base64" in text, text
+    assert "must be valid base64" in text and "MEFOR_STORE_ENCRYPTION_KEY" in text, text
     assert "MALFORMEDKEYMARKER" not in captured.out + captured.err
 
 
@@ -676,10 +680,10 @@ def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_5(
     assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 5
     captured = capsys.readouterr()
     assert captured.out.startswith("NOT CHECKED: ")
-    # Vault BACKLOG #3110, item 2: a matched anchor rules out a rewrite since it was taken, so the
-    # WARNING says that and stops naming the rewrite as a cause. The bare run above still names it.
-    assert "rewritten as keyless" not in captured.err, captured.err
-    assert "The expected anchor matched" in captured.err, captured.err
+    # Vault BACKLOG #3110, item 2: a matched anchor rules out a rewrite only since it was taken, and
+    # `audit-anchor` verifies nothing, so the WARNING still names a rewrite, scoped to before it.
+    assert "before the expected anchor was taken" in captured.err, captured.err
+    assert "which a keyless check cannot see" not in captured.err, captured.err
 
 
 @pytest.mark.parametrize("allow_empty", [False, True])
@@ -739,6 +743,26 @@ def test_a_keyless_chain_under_the_opt_out_does_not_warn(
     assert "WARNING" not in capsys.readouterr().err
 
 
+def test_a_row_that_is_not_utf8_exits_2_and_its_text_is_not_printed(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3054, item 10. A row holding text that is not valid UTF-8 exits 2: the driver
+    refuses to read it, and the line says the store could not be opened. SQLite's error quotes the
+    column's bytes, which are a row's content, so the line names the column and cuts the text. The
+    control is the same keyless chain before the write, which exits 0 under the opt-out."""
+    _opt_out(monkeypatch)
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    assert main(["audit-verify", "--db", str(db)]) == 0  # the control
+    capsys.readouterr()
+    _write(db, "UPDATE audit_log SET actor = CAST(x'ff524f574d41524b4552' AS TEXT) WHERE seq = 2")
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert "cannot open the store at" in captured.err and "'actor'" in captured.err, captured.err
+    assert "ROWMARKER" not in captured.out + captured.err, captured.err
+
+
 @pytest.mark.parametrize("error", [KeyProviderError, CipherError], ids=lambda e: e.__name__)
 def test_a_key_error_raised_after_the_open_is_not_reported_as_could_not_start(
     error: type[Exception],
@@ -750,24 +774,27 @@ def test_a_key_error_raised_after_the_open_is_not_reported_as_could_not_start(
     not "could not start", because a row's content might be what raised it. Here the verify itself
     raises the key error. Catching key errors around the whole run would turn this into exit 2.
 
-    Since vault BACKLOG #3054, item 8, it is exit 6 with a NOT CHECKED line, where it reached the
-    dispatch floor and exited 1 with no FAIL line. `CipherError` is what a Transit HMAC that fails
-    for a row raises. The line names the class and never the error's text, which names a key."""
+    Since vault BACKLOG #3054, item 8, it is still exit 1, now with a FAIL line, where it reached
+    the dispatch floor and printed none. Not a softer code: under Transit a row the provider refuses
+    raises this, so a "not checked" code would let a planted row hide every later break.
+    `CipherError` is what a Transit HMAC that fails for a row raises. The line names the class and
+    its cause's class, which tells an outage from a refused row, and never the error's text."""
     db = shell / "keyed.db"
     key = generate_key()
     _keyed_chain(db, key)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
 
     async def raising(self: MessageStore, **kwargs: object) -> object:
-        raise error("Transit audit HMAC failed (key='TEXTMARKER'): ConnectError")
+        raise error("Transit audit HMAC failed (key='TEXTMARKER')") from ConnectionError("gone")
 
     monkeypatch.setattr(MessageStore, "verify_audit_chain", raising)
     rc = main(["audit-verify", "--db", str(db)])
     captured = capsys.readouterr()
-    assert rc == 6, (captured.out, captured.err)
-    assert captured.out.startswith("NOT CHECKED: "), captured.out
-    assert f"({error.__name__})" in captured.out, captured.out
-    assert "FAIL" not in captured.out and "OK" not in captured.out, captured.out
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: "), captured.out
+    assert f"({error.__name__} from ConnectionError)" in captured.out, captured.out
+    assert "NOT CHECKED" not in captured.out and "OK" not in captured.out, captured.out
+    assert "gone" not in captured.out + captured.err, (captured.out, captured.err)
     assert "TEXTMARKER" not in captured.out + captured.err, (captured.out, captured.err)
 
 

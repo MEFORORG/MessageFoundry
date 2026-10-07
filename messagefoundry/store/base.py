@@ -2757,7 +2757,27 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
     + retired decrypt-only keyring, ``write_v2=aad_bind``). Exposed so a store-DECOUPLED PHI-at-rest
     surface — the offline uploaded-logs files (ADR 0134) — encrypts under the identical DEK / keyring /
     rotation posture as the message store, without reaching into a live ``Store`` instance's private
-    cipher. No key configured → the identity cipher (plaintext), exactly like the store."""
+    cipher. No key configured → the identity cipher (plaintext), exactly like the store.
+
+    A ``ValueError`` from the build is raised as :class:`StoreCipherConfigError`, which subclasses
+    it: at least a key that is not base64 of 32 bytes, an unknown ``cipher_provider`` and a Transit
+    client setting it refuses. Each comes from the settings or the key provider before the store
+    reads a row, so a caller can treat that class as "could not start" where a bare ``ValueError``
+    from the open could mean anything (vault BACKLOG #3054, item 8)."""
+    try:
+        return _build_store_cipher(settings)
+    except StoreCipherConfigError:
+        raise
+    except ValueError as exc:
+        raise StoreCipherConfigError(str(exc)) from exc
+
+
+class StoreCipherConfigError(ValueError):
+    """The store cipher could not be built from the settings; see :func:`build_store_cipher`. Its
+    text is the build error's, which names settings and variables, never a key."""
+
+
+def _build_store_cipher(settings: StoreSettings) -> Cipher:
     if settings.cipher_provider == "vault_transit":
         # ADR 0138: bulk at-rest crypto INSIDE Vault/OpenBao Transit — the plaintext DEK never enters
         # engine heap (ASVS 13.3.3). Lazy-imported so the base install pulls no Vault SDK; fails closed at

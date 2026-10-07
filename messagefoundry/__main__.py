@@ -950,9 +950,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
         "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store', "
         "exit 4 'this shell holds no key while its settings require one, and the chain's first "
-        "row names a key', exit 5 'the same shell, and the chain is keyless', exit 6 'a key or "
-        "key-provider error stopped the walk'). It does not apply in that shell: an empty log "
-        "there exits 2 or 5",
+        "row names a key', exit 5 'the same shell, and the chain is keyless'). It does not apply "
+        "in that shell: an empty log there exits 2 or 5",
     )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
@@ -6773,10 +6772,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
             store_slot.current = None
             await store.close()
 
-    # The store key could not be resolved. The texts of these three name settings, environment
-    # variables and files, never a key (see store/keyprovider.py, secrets_dpapi.py). Exit 2, as
-    # `rotate-key` exits on the same three: the store could not be opened, so the command could not
-    # start. Before BACKLOG #2081 they escaped to the dispatch floor.
+    # The store key could not be resolved. The texts of these classes name settings, environment
+    # variables and files, never a key (see `_key_unresolved`). Exit 2, as `rotate-key` exits on
+    # the same errors: the store could not be opened, so the command could not start. Before
+    # BACKLOG #2081 they escaped to the dispatch floor, and a malformed key did until #3054.
     key_unresolved = _key_unresolved()
 
     try:
@@ -7838,8 +7837,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         except (CipherError, KeyProviderError) as exc:
             # Raised by the walk, after the open: a Transit HMAC that failed for a row, or a key
             # provider that failed part way. Its own tuple, not `_key_unresolved()`, whose classes
-            # are raised before a row is read. Exit 6 below, never 2: rows were already read.
-            raise _AuditWalkStopped(type(exc).__name__) from exc
+            # are raised before a row is read. Exit 1 below, never 2: rows were already read.
+            cause = exc.__cause__
+            named = type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
+            raise _AuditWalkStopped(named) from exc
         finally:
             await store.close()
 
@@ -7853,17 +7854,19 @@ def _audit_verify(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except _AuditWalkStopped as exc:
-        # EXIT 6, NOT 1 (vault BACKLOG #3054, item 8). It reached the dispatch floor and exited 1 with
-        # no FAIL line, so a job reading the code took a provider outage for a broken chain. Not 2
-        # either: the store opened and rows were read. The walk has no verdict, so the line is NOT
-        # CHECKED, and it names the error's class only. Under Transit a row's content goes to the
-        # provider, so a row can cause this too, which is why 6 is never a pass.
+        # EXIT 1 WITH A FAIL LINE (vault BACKLOG #3054, item 8). It reached the dispatch floor and
+        # exited 1 with no line, so a job would see a broken chain's code with nothing to read. NOT a
+        # softer code of its own: under Transit each row goes to the provider for its MAC, so a
+        # planted row the provider refuses stops the walk, and a code that reads as "not checked"
+        # would let that row hide every break the rest of the walk would have found. The line names
+        # the error's class and its cause's class only, which tells an outage from a refused row.
         print(
-            f"NOT CHECKED: the audit chain walk stopped part way on a store key or key-provider "
-            f"error ({exc}), so the chain was neither verified nor found broken. Re-run once the "
-            "key provider answers; if it answers and this repeats, treat the log as possibly altered"
+            f"FAIL: the audit chain walk stopped part way on a store key or key-provider error "
+            f"({exc}), so the rest of the chain was not checked. Treat it as broken until a run "
+            "that finishes says otherwise: a provider outage causes this, and so can a row the "
+            "provider refuses"
         )
-        return 6
+        return 1
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; this catch is what a server backend and any error raised after the open
@@ -7907,11 +7910,13 @@ def _audit_verify(args: argparse.Namespace) -> int:
         )
         # "No first row naming a key" rather than "its first row names no key": the open refuses an
         # empty log here (#1916, exit 2), but one emptied after the open has no first row (#3054).
-        # A MATCHED anchor rules the rewrite out since the anchor was taken: rewriting a keyed chain
-        # as plain SHA-256 changes every row hash, the head included (vault BACKLOG #3110, item 2).
+        # A MATCHED anchor rules a rewrite out only SINCE the anchor was taken: rewriting a keyed
+        # chain as plain SHA-256 changes every row hash, the head included. `audit-anchor` verifies
+        # nothing, so an anchor taken after a rewrite matches it, and the cause stays named, scoped
+        # to before the anchor (vault BACKLOG #3110, item 2).
         rewrite = (
-            "The expected anchor matched, so the chain has not been rewritten since that anchor "
-            "was taken, and it was keyless then too."
+            "Or the chain was rewritten as keyless before the expected anchor was taken: it "
+            "matched, which rules out a rewrite since then and no earlier one."
             if expected_anchor is not None
             else "Or the chain was rewritten as keyless, which a keyless check cannot see."
         )
@@ -8125,7 +8130,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
+    from messagefoundry.store.base import (
+        StoreCipherConfigError,
+        StoreNotFoundError,
+        open_store,
+        resolve_active_key,
+    )
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.uploads import ResealResult, UploadStore
 
@@ -8256,7 +8266,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308).
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
-    except (NotImplementedError, StoreNotFoundError) as exc:  # #1780: no store there
+    # #1780: no store there. #3054: a key that is not base64 of 32 bytes, which the open finds
+    # when it builds the cipher, before it reads a row; `resolve_active_key` above does not decode it.
+    except (NotImplementedError, StoreNotFoundError, StoreCipherConfigError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -9430,13 +9442,14 @@ def _key_unresolved() -> tuple[type[Exception], ...]:
 
     Each is raised while the key is resolved, before the store reads a row, so nothing a database
     holds can cause one. Their texts name settings, environment variables and files, never a key.
-    A key that resolved but is not base64 of 32 bytes is one of them (vault BACKLOG #3054, item 8).
+    So is a cipher the settings cannot build, a key that is not base64 of 32 bytes among them
+    (``StoreCipherConfigError``, vault BACKLOG #3054, item 8).
     Imported here, not at module level, so the CLI's import cost stays where it is."""
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
-    from messagefoundry.store.crypto import MalformedKeyError
+    from messagefoundry.store.base import StoreCipherConfigError
     from messagefoundry.store.keyprovider import KeyProviderError
 
-    return (KeyProviderError, DpapiError, DpapiUnavailable, MalformedKeyError)
+    return (KeyProviderError, DpapiError, DpapiUnavailable, StoreCipherConfigError)
 
 
 class _StoreKeyUnresolved(RuntimeError):
@@ -9451,8 +9464,8 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
     code, and for ``admin-unlock`` and ``admin-set-notify-email`` (vault BACKLOG #3054, item 11).
     Only the OPEN is wrapped: ``open_store`` resolves the key before the backend reads a row, so
     nothing a database holds can turn a finding into "could not start". A malformed key is caught
-    by its own class, ``MalformedKeyError``, never as the bare ``ValueError`` the open raises for
-    other reasons too.
+    as ``StoreCipherConfigError``, never as the bare ``ValueError`` the open raises for other
+    reasons too.
     """
     try:
         return await opening
@@ -9462,8 +9475,9 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
 
 class _AuditWalkStopped(RuntimeError):
     """A key or key-provider error raised AFTER the store opened, while ``audit-verify`` walked the
-    chain (vault BACKLOG #3054, item 8). Its text is the error's class name only: under Transit the
-    error is raised for a row's MAC, and its own text is not this command's to print."""
+    chain (vault BACKLOG #3054, item 8). Its text is the class names of the error and its cause
+    only: under Transit the error is raised for a row's MAC, and its own text is not this command's
+    to print."""
 
 
 def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool) -> int:
@@ -9483,8 +9497,15 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
     caller forget to pass it and print text to stderr with no type error, which is the #1922 shape;
     each caller now says which mode it is in. The same holds for
     :func:`_refuse_a_store_that_is_not_an_audit_log`.
+
+    A ROW'S TEXT IS CUT FROM THE MESSAGE. SQLite's decode error quotes the column's bytes, "Could
+    not decode to UTF-8 column 'detail' with text '...'", and those bytes are a row's content, which
+    a job keeps in its log (vault BACKLOG #3054, item 10). The column name stays.
     """
-    message = f"cannot open the store at {path}: {exc}"
+    import re
+
+    shown = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
+    message = f"cannot open the store at {path}: {shown}"
     if as_json:
         print(json.dumps({"error": message}))
     else:
