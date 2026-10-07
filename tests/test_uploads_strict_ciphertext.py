@@ -525,6 +525,18 @@ async def test_a_body_unreadable_for_another_cause_still_waits_for_rotate_key(
         await store.delete(fid)
 
 
+async def test_a_body_the_engine_could_not_have_written_is_never_read(tmp_path: Path) -> None:
+    """The quota scan checks bodies under ``_quota_lock``, so a body past any size the engine could
+    have written is not read at all. It waits for an operator, like any refused upload."""
+    root = tmp_path / "uploads"
+    fid = await _plaintext_upload(root)
+    (root / f"{fid}.blob").write_bytes(b"\xff" * (3 * 1024 + 4096))
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1024)
+    assert store._scan_unsealable_sync() == []
+    assert (await store.prune_expired(now=10**12)).pruned == []
+    assert (root / f"{fid}.blob").exists()
+
+
 def test_rotate_key_notes_an_unsealable_upload_and_does_not_warn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

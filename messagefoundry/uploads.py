@@ -40,6 +40,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Protocol
 
 from messagefoundry.controlchars import strip_control_chars
@@ -294,7 +295,9 @@ class _UnsealableUpload:
 
     def expired(self, cutoff: float, now: float) -> bool:
         # An mtime more than a day ahead is not a clock the engine set: a plant dated into the future
-        # would otherwise never age out, and keep billing an uploader forever.
+        # would otherwise never age out, and keep billing an uploader forever. The cost: a clock set
+        # back more than a day, or a past ``now`` passed in, prunes these uploads early. Each one is
+        # refused on every read for good, so early is the safe direction.
         return self.modified < cutoff or self.modified > now + _SECONDS_PER_DAY
 
     def as_meta(self) -> UploadedFileMeta:
@@ -469,7 +472,8 @@ class ResealResult:
     #: How many UPLOADS this pass cannot seal and left as they were: a PLAINTEXT sidecar over a body
     #: that is missing or is not text (BACKLOG #2322). Not counted in ``skipped``: neither half is
     #: under any key, so retiring one loses nothing, and no re-run changes them. They stay refused on
-    #: every read. The retention prune removes them once they expire (:class:`_UnsealableUpload`).
+    #: every read where the store refuses plaintext. The prune removes them once they expire
+    #: (:class:`_UnsealableUpload`).
     unsealable: int = 0
     #: How many UPLOADS had a plaintext half that this pass sealed (BACKLOG #1169). It counts files,
     #: not values, so it matches the count ``serve`` logs at startup (:meth:`UploadStore.warn_if_unsealed`).
@@ -729,7 +733,7 @@ class UploadStore:
                 )
         return out
 
-    def _scan_unsealable_sync(self, *, readable: set[str]) -> list[_UnsealableUpload]:
+    def _scan_unsealable_sync(self) -> list[_UnsealableUpload]:
         """Every upload ``rotate-key`` cannot seal that the listing scan refuses (BACKLOG #2322).
 
         :meth:`_scan_metas_sync` drops each refused sidecar. Most wait for ``rotate-key``, but this
@@ -739,16 +743,15 @@ class UploadStore:
 
         Empty unless the cipher refuses plaintext. Under ``[store].allow_unmarked_ciphertext`` the
         listing scan reads these sidecars itself, and counting them here too would bill them twice.
-        ``readable`` is the ids that scan just decrypted. Their sidecars are skipped unopened, since a
-        sealed sidecar's id is bound to it. Sync: the caller runs it off the event loop."""
+        It opens every sidecar again rather than skip the ids that scan decrypted: a decrypted id is
+        the one in the sidecar's JSON, and a sealed plant can name another upload's id there. Sync:
+        the caller runs it off the event loop."""
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher) or cipher.allow_unmarked:
             return []
         out: list[_UnsealableUpload] = []
         bodies: set[str] = set()
         for fid, sidecar in self._iter_sidecars():
-            if fid in readable:
-                continue
             bodies.add(f"{fid}{_BLOB_SUFFIX}")
             held = self._unsealable_sync(fid, sidecar)
             if held is not None:
@@ -793,12 +796,19 @@ class UploadStore:
 
         ``0`` when it is missing, and its size when it does not decode as UTF-8. ``None`` also when
         it cannot be read for another cause. A decoded body is not checked again until its mtime or
-        size changes (``_body_checks``)."""
+        size changes (``_body_checks``).
+
+        Only a regular file no larger than a body the engine could have written is read, because the
+        quota scan runs this under ``_quota_lock``. A FIFO, a device or an oversized plant would
+        otherwise stall every later upload. Any of those returns ``None`` and waits for an operator."""
         try:
             stat = blob.stat()
         except FileNotFoundError:
             return 0
         except OSError:
+            return None
+        # base64 of max_bytes, plus a generous allowance for the cipher's marker and tag.
+        if not S_ISREG(stat.st_mode) or stat.st_size > 2 * self._max_bytes + 4096:
             return None
         key = (stat.st_mtime_ns, stat.st_size)
         cached = self._body_checks.get(blob.name)
@@ -1010,7 +1020,8 @@ class UploadStore:
         refusing the other.
 
         That makes two sidecar scans per save, this one and the one in ``_build_and_write``. Each
-        reads and decrypts EVERY sidecar in the directory, for every uploader, then filters, and both
+        reads and decrypts EVERY sidecar in the directory, for every uploader, then filters, and walks
+        it once more for an upload ``rotate-key`` cannot seal (BACKLOG #2322). Both
         run under the per-process ``_quota_lock``. They run off the event loop, on the operator
         diagnostic surface rather than the data plane.
 
@@ -1201,8 +1212,7 @@ class UploadStore:
         Its owner is unverified, so this errs toward refusing; :class:`_UnsealableUpload` says why."""
         metas = self._scan_metas_sync()
         sizes = [m.size for m in metas if m.uploader_id == uploader_id]
-        held = self._scan_unsealable_sync(readable={m.file_id for m in metas})
-        sizes += [h.size for h in held if h.uploader_id == uploader_id]
+        sizes += [h.size for h in self._scan_unsealable_sync() if h.uploader_id == uploader_id]
         return len(sizes), sum(sizes)
 
     async def list_files(self) -> list[UploadedFileMeta]:
@@ -1547,7 +1557,7 @@ class UploadStore:
             if not stop.is_set():
                 due += [
                     held.as_meta()
-                    for held in self._scan_unsealable_sync(readable={m.file_id for m in metas})
+                    for held in self._scan_unsealable_sync()
                     if held.expired(cutoff, at)
                 ]
             for meta in due:
