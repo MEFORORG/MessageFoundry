@@ -883,7 +883,9 @@ def parse_tree_unavailable(message_id: str, reason: str) -> Markup:
     )
 
 
-def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str) -> Markup:
+def dead_letters(
+    data: DeadLetterList, *, channel_id: str, destination_name: str, can_reveal_errors: bool
+) -> Markup:
     """The dead-letter list (newest first) + per-channel bulk replay (M3).
 
     Each row links to the audited message detail (single-message replay lives there, M2b). The bulk
@@ -906,6 +908,11 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
     "Replay all dead (every channel)" ignores the filters, by decision, and its label says so. It
     shows whenever ``data.replayable_in_scope`` is true, even on a filtered page that matched
     nothing. The engine refuses it for a channel-scoped caller (``_replay_in_scope``).
+
+    ``can_reveal_errors`` says whether the caller may open ``/ui/messages/{id}/errors``. This page
+    is gated on ``messages:read`` and the reveal on ``messages:view_raw``, so a role holding
+    ``messages:view_summary`` without ``view_raw`` sees the masked error with no link rather than a
+    link that answers 403 (BACKLOG #2440). REQUIRED for the reason the two filters are.
     """
     headers = ["Failed", "Channel", "Destination", "Type", "Attempts", "Last error", "Message"]
     body = [
@@ -916,7 +923,11 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
             d.message_type,
             d.attempts,
             # No reveal here: the message's /errors reveals it (field_authz, BACKLOG #2436).
-            _reveal_cell(d.last_error, f"/ui/messages/{_seg(d.message_id)}/errors", revealed=False),
+            _reveal_cell(
+                d.last_error,
+                f"/ui/messages/{_seg(d.message_id)}/errors" if can_reveal_errors else None,
+                revealed=False,
+            ),
             el("a", "view", href=f"/ui/messages/{_seg(d.message_id)}"),
         ]
         for d in data.dead_letters

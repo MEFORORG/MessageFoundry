@@ -987,6 +987,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 data,
                 channel_id=channel_id or "",
                 destination_name=destination_name or "",
+                # The permission ui_message_detail_errors requires, so the page offers the link
+                # only to a caller that route will answer (BACKLOG #2440).
+                can_reveal_errors=identity.has(Permission.MESSAGES_VIEW_RAW),
             )
         )
 

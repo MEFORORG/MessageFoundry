@@ -5358,12 +5358,17 @@ def create_app(
         # got nulls, and an empty value had nothing to unmask, so neither is recorded as a
         # disclosure it never received (BACKLOG #2346). A nested row's property is recorded under
         # its list's name, `outbox.last_error` or `events.detail` (BACKLOG #2436).
+        # A `viewed` event's detail is the viewer's username, which record_view above writes on
+        # EVERY open, so counting it would name `events.detail` on every error reveal whatever the
+        # message holds. Only an event of another kind can make that entry true (BACKLOG #2440).
+        # This narrows the audit record only; the redaction above still masks and lifts every row.
+        disclosing_events = [e for e in events if e.event != "viewed"]
         revealed = sorted(
             f"{prefix}{p}"
             for prefix, cls, shown in (
                 ("", MessageDetail, [detail]),
                 ("outbox.", OutboxInfo, outbox),
-                ("events.", EventInfo, events),
+                ("events.", EventInfo, disclosing_events),
             )
             for p in reveal[cls]
             if any(getattr(m, p) for m in shown)
