@@ -4318,7 +4318,7 @@ def create_app(
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> DeadLetterReplayResult | PendingApprovalResponse:
         """Re-queue dead-lettered deliveries (optionally scoped). Already-delivered rows are left
-        alone; each affected message reverts from ``error`` to ``received`` and re-drains."""
+        alone; each affected message reverts from ``error`` to ``routed`` and re-drains."""
         # A channel-scoped user must target one of their channels (replay isn't channel-filtered at
         # the engine level, so an unscoped "replay all" would cross channels).
         if not _replay_in_scope(identity, req.channel_id):
@@ -9241,6 +9241,18 @@ def create_managed_app(
                 except Exception:
                     _log.exception(
                         "approval gate: the shutdown drain failed; continuing the teardown"
+                    )
+            # BACKLOG #2216: a lock notice still in flight reads and writes the audit log, then
+            # hands its mail to the security notifier, so it drains before engine.stop() closes the
+            # store and before that notifier stops below. Bounded, and it logs and cancels what it
+            # cannot finish; guarded like the drain above so a failure cannot skip engine.stop().
+            if auth is not None:
+                try:
+                    await auth.close_background()
+                except Exception:
+                    _log.exception(
+                        "auth: the shutdown drain of background notices failed; continuing the "
+                        "teardown"
                     )
             # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
             # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING

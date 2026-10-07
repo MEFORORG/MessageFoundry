@@ -691,7 +691,7 @@ class _GroupCommitter:
 
 class MessageStatus(str, Enum):  # noqa: UP042
     RECEIVED = "received"  # persisted at ingress, awaiting router+transform (staged pipeline)
-    ROUTED = "routed"  # router produced ≥1 delivery; outbound rows queued, awaiting delivery
+    ROUTED = "routed"  # router selected at least one handler; awaiting transform and/or delivery
     PROCESSED = "processed"  # all destinations terminal (done or dead)
     ERROR = "error"  # parse/validation/processing failure (dead-lettered); logged, not routed
     FILTERED = "filtered"  # rejected by the channel filter; logged, intentionally not routed
@@ -9586,16 +9586,15 @@ class MessageStore:
                 (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
             )
             if cur.rowcount:
-                # Status reflects the earliest re-queued stage: a pending ingress/routed row → RECEIVED
-                # (back in the route/transform path); else outbound only → ROUTED (awaiting delivery).
+                # Status reflects the earliest re-queued stage, per ADR 0001's count-and-log flow. A
+                # pending INGRESS row gives RECEIVED: the router has not run, and route_handoff writes
+                # the disposition again. Anything else gives ROUTED: a routed row exists only because
+                # the router already selected its handler, and the router never re-runs for it.
+                # RECEIVED there would strand the message, because the finalizer collapses a no-rows
+                # message to FILTERED / NOT_DEPLOYED only from ROUTED (vault BACKLOG #2723).
                 pre = await self._db.execute(
-                    "SELECT 1 FROM queue WHERE message_id=? AND stage IN (?, ?) AND status=? LIMIT 1",
-                    (
-                        message_id,
-                        Stage.INGRESS.value,
-                        Stage.ROUTED.value,
-                        OutboxStatus.PENDING.value,
-                    ),
+                    "SELECT 1 FROM queue WHERE message_id=? AND stage=? AND status=? LIMIT 1",
+                    (message_id, Stage.INGRESS.value, OutboxStatus.PENDING.value),
                 )
                 status = (
                     MessageStatus.RECEIVED.value

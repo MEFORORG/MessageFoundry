@@ -24,7 +24,15 @@ import sqlite3
 import time
 import unicodedata
 import urllib.request
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -667,6 +675,18 @@ _T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
+class RolesGained:
+    """The roles a directory sign-in's role sync NEWLY gave an account (vault BACKLOG #2610).
+
+    ``username`` is the account the sync wrote to, which is not always the name the directory
+    presented, so a caller keys on this and never on the sign-in's input. ``roles`` holds role ids
+    and is never empty: a sync that gained nothing reports no :class:`RolesGained` at all."""
+
+    username: str
+    roles: frozenset[str]
+
+
+@dataclass(frozen=True)
 class LoginOutcome:
     """Result of a login attempt. ``error`` is for logs/audit — never leak the reason to clients."""
 
@@ -689,6 +709,12 @@ class LoginOutcome:
     #: "always ``None`` on the local/AD/Kerberos paths" and stopped being true. A slug the browser
     #: layer's map does not know collapses to its generic code, which is the safe default.
     reason: str | None = None
+    #: Set only by a directory sign-in whose role sync newly gave the account a role (vault BACKLOG
+    #: #2610). ``auth/`` raises no alert (CLAUDE.md section 4), so every route that completes a
+    #: directory sign-in reads this and raises ``administrator_granted`` when Administrator is among
+    #: the roles. Set on a refused outcome too: a bind landing between the sync and the mint refuses
+    #: the session after the roles were written, and that grant happened all the same.
+    roles_gained: RolesGained | None = None
 
 
 @dataclass(frozen=True)
@@ -1528,8 +1554,8 @@ def _directory_answer_mismatch(principal: AdPrincipal, object_id: str) -> str | 
 @dataclass
 class _KeyedLock:
     """One entry of a per-account lock table, with a count of the tasks holding or awaiting it so the
-    entry can be dropped when the last one leaves. The re-proof table and the credential table both
-    use it (:func:`_hold_keyed_lock`)."""
+    entry can be dropped when the last one leaves. The re-proof table, the credential table and the
+    lock-notice table (BACKLOG #2216) each use it (:func:`_hold_keyed_lock`)."""
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
@@ -1818,6 +1844,14 @@ def _json(obj: Any) -> str:
 #: it throttles over. See :meth:`AuthService._lock_notice_due`.
 _LOCK_NOTICE_ACTION: Final = LOCK_NOTICE_ACTION
 _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
+#: BACKLOG #2216: how long the API lifespan's :meth:`AuthService.drain_background` lets the
+#: service's background tasks finish at shutdown before it cancels the rest, and how long it then
+#: waits for the cancelled ones to unwind. Both are shares of the service's graceful-stop window,
+#: whose budget is stated at ``DRAIN_TIMEOUT_SECONDS`` in ``api/approvals.py``; keep the sum inside
+#: it. A task still running at the first bound is queued behind other throttle reads, or stuck on
+#: the store. A task still unwinding at the second is left to finish or fail on its own.
+_BACKGROUND_DRAIN_SECONDS: Final = 2.0
+_BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 
 #: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_credential_issuer` finds the audit row
 #: that issued an account's current temporary password. The two issuing paths stamp
@@ -2225,6 +2259,20 @@ class AuthService:
         # same caveat as the re-proof table above: engine shards serving their own API ports each
         # keep their own table, so the bound holds per process, not across them.
         self._credential_locks: dict[str, _KeyedLock] = {}
+        # BACKLOG #2216: one in-flight ACCOUNT_LOCKED notice per (user id, lock kind), so two locks of
+        # one kind landing together read the throttle one after the other and mail once. Its own table:
+        # the credential queue above is held across a sign-in's pad, and the notice runs off it. Per
+        # API process, like that queue: engine shards serving their own API ports each keep one, so
+        # two locks landing on two of them at once can still mail twice.
+        self._lock_notice_locks: dict[str, _KeyedLock] = {}
+        # BACKLOG #2216: strong references to the service's background tasks, so a running one is not
+        # garbage-collected. Each removes itself when done; drain_background() awaits the rest.
+        self._background_tasks: set[asyncio.Task[None]] = set()
+        # Set by drain_background(close=True) at shutdown. After it, a lock notice runs inline,
+        # since a task started then would outlive the drain and meet a closed store.
+        self._background_closed = False
+        # One throttle read at a time (BACKLOG #2216); see _lock_notice_held_back.
+        self._lock_notice_read_slots = asyncio.Semaphore(1)
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
         # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
         # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
@@ -2394,6 +2442,50 @@ class AuthService:
         API lifespan passes the notifier to the constructor and never calls this. Call it before
         the first operation that could notify; it replaces whatever channel was wired."""
         self._security_notifier = notifier
+
+    def _start_background(self, work: Coroutine[Any, Any, None]) -> None:
+        """Run ``work`` as a task this service owns (BACKLOG #2216).
+
+        The set holds a strong reference, since the event loop keeps only a weak one and a running
+        task with no other holder can be garbage-collected. ``work`` must log its own failures: the
+        task's result is read by nobody but :meth:`drain_background`."""
+        task = asyncio.create_task(work)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def close_background(self) -> None:
+        """The shutdown drain (BACKLOG #2216): :meth:`drain_background` with ``close=True`` and
+        the :data:`_BACKGROUND_DRAIN_SECONDS` bound. The API lifespan calls it; so must any app
+        that owns its engine some other way, before it stops the engine."""
+        await self.drain_background(timeout=_BACKGROUND_DRAIN_SECONDS, close=True)
+
+    async def drain_background(self, *, timeout: float | None = None, close: bool = False) -> None:
+        """Let the service's background tasks finish. With ``timeout``, cancel any still running
+        at it, and give those at most :data:`_BACKGROUND_CANCEL_GRACE_SECONDS` to unwind.
+
+        BACKLOG #2216. The API lifespan calls this at shutdown with ``close=True`` and
+        :data:`_BACKGROUND_DRAIN_SECONDS`, BEFORE the engine closes the store and before the
+        security notifier stops. A pending ``ACCOUNT_LOCKED`` notice still reads the audit log,
+        hands its mail to that notifier and writes its row. ``close`` also makes every later
+        notice run inline, so none starts after the drain and meets a closed store. A task
+        cancelled here logs a line that names no account, so a notice cut off at shutdown is on
+        record as cut off. **An app that owns its engine some other way than the managed lifespan
+        calls this itself, the same way, before it stops the engine.**
+
+        With no ``timeout`` it is a join and cancels nothing, which is what tests await instead of
+        sleeping. A task started while it waits is waited for too. Safe to call more than once."""
+        if close:
+            self._background_closed = True
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while pending := set(self._background_tasks):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is None or remaining > 0:
+                await asyncio.wait(pending, timeout=remaining)
+                continue  # re-read the set: some finished, and new ones may have started
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=_BACKGROUND_CANCEL_GRACE_SECONDS)
+            return
 
     @property
     def policy(self) -> PasswordPolicy:
@@ -4710,6 +4802,10 @@ class AuthService:
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
+        # vault BACKLOG #2610: only a role this sync ADDED is reported, so an account that already
+        # held Administrator pages nobody on each sign-in.
+        gained = frozenset(role_ids) - previous
+        roles_gained = RolesGained(user.username, gained) if gained else None
         if set(role_ids) != previous:
             # Directory-side role change (often a downgrade): revoke the user's other live sessions
             # so stale elevated tokens don't linger until expiry (AUTH-AD-REVOKE). The new session
@@ -4799,9 +4895,10 @@ class AuthService:
                 # the account's other sessions as that sync always does. The reason is
                 # also written for a row deleted in the same window, which the guard
                 # refuses too; that row has no binding to look for.
-                return await self._refuse_directory_row(
+                refused = await self._refuse_directory_row(
                     principal.username, FEDERATED_SIGN_IN_REQUIRED, client=client
                 )
+                return replace(refused, roles_gained=roles_gained)
             await self._directory_reject_audit(
                 principal.username, "oidc", "federated_subject_unbound"
             )
@@ -4809,6 +4906,7 @@ class AuthService:
                 ok=False,
                 error="federated sign-in failed",
                 reason="federated_subject_unbound",
+                roles_gained=roles_gained,
             )
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
         # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
@@ -4856,6 +4954,7 @@ class AuthService:
             token=token,
             identity=identity,
             mfa_required=mfa_required,
+            roles_gained=roles_gained,
         )
 
     async def _sync_ad_channel_scope(
@@ -11055,7 +11154,15 @@ class AuthService:
         **``audit_detail`` MIRRORS THE ATTEMPT'S OWN ROW, never ``notice_detail``.** The failure count
         goes in the notice only. The audit row carries no more than the ``auth.login_failed``,
         ``auth.mfa_failed`` or ``auth.login_success`` row beside it. The attempt itself stays audited
-        once, by that row; this adds the event the attempt caused."""
+        once, by that row; this adds the event the attempt caused.
+
+        **AN ``ACCOUNT_LOCKED`` NOTICE WITH A NOTIFIER WIRED RUNS OFF THE REQUEST PATH (BACKLOG
+        #2216).** Its throttle reads the audit log (:meth:`_lock_notice_due`), and every caller is
+        a refusal: the sign-in's deferred rows, which must fit the write room of its padded slot,
+        and the second-step and re-proof refusals. So the throttle and the mail run as one task the
+        service owns (:meth:`_send_lock_notice`), and this returns once the ``auth.account_locked``
+        row is in. The row stays inline, since it is the record the feed reads. With no notifier
+        the throttle reads nothing and writes one row, so that arm stays inline too."""
         action = _SUSPICIOUS_LOGIN_ACTIONS[event_type]
         await self._audit(
             action,
@@ -11063,10 +11170,17 @@ class AuthService:
             detail=_json(audit_detail) if audit_detail is not None else None,
             client=client,
         )
-        if event_type == ACCOUNT_LOCKED and not await self._lock_notice_due(
-            user, str(notice_detail.get("lock", "sign_in"))
-        ):
-            return
+        if event_type == ACCOUNT_LOCKED:
+            lock = str(notice_detail.get("lock", "sign_in"))
+            if self._security_notifier is not None:
+                send = self._send_lock_notice(user, lock, client=client, detail=dict(notice_detail))
+                if self._background_closed:
+                    await send  # shutting down: a task would outlive the drain
+                else:
+                    self._start_background(send)
+                return
+            if not await self._lock_notice_due(user, lock):
+                return
         await self._notify_security(
             event_type,
             username=user.username,
@@ -11075,8 +11189,69 @@ class AuthService:
             detail=notice_detail,
         )
 
+    async def _send_lock_notice(
+        self, user: UserRecord, lock: str, *, client: str | None, detail: dict[str, Any]
+    ) -> None:
+        """Decide whether an ``ACCOUNT_LOCKED`` notice is due and send it, off the request path.
+
+        BACKLOG #2216. :meth:`_record_suspicious_login` starts this as a background task, or awaits
+        it once :meth:`drain_background` has closed the service to new ones.
+
+        **Serialized per account and lock kind** (``_lock_notice_locks``). Off the request path two
+        locks of one kind can land together, for example a sign-in lock set by a re-proof while a
+        sign-in sets it too. Each would read the throttle before the other wrote its row, and the
+        owner would get two mails. Under the lock the second reads the first's row.
+
+        **The mail goes before its ``auth.lock_notice`` row.** A row write that fails or is cut off
+        then costs at most a duplicate mail at the next lock, which the throttle already treats as
+        the cheap failure.
+
+        **Its failures are logged by exception class only, and its log lines name no account,
+        user id or lock kind.** ``GET /logs/tail`` serves the log to ``logs:view``, and a lock
+        notice is silent there by design (``LOG_SILENT_EVENT_TYPES``). A store error raised here
+        used to fail the request; now nobody would read it, so it is logged instead. A task
+        cancelled before it finishes, at shutdown, logs a line saying the notice may be neither
+        mailed nor recorded, as :func:`_write_through_cancellation` does for a refused sign-in's
+        rows. These lines still show a ``logs:view`` reader WHEN some lock's notice failed, though
+        not whose: the residual ``docs/SECURITY.md`` states."""
+        try:
+            async with _hold_keyed_lock(self._lock_notice_locks, f"{user.id}\x00{lock}"):
+                # Read once: ``attach_security_notifier`` can detach the channel while this waits.
+                # Without one, _lock_notice_due writes the no-notifier row itself.
+                wired = self._security_notifier is not None
+                if not await self._lock_notice_due(user, lock):
+                    return
+                # The mail BEFORE its row, and the row says whether the notifier took it. A
+                # cut-off or failed row write, or a refused hand-off, then costs at most a
+                # duplicate mail at the next lock, the cheap failure. The other order could leave
+                # a row saying a mail went out that never did, holding the next one back a day.
+                handed = await self._notify_security(
+                    ACCOUNT_LOCKED,
+                    username=user.username,
+                    email=user.notify_email,
+                    client=client,
+                    detail=detail,
+                )
+                if wired:
+                    await self._record_lock_notice(user, lock, handed=handed)
+        except asyncio.CancelledError:
+            _log.warning(
+                "a security notice was cancelled before it finished; it may be neither mailed "
+                "nor recorded"
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - nobody awaits this task; log and stop
+            _log.error(
+                "a security notice failed off the request path (%s); it may be neither mailed "
+                "nor recorded",
+                type(exc).__name__,
+            )
+
     async def _lock_notice_due(self, user: UserRecord, lock: str) -> bool:
-        """Whether an ``ACCOUNT_LOCKED`` mail for this ``lock`` kind is due, and if so, record it.
+        """Whether an ``ACCOUNT_LOCKED`` mail for this ``lock`` kind is due.
+
+        With a notifier wired, the caller records a due notice AFTER the mail, through
+        :meth:`_record_lock_notice` (BACKLOG #2216). With none, this writes the row itself.
 
         ADR 0197 Decision item 7 (BACKLOG #1131): at most one mail per lock kind per account per
         :data:`_LOCK_NOTICE_WINDOW_SECONDS`, and always a mail for the first lock after a quiet window.
@@ -11101,7 +11276,11 @@ class AuthService:
         every 15 minutes, but its row says ``mailed: false``, so once an address is set the next
         lock of that kind IS mailed rather than held back by a notice nobody received. A failed read
         fails OPEN, sending the mail, and is logged: a duplicate notice is the cheap failure here, a
-        missing one the costly."""
+        missing one the costly.
+
+        **With a notifier wired this runs in :meth:`_send_lock_notice`'s task, never on a request
+        (BACKLOG #2216)**, so the read cannot overrun a refusal's padded slot however large the
+        audit log grows. Without one it runs inline and reads nothing."""
         if self._security_notifier is None:
             if self._settings.notify_security_events:
                 await self._audit(
@@ -11110,21 +11289,34 @@ class AuthService:
                     detail=_json({"lock": lock, "mailed": False, "reason": "no_notifier"}),
                 )
             return True
+        return not await self._lock_notice_held_back(user, lock)
+
+    async def _lock_notice_held_back(self, user: UserRecord, lock: str) -> bool:
+        """The throttle's READ: whether a notice of this ``lock`` kind already went out in the window.
+
+        Kept apart from the row write, so the background task can send the mail between this read
+        and :meth:`_record_lock_notice` (BACKLOG #2216). One such read runs at a time per
+        service (``_lock_notice_read_slots``). It walks every recent ``auth.lock_notice`` row of
+        every account, since the audit log has no actor index. Many locks at once would otherwise
+        fill the store's read pool, which sign-ins wait on too.
+
+        A failed read fails OPEN (``False``) and is logged by exception class alone. The line names
+        neither the account nor the notice kind (BACKLOG #1131): it runs only when a lock lands,
+        and ``GET /logs/tail`` serves the log to ``logs:view``. A traceback would carry the
+        driver's message, which can quote the bound username."""
         mailable = bool(user.notify_email)
-        now = time.time()
-        since = max(now - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
+        since = max(time.time() - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
         try:
-            rows = await self._store.list_audit(
-                actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
+            async with self._lock_notice_read_slots:
+                rows = await self._store.list_audit(
+                    actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
+                )
+        except Exception as exc:  # noqa: BLE001 - fails open by design, and is logged
+            _log.error(
+                "a security-notice throttle read failed (%s); the notice was sent unthrottled",
+                type(exc).__name__,
             )
-        except Exception:
-            # Names neither the account nor the notice kind (BACKLOG #1131): this line runs only
-            # when a lock lands, and ``GET /logs/tail`` serves the log to ``logs:view``. It still
-            # tells an operator the store read failed and that a notice went unthrottled.
-            _log.exception(
-                "a security-notice throttle read failed; the notice was sent unthrottled"
-            )
-            rows = []
+            return False
         for row in rows:
             try:
                 detail = json.loads(row["detail"] or "{}")
@@ -11133,13 +11325,21 @@ class AuthService:
                 continue
             # A row that mailed nothing holds back only another addressless notice.
             if kind == lock and (mailed is not False or not mailable):
-                return False
+                return True
+        return False
+
+    async def _record_lock_notice(self, user: UserRecord, lock: str, *, handed: bool) -> None:
+        """Write the ``auth.lock_notice`` row the throttle reads, after the mail.
+
+        ``mailed`` is true only when the account had an address AND the notifier took the event
+        (``handed``, BACKLOG #2019). A refused hand-off then writes ``mailed: false``, which holds
+        back no later mailable notice, so the next lock mails again rather than staying quiet for
+        a day."""
         await self._audit(
             _LOCK_NOTICE_ACTION,
             actor=user.username,
-            detail=_json({"lock": lock, "mailed": mailable}),
+            detail=_json({"lock": lock, "mailed": bool(user.notify_email) and handed}),
         )
-        return True
 
     async def _notify_security(
         self,

@@ -475,13 +475,12 @@ stateDiagram-v2
   RECEIVED --> ROUTED: the Router picked one or more Handlers
   RECEIVED --> UNROUTED: the Router picked no Handler
   RECEIVED --> ERROR: a row is dead
-  RECEIVED --> PROCESSED: after a replay of a routed row, every outbound row resolved
   ROUTED --> PROCESSED: every outbound row resolved, none dead
   ROUTED --> FILTERED: every Handler ran and sent nothing
   ROUTED --> NOT_DEPLOYED: every Send was declined
   ROUTED --> ERROR: a row is dead
-  ERROR --> RECEIVED: replay of a dead ingress or routed row
-  ERROR --> ROUTED: replay of outbound rows
+  ERROR --> RECEIVED: replay of a dead ingress row
+  ERROR --> ROUTED: replay of routed or outbound rows
   PROCESSED --> ROUTED: replay or resend
   PROCESSED --> [*]
   FILTERED --> [*]
@@ -509,13 +508,12 @@ covers the moves that are not drawn.
 | `RECEIVED` | `ROUTED` | The Router picks one or more Handlers. |
 | `RECEIVED` | `UNROUTED` | The Router picks no Handler. |
 | `RECEIVED` | `ERROR` | A row is dead, and no row is pending or in flight. Most often it is the ingress row: the Router raised, or the inbound Connection left the config. |
-| `RECEIVED` | `PROCESSED` | Only after a replay put a routed row back. The Handler runs again and its deliveries resolve. The message does not pass through `ROUTED` on this path. |
 | `ROUTED` | `PROCESSED` | No row is pending or in flight, none is dead, and at least one outbound row exists. Each one was delivered, or an operator purged it from the queue. |
 | `ROUTED` | `FILTERED` | Every Handler ran, and none of them sent anything. |
 | `ROUTED` | `NOT_DEPLOYED` | No delivery was queued, and at least one Send was declined because its target Connection is in the graph but not deployed. |
 | `ROUTED` | `ERROR` | A row is dead, and no row is pending or in flight. A row goes dead when a Handler raises, a partner rejects the message permanently, or the delivery attempts run out. It also goes dead when its Handler or its outbound Connection has left the config. |
-| `ERROR` | `RECEIVED` | A message replay puts a dead ingress or routed row back in the queue. |
-| `ERROR` | `ROUTED` | A message replay or a dead-letter replay puts dead outbound rows back in the queue. A resend also moves the message to `ROUTED`, because it adds a new outbound row. |
+| `ERROR` | `RECEIVED` | A message replay puts a dead ingress row back in the queue. The Router runs again. |
+| `ERROR` | `ROUTED` | A message replay puts a dead routed row back in the queue: the Router already chose that Handler, so the Handler runs again and the message settles from `ROUTED` as usual, to `FILTERED` or `NOT_DEPLOYED` as well if it now sends nothing. A message replay or a dead-letter replay puts dead outbound rows back in the queue. A resend also moves the message to `ROUTED`, because it adds a new outbound row. |
 | `PROCESSED` | `ROUTED` | A message replay sends the delivered rows again. A resend queues the stored body to another outbound Connection. |
 
 A new message also starts at `RECEIVED` in at least three other cases:
@@ -532,10 +530,10 @@ already has.
 
 **Replay works on queue rows.** A message replay first looks for dead or pending rows. If it finds
 any, it puts only those back and leaves the delivered rows alone. If it finds none, it sends the
-delivered rows again. The message then shows `RECEIVED` if an ingress or routed row is waiting, and
-`ROUTED` if only outbound rows are. An `ERROR` recorded before ingress has no queue row. Neither
-does an `UNROUTED`, `FILTERED` or `NOT_DEPLOYED` message. A replay of any of these changes nothing,
-and the API answers 409.
+delivered rows again. The message then shows `RECEIVED` if an ingress row is waiting, and `ROUTED`
+otherwise, because a routed row exists only after the Router ran. An `ERROR` recorded before
+ingress has no queue row. Neither does an `UNROUTED`, `FILTERED` or `NOT_DEPLOYED` message. A replay
+of any of these changes nothing, and the API answers 409.
 
 **An edit and resubmit makes a new message.** By default the edited body enters as a new `RECEIVED`
 message and takes the whole path again. When the operator names a target outbound Connection, the

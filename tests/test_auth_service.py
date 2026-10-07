@@ -454,6 +454,8 @@ async def test_notifier_fires_once_on_account_lockout() -> None:
         await _local_user(store)
         for _ in range(3):
             await service.login("bob", "wrong", client="10.0.0.9")
+        # The lock notice runs as a background task (BACKLOG #2216); finish it, never sleep.
+        await service.drain_background()
         locked = [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
         assert len(locked) == 1  # exactly one notice on the attempt that crosses the threshold
         assert locked[0].username == "bob"

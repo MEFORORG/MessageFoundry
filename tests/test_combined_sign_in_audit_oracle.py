@@ -234,8 +234,8 @@ async def test_counting_is_unchanged_right_password_charges_the_second_step_coun
 
 
 class _FakeNotifier:
-    """Captures out-of-band security events instead of emailing them, so ``_lock_notice_due`` sees a
-    wired notifier and writes its ``auth.lock_notice`` row."""
+    """Captures out-of-band security events instead of emailing them, so the service sees a wired
+    notifier and its lock-notice task writes the ``auth.lock_notice`` row (BACKLOG #2216)."""
 
     def __init__(self) -> None:
         self.events: list[Any] = []
@@ -396,6 +396,9 @@ async def _campaign(world: _World, *, right_password: bool) -> None:
         world.steps.next_code()
         out = await world.service.login(ADMIN_USERNAME, sent, totp_code=world.steps.wrong_code())
         assert not out.ok
+    # The lock notice and its ``auth.lock_notice`` row are written by a background task (BACKLOG
+    # #2216), so the campaign finishes it before anyone reads the trail.
+    await world.service.drain_background()
 
 
 async def _lapse_sign_in_lock_then_probe(world: _World, *, right_password: bool) -> None:
@@ -414,6 +417,7 @@ async def _lapse_sign_in_lock_then_probe(world: _World, *, right_password: bool)
 async def _admin_unlock(world: _World, monkeypatch: pytest.MonkeyPatch) -> _World:
     """Run the real ``admin-unlock`` CLI against the world's database (engine stopped, as ADR 0171
     requires), then reopen the engine on the same file. Returns the reopened world."""
+    await world.service.drain_background()
     await world.engine.stop()
     monkeypatch.chdir(world.db.parent)
     setenv_at_rest_opt_out(monkeypatch)
@@ -1024,6 +1028,8 @@ async def test_a_failed_throttle_read_names_neither_the_account_nor_the_lock(
                 steps.next_code()
                 sent = await service.login(ADMIN_USERNAME, password, totp_code=steps.wrong_code())
                 assert not sent.ok
+            # The throttle reads in a background task (BACKLOG #2216): finish it inside the capture.
+            await service.drain_background()
         assert [r for r in caplog.records if "throttle read failed" in r.getMessage()], (
             "the control: the failed read was not reported at all"
         )
