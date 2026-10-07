@@ -274,7 +274,10 @@ _BASELINE_RESPONSE_HEADERS: tuple[tuple[str, str], ...] = (
     ("X-Content-Type-Options", "nosniff"),
     ("Referrer-Policy", "no-referrer"),
     ("X-Frame-Options", "DENY"),
-    ("Content-Security-Policy", "frame-ancestors 'none'"),
+    # base-uri beside frame-ancestors, as the API floor sends it (ASVS 3.4.3, BACKLOG #2341). One
+    # field, decided by NAME: no caller of build_response supplies a CSP today (handlers cannot set
+    # response headers here), and one that did would own the whole policy, as the test pins.
+    ("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'"),
 )
 
 

@@ -47,6 +47,7 @@ from websockets.version import version as websockets_version
 
 from messagefoundry.api import create_app, protocol_headers
 from messagefoundry.api.header_floor import (
+    BASE_URI_CSP,
     BASELINE_SECURITY_HEADERS,
     CSP_HEADER,
     FRAME_ANCESTORS_CSP,
@@ -131,31 +132,44 @@ async def _exchange(port: int, request: bytes) -> tuple[int, list[tuple[str, str
 
 
 def _floored(headers: list[tuple[str, str]]) -> bool:
-    """Whether a response carries the whole baseline and denies framing in EVERY policy it sends."""
+    """Whether a response carries the whole baseline and denies framing and ``<base>`` (BACKLOG
+    #2341) in EVERY policy it sends that names either."""
     baseline = all((n.lower(), v) in headers for n, v in BASELINE_SECURITY_HEADERS)
-    directives = _frame_ancestors(headers)
-    return baseline and bool(directives) and all(d == FRAME_ANCESTORS_CSP for d in directives)
+    return baseline and _csp_floored(headers)
 
 
-def _frame_ancestors(headers: list[tuple[str, str]]) -> list[str]:
+def _directives(headers: list[tuple[str, str]], name: str) -> list[str]:
     return [
         d.strip()
         for n, policy in headers
         if n == CSP_HEADER.lower()
         for d in policy.split(";")
-        if d.strip().casefold().startswith("frame-ancestors")
+        if d.strip().casefold().startswith(name)
     ]
 
 
+def _frame_ancestors(headers: list[tuple[str, str]]) -> list[str]:
+    return _directives(headers, "frame-ancestors")
+
+
+def _csp_floored(headers: list[tuple[str, str]]) -> bool:
+    framing = _frame_ancestors(headers)
+    base = _directives(headers, "base-uri")
+    return (
+        bool(framing)
+        and all(d == FRAME_ANCESTORS_CSP for d in framing)
+        and bool(base)
+        and all(d == BASE_URI_CSP for d in base)
+    )
+
+
 def _protocol_floored(headers: list[tuple[str, str]]) -> bool:
-    """The protocol layer's set: ``nosniff`` exactly once, and framing denied in every policy."""
+    """The protocol layer's set: ``nosniff`` exactly once, and framing and base-uri denied."""
     names = [n for n, _ in headers]
-    directives = _frame_ancestors(headers)
     return (
         names.count("x-content-type-options") == 1
         and ("x-content-type-options", "nosniff") in headers
-        and bool(directives)
-        and all(d == FRAME_ANCESTORS_CSP for d in directives)
+        and _csp_floored(headers)
     )
 
 
