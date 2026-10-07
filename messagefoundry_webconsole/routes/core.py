@@ -354,9 +354,16 @@ def _spent_name(request: Request, key: str, to: str | None, rest: str) -> str:
     return "\x00".join((request.path_params["message_id"], to or "", key, rest))
 
 
-def _body_digest(raw: str) -> str:
-    """Names an edited body in a spend record without holding the body (PHI) in memory."""
-    return hash_bytes(raw.encode("utf-8", "surrogatepass"))
+def _body_digest(request: Request, raw: str) -> str:
+    """Names an edited body in a spend record without holding the body (PHI) in memory. Hashed
+    once per request and kept in the ASGI scope, since a body may run to megabytes and the hash
+    runs on the event loop; the gate and the route both ask for it."""
+    cache = request.scope.setdefault("mf_2625", {})
+    digest = cache.get("digest")
+    if not isinstance(digest, str):
+        digest = hash_bytes(raw.encode("utf-8", "surrogatepass"))
+        cache["digest"] = digest
+    return digest
 
 
 def _fits_key(value: str) -> bool:
@@ -1156,10 +1163,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def _resend_logged(request: Request) -> bool:
         """Whether ``resend_log`` already holds this resend's key, so the store can only answer it
         as ADR 0090's duplicate (vault BACKLOG #2625). It covers a repeat after a restart, when no
-        spend record survives. Only the plain resend reads it: a row records no actor and no
-        action, and the resend handler renders no body and queues nothing on a duplicate. Read
-        once per request (kept in the ASGI scope), so the gate and the route agree. Never under
-        the org opt-out."""
+        spend record survives. It matches the key, message and target, not the source, which is
+        safe because a duplicate queues nothing. Only the plain resend reads it: a row records no
+        actor and no action, and the resend handler renders no body and queues nothing on a
+        duplicate. Read at most once per request (kept in the ASGI scope); the gate skips it when
+        a spend record already answered. Never under the org opt-out."""
         auth = get_auth(request)
         if auth is None or not auth.action_step_up_required:
             return False
@@ -1254,7 +1262,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # selection. The stale key is not carried: the confirm page mints a fresh one.
                 reauth_next=_resend_confirm_next,
                 spend=False,
-                # A same-key repeat asks for no fresh proof (vault BACKLOG #2625, _is_repeat).
+                # A double-click's repeat passes without a proof, for the route to decide
+                # (vault BACKLOG #2625, _spend_on_record and _resend_logged).
                 repeat=_resend_is_repeat,
             )
         ),
@@ -1306,6 +1315,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     STEP_UP_ACTION_MESSAGE_RESEND,
                     reauth_next=_resend_confirm_next,
                     key=_spent_name(request, body.idempotency_key, body.to, source),
+                    identity=identity,
                 )
             )
         except RepeatRefused as repeat:
@@ -1396,14 +1406,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return form
 
     async def _resubmit_is_repeat(request: Request) -> bool:
+        auth = get_auth(request)
+        if auth is None or not auth.action_step_up_required:
+            return False  # no proof is spent under the opt-out, so hash nothing
         form = await _resubmit_form(request)
+        key = str(form.get("idempotency_key", "")).strip()
+        if not _fits_key(key):
+            return False
         direct = str(form.get("mode", "reroute")) == "direct"
         return _spend_on_record(
             request,
             STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
-            key=str(form.get("idempotency_key", "")).strip(),
+            key=key,
             to=str(form.get("to", "")).strip() if direct else None,
-            rest=_body_digest(str(form.get("raw", ""))),
+            rest=_body_digest(request, str(form.get("raw", ""))),
         )
 
     @app.post("/ui/messages/{message_id}/edit-resend")
@@ -1425,7 +1441,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # POST path (a re-POST would drop the edited body).
                 reauth_next=_edit_page,
                 spend=False,
-                # A same-key repeat asks for no fresh proof (vault BACKLOG #2625, _is_repeat).
+                # A double-click's repeat passes without a proof, for the route to decide
+                # (vault BACKLOG #2625, _spend_on_record).
                 repeat=_resubmit_is_repeat,
             )
         ),
@@ -1481,7 +1498,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 request,
                 STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
                 reauth_next=_edit_page,
-                key=_spent_name(request, body.idempotency_key, body.to, _body_digest(raw)),
+                key=_spent_name(request, body.idempotency_key, body.to, _body_digest(request, raw)),
+                identity=identity,
             )
         except RepeatRefused as repeat:
             # A double-click whose first POST the handler refused: the same answer, with the

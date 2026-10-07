@@ -2091,10 +2091,12 @@ drops an edit the operator is about to type, and a refusal of the console's own 
 A refusal from the engine handler comes after the spend: the next submit asks again and re-opens the
 editor from the stored body, as an expired grant (300 s by default) does. The console resend checks
 its own input before it spends the proof too. On both, a double-click asks for no second proof.
-The console marks each request it spends a proof on, and only an identical request counts as its
-repeat: the same key, target and source, or for edit-resend the same edited body. A repeat of a
-plain resend also counts when the key already has a `resend_log` row. A repeat that arrives while
-the first request runs waits for it, up to the request timeout. If the handler refused the first,
+The console marks each request it spends a proof on. Only an identical request rides on that mark.
+For a resend that means the same key, target and source. For an edit-resend it means the same key,
+target and edited body. A plain resend whose key already has a `resend_log` row also needs no
+proof, whatever its source, because the store answers it as a duplicate and queues nothing. A
+repeat that arrives while the first request runs waits for it, for two minutes at most. Past that,
+or if the session changed meanwhile, it goes to re-auth. If the handler refused the first,
 the repeat gets the same refusal and runs nothing. The mark goes with that refusal, so the next
 submit asks for a proof again. A refusal of a repeat drops the mark too. A request that ends any
 other way keeps its mark, an error or a cancel by a timeout or a disconnect included. The store may

@@ -656,26 +656,23 @@ async def test_a_repeat_in_flight_waits_and_takes_the_first_ones_refusal(
     await _add(service, "op", Role.OPERATOR.value)
     mid = await _seed(engine)
     entered, release, rider_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    real_resend = engine.resend
     calls = 0
 
     async def refused_after_the_spend(*args: Any, **kwargs: Any) -> Any:
         nonlocal calls
         calls += 1
-        if calls > 1:
-            return await real_resend(*args, **kwargs)
         entered.set()
         await release.wait()
         raise ResendError("refused for the test")
 
-    real_await = _auth._SPENT_FOR_KEY.await_settled
+    real_await = _auth._SpentForKey.await_settled
 
-    async def noted_await(spend: Any) -> None:
+    async def noted_await(self: Any, spend: Any) -> bool:
         rider_waiting.set()
-        await real_await(spend)
+        return await real_await(self, spend)
 
     monkeypatch.setattr(engine, "resend", refused_after_the_spend)
-    monkeypatch.setattr(_auth._SPENT_FOR_KEY, "await_settled", noted_await)
+    monkeypatch.setattr(_auth._SpentForKey, "await_settled", noted_await)
     async with _client(engine, service) as c:
         await _login(c, "op")
         await _mint(c, mid)  # the one proof

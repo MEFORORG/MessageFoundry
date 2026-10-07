@@ -281,6 +281,73 @@ async def test_an_edit_resubmit_cancelled_after_its_commit_keeps_its_repeat(
     assert [m["id"] for m in children] == [retry.headers["location"].rsplit("/", 1)[-1]]
 
 
+async def test_a_refused_edit_resubmit_answers_its_repeat_with_the_edit_kept(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2625. A double-clicked edit-resend whose first POST the engine refuses after
+    the spend. The repeat waits for the first and gets the same refusal: the editor again, with the
+    operator's edit in it, rather than a re-auth that would re-open the editor from the stored
+    body. Neither runs the engine twice, and the same submit afterwards asks for a proof."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+    from messagefoundry.store.base import ResendError
+    from messagefoundry_webconsole import _auth
+
+    (tmp_path / "in").mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "ch1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    mid = await seed_message(engine)
+    editor = f"/ui/messages/{mid}/edit"
+    post = f"/ui/messages/{mid}/edit-resend"
+    entered, release, rider_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def refused_after_the_spend(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        raise ResendError("refused for the test")
+
+    real_await = _auth._SpentForKey.await_settled
+
+    async def noted_await(self: Any, spend: Any) -> bool:
+        rider_waiting.set()
+        return await real_await(self, spend)
+
+    monkeypatch.setattr(engine, "edit_resend_reroute", refused_after_the_spend)
+    monkeypatch.setattr(_auth._SpentForKey, "await_settled", noted_await)
+    form = {"raw": EDITED, "idempotency_key": "k1", "mode": "reroute"}
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        await mint_bound_proof(c, editor)  # the one proof
+        first = asyncio.create_task(c.post(post, data=form, headers=SAME_ORIGIN))
+        await entered.wait()
+        rider = asyncio.create_task(c.post(post, data=form, headers=SAME_ORIGIN))
+        await rider_waiting.wait()
+        release.set()
+        for answer in await asyncio.gather(first, rider):
+            assert answer.status_code == 400 and _reauth_next(answer) is None
+            assert "refused for the test" in answer.text
+            assert "DOE^JOHN" in answer.text  # the edit, kept in the editor
+        again = await c.post(post, data=form, headers=SAME_ORIGIN)
+        assert _reauth_next(again) == editor
+    assert calls == 1
+
+
 async def test_a_replay_still_opens_on_the_window(engine: Engine) -> None:
     """The row's own limit: replay is a step-up write outside the injection and bulk set, so a
     fresh window still opens it, twice, with no typed proof per message."""
