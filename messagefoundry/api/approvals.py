@@ -1113,7 +1113,7 @@ class ApprovalGate:
             message="approval %s: %s, but its %s audit row failed. Lost detail: %s",
             # The detail names the requester. It is JSON, so the scrub leaves it byte-identical;
             # it is here for CodeQL py/log-injection, which cannot see that.
-            args=(approval_id, context, action, scrub_log_argument(detail)),
+            args=lambda: (approval_id, context, action, scrub_log_argument(detail)),
             defects=(),
         ):
             self._alert_lost_audit(approval_id, action)

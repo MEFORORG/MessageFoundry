@@ -1501,7 +1501,7 @@ async def _audit_refused_reload(
         lambda: engine.store.record_audit(action, actor=actor, detail=row, client=client),
         log=_log,
         message="a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
-        args=(action, scrub_log_argument(actor), scrub_log_argument(row)),
+        args=lambda: (action, scrub_log_argument(actor), scrub_log_argument(row)),
         defects=(),
     )
     return status, answer

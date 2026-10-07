@@ -42,7 +42,7 @@ from types import MappingProxyType
 from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
 
-from messagefoundry.audit_write import write_audit_soft
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
 from messagefoundry.auth.audit_visibility import (
     ACCOUNT_LOCKED_ACTION,
@@ -6949,6 +6949,7 @@ class AuthService:
             "so its alerts still fire",
             args=(action,),
             errors=_audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
         )
 
     async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> bool:
@@ -10468,9 +10469,10 @@ class AuthService:
                 detail["user_id"] = user_id
             if roles is not None:
                 detail["roles"] = list(roles)
-            # A store refusal only: a bug in the call, a defect among them (vault BACKLOG #2260),
-            # still raises. The refusal below is the answer either way, and the traceback says why
-            # the row is missing.
+            # The refusal below is the answer either way, and the traceback says why the row is
+            # missing. ``defects=()``: a defect raised here would replace the refusal, so the route
+            # would answer 500 and keep the spent step-up grant (vault BACKLOG #2260). A fault
+            # outside the store-refusal set still raises.
             await write_audit_soft(
                 lambda: self._audit(
                     CREDENTIAL_ISSUE_REFUSED_ACTION,
@@ -10482,6 +10484,7 @@ class AuthService:
                 message="could not write the %s audit row for a refused %s by %s",
                 args=(CREDENTIAL_ISSUE_REFUSED_ACTION, op, actor),
                 errors=_audit_write_errors(),
+                defects=(),
             )
             raise
 
@@ -11537,6 +11540,7 @@ class AuthService:
             message="could not write the %s audit row for a refused save by %s",
             args=(CHANNEL_SCOPE_CHANGE_REFUSED_ACTION, actor),
             errors=_audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
         )
 
     async def is_last_enabled_admin(self, user_id: str) -> bool:
