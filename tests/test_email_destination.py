@@ -1479,6 +1479,64 @@ async def test_a_body_set_content_cannot_encode_is_refused_content_free(
     assert wire.connections == 0
 
 
+def _first_unencodable(payload: str, encoding: str) -> int:
+    return next(i for i, ch in enumerate(payload) if not _encodes(ch, encoding))
+
+
+def _encodes(ch: str, encoding: str) -> bool:
+    try:
+        ch.encode(encoding)
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    ("encoding", "payload"),
+    [
+        ("us-ascii", _NON_ASCII_BODY),
+        ("latin-1", _NON_ASCII_BODY),
+        ("utf-8", _NON_ASCII_BODY + _LONE_SURROGATE),
+    ],
+    ids=["us-ascii", "latin-1", "utf-8-lone-surrogate"],
+)
+async def test_the_guard_refuses_before_the_backstop_and_names_the_position(
+    wire: _WireCapture, encoding: str, payload: str
+) -> None:
+    """Pins the guard itself (vault BACKLOG #3033). Only ``encode_wire_body`` names a position; the
+    backstop keeps the type name alone. So the tests above pass with the guard call removed, or
+    pointed at the wrong codec, because the backstop alone meets them. This one does not: each
+    case must name the first character THIS codec cannot encode."""
+    with pytest.raises(NegativeAckError) as ei:
+        await _body_dest(wire.port, encoding).send(payload)
+    position = _first_unencodable(payload, encoding)
+    assert f"first offending character at position {position})" in str(ei.value)
+    assert repr(encoding) in str(ei.value)
+    assert wire.connections == 0
+
+
+async def test_a_subject_fault_is_not_reported_as_the_body(wire: _WireCapture) -> None:
+    """The body backstop wraps ``set_content()`` alone (vault BACKLOG #3033). It used to wrap the
+    whole build, subject included, and blame the body for a subject fault.
+
+    Load refuses every subject a header cannot encode, so the subject is set after construction
+    here, as a build path that skipped the load check would leave it. Every row would fail the same
+    way, so it is a configuration fault, which stops the lane rather than dead-lettering each row."""
+    dest = _body_dest(wire.port, "utf-8")
+    dest.subject = f"Referral {_LONE_SURROGATE} note"
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(PAYLOAD)
+    exc = ei.value
+    assert "a configured header (subject, sender or recipients)" in str(exc)
+    assert "the message could not be encoded" not in str(exc)
+    assert exc.config_fault is True and exc.permanent is True
+    assert exc.__cause__ is None and exc.__context__ is None
+    stored = safe_exc(exc)
+    for form in _escapes(_LONE_SURROGATE):
+        assert form not in stored, f"the subject character reached the stored error as {form!r}"
+    assert wire.connections == 0
+
+
 @pytest.mark.parametrize(
     ("encoding", "payload", "wire_charset"),
     [
