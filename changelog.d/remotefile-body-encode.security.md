@@ -6,6 +6,6 @@
   and a position, carries no exception chain, and comes before anything is sent.
 - **Under `internal_error = stop`, an unencodable RemoteFile payload no longer stops the lane.**
   Before, `stop` kept the row queued, stopped the lane, and raised a `connection_stopped` alert.
-  The refusal is now a bad message, not an internal error, so the row dead-letters on the first
-  attempt under either policy, and no alert fires. One bad message no longer holds every message
-  behind it, and the row stays replayable from the dead-letter queue. (vault `BACKLOG #3044`)
+  The engine now treats the refusal as a bad message. The row dead-letters on the first attempt
+  under either policy, and no alert fires. One bad message no longer holds every message behind it,
+  and the row stays replayable from the dead-letter queue. (vault `BACKLOG #3044`)

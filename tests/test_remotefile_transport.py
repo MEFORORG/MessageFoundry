@@ -41,7 +41,7 @@ from messagefoundry.config.models import ConnectorType, ContentType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.keywrap import KeyWrapRefused
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.transports import build_destination, build_source, remotefile
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -541,8 +541,8 @@ _NAMED_BODY = (
 async def test_the_refusal_never_carries_the_rendered_file_name(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, template: str | None
 ) -> None:
-    """The name is rendered from the message before the encode, so a label that carried it would
-    put message content in the stored error. The other refusal tests pin a fixed ``msg.hl7``, so
+    """The upload name is rendered from the message, so a label that carried it would put message
+    content in the stored error. The other refusal tests pin a fixed ``msg.hl7``, so
     they cannot see that; this one renders from MSH-10 and PID-5 (vault BACKLOG #3044)."""
     client = _FakeClient()
     over: dict[str, Any] = {} if template is None else {"filename": template}
@@ -566,21 +566,36 @@ async def test_the_refusal_never_carries_the_rendered_file_name(
             assert marker not in text, f"the rendered file name reached the {where}"
 
 
-async def test_a_long_remote_dir_leaves_the_charset_and_position_in_the_stored_error(
+async def test_a_long_host_and_dir_leave_the_charset_and_position_in_the_stored_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``safe_exc`` cuts the stored error at 200 characters. The label carries ``host:remote_dir``,
-    so it goes last: a long directory then loses its own tail, never the charset or the position."""
+    """The stored error is cut short twice: by ``safe_exc``, then by the store's own ``safe_text``
+    over the type-prefixed text. A label carrying ``host:remote_dir`` was one long token, and the
+    cut drops a crossing token whole, so a long host and directory took the charset and position
+    with them. The label is fixed now, so their length cannot reach the refusal."""
     client = _FakeClient()
+    host = "sftp.partner-hospital-integration-gateway.example.org"
     remote_dir = "/" + "/".join(["partner_inbound_drop_directory"] * 8)
-    dest = _dest(monkeypatch, client, remote_dir=remote_dir, encoding="us-ascii")
+    dest = _dest(monkeypatch, client, host=host, remote_dir=remote_dir, encoding="us-ascii")
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(_NAMED_BODY)
-    stored = safe_exc(ei.value)
-    # Arming: the label alone is longer than the cut, so a label-first text would lose the facts.
-    assert len(remote_dir) > 200
+    # What dead_letter_now persists for a permanent refusal.
+    stored = safe_text(safe_exc(ei.value))
     position = _NAMED_BODY.index(SECRET_CHAR)
     assert f"'us-ascii' (first offending character at position {position})" in stored
+    assert "REMOTEFILE upload" in stored
+    assert "partner_inbound_drop_directory" not in stored and host not in stored
+
+
+async def test_an_explicit_none_encoding_is_utf_8_as_on_the_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``None`` means "not declared". Read as given, ``.encode(None)`` raised a TypeError, which is
+    an internal error: under ``internal_error = stop`` it stopped the lane (vault BACKLOG #3044)."""
+    client = _FakeClient()
+    dest = _dest(monkeypatch, client, filename="msg.hl7", encoding=None)
+    await dest.send(_NAMED_BODY)
+    assert client.files == {"/in/msg.hl7": _NAMED_BODY.encode("utf-8")}
 
 
 # === source ==================================================================

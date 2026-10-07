@@ -1984,7 +1984,9 @@ class RemoteFileDestination(DestinationConnector):
         # the fallback, so it is refused here.
         _check_template_fits(self._filename_template, "", FILENAME_MAX_BYTES)
         self._overwrite = bool(s.get("overwrite", False))
-        self._encoding: str = s.get("encoding", "utf-8")
+        # An explicit None is "not declared", as on the source: utf-8. Left None, .encode(None)
+        # raised a TypeError that reached the internal-error arm (vault BACKLOG #3044).
+        self._encoding: str = s.get("encoding") or "utf-8"
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (ensure_dir creates the upload dir on the first send). When on, remote_dir
         # must be listable at start AND _upload never creates it.
@@ -2074,14 +2076,14 @@ class RemoteFileDestination(DestinationConnector):
         # The default byte cap applies (ADR 0204): a long field falls back rather than reaching the
         # server. The remote path limit is the partner's and is not known here, so there is no
         # directory budget; a server refusal is classified by its own reply.
+        # The shared helper, not a bare .encode(): a UnicodeEncodeError names a character of the
+        # message and holds the WHOLE payload on `.object` (#1920). It runs first, before any I/O
+        # and before the name is rendered from the message, so the name cannot reach the refusal.
+        # Not a _RemoteError, so send() lets it through and the row dead-letters under either
+        # internal_error policy. The label is fixed: the stored error is cut short, and a label
+        # carrying host:remote_dir as one long token was dropped whole (vault BACKLOG #3044).
+        data = encode_wire_body(payload, self._encoding, transport="REMOTEFILE upload")
         name = render_filename(self._filename_template, payload, fallback=_FALLBACK_NAME)
-        # Before any I/O. The refusal is not a _RemoteError, so send() lets it through and the row
-        # dead-letters, under either internal_error policy. The label carries no file name.
-        data = encode_wire_body(
-            payload,
-            self._encoding,
-            transport=f"REMOTEFILE upload to {_where(self._host, self._remote_dir)}",
-        )
         self._prepare_remote_dir()
         # With overwrite off, list for free names BEFORE anything is written (the #1936 rule).
         candidates = [] if self._overwrite else self._unique(name)

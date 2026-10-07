@@ -37,6 +37,10 @@ from tests._root_logging import root_logging_restored
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinConfigSourceProbes
 
+# A helper module holding the content-free asserts several connector tests share. pytest rewrites
+# asserts only in test modules unless told, and an unrewritten assert vanishes under `python -O`.
+pytest.register_assert_rewrite("tests._content_free")
+
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
 #
