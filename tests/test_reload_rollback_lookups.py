@@ -15,6 +15,7 @@ tracked, detached task, so a cancellation cannot cut a close off, and teardown w
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal
@@ -132,7 +133,14 @@ async def _failed_reload(
     # FIRST_COMPLETED, so a reload that fails before step 3 surfaces here instead of timing out.
     await asyncio.wait({task, reached}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
     reached.cancel()
-    assert entered.is_set(), task.exception() if task.done() else "step 3 not reached within 10s"
+    if not entered.is_set():
+        if task.done():
+            await task  # re-raises the reload's own failure
+        # Still running and holding _reload_lock: cancel it first, or the caller's stop() hangs.
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        pytest.fail("reload did not reach step 3 within 10s")
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -214,8 +222,10 @@ async def test_the_rollback_restores_before_its_first_await(
         await _failed_reload(runner, _registry(tmp_path, with_lookups=False), "raise", monkeypatch)
         await _settle_closes(runner)
 
-        # [0] is the forward step 2 call, made before the rebuild; [1] is the rollback's.
+        # [0] is the forward step 2 call, which runs after the rebuild, so it sees the refused
+        # graph; [1] is the rollback's, which must already see the old one.
         assert len(seen) == 2
+        assert seen[0] == (None, None, {"file_in": True})
         assert seen[1] == (old_db, old_fhir, old_inline)
     finally:
         await runner.stop()
@@ -353,7 +363,10 @@ async def test_a_demote_stop_bounds_the_wait_on_a_hanging_retired_close(
 
         await asyncio.wait_for(runner.stop(reason=TeardownReason.DEMOTE, budget_seconds=0.2), 5)
         assert not runner._running
-        assert not any(t.done() for t in pending)  # abandoned, not cancelled
+        assert not any(t.done() or t.cancelled() for t in pending)  # abandoned, not cancelled
+        # The timeout continued the sequence rather than unwinding it.
+        assert runner._lookup_executor is None
+        assert not runner._sources and not runner._workers and not runner._destinations
     finally:
         release.set()
         await _settle_closes(runner)

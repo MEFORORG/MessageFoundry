@@ -1871,10 +1871,11 @@ class Engine:
         stops binding/processing. The reference-sync loop and the self-gated maintenance/convergence
         loops keep running (a follower still converges its caches), so only the runner is stopped."""
         if self._registry_runner is not None:
-            # ADR 0157 C6: demotion is BOUNDED — the source and dispatcher phases only. Phases after
-            # them (connector aclose, executor shutdown, sandbox close) remain unbounded; they run
-            # after the graph has stopped so they cannot extend the split-brain window, but do NOT
-            # describe this as 'the demotion teardown is bounded'.
+            # ADR 0157 C6: demotion is BOUNDED — the source and dispatcher phases, plus the wait for
+            # the lookup executors to close. Phases after them (connector aclose, executor shutdown,
+            # sandbox close) remain unbounded; they run after the graph has stopped so they cannot
+            # extend the split-brain window, but do NOT describe this as 'the demotion teardown is
+            # bounded'.
             budget, _headroom = demote_stop_budget(
                 lease_ttl_seconds=self._cluster_settings.leader_lease_ttl_seconds,
                 fence_timeout_seconds=self._cluster_settings.leader_fence_timeout_seconds,

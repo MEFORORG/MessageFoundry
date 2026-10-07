@@ -743,7 +743,8 @@ class TeardownReason(StrEnum):
     ``is_clustered()`` — and ``[cluster].enabled`` is rejected on SQLite at config load.
     DEMOTE — loss of leadership, racing a lease this node no longer holds. Dispatchers drain
     cooperatively BEFORE any hard cancel, and both phases are bounded. An inbound that cannot stop
-    inside the budget is ABANDONED — not awaited, and not cancelled."""
+    inside the budget is ABANDONED — not awaited, and not cancelled. Teardown's wait for the lookup
+    executors to close takes the same budget and abandons the same way (:meth:`_teardown_body`)."""
 
     SHUTDOWN = "shutdown"
     DEMOTE = "demote"
@@ -1548,7 +1549,7 @@ class RegistryRunner:
         # waits on (or is cancelled inside) its store reads. Held here so the task is not collected.
         self._reload_report_tasks: set[asyncio.Task[dict[str, int]]] = set()
         # The lookup executor a reload retires (the old graph's on commit, the refused graph's on
-        # rollback) closes DETACHED: see :meth:`_retire_lookup_executor`. Teardown awaits these.
+        # rollback) closes DETACHED: see :meth:`_retire_lookup_executor`. Teardown waits for these.
         self._lookup_close_tasks: set[asyncio.Task[None]] = set()
         # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
         # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
@@ -2187,7 +2188,8 @@ class RegistryRunner:
         so it cannot be interrupted between a reload's swap (or rollback) and the close being owned:
         an awaited close could be cut off by a cancellation, which would leak the pools and make a
         committed reload look cancelled, and an unbounded ``wait_closed`` behind an in-flight lookup
-        would hold ``_reload_lock``. Tracked so :meth:`_teardown_body` waits for it."""
+        would hold ``_reload_lock``. Tracked so :meth:`_teardown_body` waits for it (bounded under
+        DEMOTE, where a close still pending is left running)."""
         if executor is None:
             return
         task = asyncio.create_task(self._close_lookup_executor(executor))
@@ -4977,26 +4979,26 @@ class RegistryRunner:
         # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop.
         # No-op unless [sandbox].mode=subprocess actually spawned any.
         await self._close_sandbox_sessions()
+        # The live lookup executor retires like a reload's: its close joins any a reload left
+        # pending, and ONE wait covers them all, concurrently. Waited on, never cancelled: a
+        # cancelled close leaves its pools open, and the set keeps an abandoned one alive.
+        # asyncio.wait, unlike gather, does not cancel them if this teardown is itself cancelled,
+        # and a close that raises is logged by its task rather than unwinding this sequence. Under
+        # DEMOTE the wait is bounded by the budget and a timeout continues the sequence (ADR 0157:
+        # every DEMOTE bound is absorbed where it is set); under SHUTDOWN it is unbounded, as the
+        # live close always was.
+        self._retire_lookup_executor(self._lookup_executor)
+        self._lookup_executor = None
         if self._lookup_close_tasks:
-            # A reload's retired executor may still be closing. Waited on, never cancelled: a
-            # cancelled close leaves its pools open, and the set keeps an abandoned one alive.
-            # asyncio.wait, unlike gather, does not cancel them if this teardown is itself
-            # cancelled. Under DEMOTE the wait is bounded by the budget and a timeout continues the
-            # sequence (ADR 0157: every DEMOTE bound is absorbed where it is set). Before the live
-            # close below, so a raise there cannot skip it.
             _done, still = await asyncio.wait(
                 self._lookup_close_tasks, timeout=budget if demote else None
             )
             if still:
                 log.warning(
-                    "teardown: %d retired lookup executor close(s) still pending after %.1fs; "
-                    "left running",
+                    "teardown: %d lookup executor close(s) still pending after %.2fs; left running",
                     len(still),
                     budget,
                 )
-        if self._lookup_executor is not None:
-            await self._lookup_executor.aclose()
-            self._lookup_executor = None
         self._workers.clear()
         self._router_workers.clear()
         self._transform_workers.clear()
