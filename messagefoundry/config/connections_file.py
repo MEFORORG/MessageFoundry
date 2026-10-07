@@ -52,6 +52,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.wiring import (
     _ENVREF_KEYS,  # parse_env_setting's own env-marker key set -- mirrored, never re-derived
+    _NAMED_CASTS,  # the named casts; only "bool" converts a default (vault BACKLOG #3138)
     _UNSET,  # the "no default=" sentinel an EnvRef carries
     MLLP,
     ConnectionSpec,
@@ -374,6 +375,12 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
 # --- decoding helpers --------------------------------------------------------
 
 
+def _converts_default(ref: Any) -> bool:
+    """Whether an env ref's cast converts its ``default``. Only the bool cast does: :class:`EnvRef`
+    reads that default when it is made (vault BACKLOG #3138). An int, float or str cast does not."""
+    return isinstance(ref, EnvRef) and ref.cast is _NAMED_CASTS["bool"]
+
+
 def _build_spec(transport: str, table: dict[str, Any], where: str) -> ConnectionSpec:
     """Resolve ``transport`` to its factory and call it with the decoded ``[settings]`` table."""
     factory = _TRANSPORTS.get(transport)
@@ -570,11 +577,10 @@ def _check_setting_types(
         subject = (f"{key!r} env() default" if is_default else repr(key)) + suffix
         expected = _render_expected(judged, None if is_default or suffix else param.annotation)
         detail = f"{subject} must be {expected}, got {_word_for(offender)}"
-        if is_default and not suffix and not isinstance(checked, bool):
+        if is_default and not suffix and not _converts_default(value):
             # Without this the refusal reads as simply wrong to an author looking at the `cast = "int"`
             # they wrote on the same line. The reason lives in the comment above, where they cannot see it.
-            # A bool default is skipped: the bool cast DOES convert its default (vault BACKLOG #3138),
-            # and a native TOML bool needed no converting, so the note would be false for either.
+            # The bool cast is skipped: it DOES convert its default (vault BACKLOG #3138).
             detail += " (a default is not converted by the ref's cast)"
         elif judged.scalars and isinstance(offender, str) and str not in judged.scalars:
             # Stated as a FACT, not as an instruction. "Write it unquoted" is wrong for every value

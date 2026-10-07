@@ -281,3 +281,35 @@ def test_a_toml_bool_default_resolves_through_a_real_load(
         reg.outbound["OB_SYNTH_REST"], {}, None, EgressSettings(deny_by_default=False)
     )
     assert dest.settings["tls_allow_expired"] is want
+
+
+def _toml_with(tmp_path: Path, setting_line: str) -> Any:
+    (tmp_path / "connections.toml").write_text(
+        "[[outbound]]\n"
+        'name = "OB_SYNTH_REST"\n'
+        'transport = "rest"\n'
+        "  [outbound.settings]\n"
+        '  url = "https://partner.example.org/in"\n'
+        f"  {setting_line}\n",
+        encoding="utf-8",
+    )
+    return load_config(tmp_path, allow_empty=True)
+
+
+@pytest.mark.parametrize(
+    "cast", ['"nope"', '["bool"]', '{ name = "bool" }'], ids=["unknown", "array", "table"]
+)
+def test_an_unknown_or_non_string_cast_names_the_connection_and_setting(
+    tmp_path: Path, cast: str
+) -> None:
+    # An array or table cast used to raise a raw TypeError out of the named-cast lookup.
+    with pytest.raises(WiringError) as ei:
+        _toml_with(tmp_path, f'tls_allow_expired = {{ env = "rx", cast = {cast} }}')
+    msg = str(ei.value)
+    assert "OB_SYNTH_REST" in msg and "'tls_allow_expired'" in msg and "unknown cast" in msg
+
+
+def test_a_non_bool_cast_still_says_its_default_is_not_converted(tmp_path: Path) -> None:
+    # The note is skipped only for the bool cast, which does convert its default.
+    with pytest.raises(WiringError, match=r"not converted by the ref's cast"):
+        _toml_with(tmp_path, 'timeout_seconds = { env = "t", cast = "float", default = true }')

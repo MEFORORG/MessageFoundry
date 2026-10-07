@@ -615,7 +615,9 @@ def parse_env_setting(value: Any) -> Any:
     if not isinstance(key, str) or not key:
         raise WiringError(f"env reference must name a non-empty string key, got {key!r}")
     cast_name = value.get("cast")
-    if cast_name is not None and cast_name not in _NAMED_CASTS:
+    # `not isinstance(str)` first: a TOML array or table is unhashable, and the dict lookup would raise
+    # a raw TypeError that no caller turns into a message naming the connection.
+    if cast_name is not None and (not isinstance(cast_name, str) or cast_name not in _NAMED_CASTS):
         raise WiringError(
             f"env reference {key!r}: unknown cast {cast_name!r} "
             f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
