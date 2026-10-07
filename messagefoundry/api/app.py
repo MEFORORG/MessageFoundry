@@ -3464,6 +3464,13 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
+            except TrustAnchorError:
+                # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
+                # and logged why; the action is audited, and the caller gets the fixed line.
+                await _record_control_audit(
+                    engine, identity, name, action, role="source", running=False, client=client
+                )
+                raise HTTPException(409, _ANCHOR_REFUSED_DETAIL) from None
             running = rr.inbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="source", running=running, client=client

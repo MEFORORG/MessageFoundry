@@ -3055,7 +3055,7 @@ checks.
 
 | When | What a refused file stops |
 |---|---|
-| Start, for an outbound or an `Ftp()` poller | That connection only. It reads `failed`, and the rest of the graph comes up. |
+| Start, for an outbound or an `Ftp()` poller | That connection only. It reads `failed`, and the rest of the graph comes up. Its status and its `connection_stopped` alert carry a fixed line naming the connection; the reason, which names the file and its SHA-256, is in the server log and the audit rows. |
 | An operator start (`POST /connections/{name}/start`), such as of an `auto_start = false` lane | That connection only. |
 | Start, for a `FhirLookup()` | The whole start. A lookup has no lane of its own to fail. |
 | A reload, for a lane it builds or keeps running, and for a `FhirLookup()` | The whole reload, before anything changes. |

@@ -1243,7 +1243,9 @@ class RegistryRunner:
         self._lane_anchor_check = lane_anchor_check
         # The lanes whose last check refused their CA. A reload does not rebuild one of these unless
         # its config changed (:meth:`_keeps_anchor_failure`); an operator start checks it again.
-        self._anchor_refused: set[tuple[Direction, str]] = set()
+        # Each holds the resolved (tls_ca_file, tls_ca_pin) the refusal read, so a changed env()
+        # value counts as a changed config.
+        self._anchor_refused: dict[tuple[Direction, str], tuple[str, object]] = {}
         # Deployment-wide shadow override ([shadow].simulate_all_egress, #15): when True, EVERY outbound
         # runs egress-suppressed regardless of its own simulate= flag. Resolved per-connection into
         # self._simulate at reconcile (per-connection simulate OR this).
@@ -2700,7 +2702,7 @@ class RegistryRunner:
         runs. Every alert could re-fire a ``restart_inbound`` control action."""
         try:
             await self._check_inbound_lane_anchor(name)
-        except (TrustAnchorError, ValueError) as exc:
+        except TrustAnchorError as exc:
             if ("inbound", name) not in self._failed:
                 self._record_failed(name, exc, kind="inbound")
             raise
@@ -2963,18 +2965,28 @@ class RegistryRunner:
         isolation, so a refusal fails that lane only, and the lane is marked for
         :meth:`_keeps_anchor_failure`. ``fails_lane=False`` is for a check that fails no lane: the
         reload pre-check, which refuses the reload and leaves the lane as it was, and a connection
-        test. Marking the lane there would let a retried reload skip a lane that is still running.
-        ``auth.trust_anchors``, module item 9, states the rule once."""
+        test. Neither marks nor clears: a reload clears the marks of the lanes it checked only once
+        it commits (:meth:`reload`). ``auth.trust_anchors``, module item 9, states the rule once.
+
+        A refusal that fails a lane is raised as a fixed line naming the connection. The refusal
+        text names the CA's path, the folders above it and its SHA-256, so it goes to the server
+        log only, as the connection-test route keeps it from API callers (BACKLOG #1142). The lane
+        status and the ``connection_stopped`` alert carry the fixed line."""
         if self._lane_anchor_check is None:
             return
         try:
             await self._lane_anchor_check(direction, name, settings)
-        except (TrustAnchorError, ValueError):
-            if fails_lane:
-                self._anchor_refused.add((direction, name))
-            raise
-        # A passing check clears the mark whoever asked: the CA a refusal named is good now.
-        self._anchor_refused.discard((direction, name))
+        except (TrustAnchorError, ValueError) as exc:
+            if not fails_lane:
+                raise
+            self._anchor_refused[(direction, name)] = _anchor_key(settings)
+            log.warning("%s connection %r: trust anchor refused: %s", direction, name, exc)
+            raise TrustAnchorError(
+                f"{direction} connection '{name}': its tls_ca_file was refused. Fix the file, then "
+                "start the connection; the server log and the auth.trust_anchor audit rows say why"
+            ) from exc
+        if fails_lane:
+            self._anchor_refused.pop((direction, name), None)
 
     async def _check_inbound_lane_anchor(self, name: str) -> None:
         """:meth:`_check_lane_anchor` for an inbound ``Ftp`` poller about to bind, the one inbound
@@ -2985,7 +2997,7 @@ class RegistryRunner:
             ic.spec.type is not ConnectorType.REMOTEFILE or not ic.spec.settings.get("tls_ca_file")
         ):
             # An SFTP poller, or FTPS with no CA: nothing to check, so no old refusal stands.
-            self._anchor_refused.discard(("inbound", name))
+            self._anchor_refused.pop(("inbound", name), None)
             return
         if (
             self._lane_anchor_check is None
@@ -3015,19 +3027,47 @@ class RegistryRunner:
         The lane must still be down and still recorded failed: no live connector for an outbound,
         and not in ``bound``, the inbounds listening before the reload. A branch that clears the
         failed record, such as an ``auto_start=False`` or DR park, ends the kept failure, so the
-        next reload that builds the lane checks it first."""
-        if (direction, name) not in self._anchor_refused or (direction, name) not in self._failed:
+        next reload that builds the lane checks it first.
+
+        "Unchanged" covers more than the spec: ``deployed`` and ``auto_start`` too, so flipping
+        either back ends it, and the resolved ``tls_ca_file`` and ``tls_ca_pin``, so a fixed
+        ``env()`` value ends it, though the spec still holds the same reference."""
+        key = self._anchor_refused.get((direction, name))
+        if key is None or (direction, name) not in self._failed:
             return False
+        prior: InboundConnection | OutboundConnection | None
         if isinstance(new, OutboundConnection):
-            prior_out = old.outbound.get(name)
-            return (
-                name not in self._destinations
-                and prior_out is not None
-                and prior_out.spec == new.spec
-                and _hop_policy(prior_out) == _hop_policy(new)
+            prior = old.outbound.get(name)
+            if (
+                name in self._destinations
+                or not isinstance(prior, OutboundConnection)
+                or _hop_policy(prior) != _hop_policy(new)
+            ):
+                return False
+        else:
+            prior = old.inbound.get(name)
+            if name in bound:
+                return False
+        if (
+            prior is None
+            or prior.spec != new.spec
+            or prior.deployed != new.deployed
+            or prior.auto_start != new.auto_start
+        ):
+            return False
+        try:
+            settings = (
+                _dest_config(
+                    new, self._env_values, self._trust_anchor_policy, self._egress
+                ).settings
+                if isinstance(new, OutboundConnection)
+                else _source_config(
+                    new, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
+                ).settings
             )
-        prior_in = old.inbound.get(name)
-        return name not in bound and prior_in is not None and prior_in.spec == new.spec
+        except Exception:  # noqa: BLE001 - an unresolvable value is a change; the build reports it
+            return False
+        return _anchor_key(settings) == key
 
     def _reload_anchor_lanes(
         self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
@@ -3071,20 +3111,24 @@ class RegistryRunner:
 
     async def _check_reload_lane_anchors(
         self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
-    ) -> None:
+    ) -> list[tuple[Direction, str]]:
         """Check the CA of each lane a reload builds or keeps running (vault BACKLOG #2371, ADR
         0031 as amended 2026-10-06). A refusal refuses the whole reload, before anything changes,
         as a ``WiringError`` whose cause is the :class:`TrustAnchorError`. An idle lane is not read
         (:meth:`_reload_anchor_lanes`), so a bad CA there never refuses a reload, a DR activation or
-        a follower convergence."""
+        a follower convergence. Returns the lanes it passed, whose marks the reload clears once it
+        commits."""
         if self._lane_anchor_check is None:
-            return
+            return []
+        passed: list[tuple[Direction, str]] = []
         for direction, name, settings in self._reload_anchor_lanes(old, new, old_inbound_names):
             try:
                 await self._check_lane_anchor(direction, name, settings, fails_lane=False)
             except (TrustAnchorError, ValueError) as exc:
                 error = refused_connection_anchor(exc)
                 raise error from error.__cause__
+            passed.append((direction, name))
+        return passed
 
     async def _ensure_destination_built(self, name: str) -> None:
         """Build ``name``'s connector into ``_destinations`` if the lane has none — the missing half of
@@ -5901,7 +5945,9 @@ class RegistryRunner:
             old = self.registry
             old_inbound_names = list(self._sources)
             # vault BACKLOG #2371: before the quiesce, so a refused CA leaves the graph untouched.
-            await self._check_reload_lane_anchors(old, new_registry, old_inbound_names)
+            anchors_passed = await self._check_reload_lane_anchors(
+                old, new_registry, old_inbound_names
+            )
 
             try:
                 # 1. Quiesce intake: stop every inbound source so no NEW messages are accepted. Any
@@ -6076,6 +6122,10 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
+            # vault BACKLOG #2371: the swap committed, so a lane the pre-check passed loses any old
+            # refusal mark. Not before: a rolled-back reload leaves the old marks as they were.
+            for lane in anchors_passed:
+                self._anchor_refused.pop(lane, None)
             # 3a. The swap committed, so the calendars follow it: every task is replaced from the new
             # graph, so an added schedule starts, an edited one changes and a removed one stops
             # (BACKLOG #2069). After the rollback point on purpose,
@@ -9983,6 +10033,12 @@ def _insecure_bind_cause(source: Source) -> str:
         return f"tls_hop_attested; reason: {source.tls_hop_attested_reason or '(none provided)'}"
     # serve folds [security].require_encryption_for_remote = false into the same flag (ADR 0118).
     return "--allow-insecure-bind / require_encryption_for_remote = false"
+
+
+def _anchor_key(settings: Mapping[str, Any]) -> tuple[str, object]:
+    """The resolved CA path and pin a lane refusal read (vault BACKLOG #2371). A reload compares a
+    lane's new pair with it, so a fixed ``env()`` value ends a kept failure."""
+    return (str(settings.get("tls_ca_file") or ""), settings.get("tls_ca_pin"))
 
 
 def _hop_policy(oc: OutboundConnection) -> tuple[object, ...]:

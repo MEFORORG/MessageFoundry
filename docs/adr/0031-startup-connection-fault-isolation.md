@@ -321,9 +321,7 @@ Context above names: feed #21's downstream cert should not stop the other 20.
    limit:** a reload's build check builds every deployed connection, and `MLLP()`, `Ftp()`,
    `Email()` and `Direct()` read their CA file as they are built. So a CA file one of those
    cannot read or load still refuses the reload, audited as `invalid_config`, on any deployed
-   lane, idle or not. **A second limit, which predates #2371:** the runner takes its DR threshold
-   when it is built, and a DR activation reloads the runner it has. So a lane the activation is
-   meant to park is checked as a running one.
+   lane, idle or not.
 3. **An inbound listener CA refused at start refuses the start. This records existing behaviour;
    it is not a new decision.** BACKLOG #1142 slice 3 shipped it (engine PR 1535, `29ab2e60b8`):
    the start preflight checks every inbound CA that requires a peer certificate, before any
@@ -334,7 +332,12 @@ because #2371 did not set out to move it. Whether an inbound listener's CA shoul
 instead is a separate question, not asked here.
 
 **Consequences.** A start with a broken outbound CA comes up degraded, and the lane reads `failed`
-with a `TrustAnchorError` reason. A reload that leaves that lane's config alone goes through and
-leaves it failed. Fixing the file alone does not heal it on a reload; an operator start or a
-restart does. A lane DR-parked or left down by `auto_start = false` is not checked at start or
-at a reload; it is checked when it is built.
+with a fixed `TrustAnchorError` line that names the connection. The refusal text names the CA's
+path and its SHA-256, so it goes to the server log and the `auth.trust_anchor` rows only, as the
+connection-test route keeps it from API callers (BACKLOG #1142). A reload that leaves that lane's
+config alone goes through and leaves it failed. "Its config" includes `deployed`, `auto_start` and
+the resolved `tls_ca_file` and `tls_ca_pin`, so a fixed `env()` value counts as a change. Fixing
+the file alone does not heal it on a reload; an operator start or a restart does. A lane DR-parked
+or left down by `auto_start = false` is not checked at start or at a reload; it is checked when it
+is built. A DR park clears a lane's failed record, so the first reload after a DR release builds
+that lane and checks it.

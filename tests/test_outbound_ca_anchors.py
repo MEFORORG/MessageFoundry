@@ -463,7 +463,9 @@ def test_an_mllp_and_a_dicom_destination_build_with_a_pin(tmp_path: Path) -> Non
 _PIN_MISMATCH = "does not match its configured SHA-256 pin"
 #: How a lane failed by its CA reads in its status. ``safe_exc`` shortens the rest of the reason,
 #: so the audit row is what proves it was the pin.
-_REFUSED_OUT = "TrustAnchorError: outbound connection 'OUT' tls_ca_file: the trust anchor"
+_REFUSED_OUT = "TrustAnchorError: outbound connection 'OUT': its tls_ca_file was refused"
+#: The fixed line a refused lane raises; the refusal text itself goes to the server log only.
+_LANE_REFUSED = "its tls_ca_file was refused"
 
 
 def _engine(store: MessageStore) -> Any:
@@ -579,7 +581,7 @@ async def test_a_refused_ftps_poller_ca_fails_that_inbound_at_start(
     engine = _engine(store)
     try:
         runner = await _start_like_serve(engine, cfg)
-        refused = "TrustAnchorError: inbound connection 'IB_FTPS' tls_ca_file: the trust anchor"
+        refused = "TrustAnchorError: inbound connection 'IB_FTPS': its tls_ca_file was refused"
         assert runner.degraded_inbound()["IB_FTPS"].startswith(refused)
         assert not runner.degraded_outbound()
         rows = await _rows(store, "inbound:IB_FTPS")
@@ -591,7 +593,7 @@ async def test_a_refused_ftps_poller_ca_fails_that_inbound_at_start(
         # Review round 3, finding 8: an operator start refused by the CA records the failure, so
         # the poller reads failed and not stopped. Cleared first, to see it written again.
         runner._failed.pop(("inbound", "IB_FTPS"))
-        with pytest.raises(TrustAnchorError, match=_PIN_MISMATCH):
+        with pytest.raises(TrustAnchorError, match=_LANE_REFUSED):
             await runner.start_inbound("IB_FTPS")
         assert runner.degraded_inbound()["IB_FTPS"].startswith(refused)
     finally:
@@ -894,6 +896,7 @@ def _real_ca(tmp_path: Path) -> Path:
     """A CA file an FTPS context loads, so a poller can bind for real."""
     from tests.test_alert_smtp_tls import _self_signed_ca_pem
 
+    tmp_path.mkdir(parents=True, exist_ok=True)
     p = tmp_path / "real-ca.pem"
     p.write_bytes(_self_signed_ca_pem())
     return p
@@ -985,13 +988,14 @@ async def test_a_marked_lane_with_a_live_connector_is_still_checked(
     keeps it and must check it, whatever an old mark says. The mark and failure are planted, since
     no path today leaves them on a live lane. Red under: the clause removed."""
     ca = _ca(tmp_path)
+    pin = _sha(ca)
     cfg = tmp_path / "cfg"
-    _two_outbound_graph(cfg, _dest("rest", ca, pin=_sha(ca)))
+    _two_outbound_graph(cfg, _dest("rest", ca, pin=pin))
     engine = _engine(store)
     try:
         runner = await _start_like_serve(engine, cfg)
         assert "OUT" in runner._destinations
-        runner._anchor_refused.add(("outbound", "OUT"))
+        runner._anchor_refused[("outbound", "OUT")] = (str(ca), pin)
         runner._failed[("outbound", "OUT")] = "planted"
         ca.write_bytes(_block(b"substitute"))
         with pytest.raises(WiringError, match=_PIN_MISMATCH):
@@ -1012,7 +1016,7 @@ async def test_a_marked_poller_that_is_bound_is_still_checked(
     await runner.start()
     try:
         assert runner.inbound_running("IB_FTPS")
-        runner._anchor_refused.add(("inbound", "IB_FTPS"))
+        runner._anchor_refused[("inbound", "IB_FTPS")] = (str(ca), pin)
         runner._failed[("inbound", "IB_FTPS")] = "planted"
         ca.write_bytes(_block(b"substitute"))
         with pytest.raises(WiringError, match=_PIN_MISMATCH):
@@ -1034,8 +1038,10 @@ async def test_a_reload_rollback_does_not_rebind_a_poller_whose_ca_was_swapped(
     try:
         assert runner.inbound_running("IB_FTPS")
 
+        other = _real_ca(tmp_path / "other").read_bytes()
+
         async def swap_then_fail(old: Registry, new: Registry) -> None:
-            ca.write_bytes(_block(b"substitute"))
+            ca.write_bytes(other)  # loadable, so only the check keeps it down
             raise RuntimeError("reconcile failed")
 
         monkeypatch.setattr(runner, "_reconcile_outbounds", swap_then_fail)
@@ -1068,3 +1074,66 @@ async def test_a_poller_whose_ca_was_removed_drops_its_old_refusal(
         assert ("inbound", "IB_FTPS") not in runner._anchor_refused
     finally:
         await runner.stop()
+
+
+# --- round 4, code-review repair --------------------------------------------------------------------
+
+
+async def test_a_fixed_env_pin_ends_a_kept_failure(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review finding 1: the spec holds the same ``env()`` reference after the operator fixes its
+    value, so "config unchanged" must compare the resolved CA path and pin. A reload with the fixed
+    value rebuilds the lane. Red under: the kept failure ignoring the resolved pair."""
+    ca = _ca(tmp_path)
+    reg_text = (
+        "from messagefoundry import File, Rest, Send, env, handler, inbound, outbound, router\n"
+        f"inbound('IB_IN', File(directory={str(tmp_path / 'in')!r}, poll_seconds=1.0), "
+        "router='r')\n"
+        "outbound('OUT', Rest(url='https://partner.example.org/api', "
+        f"tls_ca_file={str(ca)!r}, tls_ca_pin=env('pin')))\n" + _GRAPH_TAIL
+    )
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (tmp_path / "in").mkdir()
+    (cfg / "feed.py").write_text(reg_text, encoding="utf-8")
+    runner = _runner(store, load_config(cfg), env_values={"pin": "00" * 32})
+    await runner.start()
+    try:
+        assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
+        runner.set_env_values({"pin": _sha(ca)})
+        await runner.reload(load_config(cfg))
+        assert "OUT" not in runner.degraded_outbound()
+        assert "OUT" in runner._destinations
+    finally:
+        await runner.stop()
+
+
+async def test_the_control_route_audits_a_refused_poller_start(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review finding 3: an operator start of a poller refused by its CA answers 409 with the fixed
+    line, never a 500, and its control audit row is written. Red under: the route not catching the
+    refusal."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        lane_anchor_check=ta.make_lane_anchor_check(store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_ftps_poller_registry(_ca(tmp_path), pin="00" * 32))
+    await engine.start()
+    try:
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post("/connections/IB_FTPS/start")
+        assert r.status_code == 409, r.text
+        assert "trust anchor refused" in r.text
+        rows = await store.list_audit(action="connection_control", limit=10)
+        assert [json.loads(row["detail"])["connection"] for row in rows] == ["IB_FTPS"]
+    finally:
+        await engine.stop()
