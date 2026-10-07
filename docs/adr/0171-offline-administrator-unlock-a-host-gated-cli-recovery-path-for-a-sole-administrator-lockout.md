@@ -327,3 +327,20 @@ passes through a state the property above forbids. The shared TOTP store contrac
   user at a time, as `is_last_enabled_admin` does. One shared query for the predicate is unbuilt.
 - A store key that cannot be resolved exits 2 here, as it does for `provision-admin`.
   `admin-unlock` does not route that error yet.
+
+## Amendment C (2026-10-07) -- "could not start" exits 2 for every host-gated command (vault BACKLOG #3054, #3110)
+
+This amends the decision *Exit codes follow the `--json` convention* and two lines of Amendment B.
+The `--json` half stands: a refusal is still one JSON object on stdout under `--json`. The exit
+code no longer follows the helper that prints it.
+
+- The shared host gate, `_host_gated_store_settings`, exits **2**, not 1, for settings it cannot
+  load and for an absent SQLite store. Both are "could not start", which each command's
+  `StoreNotFoundError` arm already exited 2 for on a server database. Exit 1 stays the code for a
+  refusal about the account, such as no account by that name. This covers `admin-unlock`,
+  `admin-set-notify-email` and `admin-reset-totp`.
+- `admin-unlock` and `admin-set-notify-email` now route a store key that cannot be resolved to
+  exit 2, as `admin-reset-totp` and `provision-admin` do. Amendment B's last line, that
+  `admin-unlock` does not route it yet, no longer holds.
+- A store cipher the settings cannot build, a key that is not base64 of 32 bytes among them, is
+  one of those key errors (`StoreCipherConfigError`), so all four commands exit 2 on it too.

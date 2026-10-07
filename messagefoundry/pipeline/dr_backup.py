@@ -271,6 +271,33 @@ class BackupResult:
     #: the run alerts ``backup_failed`` with kind ``cleanup`` and records this in its audit row, and the
     #: next backup's sweep retries the directory.
     staging_leftover: str | None = None
+    #: Whether the archive carries the config dir under ``config/``, the dir this pass read, and,
+    #: when it could not be read, the fault's class name (vault BACKLOG #3094). A full run with
+    #: ``config_bundled`` false and a fault still succeeds: the store snapshot is worth keeping.
+    config_bundled: bool = False
+    config_dir: str | None = None
+    config_bundle_error: str | None = None
+
+
+@dataclass(frozen=True)
+class _ConfigBundle:
+    """What one pass found at its config dir; see :meth:`BackupRunner._inspect_config`."""
+
+    path: Path | None
+    bundled: bool
+    fingerprint: str | None
+    error: str | None
+
+    def manifest_fields(self) -> dict[str, object]:
+        """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
+        directory path, a digest and an exception class name."""
+        return {
+            "config_fingerprint": self.fingerprint,
+            "config_bundled": self.bundled,
+            # Named on a fault too, so the record says which directory failed.
+            "config_dir": str(self.path) if self.path is not None else None,
+            "config_bundle_error": self.error,
+        }
 
 
 @dataclass(frozen=True)
@@ -291,7 +318,11 @@ class RestoreResult:
 class BackupRunner:
     """Engine-managed DR backup (ADR 0049). Construct with the store + ``[backup]`` settings + the store
     settings (for the key source) + the loaded config dir; call :meth:`start`/:meth:`stop` for the
-    supervised daily loop, or :meth:`run_once` for a single deterministic pass (the CLI + tests)."""
+    supervised daily loop, or :meth:`run_once` for a single deterministic pass (the CLI + tests).
+
+    ``config_dir`` may be a callable, read once at the start of each pass. The engine passes its
+    running config dir that way, so after an operator reload from another root the archive carries,
+    and fingerprints, the directory the running graph came from (vault BACKLOG #3094)."""
 
     def __init__(
         self,
@@ -299,7 +330,7 @@ class BackupRunner:
         settings: BackupSettings,
         *,
         store_settings: object,
-        config_dir: str | Path | None,
+        config_dir: str | Path | Callable[[], str | Path | None] | None,
         engine_version: str = "",
         instance: str = "",
         alert_sink: AlertSink | None = None,
@@ -311,7 +342,7 @@ class BackupRunner:
         # The store settings carry the KeyProvider seam (ADR 0019) — the archive's KEY SOURCE. Typed
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
         self._store_settings = store_settings
-        self._config_dir = Path(config_dir) if config_dir is not None else None
+        self._config_dir_source = config_dir
         self._engine_version = engine_version
         self._instance = instance
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
@@ -464,6 +495,9 @@ class BackupRunner:
         # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
         # --config-only flag forces config-only even on SQLite.
         config_only = force_config_only or self._is_server_db()
+        # Read once, so the space check, the archive's config/ members and its fingerprint all name
+        # one directory even if a reload lands during the pass.
+        config_dir = self._current_config_dir()
         if self._is_server_db() and not s.config_only_on_server_db:
             raise BackupError(
                 "snapshot",
@@ -495,7 +529,11 @@ class BackupRunner:
         # account to sweep for; on a box where the temp dir shares the data volume, a killed
         # standalone verify's leftovers are still counted as used here.
         shortfall = await asyncio.to_thread(
-            self._space_shortfall, staging_root, dest_dir, config_only=config_only
+            self._space_shortfall,
+            staging_root,
+            dest_dir,
+            config_only=config_only,
+            config_dir=config_dir,
         )
         if shortfall is not None:
             raise BackupError(
@@ -555,12 +593,26 @@ class BackupRunner:
                 # for what is still to come: the tar beside it and the archive at the destination.
                 # Inside the try, so a refusal here still releases the staging directory.
                 shortfall = await asyncio.to_thread(
-                    self._space_shortfall_after_snapshot, snap_path, work.path, dest_dir
+                    self._space_shortfall_after_snapshot,
+                    snap_path,
+                    work.path,
+                    dest_dir,
+                    config_dir=config_dir,
                 )
                 if shortfall is not None:
                     raise BackupError(
                         "space", f"not enough free space to finish this backup: it {shortfall}"
                     )
+            # Read once, off the loop, and recorded in both the manifest and the audit row.
+            bundle = await asyncio.to_thread(self._inspect_config, config_dir)
+            if config_only and bundle.error is not None:
+                # A config-only archive without its config holds nothing to restore, yet it would
+                # verify and take a keep-N slot from an archive that does. It fails instead.
+                raise BackupError(
+                    "snapshot",
+                    f"config-only backup: the config dir {config_dir} could not be read "
+                    f"({bundle.error}); nothing to archive",
+                )
             try:
                 (
                     snapshot_sha256,
@@ -577,6 +629,7 @@ class BackupRunner:
                     salt=salt,
                     config_only=config_only,
                     now=now,
+                    bundle=bundle,
                 )
             except (OSError, BackupCodecError) as exc:
                 kind = "write" if isinstance(exc, OSError) else "encrypt"
@@ -630,12 +683,15 @@ class BackupRunner:
             config_only=config_only,
             snapshot_method=s.snapshot_method,
             key_id=key_id,
-            config_fingerprint=self._config_fingerprint(),
+            config_fingerprint=bundle.fingerprint,
             row_counts=row_counts,
             verify=verify,
             pruned=pruned,
             encrypted=key is not None,
             staging_leftover=staging_leftover,
+            config_bundled=bundle.bundled,
+            config_dir=str(bundle.path) if bundle.path is not None else None,
+            config_bundle_error=bundle.error,
         )
 
     async def _verify_and_publish(
@@ -812,6 +868,7 @@ class BackupRunner:
         key_id: str | None,
         config_only: bool,
         now: float,
+        bundle: _ConfigBundle,
         salt: bytes | None = None,
     ) -> tuple[str, dict[str, int], int, str | None]:
         """Run :meth:`_build_archive_blocking` in ``work`` and release ``work`` on every exit, from this
@@ -832,6 +889,7 @@ class BackupRunner:
                 salt=salt,
                 work_dir=work.path,
                 secure=work.secure,
+                bundle=bundle,
             )
         except BaseException as exc:
             leftover = work.release()
@@ -857,6 +915,7 @@ class BackupRunner:
         now: float,
         work_dir: Path,
         secure: bool,
+        bundle: _ConfigBundle,
         salt: bytes | None = None,
     ) -> tuple[str, dict[str, int], int]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
@@ -889,7 +948,7 @@ class BackupRunner:
             "config_only": config_only,
             "backend": self._backend_value(),
             "key_id": key_id,  # one-way fingerprint, NEVER key bytes
-            "config_fingerprint": self._config_fingerprint(),
+            **bundle.manifest_fields(),
             "snapshot_sha256": snapshot_sha256,
             "row_counts": row_counts,
         }
@@ -902,8 +961,8 @@ class BackupRunner:
             with tarfile.open(fileobj=tar_fh, mode="w") as tar:
                 if snap_path is not None:
                     tar.add(snap_path, arcname=_STORE_MEMBER)
-                if self._settings.include_config and self._config_dir is not None:
-                    self._add_config_dir(tar)
+                if bundle.bundled and bundle.path is not None:
+                    self._add_config_dir(tar, bundle.path)
                 info = tarfile.TarInfo(_MANIFEST_MEMBER)
                 info.size = len(manifest_bytes)
                 info.mtime = int(now)
@@ -938,16 +997,14 @@ class BackupRunner:
         archive_bytes = out_path.stat().st_size
         return snapshot_sha256, row_counts, archive_bytes
 
-    def _add_config_dir(self, tar: tarfile.TarFile) -> None:
-        """Add the loaded config dir under ``config/`` — every regular file (incl. ``_*.py``,
+    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> None:
+        """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
         ``connections.toml``, ``codesets/``, fixtures). Symlinks are NOT followed (a symlink out of the
         bundle would smuggle an arbitrary host file into the archive); only regular files are added.
 
         A config editor's lock file and candidate directories are skipped (vault BACKLOG #2782): a
         candidate lives only for one validation, so one listed here may be gone by the add, and a
         killed editor's leftover is not config."""
-        base = self._config_dir
-        assert base is not None
         for path in sorted(base.rglob("*")):
             if path.is_symlink() or not path.is_file():
                 continue
@@ -1075,6 +1132,9 @@ class BackupRunner:
             "encrypted": result.encrypted,
             "key_id": result.key_id,  # one-way fingerprint — never key bytes
             "config_fingerprint": result.config_fingerprint,
+            "config_bundled": result.config_bundled,
+            "config_dir": result.config_dir,
+            "config_bundle_error": result.config_bundle_error,
             "snapshot_sha256": result.snapshot_sha256,
             "row_counts": result.row_counts,
             "verify": verify.status if verify is not None else "skipped",
@@ -1128,15 +1188,60 @@ class BackupRunner:
             return None
         return base64.b64decode(key_b64)
 
-    def _config_fingerprint(self) -> str | None:
-        if self._config_dir is None:
-            return None
+    def _current_config_dir(self) -> Path | None:
+        """The config dir this pass backs up: the constructor's value, or what its callable names
+        now."""
+        source = self._config_dir_source
+        current = source() if callable(source) else source
+        return Path(current) if current is not None else None
+
+    def _inspect_config(self, config_dir: Path | None) -> _ConfigBundle:
+        """Whether this pass can bundle ``config_dir``, and its ADR 0041 D1 digest. Blocking; the
+        caller runs it off the loop.
+
+        A directory that is gone or cannot be listed is not bundled, and the archive records that
+        with the fault's class name (vault BACKLOG #3094). The fold and the archive walk both list
+        through ``glob``, which swallows that error, so without this check the archive would carry
+        an empty ``config/``, and an empty-bundle digest, under a clean success. A full pass still
+        goes on, because the store snapshot is worth keeping; a config-only pass fails, in
+        :meth:`_do_backup`. The digest itself catches what
+        :meth:`Engine.fingerprint_bundle_blocking` catches, its rule's source of record, so a bundle
+        a load tolerates cannot fail a backup. Each warning names the directory and an error class
+        or a scrubbed reason, never config content. With ``include_config`` off nothing is bundled,
+        so a fault is not one the operator needs to hear about, and none is recorded."""
+        if config_dir is None:
+            return _ConfigBundle(path=None, bundled=False, fingerprint=None, error=None)
         from messagefoundry.config.fingerprint import config_fingerprint
 
+        include = self._settings.include_config
         try:
-            return config_fingerprint(self._config_dir)
-        except OSError:
-            return None
+            # Raises the real reason (gone, not a directory, access denied) where glob would not.
+            with os.scandir(config_dir):
+                pass
+        except OSError as exc:
+            error = type(exc).__name__
+            if not include:
+                return _ConfigBundle(path=config_dir, bundled=False, fingerprint=None, error=None)
+            log.warning(
+                "DR backup: config dir %s could not be read (%s); this archive carries no config "
+                "and no config fingerprint",
+                config_dir,
+                error,
+            )
+            return _ConfigBundle(path=config_dir, bundled=False, fingerprint=None, error=error)
+        fingerprint: str | None = None
+        try:
+            fingerprint = config_fingerprint(config_dir)
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "DR backup: config fingerprint failed for %s: %s", config_dir, safe_exc(exc)
+            )
+        return _ConfigBundle(
+            path=config_dir,
+            bundled=include,
+            fingerprint=fingerprint,
+            error=None,
+        )
 
     def _is_server_db(self) -> bool:
         return self._backend_value() in (StoreBackend.POSTGRES.value, StoreBackend.SQLSERVER.value)
@@ -1152,7 +1257,7 @@ class BackupRunner:
         )
 
     def _space_shortfall(
-        self, staging_root: Path, dest_dir: Path, *, config_only: bool
+        self, staging_root: Path, dest_dir: Path, *, config_only: bool, config_dir: Path | None
     ) -> str | None:
         """Whether this run fits, as :func:`_space_shortfall` answers it. Runs off the loop.
 
@@ -1169,7 +1274,7 @@ class BackupRunner:
         path = getattr(self._store, "path", None)
         if not config_only and isinstance(path, str) and path != ":memory:":
             store_bytes = _file_size(Path(path))
-        config_bytes = self._config_bytes()
+        config_bytes = self._config_bytes(config_dir)
         return _space_shortfall(
             [
                 (staging_root, 2 * store_bytes + config_bytes),
@@ -1178,20 +1283,20 @@ class BackupRunner:
         )
 
     def _space_shortfall_after_snapshot(
-        self, snap_path: Path, staging: Path, dest_dir: Path
+        self, snap_path: Path, staging: Path, dest_dir: Path, *, config_dir: Path | None
     ) -> str | None:
         """The second free-space check, once the snapshot is on disk. It asks only for what is still
         to be written: the tar in staging (``S' + C``) and the archive at the destination
         (``S' + C``), with ``S'`` the snapshot's real size. The backup's own verify later holds no
         more on the staging volume than the build did, because the build's staging is released
         first."""
-        rest = _file_size(snap_path) + self._config_bytes()
+        rest = _file_size(snap_path) + self._config_bytes(config_dir)
         return _space_shortfall([(staging, rest), (dest_dir, rest)])
 
-    def _config_bytes(self) -> int:
+    def _config_bytes(self, config_dir: Path | None) -> int:
         """The bytes of the config bundle the archive will carry, or 0 when it carries none."""
-        if self._settings.include_config and self._config_dir is not None:
-            return _tree_size(Path(self._config_dir))
+        if self._settings.include_config and config_dir is not None:
+            return _tree_size(config_dir)
         return 0
 
     def _backend_value(self) -> str:

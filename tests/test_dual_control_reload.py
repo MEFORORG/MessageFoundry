@@ -21,13 +21,21 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import _compare_start_config, _record_reload_audit
+from messagefoundry.api.app import (
+    _REFUSAL_LOG_LIMIT,
+    _audit_refused_reload,
+    _audit_reload_attempt,
+    _compare_start_config,
+    _record_reload_audit,
+)
 from messagefoundry.auth import Role
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
@@ -38,6 +46,7 @@ from messagefoundry.config.settings import (
     AuthSettings,
     EgressSettings,
 )
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
@@ -782,6 +791,175 @@ async def test_a_refused_release_whose_audit_row_fails_still_answers_422(
         rec.levelno == logging.ERROR and "config_reload_failed audit row failed" in rec.getMessage()
         for rec in caplog.records
     )
+
+
+async def _refuse_audit(action: str, **kwargs: Any) -> None:
+    raise sqlite3.OperationalError("disk I/O error")
+
+
+#: An engine whose audit log refuses every write, for the lost-row log tests below.
+_AUDIT_DOWN = cast(Engine, SimpleNamespace(store=SimpleNamespace(record_audit=_refuse_audit)))
+
+#: A CR/LF in the actor and in the requested directory, each shaped to forge a log line.
+_FORGING_ACTOR = "alice\nFORGED actor=root"
+_FORGING_DIR = "/cfg\r\nFORGED config reload succeeded"
+
+
+def _assert_no_forged_line(caplog: pytest.LogCaptureFixture) -> None:
+    """caplog's handler has no ControlCharScrubFilter, so this reads each call site's own scrub."""
+    records = [r for r in caplog.records if r.name == "messagefoundry.api.app"]
+    assert records
+    for record in records:
+        message = record.getMessage()
+        assert "\r" not in message and "\n" not in message, message
+
+
+async def test_a_lost_refusal_row_cannot_forge_a_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CodeQL py/log-injection on PR 2115. A refused reload logs the caller's requested directory
+    twice: in the refusal WARNING and in the lost-row ERROR. Neither message may start a new line,
+    and the lost row must still parse back to the detail that was lost. This reads the messages,
+    not a traceback: a route's chained refusal is left to the handler filter, as app.py says."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        status, _answer = await _audit_refused_reload(
+            _AUDIT_DOWN,
+            FileNotFoundError(f"config directory not found: {_FORGING_DIR}"),
+            actor=_FORGING_ACTOR,
+            requested=_FORGING_DIR,
+            dry_run=False,
+        )
+    assert status == 404
+    _assert_no_forged_line(caplog)
+    [lost] = [r for r in caplog.records if "Lost row" in r.getMessage()]
+    message = lost.getMessage()
+    assert "actor=alice\\nFORGED actor=root " in message
+    row = message.split(" detail=", 1)[1]
+    assert json.loads(row) == {"requested": _FORGING_DIR, "dry_run": False, "reason": "not_found"}
+
+
+async def test_the_other_lost_reload_rows_cannot_forge_a_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same for the two sibling lost-row logs: a reload's own row after the swap, and the
+    attempt row an ungated reload writes first. The fake engine has no graph, so the first one
+    loses the row before its detail is built and logs the actor alone."""
+    lost_actions: list[str] = []
+    sink = SimpleNamespace(audit_write_failed=lambda name, *, action: lost_actions.append(action))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR)
+        with pytest.raises(HTTPException) as refused:
+            await _audit_reload_attempt(
+                _AUDIT_DOWN,
+                actor=_FORGING_ACTOR,
+                requested=_FORGING_DIR,
+                client=None,
+                alert_sink=cast(Any, sink),
+            )
+    assert steps and refused.value.status_code == 503
+    assert lost_actions == ["config_reload_attempted"]
+    _assert_no_forged_line(caplog)
+    lost = [r.getMessage() for r in caplog.records if "Lost row" in r.getMessage()]
+    assert len(lost) == 2
+    assert json.loads(lost[1].split(" detail=", 1)[1]) == {
+        "requested": _FORGING_DIR,
+        "dry_run": False,
+    }
+
+
+async def _keep_audit(action: str, **kwargs: Any) -> None:
+    return None
+
+
+#: An engine whose audit log takes every write, so a refusal logs its WARNING and nothing else.
+_AUDIT_UP = cast(Engine, SimpleNamespace(store=SimpleNamespace(record_audit=_keep_audit)))
+
+
+def _refusal_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "messagefoundry.api.app"
+        and r.levelno == logging.WARNING
+        and r.getMessage().startswith("config reload ")
+    ]
+
+
+@pytest.mark.parametrize(
+    "long_dir",
+    [
+        "/opt/messagefoundry/" + "/".join(f"site-{i:02d}-feeds" for i in range(25)),
+        "/opt/" + "a" * 4091,  # the longest config_dir FilesystemPath accepts, one token
+    ],
+)
+async def test_a_missing_dir_refusal_logs_the_whole_long_path(
+    caplog: pytest.LogCaptureFixture, long_dir: str
+) -> None:
+    """Lander hold on PR 2115. The refusal WARNING carries the real reload error, and
+    ``safe_exc``'s default 200-character cut dropped the directory from a long config path. The
+    whole path must reach the line, past where the old cut fell, up to the longest the API takes."""
+    assert len(long_dir) > 300
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        status, answer = await _audit_refused_reload(
+            _AUDIT_UP,
+            FileNotFoundError(f"config directory not found: {long_dir}"),
+            actor="alice",
+            requested=long_dir,
+            dry_run=False,
+        )
+    assert (status, answer) == (404, "config directory not found")
+    [warning] = _refusal_warnings(caplog)
+    assert warning == (
+        f"config reload failed (missing dir): FileNotFoundError: config directory not found: {long_dir}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("cause", "prefix"),
+    [
+        (None, "config reload failed (invalid config): WiringError: "),
+        (
+            ta.TrustAnchorError("pin mismatch"),
+            "config reload refused (trust anchor): WiringError: ",
+        ),
+    ],
+)
+async def test_an_invalid_config_refusal_cannot_forge_a_log_line_and_keeps_its_fix(
+    caplog: pytest.LogCaptureFixture, cause: Exception | None, prefix: str
+) -> None:
+    """The 422 WiringError arm of the same WARNING, in both its wordings. A CR/LF in the error text
+    must not start a new log line, and a long error keeps its tail, which is where a WiringError
+    puts its fix."""
+    fix = "fix: point tls_ca_file at a readable PEM bundle"
+    padding = " ".join(f"step-{i:02d}-checked" for i in range(20))
+    error = WiringError(
+        f"inbound IB_X_ADT at {_FORGING_DIR}: tls_ca_file unreadable; {padding}; {fix}"
+    )
+    error.__cause__ = cause
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        status, answer = await _audit_refused_reload(
+            _AUDIT_UP, error, actor="alice", requested=_FORGING_DIR, dry_run=False
+        )
+    assert (status, answer) == (422, "invalid configuration")
+    _assert_no_forged_line(caplog)
+    [warning] = _refusal_warnings(caplog)
+    assert warning.startswith(prefix)
+    assert "/cfg\\r\\nFORGED config reload succeeded" in warning
+    assert warning.endswith(fix)
+
+
+async def test_a_refusal_warning_is_still_bounded(caplog: pytest.LogCaptureFixture) -> None:
+    """The lifted cut is a larger bound, not none: an error past _REFUSAL_LOG_LIMIT is cut, so one
+    refusal cannot write a 64 KiB line for every handler to re-scan on the event loop."""
+    error = WiringError(" ".join(f"word-{i:05d}" for i in range(2000)))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        await _audit_refused_reload(
+            _AUDIT_UP, error, actor="alice", requested="/cfg", dry_run=False
+        )
+    [warning] = _refusal_warnings(caplog)
+    assert "word-00300" in warning  # well past the old 200-character cut
+    assert "word-01999" not in warning
+    assert len(warning) < _REFUSAL_LOG_LIMIT + 200
 
 
 async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(

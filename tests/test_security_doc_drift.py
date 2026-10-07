@@ -91,11 +91,13 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # BACKLOG #2443 (ASVS 14.2.6, owner ruling R12) added three /ui routes and no JSON route: the
 # per-item reason reveals GET /ui/events/{event_id}/reason, /ui/alerts/{alert_id}/reason and
 # /ui/connection/{name}/events/{event_id}/reason. The JSON reveal is a query parameter.
+# BACKLOG #2460 added one /ui route and no JSON route: POST /ui/approvals/{approval_id}/resolve/
+# {outcome}, the console's resolve of an interrupted release.
 # BACKLOG #2331 added one JSON route: GET /users/{user_id}/federated-identity, users:manage.
 _ROUTES_DEFAULT = 116
 _ROUTES_WITH_DOCS = 120
 # Vault BACKLOG #2625 added one console route: GET /ui/messages/{message_id}/resend-done.
-_ROUTES_WITH_UI = 241
+_ROUTES_WITH_UI = 242
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -443,6 +445,8 @@ _CONTEXTUAL_TOKENS = frozenset(
         "admin_write_min_interval_seconds",
         "mfa_verify_min_elapsed_seconds",
         "oidc_callback_min_elapsed_seconds",
+        # BACKLOG #2388: the verified amr values that skip that federated floor.
+        "oidc_callback_floor_exempt_amr",
         "ad_session_recheck_seconds",
         "ad_session_recheck_strikes",
         "ad_session_recheck_max_users",
@@ -488,6 +492,10 @@ _CONTEXTUAL_TOKENS = frozenset(
         # the hold-age FLOOR beside that ceiling (ASVS 2.4.2, BACKLOG #287)
         "min_dwell_seconds",
         "approval.too_early",
+        # a repeat of an open hold joins it rather than filing a second (vault BACKLOG #2445)
+        "approval.request_repeated",
+        # a hold whose operation dual control no longer gates is refused, not released
+        "approval.no_longer_gated",
         # observable outcomes
         "X-MessageFoundry-Denied",
         "client-network",

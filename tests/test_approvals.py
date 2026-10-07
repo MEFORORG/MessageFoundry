@@ -144,6 +144,113 @@ async def test_high_value_action_is_held_pending(engine: Engine) -> None:
         assert any(a["id"] == body["approval_id"] and a["requester"] == "op" for a in pending)
 
 
+async def test_the_queue_shows_the_params_a_hold_captured(engine: Engine) -> None:
+    """BACKLOG #2458: the approver sees what a release would re-run, not only the operation name."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        held = await c.post(
+            "/dead-letters/replay",
+            headers=await _token(c, "op"),
+            json={"channel_id": "IB_ACME_ADT", "destination_name": "OB_LAB_ORU"},
+        )
+        assert held.status_code == 202
+        approval_id = held.json()["approval_id"]
+        listed = (await c.get("/approvals", headers=await _token(c, "approver"))).json()
+    row = next(a for a in listed["approvals"] if a["id"] == approval_id)
+    # Exactly the mapping the release hands the executor, read back from the stored row.
+    stored = await engine.store.get_pending_approval(approval_id)
+    assert stored is not None
+    assert row["params"] == json.loads(str(stored["params"]))
+    assert row["params"] == {
+        "channel_id": "IB_ACME_ADT",
+        "destination_name": "OB_LAB_ORU",
+        "requester": "op",
+    }
+
+
+async def test_the_queue_marks_the_callers_own_requests_by_user_id(engine: Engine) -> None:
+    """BACKLOG #2460: ``caller_is_requester`` is keyed on the immutable id, as the refusal is
+    (#1540), so a rename does not unmark the requester and a new holder of the name is not marked."""
+    service = await _service(engine)
+    maker_id = await _add(service, "maker", Role.ADMINISTRATOR)
+    await _add(service, "checker", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        maker = await _token(c, "maker")
+        approval_id = (await _request_replay(c, maker)).json()["approval_id"]
+
+        async def _mark(headers: dict[str, str]) -> bool:
+            listed = (await c.get("/approvals", headers=headers)).json()
+            row = next(a for a in listed["approvals"] if a["id"] == approval_id)
+            return bool(row["caller_is_requester"])
+
+        assert await _mark(maker) is True
+        assert await _mark(await _token(c, "checker")) is False
+        # Rename the requester (same session) and give the freed name to somebody else.
+        assert await engine.store.set_user_username(maker_id, "maker2", expected_username="maker")
+        await _add(service, "maker", Role.ADMINISTRATOR)
+        assert await _mark(maker) is True
+        assert await _mark(await _token(c, "maker")) is False
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        OFF,
+        ApprovalsSettings(enabled=True, operations=["connection_purge"], min_dwell_seconds=0.0),
+    ],
+    ids=["dual-control-off", "operation-removed"],
+)
+async def test_the_queue_marks_a_request_dual_control_no_longer_gates(
+    engine: Engine, later: ApprovalsSettings
+) -> None:
+    """``gated`` is False once the settings no longer gate the operation, and the release it
+    predicts is refused. Held under one app and listed under a second over the same store, as a
+    restart with changed ``[approvals]`` settings gives."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        before = (await c.get("/approvals", headers=await _token(c, "approver"))).json()
+    async with _client(engine, service, later) as c:
+        approver = await _token(c, "approver")
+        after = (await c.get("/approvals", headers=approver)).json()
+        released = await c.post(f"/approvals/{approval_id}/approve", headers=approver)
+    assert [a["gated"] for a in before["approvals"] if a["id"] == approval_id] == [True]
+    assert [a["gated"] for a in after["approvals"] if a["id"] == approval_id] == [False]
+    assert released.status_code == 409
+    assert await _status_of(engine, approval_id) == "pending"
+
+
+async def test_a_row_whose_params_do_not_parse_is_listed_without_them(engine: Engine) -> None:
+    """One damaged row must not take the queue down; it is listed with ``params`` None."""
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    damaged = uuid4().hex
+    await engine.store.create_pending_approval(
+        approval_id=damaged,
+        operation="dead_letter_replay",
+        params="not json",
+        requester="op",
+        requester_user_id=op_id,
+        requested_at=time.time(),
+        expires_at=None,
+    )
+    async with _client(engine, service, ON) as c:
+        approver = await _token(c, "approver")
+        r = await c.get("/approvals", headers=approver)
+        # The same decoder refuses the release as a 409, not a 500 from a bare parse.
+        released = await c.post(f"/approvals/{damaged}/approve", headers=approver)
+    assert r.status_code == 200
+    assert [a["params"] for a in r.json()["approvals"] if a["id"] == damaged] == [None]
+    assert released.status_code == 409
+    assert "unreadable" in released.json()["detail"]
+    assert await _status_of(engine, damaged) == "pending"
+
+
 async def test_requester_cannot_approve_their_own_request(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "admin1", Role.ADMINISTRATOR)  # admins can both request and approve
@@ -512,14 +619,16 @@ async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engin
 
 
 def _fail_audit_for(monkeypatch: pytest.MonkeyPatch, engine: Engine, *actions: str) -> None:
-    real = engine.store.record_audit
+    """Fail the named audit actions at the one append every audit write goes through: a
+    ``record_audit`` and the row a status write appends with it (vault BACKLOG #2255) alike."""
+    real = engine.store._append_audit_row  # type: ignore[attr-defined]
 
-    async def _record(action: str, **kwargs: Any) -> None:
+    async def _append(action: str, **kwargs: Any) -> Any:
         if action in actions:
             raise sqlite3.OperationalError("disk I/O error")
-        await real(action, **kwargs)
+        return await real(action, **kwargs)
 
-    monkeypatch.setattr(engine.store, "record_audit", _record)
+    monkeypatch.setattr(engine.store, "_append_audit_row", _append)
 
 
 async def _gate_with_spy_op(engine: Engine) -> tuple[ApprovalGate, list[Mapping[str, Any]], str]:
@@ -582,7 +691,7 @@ async def test_the_refused_release_is_a_503_at_the_route(
         _fail_audit_for(monkeypatch, engine, "approval.release_attempted", "approval.approved")
         r = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
         assert r.status_code == 503
-        assert "still pending" in r.json()["detail"]
+        assert "did not run" in r.json()["detail"]
     # The dead letter was not re-queued: nothing ran, and the request did not move.
     assert len(await engine.store.list_dead(limit=10, allowed_channels=None)) == 1
     row = await engine.store.get_pending_approval(approval_id)
@@ -593,38 +702,39 @@ async def test_the_refused_release_is_a_503_at_the_route(
 async def test_a_release_row_whose_commit_failed_never_commits_later(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PR 1607 review finding 3. The 503 tells the approver the release row is absent. The fault is
-    injected at the COMMIT, so the INSERT really ran. SQLite leaves a transaction open when its
-    COMMIT fails, and a store that did not roll it back would hand it to the next writer, whose
-    COMMIT made the refused row durable after all. The next writer here is the re-approve's own
-    release row, so a leaked row shows up as a second one."""
+    """PR 1607 review finding 3. The 503 tells the approver the claim and its release row are both
+    absent. The fault is injected at the COMMIT, so both statements really ran. SQLite leaves a
+    transaction open when its COMMIT fails, and a store that did not roll it back would hand it to
+    the next writer, whose COMMIT made the refused claim durable after all. The next writer here is
+    the re-approve's own claim, so a leaked claim shows up as a 409 and a leaked row as a second
+    one."""
     gate, calls, maker_id = await _gate_with_spy_op(engine)
     approval_id = await gate.guard(
         "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
     )
     assert approval_id is not None
     store = engine.store
-    real_record, real_commit = store.record_audit, store._commit  # type: ignore[attr-defined]
+    real_append, real_commit = store._append_audit_row, store._commit  # type: ignore[attr-defined]
     armed = False
 
-    async def _record(action: str, **kwargs: Any) -> None:
+    async def _append(action: str, **kwargs: Any) -> Any:
         nonlocal armed
         armed = action == "approval.release_attempted"
-        try:
-            await real_record(action, **kwargs)
-        finally:
-            armed = False
+        return await real_append(action, **kwargs)
 
     async def _commit() -> None:
+        nonlocal armed
         if armed:
+            armed = False
             raise sqlite3.OperationalError("database is locked")
         await real_commit()
 
-    monkeypatch.setattr(store, "record_audit", _record)
+    monkeypatch.setattr(store, "_append_audit_row", _append)
     monkeypatch.setattr(store, "_commit", _commit)
     with pytest.raises(ApprovalError) as caught:
         await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     assert caught.value.status == 503 and calls == []
+    assert await _status_of(engine, approval_id) == "pending"  # the claim rolled back with it
 
     monkeypatch.undo()
     outcome = await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
@@ -632,35 +742,78 @@ async def test_a_release_row_whose_commit_failed_never_commits_later(
     assert len(await store.list_audit(action="approval.release_attempted")) == 1
 
 
-async def test_a_release_that_loses_to_a_reject_runs_nothing(
+async def test_a_release_that_loses_to_a_reject_runs_nothing_and_writes_no_release_row(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The documented cost of writing the release row first. A reject that lands between that row
-    and the transition wins: the approve is refused, nothing runs, and the release row stands
-    alone with no approved or failed row after it."""
+    """A reject that lands after the approve's checks and before its claim wins: the approve is
+    refused, nothing runs, and, because the claim and its row are one write (vault BACKLOG #2255),
+    the loser leaves no release row behind. Before the fix it left one with no outcome after it."""
     gate, calls, maker_id = await _gate_with_spy_op(engine)
     approval_id = await gate.guard(
         "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
     )
     assert approval_id is not None
-    real = engine.store.record_audit
+    real = engine.store.decide_pending_approval
 
-    async def _reject_right_after_the_release_row(action: str, **kwargs: Any) -> None:
-        await real(action, **kwargs)
-        if action == "approval.release_attempted":
-            monkeypatch.undo()  # so the reject's own audit write goes straight through
+    async def _reject_just_before_the_claim(approval_id: str, **kwargs: Any) -> bool:
+        if kwargs["status"] == "executing":
+            monkeypatch.undo()  # so the reject's own write goes straight through
             await gate.reject(approval_id, approver="other-checker")
+        return bool(await real(approval_id, **kwargs))
 
-    monkeypatch.setattr(engine.store, "record_audit", _reject_right_after_the_release_row)
+    monkeypatch.setattr(engine.store, "decide_pending_approval", _reject_just_before_the_claim)
     with pytest.raises(ApprovalError) as caught:
         await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     assert caught.value.status == 409
     assert calls == []
-    row = await engine.store.get_pending_approval(approval_id)
-    assert row is not None and str(row["status"]) == "rejected"
+    assert await _status_of(engine, approval_id) == "rejected"
     actions = [str(r["action"]) for r in await engine.store.list_audit(limit=50)]
-    assert actions.count("approval.release_attempted") == 1
+    assert actions.count("approval.rejected") == 1
+    assert "approval.release_attempted" not in actions
     assert "approval.approved" not in actions and "approval.failed" not in actions
+
+
+async def test_a_request_whose_requested_row_fails_is_never_held(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The request and its approval.requested row are one write (vault BACKLOG #2255). Before the
+    fix the request was written first and withdrawn after a failed row, so a crash between the two
+    left a releasable request nobody had recorded. The fault is the real append, so this is the
+    store's own rollback, not a wrapper declining to call it."""
+    gate, _calls, maker_id = await _gate_with_spy_op(engine)
+    _fail_audit_for(monkeypatch, engine, "approval.requested")
+    with pytest.raises(sqlite3.OperationalError):
+        await gate.guard("dead_letter_replay", {}, requester="maker", requester_user_id=maker_id)
+    assert await engine.store.list_pending_approvals(now=0.0) == []
+    monkeypatch.undo()
+    # The control: the same request is held once the audit log accepts writes.
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None and await _status_of(engine, approval_id) == "pending"
+    assert len(await engine.store.list_audit(action="approval.requested")) == 1
+
+
+async def test_a_rejection_whose_rejected_row_fails_is_refused_and_stays_pending(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rejection and its approval.rejected row are one write (vault BACKLOG #2255). Before the
+    fix the row moved first and its audit row could be lost, leaving a rejection nobody signed."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    _fail_audit_for(monkeypatch, engine, "approval.rejected")
+    with pytest.raises(ApprovalError) as caught:
+        await gate.reject(approval_id, approver="checker")
+    assert caught.value.status == 503
+    assert await _status_of(engine, approval_id) == "pending"
+    monkeypatch.undo()
+    await gate.reject(approval_id, approver="checker")
+    assert await _status_of(engine, approval_id) == "rejected"
+    assert len(await engine.store.list_audit(action="approval.rejected")) == 1
+    assert calls == []
 
 
 async def test_a_failed_approved_row_after_the_operation_ran_still_reports_success(
@@ -740,6 +893,14 @@ async def test_pending_approval_store_contract(engine: Engine) -> None:
     from tests._pending_approval_store_contract import _assert_pending_approval_contract
 
     await _assert_pending_approval_contract(engine.store)
+
+
+async def test_approval_transition_audit_contract(engine: Engine) -> None:
+    """vault BACKLOG #2255 on the SQLite backend: a request or a transition and its audit row
+    commit or roll back together, and a transition that matches no row writes no row."""
+    from tests._pending_approval_store_contract import _assert_transition_audit_contract
+
+    await _assert_transition_audit_contract(engine.store)
 
 
 # --- BACKLOG #1562: a release is 'executing' until its outcome is known ---------------------------
@@ -953,10 +1114,10 @@ async def test_cancel_during_the_claim_settles_to_failed_and_never_runs(engine: 
 async def test_a_failed_approved_write_still_writes_the_audit_row(
     engine: Engine, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The operation RAN. If moving the row to 'approved' fails, approval.approved is still written,
-    the failure is logged at ERROR, and the approver still gets success: a 500 would invite a new
-    request that runs the operation twice (BACKLOG #1940's reasoning, applied to the status write).
-    The row is left 'executing', never 'failed'."""
+    """The operation RAN. If moving the row to 'approved' fails, both with its row and alone,
+    approval.approved is still written on its own, the failure is logged at ERROR, and the approver
+    still gets success: a 500 would invite a new request that runs the operation twice (BACKLOG
+    #1940's reasoning, applied to the status write). The row is left 'executing', never 'failed'."""
     from tests._pending_approval_store_contract import _resolve, _StandingStore
 
     class _SettleFails(_StandingStore):
@@ -980,9 +1141,21 @@ async def test_a_failed_approved_write_still_writes_the_audit_row(
     assert any(
         r.levelno == logging.ERROR
         and approval_id in r.getMessage()
-        and "moving the row to 'approved' failed" in r.getMessage()
+        and "writing the 'approved' status alone failed too" in r.getMessage()
         for r in caplog.records
     )
+    # BACKLOG #2087 limb 4: the row's way out. The same engine process, restarted, moves it to
+    # 'interrupted' with its own row, and an operator resolves it. The trail already holds
+    # approval.approved, which tells the operator the operation ran.
+    restarted = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
+    assert (await restarted.reconcile_after_restart()).interrupted == (approval_id,)
+    assert await _status_of(engine, approval_id) == "interrupted"
+    assert len(await engine.store.list_audit(action="approval.interrupted")) == 1
+    out = await restarted.resolve_interrupted(
+        approval_id, outcome="effects_applied", resolver="checker", resolver_user_id="checker-id"
+    )
+    assert out["status"] == "resolved_applied"
+    assert await _status_of(engine, approval_id) == "resolved_applied"
 
 
 # --- BACKLOG #1540: the self-approval refusal keys on users.id, not on the username --------
@@ -1084,6 +1257,14 @@ async def test_interrupted_resolution_store_contract(engine: Engine) -> None:
     await _assert_interrupted_resolution_contract(engine.store)
 
 
+async def test_restart_reconcile_store_contract(engine: Engine) -> None:
+    """The SQLite leg of the shared restart-reconcile contract (BACKLOG #1562); the server legs run
+    the same body."""
+    from tests._pending_approval_store_contract import _assert_restart_reconcile_contract
+
+    await _assert_restart_reconcile_contract(engine.store)
+
+
 def _app_client(
     engine: Engine, service: AuthService, runs: list[str]
 ) -> tuple[ApprovalGate, httpx.AsyncClient]:
@@ -1166,7 +1347,7 @@ async def test_a_row_cut_off_between_the_two_reads_is_listed_once(engine: Engine
         cut_off = (await gate.list_interrupted())[0]
         stale = {**cut_off, "status": "pending", "approver": None, "decided_at": None}
 
-        async def _stale_pending() -> list[dict[str, Any]]:
+        async def _stale_pending(**_: Any) -> list[dict[str, Any]]:
             return [stale]
 
         gate.list_pending = _stale_pending  # type: ignore[method-assign]
@@ -1223,14 +1404,12 @@ async def test_resolve_records_the_outcome_audits_it_and_never_runs(
     # The row's decided_at is now the resolution time; the audit rows keep the cut-off time.
     resolved_row = await engine.store.get_pending_approval(approval_id)
     assert resolved_row is not None and float(resolved_row["decided_at"]) != interrupted_at
-    for action in ("approval.resolve_attempted", "approval.resolved"):
-        rows = await engine.store.list_audit(action=action)
-        assert len(rows) == 1, action
-        assert str(rows[0]["actor"]) == "resolver"
-        assert json.loads(str(rows[0]["detail"])) == expected
-    # The attempt row is written BEFORE the move (list_audit is newest-first).
-    actions = [str(r["action"]) for r in await engine.store.list_audit(limit=50)]
-    assert actions.index("approval.resolved") < actions.index("approval.resolve_attempted")
+    rows = await engine.store.list_audit(action="approval.resolved")
+    assert len(rows) == 1
+    assert str(rows[0]["actor"]) == "resolver"
+    assert json.loads(str(rows[0]["detail"])) == expected
+    # One write, one row (vault BACKLOG #2255): no separate attempt row before the move.
+    assert await engine.store.list_audit(action="approval.resolve_attempted") == []
 
 
 async def test_requester_cannot_resolve_their_own_interrupted_request(engine: Engine) -> None:
@@ -1370,10 +1549,9 @@ async def test_a_resolve_that_loses_the_race_answers_409(engine: Engine) -> None
         caught.value.status == 409 and "another operator resolved it first" in caught.value.detail
     )
     assert await _status_of(engine, approval_id) == "resolved_applied"
-    assert len(await engine.store.list_audit(action="approval.resolved")) == 1
-    # The loser got as far as its attempt row; the row's status says who won.
-    attempted = await engine.store.list_audit(action="approval.resolve_attempted")
-    assert sorted(str(r["actor"]) for r in attempted) == ["a", "b"]
+    # The loser moved nothing, so it wrote nothing: the one row is the winner's.
+    resolved = await engine.store.list_audit(action="approval.resolved")
+    assert [str(r["actor"]) for r in resolved] == ["a"]
 
 
 class _AuditRefuses:
@@ -1391,56 +1569,35 @@ class _AuditRefuses:
             raise OSError("audit log unreachable")
         return await self._store.record_audit(action, **kw)
 
+    async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+        # The row a status write appends with it is refused the same way, and the store then moves
+        # nothing, which is what its own rollback gives.
+        audit = kw.get("audit")
+        if audit is not None and audit.action == self._refused:
+            raise OSError("audit log unreachable")
+        return bool(await self._store.decide_pending_approval(approval_id, **kw))
 
-async def test_a_refused_attempt_row_leaves_the_request_interrupted(engine: Engine) -> None:
-    """The audit log must accept the resolution BEFORE the row moves (BACKLOG #1940's shape), so a
-    refused attempt row answers 503 and changes nothing."""
+
+async def test_a_refused_resolved_row_leaves_the_request_interrupted(engine: Engine) -> None:
+    """The move and its approval.resolved row are one write (vault BACKLOG #2255), so a refused
+    row answers 503 and changes nothing."""
     from tests._pending_approval_store_contract import _resolve
 
     approval_id = await _interrupted_row(engine, "maker", "maker-id")
     before = await engine.store.get_pending_approval(approval_id)
     assert before is not None
-    store = _AuditRefuses(engine.store, "approval.resolve_attempted")
+    store = _AuditRefuses(engine.store, "approval.resolved")
     gate = ApprovalGate(store, ON, resolve_identity=_resolve)
     with pytest.raises(ApprovalError) as caught:
         await gate.resolve_interrupted(
             approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
         )
-    assert caught.value.status == 503 and "still interrupted" in caught.value.detail
+    assert caught.value.status == 503 and "still reads interrupted" in caught.value.detail
     after = await engine.store.get_pending_approval(approval_id)
     assert after is not None
     assert str(after["status"]) == "interrupted"
     assert float(after["decided_at"]) == float(before["decided_at"])  # never written
     assert await engine.store.list_audit(action="approval.resolved") == []
-
-
-async def test_a_failed_resolved_row_still_resolves_and_is_logged(
-    engine: Engine, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Once the row has moved, a failed approval.resolved write must not turn into an error: the
-    attempt row already names the resolver and the outcome. The loss is logged at ERROR."""
-    from tests._pending_approval_store_contract import _resolve
-
-    approval_id = await _interrupted_row(engine, "maker", "maker-id")
-    store = _AuditRefuses(engine.store, "approval.resolved")
-    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
-    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
-        out = await gate.resolve_interrupted(
-            approval_id, outcome="effects_not_applied", resolver="a", resolver_user_id="a-id"
-        )
-    assert out["status"] == "resolved_not_applied"
-    assert await _status_of(engine, approval_id) == "resolved_not_applied"
-    attempted = await engine.store.list_audit(action="approval.resolve_attempted")
-    assert [str(r["actor"]) for r in attempted] == ["a"]
-    assert json.loads(str(attempted[0]["detail"]))["outcome"] == "effects_not_applied"
-    assert any(
-        r.levelno == logging.ERROR
-        and approval_id in r.getMessage()
-        # Names the resolver: in a same-outcome race this line is what says who won.
-        and "resolver a moved the row" in r.getMessage()
-        and "approval.resolved audit row failed" in r.getMessage()
-        for r in caplog.records
-    )
 
 
 async def test_a_cancel_during_the_status_write_still_records_the_resolution(
@@ -1709,11 +1866,28 @@ async def _probe_rows(db_path: Path) -> list[Any]:
         await store.close()
 
 
-async def _run_an_orphaned_write_through_shutdown(db_path: Path, *, drained: bool) -> None:
-    """Start a slow shielded write inside the managed lifespan, cancel its caller, then shut down."""
+async def test_the_claim_owner_is_read_on_first_use_and_then_fixed(engine: Engine) -> None:
+    """An app built before its engine holds a sharded graph still claims under the shard's name,
+    and a later change (the runner gone at stop) cannot move the owner mid-life."""
+    identity = ["engine"]
+    gate = ApprovalGate(engine.store, ON, claim_owner=lambda: identity[0])
+    identity[0] = "shard:a"  # the graph arrives after the gate was built
+    assert gate.claim_owner == "shard:a"
+    identity[0] = "engine"
+    assert gate.claim_owner == "shard:a"
+
+
+def _managed(db_path: Path) -> Any:
     from messagefoundry.api import create_managed_app
 
-    app = create_managed_app(db_path=db_path, egress_settings=EgressSettings(deny_by_default=False))
+    return create_managed_app(
+        db_path=db_path, egress_settings=EgressSettings(deny_by_default=False)
+    )
+
+
+async def _run_an_orphaned_write_through_shutdown(db_path: Path, *, drained: bool) -> None:
+    """Start a slow shielded write inside the managed lifespan, cancel its caller, then shut down."""
+    app = _managed(db_path)
     finished = asyncio.Event()
     # Undrained, the write is held until the lifespan has exited, so the control cannot pass by a
     # slow teardown. Drained, it sleeps briefly, and the drain has to wait for it.
@@ -1766,30 +1940,254 @@ async def test_the_drain_assertion_can_fail(tmp_path: Path) -> None:
 async def test_a_drain_failure_does_not_skip_engine_stop(tmp_path: Path) -> None:
     """The drain runs BEFORE engine.stop(), and a drain that raises must not skip the stop, or the
     store's non-daemon worker keeps the process alive."""
-    from messagefoundry.api import create_managed_app
-
-    app = create_managed_app(
-        db_path=tmp_path / "boom.db", egress_settings=EgressSettings(deny_by_default=False)
-    )
+    app = _managed(tmp_path / "boom.db")
     calls: list[str] = []
     real_stop: list[Any] = []
+
+    async def _boom(timeout: float = 0.0) -> list[str]:
+        calls.append("drain")
+        raise RuntimeError("PROBE: deliberate drain failure")
+
     try:
         async with app.router.lifespan_context(app):
-            engine = app.state.engine
-            real_stop.append(engine.stop)
-            gate: ApprovalGate = app.state.approval_gate
-
-            async def _boom(timeout: float = 0.0) -> list[str]:
-                calls.append("drain")
-                raise RuntimeError("PROBE: deliberate drain failure")
-
-            async def _spy_stop() -> None:
-                calls.append("stop")
-                await real_stop[0]()
-
-            gate.drain = _boom  # type: ignore[method-assign]
-            engine.stop = _spy_stop
+            _spy_on_teardown(app, _boom, calls, real_stop)
     finally:
         if real_stop and "stop" not in calls:
             await real_stop[0]()
     assert calls == ["drain", "stop"]
+
+
+def _spy_on_teardown(
+    app: Any, drain: Callable[..., Awaitable[list[str]]], calls: list[str], real_stop: list[Any]
+) -> None:
+    """Swap the gate's drain for ``drain`` and record engine.stop() in ``calls``. ``real_stop``
+    keeps the real stop, so the caller can still stop the engine if the teardown never did."""
+    engine = app.state.engine
+    real_stop.append(engine.stop)
+
+    async def _spy_stop() -> None:
+        calls.append("stop")
+        await real_stop[0]()
+
+    app.state.approval_gate.drain = drain
+    engine.stop = _spy_stop
+
+
+async def test_the_long_operations_drain_runs_before_the_approval_drain(tmp_path: Path) -> None:
+    """The managed teardown drains long operations (DR activate or release, config reload) first,
+    then the approval gate, then stops the engine. A released reload's outcome write follows the
+    reload itself, so the reversed order would let that write meet a gate already drained."""
+    app = _managed(tmp_path / "order.db")
+    calls: list[str] = []
+    real_stop: list[Any] = []
+
+    async def _outliving(timeout: float = 0.0, *, grace: float = 0.0) -> list[str]:
+        calls.append("outliving")
+        return []
+
+    async def _approvals(timeout: float = 0.0) -> list[str]:
+        calls.append("drain")
+        return []
+
+    try:
+        async with app.router.lifespan_context(app):
+            _spy_on_teardown(app, _approvals, calls, real_stop)
+            app.state.outliving_operations.drain = _outliving
+    finally:
+        if real_stop and "stop" not in calls:
+            await real_stop[0]()
+    assert calls == ["outliving", "drain", "stop"]
+
+
+def test_every_resolve_outcome_has_a_status() -> None:
+    """The JSON body, the console path and its buttons all read ``ResolveOutcome``; the gate maps
+    each to a status through ``RESOLVE_OUTCOMES``. Pinned, so a new outcome cannot reach the page
+    and then answer 422 from the gate."""
+    from typing import get_args
+
+    from messagefoundry.api.approvals import RESOLVE_OUTCOMES
+    from messagefoundry.api.models import ResolveOutcome
+
+    assert set(RESOLVE_OUTCOMES) == set(get_args(ResolveOutcome))
+
+
+# --- BACKLOG #1562: the claim owner and the startup reconcile ---------------------------------------
+
+
+def _identity(
+    *, clustered: str | None = None, shard: str | None = None, runner: bool = True
+) -> Any:
+    """Engine.instance_identity over a stand-in holding only the two attributes it reads."""
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline.cluster import NullCoordinator
+
+    coordinator: Any = (
+        NullCoordinator()
+        if clustered is None
+        else SimpleNamespace(is_clustered=lambda: True, node_id=clustered)
+    )
+    registry_runner = SimpleNamespace(registry=SimpleNamespace(shard_id=shard)) if runner else None
+    fake = SimpleNamespace(_coordinator=coordinator, _registry_runner=registry_runner)
+    return Engine.instance_identity.fget(fake)  # type: ignore[attr-defined]
+
+
+def test_the_instance_identity_names_the_engine_process() -> None:
+    """Stable across a restart of the same process, distinct between processes over one store."""
+    assert _identity() is None
+    assert _identity(runner=False) is None
+    assert _identity(shard="a") == "shard:a"
+    assert _identity(shard="b") == "shard:b"
+    assert _identity(clustered="node-1") == "node:node-1"
+    # The cluster wins over a shard id; serve refuses that combination anyway (ADR 0073).
+    assert _identity(clustered="node-1", shard="a") == "node:node-1"
+
+
+async def _first_life_leaves_two_rows(db_path: Path) -> tuple[str, str]:
+    """A first life of the engine that claims two releases and never settles them: one its own,
+    one carrying a sibling's owner."""
+    from tests._pending_approval_store_contract import _claimed_directly
+
+    first = _managed(db_path)
+    async with first.router.lifespan_context(first):
+        assert first.state.approval_gate.claim_owner == "engine"
+        store = first.state.engine.store
+        now = time.time()
+        mine = await _claimed_directly(store, claim_owner="engine", claimed_at=now)
+        theirs = await _claimed_directly(store, claim_owner="shard:elsewhere", claimed_at=now)
+    return mine, theirs
+
+
+async def test_a_restart_marks_its_own_leftover_release_interrupted(tmp_path: Path) -> None:
+    db_path = tmp_path / "restart.db"
+    mine, theirs = await _first_life_leaves_two_rows(db_path)
+    second = _managed(db_path)
+    async with second.router.lifespan_context(second):
+        store = second.state.engine.store
+        assert await _status_of(second.state.engine, mine) == "interrupted"
+        assert await _status_of(second.state.engine, theirs) == "executing"
+        rows = await store.list_audit(action="approval.interrupted")
+        assert [json.loads(str(r["detail"]))["approval_id"] for r in rows] == [mine]
+        assert json.loads(str(rows[0]["detail"]))["reason"] == "engine_restart"
+
+
+async def test_the_restart_assertion_can_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: with the reconcile neutralised the same row stays 'executing', so the test above
+    measures the lifespan's call and not a row that was never left executing."""
+    db_path = tmp_path / "unreconciled.db"
+    mine, _theirs = await _first_life_leaves_two_rows(db_path)
+
+    async def _nothing(self: ApprovalGate) -> Any:
+        return None
+
+    monkeypatch.setattr(ApprovalGate, "reconcile_after_restart", _nothing)
+    second = _managed(db_path)
+    async with second.router.lifespan_context(second):
+        assert await _status_of(second.state.engine, mine) == "executing"
+
+
+async def test_a_failed_reconcile_does_not_stop_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _boom(self: ApprovalGate) -> Any:
+        raise OSError("PROBE: store unreachable")
+
+    monkeypatch.setattr(ApprovalGate, "reconcile_after_restart", _boom)
+    app = _managed(tmp_path / "boom.db")
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+        async with app.router.lifespan_context(app):
+            assert app.state.engine is not None
+    assert any("startup reconcile" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_embedded_app_reconciles_at_start(engine: Engine) -> None:
+    """create_app(engine=...) gives the app a lifespan that runs the gate's start step too."""
+    from tests._pending_approval_store_contract import _claimed_directly
+
+    mine = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=time.time())
+    app = create_app(engine, approvals=ON)
+    async with app.router.lifespan_context(app):
+        assert await _status_of(engine, mine) == "interrupted"
+
+
+async def test_a_reconcile_that_cannot_move_a_row_leaves_it_for_the_next_start(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed move is logged and skipped, never written as a bare status: the row stays
+    'executing' with no audit row, and a later start moves it with its row."""
+    from tests._pending_approval_store_contract import _claimed_directly
+
+    mine = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=time.time())
+
+    gate = ApprovalGate(_AuditRefuses(engine.store, "approval.interrupted"), ON)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        found = await gate.reconcile_after_restart()
+    assert found.unsettled == (mine,) and found.interrupted == ()
+    assert await _status_of(engine, mine) == "executing"
+    assert await engine.store.list_audit(action="approval.interrupted") == []
+    assert any(mine in r.getMessage() for r in caplog.records)
+    later = await ApprovalGate(engine.store, ON).reconcile_after_restart()
+    assert later.interrupted == (mine,)
+    assert await _status_of(engine, mine) == "interrupted"
+
+
+# --- BACKLOG #2087: the teardown always stops the engine, and the embedded app drains ------------
+
+
+async def test_a_lifespan_cancelled_mid_drain_still_stops_the_engine(tmp_path: Path) -> None:
+    """A cancel delivered to the lifespan while the drain waits used to skip engine.stop(), and the
+    store's non-daemon worker then kept the process alive. The cancel still propagates."""
+    app = _managed(tmp_path / "cancelled.db")
+    calls: list[str] = []
+    real_stop: list[Any] = []
+    entered, leave, draining = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def _hangs(timeout: float = 0.0) -> list[str]:
+        calls.append("drain")
+        draining.set()
+        await asyncio.Event().wait()
+        return []
+
+    async def _run() -> None:
+        async with app.router.lifespan_context(app):
+            _spy_on_teardown(app, _hangs, calls, real_stop)
+            entered.set()
+            await leave.wait()
+
+    task = asyncio.create_task(_run())
+    try:
+        await asyncio.wait_for(entered.wait(), _WAIT_S)
+        leave.set()
+        await asyncio.wait_for(draining.wait(), _WAIT_S)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, _WAIT_S)
+    finally:
+        if real_stop and "stop" not in calls:
+            await real_stop[0]()
+    assert calls == ["drain", "stop"]
+
+
+async def test_the_embedded_app_drains_an_orphaned_write_at_shutdown(engine: Engine) -> None:
+    """create_app(engine=...) has no engine to stop, so it drains in its own lifespan: the write
+    lands before the app's shutdown returns, and so before the caller stops its engine."""
+    app = create_app(engine, approvals=ON)
+    finished = asyncio.Event()
+    async with app.router.lifespan_context(app):
+        gate: ApprovalGate = app.state.approval_gate
+
+        async def _slow_write() -> None:
+            await asyncio.sleep(0.3)
+            await engine.store.record_audit("approval.drain_probe", actor="checker")
+            finished.set()
+
+        caller = asyncio.create_task(gate._shielded(_slow_write(), "probe-id"))
+        await asyncio.sleep(0)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert not finished.is_set()
+    assert finished.is_set(), "the shutdown returned before the orphaned write landed"
+    assert len(await engine.store.list_audit(action="approval.drain_probe")) == 1

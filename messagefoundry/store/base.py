@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -103,6 +103,7 @@ from messagefoundry.store.store import (
     StreamingAttachmentsUnsupported,
     UserRecord,
     WebAuthnCredential,
+    note_audit_chain_read,
 )
 
 log = logging.getLogger(__name__)
@@ -1757,8 +1758,25 @@ class AuditStore(Protocol):
         requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None:
+        audit: AuditAppend | None = None,
+        on_repeat: Callable[[str], AuditAppend] | None = None,
+    ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+        Returns the id of the row that holds the request: ``approval_id``, or an open request's id
+        when ``on_repeat`` joins this one to it.
+
+        ``audit``, when given, is appended to the audit chain in the SAME transaction as the INSERT,
+        so the request and its ``approval.requested`` row commit or roll back together, then teed
+        off-box (vault BACKLOG #2255). Its timestamp is the store's own clock.
+
+        ``on_repeat``, when given, makes a repeat file nothing (vault BACKLOG #2445). If an OPEN
+        request matches -- the same ``operation``, the same ``params`` text, the same
+        ``requester_user_id``, still ``pending`` and unexpired at ``requested_at`` -- no row is
+        inserted, ``audit`` is not written, and ``on_repeat(<that request's id>)`` is appended
+        instead, in the same transaction; that id is returned. The oldest match wins. The check and
+        the insert are one serialized step on every backend, so two concurrent repeats file one
+        request between them. The match includes the requester because the requester of record is
+        whose authority the release re-checks; ``ApprovalGate.guard`` says more.
 
         ``requester_user_id`` is the **authorization key** and ``requester`` is the display label
         (BACKLOG #1540). :meth:`~messagefoundry.api.approvals.ApprovalGate.approve` is the source of
@@ -1776,7 +1794,12 @@ class AuditStore(Protocol):
 
     async def get_pending_approval(self, approval_id: str) -> Row | None: ...
 
-    async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]: ...
+    async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
+        """Open (``pending``, unexpired) requests, newest first. Each row projects at least ``id``,
+        ``operation``, ``params``, ``requester``, ``requester_user_id`` (BACKLOG #2460: the queue
+        marks the caller's own requests by it), ``requested_at``, ``status``, ``approver``,
+        ``decided_at`` and ``expires_at``."""
+        ...
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
         """Released requests whose operation was cut off mid-run (status ``interrupted``), OLDEST
@@ -1800,7 +1823,40 @@ class AuditStore(Protocol):
         approver: str | None,
         decided_at: float,
         from_status: str = "pending",
-    ) -> bool: ...
+        audit: AuditAppend | None = None,
+        claim_owner: str | None = None,
+    ) -> bool:
+        """Move a request from ``from_status`` to ``status`` in one guarded UPDATE. ``True`` iff
+        this call moved it, which is what guards a double decision.
+
+        ``audit``, when given, is appended to the audit chain in the SAME transaction, and only
+        when the row moved: a transition that matched no row writes no audit row. A failed append
+        rolls the transition back, so the gate never sees a moved row without its audit row, nor
+        the reverse (vault BACKLOG #2255). The row is teed off-box after the commit. Its timestamp
+        is the store's own clock, not ``decided_at``.
+
+        ``claim_owner``, when given, is written to the row's ``claim_owner`` column in the same
+        UPDATE; ``None`` leaves the column as it is (BACKLOG #1562). The approval gate passes it on
+        the claim (``pending`` to ``executing``): it names the engine process that will run the
+        operation, so that process can recognise its own claims after a restart
+        (``ApprovalGate.reconcile_after_restart``). Engine shards and cluster nodes share one store,
+        and the owner is what keeps one process from settling a sibling's live release."""
+        ...
+
+    async def list_executing_approvals(
+        self, *, claim_owner: str | None = None, limit: int = 1000
+    ) -> Sequence[Row]:
+        """Released requests still claimed as ``executing``, OLDEST claim first (BACKLOG #1562).
+
+        ``claim_owner``, when given, keeps only the rows that owner claimed and the rows with no
+        owner, filtered in SQL so other owners' rows cannot push them past ``limit``.
+
+        Projects ``id``, ``operation``, ``requester``, ``approver``, ``decided_at`` (when it was
+        claimed) and ``claim_owner``. Read at startup by ``ApprovalGate.reconcile_after_restart``,
+        which settles the rows this process owns and reports the rest. An ``executing`` row is
+        normally short-lived, so the cap is generous; oldest first so a row stuck longest is never
+        the one past it."""
+        ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...
 
@@ -2778,7 +2834,25 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
     + retired decrypt-only keyring, ``write_v2=aad_bind``). Exposed so a store-DECOUPLED PHI-at-rest
     surface — the offline uploaded-logs files (ADR 0134) — encrypts under the identical DEK / keyring /
     rotation posture as the message store, without reaching into a live ``Store`` instance's private
-    cipher. No key configured → the identity cipher (plaintext), exactly like the store."""
+    cipher. No key configured → the identity cipher (plaintext), exactly like the store.
+
+    A ``ValueError`` from the build is raised as :class:`StoreCipherConfigError`, which subclasses
+    it: at least a key that is not base64 of 32 bytes, an unknown ``cipher_provider`` and a Transit
+    client setting it refuses. Each comes from the settings or the key provider before the store
+    reads a row, so a caller can treat that class as "could not start" where a bare ``ValueError``
+    from the open could mean anything (vault BACKLOG #3054, item 8)."""
+    try:
+        return _build_store_cipher(settings)
+    except ValueError as exc:
+        raise StoreCipherConfigError(str(exc)) from exc
+
+
+class StoreCipherConfigError(ValueError):
+    """The store cipher could not be built from the settings; see :func:`build_store_cipher`. Its
+    text is the build error's, which names settings and variables, never a key."""
+
+
+def _build_store_cipher(settings: StoreSettings) -> Cipher:
     if settings.cipher_provider == "vault_transit":
         # ADR 0138: bulk at-rest crypto INSIDE Vault/OpenBao Transit — the plaintext DEK never enters
         # engine heap (ASVS 13.3.3). Lazy-imported so the base install pulls no Vault SDK; fails closed at
@@ -2983,6 +3057,80 @@ def store_driver_errors() -> tuple[type[Exception], ...]:
     return tuple(errors)
 
 
+def store_connect_errors() -> tuple[type[Exception], ...]:
+    """What a store raises when it cannot reach its database, beyond :func:`store_driver_errors`
+    (vault BACKLOG #3054, item 10). At least ``OSError``, which asyncpg raises for a refused
+    connection, :class:`StoreAcquireTimeout`, a pool borrow that waited out a database that stopped
+    answering, and pyodbc's ``Error`` root. pyodbc raises the root itself for every SQLSTATE it does
+    not map, such as a missing ODBC driver (01000) or a deadlock victim (40001), and its
+    ``InterfaceError`` for a failed login (28000). The pyodbc entry is left out when it is not
+    installed."""
+    errors: list[type[Exception]] = [OSError, StoreAcquireTimeout]
+    try:
+        import pyodbc
+    except ImportError:
+        pass
+    else:
+        errors.append(pyodbc.Error)
+    return tuple(errors)
+
+
+def store_open_errors() -> tuple[type[Exception], ...]:
+    """:func:`store_driver_errors` and :func:`store_connect_errors`: at least the driver and
+    connection errors a store open can raise, on any backend."""
+    return (*store_driver_errors(), *store_connect_errors())
+
+
+def audit_chain_read_errors() -> tuple[type[Exception], ...]:
+    """What a read of the audit chain's rows can raise from the store: :func:`store_open_errors`,
+    and ``UnicodeError``, which a driver raises decoding a row's text. The one list both the open's
+    tag (:func:`~messagefoundry.store.store.note_audit_chain_read`) and ``audit-verify`` read, so
+    the two cannot drift (vault BACKLOG #3054, item 10)."""
+    return (*store_open_errors(), UnicodeError)
+
+
+def driver_sqlstate(exc: BaseException) -> str | None:
+    """The 5-character SQLSTATE a server driver's error carries, or ``None``: asyncpg's
+    ``sqlstate`` attribute, or pyodbc's first argument. Only a server driver's own error is read for
+    one, so an ``OSError("reset")`` is never given a SQLSTATE of ``reset``."""
+    state = getattr(exc, "sqlstate", None)
+    if state is None and _is_server_driver_error(exc) and exc.args:
+        state = exc.args[0]
+    if isinstance(state, str) and len(state) == 5 and state.isalnum():
+        return state
+    return None
+
+
+def _is_server_driver_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a server driver's error: one of :func:`store_driver_errors` or pyodbc's
+    root, and not SQLite's."""
+    import sqlite3
+
+    bases = [*store_driver_errors()]
+    try:
+        import pyodbc
+    except ImportError:
+        pass
+    else:
+        bases.append(pyodbc.Error)
+    return isinstance(exc, tuple(bases)) and not isinstance(exc, sqlite3.Error)
+
+
+def is_store_shape_error(exc: BaseException) -> bool:
+    """Whether ``exc`` says the store's tables, columns, types or grants are not what a read needs,
+    and not anything about a row: SQLite's schema-step error, or SQLSTATE class 42 (syntax error or
+    access rule violation). SQL Server reports at least a lock timeout and a full log under the
+    generic 42000 too, so that one counts only with native error 229 or 230, a denied permission."""
+    from messagefoundry.store.schema_verify import is_schema_step_error
+
+    if is_schema_step_error(exc):
+        return True
+    state = driver_sqlstate(exc)
+    if state == "42000":
+        return any(f"({code})" in str(exc) for code in (229, 230))
+    return state is not None and state.startswith("42")
+
+
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     """The configured SQLite path when nothing is there, else ``None``.
 
@@ -3130,7 +3278,9 @@ async def _refuse_to_start_a_keyless_chain(
         # A keyed chain is never empty, since it holds its genesis row. So an empty log is one
         # nobody has started, and this handle's first append would start it keyless.
         starts_keyless = count == 0
-    except BaseException:
+    except BaseException as exc:
+        # The anchor read is a read of the chain's newest row (vault BACKLOG #3054, item 10).
+        note_audit_chain_read(exc)
         await _close_quietly(store)
         raise
     if starts_keyless:
@@ -3142,8 +3292,14 @@ async def _close_quietly(store: Store) -> None:
     """Close ``store`` on an error path without letting a close failure replace the real error."""
     try:
         await store.close()
-    except Exception:
-        log.warning("closing the store after a failed open also failed", exc_info=True)
+    except Exception as exc:
+        # Class and SQLSTATE only: a driver's text is not this function's to vouch for (vault
+        # BACKLOG #3054), and those two are what a diagnosis needs.
+        log.warning(
+            "closing the store after a failed open also failed (%s, SQLSTATE %s)",
+            type(exc).__name__,
+            driver_sqlstate(exc),
+        )
 
 
 async def _open_backend(
