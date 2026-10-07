@@ -882,10 +882,12 @@ async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _boss_headers(c)
         assert (await c.get("/ad-group-scope-map", headers=h)).json()["entries"] == []
-        body = {"entries": [{"ad_group": "Lab-Ops", "channel": "IB_LAB"}]}
+        # A full DN: a short name is refused (BACKLOG #2610, tests/test_ad_group_dn_only.py).
+        group = "CN=Lab-Ops,OU=Groups,DC=example,DC=invalid"
+        body = {"entries": [{"ad_group": group, "channel": "IB_LAB"}]}
         assert (await c.put("/ad-group-scope-map", json=body, headers=h)).status_code == 200
         got = (await c.get("/ad-group-scope-map", headers=h)).json()["entries"]
-        assert got == [{"ad_group": "lab-ops", "channel": "IB_LAB"}]  # lower-cased group
+        assert got == [{"ad_group": group.lower(), "channel": "IB_LAB"}]  # lower-cased group
         assert any(
             a["action"] == "ad_group_scope_map.updated" for a in await engine.store.list_audit()
         )

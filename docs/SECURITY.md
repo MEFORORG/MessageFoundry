@@ -1661,7 +1661,8 @@ the same permission set on the same method reds CI until it is listed here.
 > read as broken RBAC; that is deliberately a page banner and not a start-time refusal, which would
 > make a fresh single-operator install unbootable for the same condition. A channel-scoped user
 > **cannot purge** a shared outbound (purge spans every inbound feeding it). **AD users** inherit
-> their scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all): on
+> their scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all; a
+> group is keyed by its full DN only, as the [AD-group to role map](#ad-group--role-mapping) says): on
 > login the group-derived scope is persisted — a wildcard row persists the explicit `["*"]` grant —
 > and stale sessions revoked. When no mapped group matches, the AD login sync withdraws the stored
 > scope to NULL, which denies, and revokes the user's other sessions (BACKLOG #1927). It keeps a
@@ -3144,9 +3145,34 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
 
 ### AD-group → role mapping
 
-An admin sets which AD groups govern which role via `GET/PUT /ad-group-map` (or the web console). Group
-identifiers are matched case-insensitively and may be either the group **DN** or its
-**sAMAccountName**. A user in multiple mapped groups gets the union of those roles.
+An admin sets which AD groups govern which role via `GET/PUT /ad-group-map` (or the web console). A
+group is named by its **full distinguished name (DN)** and nothing else. `PUT /ad-group-map` and
+`PUT /ad-group-scope-map` refuse any other key with a 400, and a user's groups are read as DNs
+only. A user in multiple mapped groups gets the union of those roles.
+
+**Keys and a user's groups are compared in one canonical form.** The engine parses each DN,
+unescapes each value and escapes it again one way, and sorts the parts of a multi-valued RDN. The
+result is printable ASCII: ASCII letters are lower-cased, and every non-ASCII or control
+character is written as hex escapes of its UTF-8 bytes. The maps store that form, and a key
+whose canonical form passes 256 characters is refused. So a key matches however either side
+escapes a value: Active Directory writes `CN=C# Developers,OU=Groups,...` with the `#` unescaped,
+and `CN=C\# Developers` and `CN=C\23 Developers` name the same group.
+
+**Distinct groups stay apart, and every gap fails closed.** A tab or line break in a value is part
+of it. A non-ASCII letter matches only in the case it was written in, so `CN=Ärzte` and
+`CN=ärzte` are different keys; copy a key from the directory's own spelling. Case and width rules,
+in Unicode or a SQL Server collation, have nothing left to fold: the key holds no upper-case or
+non-ASCII character. An
+attribute written as a dotted OID instead of its name, such as `CN`, is not mapped onto that
+name, so such a key matches nothing. The routes trim white space around the whole key, so a key
+pasted with a line break still maps.
+
+**A short name is refused because the engine cannot tell two same-named groups apart** (BACKLOG
+#2610). This section used to say a key could be the group's `sAMAccountName`, which is unique in a
+domain. For a direct group the code matched the first CN of its DN instead, and a CN is unique only
+within its unit. So on a site that mapped a short name, anyone able to create a same-named group in
+any unit and add an account to it would have given that account the mapped roles, Administrator
+included. A stored short-name key now matches nothing.
 
 ```
 CN=MF-Admins,OU=Groups,DC=example,DC=com  ->  administrator

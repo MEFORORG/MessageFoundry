@@ -4942,13 +4942,13 @@ CREATE TABLE IF NOT EXISTS user_roles (
 );
 
 CREATE TABLE IF NOT EXISTS ad_group_role_map (
-    ad_group TEXT NOT NULL,                    -- AD group (lower-cased): DN or sAMAccountName
+    ad_group TEXT NOT NULL,                    -- AD group DN, canonical_group_dn form (#2610)
     role_id  TEXT NOT NULL REFERENCES roles(id),
     PRIMARY KEY (ad_group, role_id)
 );
 
 CREATE TABLE IF NOT EXISTS ad_group_scope_map (
-    ad_group TEXT NOT NULL,                    -- AD group (lower-cased): DN or sAMAccountName
+    ad_group TEXT NOT NULL,                    -- AD group DN, canonical_group_dn form (#2610)
     channel  TEXT NOT NULL,                    -- inbound connection name, or '*' for all channels
     PRIMARY KEY (ad_group, channel)
 );
