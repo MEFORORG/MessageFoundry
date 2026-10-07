@@ -498,6 +498,81 @@ def test_a_proxy_that_fakes_its_class_renders_as_the_stdlib_renders_it() -> None
     assert f"val {proxy} 5" in stream.getvalue()
 
 
+class _CaseFolding(dict[str, object]):
+    def __getitem__(self, key: str) -> object:
+        return dict.__getitem__(self, key.lower())
+
+
+def test_a_mapping_key_answered_by_the_original_is_walked_too() -> None:
+    # The rebuilt mapping asks the original for a key it lacks; what comes back is walked.
+    logger, stream = _capture()
+    logger.warning("%(E)s %(E)r", _CaseFolding(e=_encode_error()))
+    out = stream.getvalue()
+    _assert_encode_safe(out)
+    assert "caf" not in out
+
+
+def test_a_withheld_message_takes_its_arguments_with_it() -> None:
+    logger, stream = _capture()
+    logger.warning(RuntimeError(_encode_error(), _Unreprable()), 1)
+    assert "[withheld: ValueError while scanning it for a codec error]" in stream.getvalue()
+
+
+def test_dict_views_holding_a_unicode_error_render_safely() -> None:
+    errors = {"e": _encode_error()}
+    logger, stream = _capture()
+    logger.warning("%s %s %r", errors.values(), errors.items(), errors.keys())
+    out = stream.getvalue()
+    _assert_encode_safe(out)
+    assert "caf" not in out
+
+
+class _LoudGroup(ExceptionGroup[Exception]):
+    def __str__(self) -> str:
+        return f"{self.message}: {self.exceptions!r}"
+
+
+def test_a_group_subclass_printing_its_members_renders_from_its_message() -> None:
+    logger, stream = _capture()
+    logger.warning("%s", _LoudGroup("batch", [_encode_error()]))
+    out = stream.getvalue()
+    assert "_LoudGroup: batch (1 sub-exceptions)" in out
+    assert "caf" not in out
+
+
+def test_a_shared_container_is_walked_once() -> None:
+    # Thirty references to one list, four levels down, are 30**4 paths and four containers.
+    shared: list[object] = [_encode_error()]
+    for _ in range(4):
+        shared = [shared] * 30
+    record = logging.LogRecord("t", logging.WARNING, __file__, 1, "%s", (shared,), None)
+    prepare_log_record(record)
+    out = record.getMessage()
+    assert "caf" not in out and "UnicodeEncodeError" in out
+
+
+class _UnprintableError(Exception):
+    def __str__(self) -> str:
+        raise ValueError("no str")
+
+
+@pytest.mark.parametrize("arg", [_Unreprable(), "%d"], ids=["raising-repr", "bad-format"])
+def test_a_record_the_stdlib_could_not_format_is_dropped_never_raised(arg: object) -> None:
+    logger, stream = _capture()
+    if isinstance(arg, _Unreprable):
+        logger.warning("%r", arg)  # the stdlib alone would raise here, from the caller's call
+    else:
+        logger.warning(arg, "x")
+    assert "[log record dropped: " in stream.getvalue()
+
+
+def test_a_sandboxed_handler_error_that_cannot_be_printed_reports_its_class(
+    sandbox_run_one: Any,  # noqa: F811 - the fixture imported above
+) -> None:
+    kind, error = _sandbox_kind(sandbox_run_one, _UnprintableError())
+    assert (kind, error) == ("error", "_UnprintableError")
+
+
 def test_a_traceback_that_cannot_be_rendered_is_withheld_never_raised(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -617,6 +692,9 @@ def test_a_sandbox_bootstrap_unicode_failure_is_reported_without_the_character(
     monkeypatch.setattr(sys, "stdout", types.SimpleNamespace(buffer=stdout))
     monkeypatch.setattr(_sandbox_worker, "_redirect_stdout_to_stderr", lambda: None)
     monkeypatch.setattr(wiring, "load_config", unreadable)
+    # Should main() stop reaching the patched load, these must still not touch the test process.
+    monkeypatch.setattr(_sandbox_worker, "_apply_resource_caps", lambda mem_mb: None)
+    monkeypatch.setattr(_sandbox_worker, "_install_import_guard", lambda forbidden: None)
     assert _sandbox_worker.main() == 1
     stdout.seek(0)
     reply = sandbox._read_frame_bytes(stdout)
@@ -740,7 +818,12 @@ def _renders_the_handled_error(node: ast.Call) -> bool:
 
 def _raw_renders(handler: ast.ExceptHandler) -> Iterator[tuple[int, str]]:
     name = handler.name
-    for node in (n for stmt in handler.body for n in ast.walk(stmt)):
+    nodes = [n for stmt in handler.body for n in ast.walk(stmt)]
+    # exc_info=sys.exc_info() is path 1, which the log filter chain renders safely.
+    exempt = {id(n.value) for n in nodes if isinstance(n, ast.keyword) and n.arg == "exc_info"}
+    for node in nodes:
+        if isinstance(node, ast.Call) and id(node) in exempt:
+            continue
         if isinstance(node, ast.Call) and _renders_the_handled_error(node):
             yield node.lineno, "the handled error reached without its name"
         elif name is None:
@@ -887,6 +970,11 @@ def b2(b):
         b.decode()
     except UnicodeDecodeError as exc:
         log.warning("unreadable", exc_info=exc)
+def b3(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError:
+        log.warning("unreadable", exc_info=sys.exc_info())
 def c(b):
     try:
         b.decode()
@@ -919,4 +1007,4 @@ def test_the_guard_fires_on_every_planted_shape() -> None:
 
 
 def test_the_guard_passes_the_safe_shapes() -> None:
-    assert _scan_source(_CLEAN, "clean.py") == (2, [])
+    assert _scan_source(_CLEAN, "clean.py") == (3, [])

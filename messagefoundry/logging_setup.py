@@ -279,7 +279,15 @@ class RedactionFilter(logging.Filter):
         # (vault BACKLOG #3185): its str() names the character or byte the codec failed on, which no
         # pattern can tell from prose. The tray's chain shares the step, through the same function.
         prepare_log_record(record)
-        _rewrite_record(record, redact_untrusted)
+        try:
+            _rewrite_record(record, redact_untrusted)
+        except Exception as exc:  # noqa: BLE001 -- a log call must never raise, as in the tray's filter
+            # getMessage() runs the caller's % format and its arguments' own __str__/__repr__, and
+            # Handler.handle does not guard a filter. Fail closed: a fixed line, never the raw record.
+            record.msg = f"[log record dropped: {type(exc).__name__} while redacting it]"
+            record.args = ()
+            record.exc_text = None
+            record.stack_info = None
         return True
 
 

@@ -2229,26 +2229,38 @@ def codec_safe_str(exc: BaseException) -> str:
 #: The containers a log argument is walked through, and how deep. A ``UnicodeError`` inside one
 #: renders through ``repr``, which prints ``.object``, the whole input. The record's arguments are
 #: level 1, so an error inside five nested containers of the caller's own is found. A container
-#: deeper than that, or met again round a cycle, is not scanned, so it is replaced by
-#: ``_TOO_DEEP``: it may hold an error. Subclasses count (an ``OrderedDict``, a ``defaultdict``, a
-#: namedtuple, a ``deque``), and so do a ``UserDict``'s data and an exception's ``.args``.
+#: deeper than that, or met again round a cycle, is not scanned, so it is replaced by a fixed note:
+#: it may hold an error. Subclasses count (an ``OrderedDict``, a ``defaultdict``, a namedtuple, a
+#: ``deque``), and so do a dict's views, a ``UserDict``'s data and an exception's ``.args``.
 #:
-#: THE WALK RUNS NO CODE OF THE ARGUMENT'S OWN. It tests the real type, never ``isinstance``,
-#: which a proxy can fake, and reads through the builtin's own methods (``dict.items(arg)``). A log
-#: call must never raise because of its arguments, and any other ``Mapping`` runs its own code to be
-#: read: ``ConfigParser.items()`` interpolates and can raise, and the engine's ``CodeSet`` would be
-#: walked whole on every record. Those, a ``ChainMap``, a ``MappingProxyType``, a dataclass and
-#: every other object are left as they are.
+#: IT READS A CONTAINER THROUGH THE BUILTIN'S OWN METHODS (``dict.items(arg)``), and tests the real
+#: type, never ``isinstance``, which a proxy can fake. A log call must never raise because of its
+#: arguments, and any other ``Mapping`` runs its own code to be read: ``ConfigParser.items()``
+#: interpolates and can raise, and the engine's ``CodeSet`` would be walked whole on every record.
+#: Those, a ``ChainMap``, a ``MappingProxyType``, a ``SimpleNamespace``, a dataclass and every other
+#: object are left as they are. The caller's code still runs in at least three places: a
+#: ``UserDict``'s ``.data``, ``repr()`` of a wrapping exception's other arguments, and the hash and
+#: equality of keys when a mapping is rebuilt. :func:`prepare_log_record` catches what they raise.
 _ARG_SEQUENCES: tuple[type[Any], ...] = (tuple, list, set, frozenset, deque)
+_ARG_VIEWS: tuple[type[Any], ...] = (type({}.keys()), type({}.values()), type({}.items()))
 _ARG_MAPPINGS: tuple[type[Any], ...] = (dict, UserDict)
-_ARG_WALKED: tuple[type[Any], ...] = (BaseException, *_ARG_MAPPINGS, *_ARG_SEQUENCES)
+_ARG_WALKED: tuple[type[Any], ...] = (
+    BaseException,
+    *_ARG_MAPPINGS,
+    *_ARG_SEQUENCES,
+    *_ARG_VIEWS,
+)
 _ARG_DEPTH = 5
 #: The argument types nearly every record carries, answered without a subclass check.
 _ARG_SCALARS = frozenset({str, int, float, bool, bytes, type(None)})
 _TOO_DEEP = "[nested too deep to scan for a codec error]"
+_CYCLE = "[a cycle, not scanned for a codec error]"
+#: Marks a container the walk is inside, so meeting it again is a cycle.
+_IN_PROGRESS: Any = object()
 #: The builtin descriptors, so a subclass that overrides one cannot run its own code here.
 _EXC_ARGS: Any = BaseException.__dict__["args"]
 _GROUP_MEMBERS: Any = BaseExceptionGroup.__dict__["exceptions"]
+_GROUP_MESSAGE: Any = BaseExceptionGroup.__dict__["message"]
 _DEQUE_MAXLEN: Any = deque.__dict__["maxlen"]
 
 
@@ -2271,9 +2283,13 @@ class _SafeText(str):
 
 
 class _Rebuilt(dict[Any, Any]):
-    """A mapping argument rebuilt with its errors replaced. A key it lacks is looked up in the
-    original, as a ``"%(name)s"`` against the original would have been, so a ``defaultdict``'s
-    default or a ``Counter``'s zero still renders. The original itself is never written to."""
+    """A mapping argument rebuilt with its errors replaced, so the walk writes nothing to the
+    caller's own mapping.
+
+    A key it lacks is looked up in the original, as ``"%(name)s"`` against the original would have
+    been, so a ``defaultdict``'s default or a ``Counter``'s zero still renders. That lookup is the
+    original's own code, exactly as without this filter: a ``defaultdict`` stores its default there.
+    What it returns is walked before it is rendered."""
 
     __slots__ = ("_original",)
 
@@ -2282,14 +2298,20 @@ class _Rebuilt(dict[Any, Any]):
         self._original = original
 
     def __missing__(self, key: Any) -> Any:
-        return self._original[key]
+        value = self._original[key]
+        try:
+            return _safe_arg(value, 1, {})
+        except Exception as exc:  # noqa: BLE001 -- fail closed, see prepare_log_record
+            return _withheld(exc)
 
 
-def _safe_items(items: Sequence[Any], depth: int) -> list[Any] | None:
+def _safe_items(
+    items: Sequence[Any], depth: int, seen: dict[int, tuple[Any, Any]]
+) -> list[Any] | None:
     """``items`` with each error replaced, or None when nothing was. Copies only on a change."""
     fresh: list[Any] | None = None
     for i, item in enumerate(items):
-        new = _safe_arg(item, depth)
+        new = _safe_arg(item, depth, seen)
         if fresh is not None:
             fresh.append(new)
         elif new is not item:
@@ -2297,33 +2319,63 @@ def _safe_items(items: Sequence[Any], depth: int) -> list[Any] | None:
     return fresh
 
 
-def _safe_mapping(arg: Any, kind: type[Any], depth: int) -> Any:
+def _safe_mapping(arg: Any, kind: type[Any], depth: int, seen: dict[int, tuple[Any, Any]]) -> Any:
     data = arg.data if issubclass(kind, UserDict) else arg
     data_kind = type(data)
     if not issubclass(data_kind, dict):
         return arg
     # An OrderedDict keeps its own order apart from the dict's storage.
-    pairs = list((OrderedDict.items if issubclass(data_kind, OrderedDict) else dict.items)(data))
-    fresh: list[tuple[Any, Any]] | None = None
-    for i, (k, v) in enumerate(pairs):
-        nk, nv = _safe_arg(k, depth), _safe_arg(v, depth)
-        if fresh is not None:
-            fresh.append((nk, nv))
-        elif nk is not k or nv is not v:
-            fresh = [*pairs[:i], (nk, nv)]
+    items = OrderedDict.items if issubclass(data_kind, OrderedDict) else dict.items
+    flat = [part for pair in items(data) for part in pair]  # key, value, key, value, ...
+    fresh = _safe_items(flat, depth, seen)
     if fresh is None:
         return arg
-    return dict(fresh) if kind is dict else _Rebuilt(fresh, arg)
+    pairs = list(zip(fresh[0::2], fresh[1::2], strict=True))
+    return dict(pairs) if kind is dict else _Rebuilt(pairs, arg)
 
 
-def _safe_arg(arg: Any, depth: int) -> Any:
+def _walk(arg: Any, kind: type[Any], depth: int, seen: dict[int, tuple[Any, Any]]) -> Any:
+    if issubclass(kind, BaseExceptionGroup):
+        # Its str() and repr() print its members, and a subclass may print them its own way, so a
+        # group holding an error is rendered from its message and member count alone.
+        members = _GROUP_MEMBERS.__get__(arg)
+        if _safe_items(members, depth + 1, seen) is None:
+            return arg
+        message = safe_text(_GROUP_MESSAGE.__get__(arg))
+        return _SafeText(f"{kind.__name__}: {message} ({len(members)} sub-exceptions)")
+    if issubclass(kind, BaseException):
+        # str() and repr() print .args, so a wrapping exception prints its error's text.
+        fresh = _safe_items(_EXC_ARGS.__get__(arg), depth + 1, seen)
+        if fresh is None:
+            return arg
+        return _SafeText(f"{kind.__name__}({', '.join(map(repr, fresh))})")
+    if issubclass(kind, _ARG_MAPPINGS):
+        return _safe_mapping(arg, kind, depth + 1, seen)
+    if kind in _ARG_VIEWS:  # read through the dict; a view cannot be subclassed
+        fresh = _safe_items(list(arg), depth + 1, seen)
+        return arg if fresh is None else fresh
+    for base in _ARG_SEQUENCES:
+        if issubclass(kind, base):
+            items = arg if kind is tuple or kind is list else list(base.__iter__(arg))
+            fresh = _safe_items(items, depth + 1, seen)
+            if fresh is None:
+                return arg
+            if base is deque:
+                return deque(fresh, _DEQUE_MAXLEN.__get__(arg))
+            # The plain builtin, not the subclass: a namedtuple's constructor does not take a list.
+            return base(fresh)
+    return arg
+
+
+def _safe_arg(arg: Any, depth: int, seen: dict[int, tuple[Any, Any]]) -> Any:
     """``arg`` with each ``UnicodeError`` in it replaced by :func:`safe_exc` text, or ``arg`` itself
     when nothing was replaced, so a record with nothing to replace keeps its own objects.
 
     One walker finds and rebuilds, so the two cannot disagree about how deep to look (round 2 of
     vault BACKLOG #3185 split them, and the copy that checked depth first missed an error at the last
-    level). It can still raise, from a wrapped exception's ``repr`` or a dict mutated by another
-    thread mid-walk; :func:`prepare_log_record` catches that."""
+    level). ``seen`` holds each container's result by ``id``, so a structure that shares a container
+    walks it once, and a cycle stops at its first repeat. The caller's code it runs may raise;
+    :func:`prepare_log_record` catches that."""
     kind = type(arg)
     if kind in _ARG_SCALARS:
         return arg
@@ -2334,29 +2386,16 @@ def _safe_arg(arg: Any, depth: int) -> Any:
         return arg
     if depth > _ARG_DEPTH:
         return _SafeText(_TOO_DEEP)  # unscanned, so fail closed
-    if issubclass(kind, BaseException):
-        # repr() and str() print .args. A group prints its members, which its .args may not hold.
-        fresh = _safe_items(_EXC_ARGS.__get__(arg), depth + 1)
-        if issubclass(kind, BaseExceptionGroup):
-            if fresh is None and _safe_items(_GROUP_MEMBERS.__get__(arg), depth + 1) is None:
-                return arg
-            return _SafeText(safe_exc(arg))  # its str() is its message and a member count
-        if fresh is None:
-            return arg
-        return _SafeText(f"{kind.__name__}({', '.join(map(repr, fresh))})")
-    if issubclass(kind, _ARG_MAPPINGS):
-        return _safe_mapping(arg, kind, depth + 1)
-    for base in _ARG_SEQUENCES:
-        if issubclass(kind, base):
-            items = arg if kind is tuple else list(base.__iter__(arg))
-            fresh = _safe_items(items, depth + 1)
-            if fresh is None:
-                return arg
-            if base is deque:
-                return deque(fresh, _DEQUE_MAXLEN.__get__(arg))
-            # The plain builtin, not the subclass: a namedtuple's constructor does not take a list.
-            return base(fresh)
-    return arg
+    # Each entry keeps its container alive, so an id cannot be reused by another object mid-walk.
+    done = seen.get(id(arg))
+    if done is not None:
+        if done[1] is _IN_PROGRESS:
+            return _SafeText(_CYCLE)  # the back edge would print the raw original: fail closed
+        return done[1]
+    seen[id(arg)] = (arg, _IN_PROGRESS)
+    result = _walk(arg, kind, depth, seen)
+    seen[id(arg)] = (arg, result)
+    return result
 
 
 def _withheld(exc: Exception) -> _SafeText:
@@ -2388,23 +2427,26 @@ def prepare_log_record(record: logging.LogRecord) -> None:
         except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
             record.exc_text = f"[traceback withheld: {type(exc).__name__} while rendering it]"
     record.exc_info = None
+    seen: dict[int, tuple[Any, Any]] = {}
     try:
-        record.msg = _safe_arg(record.msg, 1)
+        record.msg = _safe_arg(record.msg, 1, seen)
     except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
-        record.msg = _withheld(exc)
+        # The args went with the message they were for, or the formatter's % would raise.
+        record.msg, record.args = _withheld(exc), ()
+        return
     args = record.args
     if type(args) is tuple:
         fresh: list[Any] = []
         for arg in args:  # one at a time, so one bad argument withholds only itself
             try:
-                fresh.append(_safe_arg(arg, 1))
+                fresh.append(_safe_arg(arg, 1, seen))
             except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
                 fresh.append(_withheld(exc))
         if any(new is not old for new, old in zip(fresh, args, strict=True)):
             record.args = tuple(fresh)
         return
     try:  # the stdlib's single-mapping form: its values are the arguments, at level 1
-        record.args = _safe_arg(args, 0)
+        record.args = _safe_arg(args, 0, seen)
     except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
         # With no args the formatter applies no %, so the template prints as it was written.
         template = record.msg if type(record.msg) is str else "[log message withheld]"
