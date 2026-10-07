@@ -5454,6 +5454,8 @@ def create_app(
         delivery buffer-once posture); an SVG is then sanitized or refused (see the comment below).
         Every download is audited (``record_view`` + an
         ``attachment_download`` row in the tamper-evident chain, docs/PHI.md §6) BEFORE the bytes leave.
+        The handler's two 422 refusals (an undecodable stored value, an SVG it cannot sanitize) write
+        an ``attachment_download_refused`` row naming its ``reason`` instead.
         The document bytes/base64 are **never logged**."""
         # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
         # channel (per-channel RBAC), mirroring get_message.
@@ -5473,42 +5475,65 @@ def create_app(
             )
         except KeyError as exc:
             raise HTTPException(404, f"attachment content unavailable: {attachment_id}") from exc
+        audit_detail = {"message_id": message_id, "attachment_id": attachment_id}
+
+        async def audit(action: str, **extra: str) -> None:
+            # The one writer of this route's rows: the acting user and the id pair, never a byte.
+            await engine.store.record_audit(
+                action,
+                actor=identity.username,
+                channel_id=row["channel_id"],
+                detail=json.dumps({**audit_detail, **extra}),
+                client=client_ip(request),
+            )
+
+        async def refuse(reason: str, answer: str) -> NoReturn:
+            # Each of this handler's two 422s is an attempted PHI read by an authorized actor, so it
+            # goes in the tamper-evident chain under its own action (BACKLOG #2387). No reader
+            # filtering on attachment_download then counts it as a document that left. No
+            # record_view, since nothing was viewed. Callers call this after their except block
+            # ends, so a failed audit write chains no caught error into a logged traceback
+            # (BACKLOG #1796). The WARNING follows the row, so the log never names a refusal the
+            # chain lacks.
+            await audit("attachment_download_refused", reason=reason)
+            _log.warning(
+                "attachment download refused: %s (message=%s attachment=%s)",
+                reason,
+                message_id,
+                attachment_id,
+            )
+            raise HTTPException(422, answer)
+
         try:
-            body = base64.b64decode("".join(verbatim.split()), validate=True)
-        except (binascii.Error, ValueError) as exc:
-            # A stored value that isn't clean base64 is corruption — surface it, never the bytes.
-            raise HTTPException(422, "attachment content is not decodable") from exc
+            body: bytes | None = base64.b64decode("".join(verbatim.split()), validate=True)
+        except (binascii.Error, ValueError):
+            # Not clean base64: store corruption, or a sender value that was never base64 (detach
+            # does not validate it). Refused below, after this except ends; never the bytes.
+            body = None
+        if body is None:
+            await refuse("undecodable", "attachment content is not decodable")
         # ASVS 1.3.4 (ADR 0105, amendment 2026-09-28): an SVG is served as its tag and attribute
         # allow-listed copy. Only the SERVED bytes change; the stored OBX-5.5 value stays verbatim. An
-        # SVG the parser cannot vet is refused before the audit, since no byte of it leaves. The
-        # pre-check keeps a PDF or an image off the thread pool. The audit row says when the served
-        # bytes are a sanitized copy, so they are never mistaken for the stored document's.
-        audit_detail = {"message_id": message_id, "attachment_id": attachment_id}
+        # SVG the parser cannot vet is refused and audited as a refusal, since no byte of it leaves.
+        # The pre-check keeps a PDF or an image off the thread pool. The audit row says when the
+        # served bytes are a sanitized copy, so they are never mistaken for the stored document's.
+        served_as: dict[str, str] = {}
         if may_be_svg(body):
+            served: bytes | None
             try:
                 async with svg_sanitize_slots:
                     served = await asyncio.to_thread(sanitize_if_svg, match["content_type"], body)
-            except SvgRejected as exc:
-                _log.warning(
-                    "attachment download refused: SVG could not be sanitized "
-                    "(message=%s attachment=%s)",
-                    message_id,
-                    attachment_id,
-                )
-                raise HTTPException(422, "attachment is SVG that cannot be sanitized") from exc
+            except SvgRejected:
+                served = None
+            if served is None:
+                await refuse("svg_unsanitizable", "attachment is SVG that cannot be sanitized")
             if served is not body:
                 body = served
-                audit_detail["served"] = "sanitized-svg"
+                served_as["served"] = "sanitized-svg"
         # Audit the PHI access BEFORE the bytes leave: record_view for the per-message timeline +
         # attachment_download in the tamper-evident chain (with the acting user + the id pair, NO bytes).
         await engine.store.record_view(message_id, actor=identity.username)
-        await engine.store.record_audit(
-            "attachment_download",
-            actor=identity.username,
-            channel_id=row["channel_id"],
-            detail=json.dumps(audit_detail),
-            client=client_ip(request),
-        )
+        await audit("attachment_download", **served_as)
         # Neutralize at serve (ASVS 1.3.4): the sender-influenced OBX-5.2 label is declared only when it
         # names one of the inert types on the _INERT_ATTACHMENT_TYPES allow-list, so a browser-active
         # label (svg/html/hta/script and every type nobody listed) is declared as the inert binary type,
@@ -5985,12 +6010,22 @@ def create_app(
     # can also be a file under a key that is no longer configured. 423 Locked says the file exists and
     # needs an operator, where an unhandled CipherError answered 500. It is not 409, which the resend
     # route already spends on "inbound not running" and the web console maps to that text. No file
-    # detail is in the body.
+    # detail is in the body. One text serves every refused shape, and rotate-key does not seal every
+    # one (BACKLOG #2322), so the text offers remedies and promises none of them.
     _UPLOAD_UNREADABLE_STATUS = 423
     _UPLOAD_UNREADABLE = (
-        "this uploaded file cannot be read under the configured store key; if it was stored before "
-        "the key was enabled, an operator must run 'messagefoundry rotate-key' to seal it"
+        "this uploaded file cannot be read under the configured store key. An operator may seal it "
+        "with 'messagefoundry rotate-key', or restore the retired key it was sealed under. If "
+        "rotate-key reports it as unsealable, an operator can only delete it"
     )
+
+    class _UploadSidecarRefused(HTTPException):
+        """The 423 an override holder gets when an upload's sidecar is refused. Every other route
+        answers it as is. DELETE alone catches it and asks ``UploadStore.delete``. That call can
+        still remove an upload ``rotate-key`` never seals (BACKLOG #2322)."""
+
+        def __init__(self) -> None:
+            super().__init__(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE)
 
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
@@ -6008,18 +6043,25 @@ def create_app(
 
         Every by-id route calls this BEFORE it decrypts a body or unlinks anything, which is the point:
         the check has to sit in the handler BODY, not in a ``Depends`` gate, because the web console
-        invokes these handlers directly through the CoreHandlers seam and never runs their gates."""
+        invokes these handlers directly through the CoreHandlers seam and never runs their gates.
+        One exception: DELETE catches :class:`_UploadSidecarRefused`, which only an override holder
+        gets, and lets ``UploadStore.delete`` decide (BACKLOG #2322)."""
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnreadableError:
+            unreadable = True
+        else:
+            unreadable = False
+        if unreadable:
             # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
             # for everyone but an override holder, who may see any file anyway and is the one who
-            # can act on it; the refused sidecar is not an existence oracle for anyone else.
+            # can act on it; the refused sidecar is not an existence oracle for anyone else. Both
+            # raises sit after the handler ends, so neither chain carries the cipher's error.
             if identity.has(Permission.FILES_ACCESS_ANY):
-                raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
-            raise HTTPException(404, "no such uploaded file") from None
+                raise _UploadSidecarRefused()
+            raise HTTPException(404, "no such uploaded file")
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
                 "upload.denied",
@@ -6501,11 +6543,18 @@ def create_app(
 
         The check reads the metadata FIRST, because ``UploadStore.delete`` returns the metadata only
         after it has already unlinked both sidecars — a check bolted onto that call would fire too
-        late. The age-based retention sweep is deliberately owner-blind and unaffected."""
+        late. The age-based retention sweep is deliberately owner-blind and unaffected.
+
+        An override holder goes on to ``UploadStore.delete`` when the sidecar is refused. That call
+        removes the kind it classes as never sealable, and refuses the rest (BACKLOG #2322)."""
         us = _require_upload_store(request)
-        await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
+        refused = False
         try:
-            meta = await us.delete(file_id)
+            await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
+        except _UploadSidecarRefused:
+            refused = True
+        try:
+            meta = await us.delete(file_id, sidecar_refused=refused)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnreadableError:

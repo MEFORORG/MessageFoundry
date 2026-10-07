@@ -52,6 +52,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.wiring import (
     _ENVREF_KEYS,  # parse_env_setting's own env-marker key set -- mirrored, never re-derived
+    _NAMED_CASTS,  # the named casts; only "bool" converts a default (vault BACKLOG #3138)
     _UNSET,  # the "no default=" sentinel an EnvRef carries
     MLLP,
     ConnectionSpec,
@@ -375,6 +376,12 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
 # --- decoding helpers --------------------------------------------------------
 
 
+def _converts_default(ref: Any) -> bool:
+    """Whether an env ref's cast converts its ``default``. Only the bool cast does: :class:`EnvRef`
+    reads that default when it is made (vault BACKLOG #3138). An int, float or str cast does not."""
+    return isinstance(ref, EnvRef) and ref.cast is _NAMED_CASTS["bool"]
+
+
 def _build_spec(transport: str, table: dict[str, Any], where: str) -> ConnectionSpec:
     """Resolve ``transport`` to its factory and call it with the decoded ``[settings]`` table."""
     factory = _TRANSPORTS.get(transport)
@@ -386,7 +393,15 @@ def _build_spec(transport: str, table: dict[str, Any], where: str) -> Connection
     raw = table.get("settings", {})
     if not isinstance(raw, dict):
         raise WiringError(f"{where}: [settings] must be a table")
-    settings = {key: parse_env_setting(value) for key, value in raw.items()}
+    settings: dict[str, Any] = {}
+    for key, value in raw.items():
+        # Per setting, so a refused env() marker names the connection and the setting. The handler
+        # below re-raises a WiringError verbatim, so moving this inside it would add nothing. Vault
+        # BACKLOG #3138 made this matter more: an unreadable `cast = "bool"` default is refused here.
+        try:
+            settings[key] = parse_env_setting(value)
+        except WiringError as exc:
+            raise WiringError(f"{where}: invalid {transport!r} settings — {key!r}: {exc}") from exc
     try:
         # INSIDE the try, not above it. This module's contract is that a bad [settings] table fails
         # loud as a WiringError NAMING THE CONNECTION, and the check below reads annotations through
@@ -541,7 +556,8 @@ def _check_setting_types(
             # What CAN be judged here is an inline `default =`, because resolve_env_settings returns a
             # default WITHOUT applying the ref's `cast`. So `{ env = "m", cast = "int", default = "16" }`
             # reaches the factory as the STRING "16" -- the exact shape this check exists to stop,
-            # written one level down where the cast looks like it covers it.
+            # written one level down where the cast looks like it covers it. The bool cast is the one
+            # exception: EnvRef reads its default strictly when it is made (vault BACKLOG #3138).
             #
             # The value that arrives FROM the environment is NOT judged here and must not be claimed to
             # be: an uncast ref hands the factory whatever the environment holds, as a string. That is
@@ -562,9 +578,10 @@ def _check_setting_types(
         subject = (f"{key!r} env() default" if is_default else repr(key)) + suffix
         expected = _render_expected(judged, None if is_default or suffix else param.annotation)
         detail = f"{subject} must be {expected}, got {_word_for(offender)}"
-        if is_default and not suffix:
+        if is_default and not suffix and not _converts_default(value):
             # Without this the refusal reads as simply wrong to an author looking at the `cast = "int"`
             # they wrote on the same line. The reason lives in the comment above, where they cannot see it.
+            # The bool cast is skipped: it DOES convert its default (vault BACKLOG #3138).
             detail += " (a default is not converted by the ref's cast)"
         elif judged.scalars and isinstance(offender, str) and str not in judged.scalars:
             # Stated as a FACT, not as an instruction. "Write it unquoted" is wrong for every value
