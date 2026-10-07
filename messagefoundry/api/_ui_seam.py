@@ -300,10 +300,13 @@ from typing import Any
 #: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
 #: signatures changed.
 #:
-#: Batch 197 wave 2 (approvals): ``CoreHandlers`` gains a required ``resolve_action`` for the console's resolve of
-#: an interrupted release, with the ``ApprovalResolveRequest`` DTO and its ``outcome`` values.
-#: ``PendingApprovalInfo`` gains ``params``, ``caller_is_requester`` and ``gated``. An older
-#: console fails at ``UiDeps`` construction, so the digest moved for this too.
+#: Vault BACKLOG #2460 / #2458: ``CoreHandlers`` gains a required ``resolve_action`` for the
+#: console's resolve of an interrupted release, with the ``ApprovalResolveRequest`` DTO and its
+#: ``outcome`` values. ``PendingApprovalInfo`` gains ``params``, ``caller_is_requester`` and
+#: ``gated``. The engine builds ``UiDeps``, so an older console constructs nothing that breaks; it is
+#: a newer console on an older engine that would read a handler and three fields the engine lacks,
+#: and raise ``AttributeError`` on the approvals page. The pinned digest refuses that pair at mount
+#: first. The digest moved because the surface grew.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

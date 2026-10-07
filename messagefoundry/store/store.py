@@ -4071,6 +4071,12 @@ _SQLITE_OPEN_REPEAT = (
     " AND (expires_at IS NULL OR expires_at > ?)"
 )
 
+#: The head both of ``create_pending_approval``'s INSERTs share; each appends its own row source.
+_SQLITE_APPROVAL_INSERT = (
+    "INSERT INTO pending_approvals "
+    "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class AuditAppend:
@@ -11231,10 +11237,6 @@ class MessageStore:
     ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
         The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned."""
-        insert = (
-            "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
-        )
         args: tuple[Any, ...] = (
             approval_id,
             operation,
@@ -11245,22 +11247,26 @@ class MessageStore:
             expires_at,
         )
         match = (operation, params, requester_user_id, requested_at)
-        if on_repeat is None:
-            sql = f"{insert} VALUES (?,?,?,?,?,?,'pending',?)"
-        else:
-            # vault BACKLOG #2445. ONE statement, so its read and its write cannot be split: it
-            # takes SQLite's file-level write lock before it reads, which holds against another
-            # connection to the file too, where the in-process lock does not reach.
-            sql = (
-                f"{insert} SELECT ?,?,?,?,?,?,'pending',? WHERE NOT EXISTS ("
-                f"SELECT 1 FROM pending_approvals WHERE {_SQLITE_OPEN_REPEAT})"
-            )
-            args += match
         now = time.time()
         held = approval_id
         append = audit
+        # Each statement is spelled at its `execute` from module constants, not built into a local
+        # first: `tests/test_writer_txn_is_the_only_begin.py` reads the SQL at the call, and a local
+        # variable there is an argument it cannot read.
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(sql, args)
+            if on_repeat is None:
+                cur = await self._db.execute(
+                    _SQLITE_APPROVAL_INSERT + " VALUES (?,?,?,?,?,?,'pending',?)", args
+                )
+            else:
+                # vault BACKLOG #2445. ONE statement, so its read and its write cannot be split: it
+                # takes SQLite's file-level write lock before it reads, which holds against another
+                # connection to the file too, where the in-process lock does not reach.
+                cur = await self._db.execute(
+                    _SQLITE_APPROVAL_INSERT + " SELECT ?,?,?,?,?,?,'pending',? WHERE NOT EXISTS ("
+                    "SELECT 1 FROM pending_approvals WHERE " + _SQLITE_OPEN_REPEAT + ")",
+                    args + match,
+                )
             if on_repeat is not None and cur.rowcount == 0:
                 # The INSERT opened this connection's write transaction, so this read is the
                 # authoritative one. Oldest first: that is the request every earlier caller got.

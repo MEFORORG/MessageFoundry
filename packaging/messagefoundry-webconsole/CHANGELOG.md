@@ -27,8 +27,9 @@ this line.**
   required "I checked its effects" box, through `POST /ui/approvals/{id}/resolve/{outcome}`. It
   asks for the same fresh step-up as the engine's resolve (`BACKLOG #2460`). Each row shows the
   parameters its hold captured (`BACKLOG #2458`). Approve is not offered on the requester's own
-  request, which offers Withdraw, on a row whose stored parameters are unreadable, or on a row
-  whose operation dual control no longer gates; those offer Reject and say why. Seam change:
+  request, on a row whose stored parameters are unreadable, or on a row whose operation dual
+  control no longer gates. Each such row says why and offers the reject instead, labelled
+  Withdraw on the requester's own row and Reject on anyone else's. Seam change:
   `resolve_action` joins the handlers, and `PendingApprovalInfo` gains `params`,
   `caller_is_requester` and `gated`.
 

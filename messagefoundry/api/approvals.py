@@ -590,7 +590,8 @@ class ApprovalGate:
         ``approval.no_longer_gated``) that fails to write is logged and the refusal still answers
         409, since it runs nothing. Many failed writes on this path also page
         ``audit_write_failed``, but not all of them. docs/SECURITY.md, in its approvals section,
-        is the one list of which do and which do not. The store READS here (the request row, the
+        names at least the ones that do and at least the ones that do not; it is not a closed list,
+        and the code is the authority. The store READS here (the request row, the
         requester's account) are not mapped, so a store that refuses reads can still answer a raw
         500.
 
