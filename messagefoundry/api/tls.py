@@ -20,7 +20,6 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -226,7 +225,9 @@ async def record_generated_pair_replacements(
     for event in events:
         detail = event.audit_detail()
         await write_audit_soft(
-            partial(store.record_audit, GENERATED_PAIR_REPLACED, actor=None, detail=detail),
+            # Awaited in this pass, so the late binding B023 warns about cannot bite. A lambda, not
+            # a partial, keeps the lookup of record_audit inside the guard.
+            lambda: store.record_audit(GENERATED_PAIR_REPLACED, actor=None, detail=detail),  # noqa: B023
             log=log,
             message="could not write the %s audit row; the record is: %s",
             args=(GENERATED_PAIR_REPLACED, detail),

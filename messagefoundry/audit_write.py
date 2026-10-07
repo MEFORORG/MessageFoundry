@@ -47,7 +47,8 @@ async def write_audit_soft(
     """Run ``write``, and say whether the row was written.
 
     A fault in ``errors`` is logged at ERROR on ``log``, with its traceback, as ``message % args``,
-    and the call returns ``False``. The record names the caller, not this helper. ``args`` may be a
+    and the call returns ``False``. The record names the caller, not this helper, as long as the
+    caller awaits this directly: under ``wait_for`` or ``shield`` it names asyncio. ``args`` may be a
     callable, read only on a failure: for a log line that names something ``write`` builds, or
     scrubs a value only when it is logged. A fault in neither ``errors`` nor ``defects`` escapes,
     and so does a cancellation, which no ``Exception`` class can catch.

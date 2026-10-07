@@ -7,20 +7,27 @@ other test."""
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+from messagefoundry import integrity as integrity_module
+from messagefoundry import redaction
 from messagefoundry.api import app as app_module
+from messagefoundry.api import approvals as approvals_module
+from messagefoundry.api import tls as tls_module
 from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 
 _LOG = logging.getLogger("tests.audit_write")
+_ENGINE = Path(__file__).resolve().parents[1] / "messagefoundry"
 
 
 def _raising(exc: BaseException) -> Callable[[], Awaitable[None]]:
@@ -39,7 +46,8 @@ def test_a_written_row_returns_true_and_logs_nothing(caplog: pytest.LogCaptureFi
         assert asyncio.run(
             write_audit_soft(_ok, log=_LOG, message="lost %s", args=("row",), defects=())
         )
-    assert caplog.records == []
+    # Only this logger: asyncio.run may log its selector at DEBUG, depending on the root level.
+    assert [r for r in caplog.records if r.name == _LOG.name] == []
 
 
 async def _caller_named_like_a_call_site() -> bool:
@@ -182,7 +190,7 @@ def test_a_refused_reload_row_defect_still_answers_the_refusal() -> None:
     assert status == 404
 
 
-def test_a_gate_row_defect_is_logged_and_paged() -> None:
+def test_a_gate_row_defect_is_logged_and_paged(caplog: pytest.LogCaptureFixture) -> None:
     """Some gate rows are written after a release executed; a raise would skip the page."""
     paged: list[tuple[str, str]] = []
 
@@ -195,9 +203,67 @@ def test_a_gate_row_defect_is_logged_and_paged() -> None:
         Any,
         SimpleNamespace(audit_write_failed=lambda name, *, action: paged.append((name, action))),
     )
-    asyncio.run(
-        gate._record_audit_soft(
-            "a1", "approval.too_early", actor="bob", detail="{}", client=None, context="refused"
+    with caplog.at_level(logging.ERROR, logger=approvals_module.log.name):
+        asyncio.run(
+            gate._record_audit_soft(
+                "a1", "approval.too_early", actor="bob", detail="{}", client=None, context="refused"
+            )
         )
-    )
     assert paged == [("approval:a1", "approval.too_early")]
+    [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert record.getMessage() == (
+        "approval a1: refused, but its approval.too_early audit row failed. Lost detail: {}"
+    )
+
+
+def test_an_integrity_row_defect_still_pages_the_drift(caplog: pytest.LogCaptureFixture) -> None:
+    drifts: list[str] = []
+    engine = _engine_whose_audit_raises(NotImplementedError())
+    sink = SimpleNamespace(integrity_drift=lambda label, **_k: drifts.append(label))
+    with caplog.at_level(logging.ERROR, logger=integrity_module.log.name):
+        asyncio.run(
+            integrity_module._record_and_alert(
+                engine.store,
+                cast(Any, sink),
+                detail={},
+                label="engine",
+                reason="drift",
+                drift_count=1,
+            )
+        )
+    assert drifts == ["engine"]
+    assert any(r.funcName == "_record_and_alert" for r in caplog.records)
+
+
+def test_a_tls_replacement_row_defect_does_not_stop_the_start() -> None:
+    engine = _engine_whose_audit_raises(sqlite3.ProgrammingError())
+    event = SimpleNamespace(audit_detail=lambda: "{}")
+    asyncio.run(tls_module.record_generated_pair_replacements(engine.store, [cast(Any, event)] * 2))
+
+
+def _soft_write_messages() -> list[str]:
+    """Every literal ``message=`` passed to :func:`write_audit_soft` in the engine package."""
+    found: list[str] = []
+    for path in sorted(_ENGINE.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "write_audit_soft"
+            ):
+                for kw in node.keywords:
+                    if kw.arg == "message":
+                        found.append(ast.literal_eval(kw.value))
+    return found
+
+
+def test_the_soft_write_messages_survive_the_console_and_redaction() -> None:
+    """The log-text gates read a logger method's first argument, so they cannot see a message that
+    reaches the log through this helper. This holds those messages to two of the same rules: a
+    stock cp1252 console can print them, and the PHI name heuristic leaves them whole."""
+    messages = _soft_write_messages()
+    # CONTROL: the nine call sites this module replaced. A scan that finds none proves nothing.
+    assert len(messages) >= 9
+    for message in messages:
+        message.encode("cp1252")
+        assert redaction.redact(message) == message, message
