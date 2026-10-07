@@ -408,8 +408,7 @@ class _Section(_InputHidingModel):
         section built in code skips the loader, and ``extra="ignore"`` would drop the key, so
         ``SecuritySettings(require_sign_in=False)`` would quietly keep sign-in on. Unlike a blanket
         ``extra="forbid"``, this names only keys that were removed, and its message carries no value."""
-        if isinstance(data, Mapping):
-            removed = _removed_keys_for(cls)
+        if isinstance(data, Mapping) and (removed := _removed_keys_for(cls)):
             for key in removed.keys() & data.keys():
                 raise ValueError(removed[key])
         return data
@@ -6684,10 +6683,10 @@ def _removed_key_message(section: str, key: str, reason: str) -> str:
 def _removed_keys_for(model: type[BaseModel]) -> dict[str, str]:
     """``key -> refusal`` for the :data:`_REMOVED_KEYS` of the section(s) ``model`` validates.
 
-    Read from :class:`ServiceSettings`' own fields, so a section gains the model-level refusal by
-    being listed in ``_REMOVED_KEYS`` and nothing else. Called only when a model is built, never at
-    import, so both names exist by then."""
-    sections = {name for name, f in ServiceSettings.model_fields.items() if f.annotation is model}
+    Read through :func:`_section_models`, so a section gains the model-level refusal by being
+    listed in ``_REMOVED_KEYS`` and nothing else. Called only when a model is built, never at
+    import, so every name it reads exists by then."""
+    sections = {name for name, m in _section_models().items() if m is model}
     return {
         key: _removed_key_message(section, key, reason)
         for (section, key), reason in _REMOVED_KEYS.items()

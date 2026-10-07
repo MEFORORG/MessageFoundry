@@ -1714,6 +1714,11 @@ def test_the_revocation_attestation_is_actually_wired() -> None:
 # --- the API surface: GET /security/posture reports store + auth deviations --------------------
 
 
+#: ``_posture_body`` reaches the route through the open mode, and the route names that mode (vault
+#: BACKLOG #3062). So a quiet posture here carries that one entry and nothing else.
+_HARNESS_ONLY = ["allow_no_auth"]
+
+
 async def _posture_body(engine: Engine, **state: object) -> dict[str, object]:
     app = create_app(engine, allow_no_auth=True)
     for key, value in state.items():
@@ -1761,7 +1766,7 @@ async def test_posture_route_reports_the_plaintext_hop_acknowledgement(engine: E
     quiet = await _posture_body(
         engine, static_credential_settings=ServiceSettings(api=_terminated(ack=True, cert=True))
     )
-    assert quiet["loosenings"] == []
+    assert [e["switch"] for e in quiet["loosenings"]] == _HARNESS_ONLY  # type: ignore[index,union-attr]
 
 
 @pytest.mark.usefixtures("remote_debugging_off")
@@ -1772,7 +1777,7 @@ async def test_posture_route_reports_nothing_at_the_shipped_defaults(engine: Eng
     the console script leaves it on, and the route then names it: see
     ``tests/test_remote_debug_guard.py``."""
     body = await _posture_body(engine)
-    assert body["loosenings"] == []
+    assert [e["switch"] for e in body["loosenings"]] == _HARNESS_ONLY  # type: ignore[index,union-attr]
 
 
 # --- the ONE connection-scoped deviation (ADR 0153) --------------------------------------------

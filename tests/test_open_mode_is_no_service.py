@@ -12,13 +12,12 @@ reachable, and reported, only with no service attached.
 from __future__ import annotations
 
 import ast
+import functools
 from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import FastAPI
-from pydantic import BaseModel
 from starlette.testclient import TestClient, WebSocketDenialResponse
 
 from messagefoundry.api import create_app, create_managed_app
@@ -28,21 +27,17 @@ from messagefoundry.config.settings import (
     _REMOVED_KEYS,
     AuthSettings,
     EgressSettings,
-    SecuritySettings,
     ServiceSettings,
+    _section_models,
 )
 from messagefoundry.pipeline import Engine
-from tests.test_api_auth import _DEFAULT_PEER, PW, _add, _auth, _login, _service
+from tests._ast_sites import callee_name
+from tests.test_api_auth import PW, _add, _auth, _login, _service
+from tests.test_managed_app_no_auth_default import _client
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCANNED = ("messagefoundry", "messagefoundry_webconsole")
 _EGRESS = EgressSettings(deny_by_default=False)
-
-
-def _client(app: FastAPI) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app, client=_DEFAULT_PEER), base_url="http://t"
-    )
 
 
 # --- item 1: no code reads an `enabled` switch on an auth service --------------------------------
@@ -54,8 +49,7 @@ def _is_auth_source(value: ast.expr | None) -> bool:
         return value.attr == "auth"  # request.app.state.auth
     if not isinstance(value, ast.Call):
         return False
-    func = value.func
-    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+    name = callee_name(value)
     if name == "get_auth":
         return True
     return (
@@ -84,8 +78,9 @@ def _auth_bound_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     return bound
 
 
-def _reads_on_auth(source: str, attr: str) -> Iterator[tuple[int, str]]:
-    """``(line, name)`` for each read of ``<name>.<attr>`` where ``name`` holds an auth service."""
+def _reads_on_auth(source: str, attrs: frozenset[str]) -> Iterator[tuple[str, int, str]]:
+    """``(attr, line, name)`` for each read of ``<name>.<attr>`` where ``name`` holds an auth
+    service and ``attr`` is one of ``attrs``."""
     for func in ast.walk(ast.parse(source)):
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
@@ -93,20 +88,26 @@ def _reads_on_auth(source: str, attr: str) -> Iterator[tuple[int, str]]:
         for node in ast.walk(func):
             if (
                 isinstance(node, ast.Attribute)
-                and node.attr == attr
+                and node.attr in attrs
                 and isinstance(node.value, ast.Name)
                 and node.value.id in bound
             ):
-                yield node.lineno, node.value.id
+                yield node.attr, node.lineno, node.value.id
 
 
-def _scan(attr: str) -> set[tuple[str, int, str]]:
-    found: set[tuple[str, int, str]] = set()
+#: The read under test, and the control read through the same bindings.
+_SCANNED_ATTRS = frozenset({"enabled", "identity_for_token"})
+
+
+@functools.cache
+def _scan() -> dict[str, set[tuple[str, int, str]]]:
+    """Every scanned read, by attribute, with each file parsed once."""
+    found: dict[str, set[tuple[str, int, str]]] = {attr: set() for attr in _SCANNED_ATTRS}
     for package in _SCANNED:
         for path in sorted((_ROOT / package).rglob("*.py")):
             source = path.read_text(encoding="utf-8")
-            for line, name in _reads_on_auth(source, attr):
-                found.add((path.relative_to(_ROOT).as_posix(), line, name))
+            for attr, line, name in _reads_on_auth(source, _SCANNED_ATTRS):
+                found[attr].add((path.relative_to(_ROOT).as_posix(), line, name))
     return found
 
 
@@ -133,7 +134,8 @@ def control(dr, service):
 def test_the_scanner_finds_every_binding_form() -> None:
     """Positive control: each way the tree binds a service is recognised, and a same-named read on
     something else is not. A scanner that recognised nothing would report the clean zero below."""
-    assert sorted(name for _, name in _reads_on_auth(_EVERY_BINDING_FORM, "enabled")) == [
+    reads = _reads_on_auth(_EVERY_BINDING_FORM, frozenset({"enabled"}))
+    assert sorted(name for _, _, name in reads) == [
         "auth",
         "current",
         "service",
@@ -146,8 +148,8 @@ def test_no_engine_or_console_code_reads_enabled_on_an_auth_service() -> None:
 
     The control on the same walk: the service's own methods are read through these bindings in the
     real tree, so the walk reached the files and recognised the bindings in them."""
-    assert _scan("enabled") == set()
-    assert len(_scan("identity_for_token")) >= 5, "control: the walk sees real auth bindings"
+    assert _scan()["enabled"] == set()
+    assert len(_scan()["identity_for_token"]) >= 5, "control: the walk sees real auth bindings"
 
 
 def test_the_service_has_no_enabled_switch() -> None:
@@ -157,26 +159,18 @@ def test_the_service_has_no_enabled_switch() -> None:
 # --- item 2: a removed key is refused by the model, not only by the loader -----------------------
 
 
-def _section_model(section: str) -> type[BaseModel]:
-    model = ServiceSettings.model_fields[section].annotation
-    assert isinstance(model, type) and issubclass(model, BaseModel), (section, model)
-    return model
-
-
 @pytest.mark.parametrize(("section", "key"), sorted(_REMOVED_KEYS))
 def test_every_removed_key_is_refused_by_the_section_built_in_code(section: str, key: str) -> None:
-    """``SecuritySettings(require_sign_in=False)`` used to drop the key and keep sign-in on silently."""
-    model = _section_model(section)
+    """``SecuritySettings(require_sign_in=False)`` used to drop the key and keep sign-in on silently.
+
+    Built from a mapping, which the validator reads either way: a literal unknown keyword in a test
+    is refused by ``tests/test_settings_unknown_kwargs.py``."""
+    model = _section_models()[section]
     model()  # control: the same section builds without the key
     with pytest.raises(ValueError, match=key):
         model.model_validate({key: False})
     with pytest.raises(ValueError, match=key):
         ServiceSettings.model_validate({section: {key: False}})
-
-
-def test_the_security_section_names_its_removed_switch() -> None:
-    with pytest.raises(ValueError, match=r"\[security\]\.require_sign_in was REMOVED"):
-        SecuritySettings(require_sign_in=False)  # type: ignore[call-arg]
 
 
 # --- item 3: GET /security/posture reports the open mode ----------------------------------------
@@ -227,14 +221,14 @@ def test_the_stats_socket_ignores_the_flag_beside_a_service(tmp_path: Path) -> N
         egress_settings=_EGRESS,
     )
     with TestClient(app) as tc:
-        tc.app.state.allow_no_auth = True  # type: ignore[attr-defined]
-        tc.app.state.auth.enabled = False  # type: ignore[attr-defined]
+        app.state.allow_no_auth = True
+        app.state.auth.enabled = False
         with pytest.raises(WebSocketDenialResponse) as denied, tc.websocket_connect("/ws/stats"):
             pass
         assert denied.value.status_code == 403
         # The control on the same app: a signed-in socket opens.
         assert tc.portal is not None
-        tc.portal.call(_add, tc.app.state.auth, "root", Role.ADMINISTRATOR)  # type: ignore[attr-defined]
+        tc.portal.call(functools.partial(_add, app.state.auth, "root", Role.ADMINISTRATOR))
         login = tc.post(
             "/auth/login", json={"username": "root", "password": PW, "provider": "local"}
         )

@@ -209,6 +209,7 @@ from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
+    _allow_no_auth,
     answers_before_body,
     authorize_ws,
     authorizes_in_body,
@@ -1072,7 +1073,7 @@ def _posture_loosenings(
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
     # cannot see it. The same two reads the request-time gates make decide it: no service, and
     # the flag. A service beside the flag still requires sign-in, so it reports nothing.
-    if getattr(state, "auth", None) is None and getattr(state, "allow_no_auth", False):
+    if getattr(state, "auth", None) is None and _allow_no_auth(state):
         pairs.append(
             (
                 "allow_no_auth",

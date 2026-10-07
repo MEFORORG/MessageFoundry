@@ -1307,7 +1307,7 @@ async def authorize_ui_ws(
     token = session_token(websocket)
     if not token:
         return None, None
-    auth = getattr(websocket.app.state, "auth", None)
+    auth: AuthService | None = getattr(websocket.app.state, "auth", None)
     if auth is None:
         return None, None
     # activity=False (ASVS 14.3.1): app.js now re-opens this socket on a TIMER after a drop, and a
