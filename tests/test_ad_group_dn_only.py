@@ -170,8 +170,6 @@ def test_a_full_dn_is_a_group_dn(value: str) -> None:
         "CN=MF-Admins,DC=example\\",  # a trailing lone backslash
         "CN=\\ff,DC=example",  # not UTF-8 once unescaped
         "C N=MF-Admins,DC=example",  # not an attribute type
-        "CN=\u212aiosk,DC=example",  # the Kelvin sign lower-cases onto a different letter
-        "CN=\\E2\\84\\AAiosk,DC=example",  # the same, hex-escaped
         "CN=\ud800,DC=example",  # a lone surrogate cannot be encoded
         "example\\MF-Admins",
         "",
@@ -206,7 +204,10 @@ def test_anything_else_is_not_a_group_dn(value: str) -> None:
         ("CN=a\tb\\0A,DC=example", "cn=a\\09b\\0a,dc=example"),
         ("CN=a\u00a0,DC=example", "cn=a\\c2\\a0,dc=example"),
         ("CN=a\\+b\\<c\\>,DC=example", "cn=a\\+b\\<c\\>,dc=example"),
-        ("CN=Caf\\C3\\A9,DC=example", "cn=caf\u00e9,dc=example"),
+        ("CN=Caf\\C3\\A9,DC=example", "cn=caf\\c3\\a9,dc=example"),
+        # Non-ASCII is hex-escaped however it arrives, and only ASCII letters fold case.
+        ("CN=Caf\u00e9,DC=example", "cn=caf\\c3\\a9,dc=example"),
+        ("CN=\u00c4RZTE,DC=example", "cn=\\c3\\84rzte,dc=example"),
         ("CN=a\\00b,DC=example", "cn=a\\00b,dc=example"),
         # A dotted-OID attribute type. Three arcs, so it is not mistaken for an IP address.
         ("2.5.77=Ops,DC=example", "2.5.77=ops,dc=example"),
@@ -233,6 +234,13 @@ def test_each_spelling_has_one_canonical_form(spelling: str, canonical: str) -> 
         ("CN=MF-Admins,OU=Groups,DC=example\\c2\\a0", "CN=MF-Admins,OU=Groups,DC=example"),
         # An escaped backslash followed by "00" is not a NUL.
         ("CN=a\\5c00,DC=example", "CN=a\\00,DC=example"),
+        # Only ASCII letters fold case. The Kelvin sign is not k, Georgian Mtavruli is not
+        # Mkhedruli, and a non-ASCII capital is not its small letter.
+        ("CN=\u212aiosk,DC=example", "CN=Kiosk,DC=example"),
+        ("CN=\u1c90\u1c93,DC=example", "CN=\u10d0\u10d3,DC=example"),
+        ("CN=\u00c4rzte,DC=example", "CN=\u00e4rzte,DC=example"),
+        # Fullwidth letters, which a width-insensitive SQL collation would fold onto ASCII.
+        ("CN=\uff2d\uff26-Admins,DC=example", "CN=MF-Admins,DC=example"),
         # A different unit is a different group, which is the point of #2610.
         (LEGIT, ROGUE),
     ],
@@ -243,8 +251,38 @@ def test_distinct_groups_keep_distinct_canonical_forms(one: str, other: str) -> 
     a, b = canonical_group_dn(one), canonical_group_dn(other)
     assert a is not None and b is not None
     assert a != b
-    # The store strips and folds case on both sides; that must not merge them either.
+    # The store strips and folds case on both sides; that must not merge them either. Nor can
+    # a collation: the key is printable ASCII with no capital letter.
     assert a.strip().lower() != b.strip().lower()
+    for key in (a, b):
+        assert key.isascii() and key.isprintable() and key == key.lower(), key
+
+
+def test_resolve_groups_counts_a_dropped_dn_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+    """A member DN with no canonical form is dropped, and the log says how many, never which."""
+    with caplog.at_level("DEBUG", logger=ldap_mod.logger.name):
+        got = _groups_of([LEGIT, 'CN="quoted",DC=example'])
+    assert got == {LEGIT.lower()}
+    dropped = [r for r in caplog.records if "dropped" in r.getMessage()]
+    assert len(dropped) == 1 and dropped[0].levelname == "DEBUG"
+    assert "1 group DN" in dropped[0].getMessage() and "quoted" not in dropped[0].getMessage()
+
+
+async def test_a_key_too_long_once_canonical_is_refused(engine: Engine) -> None:
+    """A key within the request model's 512 characters whose canonical form passes the 256 the
+    SQL Server column holds is refused with a 400, not stored partway. Each non-ASCII letter takes
+    six or more characters once escaped."""
+    transport = await _admin_transport(engine)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        login = {"username": "boss", "password": PW, "provider": "local"}
+        h = {"Authorization": f"Bearer {(await c.post('/auth/login', json=login)).json()['token']}"}
+        key = "CN=" + "\u00e4" * 60 + ",OU=Groups,DC=example,DC=invalid"
+        assert len(key) < 512
+        body = {"entries": [{"ad_group": key, "role": Role.OPERATOR.value}]}
+        r = await c.put("/ad-group-map", json=body, headers=h)
+        assert r.status_code == 400, r.text
+        assert "canonical form" in r.json()["detail"]
+        assert (await c.get("/ad-group-map", headers=h)).json()["entries"] == []
 
 
 async def test_a_pasted_key_with_a_line_break_still_maps(engine: Engine) -> None:

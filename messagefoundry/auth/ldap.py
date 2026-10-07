@@ -472,21 +472,23 @@ def _hex_escaped(ch: str) -> str:
 
 
 def _canonical_value(tokens: list[tuple[bytes, bool]]) -> str | None:
-    """One attribute value, lower-cased and re-escaped, or ``None``.
+    """One attribute value, case-folded and re-escaped, or ``None``.
 
     ``tokens`` holds each character or hex pair as ``(bytes, escaped)``. An unescaped space at
     either end is padding, so it is dropped. An unescaped ``#`` at the start would make the value a
     BER hex string, which no group map needs, so it is refused.
 
-    **Lower-casing must merge only a letter with its own other case.** ``str.lower()`` also folds
-    some characters onto a different letter: the Kelvin sign onto ``k``, the ohm sign onto omega. A
-    directory may hold ``CN=Kiosk`` and ``CN=<KELVIN SIGN>iosk`` as two groups, so a value holding
-    such a character is refused. The test is that upper-casing the lower-cased character gives it
-    back. A refused member group can be named by no key, so it grants nothing.
+    **The output is printable ASCII, and only ASCII letters fold case.** Every other character is
+    written as ``\\xx`` escapes of its UTF-8 bytes, in lower-case hex. Python's Unicode case tables
+    fold some characters onto a different letter (the Kelvin sign onto ``k``) and pair scripts AD's
+    own table may keep apart, and a SQL Server column under a case- and width-insensitive collation
+    folds far more. An all-ASCII key with no upper-case letter means none of those can merge two
+    groups, and the store's ``strip().lower()`` is a no-op on it. **The cost fails closed:** a
+    non-ASCII letter matches only in the case it was written in, so ``CN=Ärzte`` and ``CN=ärzte``
+    name different keys. Copy a key from the directory's own spelling.
 
-    The output hex-escapes every space-like or control character it keeps except an inner plain
-    space, and a space at either end. So it never starts or ends with white space, and the store's
-    own ``strip()`` cannot shorten it."""
+    The plain space is the one exception to escaping, and only inside a value. At either end it is
+    written ``\\20``, so a key never starts or ends with white space."""
     first, last = 0, len(tokens)
     while first < last and tokens[first] == _DN_PAD:
         first += 1
@@ -499,41 +501,39 @@ def _canonical_value(tokens: list[tuple[bytes, bool]]) -> str | None:
         raw = b"".join(part for part, _escaped in tokens).decode("utf-8")
     except UnicodeDecodeError:
         return None
-    if any(ch.lower() != ch and ch.lower().upper() != ch for ch in raw):
-        return None
-    value = raw.lower()
     out = []
-    for i, ch in enumerate(value):
-        edge = i in (0, len(value) - 1)
+    for i, ch in enumerate(raw):
         if ch in _DN_ESCAPED or (ch == "#" and i == 0):
             out.append("\\" + ch)
-        elif (ch == " " and edge) or (ch != " " and (ch.isspace() or not ch.isprintable())):
-            out.append(_hex_escaped(ch))
+        elif ch == " ":
+            out.append("\\20" if i in (0, len(raw) - 1) else " ")
+        elif "!" <= ch <= "~":  # printable ASCII other than the space
+            out.append(ch.lower())
         else:
-            out.append(ch)
+            out.append(_hex_escaped(ch))
     return "".join(out)
 
 
 def canonical_group_dn(text: str) -> str | None:
     """The one form a group DN is compared in (BACKLOG #2610), or ``None`` if ``text`` is no DN.
 
-    Each attribute becomes ``type=value``, both lower-cased, with the value unescaped and then
-    escaped again one way (:func:`_canonical_value`). The parts of a multi-valued RDN (``+``) are
+    Each attribute becomes ``type=value``, ASCII letters lower-cased, with the value unescaped and
+    then escaped again one way (:func:`_canonical_value`). The parts of a multi-valued RDN (``+``) are
     sorted, and RDNs are joined with ``,``. So however a value is escaped, one DN gives one
     string: ``CN=C# Developers``, ``cn=C\\# developers`` and ``CN=C\\23 Developers`` all become
     ``cn=c# developers``, and ``\\2C`` and ``\\,`` agree. It does not map an attribute's OID onto
-    its name, or one Unicode normal form onto another; those spellings stay apart and match
-    nothing, which fails closed.
+    its name, a non-ASCII letter onto its other case, or one Unicode normal form onto another;
+    those spellings stay apart and match nothing, which fails closed.
 
     The parser is tolerant where Active Directory is. A ``#`` after a value's first character is
     literal, which RFC 4514 allows and ldap3's ``parse_dn`` refuses, and AD writes it unescaped in
     ``memberOf``. Spaces around a separator are padding. It refuses an unescaped ``"`` or ``;``,
     an unescaped ``#`` that starts a value, an empty value, a value that is not UTF-8 once
-    unescaped, a value whose case cannot be folded safely, text that cannot be encoded as UTF-8,
-    and anything with fewer than :data:`_GROUP_DN_MIN_RDNS` RDNs.
+    unescaped, text that cannot be encoded as UTF-8, and anything with fewer than
+    :data:`_GROUP_DN_MIN_RDNS` RDNs.
 
-    The output never changes under ``str.lower()`` or ``str.strip()``, so the store's own
-    ``strip().lower()`` is a no-op on it. Linear apart from sorting a multi-valued RDN's parts, so
+    The output is printable ASCII and never changes under ``str.lower()`` or ``str.strip()``, so
+    the store's own ``strip().lower()`` is a no-op on it. Linear apart from sorting a multi-valued RDN's parts, so
     operator text cannot make it backtrack.
     """
     try:
@@ -1114,8 +1114,9 @@ class LdapAuthenticator:
         canonical = [canonical_group_dn(dn) for dn in found]
         dropped = canonical.count(None)
         if dropped:
-            # A count only: a group DN is directory text, and the log is not the place for it.
-            logger.info(
+            # A count only, at DEBUG: a group DN is directory text, and this runs on every sign-in
+            # and every reconcile probe.
+            logger.debug(
                 "AD group resolution dropped %d group DN(s) with no canonical form; no group map "
                 "key can name such a group, so it grants nothing (BACKLOG #2610)",
                 dropped,

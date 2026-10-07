@@ -363,6 +363,11 @@ async def _validate_roles(service: AuthService, roles: list[str]) -> None:
 #: How many refused group keys the 400 names before it only counts the rest.
 _GROUPS_NAMED = 3
 
+#: The longest canonical group key any store can hold: SQL Server's ``ad_group NVARCHAR(256)``.
+#: The request model allows 512 characters, and canonical form can be longer than what was typed,
+#: so a key past this would fail inside the store's write with a 500 rather than a 400.
+_STORED_GROUP_MAX = 256
+
 
 def _canonical_group_dns(groups: list[str]) -> list[str]:
     """Each group map key in canonical form, or a 400 if any is not a full DN (BACKLOG #2610).
@@ -372,21 +377,35 @@ def _canonical_group_dns(groups: list[str]) -> list[str]:
     so it is refused rather than stored. The canonical form is the one ``_resolve_groups`` gives a
     member's groups, so a key matches however it escapes a value (:func:`canonical_group_dn`). The
     store still strips and folds case, which changes nothing in that form. A blank key stays blank,
-    and the store drops it as it always has."""
+    and the store drops it as it always has. A canonical key longer than
+    :data:`_STORED_GROUP_MAX` is refused too."""
     # Outer white space is trimmed first: a pasted key often carries a line break, and the last
     # RDN of a group DN is a domain component, which holds none.
-    canonical = [canonical_group_dn(g.strip()) if g.strip() else "" for g in groups]
-    bad = sorted({g.strip() for g, c in zip(groups, canonical, strict=True) if c is None})
+    keys = [g.strip() for g in groups]
+    canonical = [canonical_group_dn(k) if k else "" for k in keys]
+    pairs = list(zip(keys, canonical, strict=True))
+    _refuse_group_keys(
+        sorted({k for k, c in pairs if c is None}),
+        "AD group must be a full distinguished name, such as "
+        "CN=MF-Admins,OU=Groups,DC=example,DC=com",
+    )
+    _refuse_group_keys(
+        sorted({k for k, c in pairs if c and len(c) > _STORED_GROUP_MAX}),
+        f"AD group is longer than {_STORED_GROUP_MAX} characters in canonical form, where each "
+        "non-ASCII character is written as several escapes",
+    )
+    return [c or "" for c in canonical]
+
+
+def _refuse_group_keys(bad: list[str], reason: str) -> None:
+    """Raise the 400 naming the first :data:`_GROUPS_NAMED` of ``bad``, if there are any."""
     if bad:
-        named = ", ".join(bad[:_GROUPS_NAMED])
         more = len(bad) - _GROUPS_NAMED
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "AD group must be a full distinguished name, such as "
-            f"CN=MF-Admins,OU=Groups,DC=example,DC=com; refused: {named}"
+            f"{reason}; refused: {', '.join(bad[:_GROUPS_NAMED])}"
             + (f" and {more} more" if more > 0 else ""),
         )
-    return [c or "" for c in canonical]
 
 
 def add_auth_routes(app: FastAPI) -> AdminHandlers:

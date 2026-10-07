@@ -3020,15 +3020,22 @@ group is named by its **full distinguished name (DN)** and nothing else. `PUT /a
 `PUT /ad-group-scope-map` refuse any other key with a 400, and a user's groups are read as DNs
 only. A user in multiple mapped groups gets the union of those roles.
 
-**Keys and a user's groups are compared in one canonical form.** The engine parses each DN, then
-lower-cases it, unescapes each value and escapes it again one way, and sorts the parts of a
-multi-valued RDN. The maps store that form. So a key matches however either side escapes a value:
-Active Directory writes `CN=C# Developers,OU=Groups,...` with the `#` unescaped, and
-`CN=C\# Developers` and `CN=C\23 Developers` name the same group. Distinct groups stay apart. A
-tab or line break in a value is part of it, and a value whose case cannot be folded without
-merging two letters, such as one holding the Kelvin sign, is refused. An attribute written as a
-dotted OID instead of its name, such as `CN`, is not mapped onto that name, so such a key matches
-nothing.
+**Keys and a user's groups are compared in one canonical form.** The engine parses each DN,
+unescapes each value and escapes it again one way, and sorts the parts of a multi-valued RDN. The
+result is printable ASCII: ASCII letters are lower-cased, and every non-ASCII or control
+character is written as hex escapes of its UTF-8 bytes. The maps store that form, and a key
+whose canonical form passes 256 characters is refused. So a key matches however either side
+escapes a value: Active Directory writes `CN=C# Developers,OU=Groups,...` with the `#` unescaped,
+and `CN=C\# Developers` and `CN=C\23 Developers` name the same group.
+
+**Distinct groups stay apart, and every gap fails closed.** A tab or line break in a value is part
+of it. A non-ASCII letter matches only in the case it was written in, so `CN=Ärzte` and
+`CN=ärzte` are different keys; copy a key from the directory's own spelling. Case and width rules,
+in Unicode or a SQL Server collation, have nothing left to fold: the key holds no upper-case or
+non-ASCII character. An
+attribute written as a dotted OID instead of its name, such as `CN`, is not mapped onto that
+name, so such a key matches nothing. The routes trim white space around the whole key, so a key
+pasted with a line break still maps.
 
 **A short name is refused because the engine cannot tell two same-named groups apart** (BACKLOG
 #2610). This section used to say a key could be the group's `sAMAccountName`, which is unique in a
