@@ -1217,8 +1217,9 @@ save path, exactly as before.
 
 ## Amendment G (2026-10-07) -- PROPOSED -- the analyst build of the Theia editor drops three IDE guardrails for that build only, and a typed-only mode closes two escape hatches (review R1, R9)
 
-**Status: Proposed.** Not accepted; accepting it needs the owner. No text above this heading is
-edited by it (G.6 and G.7 say where its meaning narrows). It is written for [ADR 0208](0208-a-theia-desktop-app-gives-interface-analysts-a-simpler-steps-only-editor.md),
+**Status: Proposed.** Not accepted; accepting it needs the owner. It edits no text above this heading
+except one: a dated pointer appended to the E.11 sentence about structural inserts, which sends the
+reader to G.7. G.6 and G.7 say where its meaning narrows. It is written for [ADR 0208](0208-a-theia-desktop-app-gives-interface-analysts-a-simpler-steps-only-editor.md),
 which proposes a Theia desktop editor for interface analysts, and for its specification
 [`docs/design/theia-analyst-editor.md`](../design/theia-analyst-editor.md). A review of the
 2026-10-02 drafts of that design found that they removed guardrails this ADR accepted without
@@ -1244,10 +1245,9 @@ from its header row, nested `code` rows included. In the analyst build a delete 
 that contains a `code` row, or whose test is unrecognized, is refused (AC-G5), because it would
 remove or reorder hand-written Python.
 
-**The `ide/` extension keeps all three guardrails unchanged, and so does the developer build of ADR
-0208 for a `code:edit` holder.** Every other clause of this ADR stands in every build. A
-developer-build user without `code:edit` gets the analyst build's limits, so AC-G1, AC-G2 and AC-G5
-apply to that user too.
+**The `ide/` extension and the developer build of ADR 0208 keep all three guardrails unchanged.** The
+developer build applies no per-user limits (ADR 0208, Manager decision D-A); a user without
+`code:edit` is given the analyst build. Every other clause of this ADR stands in every build.
 
 ### G.2 Why each guardrail can go in that build, and what replaces it
 
@@ -1301,56 +1301,67 @@ even inside the editor. ADR 0208 makes both a condition of shipping the analyst 
 
 Two hatches write code that runs, and accepted ADRs license both:
 
-- **`paste_block`**, the paste op this ADR's §5 and §2 Phase 3 brought in, which keyboard paste uses
-  (ADR 0103 names that verb). The multi-line insert templates (ADR 0106 section 5, item (A)) share its
-  machinery but are `insert_row` edits and are **not** refused; their only hatch is the raw `test`
-  below, plus G.7.
-- **A one-line raw `test`** on an `If` or `Else If`: ADR 0106 section 3, Group 3, names it the
-  *"power-user `test:{expr}` escape hatch"*.
+- **`paste_block`**, the op behind keyboard paste. ADR 0103 names keyboard paste as a verb, and the
+  provenance comment above `_SUPPORTED_OPS` in `messagefoundry/lens.py` places the op under §2
+  Phase 3 v2. No ADR text names `paste_block` itself.
+- **A one-line raw `test`**: a `test` key on an `op: template` If edit, or on an `insert_clause` Else
+  If edit. ADR 0106 section 3, Group 3, names it the *"power-user `test:{expr}` escape hatch"*.
+
+**The templates themselves are not refused.** An `op: template` edit (If, For Each, Filter, Raise,
+Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and is routed through
+`_apply_paste_block`
+internally. So the refusal must sit on the `paste_block` *op* and on the `test` *key*, not inside
+`_apply_paste_block`, or typed templates would be refused too.
 
 **The owner ruled on 2026-10-07 that both close under a typed-only mode, and are otherwise kept.**
 
-- `lens rewrite` gains a flag, working name `--typed-only`. Under it, a `paste_block` edit and a raw
-  `test` are refused with the generic `refused` code, and nothing is written.
-- **The flag is off by default.** Developers, the `ide/` extension, and the developer build for a
-  `code:edit` holder keep both hatches exactly as this ADR's §5 and ADR 0106 describe them.
-- **The ADR 0208 analyst build always sets it**, and so does the developer build for a user without
-  `code:edit`. Neither offers a way to turn it off.
+- `lens rewrite` would gain a flag, working name `--typed-only`. Under it, a `paste_block` edit, and a
+  `template` or `insert_clause` edit carrying a `test` key, would be refused with the generic
+  `refused` code, and nothing written.
+- **The flag is off by default.** Developers, the `ide/` extension and the ADR 0208 developer build
+  keep both hatches.
+- **The ADR 0208 analyst build always sets it** and offers no way to turn it off.
 
-This narrows §5 of this ADR and ADR 0106, in typed-only mode only. Neither text is changed; this
-amendment is the record, and it is the one place G changes what text above it means. The flag is
-being built with the R1 fix and has not landed.
+In typed-only mode only, this narrows §2 Phase 3 and §5 of this ADR and ADR 0106. Neither text is
+changed; this amendment is the record. The flag is being built with the R1 fix and has not landed.
 
-### G.7 Structural inserts stop splicing a value that is not inert
+### G.7 Structural inserts and send destinations stop accepting a value that is not inert
 
 Amendment E's 2026-09-29 note (E.11, rule 3) records that structural inserts (`insert_row` and the
 insert templates) *"still splice an `{"expr": ...}` verbatim"*, and that the note does not cover them.
-The R1 fix changes that, in every mode: a structural insert refuses a value that is not inert.
+The R1 fix would change that, in every mode:
+
+- a structural insert would refuse an `{"expr": ...}` that is not inert;
+- a send row's `set_params` destination would refuse one too;
+- `assign_to` would be restricted: not `msg`, not a keyword, not a dunder name, and not a name
+  already bound or used in the def.
+
 Here *inert* means a literal or an admitted `templated` value (Amendment E); the R1 fix settles the
-exact set, and its tests are the record. `set_params` already refuses a `dynamic` value (AC-M5). That
-sentence of E.11 is not rewritten. It describes the code as it stood when written; this section
-records the change, which is being built separately and has not landed.
+exact set, and its tests are the record. `set_params` on action, lookup and diagnostic rows already
+refuses a `dynamic` value (AC-M5). That sentence of E.11 is not rewritten; the dated pointer appended
+to it sends the reader here. The change is being built separately and has not landed.
 
 ### Acceptance Criteria (Amendment G -- proposed, not ratified)
 
-- [ ] **AC-G1** -- WHILE the editor is the ADR 0208 analyst build, or its developer build for a user
-  without `code:edit`, THE SYSTEM SHALL offer no command, menu or link that opens a `.py` file in a
-  text editor.
+- [ ] **AC-G1** -- WHILE the editor is the ADR 0208 analyst build, THE SYSTEM SHALL offer no command,
+  menu or link that opens a `.py` file in a text editor. (Mechanism: Theia's `EditorManager` rebound
+  and *Open With* removed; ADR 0208 spike S-2 tests it.)
 - [ ] **AC-G2** -- WHEN a file fails `lens parse` in the analyst build, THE SYSTEM SHALL show a
   read-only notice that a developer must fix it, and SHALL NOT open a text editor.
-- [ ] **AC-G3** -- WHILE the editor is the ADR 0208 developer build for a `code:edit` holder, or the
-  `ide/` extension, THE SYSTEM SHALL keep *Reopen With: Python*, the text-editor fallback and
-  opt-in entry unchanged.
+- [ ] **AC-G3** -- WHILE the editor is the ADR 0208 developer build or the `ide/` extension, THE
+  SYSTEM SHALL keep *Reopen With: Python*, the text-editor fallback and opt-in entry unchanged.
 - [ ] **AC-G4** -- THE analyst build SHALL write a `.py` only through `lens rewrite` output applied
   to the editor's document, and SHALL store no Steps model.
-- [ ] **AC-G5** -- IF an analyst-build delete or move targets a control block that contains a `code`
-  row or has an unrecognized test, THEN THE SYSTEM SHALL refuse it.
-- [ ] **AC-G6** -- WHILE `lens rewrite` runs in typed-only mode, IF an edit is a `paste_block` or
-  carries a raw control `test`, THEN THE SYSTEM SHALL refuse it with the generic `refused` code and
-  write nothing. The R1 Builder's tests verify this; they land separately.
+- [ ] **AC-G5** -- IF a delete or move in the ADR 0208 analyst build targets a control block that
+  contains a `code` row or has an unrecognized test, THEN THE SYSTEM SHALL refuse it.
+- [ ] **AC-G6** -- WHILE `lens rewrite` runs in typed-only mode, IF an edit is a `paste_block`, or a
+  `template` or `insert_clause` edit with a `test` key, THEN THE SYSTEM SHALL refuse it with the
+  generic `refused` code and write nothing. The R1 Builder's tests verify this; they land separately.
 - [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL accept `paste_block`
-  and a raw `test` as ADR 0103 and ADR 0106 describe.
-- [ ] **AC-G8** -- THE ADR 0208 analyst build, and its developer build for a user without `code:edit`,
-  SHALL pass typed-only mode on every `lens rewrite` call.
-- [ ] **AC-G9** -- IF a structural insert carries a value that is not inert, THEN `lens rewrite` SHALL
-  refuse it, in every mode (G.7).
+  and a raw `test`, and SHALL accept every typed `template` edit in either mode.
+- [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite` call.
+- [ ] **AC-G9** -- IF a structural insert, or a send row's `set_params` destination, carries an
+  `{"expr": ...}` that is not inert, or an `assign_to` breaks the G.7 rule, THEN `lens rewrite` SHALL
+  refuse it, in every mode. The R1 payloads it covers are an `insert_row` with an `{"expr": ...}`
+  value calling `os.system`, and a send row's `to` set to an `{"expr": ...}`; the other two, a
+  `paste_block` and a template If's raw `test`, are AC-G6's.
