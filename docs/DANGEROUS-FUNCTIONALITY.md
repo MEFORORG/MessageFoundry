@@ -657,11 +657,12 @@ or compression library:
   machine with no store key.
 - `api/svg_sanitize.py` inflates a gzip attachment on download, since an SVGZ file is a gzipped SVG
   (BACKLOG #2391). It inflates a 64 KiB head first, and serves the body as stored when that head
-  plainly is not markup. Otherwise it inflates to at most 32 MiB, enforced as it goes, so a bomb
-  stops there. A body may hold at most 16 gzip members. Markup it cannot read to the end is refused
-  with HTTP 422. That covers output over the bound, more than 16 members, a cut-short or corrupt
-  member, and trailing bytes other than NUL padding. The inflated bytes stay in memory; nothing is
-  written to disk, and the stored attachment is never changed.
+  shows a first non-whitespace byte other than `<`. Otherwise it inflates to at most 32 MiB,
+  enforced as it goes, so a bomb stops there. Output it cannot read to the end is refused with HTTP
+  422 unless it has already shown a first byte other than `<`. That covers output over the bound,
+  more than 16 gzip members, a cut-short or corrupt member, and trailing bytes other than NUL
+  padding. A sanitized SVG inside is served gzipped again. The inflated bytes stay in memory;
+  nothing is written to disk, and the stored attachment is never changed.
 - `support/bundle.py` only writes a zip, the support bundle. It reads none.
 
 ---
