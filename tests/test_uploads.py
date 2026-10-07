@@ -1391,7 +1391,9 @@ async def test_a_write_stuck_past_the_bound_is_left_to_finish(
         release.set()
         await _drain_stragglers(store)
         await asyncio.sleep(0)  # the done callback runs one loop pass after the task ends
-    assert "left running after its caller was cancelled failed" in caplog.text, caplog.text
+    assert "a task run to completion failed after its caller was cancelled" in caplog.text, (
+        caplog.text
+    )
 
 
 async def test_a_save_time_sweep_shutdown_cancels_names_each_unaudited_file(
@@ -1424,8 +1426,9 @@ async def test_a_save_time_sweep_shutdown_cancels_names_each_unaudited_file(
         with contextlib.suppress(asyncio.CancelledError):
             await held
         await asyncio.sleep(0)  # the done callback runs one loop pass after the task ends
-    [record] = [r for r in caplog.records if "save-time upload prune" in r.getMessage()]
+    [record] = [r for r in caplog.records if "upload.prune" in r.getMessage()]
     assert record.levelno == logging.ERROR, record.getMessage()
+    assert record.getMessage().startswith("the save-time upload prune was cancelled")
     assert "2 file(s) it removed, or was removing, may have no" in record.getMessage()
     named = set(record.getMessage().rsplit(": ", 1)[1].split(", "))
     assert named == ids - set(written) and len(written) == 1

@@ -7572,22 +7572,18 @@ class PostgresStore:
         land between the read and the write. ``RETURNING`` (absent on a refusal) discriminates applied
         from refused."""
         now = time.time()
-        # A stamp further ahead than this is not trusted (see the SQLite twin and the contract).
-        ahead = now + max(0.0, stale_after)
         if files <= 0:
             # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
             await self._execute(
                 "UPDATE upload_quota SET"
                 " inflight_files = GREATEST(0, inflight_files + $2),"
                 " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
-                # never backwards (BACKLOG #2648), unless the stamp is past `ahead`
-                " since = CASE WHEN since > $5 THEN $4 ELSE GREATEST(since, $4) END"
+                " since = GREATEST(since, $4)"  # never backwards (BACKLOG #2648)
                 " WHERE uploader_id = $1",
                 uploader_id,
                 int(files),
                 int(size_bytes),
                 now,
-                ahead,
             )
             return True
         if files > max_files or size_bytes > max_total_bytes:
@@ -7598,16 +7594,15 @@ class PostgresStore:
             "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
             " VALUES ($1,$2,$3,$4)"
             " ON CONFLICT (uploader_id) DO UPDATE SET"
-            " inflight_files = CASE WHEN (upload_quota.since <= $5 OR upload_quota.since > $8)"
-            " THEN 0 ELSE upload_quota.inflight_files END + $2,"
-            " inflight_bytes = CASE WHEN (upload_quota.since <= $5 OR upload_quota.since > $8)"
-            " THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
+            " inflight_files ="
+            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
+            " inflight_bytes ="
+            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
             # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
-            " since = CASE WHEN upload_quota.since > $8 THEN $4"
-            " ELSE GREATEST(upload_quota.since, $4) END"
-            " WHERE (CASE WHEN (upload_quota.since <= $5 OR upload_quota.since > $8) THEN 0"
+            " since = GREATEST(upload_quota.since, $4)"
+            " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
             " ELSE upload_quota.inflight_files END) + $2 <= $6"
-            " AND (CASE WHEN (upload_quota.since <= $5 OR upload_quota.since > $8) THEN 0"
+            " AND (CASE WHEN upload_quota.since <= $5 THEN 0"
             " ELSE upload_quota.inflight_bytes END) + $3 <= $7"
             " RETURNING 1 AS applied",
             uploader_id,
@@ -7617,7 +7612,6 @@ class PostgresStore:
             stale,
             int(max_files),
             int(max_total_bytes),
-            ahead,
         )
         return row is not None
 

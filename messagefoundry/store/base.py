@@ -1461,15 +1461,7 @@ class QueueStore(StoreLifecycle, Protocol):
         past ``stale_after`` (BACKLOG #2648). So the reset normally reclaims only slots no live
         process holds. When it does reclaim a live one, it can only restore the pre-ledger
         behaviour (an overshoot bounded by the number of concurrent writers), never something
-        worse.
-
-        **A clock more than ``stale_after`` ahead of the writer's is not trusted.** Never-backwards
-        alone would let one write from a host whose clock runs far ahead pin the row's clock in the
-        future, so a slot leaked later never went stale until real time caught up. So a row stamped
-        more than ``stale_after`` past the writer's now counts as stale too: a reserve resets it, and
-        a reserve or release stamps it with now. The cost is the mirror of the lagging case: a live
-        slot held by a host whose clock runs that far ahead of a sibling's is reclaimed by the
-        sibling's next reserve."""
+        worse."""
         ...
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:

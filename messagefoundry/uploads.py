@@ -29,6 +29,7 @@ import asyncio
 import base64
 import contextlib
 import contextvars
+import functools
 import hashlib
 import json
 import logging
@@ -228,8 +229,10 @@ class UploadQuotaError(UploadError):
       slots. **So a leaked slot self-heals only once that uploader is otherwise IDLE** for the whole
       window, with no bound while activity continues. Any reserve, release or heartbeat for that
       uploader, from any shard, keeps it alive. A host whose clock runs ahead holds it longer by the
-      skew, up to one window: a stamp further ahead than that is not trusted, and the next reserve
-      or release overwrites it (:meth:`messagefoundry.store.base.Store.reserve_upload_quota`).
+      skew, with no cap: the stamp never moves backwards, so one write from a host a year ahead
+      holds a slot leaked later for a year. A cap read from the writer's own clock cannot tell that
+      stamp from a fresh one seen by a host that lags, and the lagging host would then reset a
+      sibling's live slots, so the server-clock fix below is the one that closes it.
     * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a row with no activity
       for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow one.
       Every applied reserve moves the row's clock, and a live save touches it every
@@ -237,9 +240,8 @@ class UploadQuotaError(UploadError):
       keeps its slot. A live slot is still reclaimed in at least these cases: its holder lands no
       touch for the whole window while it is alive (a suspended process or VM, an event loop
       starved for minutes, or a store this shard cannot reach while a sibling can); its save
-      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; the holder's host clock lags a sibling's
-      by a large part of the window; or it runs more than a window ahead of a sibling's, whose next
-      reserve then reads the stamp as untrusted. ``since`` is stamped from the writer's ``time.time()`` and
+      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; or the holder's host clock lags a sibling's
+      by a large part of the window. ``since`` is stamped from the writer's ``time.time()`` and
       compared against the reader's, and the stamp never moves backwards, so a lagging host can no
       longer age a row a sibling keeps fresh, but a row only it touches still looks old to the
       sibling. A sibling then counts neither that file nor its slot, and the holder's later release
@@ -1825,6 +1827,7 @@ class UploadStore:
 
         return await self._run_to_completion(
             self.prune_and_audit(audit, abort=abort, tally=tally),
+            what="the save-time upload prune",
             on_cancel=lambda: tally.abort(abort),
             on_late=_late,
         )
@@ -1833,6 +1836,7 @@ class UploadStore:
         self,
         coro: Coroutine[Any, Any, T],
         *,
+        what: str = "a task run to completion",
         on_cancel: Callable[[], None] | None = None,
         on_late: Callable[[asyncio.Future[Any]], None] | None = None,
     ) -> T:
@@ -1841,23 +1845,29 @@ class UploadStore:
         The task is outside the caller's cancel scope, so the request deadline does not reach its
         awaits. A cancelled caller calls ``on_cancel`` first, then waits up to
         ``_LEDGER_CANCEL_WAIT_SECONDS`` for the task, then the cancellation propagates. A task
-        still running at that bound is logged and held until it finishes. Once the caller is
-        cancelled, ``on_late`` is given the finished task, since the cancellation is what
-        propagates and nothing else reads its outcome; without one, a failure is logged at ERROR.
-        Without a cancellation, the task's result or exception is the caller's."""
+        still running at that bound is logged, naming it by ``what``, and held until it finishes.
+        Once the caller is cancelled, ``on_late`` is given the finished task, since the
+        cancellation is what propagates and nothing else reads its outcome; without one, a failure
+        is logged at ERROR. Without a cancellation, the task's result or exception is the caller's.
+
+        The task itself can be cancelled too, by a loop shutdown, while its caller is not. That
+        surfaces here as the same ``CancelledError``, so ``on_cancel`` runs again on this path: a
+        sweep's thread outlives its task, and must still be told to stop."""
         task = asyncio.create_task(coro)
         try:
             return await _wait_to_completion(
                 task, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS, on_cancel=on_cancel
             )
         except asyncio.CancelledError:
+            if on_cancel is not None:
+                on_cancel()  # idempotent; covers a cancel of the task itself (see above)
             if not task.done():
                 _log.warning(
-                    "a task its caller's cancellation could not cut short did not finish within "
-                    "%gs of it; it was left running",
+                    "%s did not finish within %gs of its caller's cancellation; it was left running",
+                    what,
                     _LEDGER_CANCEL_WAIT_SECONDS,
                 )
-            self._hold(task, on_late or _log_late_failure)
+            self._hold(task, on_late or functools.partial(_log_late_failure, what=what))
             raise
 
     def _sweep_orphans_sync(self, *, now: float, abort: threading.Event | None = None) -> int:
@@ -1893,15 +1903,20 @@ class UploadStore:
         ``abort`` is :meth:`prune_expired`'s, checked before each entry. The pass's audit rows are
         written only once this returns, so a slow sweep over a large dir must not hold them past a
         stop (BACKLOG #2264). An aborted sweep returns what it removed so far; the next one resumes."""
+        stop = abort if abort is not None else threading.Event()
         root = self._root
-        if not root.is_dir():
+        if stop.is_set() or not root.is_dir():
             return 0
         cutoff = now - _ORPHAN_MIN_AGE_SECONDS
         # A sidecar is the listing key, so an id with one is reachable and this pass is not about it.
-        reachable = {fid for fid, _ in self._iter_sidecars()}
+        reachable: set[str] = set()
+        for fid, _ in self._iter_sidecars():
+            if stop.is_set():
+                return 0  # nothing removed yet; the listing alone can be long on a large dir
+            reachable.add(fid)
         removed = 0
         for entry in root.iterdir():
-            if abort is not None and abort.is_set():
+            if stop.is_set():
                 break
             name = entry.name
             stem = name[: -len(_BLOB_SUFFIX)] if name.endswith(_BLOB_SUFFIX) else ""
@@ -1956,7 +1971,9 @@ _DEFAULT_STOP_TIMEOUT_SECONDS = 5.0
 
 @dataclass
 class _SweepTally:
-    """How far one runner sweep got, read by :meth:`UploadRetentionRunner.stop` when it times out.
+    """How far one sweep got. Two readers: :meth:`UploadRetentionRunner.stop` when it times out,
+    and :meth:`UploadStore.prune_on_save` when a sweep its request stopped waiting for is cancelled
+    or fails. Both read it through :func:`_log_unaudited`.
 
     ``removed`` lists each pair the sweep's thread removed, in the order it is audited, and
     ``removing`` is the pair it is removing now. ``audited`` counts audit calls that returned or
@@ -1967,8 +1984,8 @@ class _SweepTally:
 
     The abort check and the ``removing`` mark are one step under ``lock``, and so is the stop's
     ``abort.set()``. A thread that passed the check is therefore already visible to the stop.
-    Each loop sweep gets its own tally, so a thread a timed-out stop left running never writes
-    into the next sweep's."""
+    Each sweep, the runner's and the save-time one alike, gets its own tally, so a thread a
+    timed-out stop left running never writes into the next sweep's."""
 
     lock: threading.Lock = field(default_factory=threading.Lock)
     removed: list[UploadedFileMeta] = field(default_factory=list)
@@ -2167,14 +2184,14 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     return await _wait_to_completion(loop.run_in_executor(None, ctx.run, func, arg))
 
 
-def _log_late_failure(task: asyncio.Future[Any]) -> None:
+def _log_late_failure(task: asyncio.Future[Any], *, what: str) -> None:
     """Log the failure of a :meth:`UploadStore._run_to_completion` task whose caller was cancelled
     and passed no ``on_late``, since nothing else will read it. A cancelled task (shutdown) is
     logged too, since it stopped short of what it was run to finish."""
     if task.cancelled():
-        _log.error("a task left running after its caller was cancelled was itself cancelled")
+        _log.error("%s was cancelled after its caller was cancelled", what)
     elif (exc := task.exception()) is not None:
-        _log.error("a task left running after its caller was cancelled failed", exc_info=exc)
+        _log.error("%s failed after its caller was cancelled", what, exc_info=exc)
 
 
 # How many file_ids one audit-gap line names. A first sweep after a long outage can remove
