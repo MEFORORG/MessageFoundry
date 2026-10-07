@@ -209,13 +209,15 @@ def rename_code_set(
         # byte-identical to the pre-#152 shape.
         plan = _plan_code_set_referents(config_dir, old, new)
         os.replace(src, dest)
-    result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
-    if plan is not None:
-        from messagefoundry.config import impact
+        result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
+        # The referent rewrite stays under the lock: a second rename planned between the move
+        # and the rewrite would read literals naming a table that is already gone.
+        if plan is not None:
+            from messagefoundry.config import impact
 
-        rewritten = len(impact.apply_rename(plan))
-        if rewritten:
-            result["referents_rewritten"] = rewritten
+            rewritten = len(impact.apply_rename(plan))
+            if rewritten:
+                result["referents_rewritten"] = rewritten
     return result
 
 
@@ -388,9 +390,10 @@ def _codesets_dir(config_dir: str | Path) -> Path:
 def _directory_lock(codesets_dir: Path) -> AbstractContextManager[None]:
     """The cross-process edit lock for every code set in ``codesets_dir`` (vault BACKLOG #2782).
 
-    Keyed on the directory, never on an operator-supplied name, so no name can steer the lock file
-    outside ``codesets/``."""
-    return atomic_edit.edit_lock(codesets_dir / atomic_edit.LOCK_FILE_NAME, busy_error=WiringError)
+    It is the CONFIG directory's lock, the one ``connections_edit`` takes, because the engine's
+    flag toggle holds it across two digests of the whole bundle, code sets included. Keyed on
+    the directory, never on an operator-supplied name, so no name can steer the lock file."""
+    return atomic_edit.edit_lock(codesets_dir, busy_error=WiringError)
 
 
 def _iter_code_set_files(codesets_dir: Path) -> list[Path]:

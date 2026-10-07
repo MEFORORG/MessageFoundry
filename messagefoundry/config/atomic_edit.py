@@ -30,7 +30,7 @@ remove covers both of its names with one lock and a renamed table leaves no lock
 runs on an event loop: the engine's one caller already moves the whole write to a worker thread.
 
 :func:`read_text` and :func:`encode_text` keep a file's line endings: the editors parse and dump with
-``\n``, and a file that used ``\r\n`` is written back with ``\r\n`` rather than reflowed.
+``\n``, and a file written wholly in ``\r\n`` is written back that way rather than reflowed.
 """
 
 from __future__ import annotations
@@ -88,9 +88,13 @@ def lock_path_for(path: Path) -> Path:
 
 
 def read_text(path: Path) -> tuple[str, bool]:
-    """``path`` as UTF-8 text with ``\n`` line endings, and whether it used ``\r\n``."""
+    """``path`` as UTF-8 text with ``\n`` line endings, and whether EVERY line ended ``\r\n``.
+
+    A file with mixed endings reads as ``\n``, the editors' own form, rather than being
+    reflowed to ``\r\n`` on the strength of one line."""
     raw = path.read_bytes()
-    return raw.decode("utf-8").replace("\r\n", "\n"), b"\r\n" in raw
+    crlf = raw.count(b"\r\n")
+    return raw.decode("utf-8").replace("\r\n", "\n"), crlf > 0 and crlf == raw.count(b"\n")
 
 
 def encode_text(text: str, crlf: bool) -> bytes:
@@ -118,7 +122,10 @@ def edit_lock(
     if key in held:
         yield
         return
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | _O_BINARY, 0o600)
+    # Read-only and readable by all: the file holds no data, a lock needs only an open handle,
+    # and an editor running as another account (an operator's CLI beside the service) must
+    # still be able to open a lock file the other one created.
+    fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT | _O_BINARY, 0o644)
     try:
         locked = _acquire(fd, lock_path, path, busy_error, timeout)
         held.add(key)

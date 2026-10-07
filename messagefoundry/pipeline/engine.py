@@ -1996,14 +1996,11 @@ class Engine:
 
             connections_edit.upsert_connection(cfg_dir, match, validate=validate)
 
-        loop = asyncio.get_running_loop()
-
         def _digest() -> dict[str, object] | None:
-            # From the worker thread: ask the loop (free, since it is awaiting this thread) for the
-            # digest, so every digest still goes through `fingerprint_bundle`.
-            digest, _reason = asyncio.run_coroutine_threadsafe(
-                self.fingerprint_bundle(cfg_dir), loop
-            ).result()
+            # Already on a worker thread and holding the lock, so the blocking twin of
+            # `fingerprint_bundle`: the same best-effort rule, with no hop back through the loop
+            # or a second executor thread while the lock is held.
+            digest, _reason = self.fingerprint_bundle_blocking(cfg_dir)
             return digest
 
         def _locked_write(loaded_fp: object) -> tuple[dict[str, object] | None, bool]:
@@ -2090,12 +2087,21 @@ class Engine:
         OSError is an unreadable file; ValueError is a VCS head that is not UTF-8
         (UnicodeDecodeError). Anything else, such as an ImportError of the fingerprint module, still
         raises. The reason is a :func:`safe_exc` rendering, logged here at WARNING."""
+        return await asyncio.to_thread(self.fingerprint_bundle_blocking, path)
+
+    def fingerprint_bundle_blocking(
+        self, path: Path
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """:meth:`fingerprint_bundle` for a caller already on a worker thread, under the same rule.
+
+        :meth:`set_connection_flag` takes its digests here while it holds the cross-process
+        config edit lock (vault BACKLOG #2782)."""
         from messagefoundry.config.fingerprint import config_fingerprint_detail
 
         try:
-            # A lambda, and not the bare function: the crypto inventory scanner follows a call it
-            # can see and not a function passed as a value, so this keeps the hash on its record.
-            return await asyncio.to_thread(lambda: config_fingerprint_detail(path)), None
+            # A direct call, so the crypto inventory scanner, which follows a call it can see,
+            # keeps the hash on its record.
+            return config_fingerprint_detail(path), None
         except (OSError, ValueError) as exc:
             reason = safe_exc(exc)
             log.warning("config fingerprint failed for %s: %s", path, reason)

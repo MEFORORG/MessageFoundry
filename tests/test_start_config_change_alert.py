@@ -874,20 +874,22 @@ async def test_a_failed_digest_after_the_toggle_vouches_for_nothing(
     cfg = _toml_config(tmp_path)
     app = _app(tmp_path, cfg)
     async with app.router.lifespan_context(app), _client(app) as c:
-        real = Engine.fingerprint_bundle
+        # The toggle takes both digests on its worker thread, under the config edit lock (vault
+        # BACKLOG #2782), so it calls the blocking twin of fingerprint_bundle.
+        real = Engine.fingerprint_bundle_blocking
         calls = 0
 
-        async def _second_fails(self: Engine, path: Path) -> Any:
+        def _second_fails(self: Engine, path: Path) -> Any:
             nonlocal calls
             calls += 1
-            return (None, "unreadable") if calls == 2 else await real(self, path)
+            return (None, "unreadable") if calls == 2 else real(self, path)
 
-        monkeypatch.setattr(Engine, "fingerprint_bundle", _second_fails)
+        monkeypatch.setattr(Engine, "fingerprint_bundle_blocking", _second_fails)
         r = await c.post(
             "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": True}
         )
         assert r.status_code == 200, r.text
-        monkeypatch.setattr(Engine, "fingerprint_bundle", real)
+        monkeypatch.setattr(Engine, "fingerprint_bundle_blocking", real)
         engine: Engine = app.state.engine
         flag = json.loads(
             (await engine.store.list_audit(action="connection_flag_set"))[0]["detail"]

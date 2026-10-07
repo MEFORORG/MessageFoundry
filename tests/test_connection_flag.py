@@ -244,3 +244,43 @@ def test_flagged_survives_toml_roundtrip(tmp_path: Path) -> None:
 
     reg = load_config(tmp_path)
     assert reg.outbound["OB_TOML"].flagged is True
+
+
+async def test_the_toggle_takes_its_digests_under_the_config_edit_lock(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vault BACKLOG #2782: both config digests are taken while the toggle holds the cross-process
+    edit lock, so a `connection` or `codeset` CLI edit cannot land between them and be vouched for as
+    loaded. Probed from a second thread, which must find the lock taken at each digest."""
+    import threading
+
+    from messagefoundry.config import atomic_edit
+    from messagefoundry.config.fingerprint import config_fingerprint_detail
+
+    engine.loaded_config_fingerprint = config_fingerprint_detail(tmp_path)
+    real = Engine.fingerprint_bundle_blocking
+    held_at_digest: list[bool] = []
+
+    def _probe() -> bool:
+        free: list[bool] = []
+
+        def run() -> None:
+            try:
+                with atomic_edit.edit_lock(tmp_path / "connections.toml", timeout=0):
+                    free.append(True)
+            except TimeoutError:
+                free.append(False)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(20)
+        return free == [False]
+
+    def _recording(self: Engine, path: Path) -> tuple[dict[str, object] | None, str | None]:
+        held_at_digest.append(_probe())
+        return real(self, path)
+
+    monkeypatch.setattr(Engine, "fingerprint_bundle_blocking", _recording)
+    await engine.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+    assert held_at_digest == [True, True], "control: both digests were taken, each under the lock"
+    assert not _probe(), "control: the probe reads the lock as free once the toggle returns"

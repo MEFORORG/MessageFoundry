@@ -367,13 +367,15 @@ def test_the_lock_is_reentrant_within_a_thread(tmp_path: Path) -> None:
 
 
 def test_one_hidden_lock_file_per_directory(tmp_path: Path) -> None:
-    """One lock per directory: a renamed or removed code set leaves no lock file of its own behind."""
+    """One lock per directory, and code sets take the CONFIG directory's: a renamed or removed code
+    set leaves no lock file of its own behind, and nothing at all in ``codesets/``."""
     codesets = tmp_path / "codesets"
     assert atomic_edit.lock_path_for(codesets / "diets.csv") == codesets / ".mefor-edit.lock"
-    assert atomic_edit.lock_path_for(codesets / "meals.csv") == codesets / ".mefor-edit.lock"
+    assert atomic_edit.lock_path_for(tmp_path / "connections.toml") == tmp_path / ".mefor-edit.lock"
     codeset_edit.upsert_code_set(tmp_path, "diets", ["code", "value"], [["A", "B"]], validate=_noop)
     codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_noop)
-    assert sorted(p.name for p in codesets.iterdir()) == [".mefor-edit.lock", "meals.csv"]
+    assert sorted(p.name for p in codesets.iterdir()) == ["meals.csv"]
+    assert (tmp_path / ".mefor-edit.lock").is_file()
 
 
 def test_codeset_remove_waits_for_the_directory_lock(tmp_path: Path) -> None:
@@ -382,7 +384,8 @@ def test_codeset_remove_waits_for_the_directory_lock(tmp_path: Path) -> None:
     codeset_edit.upsert_code_set(tmp_path, "diets", ["code", "value"], [["A", "B"]], validate=_noop)
     path = tmp_path / "codesets" / "diets.csv"
     held, release, done = threading.Event(), threading.Event(), threading.Event()
-    holder = _hold_lock(path, held, release)
+    # The config directory's lock, the one a connection edit (and the engine toggle) holds.
+    holder = _hold_lock(tmp_path / "connections.toml", held, release)
 
     def remover() -> None:
         codeset_edit.remove_code_set(tmp_path, "diets", validate=_noop)
@@ -396,6 +399,14 @@ def test_codeset_remove_waits_for_the_directory_lock(tmp_path: Path) -> None:
     holder.join(_JOIN_S)
     thread.join(_JOIN_S)
     assert done.is_set() and not path.exists()
+
+
+def test_a_mixed_ending_file_is_written_back_lf(tmp_path: Path) -> None:
+    """One stray CRLF line does not reflow the whole file to CRLF."""
+    path = tmp_path / "messagefoundry.toml"
+    path.write_bytes(b"# keep me\r\n[security]\nrequire_mfa = true\n")
+    security_edit.set_security(path, {"require_mfa": False}, validate=_noop)
+    assert b"\r\n" not in path.read_bytes()
 
 
 @pytest.mark.parametrize("ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
