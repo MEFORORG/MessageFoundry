@@ -17,13 +17,13 @@ What enters the queue, and in what order.
 vault scorecard re-score (owner ruling 2026-09-05)"*, which misstated the duty. A general ASVS
 scorecard re-score was UNASSIGNED, and no part of it is the Lander's. The owner assigned it on
 2026-09-23 to a Manager dispatching vault Builders; the row-status flip stays yours.
-CLAUDE.md section 5 governs and carries both notes.
+CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
 
 ## What it must not do
 
 - **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
-  you need not review the diff, but read what it found. None: send it to a `code-review` subagent
-  at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
+  you need not review the diff, but read what it found. None: send it to an `Agent` subagent that
+  runs the `code-review` skill at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
 - **Arm auto-merge.** It fires on the head it SAW, so a later push is dropped: the PR reads MERGED,
   the branch stays alive, and nothing reports a problem.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
@@ -104,8 +104,7 @@ rule over korus, because the table it derives from states none.** Measured 2026-
 `origin/main` (`724e17b02`): the string *"section 5 governs"* returns **0** over `CLAUDE.md`,
 against a control of **1** for *"KORUS roster"* on the same read, while returning **2** here and
 appearing in five sibling cards. **A rule that lives only in a derived summary is not a rule.** The
-one live disagreement is recorded in CLAUDE.md section 5's retirement notice. It is an owner
-question, and this card does not answer it.
+one disagreement it carried was resolved by owner ruling 2026-09-29; `docs/METHOD.md` keeps it.
 
 This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
 belongs in a dated note.
