@@ -71,7 +71,8 @@ import logging
 import pkgutil
 import re
 import traceback
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
@@ -2187,8 +2188,12 @@ def safe_traceback(ei: ExcInfo) -> str:
     the same chain the stdlib builds and replaces only those lines. Frames and every other line are
     unchanged.
 
-    ``TracebackException._str`` is the stdlib's private name for that line. Python is pinned at 3.14
-    or later, and ``tests/test_unicode_error_log_paths.py`` fails if the name stops being read."""
+    ``TracebackException._str`` is the stdlib's private name for that line, read by every 3.14
+    release. A later one that drops it gets :func:`safe_exc`'s single line and no frames, rather than
+    the raw text, and ``tests/test_unicode_error_log_paths.py`` fails if the write stops landing.
+
+    A different exception built FROM a Unicode error, as ``RuntimeError(exc)``, has the same
+    ``str()`` and is not rewritten here. That is the third path, closed where the wrap is written."""
     value, tb = ei[1], ei[2]
     # `type(None)` and None are what the stdlib's own print_exception passes for an empty exc_info.
     te = traceback.TracebackException(type(value), value, tb, compact=True)  # type: ignore[arg-type]
@@ -2200,6 +2205,8 @@ def safe_traceback(ei: ExcInfo) -> str:
         if node is None or exc is None:  # exc is None at the root of an empty exc_info
             continue
         if isinstance(exc, UnicodeError):
+            if "_str" not in vars(node):  # the stdlib renamed its line: fail closed, no traceback
+                return safe_exc(value) if value is not None else ""
             node._str = _unicode_error_detail(exc)  # the stdlib's private name: see docstring
         pending.append((node.__cause__, exc.__cause__))
         pending.append((node.__context__, exc.__context__))
@@ -2217,28 +2224,47 @@ def codec_safe_str(exc: BaseException) -> str:
     return safe_exc(exc) if isinstance(exc, UnicodeError) else str(exc)
 
 
-#: The builtin containers a log argument is walked through, and how deep. A ``UnicodeError`` inside
-#: one renders through ``repr``, which prints ``.object``, the whole input. The record's own ``args``
-#: tuple is the first level.
-_ARG_CONTAINERS = (tuple, list, set, frozenset, dict)
+#: The containers a log argument is walked through, and how deep. A ``UnicodeError`` inside one
+#: renders through ``repr``, which prints ``.object``, the whole input. The record's own ``args`` is
+#: the first level. Subclasses count (an ``OrderedDict``, a namedtuple, a ``deque``), and one that
+#: holds an error is rebuilt as its plain builtin, since its own constructor may not take a list.
+#: Other objects, a dataclass among them, are not walked.
+_ARG_SEQUENCES = (tuple, list, set, frozenset, deque)
 _ARG_DEPTH = 5
+#: The argument types nearly every record carries, answered without an ABC check.
+_ARG_SCALARS = frozenset({str, int, float, bool, bytes, type(None)})
+
+
+def _holds_unicode_error(arg: Any, depth: int = 0) -> bool:
+    if type(arg) in _ARG_SCALARS or depth >= _ARG_DEPTH:
+        return False
+    if isinstance(arg, UnicodeError):
+        return True
+    if isinstance(arg, Mapping):
+        return any(
+            _holds_unicode_error(k, depth + 1) or _holds_unicode_error(v, depth + 1)
+            for k, v in arg.items()
+        )
+    if isinstance(arg, _ARG_SEQUENCES):
+        return any(_holds_unicode_error(a, depth + 1) for a in arg)
+    return False
 
 
 def _safe_arg(arg: Any, depth: int = 0) -> Any:
-    """``arg`` with each ``UnicodeError`` in it replaced by :func:`safe_exc` text, or ``arg`` itself
-    when nothing was replaced. Only the exact builtin containers are walked, and only so deep."""
+    """``arg`` with each ``UnicodeError`` in it replaced by :func:`safe_exc` text. A part holding
+    none is returned as it is, so only the path down to an error is rebuilt."""
     if isinstance(arg, UnicodeError):
         return safe_exc(arg)
-    kind = type(arg)
-    # The type test first: truth-testing an arbitrary object runs its own code.
-    if kind not in _ARG_CONTAINERS or depth >= _ARG_DEPTH or not arg:
+    if not _holds_unicode_error(arg, depth):
         return arg
-    if kind is dict:
-        values = [_safe_arg(v, depth + 1) for v in arg.values()]
-        changed = any(n is not o for n, o in zip(values, arg.values(), strict=True))
-        return dict(zip(arg, values, strict=True)) if changed else arg
+    if isinstance(arg, Mapping):
+        return {_safe_arg(k, depth + 1): _safe_arg(v, depth + 1) for k, v in arg.items()}
     items = [_safe_arg(a, depth + 1) for a in arg]
-    return kind(items) if any(n is not o for n, o in zip(items, arg, strict=True)) else arg
+    if isinstance(arg, tuple):
+        return tuple(items)
+    if isinstance(arg, frozenset):
+        return frozenset(items)
+    return set(items) if isinstance(arg, set) else items
 
 
 def prepare_log_record(record: logging.LogRecord) -> None:
@@ -2257,8 +2283,10 @@ def prepare_log_record(record: logging.LogRecord) -> None:
     if record.exc_info:
         record.exc_text = safe_traceback(record.exc_info)
     record.exc_info = None
-    record.msg = _safe_arg(record.msg)
-    record.args = _safe_arg(record.args)
+    if _holds_unicode_error(record.msg):
+        record.msg = _safe_arg(record.msg)
+    if _holds_unicode_error(record.args):
+        record.args = _safe_arg(record.args)
 
 
 def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:

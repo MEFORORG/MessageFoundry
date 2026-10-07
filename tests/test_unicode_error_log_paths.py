@@ -17,18 +17,21 @@ per path, and a source scan that keeps a new site from rendering a caught one ra
 from __future__ import annotations
 
 import ast
+import collections
 import io
 import itertools
 import logging
 import struct
+import traceback
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.connections_file import load_connections_file
-from messagefoundry.config.wiring import Registry, WiringError
+from messagefoundry.config.wiring import Registry, Send, WiringError
 from messagefoundry.corepoint_import import (
     CorepointImportError,
     _assert_encodable,
@@ -42,12 +45,18 @@ from messagefoundry.logging_setup import (
     _install_phi_filters,
     _make_formatter,
 )
-from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, decode_frame
+from messagefoundry.pipeline._sandbox_codec import (
+    SandboxCodecError,
+    _Blobs,
+    decode_frame,
+    enc_result,
+)
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
 from messagefoundry.redaction import codec_safe_str, prepare_log_record, safe_traceback
 from messagefoundry.tray.logscrub import TrayLogScrubFilter
 from tests._ast_sites import callee_name
 from tests._content_free import SECRET_CHAR, escapes
+from tests.test_db_lookup import _sandbox_kind, sandbox_run_one  # noqa: F401 - a fixture
 from tests.test_ingress_guard_parity import _inbound
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -103,6 +112,18 @@ def test_the_raw_errors_and_the_stdlib_renderer_carry_the_planted_value() -> Non
 
 
 # --- path 1: the traceback renderer -----------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _drop_capture_loggers() -> Iterator[None]:
+    yield
+    manager = logging.Logger.manager
+    for name in [n for n in manager.loggerDict if n.startswith("test.unicode3185.")]:
+        logger = manager.loggerDict.pop(name)
+        if isinstance(logger, logging.Logger):
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                handler.close()
 
 
 def _capture(handler_fmt: str = "text") -> tuple[logging.Logger, io.StringIO]:
@@ -226,6 +247,38 @@ def test_a_unicode_error_inside_a_container_argument_renders_safely() -> None:
     assert "caf" not in out
 
 
+def test_a_unicode_error_as_a_key_or_in_a_container_subclass_renders_safely() -> None:
+    pair = collections.namedtuple("pair", "err n")
+    logger, stream = _capture()
+    logger.warning(
+        "%s %s %s %s",
+        {_encode_error(): 1},
+        collections.OrderedDict(e=_encode_error()),
+        pair(_encode_error(), 1),
+        collections.deque([_decode_error()]),
+    )
+    logger.warning("%(err)s", collections.OrderedDict(err=_decode_error()))
+    out = stream.getvalue()
+    _assert_encode_safe(out)
+    _assert_decode_safe(out)
+    assert "caf" not in out
+
+
+def test_a_renamed_private_traceback_line_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A later CPython that drops TracebackException._str must not print the raw line.
+    original = traceback.TracebackException.__init__
+
+    def init(self: traceback.TracebackException, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        self.__dict__["_renamed"] = self.__dict__.pop("_str")
+
+    monkeypatch.setattr(traceback.TracebackException, "__init__", init)
+    text = safe_traceback((None, _encode_error(), None))
+    assert text == "UnicodeEncodeError: 'ascii' codec cannot encode at position 3: " + (
+        "ordinal not in range(128)"
+    )
+
+
 def test_a_traceback_an_outside_formatter_cached_is_rendered_again() -> None:
     # A plain formatter on a child logger's own handler formats first and caches the stdlib's text
     # in exc_text while exc_info is still set. The chain must not keep that cached text.
@@ -278,6 +331,29 @@ def test_the_sandbox_codec_names_a_malformed_frame_without_the_byte() -> None:
         decode_frame(struct.pack(">I", len(header)) + header)
     assert str(caught.value).startswith("malformed sandbox frame: UnicodeDecodeError: ")
     _assert_decode_safe(str(caught.value))
+
+
+def test_a_sandboxed_handler_raising_a_unicode_error_reports_it_safely(
+    sandbox_run_one: Any,  # noqa: F811 - the fixture imported above
+) -> None:
+    # mode=subprocess reported f"{type(exc).__name__}: {exc}" across the process boundary.
+    kind, error = _sandbox_kind(sandbox_run_one, _encode_error())
+    assert kind == "error"
+    _assert_encode_safe(error)
+    kind, error = _sandbox_kind(sandbox_run_one, ValueError("plain"))
+    assert error == "ValueError: plain"  # any other error keeps its old text
+
+
+def test_a_send_whose_message_cannot_encode_is_refused_without_the_character() -> None:
+    class _Unencodable:
+        def encode(self) -> str:
+            f"caf{_CHAR}".encode("ascii")
+            return ""
+
+    with pytest.raises(SandboxCodecError) as caught:
+        enc_result("transform", Send("OB_A", _Unencodable()), _Blobs())  # type: ignore[arg-type]
+    assert str(caught.value).startswith("Send message is not encodable: UnicodeEncodeError: ")
+    _assert_encode_safe(str(caught.value))
 
 
 def test_an_ingress_encode_refusal_names_the_position_without_the_character() -> None:
@@ -379,7 +455,8 @@ def _raw_renders(handler: ast.ExceptHandler) -> Iterator[tuple[int, str]]:
         elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
             if _is_raw(node.value, name):  # the raise-after-handler shape carries it out
                 yield node.lineno, "aliased out of the handler"
-        elif isinstance(node, ast.Attribute) and _is_raw(node, name) and node.attr != "reason":
+        elif isinstance(node, ast.Attribute) and _is_raw(node, name):
+            # Any read: idna and punycode put the label in .reason, so concatenation leaks it too.
             yield node.lineno, f".{node.attr} read"
 
 
@@ -509,6 +586,7 @@ def test_the_guard_fires_on_every_planted_shape() -> None:
         "f-string interpolation",
         "log argument",
         "f-string interpolation",
+        ".reason read",  # d: the same interpolation, also reported as a raw attribute read
         "% formatting",
         "passed into RuntimeError()",
         "aliased out of the handler",  # g: the assignment and the read are both reported

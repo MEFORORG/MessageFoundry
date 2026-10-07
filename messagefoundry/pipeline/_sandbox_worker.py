@@ -209,7 +209,12 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
     except SandboxError as exc:
         return False, None, "denied", str(exc)
     except Exception as exc:  # noqa: BLE001 — a handler raise is content, reported not crashed
-        return False, None, "error", f"{type(exc).__name__}: {exc}"
+        # A Unicode error's str() names the character or byte it failed on (vault BACKLOG #3185), and
+        # mode=off renders it from its attributes, so this boundary must too.
+        from messagefoundry.redaction import safe_exc
+
+        detail = safe_exc(exc) if isinstance(exc, UnicodeError) else f"{type(exc).__name__}: {exc}"
+        return False, None, "error", detail
     return True, result, "", ""
 
 
