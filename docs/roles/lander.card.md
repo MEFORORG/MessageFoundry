@@ -22,12 +22,11 @@ CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
 ## What it must not do
 
 - **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
-  you need not review the diff, but read what it found. None: send it to the `code-review` skill
+  you need not review the diff, but read what it found. None: send it to a `code-review` subagent
   at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
 - **Arm auto-merge on a branch that would merge WITHOUT the queue.** There it fires on the head it
   SAW, so a later push is dropped: the PR reads MERGED, the branch stays alive, and nothing reports
-  a problem. On `main`, which requires the queue, "Merge when ready" is the enqueue and is yours
-  (CLAUDE.md section 5).
+  a problem. Under a queue the enqueue is yours; dequeue before pushing (CLAUDE.md section 5).
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
   korus `4c-quinquies` says the same, so both documents agree here.
 
@@ -106,8 +105,7 @@ rule over korus, because the table it derives from states none.** Measured 2026-
 `origin/main` (`724e17b02`): the string *"section 5 governs"* returns **0** over `CLAUDE.md`,
 against a control of **1** for *"KORUS roster"* on the same read, while returning **2** here and
 appearing in five sibling cards. **A rule that lives only in a derived summary is not a rule.** The
-one live disagreement is recorded in CLAUDE.md section 5's retirement notice. It is an owner
-question, and this card does not answer it.
+one disagreement it carried was resolved by owner ruling 2026-09-29; `docs/METHOD.md` keeps it.
 
 This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
 belongs in a dated note.

@@ -503,10 +503,15 @@ tool-grant spelling, and the careful spelling is the broken one** -- same bullet
 ## Retired CLAUDE.md notices, kept verbatim
 
 These blocks moved out of the root `CLAUDE.md` on 2026-10-07, word for word. `CLAUDE.md` loads
-into every session, and none of these blocks changes what a seat does: each records a retired rule,
-a resolved collision, a measurement, or the history of a ruling whose live form stays in
-`CLAUDE.md` section 5. Where a block says *above*, *below* or *this file*, it means `CLAUDE.md` at
-`ddf350e1d0`. Where a block and `CLAUDE.md` now disagree, `CLAUDE.md` wins.
+into every session, and these blocks are mostly history: retired rules, a resolved collision, and
+measurements. Where a block still states a live rule, `CLAUDE.md` section 5 now carries a short form
+of it and points here. Two parts stay live in full: the verification recipe under the positional
+ruling, and the instruction to quote korus *4a-quinquies* with its condition.
+
+Read each block as `CLAUDE.md` at `ddf350e1d0`. There, *above*, *below*, *this file*, *this
+section*, *this notice* and a bare section number all mean `CLAUDE.md` and its sections, not this
+page. Where a block and `CLAUDE.md` now disagree, `CLAUDE.md` wins. The section *Why four of these
+rules changed* above holds older history of the same kind.
 
 ### The Console and the Regulator, retired 2026-09-10 and 2026-09-19
 
@@ -649,6 +654,25 @@ invisible to a reader who greps only for the heading text:
 
     git -C <korus clone> show origin/main:roles/LANDER.md | Select-String '^### '
 
+**THE VERIFICATION RECIPE OUTLIVES THE PERMISSION, and it is the half worth keeping.** It is the
+standard for checking ANY ledger conflict resolution, whoever performed it: `merge-tree` exit 0,
+paired with a self-merge control (**0**) and the pull request's own pre-fix head (**non-zero**, so
+the 0 is attributable to *this* merge rather than to a probe that cannot fail), the ledger gate
+green, the `parse_items` count up by the expected number, and both items present and whole.
+
+**Its last two legs are the weak ones, and they are the two that look strongest.** A COUNT cancels:
+added-correctly plus quietly-dropped-something-else nets to the expected number, so a count paired
+with a presence test passes in exactly the case it exists to catch. The stronger form is **three set
+comparisons** over `parse_items` output, compared by item NUMBER and never by total: nothing lost
+from `main`, nothing lost from the branch, and the set present beyond `main` exactly the numbers
+intended. korus skill `lander-resolve-a-conflict`, section *8b*, at `origin/main`, is the source of
+record -- read it there rather than relying on this summary.
+
+*The retired rule's own measurement is kept, because it is still a true reading of that day.*
+*Measured 2026-09-11:* all four open conflicts (PRs 1029, 1030, 1032, 1049) were this one positional
+shape, and #1030's authoring session had died -- leaving its PR unlandable by anyone until the owner
+routed a new session to it.
+
 ### The code-conflict collision, resolved 2026-09-29
 
 **RESOLVED 2026-09-29 BY OWNER RULING, IN SESSION: THE LANDER MAY RESOLVE A CONFLICT THAT TOUCHES
@@ -725,22 +749,3 @@ resolve or to hand over.**
 touches code in this repository or the vault, does the Lander resolve it under korus 4c-quinquies,
 or does this file's Must-not clause stand and the pull request route elsewhere -- and which applies
 until you answer?* Whoever asks it should paste the two verbatim sentences above and nothing else.
-
-**THE VERIFICATION RECIPE OUTLIVES THE PERMISSION, and it is the half worth keeping.** It is the
-standard for checking ANY ledger conflict resolution, whoever performed it: `merge-tree` exit 0,
-paired with a self-merge control (**0**) and the pull request's own pre-fix head (**non-zero**, so
-the 0 is attributable to *this* merge rather than to a probe that cannot fail), the ledger gate
-green, the `parse_items` count up by the expected number, and both items present and whole.
-
-**Its last two legs are the weak ones, and they are the two that look strongest.** A COUNT cancels:
-added-correctly plus quietly-dropped-something-else nets to the expected number, so a count paired
-with a presence test passes in exactly the case it exists to catch. The stronger form is **three set
-comparisons** over `parse_items` output, compared by item NUMBER and never by total: nothing lost
-from `main`, nothing lost from the branch, and the set present beyond `main` exactly the numbers
-intended. korus skill `lander-resolve-a-conflict`, section *8b*, at `origin/main`, is the source of
-record -- read it there rather than relying on this summary.
-
-*The retired rule's own measurement is kept, because it is still a true reading of that day.*
-*Measured 2026-09-11:* all four open conflicts (PRs 1029, 1030, 1032, 1049) were this one positional
-shape, and #1030's authoring session had died -- leaving its PR unlandable by anyone until the owner
-routed a new session to it.
