@@ -301,7 +301,7 @@ On arrival. One command, nothing to wait for, so it deadlocks nobody.
 **It is the only thing that makes a seat findable from another Claude account**, because
 `SendMessage` and `ListAgents` do not cross accounts. To find a peer, search the seat registry and
 sort by recency; never guess a mailbox from a role name. korus `roles/COMMON.md`, *"The seat
-registry is the only channel that crosses accounts"*, says how. The measurements are in
+registry is how you find a peer in another instance"*, says how. The measurements are in
 [`docs/METHOD.md`](docs/METHOD.md), *Retired CLAUDE.md notices*.
 
 **The fleet wiki is the memory every seat on every account can search.** Query it for the subject
@@ -330,7 +330,7 @@ directory, where a write lands unseen. A query also takes `-RecordRepo` with a v
 | **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. It may resolve a conflict, including one that touches code (owner ruling 2026-09-29). The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED; its notice, which also covers the *what an item SAYS* half this row's Must-not column used to carry, is in `docs/METHOD.md`. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge on a branch that would merge WITHOUT the queue (the "Merge when ready" bullet below). Decide which of two deliberate changes to an item survives. |
+| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. It may resolve a conflict, including one that touches code (owner ruling 2026-09-29). The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED; its notice, which also covers the *what an item SAYS* half this row's Must-not column used to carry, is in `docs/METHOD.md`. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge. Decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **THE LANDER MAY RESOLVE A CONFLICT THAT TOUCHES CODE. OWNER RULING 2026-09-29, IN SESSION.** The
@@ -339,9 +339,7 @@ so"*. korus `roles/LANDER.md` *4c-quinquies* governs the route. A resolution the
 still needs its own code review before the merge; the merge bullet under *Branch, commit one layer,
 open the PR* says so. **CORRECTED 2026-09-29:** the roster row's Must-not cell read *"Resolve a
 conflict that touches code, or decide which of two deliberate changes to an item survives."* Only
-the first clause was removed. **CORRECTED 2026-10-07:** the same cell read *"Arm auto-merge."* with
-no limit. It now carries the limit the "Merge when ready" bullet states, and korus
-`roles/LANDER.md` tells the Lander to arm auto-merge and let a PR land on green.
+the first clause was removed.
 
 **ASVS record work is a Manager's, dispatched to vault Builders (owner ruling 2026-09-23).** It
 covers re-scoring a cell, editing the record's own prose, and reconciling the record against a
@@ -364,9 +362,10 @@ RESOLVED by the 2026-09-29 ruling above. Both notices are kept verbatim in
 [`docs/METHOD.md`](docs/METHOD.md), *Retired CLAUDE.md notices*. None of the collision notice's
 instructions apply: do not hold a pull request on that collision, or raise it.
 
-**Verify any ledger conflict resolution, whoever performed it, with the recipe kept beside the
-positional ruling in that section.** It pairs `merge-tree` exit 0 with a self-merge control and the
-pre-fix head, and compares `parse_items` output by item number, never by count. korus skill
+**Verify any ledger conflict resolution, whoever performed it, with the recipe kept under the
+positional ruling in [`docs/METHOD.md`](docs/METHOD.md).** `merge-tree` must exit 0, paired with a
+self-merge control (0) and the pre-fix head (non-zero). The ledger gate must be green. Compare
+`parse_items` output by item number, never by count. korus skill
 `lander-resolve-a-conflict`, section *8b*, at `origin/main`, is the source of record for the set
 comparisons. Lander ledger-filing duties are in korus `roles/LANDER.md`, *Filing a new ledger item
 routes to the Lander*.
@@ -697,7 +696,7 @@ gates a merge**, and no seat has to clear one.
   in the four legs `ci.yml` runs, listed in section 7, then `pytest` (with
   `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
 - **Then review your own diff with the `code-review` SKILL, at effort `xhigh`, named explicitly:**
-  the `Skill` tool, `skill: "code-review"`. Ruff is style, mypy is types, pytest is regression, and
+  the `Skill` tool, `skill: "code-review"`, with `xhigh` in its arguments. Ruff is style, mypy is types, pytest is regression, and
   `/simplify` above is a quality pass that points at `code-review` for bugs -- none of them looks for
   a NEW correctness defect. **Name the skill, not "a review":** the looser word lets an ad-hoc
   read of the diff pass as compliance. `code-review` is a skill and not an agent type, so call it by

@@ -505,11 +505,13 @@ tool-grant spelling, and the careful spelling is the broken one** -- same bullet
 These blocks moved out of the root `CLAUDE.md` on 2026-10-07, word for word. `CLAUDE.md` loads
 into every session, and these blocks are mostly history: retired rules, a resolved collision, and
 measurements. Where a block still states a live rule, `CLAUDE.md` section 5 now carries a short form
-of it and points here. Two parts stay live in full: the verification recipe under the positional
-ruling, and the instruction to quote korus *4a-quinquies* with its condition.
+of it and points here. The verification recipe under the positional ruling stays live in full.
+The korus *4a-quinquies* condition the positional block quotes is the 2026-09-21 form; read korus
+for the current one.
 
 Read each block as `CLAUDE.md` at `ddf350e1d0`. There, *above*, *below*, *this file*, *this
 section*, *this notice* and a bare section number all mean `CLAUDE.md` and its sections, not this
+page. The ordinals *eighth* and *ninth* follow that file's count, not the count earlier on this
 page. Where a block and `CLAUDE.md` now disagree, `CLAUDE.md` wins. The section *Why four of these
 rules changed* above holds older history of the same kind.
 

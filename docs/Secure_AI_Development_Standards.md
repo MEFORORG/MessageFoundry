@@ -359,7 +359,7 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 
 **No human reads every diff.** Review before a merge is the process in [`../CLAUDE.md`](../CLAUDE.md) section 5. That section is the source of record, so read it there, under *"A Builder runs the checks before it commits, because nobody downstream can ask it to"*, *"Branch, commit one layer, open the PR"* and *"The Manager plans, dispatches, and holds the owner's attention"*. In outline:
 
-- **The Builder**, the session that writes the change, runs the `code-review` **skill** on its own diff, at the effort level that section names. This document calls that the AI code-review pass.
+- **The Builder**, the session that writes the change, runs the `code-review` **skill** on its own diff, at the effort level that section names. This document calls that the AI code-review pass. *CORRECTED 2026-10-07: this read `code-review` **subagent**. `code-review` is a skill, not an agent type, and that section now names it so.*
 - **The Lander**, the seat that merges, checks for proof that code review ran on the change being merged. With no proof, it sends the change to code review.
 - The Lander reads what the review found. A finding that names a defect the merge would ship goes back to the **owner** for a ruling.
 - **Required CI contexts and branch protection** gate the merge (§6.5).
