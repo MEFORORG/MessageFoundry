@@ -2417,7 +2417,8 @@ def _check_hop_attested(config_dir: str | Path) -> CheckResult:
 
     The sibling of :func:`_check_cleartext_accepted`, with the opposite claim: an attested hop is
     ALLOWed rather than warned, so this line is where a reviewer sees what the engine is taking on
-    trust. Owner ruling 2026-09-24. Advisory (``required=False``): an attestation with a written reason
+    trust. A declaration the build check refuses is listed and marked REFUSED, because it is never
+    crossed (vault BACKLOG #3139). Owner ruling 2026-09-24. Advisory (``required=False``): an attestation with a written reason
     is a legitimate choice, not a config error. It reads through ``attested_secure_hops``, the same
     reader as ``security_loosenings()`` and ``GET /security/posture``.
 
@@ -2440,13 +2441,16 @@ def _check_hop_attested(config_dir: str | Path) -> CheckResult:
             "tls-hop-attested", ok=True, required=False, detail="no hop is attested secure"
         )
     listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    # Vault BACKLOG #3139: an entry the build check refuses is listed too, marked REFUSED, so the
+    # sentence must not say every listed hop is allowed.
     return CheckResult(
         "tls-hop-attested",
         ok=True,
         required=False,
         detail=(
-            f"{len(attested)} hop(s) are attested secure by means the engine cannot see, and are "
-            f"ALLOWed where an enforcing gate would refuse them — {listed}"
+            f"{len(attested)} hop(s) declare they are secure by means the engine cannot see. An "
+            "enforcing gate allows each one it would otherwise refuse, unless the entry is marked "
+            f"REFUSED — {listed}"
         ),
     )
 

@@ -1871,12 +1871,17 @@ def _anon_ftp_guard(
     if s.get("username") or s.get("password"):
         return None  # credentialed ftp: _validate_common refused it outright before any caller
     reason = s.get("tls_hop_attested_reason")
+    try:
+        attested = flag_from_settings(s, "tls_hop_attested")
+    except ValueError as exc:
+        # Vault BACKLOG #3139: name the connection, as every other refusal in this module does.
+        raise ValueError(f"{hop_name_prefix(connection)}{exc}") from exc
     return InsecureHopGuard.capture(
         host=str(s["host"]),
         port=int(s.get("port", 21)),
         cell="REMOTEFILE ftp",
         description="cleartext anonymous FTP egress",
-        attested=flag_from_settings(s, "tls_hop_attested"),
+        attested=attested,
         attested_reason=None if reason is None else str(reason),
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,

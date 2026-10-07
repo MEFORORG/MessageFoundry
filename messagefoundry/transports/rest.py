@@ -844,6 +844,55 @@ def cleartext_acceptance_from_settings(
     )
 
 
+def revocation_attestation_from_settings(
+    s: Mapping[str, Any],
+) -> tuple[bool, str | None, str | None]:
+    """``(attested, reason, connection)`` for a token hop's revocation guard (ADR 0173 section 4.3).
+
+    The runner mirrors the connection's typed ``tls_revocation_attested`` declaration, its mandatory
+    reason and the connection's name (:data:`MIRRORED_CONNECTION_SETTING`, written for every
+    connection, so a REFUSAL names it too) into the resolved settings. This is the one reader of those
+    keys for both bearer providers (BACKLOG #2112, #2115), as ``cleartext_acceptance_from_settings``
+    is for the cleartext twin. The ``fhir_lookup`` read hop reads them through it too
+    (BACKLOG #2193): a lookup has no ``Destination``, so the mirror is where its declaration is."""
+    reason = s.get("tls_revocation_attested_reason")
+    connection = s.get(MIRRORED_CONNECTION_SETTING)
+    return (
+        flag_from_settings(s, "tls_revocation_attested"),
+        None if reason is None else str(reason),
+        None if connection is None else str(connection),
+    )
+
+
+#: ``(flag, reason, connection)``, as the two declaration readers return a declaration.
+_Declaration = tuple[bool, str | None, str | None]
+
+
+def hop_declarations_from_settings(
+    s: Mapping[str, Any], error: type[ValueError]
+) -> tuple[bool, _Declaration, _Declaration]:
+    """The three hop-policy flags a credential seam reads, strictly (vault BACKLOG #2232).
+
+    Returns ``(tls_hop_attested, cleartext acceptance, revocation attestation)``. A flag that is not
+    a real ``bool`` raises ``error``, the calling seam's own refusal type, naming the connection the
+    runner mirrored into ``s``. One body, so the Digest, OAuth2 and SMART seams raise alike.
+
+    It and :func:`revocation_attestation_from_settings` live here, beside
+    :func:`cleartext_acceptance_from_settings`, rather than in ``smart.py``, which re-exports the
+    revocation reader (vault BACKLOG #3139). ``smart.py`` already imports this module, so the
+    move adds no import edge."""
+    try:
+        return (
+            flag_from_settings(s, "tls_hop_attested"),
+            cleartext_acceptance_from_settings(s),
+            revocation_attestation_from_settings(s),
+        )
+    except ValueError as exc:
+        connection = s.get(MIRRORED_CONNECTION_SETTING)
+        prefix = hop_name_prefix(None if connection is None else str(connection))
+        raise error(f"{prefix}{exc}") from exc
+
+
 def _hop_guard_host(url: str, *, cell: str) -> str:
     """The host the hop guards below decide on. A URL whose authority names none (``https:///x``,
     ``https://:443/x``) raises :class:`ValueError`, whatever the posture (BACKLOG #1924).

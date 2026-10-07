@@ -401,7 +401,15 @@ class ReferenceSyncRunner:
     async def _sync_one(self, spec: ReferenceSpec) -> None:
         # Resolve env() refs in the source settings against this instance's environment. A hop-policy
         # flag is refused first, while still raw, as build_check does (vault BACKLOG #2232).
-        refuse_unresolved_hop_flags(spec.source.settings, f"reference set {spec.name!r}")
+        try:
+            refuse_unresolved_hop_flags(spec.source.settings, f"reference set {spec.name!r}")
+        except WiringError as exc:
+            # Vault BACKLOG #3139: sync_all logs only the error class, since a source error can hold
+            # a reference key. This refusal's text is config only: the set's name, the flag and a
+            # type name, never a value or the reason. So it is logged whole, or the operator learns
+            # nothing beyond "WiringError".
+            log.error("reference set %r refused: %s", spec.name, exc)
+            raise
         settings = resolve_env_settings(spec.source.settings, self._env_values)
         kind = spec.source.kind
         if kind == "file":

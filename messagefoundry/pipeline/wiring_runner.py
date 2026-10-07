@@ -10119,6 +10119,18 @@ def check_reference_backend_supported(registry: Registry, store: QueueStore) -> 
     )
 
 
+def refuse_reference_hop_flags(registry: Registry) -> None:
+    """Refuse a reference set whose source settings carry a hop-policy flag the build check refuses.
+
+    ``serve`` runs no build check, so without this a raw ``env()`` flag written into a
+    ``DatabaseRef`` or ``FileRef`` source after its factory was refused only at the set's first
+    sync, after start, where it surfaced as a failed sync (vault BACKLOG #3139). It is the same
+    :func:`refuse_unresolved_hop_flags` call :func:`build_check_registry` and the sync make, so the
+    three cannot disagree. Every source kind, and it needs no resolved value."""
+    for rname, rspec in registry.references.items():
+        refuse_unresolved_hop_flags(rspec.source.settings, f"reference set {rname!r}")
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
 #: How the four inbound bind refusals below end, after "... on a trusted, firewalled network ".

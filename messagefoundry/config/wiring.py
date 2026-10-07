@@ -81,6 +81,7 @@ from messagefoundry.config.models import (
     _check_revocation_attestation,
     check_db_connect_timeout,
     flag_from_settings,
+    require_hop_reason,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import (
@@ -89,7 +90,7 @@ from messagefoundry.connection_names import (
     inbound_record_name,
     is_connection_name,
 )
-from messagefoundry.controlchars import has_control_char
+from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.redaction import safe_name
@@ -619,6 +620,10 @@ def code_set(name: str) -> CodeSet:
 #: fields and refuses these keys in its transport settings (see :func:`refuse_raw_hop_attestation`).
 HOP_ATTESTATION_KEYS = ("tls_hop_attested", "tls_hop_attested_reason")
 
+#: Appended to a hop-policy flag refusal only when the value IS an ``env()`` reference, so a plain
+#: string such as ``"false"`` is not told about a reference it never held (vault BACKLOG #3139).
+_ENV_FLAG_HINT = " (an env() reference is not accepted on a hop-policy flag; write True or False)"
+
 
 def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> dict[str, Any]:
     """Validate a declared attestation pair and return the settings entries it writes.
@@ -626,20 +631,15 @@ def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> 
     Empty when not attested, so an undeclared carrier's settings stay byte-identical. The flag must be a
     real ``bool``: an ``env()`` reference is always truthy, so accepting one would attest the hop in
     every environment whatever the value said. The reason is written into WARNING lines, so a control
-    character in it is refused rather than allowed to forge a log line."""
+    character in it is refused rather than allowed to forge a log line; :func:`require_hop_reason`
+    holds that rule for both readers of the pair (vault BACKLOG #3139)."""
     if not isinstance(attested, bool):
         raise WiringError(
-            f"{where}: tls_hop_attested must be true or false, not {type(attested).__name__} "
-            "(an env() reference is not accepted on an attestation)"
+            f"{where}: tls_hop_attested must be true or false, not {type(attested).__name__}"
+            f"{_ENV_FLAG_HINT if isinstance(attested, EnvRef) else ''}"
         )
-    if reason is not None and not isinstance(reason, str):
-        raise WiringError(
-            f"{where}: tls_hop_attested_reason must be a string, not {type(reason).__name__}"
-        )
-    if reason is not None and has_control_char(reason):
-        raise WiringError(f"{where}: tls_hop_attested_reason must not contain control characters")
     try:
-        _check_hop_attestation(attested, reason)
+        _check_hop_attestation(attested, require_hop_reason(reason))
     except ValueError as exc:
         raise WiringError(f"{where}: {exc}") from exc
     return {"tls_hop_attested": True, "tls_hop_attested_reason": reason} if attested else {}
@@ -648,9 +648,11 @@ def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> 
 def settings_hop_attestation(settings: Mapping[str, Any], where: str) -> bool:
     """Validate the attestation pair a settings carrier holds, by the factory's own rule.
 
-    For ``FhirLookupSpec`` and :func:`refuse_unresolved_hop_flags`, since a carrier's ``settings`` stay mutable after the factory ran. The pair is checked together, with the same string-type and control-character
-    rules as :func:`_hop_attestation_entries`, because it IS that function. Absent or ``None`` reads
-    as not attested."""
+    For ``FhirLookupSpec`` and :func:`refuse_unresolved_hop_flags`, since a carrier's ``settings``
+    stay mutable after the factory ran. The pair is checked together, with the same string-type and
+    control-character rules as :func:`_hop_attestation_entries`, because it IS that function, and
+    the same reason rule as ``models.hop_attestation_from_settings``, through
+    :func:`require_hop_reason` (vault BACKLOG #3139). Absent or ``None`` reads as not attested."""
     attested = settings.get("tls_hop_attested")
     attested = False if attested is None else attested
     _hop_attestation_entries(where, attested, settings.get("tls_hop_attested_reason"))
@@ -682,10 +684,12 @@ def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool
         try:
             flag_from_settings(settings, key)
         except ValueError as exc:
-            raise WiringError(
-                f"{where}: {exc} (write a literal True or False; an env() reference is not "
-                "accepted on a hop-policy flag)"
-            ) from exc
+            hint = (
+                _ENV_FLAG_HINT
+                if isinstance(settings.get(key), EnvRef)
+                else " (write a literal True or False)"
+            )
+            raise WiringError(f"{where}: {exc}{hint}") from exc
     return settings_hop_attestation(settings, where)
 
 
@@ -5208,6 +5212,12 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+#: Appended by :func:`attested_secure_hops` to the reason of a settings carrier whose declaration
+#: :func:`refuse_unresolved_hop_flags` refuses. That carrier is listed but never crossed, so the
+#: report must not read as if a gate allows it (vault BACKLOG #3139).
+REFUSED_ATTESTATION_MARK = "[REFUSED: the build check rejects this declaration; no gate allows it]"
+
+
 def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     """Every declaration that ATTESTS its hop secure (``tls_hop_attested``), as ``(name, reason)``.
 
@@ -5223,16 +5233,29 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
 
     It fails toward listing (vault BACKLOG #2232). Every carrier is listed unless its flag is ``None``
     or ``False``, so a value the report cannot read, such as an ``env()`` reference written into a
-    lookup's settings after its factory ran, is listed rather than missed. The load-time check
-    (:func:`refuse_unresolved_hop_flags`) refuses that value, but this report can run without it.
+    lookup's settings after its factory ran, is listed rather than missed. The build check, start
+    and each reference sync refuse that declaration (:func:`refuse_unresolved_hop_flags`), but this
+    report can run without them, so it marks such an entry :data:`REFUSED_ATTESTATION_MARK` rather
+    than let a reader take it as a hop the engine crosses (vault BACKLOG #3139).
+
+    A reason is shown with its control characters escaped, so a reason holding a newline that was
+    written past every factory cannot split a ``check`` line or a log line (vault BACKLOG #3139).
 
     Pure: it reads the loaded graph and touches nothing else."""
 
     def _reason(value: object) -> str:
-        return str(value) if value else "(none recorded)"
+        return scrub_control_chars(str(value)) if value else "(none recorded)"
 
     def _listed(flag: object) -> bool:
         return flag is not None and flag is not False
+
+    def _carrier_reason(name: str, settings: Mapping[str, Any]) -> str:
+        reason = _reason(settings.get("tls_hop_attested_reason"))
+        try:
+            refuse_unresolved_hop_flags(settings, name)
+        except WiringError:
+            return f"{reason} {REFUSED_ATTESTATION_MARK}"
+        return reason
 
     out = [
         (inbound_record_name(ic.name), _reason(ic.tls_hop_attested_reason))
@@ -5250,7 +5273,7 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
         *((f"reference:{r.name}", r.source.settings) for r in registry.references.values()),
     ]
     out += [
-        (name, _reason(settings.get("tls_hop_attested_reason")))
+        (name, _carrier_reason(name, settings))
         for name, settings in settings_carriers
         if _listed(settings.get("tls_hop_attested"))
     ]
