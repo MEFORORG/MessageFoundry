@@ -29,10 +29,14 @@ negative control and is asserted just as hard.
 from __future__ import annotations
 
 import base64
+import binascii
+import json
 import logging
 import mimetypes
+import traceback
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -44,6 +48,7 @@ from messagefoundry.api.app import (
     _INERT_ATTACHMENT_TYPES,
     _safe_attachment_content_type,
 )
+from messagefoundry.api.svg_sanitize import SvgRejected
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
@@ -290,6 +295,8 @@ async def test_download_audits_view_and_download_before_returning(
     detail = dl[0]["detail"] or ""
     assert mid in detail and ref in detail
     assert DOC_B64 not in detail
+    # A served download is never also recorded as a refusal (BACKLOG #2387).
+    assert not [a for a in audit if a["action"] == "attachment_download_refused"]
 
 
 async def test_download_never_logs_bytes(
@@ -773,16 +780,159 @@ async def test_svg_served_copy_is_sanitized_and_stored_value_is_untouched(
     ids=["malformed", "entity-bomb", "entity-with-a-non-svg-label"],
 )
 async def test_svg_that_cannot_be_sanitized_is_refused_and_not_audited_as_served(
-    engine: Engine, client: httpx.AsyncClient, label: str, prefix: bytes, suffix: bytes
+    engine: Engine,
+    client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+    label: str,
+    prefix: bytes,
+    suffix: bytes,
 ) -> None:
-    """Fail closed: no copy of an SVG the parser cannot vet leaves the route, not even the original."""
+    """Fail closed: no copy of an SVG the parser cannot vet leaves the route, not even the original.
+    The attempt is still audited, as a refusal and never as a download (BACKLOG #2387)."""
     mid, ref = await _seed_labelled(engine, label, marker=label, prefix=prefix, suffix=suffix)
     before = await _stored_value(engine, ref)
-    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    with caplog.at_level(logging.WARNING):
+        r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 422
     assert b"synthetic document" not in r.content
-    assert not [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
+    logged = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "attachment download refused: svg_unsanitizable" in logged
+    assert "synthetic document" not in logged
+    await _assert_one_refusal_row(engine, mid, ref, "svg_unsanitizable")
     assert await _stored_value(engine, ref) == before
+
+
+async def _assert_one_refusal_row(engine: Engine, mid: str, ref: str, reason: str) -> None:
+    """Exactly one ``attachment_download_refused`` row whose detail is the id pair and ``reason`` and
+    nothing else, so no byte of the document; no ``attachment_download`` row; no 'viewed' event."""
+    audit = await engine.store.list_audit()
+    assert not [a for a in audit if a["action"] == "attachment_download"]
+    (row,) = [a for a in audit if a["action"] == "attachment_download_refused"]
+    assert row["actor"]
+    assert row["client"]
+    assert row["channel_id"] == "ch1"
+    assert json.loads(row["detail"]) == {"message_id": mid, "attachment_id": ref, "reason": reason}
+    assert not any(e["event"] == "viewed" for e in await engine.store.events_for(mid))
+
+
+async def test_undecodable_stored_value_is_refused_and_audited_as_a_refusal(
+    engine: Engine, client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The route's other 422, a stored value that is not clean base64, gets the same refusal row."""
+    # No whitespace in the marker: the route strips whitespace before decoding, so a spaced marker
+    # would miss a leak of the normalized value.
+    ref = await engine.store.put_attachment(["%%synthetic-undecodable-marker%%"], "application/pdf")
+    mid = await engine.store.enqueue_ingress(channel_id="ch1", raw=ADT, attachment_refs=[ref])
+    with caplog.at_level(logging.WARNING):
+        r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 422
+    assert b"synthetic-undecodable-marker" not in r.content
+    logged = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "attachment download refused: undecodable" in logged
+    assert "undecodable-marker" not in logged
+    await _assert_one_refusal_row(engine, mid, ref, "undecodable")
+
+
+_SVG_PLANTED = "SYNTHETICPLANTEDSVG"
+
+
+async def _get_with_a_failing_refusal_audit(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, mid: str, ref: str
+) -> tuple[httpx.Response, BaseException]:
+    """GET the attachment while the refusal row's write raises; the response and that error."""
+    real = engine.store.record_audit
+    raised: list[BaseException] = []
+
+    async def failing(action: str, **kwargs: Any) -> Any:
+        if action == "attachment_download_refused":
+            exc = RuntimeError(
+                f"synthetic audit store fault: {json.loads(kwargs['detail'])['reason']}"
+            )
+            raised.append(exc)
+            raise exc
+        return await real(action, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", failing)
+    transport = httpx.ASGITransport(
+        app=create_app(engine, allow_no_auth=True), raise_app_exceptions=False
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.get(f"/messages/{mid}/attachments/{ref}")
+    (exc,) = raised
+    return r, exc
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        f'<!DOCTYPE svg [<!ENTITY {_SVG_PLANTED} "x">]><svg>'.encode(),
+        f'<!DOCTYPE svg [<!ENTITY e SYSTEM "http://{_SVG_PLANTED}/">]><svg>&e;'.encode(),
+        f'<?xml version="1.0" encoding="x-{_SVG_PLANTED}"?><svg>'.encode(),
+    ],
+    ids=["entity-name", "system-id", "encoding-label"],
+)
+async def test_a_failed_refusal_audit_carries_no_svg_text_onto_the_chain(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, prefix: bytes
+) -> None:
+    """A store fault on the refusal row turns the 422 into a 500, and nothing sender-controlled rides
+    along (BACKLOG #2387, #1796). The parser's error can quote an entity name, a system id or an
+    encoding label. If the audit write ran inside the ``except``, its error would chain that text,
+    and a server such as uvicorn logs the whole chained traceback. ``format_exception`` stands in
+    for that log, since the in-process transport does not run the server's logger."""
+    mid, ref = await _seed_labelled(
+        engine, "image/svg+xml", marker="failed-audit", prefix=prefix, suffix=b"</svg>"
+    )
+    r, exc = await _get_with_a_failing_refusal_audit(engine, monkeypatch, mid, ref)
+    assert r.status_code == 500
+    assert _SVG_PLANTED.encode() not in r.content
+    # The ASGI stack's task groups may chain an ExceptionGroup on the way out; the parser's error
+    # must not be anywhere on it. format_exception also walks the groups' members.
+    chain = _chain(exc)
+    assert str(exc).endswith("svg_unsanitizable")
+    fields = [
+        (str(e), repr(e.args), repr(vars(e)), repr(getattr(e, "object", None))) for e in chain
+    ]
+    assert not [e for e in chain if isinstance(e, SvgRejected)], chain
+    assert not [f for f in fields if any(_SVG_PLANTED in x for x in f)]
+    assert _SVG_PLANTED not in "".join(traceback.format_exception(exc, chain=True))
+
+
+async def test_a_failed_undecodable_refusal_audit_chains_no_decode_error(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other 422 keeps the same order: its decode error is never on a failed audit's chain."""
+    ref = await engine.store.put_attachment(["%%synthetic-undecodable-fault%%"], "application/pdf")
+    mid = await engine.store.enqueue_ingress(channel_id="ch1", raw=ADT, attachment_refs=[ref])
+    r, exc = await _get_with_a_failing_refusal_audit(engine, monkeypatch, mid, ref)
+    assert r.status_code == 500
+    assert str(exc).endswith("undecodable")
+    assert not [e for e in _chain(exc) if isinstance(e, (binascii.Error, ValueError))]
+
+
+def test_the_chain_walker_finds_a_parser_error_raised_inside_the_handler() -> None:
+    """Control for the test above: the shape it replaced is found, so a clean reading means clean."""
+    try:
+        try:
+            raise SvgRejected("refused") from ValueError(_SVG_PLANTED)
+        except SvgRejected:
+            raise RuntimeError("synthetic audit store fault")  # noqa: B904 - the shape under test
+    except RuntimeError as exc:
+        found = exc
+    assert len(_chain(found)) == 3
+    assert _SVG_PLANTED in "".join(traceback.format_exception(found, chain=True))
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    """Every exception reachable from ``exc`` by ``__cause__`` or ``__context__``, ``exc`` first."""
+    seen: list[BaseException] = []
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        cur = stack.pop()
+        if cur is None or any(cur is s for s in seen):
+            continue
+        seen.append(cur)
+        stack += [cur.__cause__, cur.__context__]
+    return seen
 
 
 async def test_svg_label_on_non_markup_bytes_is_served_unchanged(
