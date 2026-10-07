@@ -55,7 +55,7 @@ import math
 import re
 import unicodedata
 import warnings
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
@@ -2679,8 +2679,9 @@ def _linear_items(func: ast.FunctionDef | ast.AsyncFunctionDef, ctx: _TypedCtx) 
             key = _stmt_key(stmt)
             seen[key] += 1
             # Which block with this header: a raise may not move into another guard with the same
-            # test (review of head bd5843dbd4, finding 3). Moving a whole same-header block past
-            # another renumbers them, so that move is refused too; the safe direction.
+            # test (review of head bd5843dbd4, finding 3). A move that renumbers same-header
+            # blocks changes the path of any protected or terminal statement inside them, so such
+            # a move may be refused; the safe direction.
             nth = seen[key]
             at = len(items)
             terminal = isinstance(stmt, ast.Return | ast.Raise)
@@ -2754,7 +2755,9 @@ def _unbound_reads(
     the header expression) holding the read, the name, and which read of that name it is there.
 
     A binding counts for the statements after it in its own suite and inside them; one made inside a
-    block does not count after the block, which over-counts and never under-counts. Compared before
+    block does not count after the block unless every path binds it (:func:`_bound_after`). That
+    over-counts by design. It is not proven never to under-count: this is hand-written scoping, and
+    :func:`_reads_before_any_binding` backs it up. Compared before
     and after a typed-only move or delete, a rise means a read the result leaves unbound, which raises
     NameError or UnboundLocalError on every message (Lander review of PR 2155, finding 3). ``local``
     is the names to count (:func:`_handler_locals`), taken from BOTH versions of the handler: a delete
@@ -2808,23 +2811,54 @@ def _read_sites(node: ast.AST, local: set[str], defined: set[str]) -> list[tuple
     where = _stmt_key(node) if isinstance(node, ast.stmt) else ast.dump(node)
     nth: Counter[str] = Counter()
     out: list[tuple[str, str, int]] = []
-    pending: list[tuple[ast.AST, frozenset[str]]] = [(node, frozenset())]
+    pending: deque[tuple[ast.AST, frozenset[str]]] = deque([(node, frozenset())])
     while pending:
-        n, own = pending.pop(0)
-        if isinstance(n, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
-            # The comprehension binds its targets in a scope of its own (review of head
-            # bd5843dbd4, finding 5): ``[seg for seg in ...]`` reads no handler ``seg``.
-            own = own | {
-                t.id for g in n.generators for t in ast.walk(g.target) if isinstance(t, ast.Name)
-            }
-        elif isinstance(n, ast.Lambda):
-            own = own | {a.arg for a in ast.walk(n.args) if isinstance(a, ast.arg)}
+        n, own = pending.popleft()
+        inner = _inner_scope(n, own)
+        if inner is not None:
+            pending.extend(inner)
+            continue
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
             nth[n.id] += 1
             if n.id in local and n.id not in defined and n.id not in own:
                 out.append((where, n.id, nth[n.id]))
         pending.extend((child, own) for child in ast.iter_child_nodes(n))
     return out
+
+
+def _inner_scope(n: ast.AST, own: frozenset[str]) -> list[tuple[ast.AST, frozenset[str]]] | None:
+    """For a comprehension or ``lambda``, each child paired with the names bound where it runs;
+    None for any other node.
+
+    A comprehension's targets and a lambda's parameters are bound in a scope of their own, so
+    ``[seg for seg in rows]`` reads no handler ``seg`` (review of head bd5843dbd4, finding 5). But
+    the comprehension's FIRST iterable and the lambda's default values run in the enclosing scope,
+    so their reads count there (Lander review of 71fe1207f4). Only a plain-name target binds; the
+    names inside a subscript or attribute target are reads."""
+    if isinstance(n, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
+        bound = own | {
+            t.id
+            for g in n.generators
+            for t in ast.walk(g.target)
+            if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)
+        }
+        first, *rest = n.generators
+        children: list[tuple[ast.AST, frozenset[str]]] = [(first.iter, own)]
+        for g in n.generators:
+            children.append((g.target, bound))
+            children.extend((cond, bound) for cond in g.ifs)
+        children.extend((g.iter, bound) for g in rest)
+        results = [n.key, n.value] if isinstance(n, ast.DictComp) else [n.elt]
+        children.extend((r, bound) for r in results)
+        return children
+    if isinstance(n, ast.Lambda):
+        a = n.args
+        defaults = [*a.defaults, *(d for d in a.kw_defaults if d is not None)]
+        params = {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg) if x}
+        lambda_children: list[tuple[ast.AST, frozenset[str]]] = [(d, own) for d in defaults]
+        lambda_children.append((n.body, own | params))
+        return lambda_children
+    return None
 
 
 def _reads_before_any_binding(
@@ -2898,7 +2932,7 @@ def _own_scope_bindings(node: ast.AST) -> set[str]:
     ``def`` do not count, because each binds in a scope of its own: ``[r for r in rows]`` leaves ``r``
     unbound for a later ``msg.set("A", r)`` (review of head 513797260a, finding 2). A nested ``def``
     or ``class`` binds its own name only. A walrus inside a comprehension, which does bind in the
-    handler, is left out too: that can only over-count an unbound read, never hide one."""
+    handler, is left out too: that over-counts an unbound read rather than hiding one."""
     out: set[str] = set()
     pending: list[ast.AST] = [node]
     while pending:
@@ -4638,6 +4672,7 @@ def _is_one_based_range(node: ast.expr) -> bool:
         and isinstance(node.func, ast.Name)
         and node.func.id == "range"
         and not node.keywords
+        and not any(isinstance(a, ast.Starred) for a in node.args)
         and len(node.args) in (2, 3)
         and at_least_one(node.args[0])
         and (len(node.args) == 2 or at_least_one(node.args[2]))
@@ -4698,6 +4733,34 @@ def _imported_from_messagefoundry(tree: ast.Module, name: str) -> bool:
     )
 
 
+#: Modules and names through which code can reach a builtin such as ``globals`` under another name.
+_BUILTINS_ROUTES = frozenset({"builtins", "__builtins__", "importlib"})
+
+
+def _reaches_globals(n: ast.AST) -> bool:
+    """Whether ``n`` may let the module rebind its own globals where the inert check cannot see.
+
+    Covered: a :data:`_GLOBALS_WRITERS` name; a :data:`_GLOBALS_ATTRS` attribute (``h.__globals__``,
+    ``sys.modules``); ANY touch of ``builtins``, ``__builtins__`` or ``importlib``, whether by name,
+    import or alias (``import builtins as b``, ``from builtins import globals as g``); and a
+    ``getattr`` whose name is not a non-dunder string literal (Lander review of 71fe1207f4, finding
+    4). A bypass not listed here may remain: this is a static check."""
+    if isinstance(n, ast.Name):
+        return n.id in _GLOBALS_WRITERS or n.id in _BUILTINS_ROUTES
+    if isinstance(n, ast.Attribute):
+        return n.attr in _GLOBALS_ATTRS
+    if isinstance(n, ast.Import):
+        return any(al.name.split(".")[0] in _BUILTINS_ROUTES for al in n.names)
+    if isinstance(n, ast.ImportFrom):
+        return (n.module or "").split(".")[0] in _BUILTINS_ROUTES
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "getattr":
+        name = n.args[1] if len(n.args) >= 2 else None
+        if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
+            return True
+        return _is_dunder(name.value)
+    return False
+
+
 def _root_name(node: ast.expr) -> str | None:
     """The name at the root of an attribute or subscript chain: ``BOX`` for ``BOX["a"].b``."""
     while isinstance(node, ast.Attribute | ast.Subscript):
@@ -4745,18 +4808,8 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
         pending.extend(ast.iter_child_nodes(node))
     mutated: set[str] = set()
     for n in ast.walk(tree):
-        if (isinstance(n, ast.Name) and n.id in _GLOBALS_WRITERS) or (
-            isinstance(n, ast.Attribute)
-            and (
-                n.attr in _GLOBALS_ATTRS
-                or (
-                    n.attr in _GLOBALS_WRITERS
-                    and isinstance(n.value, ast.Name)
-                    and n.value.id == "builtins"
-                )
-            )
-        ):
-            return {}  # ``h.__globals__[...]``, ``sys.modules[...]`` and the like
+        if _reaches_globals(n):
+            return {}
         if isinstance(n, ast.ImportFrom) and any(al.name == "*" for al in n.names):
             return {}
         root: str | None = None

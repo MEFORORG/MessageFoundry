@@ -1051,3 +1051,124 @@ def h(msg):
 """
     edit = _edit("move_row", 6, to_line_start=3, to_position="before")
     assert rewrite_source(src, edit).index("ids = ") < rewrite_source(src, edit).index("for seg")
+
+
+# --- Lander review of bd5843dbd4..71fe1207f4 ----------------------------------------------------
+
+_SCOPE = """\
+@handler("H")
+def h(msg):
+    d = {}
+    xs = []
+    msg.set("Z", "z")
+    col = msg.field("C")
+    {row}
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # A default runs in the handler's scope when the lambda is made.
+        "key = lambda s, col=col: s[col]",
+        # A comprehension's first iterable runs in the handler's scope.
+        "out = [col.upper() for col in col]",
+        # A subscript target's index is a read, not a binding.
+        "vals = [1 for d[col] in xs]",
+        # A nested lambda's parameter does not bind the outer lambda's body.
+        "key = lambda s, f=lambda col: 0: s[col]",
+    ],
+    ids=["lambda-default", "first-iterable", "subscript-target", "nested-lambda-default"],
+)
+def test_r6_a_read_in_the_enclosing_scope_still_counts(row: str) -> None:
+    src = _SCOPE.replace("{row}", row)
+    edit = _edit("move_row", 7, to_line_start=5, to_position="before")
+    with pytest.raises(LensRewriteError, match="before anything binds"):
+        rewrite_source(src, edit)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "key = lambda s, col=1: s[col]",
+        "out = [col.upper() for col in xs]",
+        "out = [c for col in xs for c in col]",
+    ],
+    ids=["lambda-param", "comprehension-target", "second-generator"],
+)
+def test_r6_control_a_name_the_inner_scope_binds_is_not_a_handler_read(row: str) -> None:
+    src = _SCOPE.replace("{row}", row)
+    edit = _edit("move_row", 7, to_line_start=5, to_position="before")
+    out = rewrite_source(src, edit)
+    assert out.index(row) < out.index('msg.set("Z", "z")')
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        "import builtins as b\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    b.globals()["OB_DEST"] = 1\n',
+        "from builtins import globals as g\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    g()["OB_DEST"] = 1\n',
+        "import builtins\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    getattr(builtins, "globals")()["OB_DEST"] = 1\n',
+        'def poke():  # type: ignore[no-untyped-def]\n    __builtins__["exec"]("OB_DEST = 1")\n',
+        "import importlib\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    importlib.import_module("builtins").exec("OB_DEST = 1")\n',
+        "def poke(name):  # type: ignore[no-untyped-def]\n    return getattr(poke, name)\n",
+    ],
+    ids=[
+        "import-as",
+        "from-import-as",
+        "getattr-literal",
+        "dunder-builtins",
+        "importlib",
+        "getattr-var",
+    ],
+)
+def test_r6_finding_4_every_route_to_builtins_voids_inert_names(write: str) -> None:
+    src = (
+        f'OB_DEST = "OB_X"\n\n\n{write}\n\n@handler("H")\ndef h(msg):\n    return Send("OB", msg)\n'
+    )
+    line = len(src.splitlines())
+    _refused(src, _edit("set_params", line, params={"to": {"expr": "OB_DEST"}}), match=REFUSED)
+
+
+def test_r6_finding_4_control_an_ordinary_helper_keeps_inert_names() -> None:
+    src = (
+        'import os\n\nOB_DEST = "OB_X"\n\n\ndef helper(x):  # type: ignore[no-untyped-def]\n'
+        '    return getattr(x, "name"), os.sep\n\n\n'
+        '@handler("H")\ndef h(msg):\n    return Send("OB", msg)\n'
+    )
+    line = len(src.splitlines())
+    edit = _edit("set_params", line, params={"to": {"expr": "OB_DEST"}})
+    assert "return Send(OB_DEST, msg)" in rewrite_source(src, edit)
+
+
+@pytest.mark.parametrize(
+    ("header", "ok"),
+    [
+        ("for i in range(1, *rest):", False),
+        ("for i in range(1, n, *steps):", False),
+        ("for i in range(1, 10, 2):", True),
+        ('for i in range(1, msg.count_segments("OBX") + 1):', True),
+    ],
+)
+def test_r6_finding_2_a_starred_range_is_not_1_based(header: str, ok: bool) -> None:
+    src = (
+        '@handler("H")\ndef h(msg):\n    rest = [5]\n    n = 5\n    steps = [1]\n'
+        f'    {header}\n        pass\n    return Send("OB", msg)\n'
+    )
+    edit = _edit(
+        "insert_row",
+        7,
+        position="before",
+        action="set_field",
+        params={"path": "OBX-3", "value": "x", "occurrence": {"expr": "i"}},
+    )
+    if ok:
+        assert "occurrence=i" in rewrite_source(src, edit)
+    else:
+        with pytest.raises(LensRewriteError, match="not a whole number"):
+            rewrite_source(src, edit)
