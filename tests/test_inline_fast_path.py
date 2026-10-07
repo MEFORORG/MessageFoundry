@@ -137,6 +137,19 @@ class _HandoffSpy:
         self.store.transform_handoff = transform_handoff  # type: ignore[method-assign]
 
 
+class _StopSink:
+    """An alert sink that records ``connection_stopped`` lanes and ignores every other alert."""
+
+    def __init__(self) -> None:
+        self.stopped: list[str] = []
+
+    def connection_stopped(self, name: str, *, detail: str = "") -> None:
+        self.stopped.append(name)
+
+    def __getattr__(self, _n: str):
+        return lambda *a, **k: None
+
+
 async def _run(reg: Registry, store: MessageStore, **kw: Any) -> RegistryRunner:
     runner = RegistryRunner(
         reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False), **kw
@@ -394,20 +407,10 @@ async def test_inline_handler_raises_stop_policy_halts_lane(
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
 
-    class _Sink:
-        def __init__(self) -> None:
-            self.stopped: list[str] = []
-
-        def connection_stopped(self, name: str, *, detail: str = "") -> None:
-            self.stopped.append(name)
-
-        def __getattr__(self, _n: str):
-            return lambda *a, **k: None
-
     def boom(msg: Message) -> Send:
         raise ValueError("inline transform fails")
 
-    sink = _Sink()
+    sink = _StopSink()
     reg = _registry(inbox, outdir, _route_arch, {"arch": boom}, inline=True)
     # Pinned to per_lane: this asserts the STOP path emits connection_stopped EXACTLY once. Pooled
     # emits it twice (the shared item body at wiring_runner.py:2501 AND the dispatcher's lane-STOP
@@ -431,6 +434,114 @@ async def test_inline_handler_raises_stop_policy_halts_lane(
         assert not await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
     finally:
         await runner.stop()
+
+
+# --- G1 as amended 2026-10-07: a fused-handoff STORE fault is INFRA, not content ---------------
+
+
+def _failing_handoff(store: MessageStore, failures: int | None) -> list[int]:
+    """Make ``store.handoff`` raise a store-shaped fault for its first ``failures`` calls (every call
+    when ``None``), then delegate to the real primitive. Returns a one-cell call counter."""
+    real = store.handoff
+    calls = [0]
+
+    async def handoff(**kw: Any) -> bool:
+        calls[0] += 1
+        if failures is None or calls[0] <= failures:
+            raise OSError("simulated store fault in the fused handoff")
+        return await real(**kw)
+
+    store.handoff = handoff  # type: ignore[method-assign]
+    return calls
+
+
+async def _ingress_row(store: MessageStore) -> Any:
+    cur = await store._db.execute(
+        "SELECT status, last_error FROM queue WHERE stage=?", (Stage.INGRESS.value,)
+    )
+    return await cur.fetchone()
+
+
+@pytest.mark.parametrize("policy", [InternalErrorPolicy.CONTINUE, InternalErrorPolicy.STOP])
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+async def test_inline_handoff_store_fault_repends_not_dead_lettered(
+    store: MessageStore, tmp_path: Path, claim_mode: str, policy: InternalErrorPolicy
+) -> None:
+    """ADR 0057 G1 as amended: a raise from the fused ``store.handoff`` is an infrastructure fault.
+    It reaches the caller's fault arm (per-lane #1611 / pooled T17), which re-pends the ingress row
+    PENDING; the internal_error policy never sees it, so CONTINUE does not dead-letter it and STOP
+    does not halt the lane or mark it "router error (ingest stopped)". Once the store recovers the
+    same row fuses and the message finishes PROCESSED with exactly one outbound row."""
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+    calls = _failing_handoff(store, failures=1)
+
+    sink = _StopSink()
+    reg = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+    runner = await _run(
+        reg, store, internal_error_default=policy, alert_sink=sink, claim_mode=claim_mode
+    )
+    try:
+        # Between the fault and the retry (both arms back off about a second), the row is back to
+        # PENDING with no content-fault reason, and the message is not ERROR.
+        for _ in range(200):
+            if calls[0] >= 1:
+                row = await _ingress_row(store)
+                if row is not None and row["status"] == OutboxStatus.PENDING.value:
+                    break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the faulted ingress row never re-pended")
+        assert "router error" not in (row["last_error"] or "")
+        assert not await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+        await _until_stat(store, OutboxStatus.DONE.value, 1, timeout=8.0)
+    finally:
+        await runner.stop()
+
+    assert calls[0] == 2  # the fault, then the re-pended row's successful fused commit
+    assert sink.stopped == []  # no lane halted: neither the STOP policy nor the infra bound fired
+    msgs = await store.list_messages(channel_id="file_in")
+    assert len(msgs) == 1 and msgs[0]["status"] == MessageStatus.PROCESSED.value
+    assert len(await store.outbox_for(msgs[0]["id"])) == 1  # no duplicate from the re-run
+    assert "FOUNDRY" in (outdir / "MSG1.hl7").read_bytes().decode("utf-8")
+
+
+async def test_inline_persistent_handoff_store_fault_counts_toward_pooled_infra_stop(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A fused-handoff fault that never clears is bounded the way the split path's ``route_handoff``
+    fault is: pooled T17 counts it toward ``infra_fault_stop_after`` and STOPs the lane with a
+    ``connection_stopped`` alert, preserving the good message (never dead-lettered)."""
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+    calls = _failing_handoff(store, failures=None)
+
+    sink = _StopSink()
+    reg = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+    runner = await _run(
+        reg,
+        store,
+        internal_error_default=InternalErrorPolicy.CONTINUE,
+        alert_sink=sink,
+        claim_mode="pooled",
+        infra_fault_stop_after=2,
+    )
+    try:
+        for _ in range(500):
+            if sink.stopped:
+                break
+            await asyncio.sleep(0.02)
+        assert "file_in" in sink.stopped  # the infra-fault bound fired
+    finally:
+        await runner.stop()
+
+    assert calls[0] == 2  # STOPPED at the bound, not looping
+    assert not await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+    row = await _ingress_row(store)
+    assert row is not None and row["status"] != OutboxStatus.DEAD.value  # preserved, not dead
+    assert "router error" not in (row["last_error"] or "")
 
 
 # --- matrix #1 (INV-1): crash-replay -----------------------------------------
