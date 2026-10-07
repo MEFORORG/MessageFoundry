@@ -211,6 +211,7 @@ from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
+    alert_sink_for,
     answers_before_body,
     authorize_ws,
     authorizes_in_body,
@@ -916,7 +917,9 @@ def _build_approval_gate(
 
         async def _apply() -> dict[str, Any]:
             try:
-                outcome = await _reload_or_record_interruption(
+                # BACKLOG #1940: the row's write never raises after the swap; see
+                # _record_reload_audit.
+                outcome, failures = await _reload_and_record(
                     engine, config_dir, actor=actor, client=None
                 )
             except _RELOAD_REFUSALS as exc:
@@ -940,10 +943,6 @@ def _build_approval_gate(
                 )
                 raise ApprovalError(422, answer) from exc
             registry = outcome.registry
-            # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
-            failures = await _record_reload_audit(
-                engine, actor=actor, failed_steps=[f.step for f in outcome.failures]
-            )
             return {
                 "inbound": len(registry.inbound),
                 "outbound": len(registry.outbound),
@@ -1120,24 +1119,44 @@ class _LoadedConfig:
     outbound: int | None
     fingerprint: Mapping[str, object] | None
     #: The graph object itself. An applied reload swaps it for a new one before it rebinds the
-    #: fingerprint, so comparing it by identity sees a reload still in flight.
+    #: fingerprint, so comparing it by identity sees a reload still in flight. The start's row uses
+    #: that; a reload's row does not, since an in-flight reload may still roll back (vault BACKLOG
+    #: #2257; see :func:`_record_reload_audit`).
     registry: Registry | None
 
     @classmethod
-    def read(cls, engine: Engine) -> _LoadedConfig:
-        """The engine's live state now. A reload rebinds the fingerprint rather than editing it, and
-        the copy keeps the snapshot safe even if that changes."""
-        rr = engine.registry_runner
-        directory = engine.running_config_dir
-        fingerprint = engine.loaded_config_fingerprint
+    def _of(
+        cls,
+        directory: Path | None,
+        registry: Registry | None,
+        fingerprint: Mapping[str, object] | None,
+    ) -> _LoadedConfig:
+        # A reload rebinds the fingerprint rather than editing it; the copy keeps the snapshot safe
+        # even if that changes.
         return cls(
             directory=str(directory) if directory else None,
-            shard=rr.registry.shard_id if rr else None,
-            inbound=len(rr.registry.inbound) if rr else 0,
-            outbound=len(rr.registry.outbound) if rr else 0,
+            shard=registry.shard_id if registry else None,
+            inbound=len(registry.inbound) if registry else 0,
+            outbound=len(registry.outbound) if registry else 0,
             fingerprint=dict(fingerprint) if fingerprint is not None else None,
-            registry=rr.registry if rr else None,
+            registry=registry,
         )
+
+    @classmethod
+    def read(cls, engine: Engine) -> _LoadedConfig:
+        """The engine's live state now."""
+        rr = engine.registry_runner
+        return cls._of(
+            engine.running_config_dir,
+            rr.registry if rr else None,
+            engine.loaded_config_fingerprint,
+        )
+
+    @classmethod
+    def of(cls, outcome: ReloadOutcome) -> _LoadedConfig:
+        """What an applied reload itself loaded, read off its own outcome (vault BACKLOG #2257), so
+        the row names that reload's graph whatever the engine runs by the time it is written."""
+        return cls._of(outcome.directory, outcome.registry, outcome.fingerprint)
 
     def swapped(self, engine: Engine) -> bool:
         """Whether the engine's graph is no longer the one this snapshot read: a reload has
@@ -1183,6 +1202,25 @@ async def _reload_or_record_interruption(
         raise
 
 
+async def _reload_and_record(
+    engine: Engine, config_dir: str | None, *, actor: str, client: str | None
+) -> tuple[ReloadOutcome, list[str]]:
+    """Apply a real reload and write its ``config_reload`` row from that reload's own outcome
+    (vault BACKLOG #2257). The inline route and the released executor share this.
+
+    A refusal the reload raises propagates, with nothing swapped and no row written here. Returns
+    the outcome and the failed steps to report, ``audit`` among them when the row was lost."""
+    outcome = await _reload_or_record_interruption(engine, config_dir, actor=actor, client=client)
+    failures = await _record_reload_audit(
+        engine,
+        actor=actor,
+        client=client,
+        failed_steps=[f.step for f in outcome.failures],
+        outcome=outcome,
+    )
+    return outcome, failures
+
+
 async def _record_reload_audit(
     engine: Engine,
     *,
@@ -1192,6 +1230,7 @@ async def _record_reload_audit(
     failed_steps: Sequence[str] = (),
     extra: Mapping[str, object] | None = None,
     loaded: _LoadedConfig | None = None,
+    outcome: ReloadOutcome | None = None,
 ) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
@@ -1203,15 +1242,28 @@ async def _record_reload_audit(
     records the same fingerprint-bearing row as an ungated one. A cluster convergence reload writes
     its row through here too, as :data:`_CONVERGENCE_ACTOR` (vault BACKLOG #3076).
 
-    The fingerprint is the engine's :attr:`~Engine.loaded_config_fingerprint`, the digest it took
-    of the bytes it loaded, so a reload's row and ``GET /config/provenance`` name one digest. A start row a reload superseded names the
+    The fingerprint is the digest the engine took of the bytes it loaded. A reload's is its own
+    :attr:`~messagefoundry.pipeline.ReloadOutcome.fingerprint`, the value it set as
+    :attr:`~Engine.loaded_config_fingerprint`, so its row and ``GET /config/provenance`` name one
+    digest until a later reload moves the engine on. A start row a reload superseded names the
     start's digest instead (vault BACKLOG #2838). When the engine could not take one, the row is
     written without it.
 
-    ``loaded`` is what the row names as loaded: the directory, shard, counts and fingerprint. A
-    reload leaves it ``None``, and the row reads them live, at the write. The start always passes
-    one: the snapshot it took at its first load, or :data:`_UNKNOWN_LOADED` when it could not take
-    one (vault BACKLOG #2838); see :class:`_LoadedConfig`.
+    ``loaded`` is what the row names as loaded: the directory, shard, counts and fingerprint. The
+    start always passes one: the snapshot it took at its first load, or :data:`_UNKNOWN_LOADED`
+    when it could not take one (vault BACKLOG #2838); see :class:`_LoadedConfig`. With neither,
+    the row reads them live, at the write, which the cluster convergence reload still does.
+
+    A reload passes its ``outcome`` instead, and the row names what that reload loaded (vault
+    BACKLOG #2257). The row is written after the swap, and nothing holds the graph still until
+    then, so a second reload or a connection flag toggle can move the engine on first. The row then
+    still names this reload's config, but marks itself ``superseded`` and
+    :data:`_BASELINE_UNCHECKED`, as a superseded start row does: it is no baseline, and the next
+    start compares against an older row instead. The test is whether
+    :attr:`~Engine.loaded_config_fingerprint` is still this reload's digest object, which only a
+    committed reload or a flag toggle rebinds; a reload that swaps and then rolls back leaves it
+    alone. The check runs just before the write, so a change after it is not caught. The snapshot
+    and the check are inside the guard below, so a fault in either is caught like a failed write.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -1235,7 +1287,17 @@ async def _record_reload_audit(
     A cancellation still propagates: it is not a failure of this helper."""
     detail: str | None = None
     try:
-        state = loaded if loaded is not None else _LoadedConfig.read(engine)
+        superseded = False
+        if loaded is not None:
+            state = loaded
+        elif outcome is not None:
+            state = _LoadedConfig.of(outcome)
+            # Only a COMMITTED reload or a flag toggle rebinds the loaded fingerprint. The graph
+            # object is no test: a reload part way through its swap, which then fails and rolls back
+            # to this graph, would mark a row that still names the running config.
+            superseded = engine.loaded_config_fingerprint is not outcome.fingerprint
+        else:
+            state = _LoadedConfig.read(engine)
         detail = json.dumps(
             {
                 "dir": state.directory,
@@ -1246,6 +1308,7 @@ async def _record_reload_audit(
                 "dry_run": False,
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
+                **({"superseded": True, _BASELINE_UNCHECKED: True} if superseded else {}),
                 **(state.fingerprint or {}),
             }
         )
@@ -1333,6 +1396,55 @@ async def _audit_refused_reload(
     return status, answer
 
 
+#: The ``audit_write_failed`` alert's key for an inline reload's lost attempt row (vault BACKLOG
+#: #2254). The colon keeps it outside the connection-name grammar, as the gate's ``approval:<id>`` does.
+_INLINE_RELOAD_ALERT_NAME = "config_reload:inline"
+
+
+async def _audit_reload_attempt(
+    engine: Engine,
+    *,
+    actor: str,
+    requested: str | None,
+    client: str | None,
+    alert_sink: AlertSink,
+) -> None:
+    """Write an ungated reload's ``config_reload_attempted`` row before anything swaps, and refuse
+    the reload with 503 when the audit log will not take it (vault BACKLOG #2254).
+
+    The ``config_reload`` row comes after the swap, when a failed write can only be reported
+    (:func:`_record_reload_audit`). Without this row, an audit log that refused writes would let a
+    new config go live with no record of who deployed it. A released reload needs no such row: the
+    gate writes ``approval.release_attempted`` before the release runs, and this is that row's
+    shape for the inline route.
+
+    It says ATTEMPTED because the outcome comes later. A reload the engine then refuses writes its
+    refusal row after this one, and a cancelled one writes ``config_reload_interrupted``."""
+    detail = json.dumps({"requested": requested, "dry_run": False})
+    try:
+        await engine.store.record_audit(
+            "config_reload_attempted", actor=actor, detail=detail, client=client
+        )
+    except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+        _log.exception(
+            "config reload: the audit log refused the config_reload_attempted row, so the reload "
+            "did not run. Lost row: actor=%s detail=%s",
+            actor,
+            detail,
+        )
+        try:
+            alert_sink.audit_write_failed(
+                _INLINE_RELOAD_ALERT_NAME, action="config_reload_attempted"
+            )
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+            _log.exception("config reload: the audit_write_failed alert failed to emit")
+        raise HTTPException(
+            503,
+            "the audit log could not record this reload, so it did not run; retry once the audit "
+            "log accepts writes",
+        ) from exc
+
+
 #: The audit actions that record which config bytes a process ran from: a start, an applied reload,
 #: and a flag toggle that rewrote ``connections.toml`` (vault BACKLOG #2597). A dry run's
 #: ``config_reload_check`` is not one: it applied nothing.
@@ -1356,6 +1468,8 @@ _CONFIG_BASELINE_WINDOW = 50
 #: and any flag toggle that process writes. A later start passes over such a row to the last checked
 #: one, so the change the unchecked start could not see is still reported. A start row that a reload
 #: superseded before it was written carries it too (vault BACKLOG #2838): its digest is no baseline.
+#: So does an inline or released reload's row written after a later reload or a flag toggle moved
+#: the loaded fingerprint on (vault BACKLOG #2257), and a convergence reload's row with no digest.
 _BASELINE_UNCHECKED = "baseline_unchecked"
 
 #: What a start's ``config_loaded`` row records as ``comparison``.
@@ -4623,6 +4737,8 @@ def create_app(
         ``[approvals].enabled``, a NON-dry-run reload is **held** (202) for a *distinct* second approver
         — the requester can never release their own — rather than swapping the live graph inline. A
         dry_run is never held (it swaps nothing). Deny-by-default: ungated deployments reload inline.
+        An inline reload writes ``config_reload_attempted`` before it swaps anything, and answers 503
+        without reloading when the audit log refuses that row (vault BACKLOG #2254).
 
         Error responses are intentionally generic (the detail is logged server-side, not returned)
         so a config:deploy holder can't probe the filesystem via reload error text."""
@@ -4672,8 +4788,17 @@ def create_app(
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
+                failures = [f.step for f in outcome.failures]
             else:
-                outcome = await _reload_or_record_interruption(
+                # vault BACKLOG #2254: only an ungated reload gets here, with no approval row first.
+                await _audit_reload_attempt(
+                    engine,
+                    actor=user.username,
+                    requested=req.config_dir,
+                    client=client_ip(request),
+                    alert_sink=alert_sink_for(request.app.state),
+                )
+                outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
                 )
             registry = outcome.registry
@@ -4691,9 +4816,8 @@ def create_app(
         # only counts, so two reloads of the same dir with different on-disk code were
         # indistinguishable. Computed off the event loop (it reads files) and best-effort — a
         # fingerprint failure must never block the audit of a successful reload. The non-dry-run path
-        # shares _record_reload_audit with the dual-control executor so a held-then-approved reload
-        # records the identical fingerprint-bearing row, and reports a failed row the same way (#1940).
-        failures = [f.step for f in outcome.failures]
+        # wrote its row in _reload_and_record, which the dual-control executor shares, so a
+        # held-then-approved reload records the identical row and reports a failed one the same way.
         if req.dry_run:
             # The directory this dry run checked comes from the outcome, never from
             # engine.last_reload_dir: a dry run does not move that field (vault BACKLOG #2598).
@@ -4712,13 +4836,6 @@ def create_app(
                     }
                 ),
                 client=client_ip(request),
-            )
-        else:
-            failures = await _record_reload_audit(
-                engine,
-                actor=user.username,
-                client=client_ip(request),
-                failed_steps=failures,
             )
         rr = engine.registry_runner
         return ReloadResult(

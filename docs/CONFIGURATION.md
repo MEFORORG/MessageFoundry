@@ -1307,8 +1307,10 @@ started together, can each raise it; the alert list folds them into one instance
   marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A
   later start passes over those rows, and over any row whose detail is not a JSON object (at
   WARNING), and compares against the newest usable row before them. So the change the unchecked
-  start could not see is reported by the next start that can read. A config reload is not marked:
-  applying the directory by reload vouches for it.
+  start could not see is reported by the next start that can read. A config reload's row is
+  usually not marked: applying the directory by reload vouches for it. When it is marked, and
+  when a later start passes over it, is stated once in [SECURITY.md](SECURITY.md) (vault BACKLOG
+  #2257).
 - A reload can swap the graph after a start loads it and before its `config_loaded` row is written;
   on a cluster node, the convergence loop does this. The row still names the graph the start
   loaded, with its comparison. It is marked `superseded` and `baseline_unchecked`, and its

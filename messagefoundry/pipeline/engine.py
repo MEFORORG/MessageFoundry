@@ -161,12 +161,18 @@ class ReloadOutcome:
     A dry run applies nothing, so it reports ``applied`` False with no failures.
 
     ``directory`` is the resolved directory this call loaded, applied or not. A dry run's audit row
-    reads it here, because :attr:`Engine.last_reload_dir` moves only on an applied reload."""
+    reads it here, because :attr:`Engine.last_reload_dir` moves only on an applied reload.
+
+    ``fingerprint`` is the ADR 0041 D1 digest an applied reload took of ``directory`` before its
+    swap, or ``None`` when it could not take one (and always for a dry run). The reload's audit row
+    reads it here rather than off :attr:`Engine.loaded_config_fingerprint`: a second reload can swap
+    the graph again before the first one's row is written (vault BACKLOG #2257)."""
 
     registry: Registry
     applied: bool
     directory: Path
     failures: tuple[ReloadStepFailure, ...] = ()
+    fingerprint: Mapping[str, object] | None = None
 
     @property
     def degraded(self) -> bool:
@@ -2517,7 +2523,11 @@ class Engine:
                 ", ".join(f.step for f in failures),
             )
         return ReloadOutcome(
-            registry=registry, applied=True, directory=path, failures=tuple(failures)
+            registry=registry,
+            applied=True,
+            directory=path,
+            failures=tuple(failures),
+            fingerprint=fingerprint,
         )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:
