@@ -7,9 +7,10 @@ that bundle would be reported. A gate whose success cannot be distinguished from
 thing to avoid here.* So most tests below are controls: each plants one failure the gate exists to
 catch and requires the gate to name it.
 
-NO NETWORK. The report the gate judges is a real ``npm audit --json`` reading taken on 2026-09-30
-against the vendored lockfile, recorded under ``tests/fixtures/cla_action_audit/``. The live call is
-replaced by an injected runner, so nothing here needs npm.
+NO NETWORK. The report the gate judges is a real ``npm audit --json`` reading taken on 2026-10-07
+with npm 11.5.2 against the vendored lockfile, recorded under ``tests/fixtures/cla_action_audit/``.
+It replaced the 2026-09-30 reading when two advisories were acknowledged. The live call is replaced
+by an injected runner, so nothing here needs npm.
 
 THE FALSE CLEAN IS A RECORDED READING, NOT A GUESS. :data:`_NO_MANIFEST_REPORT` is npm's verbatim
 output with the lockfile and no ``package.json``. The gate must fail it even with an EMPTY baseline,
@@ -32,7 +33,7 @@ from tests._workflow_contexts import jobs_of
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = REPO_ROOT / "scripts" / "security"
-_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-09-30.json"
+_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-10-07.json"
 
 
 def _load(name: str) -> ModuleType:
@@ -369,6 +370,37 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
     assert not missing, (
         f"the recorded reading reports these, and the baseline dropped them: {missing}"
     )
+
+
+#: Identifiers of the packages two acknowledgements were triaged as ABSENT from the bundle on
+#: (cla-action-advisories.toml, the 2026-10-07 block). Each must count 0 in ``dist/index.js``.
+_ABSENT_FROM_BUNDLE = (
+    re.compile("sprintf", re.IGNORECASE),  # sprintf-js
+    re.compile("ArgumentParser"),  # argparse
+    re.compile("YAMLException|safeLoad"),  # js-yaml
+    re.compile("Toolkit"),  # actions-toolkit
+    re.compile("CHAR_ZERO_WIDTH_NOBREAK_SPACE"),  # braces (and picomatch)
+    re.compile("toRegexRange"),  # fill-range
+)
+
+#: The control: two @actions/core functions the bundle does carry, so the probes can find code.
+_PRESENT_IN_BUNDLE = re.compile("function getInput|function setFailed")
+
+
+def test_the_triaged_bundle_reading_still_holds() -> None:
+    """The braces and sprintf-js acknowledgements rest on their code being absent from the bundle.
+
+    The provenance gate lets ``dist/index.js`` change whenever its record changes with it, so a
+    re-vendored bundle could carry that code while both entries kept suppressing the advisories.
+    This reds instead, and the fix is a re-triage, not a new probe list.
+    """
+    bundle = (REPO_ROOT / ".github/actions/cla-assistant-lite/dist/index.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert len(_PRESENT_IN_BUNDLE.findall(bundle)) == 2, "the control no longer finds @actions/core"
+    present = [probe.pattern for probe in _ABSENT_FROM_BUNDLE if probe.search(bundle)]
+    assert not present, f"triaged as absent from the bundle, now present: {present}"
 
 
 def test_the_advice_matches_the_kind_of_failure(
