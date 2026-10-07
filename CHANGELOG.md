@@ -2890,7 +2890,7 @@ All notable changes to MessageFoundry are documented here. The format follows
     `[store].allow_unmarked_ciphertext = true`. That open seals them. Then set the setting back
     to `false`.
 - **BREAKING: a keyed store now refuses a plaintext uploaded file on read until an operator runs
-  `rotate-key`, which seals it.** This follows an owner ruling of 2026-09-23. An upload stored
+  `rotate-key` to seal it.** This follows an owner ruling of 2026-09-23. An upload stored
   before the key was enabled has no `mfenc:` marker, and neither does a file planted in
   `[store].uploads_dir`. The AES-GCM store cipher now refuses both, and each refusal raises an
   `integrity_drift` alert under its own subject, `upload-cipher`, naming the surface but never the
@@ -2905,9 +2905,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   existing `[store].allow_unmarked_ciphertext` opt-out also restores the passthrough for uploads.
   **Migration:** 0.4.0 read a plaintext upload on a keyed store with no operator step. After you
   upgrade, stop the engine and run `messagefoundry rotate-key` once. The current key is enough; it
-  does not need a new one. The command seals every plaintext upload, and until it runs they stay
-  refused, as above. The startup WARNING says how many are waiting. Uploads written while the key was
-  already set are sealed at write and need no step. ([BACKLOG #1169](docs/BACKLOG.md))
+  does not need a new one. The command seals plaintext uploads, and until it runs they stay
+  refused, as above. It does not seal every one: at least an upload whose body is missing or is
+  not text stays unsealed, and the retention prune removes it at expiry (`BACKLOG #2322`). The
+  startup WARNING says how many are waiting. Uploads written while the key was already set are
+  sealed at write and need no step. ([BACKLOG #1169](docs/BACKLOG.md))
 - **A lockout, and a sign-in that succeeds after failures, now write their own audit rows, so they
   reach the user's security-events feed.** Engine 0.4.0 wrote no row of its own for either event.
   Each lived only in the out-of-band notice, so no account saw either event in
