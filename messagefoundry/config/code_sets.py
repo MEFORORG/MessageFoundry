@@ -53,6 +53,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from messagefoundry.redaction import safe_exc
+
 __all__ = [
     "CODESETS_DIR_NAME",
     "POLICY_SIDECAR_SUFFIX",
@@ -462,7 +464,7 @@ def load_policy(codeset_path: str | Path) -> UnmappedPolicy:
         with sidecar.open("rb") as fh:
             raw = tomllib.load(fh)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as exc:
-        invalid: str | None = f"policy sidecar {sidecar.name!r}: invalid TOML — {exc}"
+        invalid: str | None = f"policy sidecar {sidecar.name!r}: invalid TOML — {safe_exc(exc)}"
     else:
         invalid = None
     if invalid is not None:
@@ -547,7 +549,7 @@ def _load_toml(path: Path) -> dict[str, Any]:
         with path.open("rb") as fh:
             raw = tomllib.load(fh)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as exc:
-        invalid = f"code set {path.name!r}: invalid TOML — {exc}"
+        invalid = f"code set {path.name!r}: invalid TOML — {safe_exc(exc)}"
     else:
         # tomllib already rejects duplicate keys (TOMLDecodeError), so no extra dup check is needed.
         return dict(raw)

@@ -67,24 +67,28 @@ import encodings
 import encodings.aliases
 import hashlib
 import json
+import logging
 import pkgutil
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
+from types import TracebackType
 from typing import Any
 
 __all__ = [
     "clamp_untrusted",
     "json_loads_or_refusal",
     "log_timestamp",
+    "prepare_log_record",
     "redact",
     "redact_untrusted",
     "safe_error",
     "safe_exc",
     "safe_name",
     "safe_text",
+    "safe_traceback",
 ]
 
 _REDACTED = "[redacted]"
@@ -2046,7 +2050,9 @@ def safe_exc(
     the character or byte it failed on, which is a character of the message, and no pattern can tell
     that apart from prose. :func:`_unicode_error_text` builds the text from the attributes instead.
     That covers only the error itself: one rendered INTO another exception's message, as
-    ``f"bad frame: {exc}"``, still arrives here as text."""
+    ``f"bad frame: {exc}"``, still arrives here as text. So a handler that catches one renders it
+    through this function, and ``tests/test_unicode_error_log_paths.py`` scans for one that does not.
+    A traceback and a ``%s`` log argument take :func:`prepare_log_record`."""
     if isinstance(exc, UnicodeError):
         return safe_text(_unicode_error_text(exc), limit=limit)
     name = type(exc).__name__
@@ -2123,6 +2129,14 @@ def _unicode_error_text(exc: UnicodeError) -> str:
     there is not echoed. ``.reason`` is rendered only from a fixed list. Windows ``mbcs`` raises with
     ``start == end``, so an empty span still names its position."""
     name = type(exc).__name__
+    detail = _unicode_error_detail(exc)
+    return f"{name}: {detail}" if detail else name
+
+
+def _unicode_error_detail(exc: UnicodeError) -> str:
+    """:func:`_unicode_error_text` without the class name: empty where only the class may be shown.
+
+    It is the text a traceback prints after ``UnicodeEncodeError:``, which is why it stands alone."""
     if isinstance(exc, UnicodeEncodeError):
         verb = "encode"
     elif isinstance(exc, UnicodeDecodeError):
@@ -2130,7 +2144,7 @@ def _unicode_error_text(exc: UnicodeError) -> str:
     elif isinstance(exc, UnicodeTranslateError):
         verb = "translate"
     else:
-        return name
+        return ""
     # A subclass can make any of these a property that raises. This renderer runs inside other
     # handlers' except arms, so it must not raise in their place. The class name still says what
     # failed, and the caller's own arm is what logs it, so nothing is lost silently.
@@ -2139,9 +2153,9 @@ def _unicode_error_text(exc: UnicodeError) -> str:
         reason = exc.reason
         encoding = getattr(exc, "encoding", None)
     except Exception:  # noqa: BLE001 - see above
-        return name
+        return ""
     if type(start) is not int or type(end) is not int or not 0 <= start <= end:
-        return name
+        return ""
     where = f"position {start}" if end <= start + 1 else f"positions {start}-{end - 1}"
     codec = (
         f"{encoding!r} codec "
@@ -2150,11 +2164,79 @@ def _unicode_error_text(exc: UnicodeError) -> str:
         and _codec_key(encoding) in _KNOWN_CODECS
         else ""
     )
-    text = f"{name}: {codec}cannot {verb} at {where}"
+    text = f"{codec}cannot {verb} at {where}"
     # `type(...) is str`, not isinstance: a str subclass can compare equal to a listed phrase.
     if type(reason) is str and reason in _FIXED_UNICODE_REASONS:
         text = f"{text}: {reason}"
     return text
+
+
+#: ``sys.exc_info()`` and ``LogRecord.exc_info`` in one shape: both arms of the stdlib's own alias.
+type ExcInfo = tuple[type[BaseException] | None, BaseException | None, TracebackType | None]
+
+
+def safe_traceback(ei: ExcInfo) -> str:
+    """``logging.Formatter.formatException(ei)``, except that every ``UnicodeError`` in the chain
+    prints the line :func:`safe_exc` would (vault BACKLOG #3185).
+
+    The stdlib renderer ends each exception with its ``str()``. For a ``UnicodeEncodeError`` that is
+    ``'ascii' codec can't encode character '\\xe9' in position 3``, a character of the message, and a
+    ``__cause__``, a ``__context__`` or an exception group member prints the same way. So this walks
+    the same chain the stdlib builds and replaces only those lines. Frames and every other line are
+    unchanged.
+
+    ``TracebackException._str`` is the stdlib's private name for that line. Python is pinned at 3.14
+    or later, and ``tests/test_unicode_error_log_paths.py`` fails if the name stops being read."""
+    import traceback  # here, not at the top: lens and code_sets import this module and rarely log
+
+    value, tb = ei[1], ei[2]
+    # `type(None)` and None are what the stdlib's own print_exception passes for an empty exc_info.
+    te = traceback.TracebackException(type(value), value, tb, compact=True)  # type: ignore[arg-type]
+    # The stdlib builds one TracebackException per exception it will print, so the two trees walk in
+    # step, and a link it chose not to print (a suppressed context, a repeat) is None on its side.
+    pending: list[tuple[Any, Any]] = [(te, value)]
+    while pending:
+        node, exc = pending.pop()
+        if node is None or exc is None:  # exc is None at the root of an empty exc_info
+            continue
+        if isinstance(exc, UnicodeError):
+            node._str = _unicode_error_detail(exc)  # the stdlib's private name: see docstring
+        pending.append((node.__cause__, exc.__cause__))
+        pending.append((node.__context__, exc.__context__))
+        if node.exceptions:  # set only for an exception group the stdlib will expand
+            pending.extend(zip(node.exceptions, exc.exceptions, strict=False))
+    return "".join(te.format()).removesuffix("\n")
+
+
+def _safe_arg(arg: object) -> object:
+    return safe_exc(arg) if isinstance(arg, UnicodeError) else arg
+
+
+def prepare_log_record(record: logging.LogRecord) -> None:
+    """The first step of every log filter chain here, the engine's and the tray's (vault BACKLOG
+    #3185). One function, so the two chains cannot drift apart (the defect BACKLOG #1478 records).
+
+    It renders ``exc_info`` into ``exc_text`` through :func:`safe_traceback` and clears ``exc_info``
+    unconditionally, so no formatter can re-render the raw exception past the scrub. It then replaces
+    a ``UnicodeError`` that is the record's ``msg`` or one of its ``args`` with :func:`safe_exc`'s
+    text. ``log.warning("unreadable: %s", exc)`` renders ``str(exc)``, which names the character or
+    byte the codec failed on, and ``%r`` renders ``.object``, the whole input. A single mapping
+    argument, the ``%(name)s`` form, is walked by value. Args with nothing to replace are left as
+    they are."""
+    if not record.exc_text and record.exc_info:
+        record.exc_text = safe_traceback(record.exc_info)
+    record.exc_info = None
+    if isinstance(record.msg, UnicodeError):
+        record.msg = safe_exc(record.msg)
+    # Every record passes here, so the common case is one exact-type test and a plain loop.
+    args = record.args
+    if type(args) is tuple:
+        for arg in args:
+            if isinstance(arg, UnicodeError):
+                record.args = tuple(_safe_arg(a) for a in args)
+                break
+    elif isinstance(args, Mapping) and any(isinstance(v, UnicodeError) for v in args.values()):
+        record.args = {k: _safe_arg(v) for k, v in args.items()}
 
 
 def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:

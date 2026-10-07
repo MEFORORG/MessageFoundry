@@ -54,6 +54,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
+from messagefoundry.redaction import safe_exc
+
 __all__ = [
     "CONTRACT_LATEST",
     "CONTRACT_V1",
@@ -445,7 +447,7 @@ def parse_module(path: str | Path, *, contract: int = CONTRACT_V1) -> list[dict[
     try:
         source = p.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        unreadable = f"{p}: cannot read ({exc})"
+        unreadable = f"{p}: cannot read ({safe_exc(exc)})"
     else:
         # posix slashes keep the emitted contract (and the committed L3 fixtures) OS-neutral.
         return parse_source(source, module=p.as_posix(), contract=contract)
@@ -2310,7 +2312,7 @@ def rewrite_module(path: str | Path, edit: dict[str, Any], *, contract: int = CO
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError too, so a non-UTF-8 module is the documented LensParseError rather than
         # an escape; raised after the handler, since its .object is the whole file (BACKLOG #2085).
-        unreadable = f"{p}: cannot read ({exc})"
+        unreadable = f"{p}: cannot read ({safe_exc(exc)})"
     else:
         return rewrite_source(source, edit, module=p.as_posix(), contract=contract)
     raise LensParseError(unreadable)

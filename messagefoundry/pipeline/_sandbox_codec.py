@@ -69,6 +69,7 @@ from messagefoundry.config.wiring import (
     handler_result_items,
 )
 from messagefoundry.parsing.message import Message, RawMessage
+from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "MAX_FRAME",
@@ -175,7 +176,8 @@ def decode_frame(body: bytes) -> tuple[dict[str, Any], list[str]]:
 
     The refusal is raised OUTSIDE the handler (BACKLOG #2085): a frame carries message bodies, and
     the caught ``JSONDecodeError``/``UnicodeDecodeError`` holds the text it failed on. Only its
-    rendered text is kept: a class, a position and at most the one offending byte's value."""
+    rendered text is kept, through ``safe_exc``: a class and a position, and for a decode error its
+    codec, never the offending byte (vault BACKLOG #3185)."""
     try:
         if len(body) < _LEN.size:
             raise SandboxCodecError("truncated sandbox frame (no header length)")
@@ -207,7 +209,7 @@ def decode_frame(body: bytes) -> tuple[dict[str, Any], list[str]]:
     except (ValueError, UnicodeDecodeError, RecursionError, struct.error) as exc:
         # RecursionError is NOT a ValueError, and it is exactly what a depth-100000 header raises;
         # without it the rejection would escape the fail-closed SandboxError contract.
-        malformed = f"malformed sandbox frame: {type(exc).__name__}: {exc}"
+        malformed = f"malformed sandbox frame: {safe_exc(exc)}"
     else:
         return header, blobs
     raise SandboxCodecError(malformed)
