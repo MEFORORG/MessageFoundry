@@ -418,6 +418,69 @@ def harden_crl_check(
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
 
 
+#: The flags under which OpenSSL consults the CRLs in a context's store. Without one, a CRL in the
+#: store is never read, so it cannot refuse a peer however stale it is.
+_CRL_CHECK_FLAGS = ssl.VERIFY_CRL_CHECK_LEAF | ssl.VERIFY_CRL_CHECK_CHAIN
+
+
+def record_ca_bundle_crls(ctx: ssl.SSLContext, ca_file: str | None, *, setting: str | None) -> None:
+    """Record the CRLs a CA bundle loaded into ``ctx``, so the expiry monitor judges them (vault
+    BACKLOG #2319). Never refuses: a CA file that loads today still loads.
+
+    **Recorded, not refused, because that matches what such a file does now.** ``cafile=`` loads
+    every CRL block in the CA file along with its certificates, and a hop that checks revocation
+    reads them: past its ``nextUpdate``, such a CRL refuses every peer under its issuer, as one from
+    a CRL setting would. Refusing the block would turn a CA file that starts today into one that
+    does not, so this records it instead, and the monitor raises ``crl_expiry`` on it. The row is
+    ``held-crl:`` and the CA path, since no CRL setting names that file.
+
+    **Only where the CRLs are live.** Call it on a context that loaded ``ca_file`` with
+    ``cafile=``, after :func:`harden_crl_check`, which turns revocation checking on. With no check
+    flag set, OpenSSL never reads a CRL in the store, so there is nothing to alert on and this
+    records nothing. A CA loaded by ``cadata=`` (the inbound listeners, OIDC, AD) holds no CRL from
+    its file at all, so those callers have nothing to pass. A hop that builds a fresh context per
+    connection, as the Postgres store does, should not call this, for the reason
+    :func:`harden_crl_check` gives for ``record_held_copy``.
+
+    **The bytes are read after the load,** because ``cafile=`` reads the file itself. A file
+    replaced in that instant would be recorded as the new version while the context holds the old.
+    That window is the one ``harden_crl_check`` refuses on for a CRL setting. A CA file has no such
+    check today, and the trust it loads would be wrong in that window too.
+
+    A file this cannot read or judge is logged and skipped: the CRL still loaded, as it did before,
+    and a log line that says the monitor cannot see it beats a refusal that stops the hop."""
+    if ca_file is None or not ctx.verify_flags & _CRL_CHECK_FLAGS:
+        return
+    from messagefoundry.config.loaded_crls import record_crl_load
+    from messagefoundry.pki import read_soonest_crl_facts
+
+    where = f"{setting} ({ca_file!r})" if setting else repr(ca_file)
+    try:
+        with open(ca_file, "rb") as fh:
+            pem = fh.read()
+    except OSError as exc:
+        logger.warning(
+            "the CA file %s could not be read again to find any CRL it carries, so the expiry "
+            "monitor will not judge one: %s",
+            where,
+            exc.strerror or type(exc).__name__,
+        )
+        return
+    if b"-----BEGIN X509 CRL-----" not in pem:
+        return  # the usual CA file: certificates only
+    try:
+        facts = read_soonest_crl_facts(pem, now=time.time())
+    except ValueError as exc:
+        logger.warning(
+            "the CA file %s carries a CRL block the expiry monitor cannot judge (%s). The hop "
+            "loaded it, and it will not be alerted on. Move the CRL to the hop's CRL setting",
+            where,
+            exc,
+        )
+        return
+    record_crl_load(ctx, ca_file, pem, facts, setting=setting, ca_bundle=True)
+
+
 def crl_scratch_context(crl_file: str, blocks: Sequence[CrlBlock], *, label: str) -> ssl.SSLContext:
     """A fresh context holding only what OpenSSL loads from ``crl_file``, and proof that it loaded
     exactly the CRLs ``blocks`` describes (BACKLOG #299). Raises ``ValueError`` when not.
@@ -2738,6 +2801,8 @@ def build_verifying_client_context(
     # answer for a different store than the one the handshake uses.
     if anchor.crl_file is not None:
         harden_crl_check(ctx, anchor.crl_file, setting="[tls].crl_file")
+        # Vault BACKLOG #2319: a CRL inside the CA file is live now that the check is on.
+        record_ca_bundle_crls(ctx, anchor.cafile, setting=anchor.cafile_setting)
     return ctx
 
 
@@ -2792,6 +2857,7 @@ def build_anchored_https_handler(
         # CRL still loads last, against the final trust store.
         if anchor.crl_file is not None:
             harden_crl_check(ctx, anchor.crl_file, setting="[tls].crl_file")
+            record_ca_bundle_crls(ctx, anchor.cafile, setting=anchor.cafile_setting)
         return handler
     ctx = build_verifying_client_context(anchor)
     ctx.set_alpn_protocols(_URLLIB_HTTPS_ALPN_PROTOCOLS)

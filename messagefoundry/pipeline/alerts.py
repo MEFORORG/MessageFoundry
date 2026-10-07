@@ -26,8 +26,10 @@ __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
     "AlertSink",
+    "HELD_COPY_NOTE",
     "LoggingAlertSink",
     "config_changed_detail",
+    "crl_expiry_detail",
     "intake_pause_detail",
 ]
 
@@ -71,6 +73,25 @@ def config_changed_detail(
         f"{previous_fingerprint[:12]} (node {baseline_node or 'unknown'}, action "
         f"{baseline_action}, time {baseline_at or 'unknown'})"
     )
+
+
+#: The words that mark a ``crl_expiry`` date as a held copy's (vault BACKLOG #2319). One spelling,
+#: so the log line, the notifier's ``detail`` and a test all say the same thing.
+HELD_COPY_NOTE = "This date is the nextUpdate of a copy a running TLS hop holds, not of the file."
+
+
+def crl_expiry_detail(*, held_copy: bool, detail: str, shared_with: tuple[str, ...]) -> str:
+    """The PHI-free note both sinks add to a ``crl_expiry`` alert (vault BACKLOG #2319), or ``""``
+    when the date is the file's and no other row names the file.
+
+    ``detail`` is the scan's own account of the held copy and already names any shared rows, so the
+    shared rows are spelled out here only when the scan gave no detail."""
+    parts = [HELD_COPY_NOTE] if held_copy else []
+    if detail:
+        parts.append(detail)
+    elif shared_with:
+        parts.append(f"The same file also serves {', '.join(shared_with)}.")
+    return " ".join(parts)
 
 
 class AlertSink(Protocol):
@@ -205,11 +226,31 @@ class AlertSink(Protocol):
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...
 
-    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+    def crl_expiry(
+        self,
+        name: str,
+        *,
+        path: str,
+        not_after: str,
+        days_remaining: int,
+        held_copy: bool = False,
+        detail: str = "",
+        shared_with: tuple[str, ...] = (),
+    ) -> None:
         """A configured CRL is expired or within the warn window (BACKLOG #1005). ``name`` labels
         the inbound connection, or the setting that names the CRL, such as ``"tls.crl_file"`` for
         the CRLs on outbound hops (BACKLOG #299); ``path`` is the PEM; ``not_after`` is the ISO
         ``nextUpdate``; ``days_remaining`` is negative once expired.
+
+        **Whose date it is (vault BACKLOG #2319).** ``held_copy`` is True when ``not_after`` is not
+        the file's: it is the ``nextUpdate`` of an older copy that a running TLS hop still holds,
+        which lapses before the file does. Replacing the file again does not move that date; the
+        reload has to apply the file to the hop, or a restart has to rebuild it. ``detail`` then says
+        which settings hold that copy and what to do, in the words the scan logs. ``shared_with``
+        names the other monitored settings or connections whose rows name the same file. A held
+        copy is matched by its file, not its hop, so it is reported under every row naming that
+        file, and ``detail`` says which hop holds it. All three carry config metadata only: no key
+        material and no message content.
 
         **SEPARATE FROM :meth:`cert_expiry` BECAUSE THE REMEDY AND THE BLAST RADIUS DIFFER.** An
         expiring server certificate degrades one identity and is fixed by reissuing it. An expired
@@ -649,7 +690,28 @@ class LoggingAlertSink:
                 not_after,
             )
 
-    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+    def crl_expiry(
+        self,
+        name: str,
+        *,
+        path: str,
+        not_after: str,
+        days_remaining: int,
+        held_copy: bool = False,
+        detail: str = "",
+        shared_with: tuple[str, ...] = (),
+    ) -> None:
+        # Vault BACKLOG #2319: say whose date this is before the line that gives it, so the line
+        # below is not read as the file's. At the same level, since a held copy's lapse is the
+        # outage just as the file's would be.
+        if note := crl_expiry_detail(held_copy=held_copy, detail=detail, shared_with=shared_with):
+            log.log(
+                logging.ERROR if days_remaining < 0 else logging.WARNING,
+                "crl_expiry: %r CRL %s: %s",
+                name,
+                path,
+                note,
+            )
         # An EXPIRED crl fails every handshake it verifies, so it is an ERROR rather than a warning:
         # the hop is effectively down, not merely approaching a deadline (BACKLOG #1005). The wording
         # names no direction, because the same CRL may guard a listener or an outbound hop (#299):

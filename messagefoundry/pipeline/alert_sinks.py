@@ -53,7 +53,11 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
-from messagefoundry.pipeline.alerts import config_changed_detail, intake_pause_detail
+from messagefoundry.pipeline.alerts import (
+    config_changed_detail,
+    crl_expiry_detail,
+    intake_pause_detail,
+)
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
@@ -931,14 +935,40 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
-    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+    def crl_expiry(
+        self,
+        name: str,
+        *,
+        path: str,
+        not_after: str,
+        days_remaining: int,
+        held_copy: bool = False,
+        detail: str = "",
+        shared_with: tuple[str, ...] = (),
+    ) -> None:
         """BACKLOG #1005. Routed exactly like :meth:`cert_expiry` -- same fan-out, same redaction --
         because a CRL path is config metadata and carries no PHI. Kept a SEPARATE method because an
         expired CRL fails every handshake it verifies, inbound or outbound, rather than degrading one
-        identity, so an operator filtering on it is asking a different question."""
-        self.cert_expiry(
-            f"{name} (CRL)", path=path, not_after=not_after, days_remaining=days_remaining
-        )
+        identity, so an operator filtering on it is asking a different question.
+
+        Vault BACKLOG #2319: a date that is a running hop's held copy says so. The event gains
+        ``held_copy``, ``shared_with`` and a ``detail`` only when there is something to say, so a
+        plain CRL alert's payload is what it was. ``detail`` is also what the alert instance's
+        reason column shows."""
+        event: dict[str, Any] = {
+            "type": "cert_expiry",
+            "connection": f"{name} (CRL)",
+            "path": path,
+            "not_after": not_after,
+            "days_remaining": days_remaining,
+        }
+        if held_copy:
+            event["held_copy"] = True
+        if shared_with:
+            event["shared_with"] = list(shared_with)
+        if note := crl_expiry_detail(held_copy=held_copy, detail=detail, shared_with=shared_with):
+            event["detail"] = note
+        self._emit(event)
 
     def secret_rotation_due(
         self,

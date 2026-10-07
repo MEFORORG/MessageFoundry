@@ -72,6 +72,7 @@ class _RecordingSink(LoggingAlertSink):
     def __init__(self) -> None:
         self.cert_calls: list[tuple[str, str, str, int]] = []
         self.crl_calls: list[tuple[str, str, str, int]] = []
+        self.crl_notes: list[tuple[bool, str, tuple[str, ...]]] = []
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         pass
@@ -85,8 +86,20 @@ class _RecordingSink(LoggingAlertSink):
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
         self.cert_calls.append((name, path, not_after, days_remaining))
 
-    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+    def crl_expiry(
+        self,
+        name: str,
+        *,
+        path: str,
+        not_after: str,
+        days_remaining: int,
+        held_copy: bool = False,
+        detail: str = "",
+        shared_with: tuple[str, ...] = (),
+    ) -> None:
         self.crl_calls.append((name, path, not_after, days_remaining))
+        # Vault BACKLOG #2319: kept apart, so every existing four-field assertion still reads.
+        self.crl_notes.append((held_copy, detail, shared_with))
 
     def secret_rotation_due(
         self,

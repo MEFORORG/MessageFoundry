@@ -32,7 +32,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from messagefoundry.config.loaded_crls import HeldCrlSnapshot, crl_fingerprint
+from messagefoundry.config.loaded_crls import HeldCrlSnapshot, crl_fingerprint, crl_path_key
 from messagefoundry.config.loaded_crls import snapshot as held_crl_snapshot
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -91,6 +91,12 @@ class CertCheck:
     not_after_iso: str
     days_remaining: int
     kind: str = "cert"
+    #: True when ``not_after_iso`` is not the file's but an older copy's that a running hop holds
+    #: and that lapses first (vault BACKLOG #2319). Only ever True for a CRL.
+    held_copy: bool = False
+    #: What the scan found about held copies of this CRL, and what to do, or ``""`` when no running
+    #: hop holds a copy that differs from the file. Config metadata only, no PHI.
+    detail: str = ""
 
     @property
     def expired(self) -> bool:
@@ -316,19 +322,28 @@ class CertExpiryRunner:
         now = self._clock() if now is None else now
         held = self._held_snapshot()
         checks: list[CertCheck] = []
-        for cert in self._rows(held):
+        rows = self._rows(held)
+        sharing = _rows_by_crl_file(rows)
+        for cert in rows:
             check = self._inspect(cert, now, held)
             if check is None:
                 continue
             checks.append(check)
             if check.days_remaining <= self._settings.warn_days:
                 if check.kind == "crl":
+                    # Vault BACKLOG #2319: the other rows naming this file. A held copy is matched
+                    # by its file, not its hop, so it is reported under each of them.
+                    shared = sharing.get(crl_path_key(check.path), ())
+                    shared_with = tuple(label for label in shared if label != check.label)
                     try:
                         self._alert_sink.crl_expiry(
                             check.label,
                             path=check.path,
                             not_after=check.not_after_iso,
                             days_remaining=check.days_remaining,
+                            held_copy=check.held_copy,
+                            detail=_with_shared(check.detail, shared_with),
+                            shared_with=shared_with,
                         )
                     except Exception:
                         log.warning(
@@ -416,6 +431,30 @@ class CertExpiryRunner:
         )
 
 
+def _rows_by_crl_file(rows: Sequence[MonitoredCert]) -> dict[str, tuple[str, ...]]:
+    """The labels of the CRL rows naming each file, keyed as held copies are (vault BACKLOG #2319).
+
+    Several settings or connections can name one CRL file, and each gets its own row, since each
+    hop depends on it. A held copy is matched by its file, so each of those rows reports it."""
+    by_file: dict[str, list[str]] = {}
+    for row in rows:
+        if row.kind == "crl":
+            labels = by_file.setdefault(crl_path_key(row.path), [])
+            if row.label not in labels:
+                labels.append(row.label)
+    return {key: tuple(labels) for key, labels in by_file.items()}
+
+
+def _with_shared(detail: str, shared_with: tuple[str, ...]) -> str:
+    """``detail`` with a sentence naming the other rows of the same file, when it has both."""
+    if not detail or not shared_with:
+        return detail
+    return (
+        f"{detail} The same file also serves {', '.join(shared_with)}, whose rows report the same "
+        "held copy, since a copy is matched by its file and not by the hop holding it."
+    )
+
+
 def held_crl_label(path: str) -> str:
     """The alert label for a CRL file a live hop holds that no configured row names (BACKLOG #299).
 
@@ -445,6 +484,7 @@ def _judge_crl(
     silences the check while a hop still holds a copy of it. ``None`` only when nothing can be judged.
     A failure judging the held copies is logged and leaves the file's own verdict standing."""
     stale: list[CrlFacts] = []
+    detail = ""
     try:
         copies = held.copies(cert.path)
         fingerprint = crl_fingerprint(pem) if copies and pem is not None else None
@@ -458,6 +498,14 @@ def _judge_crl(
                     "whose file cannot be read",
                     "Restore a readable CRL file before restarting: the engine refuses to "
                     "start on one it cannot read",
+                )
+            elif all(copy.ca_bundle for copy in copies):
+                # Vault BACKLOG #2319: the reload pass never applies a CA bundle, so no wait helps,
+                # and a CA file whose CRL was moved out still starts.
+                why, remedy = (
+                    "that it loaded from its CA file, which the engine does not reload",
+                    "Restart the engine to apply the CA file. A CRL given in the hop's CRL "
+                    "setting instead is applied without a restart",
                 )
             elif file_facts is None:
                 why, remedy = (
@@ -478,6 +526,12 @@ def _judge_crl(
                     f"{RELOAD_INTERVAL_SECONDS:g} seconds, unless it refuses the file and logs why",
                 )
             holders = sorted({copy.setting or "an unnamed setting" for copy in copies})
+            # Vault BACKLOG #2319: the same account for the alert, which the log line below gives
+            # only to the log. The date is the alert's own not_after, so it is not repeated here.
+            detail = (
+                f"A running TLS hop ({', '.join(holders)}) still holds a copy of this CRL {why}. "
+                f"{remedy}."
+            )
             log.warning(
                 "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d load(s), "
                 "from %s). The hop keeps the copy it read when it built its context; the soonest "
@@ -509,4 +563,8 @@ def _judge_crl(
         not_after_iso=facts.next_update_iso,
         days_remaining=facts.days_remaining,
         kind="crl",
+        # The file comes first in ``judged``, and soonest_crl keeps the first of a tie, so a held
+        # copy that lapses with the file does not take the date from it (vault BACKLOG #2319).
+        held_copy=facts is not file_facts,
+        detail=detail if stale else "",
     )

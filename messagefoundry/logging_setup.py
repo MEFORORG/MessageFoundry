@@ -49,6 +49,7 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
     harden_verify_flags,
     narrow_to_approved_suites,
+    record_ca_bundle_crls,
 )
 
 # The escape table and this function were DEFINED here until BACKLOG #1591 and now live in
@@ -649,6 +650,8 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
             # and any client chain, so harden_crl_check's "the CRL really landed" assertion answers for
             # the final trust store.
             harden_crl_check(ctx, forward.tls_crl_file, setting="[logging].forward_tls_crl_file")
+            # Vault BACKLOG #2319: the CA file loaded by cafile= above, so a CRL in it is live too.
+            record_ca_bundle_crls(ctx, forward.tls_ca_file, setting="[logging].forward_tls_ca_file")
         # #1498: strict RFC 5280 path validation. An ASSERTION here rather than a fix -- this builder
         # uses create_default_context, which already sets the flag. The reasoning and both measured arms
         # live at tests/test_hop_refusal_revocation.py::

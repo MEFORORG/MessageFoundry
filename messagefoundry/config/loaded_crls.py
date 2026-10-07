@@ -10,9 +10,12 @@ replaced an expiring CRL would have seen the ``crl_expiry`` alert clear while th
 the old copy, which would go on to lapse and refuse every peer. The monitor and the hop disagreed.
 
 :func:`~messagefoundry.config.tls_policy.harden_crl_check` loads the CRL settings into a context, and
-it records each load here. That covers at least every CRL *setting* found on 2026-09-28. It does not
-cover a CRL block placed inside a CA bundle, which ``load_verify_locations`` loads with the CA and
-nothing here records. The monitor takes one :func:`snapshot` per pass, asks it for the copies live
+it records each load here. That covers at least every CRL *setting* found on 2026-09-28. A CRL block
+inside a CA bundle is recorded too, where the CA loads by ``cafile=`` and the hop checks revocation
+(:func:`~messagefoundry.config.tls_policy.record_ca_bundle_crls`, vault BACKLOG #2319). Such a copy
+is marked ``ca_bundle``, because no reload applies a CA bundle: only a restart replaces it. A CA
+loaded by ``cadata=`` holds no CRL from its file, so there is nothing to record. The monitor takes
+one :func:`snapshot` per pass, asks it for the copies live
 contexts still hold, and judges the soonest of those and the file. A held copy of a file no monitor
 row names, such as an inbound ``tls_crl_file`` given as a deferred ``env()`` value, gets its own row.
 So the alert stays up until every context holding the old copy is gone or has been brought current.
@@ -69,6 +72,7 @@ __all__ = [
     "ReloadRefusal",
     "clear_reload_refusal",
     "crl_fingerprint",
+    "crl_path_key",
     "has_held_copies",
     "held_contexts",
     "held_crl_copies",
@@ -106,6 +110,10 @@ class HeldCrl:
     configured_path: str | None = None
     #: How many reloads this context has taken for this file. Each one stays in its trust store.
     reloads: int = 0
+    #: True when the CRL came from a CA bundle, a CRL block inside the hop's CA file, rather than
+    #: from a CRL setting (vault BACKLOG #2319). The reload pass does not apply a CA bundle, so only
+    #: a restart replaces this copy, and the expiry monitor says so.
+    ca_bundle: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,6 +148,12 @@ def _path_key(path: str | os.PathLike[str]) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
 
 
+def crl_path_key(path: str | os.PathLike[str]) -> str:
+    """The form in which two spellings of one CRL path compare equal here, for a caller that must
+    match paths the way held copies are matched (vault BACKLOG #2319)."""
+    return _path_key(path)
+
+
 def crl_fingerprint(pem: bytes) -> tuple[int, int]:
     """A cheap in-process identity for a CRL file's bytes; the module docstring says why it suffices."""
     return (len(pem), hash(pem))
@@ -153,10 +167,12 @@ def record_crl_load(
     *,
     setting: str | None = None,
     blocks: tuple[CrlBlock, ...] = (),
+    ca_bundle: bool = False,
 ) -> None:
     """Record that ``ctx`` now holds the CRL file ``crl_file``, whose judged bytes were ``pem``,
     whose soonest-expiring block is ``facts`` and whose blocks are ``blocks``. Called by
-    ``harden_crl_check`` after a load succeeds."""
+    ``harden_crl_check`` after a load succeeds, and with ``ca_bundle`` by
+    ``record_ca_bundle_crls`` for the CRLs a CA file carried."""
     held = HeldCrl(
         path_key=_path_key(crl_file),
         fingerprint=crl_fingerprint(pem),
@@ -165,6 +181,7 @@ def record_crl_load(
         setting=setting,
         blocks=blocks,
         configured_path=crl_file,
+        ca_bundle=ca_bundle,
     )
     with _LOCK:
         loads = _HELD.get(ctx, ())
@@ -189,9 +206,16 @@ def _merged(old: HeldCrl, new: HeldCrl) -> HeldCrl:
 
     The file as last read is ``new``'s, so its fingerprint stands. The soonest lapse of the two
     counts, as across the blocks of one file. The blocks are both loads', since a reload must
-    supersede every CRL the context holds; if either load's are unknown, so are the union's."""
+    supersede every CRL the context holds; if either load's are unknown, so are the union's.
+
+    One file loaded both as a CRL setting and as the CA bundle keeps the CRL setting's record
+    alone (vault BACKLOG #2319). The CRL setting's load judged the same file and recorded its
+    blocks, so the reload can still apply it; merging in the bundle's unknown blocks would make
+    every reload of that file refuse."""
     from messagefoundry.pki import soonest_crl
 
+    if old.ca_bundle != new.ca_bundle:
+        return new if old.ca_bundle else old
     known = old.blocks and new.blocks
     blocks = (*old.blocks, *(b for b in new.blocks if b not in old.blocks)) if known else ()
     return HeldCrl(
