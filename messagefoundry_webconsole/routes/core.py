@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
@@ -56,7 +55,6 @@ from .._auth import (
     allow_reauth_attempt,
     assert_not_cross_site,
     assert_same_origin,
-    carry_across_reauth,
     clear_session_cookie,
     confined_before_its_factor,
     consume_continuation,
@@ -76,7 +74,6 @@ from .._auth import (
     session_token,
     set_session_cookie,
     spend_ui_action_step_up,
-    take_carried,
     webauthn_rp,
 )
 from .._html import CSP_PROBE_SRC
@@ -336,10 +333,6 @@ _RESEND_NOTICES: dict[int, str] = {
 #: JSON API, which has no continuation to carry.
 _RESEND_NAME_MAX = 200
 
-#: An idempotency key as this console mints one (``uuid4().hex``): the only shape a refused
-#: resend POST hands back to its confirm page (vault BACKLOG #2625).
-_RESEND_KEY_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
-
 
 def _resend_confirm_next(request: Request) -> str:
     """Where a resend POST refused for its proof sends the browser: the confirm page, carrying
@@ -348,30 +341,6 @@ def _resend_confirm_next(request: Request) -> str:
     continuation is dropped SILENTLY. Measured."""
     path = f"/ui/messages/{_seg(request.path_params['message_id'])}/resend-confirm?"
     return path + urlencode({k: request.query_params.get(k, "") for k in ("to", "source")})
-
-
-def _resend_carry_name(message_id: str, to: str, source: str) -> str:
-    """The name a refused resend's key is carried under: one message, one target, one source."""
-    return "resend\x00" + "\x00".join((message_id, to, source))
-
-
-def _carry_resend_key(request: Request) -> None:
-    """Hand a resend POST refused for its proof its own idempotency key back, server-side.
-
-    Since vault BACKLOG #2625 the POST spends a single-use proof, so a refreshed outcome page is
-    refused at the gate before the idempotent handler can call it a duplicate. The confirm page the
-    re-auth returns to takes this key instead of minting one, so a resend that already ran answers
-    "already resent" rather than queuing a second delivery. A key that never ran is unused, so
-    carrying it costs nothing. It never rides the URL: a crafted link could then preload a spent
-    key, and the operator's resend would silently do nothing."""
-    key = request.query_params.get("idempotency_key", "")
-    if re.fullmatch(_RESEND_KEY_PATTERN, key):
-        name = _resend_carry_name(
-            request.path_params["message_id"],
-            request.query_params.get("to", ""),
-            request.query_params.get("source", ""),
-        )
-        carry_across_reauth(request, name, key)
 
 
 def _csp_report_bodies(doc: object) -> list[dict[str, object]] | None:
@@ -1138,7 +1107,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.get("/ui/messages/{message_id}/resend-confirm", response_class=HTMLResponse)
     async def ui_message_resend_confirm(
         message_id: str,
-        request: Request,
         to: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
         source: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
         _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
@@ -1146,23 +1114,37 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # A fresh per-render idempotency token: a double-submit of THIS rendered confirm is the
         # ADR 0090 §4 no-op, while re-opening the confirm page mints a new one and is a genuine
         # second resend. It rides the POST's query rather than its body, which is what keeps that
-        # POST body-less. The one exception is the key a refused POST of this session carried
-        # back server-side (``_carry_resend_key``); the query string can never set it.
-        carried = take_carried(request, _resend_carry_name(message_id, to, source))
-        key = carried or uuid4().hex
-        return HTMLResponse(pages.message_resend_confirm(message_id, to, source, key))
+        # POST body-less. It is always minted here: a key in this page's own query is ignored, so
+        # a crafted link cannot preload a spent one and turn the operator's resend into a no-op.
+        return HTMLResponse(pages.message_resend_confirm(message_id, to, source, uuid4().hex))
 
-    # BOTH OUTCOMES ARE ANSWERED IN PLACE, not with a 303 to the message detail page. That page is
-    # `require_ui(MESSAGES_VIEW_RAW)`, so redirecting there handed a resend-without-read role a raw
-    # JSON 403 in place of every outcome — success and refusal alike — which is exactly the role the
-    # permission choice above exists to serve. Rendering here costs that role nothing it does not
-    # already hold.
+    # The resend OUTCOME, reached by the 303 the POST answers a completed resend with
+    # (post-redirect-get, vault BACKLOG #2625). A refresh re-renders this GET and sends nothing.
+    # Before #2625 the outcome rendered in place on the POST, which was refresh-safe only because
+    # a repeat of the same key is ADR 0090 §4's no-op; the POST now spends a single-use proof, so
+    # a repeat meets the gate instead and goes through /ui/reauth to a confirm page with a fresh key.
     #
-    # Re-POSTing this page on a browser refresh does not queue a second delivery, which is why the
-    # usual post-redirect-get is not needed: the idempotency key is IN the URL, so a repeat is ADR
-    # 0090 §4's no-op. Since vault BACKLOG #2625 the repeat first meets the gate, whose proof the
-    # first POST spent, so it goes through /ui/reauth; ``_carry_resend_key`` hands the key back to
-    # the confirm page server-side, and the resubmit still says "already resent".
+    # Same permission as the POST and nothing more, and it reads no message: the page echoes the
+    # outcome the POST put in the query, through the escaping builders. A crafted link can therefore
+    # show a "queued" page for a resend that never ran. It queues nothing, the audit row is the
+    # record, and the detail page is where the delivery shows.
+    @app.get("/ui/messages/{message_id}/resend-done", response_class=HTMLResponse)
+    async def ui_message_resend_done(
+        message_id: str,
+        to: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
+        source: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
+        duplicate: bool = Query(False),
+        _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
+    ) -> HTMLResponse:
+        return HTMLResponse(pages.message_resend_done(message_id, to, source, duplicate=duplicate))
+
+    # NEITHER OUTCOME GOES TO THE MESSAGE DETAIL PAGE. That page is `require_ui(MESSAGES_VIEW_RAW)`,
+    # so redirecting there handed a resend-without-read role a raw JSON 403 in place of every
+    # outcome — success and refusal alike — which is exactly the role the permission choice above
+    # exists to serve. A refusal re-renders the confirm page in place; a completed resend 303s to
+    # the resend-done GET above, which stands on messages:resend alone. That post-redirect-get is
+    # what keeps a refresh from re-POSTing (vault BACKLOG #2625: a re-POST would meet the spent
+    # proof, not the idempotent handler).
     @app.post("/ui/messages/{message_id}/resend", response_class=HTMLResponse)
     async def ui_message_resend(
         message_id: str,
@@ -1177,9 +1159,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 STEP_UP_ACTION_MESSAGE_RESEND,
                 Permission.MESSAGES_RESEND,
                 # A missing proof re-opens the CONFIRM page, never this POST path, carrying the
-                # selection; the key goes back server-side (``_carry_resend_key`` says why).
+                # selection. The stale key is not carried: the confirm page mints a fresh one.
                 reauth_next=_resend_confirm_next,
-                on_refusal=_carry_resend_key,
             )
         ),
     ) -> Response:
@@ -1220,10 +1201,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return _refused(notice, status=exc.status_code)
         # `duplicate` means the key was already used and NOTHING was queued (ADR 0090 §4). Reporting
         # it as a send would be the same lie as answering a refusal with the success response.
-        return HTMLResponse(
-            pages.message_resend_done(
-                message_id, result.to, result.source, duplicate=(result.status == "duplicate")
-            )
+        outcome = urlencode(
+            {
+                "to": result.to,
+                "source": result.source,
+                "duplicate": "true" if result.status == "duplicate" else "false",
+            }
+        )
+        return RedirectResponse(
+            f"/ui/messages/{_seg(message_id)}/resend-done?{outcome}", status_code=303
         )
 
     # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). GET renders the editor (a COPY of the raw); the

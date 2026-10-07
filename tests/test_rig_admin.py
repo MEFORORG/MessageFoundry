@@ -360,7 +360,7 @@ def test_a_client_refused_the_held_session_signs_in_again_at_its_own_node(
 
 
 def test_the_step_up_handler_re_proves_on_a_session_of_its_own(
-    monkeypatch: pytest.MonkeyPatch,
+    fresh_state: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Vault BACKLOG #2625: the reload takes a proof bound to its action, which no sign-in mints.
     So the handler signs in to a PRIVATE session (never the held one, which every other client

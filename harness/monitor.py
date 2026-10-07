@@ -357,6 +357,11 @@ class MonitorPanel(QWidget):
 
     def _disconnect(self) -> None:
         self._stop_poller()
+        # Stop the panels' background readers first, so none is mid-call on a closed client and no
+        # late result reaches a widget that is about to go.
+        for panel in (self._messages, self._detail):
+            if panel is not None:
+                panel.stop()
         if self._poll_client is not None:
             self._poll_client.close()
             self._poll_client = None

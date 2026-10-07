@@ -34,9 +34,10 @@ this line.**
   for it, which it spends. The re-auth page mints that proof when it continues to the action's
   confirm page, editor or auto-retry. The message editor asks for it before it opens, and the
   resubmit spends it only after its own input checks pass. A refusal from the engine comes after the
-  spend, so the next submit asks again and re-opens the editor. A refreshed resend outcome page goes
-  through the re-auth with its idempotency key held server-side (never in the URL), so it is still
-  answered as a duplicate. Upload resend also needs `messages:edit`, on the confirm page and on the POST, and the browse page offers
+  spend, so the next submit asks again and re-opens the editor. A completed resend now answers with
+  a 303 to a new GET outcome page, `/ui/messages/{id}/resend-done` (post-redirect-get), so a
+  refresh re-renders the outcome and sends nothing. The confirm page always mints its own
+  idempotency key; one in its query string is ignored. Upload resend also needs `messages:edit`, on the confirm page and on the POST, and the browse page offers
   its form only to a role that holds it. Seam change:
   `AuthService.holds_action_step_up` is new, and the console imports five new step-up action
   constants. (vault BACKLOG #2625)

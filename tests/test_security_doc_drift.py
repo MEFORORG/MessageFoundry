@@ -94,7 +94,8 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # BACKLOG #2331 added one JSON route: GET /users/{user_id}/federated-identity, users:manage.
 _ROUTES_DEFAULT = 116
 _ROUTES_WITH_DOCS = 120
-_ROUTES_WITH_UI = 240
+# Vault BACKLOG #2625 added one console route: GET /ui/messages/{message_id}/resend-done.
+_ROUTES_WITH_UI = 241
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate

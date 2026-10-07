@@ -325,12 +325,18 @@ async def _post_resend(
     key: str = "k1",
     mint: bool = True,
 ) -> httpx.Response:
+    """POST the resend and, when it completed, follow its 303 to the outcome page, as a browser
+    does (post-redirect-get, vault BACKLOG #2625). Any other answer is returned as it came."""
     if mint:
         await _mint(c, mid)
-    return await c.post(
+    posted = await c.post(
         f"/ui/messages/{mid}/resend?to={to}&source={source}&idempotency_key={key}",
         headers={"Sec-Fetch-Site": "same-origin"},
     )
+    location = posted.headers.get("location", "")
+    if posted.status_code == 303 and location.startswith(f"/ui/messages/{mid}/resend-done?"):
+        return await c.get(location)
+    return posted
 
 
 async def test_the_console_resend_queues_a_delivery_and_audits_it(
@@ -545,13 +551,11 @@ async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engin
         assert "idempotency_key" not in nxt
 
 
-async def test_a_refreshed_resend_is_still_a_duplicate_after_the_re_auth(
-    engine: Engine, tmp_path: Path
-) -> None:
-    """Vault BACKLOG #2625. The resend POST spends a single-use proof, so a refresh of the outcome
-    page is refused at the gate before the idempotent handler sees it. The re-auth must carry the
-    first POST's key back, or the confirm page mints a fresh one and the resubmit queues a SECOND
-    delivery to the partner. The audit row count is the control: one real resend, one row."""
+async def test_a_refreshed_outcome_page_sends_nothing(engine: Engine, tmp_path: Path) -> None:
+    """Vault BACKLOG #2625. The resend POST spends a single-use proof, so a refresh that RE-POSTed
+    would meet the gate, not the idempotent handler, and come back through the re-auth to a confirm
+    page with a fresh key. So a completed resend answers 303 to a GET outcome page, and a refresh
+    re-renders that page. The audit row count is the control: one real resend, one row."""
     engine.add_registry(_registry(tmp_path))
     await engine.start()
     service = await _service(engine)
@@ -559,22 +563,17 @@ async def test_a_refreshed_resend_is_still_a_duplicate_after_the_re_auth(
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _login(c, "op")
-        first = await _post_resend(c, mid, key="refresh-key-1")
-        assert first.status_code == 200 and "Resend queued" in first.text
-        # The browser's refresh: the same POST, the same key, and no proof left.
-        refreshed = await _post_resend(c, mid, key="refresh-key-1", mint=False)
-        assert refreshed.status_code == 303
-        nxt = unquote(dict(parse_qsl(urlsplit(refreshed.headers["location"]).query))["next"])
-        assert "idempotency_key" not in nxt  # the key goes back server-side, never in the URL
         await _mint(c, mid)
-        confirm = await c.get(nxt)
-        assert confirm.status_code == 200
-        assert "idempotency_key=refresh-key-1" in confirm.text
-        again = await _post_resend(c, mid, key="refresh-key-1")
-        assert again.status_code == 200 and "Already resent" in again.text
-        # Single use: opening the confirm page again mints a fresh key, a genuine second resend.
-        reopened = await c.get(nxt)
-        assert "idempotency_key=refresh-key-1" not in reopened.text
+        posted = await c.post(
+            f"/ui/messages/{mid}/resend?to=OB2&source=archive&idempotency_key=k1",
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert posted.status_code == 303
+        done = posted.headers["location"]
+        assert done.startswith(f"/ui/messages/{mid}/resend-done?")
+        for _ in range(2):  # the first view, then the browser's refresh
+            page = await c.get(done)
+            assert page.status_code == 200 and "Resend queued" in page.text
     rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
     assert len(rows) == 1
 

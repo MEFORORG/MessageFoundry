@@ -36,6 +36,9 @@ GET /ui/messages/{message_id}/parse-tree	message_id	path	-	-
 GET /ui/messages/{message_id}/resend-confirm	message_id	path	-	-
 GET /ui/messages/{message_id}/resend-confirm	source	query	-	-
 GET /ui/messages/{message_id}/resend-confirm	to	query	-	-
+GET /ui/messages/{message_id}/resend-done	message_id	path	-	-
+GET /ui/messages/{message_id}/resend-done	source	query	-	-
+GET /ui/messages/{message_id}/resend-done	to	query	-	-
 GET /ui/messages/{message_id}/summary	message_id	path	-	-
 GET /ui/reauth	next	query	-	-
 GET /ui/roles/{role_id}/edit	role_id	path	-	-
