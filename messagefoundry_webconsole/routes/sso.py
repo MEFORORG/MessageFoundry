@@ -69,12 +69,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # fixation, ADR 0068 §9 threat model).
         mode = request.headers.get("Sec-Fetch-Mode")
         if mode is not None and mode != "navigate":
-            await auth.audit_kerberos_reject("non_navigation_fetch")
+            await auth.audit_kerberos_reject("non_navigation_fetch", client=client)
             return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
         try:
             token_bytes = base64.b64decode(header[len("Negotiate ") :], validate=True)
         except (binascii.Error, ValueError):
-            await auth.audit_kerberos_reject("malformed_token")
+            await auth.audit_kerberos_reject("malformed_token", client=client)
             return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
         # NO STEP-UP WINDOW AT BIRTH: the SSO proof is AMBIENT, so the first window-gated action
         # asks for a step-up at /ui/reauth (a live directory re-bind), unless the holder has already

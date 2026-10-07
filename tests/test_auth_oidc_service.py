@@ -1793,8 +1793,10 @@ async def _callback(
     client: str = "127.0.0.1",
 ) -> LoginOutcome:
     """Drive the callback leg the way ``GET /ui/oidc/callback`` does: stage a flow, then redeem it."""
+    # The start leg comes from a different address, so a refusal row that recorded the staged
+    # flow's address instead of the callback's would fail an assertion on ``client``.
     staged_id, url = await service.begin_oidc_login(
-        client=client, public_origin="https://ops.example"
+        client="198.51.100.1", public_origin="https://ops.example"
     )
     staged_state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
     return await service.complete_oidc_login(

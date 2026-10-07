@@ -2543,14 +2543,12 @@ class AuthService:
         """Record a failed boot-time SPNEGO acceptor preflight (app lifespan, ADR 0068 §9)."""
         self._kerberos_unavailable_reason = reason
 
-    async def audit_kerberos_reject(self, reason: str) -> None:
-        """AUTH-K-AUDIT for route-level SSO rejects that never reach ``authenticate_kerberos``
-        (cross-site hygiene, malformed base64) — every reject path of a Windows-SSO attempt must be
-        visible to a defender. Rate-limit exhaustion is a log line at the route, never a row.
-
-        AN OPEN GAP, NOT A DESIGN: the route holds the client address and this seam does not take
-        it yet, so the row's ``client`` is NULL though a remote caller was present."""
-        await self._directory_reject_audit("<kerberos>", "kerberos", reason, client=None)
+    async def audit_kerberos_reject(self, reason: str, *, client: str | None) -> None:
+        """AUTH-K-AUDIT for route-level SSO rejects that never reach ``authenticate_kerberos``, such
+        as cross-site hygiene and malformed base64, so a defender sees them. Rate-limit exhaustion
+        is a log line at the route, never a row. ``client`` is the route's address for the caller
+        (BACKLOG #2132)."""
+        await self._directory_reject_audit("<kerberos>", "kerberos", reason, client=client)
 
     @property
     def oidc_enabled(self) -> bool:
@@ -2594,15 +2592,13 @@ class AuthService:
         """Record that the IdP answered. This is the half that makes recovery restart-free (AC-8)."""
         self._oidc_unavailable_reason = None
 
-    async def audit_oidc_reject(self, reason: str) -> None:
-        """Route-level federated-login rejects that never reach :meth:`authenticate_oidc` (flow-cookie
-        binding failures, a malformed callback, a non-navigation fetch). Rate-limit exhaustion is a
-        log line at the route, never a row. ``reason`` must be a closed-set slug chosen by the
-        route — never IdP-supplied text.
-
-        AN OPEN GAP, NOT A DESIGN: the route holds the client address and this seam does not take
-        it yet, so the row's ``client`` is NULL though a remote caller was present."""
-        await self._directory_reject_audit("<oidc>", "oidc", reason, client=None)
+    async def audit_oidc_reject(self, reason: str, *, client: str | None) -> None:
+        """Route-level federated-login rejects that never reach :meth:`authenticate_oidc`, such as
+        flow-cookie binding failures, a malformed callback and a non-navigation fetch. Rate-limit
+        exhaustion is a log line at the route, never a row. ``reason`` must be a closed-set slug
+        chosen by the route — never IdP-supplied text. ``client`` is the route's address for the
+        caller (BACKLOG #2132)."""
+        await self._directory_reject_audit("<oidc>", "oidc", reason, client=client)
 
     # --- lifecycle -----------------------------------------------------------
 

@@ -314,7 +314,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         mode = request.headers.get("Sec-Fetch-Mode")
         if mode is not None and mode != "navigate":
             # A non-navigation fetch of a login leg is drive-by probing. Audited (behind the limiter).
-            await auth.audit_oidc_reject("non_navigation_fetch")
+            await auth.audit_oidc_reject("non_navigation_fetch", client=client)
             return RedirectResponse("/ui/login?e=oidc_failed", status_code=303)
         public_origin = getattr(request.app.state, "public_origin", None)
         if not public_origin:
@@ -337,7 +337,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             _log.warning("federated flow cache is full; refusing new sign-in for %s", client or "?")
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)
         except FlowError:
-            await auth.audit_oidc_reject("start_failed")
+            await auth.audit_oidc_reject("start_failed", client=client)
             return RedirectResponse("/ui/login?e=oidc_failed", status_code=303)
         resp = RedirectResponse(authorization_url, status_code=303)
         set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
@@ -447,7 +447,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)
         mode = request.headers.get("Sec-Fetch-Mode")
         if mode is not None and mode != "navigate":
-            await auth.audit_oidc_reject("non_navigation_fetch")
+            await auth.audit_oidc_reject("non_navigation_fetch", client=client)
             return _fail(request, "oidc_failed")
         # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site".
 
@@ -456,7 +456,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # AC-7: without the browser-binding cookie the request is refused even when state and
             # code are otherwise valid — server-side `state` alone would let whoever presents a valid
             # (state, code) pair have the session minted into THEIR browser.
-            await auth.audit_oidc_reject("flow_binding_missing")
+            await auth.audit_oidc_reject("flow_binding_missing", client=client)
             return _fail(request, "flow_binding_missing")
         if auth.oidc_flow_is_step_up(flow_id):
             # BACKLOG #296: the IdP is returning from a STEP-UP of a live session, not a sign-in.
@@ -481,10 +481,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return _step_up_landing(request, deps, auth, step_up)
         if error is not None:
             # The IdP reported a failure. Audit a fixed slug; never the IdP's own string.
-            await auth.audit_oidc_reject("idp_error")
+            await auth.audit_oidc_reject("idp_error", client=client)
             return _fail(request, "oidc_failed")
         if not code or not state:
-            await auth.audit_oidc_reject("malformed_callback")
+            await auth.audit_oidc_reject("malformed_callback", client=client)
             return _fail(request, "oidc_failed")
 
         outcome = await auth.complete_oidc_login(

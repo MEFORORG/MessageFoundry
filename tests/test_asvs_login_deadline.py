@@ -33,6 +33,7 @@ the code rather than the runner is the sampling in :func:`_least_deadline_offset
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -490,6 +491,14 @@ async def test_route_local_rejects_are_deliberately_not_padded(
         )
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=sso_failed"
     assert recorder.deadlines == []
+    # BACKLOG #2132: both route-level reject rows record the caller's address. The ASGI transport
+    # presents the client as 127.0.0.1.
+    rows = await engine.store.list_audit(action="auth.login_failed")
+    assert sorted(json.loads(r["detail"])["reason"] for r in rows) == [
+        "malformed_token",
+        "non_navigation_fetch",
+    ]
+    assert all(r["client"] == "127.0.0.1" for r in rows), rows
 
 
 # --- the equaliser itself ----------------------------------------------------
