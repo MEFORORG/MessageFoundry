@@ -211,6 +211,7 @@ from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
+    _allow_no_auth,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -1003,7 +1004,8 @@ def _posture_loosenings(
     remote_debug: RemoteDebugPosture,
     startup: StartupPosture,
 ) -> tuple[list[tuple[str, str]], str | None]:
-    """The active ``security_loosenings()`` entries and the scope note, read off ``state``.
+    """The active ``security_loosenings()`` entries and the scope note, read off ``state``, plus
+    the ``allow_no_auth`` open mode, which is an app opt-in rather than a setting.
 
     ``GET /security/posture`` and the start's ``config_loaded`` audit row (vault BACKLOG #2597) both
     call this, so the row records the list the route would report. ``runner`` and the two process
@@ -1087,6 +1089,18 @@ def _posture_loosenings(
             startup=startup,
         )
     )
+    # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
+    # cannot see it. The same two reads the request-time gates make decide it: no service, and
+    # the flag. A service beside the flag still requires sign-in, so it reports nothing.
+    if getattr(state, "auth", None) is None and _allow_no_auth(state):
+        pairs.append(
+            (
+                "allow_no_auth",
+                "no auth service is attached, and the app opted in with allow_no_auth=True. The "
+                "permission-gated API routes answer a caller with no credentials. The audit trail "
+                "names no person",
+            )
+        )
     return pairs, loosenings_scope
 
 
@@ -4042,7 +4056,7 @@ def create_app(
             return
         if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
             auth = get_auth(request)
-            if auth is not None and auth.enabled:
+            if auth is not None:
                 await auth.audit_permission_denied(
                     identity,
                     Permission.MESSAGES_VIEW_SUMMARY,
@@ -7877,7 +7891,7 @@ def create_app(
             The enriched connections push is rendered with THIS identity, so a narrowed channel scope
             takes effect within one revalidation window — not only when the socket eventually drops.
             When no auth is enforced (embedding/dev), the handshake identity stands."""
-            if auth is None or not auth.enabled:
+            if auth is None:
                 return handshake_identity
             # activity=False: this keepalive must not reset the session's idle clock.
             current = await auth.identity_for_token(token, activity=False)
@@ -8146,7 +8160,7 @@ _PROVISION_ADMIN_HINT = (
 async def _assert_security_notice_is_deliverable(
     store: Store,
     *,
-    auth_settings: AuthSettings | None,
+    auth_settings: AuthSettings,
     alerts_settings: AlertsSettings | None,
     security_settings: SecuritySettings | None,
 ) -> None:
@@ -8183,10 +8197,9 @@ async def _assert_security_notice_is_deliverable(
     logged. It stays a warning rather than a refusal on purpose: NSSM restarts a service at boot with
     nobody present, and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
 
-    **Sign-in off returns first, and only an embedding reaches that arm.** ``serve`` refuses to start
-    with sign-in off on any bind, and no config key turns it off (vault BACKLOG #2719). So the early
-    return below serves an app an embedder or a test builds in code, which needs no Administrator and
-    logs nothing. It is not a deployable way to start without one.
+    **It runs only where an auth service is built.** The lifespan calls it after the service exists.
+    The open mode is an app with no service, opted into with ``allow_no_auth=True``, so it never
+    reaches this check. No config key turns sign-in off (vault BACKLOG #2719, #2825).
 
     **Why deliverability rather than "require an email at creation".** A fix resting on an OPERATOR
     ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
@@ -8203,7 +8216,6 @@ async def _assert_security_notice_is_deliverable(
     whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
     which is a different and much larger change.
     """
-    auth_settings = auth_settings or AuthSettings()
     alerts = alerts_settings or AlertsSettings()
     # The two preconditions of the deliverability question. Either one false skips the refusal: the
     # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.

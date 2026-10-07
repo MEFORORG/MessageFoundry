@@ -63,7 +63,9 @@ async def test_a_start_writes_one_config_loaded_row_with_the_loaded_digest(tmp_p
     assert isinstance(row["node"], str) and row["node"]
     # The row records the list GET /security/posture reports, from the same reader.
     switches = [entry["switch"] for entry in posture["loosenings"]]
-    assert switches, "control: this unkeyed test store reports at least one loosening"
+    # The app runs in the open mode, which the posture names apart from the settings registry
+    # (vault BACKLOG #3062), so the control asks for a loosening beyond that one.
+    assert set(switches) - {"allow_no_auth"}, "control: this unkeyed test store reports a loosening"
     assert row["loosenings"] == switches
 
 
