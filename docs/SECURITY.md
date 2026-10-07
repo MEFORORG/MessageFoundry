@@ -180,7 +180,8 @@ the route takes a body.
   dependency ahead of a gate. The engine adds no route through `include_router`, and every gated
   engine HTTP route keeps its gate at the top level. The third shape is present. Every route carries
   `refuse_undeclared_route`, described below, which never refuses a route that has a gate. Some
-  routes carry others, such as `_no_store_reply` in `messagefoundry/api/auth_routes.py`. An
+  routes carry others, such as `no_store_reply` in `messagefoundry/api/security.py`, which the
+  same route class adds to every route returning a `CredentialReply` (BACKLOG #2372). An
   embedder who adds routes in one of those ways must check them.
 - The gate itself does not change. After the body is read it runs in full, as before: sign-in
   again, then the password and factor checks, the permission check and its audit rows, pacing and

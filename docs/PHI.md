@@ -193,6 +193,23 @@ and whole only on the audited `reveal=<connection name>` act on `GET /connection
 field was not yet gated; the gate change that closed it is in [SECURITY.md](SECURITY.md)
 "Field-level (property) authorization".
 
+**`ConnectionTestResult.detail` is rated PL-4, the level of `audit_log.detail` (BACKLOG #2372).** It
+is the reply of `POST /connections/{name}/test` and `POST /connections/{name}/test-credential`, a
+live string with no table row. Its stored copy is `audit_log.detail`: both routes write it into
+their `connection_test` or `connection_credential_test` audit row. It says why a reachability
+probe failed or could not run. The probe sends no message, so no message content can reach it.
+`_run_connection_test` in `api/app.py` fills it with a fixed line (not deployed, timed out, or the
+trust-anchor refusal) or with a wiring or connector error passed through `safe_text()` or
+`safe_exc()`. The connector errors name the endpoint, an HTTP status, or a socket or driver error.
+No probe echoes a reply body. At least the REST, FHIR and DATABASE probes are a `HEAD`, a
+`GET /metadata` and a `SELECT 1`. A peer can still choose some of the text, such as a database
+server's error string or a socket error reason. That text is bounded and holds nothing from the
+engine's messages. **So the field carries operational metadata, and no `no-store` is stamped on
+either route.** Both routes need `connections:test`. The rating leans on the rule that a connector's
+exception never interpolates a credential value: `safe_*` scrubs PHI shapes and bounds the length,
+and has no notion of a credential. `tests/test_no_store_phi_coverage.py` binds the field to
+`audit_log.detail`.
+
 **Per-backend cipher coverage, stated exactly.** The store cipher covers **18** `(table, column)`
 pairs on SQLite. **SQL Server** covers 17 = the SQLite set **minus** `shared_body.body` (never written
 there). **Postgres** covers 17 = the SQLite set **minus** `shared_body.body`. SQL Server's count was
@@ -1195,12 +1212,15 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   `tests/test_no_store_phi_coverage.py` walks every registered route. It fails when a PHI-gated route,
   or one whose response projects a PL-1/PL-2/PL-3 column, lands outside that set. That is what keeps
   a new PHI surface from shipping header-free, the way `/search/layered`, `/logs/tail` and
-  `/uploads/{file_id}/messages` each did. Credential-bearing replies are served `no-store` by the
-  auth routes themselves: a session token, a staged TOTP seed, recovery codes, a temporary password.
-  `tests/test_credential_reply_no_store.py` drives each of those routes. **What the two tests cannot
-  see.** The route test reads a field only when its name is a rated column's name. The credential
-  test reads only the credential field names it lists. A route outside the prefix families with no
-  response model is outside both. Those shapes rest on review.
+  `/uploads/{file_id}/messages` each did. Credential-bearing replies are served `no-store` because
+  their response model subclasses `CredentialReply`: a session token, a staged TOTP seed, recovery
+  codes, a temporary password. The engine's route class adds the no-store step to every route
+  returning one, so no route declares it (BACKLOG #2372). `tests/test_credential_reply_no_store.py`
+  drives each of those routes, and fails when a model with a credential field name is unmarked.
+  **What the two tests cannot see.** The route test reads a field only when its name is a rated
+  column's name. The credential test reads only the credential field names it lists, so an unmarked
+  model returning a credential under a new name escapes it. A route outside the prefix families
+  with no response model is outside both. Those shapes rest on review.
 - **Audited raw view only.** A raw message body is shown only via the same audited body fetch the
   JSON API serves at `GET /messages/{id}/raw` (record_view + a tamper-evident `message_body_view` audit
   row whose `surface` is `console`); there is no second, unaudited PHI render path.

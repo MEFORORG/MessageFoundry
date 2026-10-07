@@ -18,13 +18,23 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, get_args
 
-from fastapi import HTTPException, Request, Response, WebSocket, WebSocketException, status
+from fastapi import (
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketException,
+    status,
+)
 from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
+from pydantic import BaseModel
 from starlette.requests import HTTPConnection
 
+from messagefoundry.api.auth_models import CredentialReply
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
     peercert_from_ssl_object,
@@ -748,6 +758,38 @@ def steps_before_body(dependant: Dependant) -> tuple[tuple[Callable[..., Any], _
     return ()
 
 
+async def no_store_reply(response: Response) -> None:
+    """Forbid caching a reply whose BODY carries a live credential (ASVS 7.2.4 delivery, 14.2.2).
+
+    A session token, a staged TOTP seed, one-time recovery codes and an admin-issued temporary
+    password all have to reach the client somehow, and the body is the only channel a bearer client
+    has. So none of those replies may sit in a proxy or browser cache, where a later reader could
+    lift a working credential out of one.
+
+    No route declares this. :class:`AuthenticatedBeforeBodyRoute` adds it to every route whose
+    response model is a ``CredentialReply`` (BACKLOG #2372), which before that each credential
+    route had to name for itself. A refusal raises before the reply is built, and FastAPI drops the
+    header with it, which is fine: a refusal carries no credential. The web console calls some of
+    these handlers as plain functions, and its HTML replies under ``/ui`` are already ``no-store``
+    by the security-header middleware."""
+    response.headers["Cache-Control"] = "no-store"
+
+
+def carries_credential(annotation: object, _seen: frozenset[int] = frozenset()) -> bool:
+    """Whether a route's response model is, or contains, a ``CredentialReply`` (BACKLOG #2372).
+
+    Walks type arguments and model fields, so ``list[X]``, ``X | None`` and a model with an ``X``
+    field all count when ``X`` does."""
+    if id(annotation) in _seen:
+        return False
+    seen = _seen | {id(annotation)}
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        if issubclass(annotation, CredentialReply):
+            return True
+        return any(carries_credential(f.annotation, seen) for f in annotation.model_fields.values())
+    return any(carries_credential(arg, seen) for arg in get_args(annotation))
+
+
 class AuthenticatedBeforeBodyRoute(APIRoute):
     """Refuse a caller the gate would refuse for having no identity BEFORE the body is read.
 
@@ -777,7 +819,29 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
     middleware, so the response is the one the gate gives a request whose body had no problem.
 
     A dependency a test or an embedder overrides through ``dependency_overrides`` is skipped here.
-    The override decides in its place, where FastAPI runs it."""
+    The override decides in its place, where FastAPI runs it.
+
+    IT ALSO SERVES EVERY CREDENTIAL REPLY ``no-store`` (BACKLOG #2372). A route whose response
+    model is a :class:`~messagefoundry.api.auth_models.CredentialReply` gets
+    :func:`no_store_reply` as a route dependency, so no route has to remember to declare it.
+    It reads the response model, so at least these escape it: a route added through
+    ``include_router``; a route with ``response_model=None`` or a ``Response`` return that hands
+    back a credential model anyway; and a pydantic generic model such as ``Page[X]``, whose type
+    arguments ``get_args`` does not report. ``tests/test_credential_reply_no_store.py`` checks
+    every route on the built app, including each endpoint's return annotation."""
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(path, endpoint, **kwargs)
+        if not carries_credential(self.response_model):
+            return
+        if any(d.dependency is no_store_reply for d in self.dependencies):
+            return
+        # Built again rather than patched: FastAPI derives the dependant, the flattened dependency
+        # list and the handler from ``dependencies`` inside ``__init__``, so appending afterwards
+        # would leave each of those without the step. ``self.response_model`` is only known after
+        # the first build, because FastAPI may infer it from the endpoint's return annotation.
+        kwargs["dependencies"] = [*(kwargs.get("dependencies") or ()), Depends(no_store_reply)]
+        super().__init__(path, endpoint, **kwargs)
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         handler = super().get_route_handler()
