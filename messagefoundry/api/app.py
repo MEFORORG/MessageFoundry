@@ -5689,15 +5689,15 @@ def create_app(
     # one (BACKLOG #2322), so the text offers remedies and promises none of them.
     _UPLOAD_UNREADABLE_STATUS = 423
     _UPLOAD_UNREADABLE = (
-        "this uploaded file cannot be read under the configured store key. An operator may be able "
-        "to seal it with 'messagefoundry rotate-key', or to read it by restoring the retired key it "
-        "was sealed under; one that rotate-key reports as unsealable can only be deleted"
+        "this uploaded file cannot be read under the configured store key. An operator may seal it "
+        "with 'messagefoundry rotate-key', or restore the retired key it was sealed under. If "
+        "rotate-key reports it as unsealable, an operator can only delete it"
     )
 
     class _UploadSidecarRefused(HTTPException):
         """The 423 an override holder gets when an upload's sidecar is refused. Every other route
-        answers it as is. DELETE catches it, because ``UploadStore.delete`` can still remove an
-        upload ``rotate-key`` never seals, whose refused sidecar hides the owner (BACKLOG #2322)."""
+        answers it as is. DELETE alone catches it and asks ``UploadStore.delete``. That call can
+        still remove an upload ``rotate-key`` never seals (BACKLOG #2322)."""
 
         def __init__(self) -> None:
             super().__init__(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE)
@@ -5718,7 +5718,9 @@ def create_app(
 
         Every by-id route calls this BEFORE it decrypts a body or unlinks anything, which is the point:
         the check has to sit in the handler BODY, not in a ``Depends`` gate, because the web console
-        invokes these handlers directly through the CoreHandlers seam and never runs their gates."""
+        invokes these handlers directly through the CoreHandlers seam and never runs their gates.
+        One exception: DELETE catches :class:`_UploadSidecarRefused`, which only an override holder
+        gets, and lets ``UploadStore.delete`` decide (BACKLOG #2322)."""
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
@@ -6211,8 +6213,8 @@ def create_app(
         after it has already unlinked both sidecars — a check bolted onto that call would fire too
         late. The age-based retention sweep is deliberately owner-blind and unaffected.
 
-        An override holder whose file has a refused sidecar goes on to ``UploadStore.delete``, which
-        removes an upload ``rotate-key`` never seals and refuses every other one (BACKLOG #2322)."""
+        An override holder goes on to ``UploadStore.delete`` when the sidecar is refused. That call
+        removes the kind it classes as never sealable, and refuses the rest (BACKLOG #2322)."""
         us = _require_upload_store(request)
         with suppress(_UploadSidecarRefused):
             await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")

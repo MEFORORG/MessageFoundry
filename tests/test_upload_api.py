@@ -1136,6 +1136,9 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
         ):
             assert r.status_code == 423, r.text
             assert "rotate-key" in r.text and "acme" not in r.text
+        # BACKLOG #2322: the override DELETE above reaches UploadStore.delete, which must refuse a
+        # body rotate-key can seal and remove nothing.
+        assert (root / f"{refused}.meta").exists() and (root / f"{refused}.blob").exists()
         assert [f["file_id"] for f in (await c.get("/uploads", headers=h)).json()["files"]] == [
             half
         ]
