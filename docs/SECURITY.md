@@ -1683,10 +1683,10 @@ the same permission set on the same method reds CI until it is listed here.
 > only the flags in `ROUTE_REGISTERING_FLAGS` (`scripts/security/route_gates.py`) register.
 >
 > The test runs each scoped GET that takes no path parameter twice: as a scoped caller, and as an
-> all-channels caller for control. It also checks the `/messages` and `/dead-letters` totals. No
-> other scoped route is executed. That leaves at least the scoped POSTs, `/ws/stats` and every
-> route with a path parameter other than the by-id message routes. `GET /status` gives no signal
-> on its fixture.
+> all-channels caller for control. It also checks the `/messages` and `/dead-letters` totals. Apart
+> from those and the by-id message routes below, no scoped route is executed. That leaves at least
+> `/ws/stats`, the POST search and export, and every other route with a path parameter.
+> `GET /status` gives no signal on its fixture.
 >
 > It aims each by-id message route at another channel's message, which must answer 404. Those
 > routes all open the message through one helper, `messagefoundry/api/message_scope.py`. A test

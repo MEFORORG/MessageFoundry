@@ -75,9 +75,11 @@ def _api_sites() -> dict[Path, list[tuple[str, int]]]:
 
 
 def test_no_api_module_reads_a_message_by_id_itself() -> None:
+    api_sites = _api_sites()
+    assert len(api_sites) >= 10, "the API package walk found almost no modules"
     offenders = [
         f"{path.relative_to(_API).as_posix()}:{line} in {func}"
-        for path, sites in _api_sites().items()
+        for path, sites in api_sites.items()
         if path != _HELPER
         for func, line in sites
         if (path.relative_to(_API).as_posix(), func) not in _ALLOWED
@@ -160,9 +162,11 @@ def test_no_api_module_passes_a_literal_every_channel_scope() -> None:
     route that writes ``allowed_channels=None`` gets the same estate-wide read and still
     type-checks. Engine-internal callers do write it; an API route takes the caller's scope
     instead, from ``_scope(identity)`` or the identity itself."""
+    modules = sorted(_API.rglob("*.py"))
+    assert len(modules) >= 10, "the API package walk found almost no modules"
     offenders = [
         f"{path.relative_to(_API).as_posix()}:{line}"
-        for path in sorted(_API.rglob("*.py"))
+        for path in modules
         for line in _literal_none_scopes(ast.parse(path.read_text(encoding="utf-8")))
     ]
     assert not offenders, f"pass the caller's channel scope, not None: {offenders}"

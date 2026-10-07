@@ -380,6 +380,7 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
         now=time.time(),
     )
     out_of_scope = (*_OUT_OF_SCOPE_TOKENS, ids[_OUT_CHANNEL], dead_mid)
+    assert len(out_of_scope) >= 6
     (dead,) = await engine.store.claim_ready(now=time.time(), destination_name=_DEAD_OUT)
     await engine.store.mark_failed(dead.id, "probe", RetryPolicy(max_attempts=1), now=time.time())
     # The pacing floor is a separate control with its own tests; off here so a probe that sends
