@@ -927,7 +927,11 @@ class Engine:
         Returns the fields for the ``dr.release`` row: ``depth_left``, the staged-queue depth left
         when the drain ended (vault BACKLOG #2752, finding D-V1); ``held_on_parked_outbounds``, the
         part of it held on outbounds the engine parks; and ``drained``, whether every OTHER row
-        drained (vault BACKLOG #3067). The coordinator records them rather than claiming a drain."""
+        drained (vault BACKLOG #3067). The coordinator records them rather than claiming a drain.
+
+        If any step fails, the runner's DR thresholds and inbound parks go back to what the
+        profile had, since the coordinator keeps the box active (vault BACKLOG #3140). The
+        listeners the park unbound stay down until a reload binds the critical set again."""
         rr = self._registry_runner
         if rr is None:
             # No graph, so nothing to unbind, no worker to drain with and no parked outbound.

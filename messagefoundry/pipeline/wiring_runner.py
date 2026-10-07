@@ -780,7 +780,7 @@ class DrIntakeState(NamedTuple):
 
     threshold: Priority | None
     standby: Priority | None
-    inbound_markers: dict[str, str]
+    parked: frozenset[str]
 
 
 class _IngressFields(NamedTuple):
@@ -2571,36 +2571,45 @@ class RegistryRunner:
         which after a release is every one. Leaving the standby swaps those markers for the
         profile's, so a tick before an activation's reload binds no feed below the threshold."""
         leaving = standby is None and self._dr_standby is not None
-        if leaving:
-            for key in [k for k in self._filtered if k[0] == "inbound"]:
-                del self._filtered[key]
         self._dr_threshold = threshold
         self._dr_standby = standby
         if standby is not None or leaving:
-            for name, ic in self.registry.inbound.items():
-                if name not in self._sources and inbound_listener_starts(ic):
-                    self._dr_filters_out(name, ic.priority, kind="inbound")
+            self._rewrite_inbound_parks()
+
+    def _rewrite_inbound_parks(self, held: Collection[str] = ()) -> None:
+        """Write every inbound DR marker again under the current thresholds (vault BACKLOG #3140).
+
+        An idle inbound is marked when start would bind it, or when it holds a marker now or is
+        named in ``held``. That second test keeps the park of an ``auto_start = false`` feed a
+        reload parked after an operator start. A listening inbound, or a name the registry no
+        longer declares, gets none. It reads the registry as it is now, so a feed a reload added,
+        dropped or re-tiered is judged on its current tier."""
+        marked = {name for (kind, name) in self._filtered if kind == "inbound"} | set(held)
+        for name in marked:
+            self._filtered.pop(("inbound", name), None)
+        for name, ic in self.registry.inbound.items():
+            if name in self._sources or not ic.deployed:
+                continue
+            if inbound_listener_starts(ic) or name in marked:
+                self._dr_filters_out(name, ic.priority, kind="inbound")
 
     def dr_intake_state(self) -> DrIntakeState:
-        """What :meth:`restore_dr_intake` puts back: the DR thresholds and the inbound markers.
-        The engine reads it before a release parks intake (vault BACKLOG #3140)."""
-        markers = {name: why for (kind, name), why in self._filtered.items() if kind == "inbound"}
-        return DrIntakeState(self._dr_threshold, self._dr_standby, markers)
+        """What :meth:`restore_dr_intake` puts back: the DR thresholds, and which inbounds the
+        profile parks. The engine reads it before a release parks intake (vault BACKLOG #3140)."""
+        return DrIntakeState(
+            self._dr_threshold, self._dr_standby, frozenset(self.filtered_inbound())
+        )
 
     def restore_dr_intake(self, state: DrIntakeState) -> None:
         """Undo :meth:`park_intake` for a release that failed, so the box is as active as the DR
-        coordinator says (vault BACKLOG #3140). The profile's markers come back as they were,
-        including one a reload wrote for an ``auto_start = false`` feed, so the scheduler and an
-        alert rule still leave a feed below the threshold down. A marker is not restored for an
-        inbound that is listening now. Nothing is bound here: the listeners the park unbound come
-        back on the next reload, as before the release began."""
-        for key in [k for k in self._filtered if k[0] == "inbound"]:
-            del self._filtered[key]
+        coordinator says (vault BACKLOG #3140). The thresholds come back, and the inbound markers
+        are written again under them, so the scheduler and an alert rule still leave a feed below
+        the threshold down. That includes a feed parked before the release and one a reload
+        parked during it. Nothing is bound here: the listeners the park unbound come back on the
+        next reload, as before the release began."""
         self._dr_threshold = state.threshold
         self._dr_standby = state.standby
-        for name, why in state.inbound_markers.items():
-            if name not in self._sources:
-                self._filtered[("inbound", name)] = why
+        self._rewrite_inbound_parks(state.parked)
 
     async def park_intake(self, standby: Priority) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the

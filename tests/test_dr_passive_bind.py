@@ -24,7 +24,7 @@ from messagefoundry.api.app import _alert_control_action
 from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from tests.test_dr_running_config_dir import _CRIT, _NORM
+from tests.test_dr_running_config_dir import _CRIT, _NORM, _free_ports
 from tests.test_dr_running_config_dir import _write_tiered_graph as _write_graph
 
 
@@ -189,6 +189,8 @@ async def test_a_failed_release_leaves_the_box_active_with_the_profile_parks(
             assert await _accepts(norm_port)  # control: the probe sees a bound feed
             await engine.reload_detail(cfg)
         assert rr.inbound_filtered(_NORM) is not None and not await _accepts(norm_port)
+        parks_before = rr.filtered_inbound()
+        assert _CRIT not in parks_before
 
         if fails_at == "first_park":
             source = rr._sources[_CRIT]
@@ -225,8 +227,72 @@ async def test_a_failed_release_leaves_the_box_active_with_the_profile_parks(
             await engine._dr_release_drain()
 
         assert engine.dr_active and rr.dr_standby is None
-        assert rr.inbound_filtered(_NORM) is not None
+        assert rr.filtered_inbound() == parks_before  # the profile's parks, reasons and all
         await _alert_control_action(engine, "restart_inbound", _NORM)
         assert not await _accepts(norm_port)
         await engine.reload_detail(cfg)
         assert await _accepts(crit_port) and not await _accepts(norm_port)
+
+
+async def test_a_failed_release_parks_a_normal_feed_a_reload_added_during_the_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The restore judges the registry as it is when the release fails, not the one it read
+    before the park. Red with a restore that put back only the pre-release markers: the feed a
+    reload added mid-drain had none, and an alert rule bound it on an active box."""
+    cfg = tmp_path / "cfg"
+    crit_port, _norm_port = _write_graph(cfg, tmp_path)
+    (added_port,) = _free_ports(1)
+    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+        rr = engine.registry_runner
+        assert rr is not None
+        await engine._dr_activate_profile()
+
+        async def reload_then_fail() -> tuple[int, int]:
+            with (cfg / "cfg.py").open("a", encoding="utf-8") as f:
+                f.write(
+                    f"inbound('IB_NORM2_ADT', MLLP(port={added_port}), router='r', "
+                    "priority=Priority.NORMAL)\n"
+                )
+            await engine.reload_detail(cfg)
+            raise OSError("injected release failure")
+
+        monkeypatch.setattr(engine, "_drain_pipeline", reload_then_fail)
+        with pytest.raises(OSError):
+            await engine._dr_release_drain()
+        assert set(rr.filtered_inbound()) == {_NORM, "IB_NORM2_ADT"}
+        await _alert_control_action(engine, "restart_inbound", "IB_NORM2_ADT")
+        assert not await _accepts(added_port)
+        await engine.reload_detail(cfg)
+        assert await _accepts(crit_port) and not await _accepts(added_port)
+
+
+@pytest.mark.parametrize("norm_auto_start", [True, False], ids=["auto_start", "operator_started"])
+async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
+    tmp_path: Path, norm_auto_start: bool
+) -> None:
+    """Leaving the standby writes the profile's markers at once, so a scheduler tick or an alert
+    rule between an activation's flip and its reload binds no feed below the threshold. Red at
+    ``dcbeb5de0b``, which purged every inbound marker there. The ``operator_started`` case is an
+    ``auto_start = false`` feed a reload on the passive box parked after an operator start."""
+    cfg = tmp_path / "cfg"
+    _crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=norm_auto_start)
+    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+        rr = engine.registry_runner
+        assert rr is not None
+        if not norm_auto_start:
+            await rr.start_inbound(_NORM, operator=True)
+            assert await _accepts(norm_port)  # control: the probe sees a bound feed
+            await engine.reload_detail(cfg)
+        assert rr.inbound_filtered(_NORM) is not None and not await _accepts(norm_port)
+
+        engine._set_dr_active(True)  # the activation's flip, before its reload takes the lock
+        assert rr.dr_standby is None
+        assert set(rr.filtered_inbound()) == {_NORM}
+        await _alert_control_action(engine, "restart_inbound", _NORM)
+        assert not await _accepts(norm_port)
+
+        await engine._dr_activate_profile()
+        assert set(rr.filtered_inbound()) == {_NORM}
+        await _alert_control_action(engine, "restart_inbound", _NORM)
+        assert not await _accepts(norm_port)
