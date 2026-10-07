@@ -1359,12 +1359,14 @@ invariant rather than a property of the moved row):
 5. A deleted or moved block takes no hand-written Python with it: no `code` row, no dynamic row, and
    no hand-written header. A delete of an `if` covers its whole chain: every `elif` test must be
    generator-shaped too, and no `elif` or `else` body may hold a `code` row or a dynamic row.
-6. A block that holds a binding row is never moved or deleted. A binding row, at any depth, is never
-   deleted while a later row reads its variable, and never moved below a row that reads it; and no
-   row that reads the variable is moved above its binding row (Manager decision 2026-10-07, after
-   review). Each would leave that read unbound. The R1 branch's `_is_typed_stmt` already refuses the
-   block case; it checks the moved or deleted row itself with `top=True`, so the rest is open work
-   for the R1 fix.
+6. Every read of a binding stays dominated by that binding: the binding row sits earlier, in the
+   same suite as the read or in a suite that encloses it (Manager decision 2026-10-07, after
+   review). A move of either end, the binding row or the reading row, that breaks this is refused,
+   and so is a delete of a binding row while a row still reads its variable. A block that holds a
+   binding row is never moved or deleted. Each refused case would leave a read unbound, at least
+   whenever a condition is false. The R1 branch's `_is_typed_stmt` already refuses the block case;
+   it checks the moved or deleted row itself with `top=True`, so the rest is open work for the R1
+   fix.
 
 A typed row that is not dynamic may move past a `code` row in the same suite, unless rule 6 refuses
 it: rule 2 holds, and the result is the same as inserting the typed row there, which the analyst
@@ -1404,9 +1406,10 @@ The R1 fix would change that, in every mode, at least as follows:
 **The inert rule, stated once here.** The lens's own predicate decides what is inert; the list below
 describes it for a reader. **The list is not a gate.** No check, test or requirement may treat it as
 the definition of inert; a checker calls the lens's predicate (Manager decision 2026-10-07, after
-review). The list is a lower bound: the predicate admits at least these, with one exception that
-is a ceiling, the module-level name rule below. Nothing it admits calls anything, except a bounded
-`msg.field(...)` read, `FhirToken(...)` and `FhirRaw(<string literal>)`.
+review). The list is a lower bound: the predicate admits at least these. It has one ceiling, the
+module-level name rule below, and one exception to "calls nothing": admitted values call nothing
+except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...)` and
+`FhirRaw(<string literal>)`, named below.
 
 - a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
 - `+` and `-` over numbers and admitted names; `*`, `/` and `//` over number literals only, with a
@@ -1420,19 +1423,24 @@ is a ceiling, the module-level name rule below. Nothing it admits calls anything
     method call on it or on an attribute of it. A mutable container fails this however it is used:
     `SEEN = []` plus `SEEN.append(msg["PID-3"])` rebinds nothing, yet `SEEN` then holds message
     content;
-  - a name bound to `code_set("<literal>")`, **only** as `code_lookup`'s `table` argument, and
-    refused everywhere else (Manager decision 2026-10-07, after review). `code_set` returns the
-    shared active `CodeSet`, whose storage is a plain dict, so any `code` row can write message
-    content into it without naming the bound variable: `code_set("lab")._data["k"] = msg["PID-3"]`.
-    No engine change is made for this. The `table` use is still accepted because `code_lookup` only
-    writes the looked-up value into the message, where a value param may already put message
-    content; the risk the refusal guards is message content reaching a log or a destination through
-    a label, a template or a lookup parameter, and `table` reaches none of those;
+  - a module-level `NAME = code_set("<literal>")` binding, **only** as `code_lookup`'s `table`
+    argument, and refused everywhere else, value params and lookup params included (Manager
+    decision 2026-10-07, after review). The scope is exact: any other way of obtaining a `CodeSet`,
+    such as an import from a helper module, `code_set(NAME)` with a non-literal argument, or an
+    alias, is not admitted, so it is refused. The rule fails closed rather than missing those.
+    Value params refuse a `code_set` name because a code set is a table, not a value (Manager
+    decision B1). No engine change is made for this.
+    **What the `table` use leaves.** `code_set` returns the shared active `CodeSet`, whose storage is
+    a plain dict, so a hand-written `code` row can write into it without naming the bound variable:
+    `code_set("lab")._data["k"] = msg["PID-3"]`. A later `code_lookup` could then write one
+    message's data into another message. That cross-message path is a property of hand-written code.
+    The `table` use opens no new write channel, because poisoning the table needs a hand-written
+    `code` row; the analyst build neither adds this path nor closes it (Manager decision
+    2026-10-07, after review);
   - **these two bullets are a ceiling: outside value params, the predicate SHALL NOT admit a
     module-level name beyond them, whatever the R1 tests say;**
-  - in value params, any other non-dunder name except `msg` and a name bound to
-    `code_set("<literal>")`, because a value param may carry message content anyway. The
-    `code_set` bullet above applies in value params too;
+  - in value params, any other non-dunder name except `msg` and a `code_set` name, because a value
+    param may carry message content anyway;
 - a list, tuple, set or dict built only from inert values, with no splat;
 - in value params only, a bounded field read (`msg.field(...)` taking only `occurrence` and
   `repetition` keywords) or a `templated` f-string whose every read is one;
@@ -1444,10 +1452,13 @@ branch, not yet merged), except for the module-level name ceiling. Elsewhere, wh
 those tests differ, the tests win. `set_params` on action, lookup and diagnostic rows already
 refuses a `dynamic` value (AC-M5).
 
-**The module-level name ceiling is not yet what the R1 branch does.** Read at `8df2bcf210`, its
-`_message_locals` admits any module-level binding no function rebinds, and a name bound nowhere, so
-its predicate would admit `SEEN` and a `code_set` name anywhere; no test covers either. The R1 code
-(PR 2155) is being changed to match the ceiling, and AC-G9 adds refusal tests for it.
+**The module-level name ceiling is not yet what the R1 branch does.** Read at `8df2bcf210`, two
+paths admit too much. `_message_locals` admits any module-level binding no function rebinds, and a
+name bound nowhere. And `_is_inert_value` ignores `blocked` when `reads_ok` is true, the path that
+value params and lookup-params values (`_is_inert_params_dict`) take, so any name except `msg` and
+a dunder passes there. Its predicate would therefore admit `SEEN` and a `code_set` name in each of
+those places, and no test covers them. The R1 code (PR 2155) is being changed to match the ceiling,
+including applying `blocked` when `reads_ok` is true, and AC-G9 adds refusal tests for it.
 
 **A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
 `_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
@@ -1488,6 +1499,7 @@ change is being built separately and has not landed.
 - [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`
   G.7 refuses, or a `set_params` on a route row whose base `handlers` is not a literal list, THEN
   `lens rewrite` SHALL refuse it, in every mode. R1 payloads 3 and 4 (G.5) are refusal tests, and
-  so are these (the G.7 ceiling): an `{"expr": "SEEN"}` value on a `checkpoint` label in a module
-  that binds `SEEN = []` and calls `SEEN.append(...)`; and a name bound to `code_set("<literal>")`
-  used as a `checkpoint` label or in a `log_note` template.
+  so are these (the G.7 ceiling), in a module that binds `SEEN = []`, calls `SEEN.append(...)` and
+  binds `NAME = code_set("<literal>")`: `SEEN` as a `checkpoint` label and as a lookup-params value;
+  and `NAME` as a `checkpoint` label, in a `log_note` template, as a lookup-params value and in a
+  value param.

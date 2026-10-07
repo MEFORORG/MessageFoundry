@@ -158,8 +158,8 @@ server-side broker, which this phase does not build.
 | **Depends on** | The R1 fix and typed-only mode (section 5.3); the permission catalog; a fully signed-in session (FR-6) | The section 5.4 preconditions; a git-host group mapped to engine `code:edit` holders, kept by hand |
 | **Kind of control** | A guardrail for analysts who use the analyst build as intended | A boundary against a deliberate or tool-assisted change, if section 5.4 holds; otherwise it stops an accidental change, not a deliberate one |
 
-**What a Steps-only change can still do**, at least. It passes the repository check, so the site's
-ordinary review is what catches these (D-C):
+**What a Steps-only change could still do**, at least. It would pass the repository check, so the
+site's ordinary review is what would catch these (D-C):
 
 - redirect a send to any existing outbound connection;
 - issue a lookup with literal arguments against any database or FHIR server the egress allow-lists
@@ -169,10 +169,11 @@ ordinary review is what catches these (D-C):
 - delete a developer-written dynamic row. The analyst build would refuse this (ADR 0076 Amendment
   G, G.6 rule 4), but a change made with another tool would pass the repository check (FR-40 item
   3);
-- delete a binding row (a Read Field or an assigned lookup), or move it below a row that reads its
-  variable, leaving that read unbound.
-  The analyst build would refuse both (G.6 rule 6), but the repository check does not test for an
-  unbound read. Today the lens refuses a delete or move of a Read Field row for this reason (the
+- leave a read of a binding unbound: delete a binding row (a Read Field or an assigned lookup)
+  while a row reads its variable, move a binding row so it no longer dominates a read, move a reading
+  row out from under its binding, or move or delete a block that holds a binding row. The analyst
+  build would refuse each (G.6 rule 6), but the repository check would not test for an unbound
+  read. Today the lens refuses a delete or move of a Read Field row for this reason (the
   `read_field` gate in `rewrite_source`, `messagefoundry/lens.py`). That gate keys on `read_field`
   alone, because it was written for Read Field rows (ADR 0089 row 4, BACKLOG #1505), so it does not
   yet cover a lookup's `assign_to`. Under typed-only mode, the R1 branch's `_is_typed_stmt` already
@@ -477,9 +478,9 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
      are compared by AST, not bytes, and blank or comment-only lines between the signature and the
      first statement count as body.
   3. Inside each def body, the ordered sequence of `code` rows is unchanged, each compared by content
-     and by its suite path, never by line number. So a hand-written line moved from under one condition to another fails.
-     *Suite path*, *dynamic row* and *hand-written header* are defined once, in ADR 0076 Amendment G,
-     G.6. From spike S-4:
+     and by its suite path, never by line number. So a hand-written line moved from under one
+     condition to another fails. *Suite path*, *dynamic row* and *hand-written header* are defined
+     once, in ADR 0076 Amendment G, G.6. From spike S-4:
      - Changing a generated `if` test that encloses a hand-written line is not Steps-only, because
        the line's suite path changes. This is intended (Manager decision 2026-10-07, from spike S-4).
      - A `pass` statement is ignored on either side, so the `pass` seed of an If or For Each template
@@ -502,12 +503,12 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
      Amendment G, G.7, as the lens's own predicate decides (from spike S-4: For Each writes
      `occurrence=i`, which is not a literal). A name bound to `code_set("<literal>")` passes only as
      `code_lookup`'s `table` argument, which `insert_code_lookup` writes, and fails anywhere else
-     (G.7; Manager decision 2026-10-07, after review). The four
-     value params ADR 0076 E.11 rule 4 admits (`set_field.value`, `add_repetition.value`,
-     `append_to_field.suffix`, `replace_literal.new`) may also be a template. A template anywhere else, such as a
-     `db_lookup` statement or a `log_note` operand, is not Steps-only even though it reads back
-     `templated`. Every new or changed `assign_to` meets G.7. A developer-written dynamic parameter
-     the change leaves alone does not fail it.
+     (G.7; Manager decision 2026-10-07, after review). The four value params ADR 0076 E.11 rule 4
+     admits (`set_field.value`, `add_repetition.value`, `append_to_field.suffix`,
+     `replace_literal.new`) may also be a template. A template anywhere else, such as a `db_lookup`
+     statement or a `log_note` operand, is not Steps-only even though it reads back `templated`.
+     Every new or changed `assign_to` meets G.7. A developer-written dynamic parameter the change
+     leaves alone does not fail it.
 
      **5a. A typed row is compared by its full statement**: the callee, every positional argument
      (`msg` included), every keyword and any assignment target. A new or changed row must have the
@@ -545,12 +546,14 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   - a template in a `db_lookup` statement;
   - a dynamic route made literal;
   - a changed import, and a new helper file;
-  - from item 5a and G.7 (Manager decision 2026-10-07, after review): `trim_field(__import__("os").getcwd() or msg, "PID-5.1")`;
-    `set_field(__import__("os").getcwd() or msg, "PID-5.1", "X")`; `anything.Send("OB", msg)`;
-    an added `SEEN = []` at module level; and, with `SEEN = []` already at base, a new `checkpoint`
-    label or `log_note` template of `{"expr": "SEEN"}`;
-  - a name bound to `code_set("<literal>")` used as a `checkpoint` label or in a `log_note` template
-    (G.7; Manager decision 2026-10-07, after review).
+  - from item 5a and G.7 (Manager decision 2026-10-07, after review):
+    `trim_field(__import__("os").getcwd() or msg, "PID-5.1")`; `set_field(__import__("os").getcwd()
+    or msg, "PID-5.1", "X")`; `anything.Send("OB", msg)`; an added `SEEN = []` at module level; and,
+    with `SEEN = []` already at base, a new `checkpoint` label or `log_note` template of `{"expr":
+    "SEEN"}`;
+  - a name bound to `code_set("<literal>")` used as a `checkpoint` label, in a `log_note` template,
+    as a lookup-params value or in a value param, and `SEEN` as a lookup-params value (G.7; Manager
+    decision 2026-10-07, after review).
 
   It SHALL pass an ordinary Steps edit, an insert above a `code` row, and one of each sanctioned shape
   in items 2 and 3 (spike S-4).
@@ -630,7 +633,8 @@ analyst build can be shown or tested on realistic work (Manager decision 2026-10
   SEC-004. It refuses to run an engine below the build's minimum version (FR-28).
 - **Workspace trust.** The analyst build trusts only the repository it cloned at setup, with no
   prompt. It opens no other folder. Theia's workspace-trust dialog blocks the interface by default,
-  so the analyst build sets `security.workspace.trust.enabled` to false, or an equivalent (Manager decision 2026-10-07, from spike S-1).
+  so the analyst build sets `security.workspace.trust.enabled` to false, or an equivalent (Manager
+  decision 2026-10-07, from spike S-1).
 - **Installer.** It bundles the Python runtime and the pinned engine. The analyst never sees a
   virtual environment or `PATH`.
 - **Errors.** Every failure reads as a plain summary, with the details behind a toggle.
@@ -651,7 +655,8 @@ Theia applications are assembled from npm packages at build time.
 | `@theia/preferences` (with `@theia/userstorage`) | **Required.** Without it the app hangs on a missing `PreferenceProvider` binding. It brings in `@theia/markers`, `@theia/outline-view` and `@theia/variable-resolver` | Yes |
 | File explorer | Feeds list only (FR-12) | Yes |
 
-Spike S-1 found the `@theia/preferences` need and its transitive packages (Manager decision 2026-10-07, from spike S-1).
+Spike S-1 found the `@theia/preferences` need and its transitive packages (Manager decision
+2026-10-07, from spike S-1).
 
 **How "no `.py` editor" is enforced:** the analyst build rebinds Theia's `EditorManager` so a `.py`
 resource opens only in the Steps view, and removes the *Open With* contribution. Spike S-2 tests
@@ -683,8 +688,9 @@ route work.
   measured it: every line bundles outside VS Code, and one types-only chain reaches `vscode`
   (`stepsModel.ts` to `liveDebugModel` to `editorToolbar`'s `ElementKind`), so the shared package
   moves `ElementKind` into a module free of `vscode`. About 84.1% of the file's bundled bytes is the
-  share a full port links; that is not the share that carries over (Manager decision 2026-10-07,
-  from spike S-1).
+  share a full port links; that is not the share that carries over. The whole file carries over,
+  because every line bundles; the rest of the bytes is code that neither host links (Manager
+  decision 2026-10-07, from spike S-1).
 - `ide/media/stepsWebview.js` reaches the host only through `acquireVsCodeApi()`. Spike S-1 rendered
   it unchanged in a sandboxed iframe with a shim that supplies that function. The page shell, toolbar
   and CSS live in `ide/src/stepsView.ts`, so they move to the shared package too.
@@ -712,7 +718,8 @@ route work.
   finding in a runtime dependency of a shipped build is triaged within a release; a finding only in
   build tooling is triaged at the next Theia bump. Spike S-1's `npm audit` found 35 findings in the
   full tree (1 critical, 11 high) and 16 moderate in the runtime tree, all through `@theia`
-  dependencies, which is why the job is non-required and triaged rather than a gate (Manager decision 2026-10-07, from spike S-1).
+  dependencies, which is why the job is non-required and triaged rather than a gate (Manager decision
+  2026-10-07, from spike S-1).
 - **SBOM and updates.** Each installer ships with an SBOM. Dependabot covers the Theia tree.
 - **Installers.** Built in CI, Authenticode-signed, and published as release assets beside the
   engine's (section 13).
