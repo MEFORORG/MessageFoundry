@@ -1363,8 +1363,9 @@ invariant rather than a property of the moved row):
    generator-shaped too, and no `elif` or `else` body may hold a `code` row or a dynamic row.
 6. Every read of a name stays dominated by that name's bindings: every path from the start of
    the body to the read passes a binding of the name (Manager decision 2026-10-07, after review).
-   Dominance is over the set of the name's bindings. A binding earlier in the same suite as the
-   read, or earlier in a suite that encloses it, dominates the read. An `if` whose every arm binds
+   Dominance is over the set of the name's bindings. A binding other than a For Each header,
+   earlier in the same suite as the read or earlier in a suite that encloses it, dominates the
+   read. An `if` whose every arm binds
    the name, with an `else`, dominates a later read; one arm alone does not. A For Each header
    dominates only reads inside its own body, so a row that uses its index, such as `occurrence=i`,
    may not move out of the loop (Manager decision 2026-10-07, after review). A move of either end,
@@ -1394,9 +1395,11 @@ typed (`_is_typed_stmt`, which also refuses a block holding a Read Field or assi
 and `_refuse_typed_only_result` then checks the result for shifted `code` rows
 (`_refuse_shifted_code`) and unbound reads (`_unbound_reads`). This review has not checked that
 code line by line against rules 1 to 6. Where R1 admits what this rule refuses, the R1 code is what
-has to change. R1 may refuse more than the rule requires: for example, its `_unbound_reads` never
-counts a binding after its block, so it refuses a move that an `if` and `else` both binding the name
-would make safe under rule 6. That is stricter, and safe.
+has to change. One such gap is open: R1 compares per-name counts of unbound reads before and after
+an edit, and never counts a binding after its block. So a read the base already over-counts can
+hide a new real one. With `if c: x = ...` and `else: x = ...` above `use(x)`, moving the `else`
+binding below `use(x)` leaves the count unchanged, so R1 admits the move. Rule 6 refuses it, and
+the handler would raise UnboundLocalError whenever `c` is false. R1 must close this.
 
 ### G.7 The R1 fix: values a typed edit may write
 
@@ -1459,8 +1462,8 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
   - in value params, lookup-params values and `FhirToken`'s second argument, which may also carry
     message content, a handler local other than `msg`, and nothing beyond what this list admits
     elsewhere. A *handler local* is a name the handler itself binds, such as `pid5`, and that no
-    function in the module declares `global` or `nonlocal`. A declared name is shared state, so it
-    could carry one message's data into the next;
+    function in the module declares `global`. A `global` name is module state, so it could carry
+    one message's data into the next;
   - **these bullets are a ceiling, on every path, value params included: the predicate SHALL NOT
     admit a name beyond a handler local, a For Each `range` index, a module-level name the
     immutable-literal bullet admits, or a `code_set` name as `code_lookup`'s `table`, whatever the
@@ -1512,9 +1515,11 @@ change is being built separately and has not landed.
 
 - [ ] **AC-G1** -- WHILE the editor is the ADR 0208 analyst build, THE SYSTEM SHALL offer no command,
   menu or link that opens a `.py` file in a text editor, and SHALL offer no route that writes a
-  `.py` without opening one: an untitled buffer, *Save As*, *Compare*, or a rename or copy into a
-  `.py`. (Mechanism: the four layers and the `FileService` rebind of ADR 0208 spec section 10;
-  spike S-2 tested them on the browser build, Manager decision 2026-10-07, from spike S-2.)
+  `.py` without opening one. The routes include at least an untitled buffer, *Save As*, *Compare*,
+  a rename or copy into a `.py`, an upload, a drop into the navigator, and a move or copy of one
+  `.py` over another. (Mechanism: ADR 0208 spec section 10. Spike S-2 closed the first three and a
+  move or copy from a file that is not a `.py`, on the browser build; the rest are open. Manager
+  decision 2026-10-07, from spike S-2.)
 - [ ] **AC-G2** -- WHEN a file fails `lens parse` in the analyst build, THE SYSTEM SHALL show a
   read-only notice that a developer must fix it, and SHALL NOT open a text editor.
 - [ ] **AC-G3** -- WHILE the editor is the ADR 0208 developer build or the `ide/` extension, THE

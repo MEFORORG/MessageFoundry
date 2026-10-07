@@ -564,7 +564,8 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
 
   FR-41 does not list a row using `occurrence=i` moved out of its For Each loop. The repository
   check has no FR-40 item that tests for an unbound read (section 5.2), so it would pass that move.
-  The lens refuses it under typed-only mode (Amendment G, AC-G6).
+  The lens refuses it under typed-only mode (Amendment G, AC-G6). The Manager had asked for this
+  case in FR-41; leaving it out is a Builder departure, for the Manager to ratify.
 
   It SHALL pass an ordinary Steps edit, an insert above a `code` row, and one of each sanctioned shape
   in items 2 and 3 (spike S-4).
@@ -676,7 +677,8 @@ decision 2026-10-07, from spike S-2):
 
 1. **Opener priority.** `EditorManager.canHandle` declines a `.py`, so the Steps view is the only
    opener. Without this, `workbench.editorAssociations` gives the text editor priority 100000.
-2. **`EditorManager.open` refuses** a `.py`.
+2. **`EditorManager.open` refuses** a `.py`, and a rebound `OpenWithService` offers no text
+   editor for one.
 3. **`TextEditorProvider` refuses** a `.py`, because layout restore and reopen-closed-editor skip
    the opener.
 4. **The blocked commands are never registered:** `navigator.openWith`,
@@ -685,12 +687,12 @@ decision 2026-10-07, from spike S-2):
 
 The analyst build must also stop a `.py` being **written** without being opened. The routes
 include at least an untitled buffer, *Save As* and *Compare* (closed by layer 4), a rename or copy
-from another file into a `.py` (closed by a `FileService` rebind), and an upload, a drop into the
-navigator, and a copy of one `.py` over another. The spike's `FileService` rebind guards only a
-move or copy from a file that is not a `.py` into a `.py`, and its walk skipped upload, so the
-last three are open for the build. The rebind, not a file-operation participant, is the mechanism,
-because a participant cannot block a move: Theia logs the participant's error and carries on. A
-shipped build SHALL NOT expose test hooks on `window`.
+from a file that is not a `.py` into a `.py` (closed by a `FileService` rebind), and an upload, a
+drop into the navigator, and a move or copy of one `.py` over another. The spike's `FileService`
+rebind guards only a move or copy from a file that is not a `.py`, and its walk skipped upload, so
+the last three are open for the build. The rebind, not a file-operation participant, is the
+mechanism, because a participant cannot block a move: Theia logs the participant's error and
+carries on. A shipped build SHALL NOT expose test hooks on `window`.
 
 On a desktop the build split is about simplicity, not a security boundary. Test in either build runs
 config code on the user's machine, as `ide/` does today (review R12). Section 5 says what the controls
@@ -979,7 +981,7 @@ was checked against `messagefoundry/lens.py` at `origin/main` and on the R1 bran
 | F12. ADR 0103 Delete and Move, ADR 0089 block-cut | Amendment G, G.6 |
 | F13. Stale-base test never resets | FR-39 |
 | F14. Block rule restated; stale index rows | Amendment G, G.6 states it once; G.1, AC-G5, FR-20, section 8.2, ADR AC-12 point there; `docs/adr/README.md` rows |
-| F15. Deleted-lookup residual | Amendment G, G.6 rule 6; section 5.2 keeps the top-level case open for the R1 fix |
+| F15. Deleted-lookup residual | Amendment G, G.6 rule 6, which also records where the R1 branch stands |
 | Spike S-4 findings | FR-40 items 2 to 6, the false-failure and public-surface notes, FR-41, section 17 |
 | Spike S-1 findings | FR-26, sections 8.1, 8.2, 9, 10, 11.2, 12, 16 and 17; ADR D3, D9 and AC-10 |
 | Spike S-2 findings | FR-17, section 10, section 17; Amendment G AC-G1 |
