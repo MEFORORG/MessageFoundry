@@ -10,7 +10,8 @@ decode path cannot name a type, import a module, or reach ``__reduce__``. Nothin
 direction, in either process.
 
 1. **Bootstrap** — reads one ``boot`` frame ``{config_dir, forbidden, mem_mb, code_sets}``, loads
-   the message :class:`~messagefoundry.config.wiring.Registry` from ``config_dir`` (the same loader the engine uses — it executes admin config under the unchanged safe-source gate),
+   the message :class:`~messagefoundry.config.wiring.Registry` from ``config_dir`` (the same loader
+   the engine uses — it executes admin config under the unchanged safe-source gate),
    **adopts the engine's code-set tables** from the frame in place of its own re-read of ``codesets/``
    (when the parent published any — a session constructed without them leaves the child on its own
    load), applies the POSIX resource caps where available, installs the forbidden-import guard, and
@@ -103,8 +104,8 @@ class _ForbiddenImportFinder:
 
 def _apply_resource_caps(mem_mb: int | None) -> None:
     """Best-effort POSIX ``RLIMIT_AS`` backstop (a no-op on Windows). The parent's wall-clock cap is
-    the authoritative bound on every platform, and the only bound on CPU time: there is deliberately
-    no ``RLIMIT_CPU`` (ADR 0087, amendment of 2026-10-07)."""
+    the authoritative bound on every platform. There is deliberately no ``RLIMIT_CPU``, so CPU spent
+    outside a call has no bound (ADR 0087, amendment of 2026-10-07)."""
     try:
         import resource
     except ImportError:

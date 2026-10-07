@@ -174,9 +174,10 @@ class SandboxPolicy:
     ``wall_seconds`` is the
     **authoritative** cap on every platform — the parent kills a worker that overruns it (so a
     pathological busy-loop Router/Handler can never wedge intake), and it is enforced **only** at
-    ``mode=subprocess``: the in-process path has no timeout at all. It is also the only bound on CPU
-    time; there is no ``RLIMIT_CPU`` (ADR 0087, amendment of 2026-10-07). ``mem_mb`` adds a POSIX ``RLIMIT_AS`` backstop *inside* the child where the ``resource`` module exists (a no-op on
-    Windows). ``startup_seconds`` bounds the one-time child bootstrap (config load)."""
+    ``mode=subprocess``: the in-process path has no timeout at all. There is no ``RLIMIT_CPU``, so
+    CPU that admin code spends outside a call has no bound (ADR 0087, amendment of 2026-10-07).
+    ``mem_mb`` adds a POSIX ``RLIMIT_AS`` backstop *inside* the child where the ``resource`` module
+    exists (a no-op on Windows). ``startup_seconds`` bounds the one-time child bootstrap (config load)."""
 
     mode: SandboxMode
     wall_seconds: float = 5.0

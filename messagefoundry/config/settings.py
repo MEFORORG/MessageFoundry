@@ -2077,7 +2077,7 @@ class SandboxSettings(_Section):
     mode: Literal["off", "subprocess"] = Field(default="off")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
-    # It is also the only CPU bound: there is no RLIMIT_CPU (ADR 0087, amendment of 2026-10-07).
+    # There is no RLIMIT_CPU, so CPU spent outside a call has no bound (ADR 0087, 2026-10-07).
     wall_seconds: float = Field(default=5.0, gt=0)
     # POSIX-only RLIMIT_AS address-space cap (MiB) inside the child (no-op on Windows). None disables it.
     mem_mb: int | None = Field(default=512, ge=1)
