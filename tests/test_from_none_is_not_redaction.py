@@ -164,6 +164,11 @@ _ALLOWED: tuple[_Allowed, ...] = (
         "the new message is that same text",
     ),
     _Allowed(
+        "messagefoundry/config/wiring.py::EnvRef.__post_init__::ValueError::WiringError",
+        _SAFE + "_cast_bool's fixed text withholds the value and lists the spellings, which the "
+        "new message also lists",
+    ),
+    _Allowed(
         "messagefoundry/framing.py::codec_for::KeyError::ValueError",
         _SAFE + "KeyError carries the framing preset name, which the new message also quotes",
     ),
