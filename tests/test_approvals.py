@@ -1955,18 +1955,6 @@ async def test_a_drain_failure_does_not_skip_engine_stop(tmp_path: Path) -> None
     assert calls == ["drain", "stop"]
 
 
-def test_every_resolve_outcome_has_a_status() -> None:
-    """The JSON body, the console path and its buttons all read ``ResolveOutcome``; the gate maps
-    each to a status through ``RESOLVE_OUTCOMES``. Pinned, so a new outcome cannot reach the page
-    and then answer 422 from the gate."""
-    from typing import get_args
-
-    from messagefoundry.api.approvals import RESOLVE_OUTCOMES
-    from messagefoundry.api.models import ResolveOutcome
-
-    assert set(RESOLVE_OUTCOMES) == set(get_args(ResolveOutcome))
-
-
 def _spy_on_teardown(
     app: Any, drain: Callable[..., Awaitable[list[str]]], calls: list[str], real_stop: list[Any]
 ) -> None:
@@ -1981,6 +1969,44 @@ def _spy_on_teardown(
 
     app.state.approval_gate.drain = drain
     engine.stop = _spy_stop
+
+
+async def test_the_long_operations_drain_runs_before_the_approval_drain(tmp_path: Path) -> None:
+    """The managed teardown drains long operations (DR activate or release, config reload) first,
+    then the approval gate, then stops the engine. A released reload's outcome write follows the
+    reload itself, so the reversed order would let that write meet a gate already drained."""
+    app = _managed(tmp_path / "order.db")
+    calls: list[str] = []
+    real_stop: list[Any] = []
+
+    async def _outliving(timeout: float = 0.0, *, grace: float = 0.0) -> list[str]:
+        calls.append("outliving")
+        return []
+
+    async def _approvals(timeout: float = 0.0) -> list[str]:
+        calls.append("drain")
+        return []
+
+    try:
+        async with app.router.lifespan_context(app):
+            _spy_on_teardown(app, _approvals, calls, real_stop)
+            app.state.outliving_operations.drain = _outliving
+    finally:
+        if real_stop and "stop" not in calls:
+            await real_stop[0]()
+    assert calls == ["outliving", "drain", "stop"]
+
+
+def test_every_resolve_outcome_has_a_status() -> None:
+    """The JSON body, the console path and its buttons all read ``ResolveOutcome``; the gate maps
+    each to a status through ``RESOLVE_OUTCOMES``. Pinned, so a new outcome cannot reach the page
+    and then answer 422 from the gate."""
+    from typing import get_args
+
+    from messagefoundry.api.approvals import RESOLVE_OUTCOMES
+    from messagefoundry.api.models import ResolveOutcome
+
+    assert set(RESOLVE_OUTCOMES) == set(get_args(ResolveOutcome))
 
 
 # --- BACKLOG #1562: the claim owner and the startup reconcile ---------------------------------------
