@@ -625,7 +625,7 @@ def _flag_hint(value: object) -> str:
     """The remedy appended to a hop-policy flag refusal. It names ``env()`` only when the value IS
     an ``env()`` reference, so a plain string such as ``"false"`` is not told about a reference it
     never held (vault BACKLOG #3139). One spelling for the factory path and the raw-settings path."""
-    if isinstance(value, EnvRef):
+    if _is_nested_envref(value):
         return " (an env() reference is not accepted on a hop-policy flag; write True or False)"
     return " (write a literal True or False)"
 
@@ -5212,18 +5212,40 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-#: Appended by :func:`attested_secure_hops` to the reason of a settings carrier whose declaration
-#: :func:`refuse_unresolved_hop_flags` refuses. That carrier is listed but never crossed, so the
-#: report must not read as if a gate allows it (vault BACKLOG #3139).
-REFUSED_ATTESTATION_MARK = "[REFUSED: the build check rejects this declaration; no gate allows it]"
+@dataclass(frozen=True)
+class AttestedHop:
+    """One declaration that attests its hop secure, as :func:`attested_secure_hop_records` reads it.
+
+    ``refused`` is its own field, never text in ``reason`` (vault BACKLOG #3139). An earlier draft
+    appended a mark to the reason, and an author could then write the mark into a live reason and
+    make a hop the engine crosses read as refused. ``name`` and ``reason`` are the author's raw text,
+    so a renderer must escape and quote them; ``reason`` is ``None`` when none was recorded."""
+
+    name: str
+    reason: str | None
+    refused: bool
 
 
-def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
-    """Every declaration that ATTESTS its hop secure (``tls_hop_attested``), as ``(name, reason)``.
+def _attested_reason_text(value: object) -> str | None:
+    """The text of an attestation reason for a report, or ``None`` when none was recorded.
 
-    The sibling of :func:`accepted_cleartext_hops`, and the same contract: the SINGLE reader behind
-    ``messagefoundry check``'s ``tls-hop-attested`` line, ``security_loosenings()`` and
-    ``GET /security/posture``, so the three can never report different sets. Owner ruling 2026-09-24.
+    A reason written past the factory may be any value. An ``env()`` reference is named by its key,
+    never its default, and any other non-string, a list holding an ``env()`` included, is named by
+    its type only, so no default or ``repr`` reaches ``check`` output (vault BACKLOG #3139)."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        return value
+    if _is_nested_envref(value):
+        return _envref_label(value)
+    return f"(not a string: {type(value).__name__})"
+
+
+def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
+    """Every declaration that ATTESTS its hop secure (``tls_hop_attested``), sorted by name.
+
+    The one walk behind :func:`attested_secure_hops` and ``messagefoundry check``'s
+    ``tls-hop-attested`` line, so the two can never list different sets. Owner ruling 2026-09-24.
 
     It walks every carrier a hop gate reads the attestation from, and reads each one where its gate
     does: the typed field on an inbound or outbound connection (``_source_config`` / ``_dest_config``
@@ -5235,42 +5257,33 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     or ``False``, so a value the report cannot read, such as an ``env()`` reference written into a
     lookup's settings after its factory ran, is listed rather than missed. The build check, start
     and each reference sync refuse that declaration (:func:`refuse_unresolved_hop_flags`), but this
-    report can run without them, so it marks such an entry :data:`REFUSED_ATTESTATION_MARK` rather
-    than let a reader take it as a hop the engine crosses (vault BACKLOG #3139).
-
-    A name and a reason are shown with their control characters escaped, so a reason holding a
-    newline that was written past every factory cannot split a ``check`` line or a log line, and an
-    ``env()`` reason is shown by its key only, never its default (vault BACKLOG #3139).
+    report can run without them, so such an entry has ``refused`` set rather than read as a hop the
+    engine crosses (vault BACKLOG #3139).
 
     Pure: it reads the loaded graph and touches nothing else."""
-
-    def _reason(value: object) -> str:
-        if not value:
-            return "(none recorded)"
-        # An env() reason written past the factory: name its key only, never its default.
-        return _envref_label(value) if _is_nested_envref(value) else scrub_control_chars(str(value))
 
     def _listed(flag: object) -> bool:
         return flag is not None and flag is not False
 
-    def _carrier_reason(name: str, settings: Mapping[str, Any], accepted: bool = False) -> str:
-        reason = _reason(settings.get("tls_hop_attested_reason"))
+    def _refused(name: str, settings: Mapping[str, Any], accepted: bool) -> bool:
         try:
             refuse_unresolved_hop_flags(settings, name)
             # A FhirLookup's typed cleartext_accepted with an attestation written into its settings
             # is refused by the lookup settings builder, so it is marked too.
             _refuse_attested_and_accepted(name, True, accepted)
         except WiringError:
-            return f"{reason} {REFUSED_ATTESTATION_MARK}"
-        return reason
+            return True
+        return False
 
     out = [
-        (inbound_record_name(ic.name), _reason(ic.tls_hop_attested_reason))
+        AttestedHop(
+            inbound_record_name(ic.name), _attested_reason_text(ic.tls_hop_attested_reason), False
+        )
         for ic in registry.inbound.values()
         if _listed(ic.tls_hop_attested)
     ]
     out += [
-        (oc.name, _reason(oc.tls_hop_attested_reason))
+        AttestedHop(oc.name, _attested_reason_text(oc.tls_hop_attested_reason), False)
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)
     ]
@@ -5283,13 +5296,32 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
         *((f"reference:{r.name}", r.source.settings, False) for r in registry.references.values()),
     ]
     out += [
-        (name, _carrier_reason(name, settings, accepted))
+        AttestedHop(
+            name,
+            _attested_reason_text(settings.get("tls_hop_attested_reason")),
+            _refused(name, settings, accepted),
+        )
         for name, settings, accepted in settings_carriers
         if _listed(settings.get("tls_hop_attested"))
     ]
-    # A reference set's or a lookup's name is not held to the connection-name pattern, so it is
-    # escaped too, or a newline in it could split the `check` line (vault BACKLOG #3139).
-    return sorted((scrub_control_chars(name), reason) for name, reason in out)
+    return sorted(out, key=lambda hop: hop.name)
+
+
+def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every declaration that ATTESTS its hop secure, as ``(name, reason)``.
+
+    The sibling of :func:`accepted_cleartext_hops`, and the same contract: the SINGLE reader behind
+    ``security_loosenings()`` and ``GET /security/posture``, built on
+    :func:`attested_secure_hop_records`, which ``messagefoundry check``'s ``tls-hop-attested`` line
+    reads, so the three can never report different sets. Owner ruling 2026-09-24.
+
+    A name and a reason are shown with their control characters escaped, so a newline written past
+    every factory cannot split a line (vault BACKLOG #3139). Whether the build check refuses an
+    entry is not in this pair; read :attr:`AttestedHop.refused` for that."""
+    return [
+        (scrub_control_chars(hop.name), scrub_control_chars(hop.reason or "(none recorded)"))
+        for hop in attested_secure_hop_records(registry)
+    ]
 
 
 #: What :func:`_peer_label` says when an address does not parse as scheme, host and port. It is fixed
