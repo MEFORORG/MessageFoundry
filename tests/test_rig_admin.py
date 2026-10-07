@@ -324,6 +324,8 @@ class _FakeClient:
         self.accepts = accepts
         self.token: str | None = None
         self.step_up: Any = None
+        self.reauths: list[str] = []
+        self.refuse_reauth = False
 
     def set_token(self, token: str) -> None:
         if token not in self.accepts:
@@ -332,6 +334,13 @@ class _FakeClient:
 
     def set_step_up_handler(self, handler: Any) -> None:
         self.step_up = handler
+
+    def reauth(self, password: str, *, purpose: str | None = None) -> None:
+        """Re-prove: refused when told to, else the engine re-keys the session, as it does."""
+        self.reauths.append(password)
+        if self.refuse_reauth:
+            raise ApiError("re-verification failed", status=403)
+        self.token = f"{self.token}-rekeyed"
 
 
 def test_a_client_refused_the_held_session_signs_in_again_at_its_own_node(
@@ -348,8 +357,39 @@ def test_a_client_refused_the_held_session_signs_in_again_at_its_own_node(
     client = _FakeClient(accepts={"fresh"})
     enginepoll.adopt_rig_session(client, "https://b", None)  # type: ignore[arg-type]
     assert client.token == "fresh" and renewed == [("https://b", "held")]
-    # The step-up handler signs in afresh (stale=None) and reports success to the client.
-    assert client.step_up() is True and renewed[-1] == ("https://b", None)
+
+
+def test_the_step_up_handler_re_proves_on_a_session_of_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2625: the reload takes a proof bound to its action, which no sign-in mints.
+    So the handler signs in to a PRIVATE session (never the held one, which every other client
+    holds) and re-proves there; the client's reauth carries the stashed action. A refused re-proof
+    reports failure, so the client surfaces the original refusal.
+
+    The credential is stubbed rather than drawn: `rig_admin` publishes a drawn password into the
+    process environment, and this test must leave none behind."""
+    monkeypatch.setattr(rigadmin, "session_token", lambda url, cacert=None: "fresh")
+    signed_in: list[str] = []
+
+    def sign_in(url: str, admin: object = None, *, cacert: str | None = None) -> str:
+        signed_in.append(url)
+        return "private"
+
+    monkeypatch.setattr(rigadmin, "sign_in", sign_in)
+    monkeypatch.setattr(rigadmin, "rig_admin", lambda: rigadmin.RigAdmin("rigadmin", "held-pw"))
+    monkeypatch.setattr(
+        rigadmin, "renew_session", lambda *a, **k: pytest.fail("the held session was replaced")
+    )
+    monkeypatch.setattr(enginepoll.time, "sleep", lambda _s: None)
+    client = _FakeClient(accepts={"fresh", "private"})
+    enginepoll.adopt_rig_session(client, "https://b", None)  # type: ignore[arg-type]
+    assert client.step_up() is True
+    assert signed_in == ["https://b"] and client.reauths == ["held-pw"]
+    assert client.token == "private-rekeyed"
+    client.refuse_reauth = True
+    assert client.step_up() is False
+    assert rigadmin.ADMIN_PASS_ENV not in os.environ
 
 
 def test_an_unreachable_engine_reads_as_an_api_error_and_a_refusal_does_not(
@@ -530,12 +570,24 @@ async def test_a_rig_node_serves_with_sign_in_on_and_the_rig_reads_it_signed_in(
         await poller.open()
         try:
             assert await poller.sample_once() is not None
-            # A caller about to TIME a sensitive request proves the credential first: a new
-            # session, taken by the client, that the engine answers.
+            # A caller about to TIME a reload proves for it first (vault BACKLOG #2625): a
+            # session of the client's own, holding a proof bound to config_reload. The held
+            # session every other client uses is left alone.
             before = rigadmin._held.token
+            primary = poller.client
+            assert primary is not None
             await poller.prove_sign_in()
-            assert rigadmin._held.token != before
+            assert rigadmin._held.token == before
+            assert primary.token not in (None, before)
             assert await poller.sample_once() is not None
+            # The proof opens the reload with no step-up retry, and only once.
+            primary.set_step_up_handler(None)
+            result = await asyncio.to_thread(primary.reload_config)
+            assert getattr(result, "inbound", None) is not None, result
+            await asyncio.sleep(0.3)  # past the engine's admin-write gap
+            with pytest.raises(ApiError) as refused:
+                await asyncio.to_thread(primary.reload_config)
+            assert refused.value.status == 403
         finally:
             await poller.close()
         # CONTROL: the same poller with no session reads nothing.
