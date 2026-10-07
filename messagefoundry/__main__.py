@@ -1731,9 +1731,9 @@ def _load_service_settings(
 def _post_write_settings_check(refusal: type[ValueError]) -> Callable[[Path], None]:
     """The ``validate`` callback ``security set`` and ``alert add``/``remove`` hand their editor.
 
-    It re-loads the edited file exactly as the engine does, so a bad write fails at edit time and the
-    editor rolls it back rather than the engine refusing at the next start. That reload is the WHOLE
-    file plus the environment layer, not the JSON the operator typed, so its failure goes through
+    It loads the editor's candidate exactly as the engine loads the file, so a bad edit fails at
+    edit time and never replaces the file, rather than the engine refusing at the next start. That
+    load is the WHOLE file plus the environment layer, not the JSON the operator typed, so its failure goes through
     :func:`_load_service_settings` and is raised as ``refusal`` already rendered (vault BACKLOG
     #2760); the editor modules stay outside the settings import graph and cannot render it."""
 
@@ -8149,7 +8149,8 @@ def _connection(args: argparse.Namespace) -> int:
     """Manage the data-authored ``connections.toml`` (ADR 0007): ``list`` to populate the VS Code
     editor, ``upsert``/``remove`` to save (a developer can also hand-edit the file). ``upsert``/
     ``remove`` validate the whole config dir (structure + connector/egress build-check) BEFORE
-    persisting and roll back on failure. Offline: touches no network, starts no server."""
+    persisting, so a refused edit never touches the file. Offline: touches no network, starts no
+    server."""
     import os
     from pathlib import Path
 
@@ -8272,13 +8273,13 @@ def _codeset(args: argparse.Namespace) -> int:
     ``upsert`` / ``rename`` / ``remove`` to save (a developer can also hand-edit the files). Offline:
     touches no network, starts no server, loads no config modules — validating a code set means
     "does this file load as a CodeSet", done by re-running the code_sets.py loader on the candidate.
-    ``upsert`` writes ``.csv`` atomically with owner-only perms and rolls back on a load failure."""
+    ``upsert`` loads an owner-only candidate ``.csv`` and replaces the live file only if it loads."""
     from messagefoundry.config import codeset_edit
     from messagefoundry.config.code_sets import CodeSetError, load_code_set
     from messagefoundry.config.wiring import WiringError
 
-    # The post-write check is the REAL loader on the written file (no egress/env build-check — a code
-    # set is standalone data): if the candidate .csv doesn't load, the writer rolls back.
+    # The pre-replace check is the REAL loader on the candidate (no egress/env build-check — a code
+    # set is standalone data): if the candidate .csv doesn't load, the live file is never touched.
     def validate(path: Path) -> None:
         load_code_set(path)
 
@@ -8640,7 +8641,8 @@ def _security(args: argparse.Namespace) -> int:
     the VS Code ``[security]`` editor (resolved values + which are explicitly set + the secure defaults +
     the active loosenings); ``set`` saves an update JSON (a ``null`` value resets a switch to its secure
     default). ``set`` re-loads the whole settings file BEFORE persisting — which also **rejects the
-    relocated legacy keys** — and rolls back on failure. Offline; applies on the next engine restart."""
+    relocated legacy keys** — so a refused edit never touches the file. Offline; applies on the next
+    engine restart."""
     from pydantic import ValidationError
 
     from messagefoundry.config import security_edit

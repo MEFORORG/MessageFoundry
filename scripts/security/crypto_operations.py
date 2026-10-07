@@ -42,8 +42,8 @@ seen:
 * a call made through ``getattr``, ``importlib`` or any other dynamic dispatch, or in a subprocess;
 * a provider passed as a VALUE and called elsewhere, such as the function handed to
   ``asyncio.to_thread``. The reload preflight reaches ``anchor_cadata`` that way (BACKLOG #2025).
-  ``Engine.fingerprint_bundle`` wraps its fold in a lambda instead, so that one is seen (vault
-  BACKLOG #2839);
+  ``Engine.fingerprint_bundle_blocking`` calls its fold directly instead, so that one is seen
+  (vault BACKLOG #2839, #2782);
 * a crypto DECISION that is not a call or a TLS-attribute assignment. ``transports/database.py``
   appends ``Encrypt=`` and ``TrustServerCertificate=`` to a DSN string: a first-party TLS posture
   decision with no crypto-shaped expression for any pattern instrument to match;
