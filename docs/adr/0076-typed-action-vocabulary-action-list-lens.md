@@ -1214,3 +1214,97 @@ save path, exactly as before.
   `RerenderDebouncer`, and the change path SHALL feed it rather than hold a timer of its own.
 - [ ] **AC-F6** — WHEN our own `lens rewrite` is applying, THE SYSTEM SHALL NOT re-project on the
   resulting document change (the update-loop guard, unchanged).
+
+## Amendment G (2026-10-07) -- PROPOSED -- the analyst build of the Theia editor drops three IDE guardrails, for that build only (review R9)
+
+**Status: Proposed.** Not accepted; accepting it needs the owner. Nothing above this heading is
+changed by it. It is written for [ADR 0208](0208-a-theia-desktop-app-gives-interface-analysts-a-simpler-steps-only-editor.md),
+which proposes a Theia desktop editor for interface analysts, and for its specification
+[`docs/design/theia-analyst-editor.md`](../design/theia-analyst-editor.md). A review of the
+2026-10-02 drafts of that design found that they removed guardrails this ADR accepted without
+amending it (finding R9). This amendment names each one.
+
+### G.1 The clauses this overrides, in the analyst build only
+
+| Clause | Where | In the analyst build |
+|---|---|---|
+| *"Reopen With: Python always available"* | §5, second bullet | Not available. The analyst build has no text editor for `.py` |
+| Degrade to the text editor on a parse failure, with a notice | §3 (the coverage invariant's *"steps aside to the text editor"*), §6 item 6, and the fifth bullet of the original Acceptance Criteria after §6 | Replaced: a read-only notice says a developer must fix the file. No text editor opens |
+| Entry is opt-in: a CodeLens and a command, not the default editor for `.py` | §2, Phase 2 | The Steps view is how the analyst build opens a Router or Handler. There is no other way |
+
+Accepted text elsewhere restates the same guardrails, and the override reaches those restatements
+too: at least D.6 (*"No relaxation of the §5 guardrails"*, which names degrade-to-text-editor for
+`route` edits) and F.3 (*"'Reopen With: Python' stands"*). Every other clause of D.6 and F.3 stands in
+the analyst build.
+
+**The analyst build also narrows one thing.** Today a whole `if`/`for` block can be deleted or moved
+from its header row, nested `code` rows included. In the analyst build a delete or move of a block
+that contains a `code` row, or whose test is unrecognized, is refused (AC-G5), because it would
+remove or reorder hand-written Python.
+
+**The `ide/` extension keeps all three guardrails unchanged. So does the developer build of ADR 0208
+for a `code:edit` holder.** A developer-build user without `code:edit` gets the analyst build's
+limits, so AC-G1, AC-G2 and AC-G5 apply to that user too. So does
+every other clause of this ADR.
+
+### G.2 Why each guardrail can go in that build, and what replaces it
+
+- **Opt-in entry** existed because *"Python files broadly belong to the user's Python tooling"*
+  (§2). The analyst build has no Python tooling, so nothing else claims the file.
+- **Reopen With: Python and the text fallback** are the escape route when the lens cannot show
+  something. In the analyst build the escape route is a developer. The cost is real: an analyst is
+  blocked on a file that fails `lens parse` until a developer fixes it. A `code` row stays visible
+  and read-only, so one hand-written line still does not eject the analyst (§4's ladder holds).
+
+### G.3 What stays, and the BACKLOG #26 note
+
+**These do not change in any build:** the `.py` is the only artifact and the only execution path
+(§2); `lens rewrite` is a row-scoped splice (§5); one editor at a time and the update-loop guard
+(§5); live values stay save-gated and redacted (Amendment F, the #225 addendum); static analysis only
+(§5). The analyst build saves through the editor's document model, as §2 Phase 3 describes, so §2's
+save path is not overridden. (The 2026-10-02 drafts' server-side broker would have replaced it. ADR
+0208 defers that design to a later hosted phase.)
+
+**Why the analyst build stays inside the BACKLOG #26 carve-out** (CLAUDE.md section 12). The carve-out
+holds because the `.py` stays the only artifact and the only execution path. The analyst build removes
+routes to the text; it adds no declarative artifact, no interpreter and no canvas. A view that offers
+less of the same file cannot cross a line drawn at a second artifact or a second execution path.
+
+**Bounds, each of which would cross the line:**
+
+- **No mapping artifact.** ADR 0208 adopts drag-a-field-onto-a-step as **parameter entry**: the drag
+  fills one typed parameter, as the field picker already does, and `lens rewrite` writes the Python.
+  A drag that created a stored field mapping, or a canvas of connected fields, is declined
+  field-mapping or canvas authoring. Whether the parameter-entry reading holds is an owner question
+  (ADR 0208, To resolve).
+- **No step descriptions drawn from comments.** Attaching a comment to the following step is ruled out
+  by A.5 (*"No attachment to a following statement"*) and needs its own amendment.
+- **No stored Steps model**, in either build.
+
+### G.4 §7 is not edited
+
+§7 lists a standalone designer or Theia studio as rejected for now, a parked exit path. ADR 0208
+proposes taking that exit path for analysts. This amendment does not rewrite §7; if ADR 0208 is
+accepted, it is the record that the parked path was taken.
+
+### G.5 A precondition this amendment does not meet
+
+Review finding R1 showed `lens rewrite` accepting arbitrary Python through `paste_block`, a raw `if`
+test and `{"expr": ...}` values. A fix to `messagefoundry/lens.py` is being built separately. Until
+it lands, a typed-row edit can carry code, and the analyst build's limit does not hold even inside
+the editor. ADR 0208 makes the fix a condition of shipping the analyst build.
+
+### Acceptance Criteria (Amendment G -- proposed, not ratified)
+
+- [ ] **AC-G1** -- WHILE the editor is the ADR 0208 analyst build, or its developer build for a user
+  without `code:edit`, THE SYSTEM SHALL offer no command,
+  menu or link that opens a `.py` file in a text editor.
+- [ ] **AC-G2** -- WHEN a file fails `lens parse` in the analyst build, THE SYSTEM SHALL show a
+  read-only notice that a developer must fix it, and SHALL NOT open a text editor.
+- [ ] **AC-G3** -- WHILE the editor is the ADR 0208 developer build for a `code:edit` holder, or the
+  `ide/` extension, THE
+  SYSTEM SHALL keep *Reopen With: Python*, the text-editor fallback and opt-in entry unchanged.
+- [ ] **AC-G4** -- THE analyst build SHALL write a `.py` only through `lens rewrite` output applied
+  to the editor's document, and SHALL store no Steps model.
+- [ ] **AC-G5** -- IF an analyst-build delete or move targets a control block that contains a `code`
+  row or has an unrecognized test, THEN THE SYSTEM SHALL refuse it.
