@@ -10110,9 +10110,10 @@ def _build_check_connectors(
     # the statement checks stay at sync. Builds no pool and opens no socket. A source whose env()
     # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
     # refuse the whole graph.
+    # Every source kind, and before the unresolved-env skip below: this refusal needs no value. The
+    # same call Engine.start makes (vault BACKLOG #3139).
+    refuse_reference_hop_flags(registry)
     for rname, rspec in registry.references.items():
-        # Every source kind, and before the unresolved-env skip below: this refusal needs no value.
-        refuse_unresolved_hop_flags(rspec.source.settings, f"reference set {rname!r}")
         if rspec.source.kind != "database":
             continue
         try:
@@ -10203,6 +10204,18 @@ def check_reference_backend_supported(registry: Registry, store: QueueStore) -> 
         f"ADR 0006 reference snapshots; backend {backend_name!r} does not, so "
         f"every reference(...) read would raise at run time, after the ACK."
     )
+
+
+def refuse_reference_hop_flags(registry: Registry) -> None:
+    """Refuse a reference set whose source settings carry a hop-policy flag the build check refuses.
+
+    ``serve`` runs no build check, so without this a raw ``env()`` flag written into a
+    ``DatabaseRef`` or ``FileRef`` source after its factory was refused only at the set's first
+    sync, after start, where it surfaced as a failed sync (vault BACKLOG #3139). It is the same
+    :func:`refuse_unresolved_hop_flags` call :func:`build_check_registry` and the sync make, so the
+    three cannot disagree. Every source kind, and it needs no resolved value."""
+    for rname, rspec in registry.references.items():
+        refuse_unresolved_hop_flags(rspec.source.settings, f"reference set {rname!r}")
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})

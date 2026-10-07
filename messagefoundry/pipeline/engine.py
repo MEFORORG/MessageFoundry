@@ -90,6 +90,7 @@ from messagefoundry.pipeline.wiring_runner import (
     TeardownReason,
     check_pt_backend_supported,
     check_reference_backend_supported,
+    refuse_reference_hop_flags,
 )
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
@@ -1495,6 +1496,9 @@ class Engine:
             # supports_ingest_stage check it fires on EVERY node (leader or standby) — which also covers
             # the clustered branch, where the reference runner starts on every node before leadership.
             self._check_reference_backend_supported()
+            # Vault BACKLOG #3139: serve runs no build check, so a reference set's raw hop flag is
+            # refused here, before any sync, rather than surfacing later as a failed sync.
+            refuse_reference_hop_flags(self._registry_runner.registry)
             if not self._coordinator.is_clustered():
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
                 # before — byte-identical. The config-drift sweeps + reference materialize + listener

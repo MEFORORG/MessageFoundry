@@ -95,6 +95,7 @@ from __future__ import annotations
 import ast
 import functools
 import importlib.metadata
+import json
 import os
 import re
 import shutil
@@ -2366,6 +2367,36 @@ def _check_alert_smtp_tls(
     )
 
 
+#: A declaration name shown bare on a check line. Anything else is quoted (vault BACKLOG #3139).
+_BARE_DECLARATION_NAME = re.compile(r"[A-Za-z0-9_.:-]+")
+
+
+def _quoted_text(text: str) -> str:
+    """``text`` as one double-quoted token that its own content cannot close or extend.
+
+    JSON string quoting escapes every quote, backslash and C0 control, so a reason cannot end its
+    token and write a separator, a second entry or a mark after it. ``ensure_ascii`` also writes
+    every non-ASCII character as ``\\uXXXX``, so a lookalike quote such as U+02BA or U+FF02, or a
+    right-to-left letter, cannot fake that end for a human reader. The log escape then covers DEL,
+    the one ASCII control JSON leaves raw (vault BACKLOG #3139)."""
+    from messagefoundry.controlchars import scrub_control_chars
+
+    return scrub_control_chars(json.dumps(text))
+
+
+def _declared_entry(name: str, reason: str | None, *, refused: bool = False) -> str:
+    """One entry of a declaration list on an advisory check line: ``name ("reason")``.
+
+    The reason is always quoted. A name is shown bare only when it holds nothing but letters,
+    digits and ``_.:-``; a reference set's or a lookup's name is not held to the connection-name
+    pattern, so any other name is quoted too. Every character an author controls is therefore
+    inside quotes, and ``REFUSED`` after the entry can only come from the caller (vault BACKLOG
+    #3139)."""
+    shown = name if _BARE_DECLARATION_NAME.fullmatch(name) else _quoted_text(name)
+    why = "none recorded" if reason is None else _quoted_text(reason)
+    return f"{shown} ({why}){' REFUSED' if refused else ''}"
+
+
 def _check_cleartext_accepted(
     config_dir: str | Path,
 ) -> CheckResult:
@@ -2403,7 +2434,7 @@ def _check_cleartext_accepted(
             required=False,
             detail="no connection declares cleartext_accepted",
         )
-    listed = "; ".join(f"{name} ({reason})" for name, reason in accepted)
+    listed = "; ".join(_declared_entry(name, reason) for name, reason in accepted)
     return CheckResult(
         "cleartext-accepted",
         ok=True,
@@ -2417,12 +2448,14 @@ def _check_hop_attested(config_dir: str | Path) -> CheckResult:
 
     The sibling of :func:`_check_cleartext_accepted`, with the opposite claim: an attested hop is
     ALLOWed rather than warned, so this line is where a reviewer sees what the engine is taking on
-    trust. Owner ruling 2026-09-24. Advisory (``required=False``): an attestation with a written reason
-    is a legitimate choice, not a config error. It reads through ``attested_secure_hops``, the same
-    reader as ``security_loosenings()`` and ``GET /security/posture``.
+    trust. A declaration the build check refuses is listed and marked REFUSED, because it is never
+    crossed (vault BACKLOG #3139). Owner ruling 2026-09-24. Advisory (``required=False``): an
+    attestation with a written reason is a legitimate choice, not a config error. It reads through
+    ``attested_secure_hop_records``, the walk behind ``attested_secure_hops``, which
+    ``security_loosenings()`` and ``GET /security/posture`` read, so all three list one set.
 
     SKIPs when the graph will not load, same convention as its siblings."""
-    from messagefoundry.config.wiring import WiringError, attested_secure_hops, load_config
+    from messagefoundry.config.wiring import WiringError, attested_secure_hop_records, load_config
 
     try:
         registry = load_config(config_dir)
@@ -2434,19 +2467,23 @@ def _check_hop_attested(config_dir: str | Path) -> CheckResult:
             skipped=True,
             detail=f"config did not load: {exc}",
         )
-    attested = attested_secure_hops(registry)
+    attested = attested_secure_hop_records(registry)
     if not attested:
         return CheckResult(
             "tls-hop-attested", ok=True, required=False, detail="no hop is attested secure"
         )
-    listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    listed = "; ".join(
+        _declared_entry(hop.name, hop.reason, refused=hop.refused) for hop in attested
+    )
+    # The sentence must not say every listed hop is allowed; see AttestedHop (vault BACKLOG #3139).
     return CheckResult(
         "tls-hop-attested",
         ok=True,
         required=False,
         detail=(
-            f"{len(attested)} hop(s) are attested secure by means the engine cannot see, and are "
-            f"ALLOWed where an enforcing gate would refuse them — {listed}"
+            f"{len(attested)} hop(s) declare they are secure by means the engine cannot see. An "
+            "enforcing gate allows each one it would otherwise refuse, unless the entry is marked "
+            f"REFUSED — {listed}"
         ),
     )
 
@@ -2725,7 +2762,7 @@ def _check_revocation_attested(config_dir: str | Path) -> CheckResult:
             required=False,
             detail="no connection declares tls_revocation_attested",
         )
-    listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    listed = "; ".join(_declared_entry(name, reason) for name, reason in attested)
     return CheckResult(
         "tls-revocation-attested",
         ok=True,

@@ -50,11 +50,9 @@ from messagefoundry.config.models import (
     ConnectorType,
     Destination,
     SignatureAlgorithm,
-    flag_from_settings,
 )
 from messagefoundry.config.tls_policy import (
     CREDENTIAL_HOP_WAYS_ACROSS,
-    MIRRORED_CONNECTION_SETTING,
     SYSTEM_TRUST_ANCHOR,
     InsecureHopRefused,
     TrustAnchor,
@@ -78,13 +76,15 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
-    cleartext_acceptance_from_settings,
     ech_readdressed_request,
     enforce_outbound_length_limits,
+    hop_declarations_from_settings,
     http_family_trust_anchor,
     refuse_cleartext_credential_hop,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
+    # Re-exported: it moved to rest.py beside its cleartext twin (vault BACKLOG #3139).
+    revocation_attestation_from_settings,
 )
 from messagefoundry.transports.signing import (
     CLIENT_ASSERTION_TYPE,
@@ -631,50 +631,6 @@ def smart_scope_letters(scope: str) -> frozenset[str] | None:
         if found:
             letters |= found
     return frozenset(letters) if letters else None
-
-
-def revocation_attestation_from_settings(
-    s: Mapping[str, Any],
-) -> tuple[bool, str | None, str | None]:
-    """``(attested, reason, connection)`` for a token hop's revocation guard (ADR 0173 section 4.3).
-
-    The runner mirrors the connection's typed ``tls_revocation_attested`` declaration, its mandatory
-    reason and the connection's name (:data:`MIRRORED_CONNECTION_SETTING`, written for every
-    connection, so a REFUSAL names it too) into the resolved settings. This is the one reader of those
-    keys for both bearer providers (BACKLOG #2112, #2115), as ``cleartext_acceptance_from_settings``
-    is for the cleartext twin. The ``fhir_lookup`` read hop reads them through it too
-    (BACKLOG #2193): a lookup has no ``Destination``, so the mirror is where its declaration is."""
-    reason = s.get("tls_revocation_attested_reason")
-    connection = s.get(MIRRORED_CONNECTION_SETTING)
-    return (
-        flag_from_settings(s, "tls_revocation_attested"),
-        None if reason is None else str(reason),
-        None if connection is None else str(connection),
-    )
-
-
-#: ``(flag, reason, connection)``, as the two declaration readers return a declaration.
-_Declaration = tuple[bool, str | None, str | None]
-
-
-def hop_declarations_from_settings(
-    s: Mapping[str, Any], error: type[ValueError]
-) -> tuple[bool, _Declaration, _Declaration]:
-    """The three hop-policy flags a credential seam reads, strictly (vault BACKLOG #2232).
-
-    Returns ``(tls_hop_attested, cleartext acceptance, revocation attestation)``. A flag that is not
-    a real ``bool`` raises ``error``, the calling seam's own refusal type, naming the connection the
-    runner mirrored into ``s``. One body, so the Digest, OAuth2 and SMART seams raise alike."""
-    try:
-        return (
-            flag_from_settings(s, "tls_hop_attested"),
-            cleartext_acceptance_from_settings(s),
-            revocation_attestation_from_settings(s),
-        )
-    except ValueError as exc:
-        connection = s.get(MIRRORED_CONNECTION_SETTING)
-        prefix = hop_name_prefix(None if connection is None else str(connection))
-        raise error(f"{prefix}{exc}") from exc
 
 
 def smart_auth_configured(s: Mapping[str, Any]) -> bool:
