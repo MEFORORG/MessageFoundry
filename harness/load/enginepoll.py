@@ -656,21 +656,26 @@ class EnginePoller:
             await loop.run_in_executor(None, client.close)
 
     async def prove_sign_in(self) -> None:
-        """Sign the PRIMARY client in afresh, for a caller about to TIME a sensitive request.
+        """Prove the PRIMARY client's credential for a reload, for a caller about to TIME one.
 
-        A route such as ``POST /config/reload`` wants a credential proved within the last few
-        minutes. A client that finds the proof stale is refused, signs in and asks again, and all
-        of that would land inside the caller's timer. So the caller proves it first, outside the
-        timer. Only a rig poller does anything here, and a failure is left for the timed request to
-        report in its own terms."""
+        ``POST /config/reload`` wants a proof bound to it (vault BACKLOG #2625). A client without
+        one is refused, re-proves and asks again, and all of that would land inside the caller's
+        timer. So the caller proves it first, outside the timer. Only a rig poller does anything
+        here, and a failure is left for the timed request to report in its own terms."""
         if isinstance(self._token, rigadmin.RigSession) and self._clients:
             await asyncio.get_running_loop().run_in_executor(None, self._prove_sign_in_sync)
 
     def _prove_sign_in_sync(self) -> None:
         url = self._urls[0]
         cacert = self._cacert or self._cacert_for(url)
+        client = self._clients[0]
         with contextlib.suppress(*SIGN_IN_ERRORS):
-            self._clients[0].set_token(rigadmin.renew_session(url, None, cacert=cacert))
+            # Since vault BACKLOG #2625 the reload takes a proof bound to its action, which a
+            # sign-in does not mint, so prove for that action here, on a session of this client's
+            # own (the rotation then touches no other client), and the timed reload spends it at
+            # once. The action id is spelled out: the harness does not import engine internals.
+            client.set_token(rigadmin.sign_in(url, cacert=cacert))
+            client.reauth(rigadmin.rig_admin().password, purpose="config_reload")
 
     async def sample_once(self) -> EngineSample | None:
         sample = await asyncio.get_running_loop().run_in_executor(None, self._sample_sync)

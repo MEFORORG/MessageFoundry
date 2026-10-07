@@ -42,6 +42,10 @@ export const STEP_UP_ATTEMPTS = 3;
 
 const CANCELLED = Symbol("cancelled");
 
+/** The detail `POST /me/reauth` answers a wrong password with (messagefoundry/api/auth_routes.py,
+ *  `reauth`). Matched exactly, because the route's other 403s are not a password the user can fix. */
+export const WRONG_PASSWORD_DETAIL = "re-verification failed";
+
 /** Prompt and re-prove, re-asking after a wrong password. Resolves to the re-keyed token (or
  *  `undefined` from an older engine), or {@link CANCELLED}. A refusal that is not a wrong password,
  *  and the last wrong one, reject as they came. */
@@ -58,9 +62,14 @@ async function reprove(
     try {
       return await host.reauth(token, password, signal.action);
     } catch (e) {
-      // A wrong password is a plain 403 from /me/reauth. A 403 carrying the IdP signal, a 401 (the
-      // session ended) and anything else are not, and re-asking would not help.
-      const wrong = e instanceof HttpError && e.status === 403 && e.stepUp === undefined;
+      // A wrong password is the 403 /me/reauth answers with exactly WRONG_PASSWORD_DETAIL. Other
+      // 403s are not: the IdP signal, and a directory that could not judge the password at all,
+      // which a re-typed password does not change. Nor are a 401 (the session ended) and the rest.
+      const wrong =
+        e instanceof HttpError &&
+        e.status === 403 &&
+        e.stepUp === undefined &&
+        e.message === WRONG_PASSWORD_DETAIL;
       if (!wrong || attempt >= STEP_UP_ATTEMPTS) {
         if (stepUpOf(e)?.viaIdp) {
           throw new IdpStepUpRequiredError();

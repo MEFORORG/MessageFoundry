@@ -218,6 +218,29 @@ suite("stepUp — withStepUp re-proves once and retries once (vault BACKLOG #262
     assert.strictEqual(prompts, STEP_UP_ATTEMPTS);
   });
 
+  test("a directory that could not judge the password is not reported as a wrong password", async () => {
+    let prompts = 0;
+    const host: StepUpHost = {
+      promptPassword: () => {
+        prompts += 1;
+        return Promise.resolve(PASSWORD);
+      },
+      reauth: () =>
+        Promise.reject(
+          new HttpError(
+            403,
+            "the directory could not confirm this account; try again later, or ask an administrator",
+          ),
+        ),
+      storeToken: () => Promise.resolve(),
+    };
+    await assert.rejects(
+      () => withStepUp("old", () => Promise.reject(refusal("config_reload")), host),
+      (e: unknown) => e instanceof HttpError && /directory/.test(e.message),
+    );
+    assert.strictEqual(prompts, 1);
+  });
+
   test("a re-proof refused for a reason a password cannot fix is not re-asked", async () => {
     let prompts = 0;
     const host: StepUpHost = {

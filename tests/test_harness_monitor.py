@@ -252,7 +252,9 @@ class _ReauthClient:
     [
         (("typed-pw", True), False, True, 1),  # re-proved: the poller moves to the new token
         (("", False), False, False, 0),  # cancelled: nothing is sent
-        (("typed-pw", True), True, False, 0),  # refused: the old session is untouched
+        # Refused: the reauth error rises out of the action that asked, so its report names the
+        # real cause, and the poller is left on the untouched old session.
+        (("typed-pw", True), True, None, 0),
     ],
 )
 def test_the_step_up_handler_re_proves_and_restarts_the_poller(
@@ -260,7 +262,7 @@ def test_the_step_up_handler_re_proves_and_restarts_the_poller(
     monkeypatch: pytest.MonkeyPatch,
     answer: tuple[str, bool],
     refuse: bool,
-    expected: bool,
+    expected: bool | None,
     restarts: int,
 ) -> None:
     """Vault BACKLOG #2625: reload and purge take a proof bound to their action, which a sign-in
@@ -275,7 +277,11 @@ def test_the_step_up_handler_re_proves_and_restarts_the_poller(
     monkeypatch.setattr(MonitorPanel, "_start_poller", lambda self: started.append(1))
     monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: answer)
     try:
-        assert panel._step_up() is expected
+        if expected is None:
+            with pytest.raises(ApiError, match="re-verification failed"):
+                panel._step_up()
+        else:
+            assert panel._step_up() is expected
         assert client.passwords == ([answer[0]] if answer[1] and answer[0] else [])
         assert len(started) == restarts
     finally:

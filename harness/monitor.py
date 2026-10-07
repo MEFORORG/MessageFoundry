@@ -344,11 +344,9 @@ class MonitorPanel(QWidget):
         )
         if not ok or not password:
             return False
-        try:
-            client.reauth(password)
-        except ApiError as exc:
-            self._set_status(str(exc), error=True)
-            return False
+        # A refused re-proof raises out of the action that asked for it, so the action's own error
+        # report names the real cause ("re-verification failed") rather than the original 403.
+        client.reauth(password)
         self._stop_poller()
         self._start_poller()
         return True
