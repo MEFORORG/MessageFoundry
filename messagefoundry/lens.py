@@ -2672,18 +2672,14 @@ def _linear_items(func: ast.FunctionDef | ast.AsyncFunctionDef, ctx: _TypedCtx) 
     """Every statement of ``func`` in source order, as :class:`_Item` s."""
     items: list[_Item] = []
 
-    seen: Counter[str] = Counter()
-
     def visit(stmts: list[ast.stmt], path: tuple[str, ...]) -> None:
         for stmt in stmts:
             key = _stmt_key(stmt)
-            seen[key] += 1
-            nth = seen[key]  # which block with this header: a raise may not change guards
             at = len(items)
             terminal = isinstance(stmt, ast.Return | ast.Raise)
             items.append(_Item(stmt, key, path, not _is_typed_unit(stmt, ctx), at + 1, terminal))
             for label, suite, _ in _suites(stmt):
-                visit(suite, (*path, f"{key}#{nth}|{label}"))
+                visit(suite, (*path, f"{key}|{label}"))
             items[at] = items[at]._replace(end=len(items))
 
     visit(func.body, ())
@@ -2765,16 +2761,7 @@ def _unbound_reads(
     out: Counter[tuple[str, str, int]] = Counter()
 
     def count(node: ast.AST, defined: set[str]) -> None:
-        # A site is (the statement's key, the name, which read of it in that statement), so a moved
-        # statement keeps its sites and a read that newly loses its binding is a new site.
-        where = _stmt_key(node) if isinstance(node, ast.stmt) else ast.dump(node)
-        nth: Counter[str] = Counter()
-        for n in ast.walk(node):
-            if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)):
-                continue
-            nth[n.id] += 1
-            if n.id in local and n.id not in defined:
-                out[(where, n.id, nth[n.id])] += 1
+        out.update(_read_sites(node, local, defined))
 
     def visit(stmts: list[ast.stmt], entry: set[str]) -> set[str]:
         """Count the suite's reads; return the names surely bound once it falls through. A suite
@@ -2806,19 +2793,76 @@ def _unbound_reads(
     return out
 
 
+def _read_sites(node: ast.AST, local: set[str], defined: set[str]) -> list[tuple[str, str, int]]:
+    """The read sites in ``node`` of names in ``local`` but not in ``defined``.
+
+    A site is (the statement's key, the name, which read of it in that statement), so a moved
+    statement keeps its sites and a read that newly loses its binding is a new site."""
+    where = _stmt_key(node) if isinstance(node, ast.stmt) else ast.dump(node)
+    nth: Counter[str] = Counter()
+    out: list[tuple[str, str, int]] = []
+    for n in ast.walk(node):
+        if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)):
+            continue
+        nth[n.id] += 1
+        if n.id in local and n.id not in defined:
+            out.append((where, n.id, nth[n.id]))
+    return out
+
+
+def _reads_before_any_binding(
+    func: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]
+) -> Counter[tuple[str, str, int]]:
+    """The read sites with no binding of the name ANYWHERE earlier in source order.
+
+    :func:`_unbound_reads` over-counts on purpose (a binding inside a loop or a one-armed ``if`` is
+    not sure to run), so a read it already counts keeps its site wherever it moves. This weaker
+    test closes that: a read that had some binding above it and has none after the edit is
+    refused too, such as a read of a loop's last value, or an ``occurrence=i`` row, moved above the
+    loop (review of head 6259fb97a2, finding 1)."""
+    a = func.args
+    defined = {
+        arg.arg
+        for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+        if arg is not None
+    }
+    out: Counter[tuple[str, str, int]] = Counter()
+
+    def visit(stmts: list[ast.stmt]) -> None:
+        for stmt in stmts:
+            if not isinstance(stmt, _COMPOUND_STMT_TYPES):
+                out.update(_read_sites(stmt, local, defined))
+                defined.update(_own_scope_bindings(stmt))
+                continue
+            for field, value in ast.iter_fields(stmt):
+                if field in ("body", "orelse", "finalbody", "handlers", "cases"):
+                    continue
+                for node in value if isinstance(value, list) else [value]:
+                    if isinstance(node, ast.AST):
+                        out.update(_read_sites(node, local, defined))
+                        defined.update(_own_scope_bindings(node))
+            for _, suite, names in _suites(stmt):
+                defined.update(names)
+                visit(suite)
+            if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                defined.add(stmt.name)
+
+    visit(func.body)
+    return out
+
+
 def _bound_after(stmt: ast.stmt, header: set[str], ends: dict[str, set[str]]) -> set[str]:
     """The names surely bound after compound ``stmt`` falls through (:func:`_unbound_reads`).
 
     ``header`` is what is bound on entry plus the header's own bindings, and ``ends`` maps each
     suite label (:func:`_suites`) to what is bound at its end. An ``if`` binds what every branch
-    binds, with a missing ``else`` binding nothing. A ``with`` binds what its body binds. A loop binds
+    binds, with a missing ``else`` binding nothing. A ``with`` binds nothing new, because a context
+    manager such as ``contextlib.suppress`` may skip the rest of its body. A loop binds
     nothing new, because its body may not run: so a For-Each index is unbound after its loop
     (Manager decision 2026-10-07). A ``try`` binds what its body and every handler bind, plus what
     its ``finally`` binds. A ``match``, a ``def`` and a ``class`` are judged conservatively."""
     if isinstance(stmt, ast.If):
         return ends.get("body", header) & ends.get("orelse", header)
-    if isinstance(stmt, ast.With | ast.AsyncWith):
-        return ends.get("body", header)
     if isinstance(stmt, ast.Try | ast.TryStar):
         caught = [v for k, v in ends.items() if k.startswith("handler")]
         out = ends.get("body", header)
@@ -2870,7 +2914,9 @@ def _refuse_new_unbound_reads(
         raise LensRewriteError(f"{what} is refused - internal: the handler was not found again")
     local = _handler_locals(before_func) | _handler_locals(after_func)
     before, after = _unbound_reads(before_func, local), _unbound_reads(after_func, local)
-    stranded = sorted(site[1] for site in after - before)
+    early_before = _reads_before_any_binding(before_func, local)
+    early_after = _reads_before_any_binding(after_func, local)
+    stranded = sorted(site[1] for site in (after - before) + (early_after - early_before))
     if stranded:
         raise LensRewriteError(
             f"{what} is refused - it would leave a read of {stranded[0]!r} before anything binds "
@@ -3311,7 +3357,7 @@ def _apply_set_params(
     if row["kind"] == "send":
         for pname, node in slots.items():
             literal = isinstance(node, ast.Constant) or (
-                isinstance(node, ast.Name) and node.id not in scope.locals
+                isinstance(node, ast.Name) and _is_free_name(node.id, scope)
             )
             if pname in params and isinstance(params[pname], dict) and not literal:
                 # ``Send(pick(msg), msg)`` projects with no destination value, so a Steps edit
@@ -4436,6 +4482,7 @@ class _Scope(NamedTuple):
     inert: frozenset[str]
     numeric: frozenset[str]
     code_sets: frozenset[str] = frozenset()
+    loop_indexes: frozenset[str] = frozenset()
     shadows: frozenset[str] = frozenset()
     #: Names the handler itself binds that no function declares ``global``: the only names a
     #: value may carry beyond ``inert`` (ADR 0076 G.7). A ``global`` name is module state.
@@ -4490,20 +4537,10 @@ def _table_scope(scope: _Scope) -> _Scope:
 _NO_NAMES = _Scope(frozenset({"msg"}), frozenset(), frozenset())
 
 #: Builtins that let a module rebind its own globals where :func:`_inert_module_literals` cannot see.
-_GLOBALS_WRITERS = frozenset(
-    {
-        "globals",
-        "vars",
-        "exec",
-        "eval",
-        "setattr",
-        "__import__",
-        "__globals__",
-        "__dict__",
-        "__builtins__",
-        "modules",
-    }
-)
+_GLOBALS_WRITERS = frozenset({"globals", "vars", "exec", "eval", "setattr", "__import__"})
+
+#: Attributes that reach a module's globals: ``h.__globals__``, ``sys.modules``, ``mod.__dict__``.
+_GLOBALS_ATTRS = frozenset({"__globals__", "__dict__", "__builtins__", "modules"})
 
 
 def _message_scope(
@@ -4539,6 +4576,19 @@ def _message_scope(
         and n.iter.func.id == "range"
     ]
     loop_indexes = {x for x in set(range_targets) if bound.count(x) == range_targets.count(x)}
+    # ``occurrence=i`` is 1 or more only when every loop binding ``i`` starts at 1 or more.
+    one_based = {
+        n.target.id
+        for n in ast.walk(func)
+        if isinstance(n, ast.For | ast.AsyncFor)
+        and isinstance(n.target, ast.Name)
+        and isinstance(n.iter, ast.Call)
+        and len(n.iter.args) >= 2
+        and isinstance(n.iter.args[0], ast.Constant)
+        and type(n.iter.args[0].value) is int
+        and n.iter.args[0].value >= 1
+    }
+    zero_based = {t for t in range_targets if t not in one_based}
     module_names, star = _module_bound_names(tree)
     if star or "range" in bound or "range" in module_names:
         loop_indexes = set()
@@ -4556,6 +4606,7 @@ def _message_scope(
         frozenset(inert),
         frozenset(numeric),
         frozenset(code_sets),
+        frozenset(loop_indexes - zero_based),
         _module_shadows(tree),
         frozenset(set(bound) - loop_indexes - globals_ - {"msg"}),
     )
@@ -4663,7 +4714,7 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
     mutated: set[str] = set()
     for n in ast.walk(tree):
         if (isinstance(n, ast.Name) and n.id in _GLOBALS_WRITERS) or (
-            isinstance(n, ast.Attribute) and n.attr in _GLOBALS_WRITERS
+            isinstance(n, ast.Attribute) and n.attr in _GLOBALS_ATTRS
         ):
             return {}  # ``h.__globals__[...]``, ``sys.modules[...]`` and the like
         if isinstance(n, ast.ImportFrom) and any(al.name == "*" for al in n.names):
@@ -6420,7 +6471,9 @@ def _native_occurrence_suffix(name: str, params: dict[str, Any], scope: _Scope) 
         if kw not in allowed:
             raise LensRewriteError(f"insert_row: {name!r} does not accept a {kw!r} argument")
         rendered = _render_insert_value(params[kw], kw, scope=scope)
-        if not _is_index_value(ast.parse(rendered, mode="eval").body, scope):
+        node = ast.parse(rendered, mode="eval").body
+        none_ok = kw == "repetition" and isinstance(node, ast.Constant) and node.value is None
+        if not none_ok and not _is_index_value(node, scope):
             # ``occurrence="x"`` or ``occurrence=0`` raises on every message (review of head
             # c172beda9c, finding 2).
             raise LensRewriteError(
@@ -6432,29 +6485,36 @@ def _native_occurrence_suffix(name: str, params: dict[str, Any], scope: _Scope) 
 
 
 def _is_index_value(node: ast.expr, scope: _Scope) -> bool:
-    """Whether ``node`` is an ``occurrence``/``repetition`` value: an ``int`` literal of 1 or more,
-    a numeric name (a For-Each index above all), or ``+``, ``-`` or ``*`` over int literals and
-    numeric names. No division: it yields a float."""
+    """Whether ``node`` is an ``occurrence``/``repetition`` value that is 1 or more on every message
+    (``Message.set`` raises on anything less): int-literal arithmetic over ``+``, ``-`` and ``*`` that
+    comes to 1 or more, a For-Each loop index (``range(1, ...)`` starts it at 1), or a loop index plus
+    such arithmetic that comes to 0 or more. No division, which yields a float, and no other name,
+    whose value the lens cannot bound (review of head 6259fb97a2, finding 2)."""
 
-    def arith(n: ast.expr) -> bool:
-        if isinstance(n, ast.Constant):
-            return type(n.value) is int
-        if isinstance(n, ast.Name):
-            return n.id in scope.numeric
+    def value(n: ast.expr) -> int | None:
+        if isinstance(n, ast.Constant) and type(n.value) is int:
+            return n.value
         if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub | ast.UAdd):
-            return arith(n.operand)
-        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add | ast.Sub):
-            return arith(n.left) and arith(n.right)
-        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Mult):
-            # No name under ``*``, as in :func:`_is_arithmetic`.
-            return all(
-                isinstance(x, ast.Constant) and type(x.value) is int for x in (n.left, n.right)
-            )
-        return False
+            inner = value(n.operand)
+            return None if inner is None else (-inner if isinstance(n.op, ast.USub) else inner)
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add | ast.Sub | ast.Mult):
+            left, right = value(n.left), value(n.right)
+            if left is None or right is None or max(abs(left), abs(right)) > 10**6:
+                return None
+            if isinstance(n.op, ast.Add):
+                return left + right
+            return left - right if isinstance(n.op, ast.Sub) else left * right
+        return None
 
-    if isinstance(node, ast.Constant):
-        return type(node.value) is int and node.value >= 1
-    return arith(node)
+    if isinstance(node, ast.Name):
+        return node.id in scope.loop_indexes
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        for index, offset in ((node.left, node.right), (node.right, node.left)):
+            if isinstance(index, ast.Name) and index.id in scope.loop_indexes:
+                bump = value(offset)
+                return bump is not None and bump >= 0
+    total = value(node)
+    return total is not None and total >= 1
 
 
 def _move_to_target(

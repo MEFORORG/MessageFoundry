@@ -99,9 +99,9 @@ def test_insert_row_refuses_an_expr_that_is_not_an_inert_value(expr: str) -> Non
         # A field value must be text; a number goes in a number slot (review of PR 2155).
         ({"path": "PID-3.1", "value": {"expr": '"0"'}}, "set_field", '"0"'),
         (
-            {"path": "PID-3.1", "value": "x", "occurrence": {"expr": "-1"}},
+            {"path": "PID-3.1", "value": "x", "occurrence": {"expr": "2"}},
             "set_field",
-            "occurrence=-1",
+            "occurrence=2",
         ),
         ({"path": "PID-3.1", "value": {"expr": 'msg["PID-5"]'}}, "set_field", 'msg["PID-5"]'),
         (
@@ -616,8 +616,9 @@ def test_assign_to_refuses_any_name_the_handler_or_module_binds_or_reads(
         ("pid5 * 2000000000", False),
         ("OB_DEST * 2000000000", False),
         ("OB_DEST % 3", False),
-        ("i - 1", True),
-        ("-i", True),
+        # An occurrence is 1 or more on every message (review of PR 2155).
+        ("i - 1", False),
+        ("-i", False),
         ("2 * 3", True),
     ],
 )
@@ -634,7 +635,7 @@ def test_multiplication_and_modulo_take_numbers_only(expr: str, ok: bool) -> Non
     if ok:
         assert expr in rewrite_source(SOURCE, edit)
     else:
-        with pytest.raises(LensRewriteError, match=REFUSED):
+        with pytest.raises(LensRewriteError, match=f"{REFUSED}|not a whole number"):
             rewrite_source(SOURCE, edit)
 
 
