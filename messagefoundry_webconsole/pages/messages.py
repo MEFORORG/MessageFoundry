@@ -617,7 +617,8 @@ def message_detail(
 
 
 def message_resend_done(message_id: str, to: str, source: str, *, duplicate: bool) -> Markup:
-    """The resend OUTCOME page — what the POST answers with instead of redirecting to the detail page.
+    """The resend OUTCOME page — the GET a completed POST redirects to (post-redirect-get, vault
+    BACKLOG #2625), instead of the detail page.
 
     Redirecting there would have needed ``messages:view_raw``, which a resend-only role does not
     hold, so every outcome reached that role as a raw 403 (see ``routes/core``'s notice block for the

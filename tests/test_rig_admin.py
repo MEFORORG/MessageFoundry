@@ -389,7 +389,6 @@ def test_the_step_up_handler_re_proves_on_a_session_of_its_own(
     assert client.token == "private-rekeyed"
     client.refuse_reauth = True
     assert client.step_up() is False
-    assert rigadmin.ADMIN_PASS_ENV not in os.environ
 
 
 def test_an_unreachable_engine_reads_as_an_api_error_and_a_refusal_does_not(

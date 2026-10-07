@@ -534,7 +534,7 @@ async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engin
     """A body-carrying POST cannot be auto-retried, and this one is body-LESS only because the
     selection rides the query. So the re-auth is pointed at the CONFIRM page carrying ``to`` and
     ``source`` -- the operator is not stranded mid-task. The ``idempotency_key`` never rides the
-    URL: since vault BACKLOG #2625 it goes back server-side (see the refresh test below)."""
+    URL, and is not carried at all: the confirm page mints a fresh one."""
     service = await _service(engine, step_up_max_age=-1)
     await _add(service, "op", Role.OPERATOR.value)
     mid = await _seed(engine)
@@ -578,10 +578,48 @@ async def test_a_refreshed_outcome_page_sends_nothing(engine: Engine, tmp_path: 
     assert len(rows) == 1
 
 
+async def test_a_double_submit_queues_once_and_sends_the_repeat_to_the_re_auth(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """What a double-click does since vault BACKLOG #2625, pinned as it is. The first POST spends
+    the proof and queues; the repeat, with the same key and no proof, meets the gate rather than the
+    idempotent handler and is sent to /ui/reauth. It queues nothing. The operator is not told there
+    that a resend already ran, which is the open part (see the PR's open items)."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        first = await _post_resend(c, mid)
+        assert first.status_code == 200 and "Resend queued" in first.text
+        repeat = await _post_resend(c, mid, mint=False)
+        assert repeat.status_code == 303 and repeat.headers["location"].startswith("/ui/reauth?")
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert len(rows) == 1
+
+
+async def test_a_malformed_name_costs_no_proof(engine: Engine) -> None:
+    """The proof is spent after the route's own input check, as on edit-resend, so a name the
+    connection-name rule refuses leaves it for the corrected submit."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        bad = await _post_resend(c, mid, to="9nosuchprefix")
+        assert bad.status_code == 400 and str(text(RESEND_MALFORMED_NOTICE)) in bad.text
+        # No re-mint: the same proof still opens the next submit (it reaches the handler, which
+        # refuses the unregistered target in place rather than the gate sending it to re-auth).
+        again = await _post_resend(c, mid, mint=False)
+        assert again.status_code == 400 and not again.headers.get("location")
+
+
 async def test_a_query_string_key_cannot_preload_the_confirm_page(engine: Engine) -> None:
     """A crafted link must not set the key: a spent one would make the operator's resend silently
     do nothing, answered as a duplicate. The confirm page ignores a key in its query and mints one;
-    only a refused POST of the same session can hand a key back (vault BACKLOG #2625)."""
+    nothing hands a key to it (vault BACKLOG #2625)."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR.value)
     mid = await _seed(engine)

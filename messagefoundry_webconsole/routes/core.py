@@ -1111,9 +1111,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         source: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
         _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
     ) -> HTMLResponse:
-        # A fresh per-render idempotency token: a double-submit of THIS rendered confirm is the
-        # ADR 0090 §4 no-op, while re-opening the confirm page mints a new one and is a genuine
-        # second resend. It rides the POST's query rather than its body, which is what keeps that
+        # A fresh per-render idempotency token: a repeat of THIS rendered confirm that reaches the
+        # handler is the ADR 0090 §4 no-op, while re-opening the confirm page mints a new one and is
+        # a genuine second resend. Since vault BACKLOG #2625 a repeat sent after the first POST spent
+        # the proof (a double-click) meets the gate first and goes through /ui/reauth instead, and
+        # the confirm page it lands on mints a fresh key; that page is not told a resend just ran. It rides the POST's query rather than its body, which is what keeps that
         # POST body-less. It is always minted here: a key in this page's own query is ignored, so
         # a crafted link cannot preload a spent one and turn the operator's resend into a no-op.
         return HTMLResponse(pages.message_resend_confirm(message_id, to, source, uuid4().hex))
@@ -1131,8 +1133,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.get("/ui/messages/{message_id}/resend-done", response_class=HTMLResponse)
     async def ui_message_resend_done(
         message_id: str,
-        to: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
-        source: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
+        # Echoed from the engine's answer, not from a form, so bounded by the connection-name rule's
+        # own 256 rather than _RESEND_NAME_MAX. `source` may be empty: a duplicate of a key first
+        # used over the JSON API without one reports the prior row's empty source.
+        to: str = Query(..., min_length=1, max_length=256),
+        source: str = Query("", max_length=256),
         duplicate: bool = Query(False),
         _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
     ) -> HTMLResponse:
@@ -1154,6 +1159,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         idempotency_key: str = Query(..., min_length=1, max_length=128),
         engine: Any = Depends(deps.get_engine),
         # Action-bound, as POST /messages/{id}/resend is (vault BACKLOG #2625).
+        # Held, not spent, in the gate: the proof is spent below, after this route's own input
+        # check, so a malformed name costs the operator no proof (as on edit-resend).
         identity: Identity = Depends(
             require_ui_step_up_action(
                 STEP_UP_ACTION_MESSAGE_RESEND,
@@ -1161,6 +1168,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # A missing proof re-opens the CONFIRM page, never this POST path, carrying the
                 # selection. The stale key is not carried: the confirm page mints a fresh one.
                 reauth_next=_resend_confirm_next,
+                spend=False,
             )
         ),
     ) -> Response:
@@ -1186,6 +1194,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # the operator hunting on /ui/connections for a connection whose real problem is that the
             # name could not name one.
             return _refused(RESEND_MALFORMED_NOTICE, status=400)
+        # The engine handler's own action-bound gate does not run on a direct call, so the proof
+        # the gate above only checked is spent here, immediately before the resend.
+        await spend_ui_action_step_up(
+            request, STEP_UP_ACTION_MESSAGE_RESEND, reauth_next=_resend_confirm_next
+        )
         try:
             result = await core.resend_message(
                 message_id, body=body, request=request, engine=engine, identity=identity

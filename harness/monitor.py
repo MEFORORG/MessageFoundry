@@ -286,7 +286,16 @@ class MonitorPanel(QWidget):
             client.close()
             return
 
+        # Built before the panel adopts the client: it reloads the pinned certificate and can fail,
+        # and a failure must leave the panel disconnected, not half-connected.
+        try:
+            poll_client = client.for_polling()
+        except ApiError as exc:
+            client.close()
+            self._set_status(str(exc), error=True)
+            return
         self._client = client
+        self._poll_client = poll_client
         # Vault BACKLOG #2625: reload and purge take a step-up proof bound to their action, which
         # a sign-in does not mint, so answer the engine's step-up refusal with a re-proof.
         client.set_step_up_handler(self._step_up)
@@ -465,7 +474,6 @@ class MonitorPanel(QWidget):
         # Their reads run on worker threads, so they get a polling client: it shares the token but
         # carries no step-up handler, so a refusal there can never open a Qt dialog off the GUI
         # thread (vault BACKLOG #2625 gave the main client one).
-        self._poll_client = self._client.for_polling()
         self._messages = MessagesPanel(self._client, poll_client=self._poll_client)
         self._detail = MessageDetailPanel(self._client, poll_client=self._poll_client)
         self._messages.message_selected.connect(self._detail.load)
