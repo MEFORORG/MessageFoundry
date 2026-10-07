@@ -1786,20 +1786,57 @@ def _verified(
 
 
 async def _callback(
-    service: AuthService, *, flow_id: str | None = None, state: str | None = None
+    service: AuthService,
+    *,
+    flow_id: str | None = None,
+    state: str | None = None,
+    client: str = "127.0.0.1",
 ) -> LoginOutcome:
     """Drive the callback leg the way ``GET /ui/oidc/callback`` does: stage a flow, then redeem it."""
     staged_id, url = await service.begin_oidc_login(
-        client="127.0.0.1", public_origin="https://ops.example"
+        client=client, public_origin="https://ops.example"
     )
     staged_state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
     return await service.complete_oidc_login(
         flow_id=staged_id if flow_id is None else flow_id,
         state=staged_state if state is None else state,
         code=AUTH_CODE,
-        client="127.0.0.1",
+        client=client,
         public_origin="https://ops.example",
     )
+
+
+@pytest.mark.parametrize("branch", ["state_unknown", "state_mismatch", "bad_signature"])
+async def test_a_callback_refusal_row_carries_the_client_address(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, branch: str
+) -> None:
+    """BACKLOG #2132. A spray of forged callbacks shows as a run of these rows, so each one records
+    where it came from, as the ``token_refused`` row does. ``bad_signature`` stands for every
+    ``ClaimsError`` reason: they share one arm."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+
+        # Reached only by bad_signature: both state refusals answer before the exchange.
+        def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
+            raise oidc.ClaimsError("bad_signature")
+
+        monkeypatch.setattr(service, "_exchange_and_validate", exchange)
+        out = await _callback(
+            service,
+            flow_id="no-such-flow" if branch == "state_unknown" else None,
+            state="wrong-state" if branch == "state_mismatch" else None,
+            client="192.0.2.44",
+        )
+        assert not out.ok and out.reason == branch
+        [row] = [
+            r
+            for r in await _audit_rows(store, "auth.login_failed")
+            if f'"reason": "{branch}"' in (r["detail"] or "")
+        ]
+        assert row["client"] == "192.0.2.44"
+    finally:
+        await store.close()
 
 
 @pytest.mark.parametrize(

@@ -2546,8 +2546,10 @@ class AuthService:
     async def audit_kerberos_reject(self, reason: str) -> None:
         """AUTH-K-AUDIT for route-level SSO rejects that never reach ``authenticate_kerberos``
         (cross-site hygiene, rate-limit exhaustion, malformed base64) — every reject path of a
-        Windows-SSO attempt must be visible to a defender."""
-        await self._directory_reject_audit("<kerberos>", "kerberos", reason)
+        Windows-SSO attempt must be visible to a defender.
+
+        Its row carries no client address: the request is the route's, and this seam takes none."""
+        await self._directory_reject_audit("<kerberos>", "kerberos", reason, client=None)
 
     @property
     def oidc_enabled(self) -> bool:
@@ -2594,8 +2596,10 @@ class AuthService:
     async def audit_oidc_reject(self, reason: str) -> None:
         """Route-level federated-login rejects that never reach :meth:`authenticate_oidc` (flow-cookie
         binding failures, rate-limit exhaustion, a non-navigation fetch). ``reason`` must be a
-        closed-set slug chosen by the route — never IdP-supplied text."""
-        await self._directory_reject_audit("<oidc>", "oidc", reason)
+        closed-set slug chosen by the route — never IdP-supplied text.
+
+        Its row carries no client address: the request is the route's, and this seam takes none."""
+        await self._directory_reject_audit("<oidc>", "oidc", reason, client=None)
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -3312,7 +3316,9 @@ class AuthService:
             # path any AD-stamped identity has -- Kerberos and OIDC logins are stamped AD too -- so
             # removing it in the same change would lock every AD operator out of factor enrolment
             # and MFA-disable. See docs/research/ad-step-up-after-simple-bind-retirement.md.
-            await self._directory_reject_audit(username, "simple_bind", "pathway_retired")
+            await self._directory_reject_audit(
+                username, "simple_bind", "pathway_retired", client=client
+            )
             return LoginOutcome(
                 ok=False,
                 error="Directory password sign-in has been retired; use Windows SSO or OIDC",
@@ -3725,12 +3731,16 @@ class AuthService:
         # Audit every reject path so blocked/failed Windows-SSO attempts are not invisible to a
         # defender (AUTH-K-AUDIT). A sentinel actor is used until the principal is known.
         if self._ldap is None or not self._settings.kerberos_enabled:
-            await self._directory_reject_audit("<kerberos>", "kerberos", "not_configured")
+            await self._directory_reject_audit(
+                "<kerberos>", "kerberos", "not_configured", client=client
+            )
             return LoginOutcome(ok=False, error="Windows SSO is not configured")
         try:
             username = await asyncio.to_thread(kerberos_principal, token, self._settings)
             if username is None:
-                await self._directory_reject_audit("<kerberos>", "kerberos", "no_principal")
+                await self._directory_reject_audit(
+                    "<kerberos>", "kerberos", "no_principal", client=client
+                )
                 return LoginOutcome(ok=False, error="SSO authentication failed")
             principal = await asyncio.to_thread(self._ldap.resolve_principal, username)
         except LdapError as exc:
@@ -3742,7 +3752,9 @@ class AuthService:
             )
             return LoginOutcome(ok=False, error="directory unavailable")
         if principal is None:
-            await self._directory_reject_audit(username, "kerberos", "not_in_directory")
+            await self._directory_reject_audit(
+                username, "kerberos", "not_in_directory", client=client
+            )
             return LoginOutcome(ok=False, error="user not found in directory")
         # MINT AT THE MINIMUM (BACKLOG #1144, ASVS 6.8.4). A Kerberos service ticket carries no
         # factor-strength assertion that pyspnego surfaces, so the engine learns NOTHING about what
@@ -3904,18 +3916,18 @@ class AuthService:
         clock: _PadClock,
     ) -> LoginOutcome:
         if not self.oidc_enabled or self._oidc_flows is None:
-            await self._directory_reject_audit("<oidc>", "oidc", "not_configured")
+            await self._directory_reject_audit("<oidc>", "oidc", "not_configured", client=client)
             return LoginOutcome(
                 ok=False, error="federated sign-in is not configured", reason="not_configured"
             )
         flow = self._oidc_flows.pop(flow_id)
         if flow is None:
-            await self._directory_reject_audit("<oidc>", "oidc", "state_unknown")
+            await self._directory_reject_audit("<oidc>", "oidc", "state_unknown", client=client)
             return LoginOutcome(
                 ok=False, error="federated sign-in expired; start again", reason="state_unknown"
             )
         if not oidc.state_matches(flow.state, state):
-            await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch")
+            await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch", client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
         # The INNER leg: the public wrapper would pad a second time inside this challenge's pad.
         return await self._authenticate_oidc(
@@ -3969,7 +3981,7 @@ class AuthService:
         than privilege escalation.
         """
         if not self.oidc_enabled or self._ldap is None:
-            await self._directory_reject_audit("<oidc>", "oidc", "not_configured")
+            await self._directory_reject_audit("<oidc>", "oidc", "not_configured", client=client)
             return LoginOutcome(
                 ok=False, error="federated sign-in is not configured", reason="not_configured"
             )
@@ -3977,7 +3989,9 @@ class AuthService:
             # BACKLOG #296. A STEP-UP flow never mints a session. It was staged to elevate one live
             # session, and signing in on it would hand the browser a second, fresh session instead.
             # Refused before the code is redeemed, so the IdP proof is spent on nothing.
-            await self._directory_reject_audit("<oidc>", "oidc", FLOW_PURPOSE_MISMATCH)
+            await self._directory_reject_audit(
+                "<oidc>", "oidc", FLOW_PURPOSE_MISMATCH, client=client
+            )
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason=FLOW_PURPOSE_MISMATCH
             )
@@ -3997,7 +4011,7 @@ class AuthService:
         except oidc.ClaimsError as exc:
             # A verification-rung failure: the token was reachable but did not satisfy the ladder.
             # exc.reason is closed-set, so nothing IdP-influenced reaches the audit row.
-            await self._directory_reject_audit("<oidc>", "oidc", exc.reason)
+            await self._directory_reject_audit("<oidc>", "oidc", exc.reason, client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=exc.reason)
         except oidc.TokenRefusedError as exc:
             # BACKLOG #1948. The token endpoint ANSWERED with a 4xx, which a signed-out caller
@@ -4128,7 +4142,9 @@ class AuthService:
             # ADR 0184 part 3 and AC-3. The bind route refuses a LOCAL row, so this is the second
             # layer: a binding placed on one by any other means still never signs a LOCAL account in
             # through the directory path.
-            await self._directory_reject_audit(username, "oidc", "local_account_conflict")
+            await self._directory_reject_audit(
+                username, "oidc", "local_account_conflict", client=client
+            )
             return LoginOutcome(ok=False, error="account conflict", reason="local_account_conflict")
         if not bound.directory_object_id:
             # BACKLOG #2027 (ADR 0184 AC-5). A BOUND ROW WITH NO IMMUTABLE ID IS REFUSED, NOT
@@ -4145,7 +4161,9 @@ class AuthService:
             #
             # The error is the generic one, and the web console collapses this slug to
             # `oidc_failed`. The precise reason is on the audit row, for the operator.
-            await self._directory_reject_audit(username, "oidc", DIRECTORY_OBJECT_ID_MISSING)
+            await self._directory_reject_audit(
+                username, "oidc", DIRECTORY_OBJECT_ID_MISSING, client=client
+            )
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
             )
@@ -4173,7 +4191,7 @@ class AuthService:
             )
         if principal is None:
             # Hybrid-only by design: a bound account with no on-prem AD object is refused.
-            await self._directory_reject_audit(username, "oidc", "not_in_directory")
+            await self._directory_reject_audit(username, "oidc", "not_in_directory", client=client)
             return LoginOutcome(
                 ok=False, error="user not found in directory", reason="not_in_directory"
             )
@@ -4186,7 +4204,7 @@ class AuthService:
             # The ladder accepts an exp up to clock_skew_seconds in the PAST, so a token inside the
             # grace window would otherwise mint an already-dead session: the user "logs in" and is
             # revoked on their first request, with no audited reason. Refuse loudly instead.
-            await self._directory_reject_audit(username, "oidc", "expired")
+            await self._directory_reject_audit(username, "oidc", "expired", client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="expired")
         # BACKLOG #1150 (ASVS 6.8.4 / 7.6.1): the session also ends max_age after the user last
         # authenticated AT THE IdP. The ladder checks recency only at login. The IdP step-up leg
@@ -4202,7 +4220,7 @@ class AuthService:
             min(principal_claims.auth_time, now) + self._settings.oidc_max_age_seconds
         )
         if recency_deadline <= now:
-            await self._directory_reject_audit(username, "oidc", "auth_time_stale")
+            await self._directory_reject_audit(username, "oidc", "auth_time_stale", client=client)
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason="auth_time_stale"
             )
@@ -4615,13 +4633,19 @@ class AuthService:
         )
         return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
 
-    async def _directory_reject_audit(self, actor: str, mech: str, reason: str) -> None:
+    async def _directory_reject_audit(
+        self, actor: str, mech: str, reason: str, *, client: str | None
+    ) -> None:
         """Audit a rejected directory-SSO attempt. ``mech`` is the mechanism slug ("kerberos" /
-        "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored."""
+        "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored.
+
+        ``client`` is required, so no caller can drop the address by leaving it out (BACKLOG
+        #2132). A run of refusals is how a spray shows, and the operator needs to see its source."""
         await self._audit(
             "auth.login_failed",
             actor=actor,
             detail=_json({"provider": "ad", "mech": mech, "reason": reason}),
+            client=client,
         )
 
     async def _complete_ad_login(
@@ -4689,7 +4713,7 @@ class AuthService:
             # below is reached only through a directory implementation that does not check it.
             if federated:
                 await self._directory_reject_audit(
-                    principal.username, "oidc", DIRECTORY_OBJECT_ID_MISSING
+                    principal.username, "oidc", DIRECTORY_OBJECT_ID_MISSING, client=client
                 )
                 return LoginOutcome(
                     ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
@@ -4814,7 +4838,7 @@ class AuthService:
             reason = (
                 FEDERATED_SUBJECT_NOT_BOUND if holder is None else "federated_subject_already_bound"
             )
-            await self._directory_reject_audit(principal.username, "oidc", reason)
+            await self._directory_reject_audit(principal.username, "oidc", reason, client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
@@ -4917,7 +4941,7 @@ class AuthService:
                 )
                 return replace(refused, roles_gained=roles_gained)
             await self._directory_reject_audit(
-                principal.username, "oidc", "federated_subject_unbound"
+                principal.username, "oidc", "federated_subject_unbound", client=client
             )
             return LoginOutcome(
                 ok=False,
