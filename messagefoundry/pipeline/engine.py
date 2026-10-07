@@ -534,13 +534,6 @@ class Engine:
         # `connections_edit.locked`, an OS file lock the `connection` CLI in another process takes too
         # (vault BACKLOG #2782); that one is blocking and is only ever taken in a worker thread.
         self._toml_write_lock = asyncio.Lock()
-        # Held across a real reload AND the writing of its config_reload audit row (vault BACKLOG
-        # #2257). The runner's own reload lock covers only the swap, and the row comes after it, so
-        # without this a second reload, or a flag toggle that moves the loaded fingerprint, could land
-        # in between and leave the newest provenance row naming a graph the engine no longer runs.
-        # The API's reload routes take it, as do the convergence reload and set_connection_flag. Take
-        # it before _toml_write_lock, never after.
-        self.reload_record_lock = asyncio.Lock()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
         # in flight (a re-promotion cancels the prior one — see _fire_pool_warm); tracked only so stop()
@@ -1993,18 +1986,13 @@ class Engine:
         named the graph this node ran before converging, so a later start compared against the wrong
         digest. A fault in that writer is logged and goes no further: the graph has swapped, and a
         raise would make the runner retry a reload that already ran."""
-        # The swap and its row under one hold, so the row's live read is this reload's graph
-        # (vault BACKLOG #2257).
-        async with self.reload_record_lock:
-            outcome = await self.reload_detail(propagate=False)
-            if self.convergence_reload_audit is None:
-                return
-            try:
-                await self.convergence_reload_audit(outcome)
-            except Exception:  # noqa: BLE001 - see the docstring; the API's writer logs its own
-                log.exception(
-                    "cluster: the convergence reload swapped the graph, but its audit failed"
-                )
+        outcome = await self.reload_detail(propagate=False)
+        if self.convergence_reload_audit is None:
+            return
+        try:
+            await self.convergence_reload_audit(outcome)
+        except Exception:  # noqa: BLE001 - see the docstring; the API's writer already logs its own
+            log.exception("cluster: the convergence reload swapped the graph, but its audit failed")
 
     async def set_connection_flag(
         self, name: str, *, direction: str, flagged: bool
@@ -2132,9 +2120,7 @@ class Engine:
         # Serialize the whole read-modify-write + live reflect under the engine-level TOML-write lock so
         # two concurrent config:deploy flag toggles can't interleave (lost update / racing temp files);
         # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
-        # reload_record_lock first: a toggle moves the loaded fingerprint, so it must not land between
-        # a reload's swap and that reload's audit row (vault BACKLOG #2257).
-        async with self.reload_record_lock, self._toml_write_lock:
+        async with self._toml_write_lock:
             loaded = self.loaded_config_fingerprint
             loaded_fp = loaded.get("fingerprint") if loaded is not None else None
             # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so

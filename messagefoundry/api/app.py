@@ -1184,25 +1184,19 @@ async def _reload_or_record_interruption(
 async def _reload_and_record(
     engine: Engine, config_dir: str | None, *, actor: str, client: str | None
 ) -> tuple[ReloadOutcome, list[str]]:
-    """Apply a real reload and write its ``config_reload`` row, holding
-    :attr:`Engine.reload_record_lock` across both (vault BACKLOG #2257).
+    """Apply a real reload and write its ``config_reload`` row from that reload's own outcome
+    (vault BACKLOG #2257). The inline route and the released executor share this.
 
-    The row is written after the swap. Without the lock, a second reload could swap again first,
-    and the newest row would name a graph the engine no longer runs; a start compares its digest
-    with that newest row. The inline route and the released executor share this. A refusal the
-    reload raises propagates, with nothing swapped and no row written here. Returns the outcome and
-    the failed steps to report, ``audit`` among them when the row was lost."""
-    async with engine.reload_record_lock:
-        outcome = await _reload_or_record_interruption(
-            engine, config_dir, actor=actor, client=client
-        )
-        failures = await _record_reload_audit(
-            engine,
-            actor=actor,
-            client=client,
-            failed_steps=[f.step for f in outcome.failures],
-            outcome=outcome,
-        )
+    A refusal the reload raises propagates, with nothing swapped and no row written here. Returns
+    the outcome and the failed steps to report, ``audit`` among them when the row was lost."""
+    outcome = await _reload_or_record_interruption(engine, config_dir, actor=actor, client=client)
+    failures = await _record_reload_audit(
+        engine,
+        actor=actor,
+        client=client,
+        failed_steps=[f.step for f in outcome.failures],
+        outcome=outcome,
+    )
     return outcome, failures
 
 
@@ -1236,12 +1230,17 @@ async def _record_reload_audit(
 
     ``loaded`` is what the row names as loaded: the directory, shard, counts and fingerprint. The
     start always passes one: the snapshot it took at its first load, or :data:`_UNKNOWN_LOADED`
-    when it could not take one (vault BACKLOG #2838); see :class:`_LoadedConfig`. A reload passes
-    its ``outcome`` instead, and the row names what that reload loaded (vault BACKLOG #2257). The
-    snapshot is built inside the guard below, so a fault building it is caught like a failed write.
-    With neither, the row reads them live, at the write, which the cluster convergence reload
-    still does. That reload holds :attr:`Engine.reload_record_lock` across the swap and this row,
-    so no other reload can move the live state in between.
+    when it could not take one (vault BACKLOG #2838); see :class:`_LoadedConfig`. With neither,
+    the row reads them live, at the write, which the cluster convergence reload still does.
+
+    A reload passes its ``outcome`` instead, and the row names what that reload loaded (vault
+    BACKLOG #2257). The row is written after the swap, and nothing holds the graph still until
+    then, so a second reload or a connection flag toggle can move the engine on first. The row then
+    still names this reload's config, but marks itself ``superseded`` and
+    :data:`_BASELINE_UNCHECKED`, as a superseded start row does: it is no baseline, and the next
+    start compares against an older row instead. The check runs just before the write, so a swap
+    after it is not caught. The snapshot and the check are inside the guard below, so a fault in
+    either is caught like a failed write.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -1265,10 +1264,15 @@ async def _record_reload_audit(
     A cancellation still propagates: it is not a failure of this helper."""
     detail: str | None = None
     try:
+        superseded = False
         if loaded is not None:
             state = loaded
         elif outcome is not None:
             state = _LoadedConfig.of(outcome)
+            # A flag toggle rebinds the loaded fingerprint without swapping the graph, so both.
+            superseded = (
+                state.swapped(engine) or engine.loaded_config_fingerprint is not outcome.fingerprint
+            )
         else:
             state = _LoadedConfig.read(engine)
         detail = json.dumps(
@@ -1281,6 +1285,7 @@ async def _record_reload_audit(
                 "dry_run": False,
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
+                **({"superseded": True, _BASELINE_UNCHECKED: True} if superseded else {}),
                 **(state.fingerprint or {}),
             }
         )

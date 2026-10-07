@@ -27,6 +27,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.api.app import _record_reload_audit
 from messagefoundry.auth import Role
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
@@ -407,10 +408,10 @@ async def test_a_dry_run_and_a_released_reload_write_no_attempt_row(engine: Engi
 async def test_two_overlapping_reloads_each_record_their_own_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A reload's row is written after its swap. Pre-fix the runner's lock covered only the swap and
-    the row read the engine's live state, so a second reload that swapped in between put its own
+    """A reload's row is written after its swap, outside the runner's swap lock. Pre-fix the row
+    read the engine's live state then, so a second reload that swapped in between put its own
     directory, counts and digest on the first reload's row. Here reload A is held in its post-swap
-    reference sync while reload B arrives: B must not swap until A's row is written."""
+    reference sync while reload B runs to completion."""
     cfg_a, cfg_b = tmp_path / "cfg_a", tmp_path / "cfg_b"
     _write_valid_config(cfg_a, tmp_path / "in_a", tmp_path / "out_a")
     _write_valid_config(cfg_b, tmp_path / "in_b", tmp_path / "out_b")
@@ -433,9 +434,8 @@ async def test_two_overlapping_reloads_each_record_their_own_config(
         service = await _service(engine)
         await _add(service, "alice", Role.ADMINISTRATOR)
         await _add(service, "bob", Role.ADMINISTRATOR)
-        a_held, release_a, b_attempted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        a_held, release_a = asyncio.Event(), asyncio.Event()
         real_sync = engine._reconcile_reference_sync
-        real_record = engine.store.record_audit
 
         async def _hold_a(*, startup: bool) -> None:
             if not a_held.is_set():  # A, after its swap and before its row
@@ -443,46 +443,23 @@ async def test_two_overlapping_reloads_each_record_their_own_config(
                 await release_a.wait()
             await real_sync(startup=startup)
 
-        b_reloading = asyncio.Event()
-        real_reload = engine.reload_detail
-
-        async def _watch_b(config_dir: Any = None, **kwargs: Any) -> Any:
-            if config_dir == str(cfg_b):
-                b_reloading.set()
-            return await real_reload(config_dir, **kwargs)
-
-        async def _spy(action: str, **kwargs: Any) -> None:
-            await real_record(action, **kwargs)
-            if action == "config_reload_attempted" and kwargs.get("actor") == "bob":
-                b_attempted.set()
-
         async with _client(engine, service, NOT_GATED) as c:
             alice, bob = await _token(c, "alice"), await _token(c, "bob")
             monkeypatch.setattr(engine, "_reconcile_reference_sync", _hold_a)
-            monkeypatch.setattr(engine.store, "record_audit", _spy)
-            monkeypatch.setattr(engine, "reload_detail", _watch_b)
             reload_a = asyncio.ensure_future(c.post("/config/reload", json={}, headers=alice))
-            reload_b: asyncio.Future[httpx.Response] | None = None
             try:
                 await asyncio.wait_for(a_held.wait(), timeout=30)
-                reload_b = asyncio.ensure_future(
-                    c.post("/config/reload", json={"config_dir": str(cfg_b)}, headers=bob)
-                )
-                await asyncio.wait_for(b_attempted.wait(), timeout=30)
-                # Unlocked, B starts its reload as soon as its attempt row lands. Locked, it waits.
-                with pytest.raises(TimeoutError):
-                    await asyncio.wait_for(b_reloading.wait(), timeout=1.0)
-                assert engine.last_reload_dir == cfg_a.resolve(), "B swapped before A's row"
+                # B swaps and writes its row while A sits between its own swap and its row.
+                r_b = await c.post("/config/reload", json={"config_dir": str(cfg_b)}, headers=bob)
             finally:
                 release_a.set()  # never leave A parked, whatever failed above
             r_a = await asyncio.wait_for(reload_a, timeout=30)
-            assert reload_b is not None
-            r_b = await asyncio.wait_for(reload_b, timeout=30)
         assert r_a.status_code == 200 and r_b.status_code == 200, (r_a.text, r_b.text)
         assert (r_a.json()["inbound"], r_b.json()["inbound"]) == (1, 2)
+        assert engine.last_reload_dir == cfg_b.resolve(), "B's graph is the one running"
 
         newest_first = await engine.store.list_audit(action="config_reload")
-        assert [r["actor"] for r in newest_first] == ["bob", "alice"], "the newest row is B's"
+        assert [r["actor"] for r in newest_first] == ["alice", "bob"]
         rows = {r["actor"]: json.loads(r["detail"]) for r in newest_first}
         digest_a, _ = await engine.fingerprint_bundle(cfg_a.resolve())
         digest_b, _ = await engine.fingerprint_bundle(cfg_b.resolve())
@@ -496,20 +473,29 @@ async def test_two_overlapping_reloads_each_record_their_own_config(
             assert row["dir"] == str(cfg.resolve()), actor
             assert row["inbound"] == inbound, actor
             assert row["fingerprint"] == digest["fingerprint"], actor
+        # A's row is the newest but names a graph the engine no longer runs, so it is no baseline:
+        # the next start passes over it to B's.
+        assert rows["alice"]["superseded"] is True and rows["alice"]["baseline_unchecked"] is True
+        assert "superseded" not in rows["bob"] and "baseline_unchecked" not in rows["bob"]
     finally:
         await engine.stop()
 
 
-async def test_a_convergence_reload_waits_for_a_reload_and_its_row(engine: Engine) -> None:
-    """vault BACKLOG #2257: the convergence reload's row reads live state, so it takes the same
-    lock across its swap and its row as the API's reloads do."""
-    async with engine.reload_record_lock:
-        converging = asyncio.ensure_future(engine._converge_reload())
-        for _ in range(20):
-            await asyncio.sleep(0)
-        assert not converging.done() and engine.last_reload_dir is None
-    await asyncio.wait_for(converging, timeout=30)
-    assert engine.last_reload_dir is not None
+async def test_a_reload_row_written_after_a_flag_toggle_is_no_baseline(engine: Engine) -> None:
+    """vault BACKLOG #2257: a connection flag toggle moves the loaded fingerprint without swapping
+    the graph. A reload row written after one names a digest the engine no longer reports, so it
+    marks itself superseded too. The toggle is stood in for by the rebind it performs."""
+    outcome = await engine.reload_detail(propagate=False)
+    assert outcome.fingerprint is not None
+    assert await _record_reload_audit(engine, actor="before", outcome=outcome) == []
+    loaded = engine.loaded_config_fingerprint
+    assert loaded is not None
+    engine.loaded_config_fingerprint = dict(loaded)  # what set_connection_flag does
+    assert await _record_reload_audit(engine, actor="after", outcome=outcome) == []
+    rows = {r["actor"]: json.loads(r["detail"]) for r in await engine.store.list_audit()}
+    assert "superseded" not in rows["before"]
+    assert rows["after"]["superseded"] is True and rows["after"]["baseline_unchecked"] is True
+    assert rows["after"]["fingerprint"] == outcome.fingerprint["fingerprint"]
 
 
 # --- a dry-run is never held (it swaps nothing) -------------------------------

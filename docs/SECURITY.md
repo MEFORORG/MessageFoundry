@@ -1761,12 +1761,13 @@ refusal or cancellation whose own row then fails, and an unexpected fault in the
 alone. The 503 has the same two lost-COMMIT exceptions as the gate's, listed above, where the
 attempt row may have committed after all.
 
-**A reload's `config_reload` row names that reload's own config (vault BACKLOG #2257).** It is
-built from the reload's own result: its directory, connection counts and the digest it took before
-the swap. The engine holds one lock across a reload's swap and its row. Every reload takes it: an
-inline one, a released one and a cluster convergence reload. So does a connection flag toggle. A
-second reload cannot swap between the first one's swap and its row, so the newest row names the
-graph the engine runs.
+**An inline or released reload's `config_reload` row names that reload's own config (vault
+BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
+the digest it took before the swap. The row is written after the swap, so a second reload or a
+connection flag toggle can move the engine on first. The row then still names its own config, but
+is marked `superseded` and `baseline_unchecked`, so the next start does not compare against it.
+The check runs just before the write, so a swap after it is not caught. A cluster convergence
+reload's row is still read from the engine's live state when it is written.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
