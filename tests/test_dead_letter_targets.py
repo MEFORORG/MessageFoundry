@@ -107,10 +107,10 @@ async def _seed(store: Any) -> None:
 async def test_the_targets_cover_the_whole_dead_set_not_the_first_page(store: Any) -> None:
     await _seed(store)
     # CONTROL: the first page of two misses IB_OLD, which is what the console used to build from.
-    page = await store.list_dead(limit=2)
+    page = await store.list_dead(limit=2, allowed_channels=None)
     assert {r["channel_id"] for r in page} == {"IB_NEW"}
 
-    assert await store.list_replay_targets() == [
+    assert await store.list_replay_targets(allowed_channels=None) == [
         ("IB_NEW", "OB_A"),
         ("IB_NEW", "OB_B"),
         ("IB_OLD", "OB_OLD"),
@@ -119,13 +119,17 @@ async def test_the_targets_cover_the_whole_dead_set_not_the_first_page(store: An
 
 async def test_the_targets_honour_the_channel_and_destination_filters(store: Any) -> None:
     await _seed(store)
-    assert await store.list_replay_targets(channel_id="IB_OLD") == [("IB_OLD", "OB_OLD")]
-    assert await store.list_replay_targets(destination_name="OB_B") == [("IB_NEW", "OB_B")]
-    assert await store.list_replay_targets(channel_id="IB_NEW", destination_name="OB_A") == [
-        ("IB_NEW", "OB_A")
+    assert await store.list_replay_targets(channel_id="IB_OLD", allowed_channels=None) == [
+        ("IB_OLD", "OB_OLD")
     ]
+    assert await store.list_replay_targets(destination_name="OB_B", allowed_channels=None) == [
+        ("IB_NEW", "OB_B")
+    ]
+    assert await store.list_replay_targets(
+        channel_id="IB_NEW", destination_name="OB_A", allowed_channels=None
+    ) == [("IB_NEW", "OB_A")]
     # A filter naming a channel with nothing dead: the pending IB_LIVE row stays out.
-    assert await store.list_replay_targets(channel_id="IB_LIVE") == []
+    assert await store.list_replay_targets(channel_id="IB_LIVE", allowed_channels=None) == []
 
 
 async def test_the_targets_honour_the_channel_scope(store: Any) -> None:
@@ -135,19 +139,22 @@ async def test_the_targets_honour_the_channel_scope(store: Any) -> None:
     assert await store.list_replay_targets(allowed_channels=[]) == []
     # A filter outside the scope cannot widen it.
     assert await store.list_replay_targets(channel_id="IB_NEW", allowed_channels=["IB_OLD"]) == []
-    # None is the whole estate, and must equal the unscoped read.
-    assert await store.list_replay_targets(allowed_channels=None) == (
-        await store.list_replay_targets()
-    )
+    # None is the whole estate: every dead pair, named, so a backend reading None as "no
+    # channels" cannot pass by comparing one read with itself (BACKLOG #2627).
+    assert await store.list_replay_targets(allowed_channels=None) == [
+        ("IB_NEW", "OB_A"),
+        ("IB_NEW", "OB_B"),
+        ("IB_OLD", "OB_OLD"),
+    ]
 
 
 async def test_with_bodies_intact_the_targets_match_the_listed_rows(store: Any) -> None:
     """Every row the full listing returns maps to a target, and every target has a row."""
     await _seed(store)
-    rows = await store.list_dead(limit=500)
-    assert len(rows) == await store.count_dead() == 4
+    rows = await store.list_dead(limit=500, allowed_channels=None)
+    assert len(rows) == await store.count_dead(allowed_channels=None) == 4
     assert sorted({(r["channel_id"], r["destination_name"]) for r in rows}) == (
-        await store.list_replay_targets()
+        await store.list_replay_targets(allowed_channels=None)
     )
 
 
@@ -162,8 +169,8 @@ async def test_a_pair_whose_bodies_retention_erased_is_not_a_target(store: Any) 
     await _dead(store, "IB_NEW", "OB_A", now=1_000_000.0)
     assert await store.purge_dead_letters(older_than=100.0, now=1_000_000.0) == 1
 
-    assert await store.count_dead() == 2
-    assert await store.list_replay_targets() == [("IB_NEW", "OB_A")]
+    assert await store.count_dead(allowed_channels=None) == 2
+    assert await store.list_replay_targets(allowed_channels=None) == [("IB_NEW", "OB_A")]
     assert await store.replay_dead(channel_id="IB_OLD", now=1_000_001.0) == 0
 
 

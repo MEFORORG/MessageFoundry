@@ -318,13 +318,15 @@ async def test_end_to_end_fanout_delivers_both_arms(
     finally:
         await r.stop()
     assert (out_a / "MSG1.hl7").exists() and (out_b / "MSG1.hl7").exists()  # both destinations
-    msgs = await pw_store.list_messages(channel_id="file_in")
+    msgs = await pw_store.list_messages(channel_id="file_in", allowed_channels=None)
     assert len(msgs) == 1 and msgs[0]["status"] == MessageStatus.PROCESSED.value
 
 
 async def _processed(store: MessageStore) -> bool:
     return bool(
-        await store.list_messages(channel_id="file_in", status=MessageStatus.PROCESSED.value)
+        await store.list_messages(
+            channel_id="file_in", status=MessageStatus.PROCESSED.value, allowed_channels=None
+        )
     )
 
 
@@ -357,7 +359,7 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
         await r.stop()
     # Every message reached PROCESSED under per-lane wake, in arrival (ingest = rowid = seq) order —
     # B12 leaves the FIFO claim untouched; only the wake timing differs (#285 / ADR 0059).
-    msgs = await store.list_messages(channel_id="file_in")
+    msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert len(msgs) == 3 and all(m["status"] == MessageStatus.PROCESSED.value for m in msgs)
     cur = await store._db.execute(
         "SELECT control_id FROM messages WHERE channel_id=? ORDER BY rowid", ("file_in",)
@@ -367,7 +369,11 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
 
 async def _n_processed(store: MessageStore, n: int) -> bool:
     return (
-        len(await store.list_messages(channel_id="file_in", status=MessageStatus.PROCESSED.value))
+        len(
+            await store.list_messages(
+                channel_id="file_in", status=MessageStatus.PROCESSED.value, allowed_channels=None
+            )
+        )
         >= n
     )
 

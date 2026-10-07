@@ -96,7 +96,9 @@ async def _until_message(
     store: MessageStore, status: str, *, channel_id: str = "file_in", timeout: float = 3.0
 ) -> None:
     elapsed = 0.0
-    while not await store.list_messages(channel_id=channel_id, status=status):
+    while not await store.list_messages(
+        channel_id=channel_id, status=status, allowed_channels=None
+    ):
         await asyncio.sleep(0.02)
         elapsed += 0.02
         if elapsed > timeout:

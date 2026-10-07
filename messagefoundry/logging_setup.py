@@ -1605,7 +1605,7 @@ def set_runtime_level(level: str, *, production: bool) -> str:
     level name applied."""
     normalized = level.upper()
     if normalized not in LOG_LEVELS:
-        raise ValueError(f"invalid log level: {level!r}; expected one of {', '.join(LOG_LEVELS)}")
+        raise ValueError(f"invalid log level: {level!r}; expected one of {'/'.join(LOG_LEVELS)}")
     if level_refused_on_production(normalized, production=production):
         raise LogLevelRefused(f"{PRODUCTION_DEBUG_REFUSED} The level was not changed.")
     numeric = _resolve_level(normalized)

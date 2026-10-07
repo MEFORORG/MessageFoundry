@@ -687,7 +687,7 @@ async def test_the_refused_release_is_a_503_at_the_route(
         assert r.status_code == 503
         assert "did not run" in r.json()["detail"]
     # The dead letter was not re-queued: nothing ran, and the request did not move.
-    assert len(await engine.store.list_dead(limit=10)) == 1
+    assert len(await engine.store.list_dead(limit=10, allowed_channels=None)) == 1
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None and str(row["status"]) == "pending"
     assert await engine.store.list_audit(action="approval.release_attempted") == []

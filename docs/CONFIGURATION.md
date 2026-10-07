@@ -7,8 +7,8 @@
 > **and** the server-DB keys), **`[api]`**, **`[inbound]`**, **`[delivery]`** (the retry policy, queue
 > ordering and alert thresholds an outbound inherits when it declares none), **`[environments]`** (`dir`;
 > active env = `[ai].environment`), **`[logging]`**, **`[auth]`**, **`[ai]`**, **`[retention]`** (enforced
-> by the retention/purge + SQLite-maintenance pass), and the rest — **except `[engine]`**, which has no
-> model at all. The four sections that used to be built-but-uncatalogued now have their own entries:
+> by the retention/purge + SQLite-maintenance pass), and the rest. **`[engine]` is not one of them**: it
+> has no model, so it is refused at load like any other unknown section ([`[engine]`](#engine)). The four sections that used to be built-but-uncatalogued now have their own entries:
 > **`[tls]`** (client trust anchors, [ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)),
 > **`[reference]`**, **`[backup]`** ([ADR 0049](adr/0049-turnkey-dr-backup-restore-verify.md)) and
 > **`[dr]`** ([ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md)).
@@ -16,8 +16,13 @@
 > **An unrecognized KEY in `messagefoundry.toml` is REFUSED at load** — a key its section does not
 > define fails the start, naming the section, the key and the nearest real field name. It used to be
 > accepted silently, which left the setting it was meant to apply un-applied with nothing anywhere
-> reporting a problem. An unknown top-level **SECTION** is still tolerated (`[engine]`, see
-> [`[engine]`](#engine)), so a forward-looking file that adds a whole section still loads.
+> reporting a problem. **An unknown top-level SECTION, or a key written above the first `[section]`
+> header, is refused the same way**, naming it and, when one fits, the section it was probably meant
+> for. So is a top-level section written as anything but one table (`[[integrity]]`). A misspelt section
+> used to drop every key under it at once: `[integrty]` with `fail_closed_on_drift = true` loaded clean
+> and left the tripwire alert-only. So a file that adds a section from newer docs no longer loads on an
+> engine that does not model it. The refusal never repeats the offending value, because this file can
+> carry secrets.
 >
 > **The refusal covers the FILE, and the CLI refuses an unknown flag too. Env mostly does not — check
 > `MEFOR_*` spellings yourself.** An unknown `serve` flag stops the command: argparse prints
@@ -652,7 +657,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `require_mfa_scope` | | | **→ set it as `[security].require_mfa_scope`** (ADR 0118) — like its `require_mfa` sibling it is rejected in `[auth]`. |
 | `totp_skew_steps` | int | `0` | TOTP clock-skew tolerance in 30 s steps applied at verify time (BACKLOG #187, ASVS 6.5.5). **Default `0` = STRICT: only the current 30 s step verifies** (tightest replay window — a captured code is valid at most for the rest of its own step). Set `1` (or `2`) — the documented opt-out — to restore RFC-6238 network-delay / clock-drift tolerance (`1` also accepts the immediately-prior and the fast-clock-clamped next step, i.e. the historical ±1 behaviour; the forward step is clamped to the current step so it never advances the single-use high-water mark). Range 0–2. |
 | `mfa_recovery_code_count` | int | 10 | single-use recovery codes minted at TOTP enrollment (the lost-authenticator escape hatch; `0` disables them, leaving an admin reset as the only recovery path). Range 0–50. |
-| `mfa_verify_min_elapsed_seconds` | float | 1.0 | the least time between sign-in and the second factor ([BACKLOG #2301](BACKLOG.md), ASVS 2.4.2). It covers a TOTP code, a recovery code and a passkey on an MFA-pending session. One that arrives sooner after the session was minted gets the leg's ordinary failure, `401 invalid code` on `POST /auth/mfa-verify`. The response says nothing about timing. It is audited with `reason=too_early`, charges no lockout and spends no code. A session whose factor is already satisfied is not floored. The default is a **provisional** human-timing floor from the keystroke-level model, derived in the comment on the setting. `0` turns it off |
+| `mfa_verify_min_elapsed_seconds` | float | 1.0 | the least time between sign-in and the second factor ([BACKLOG #2301](BACKLOG.md), ASVS 2.4.2). It covers a TOTP code, a recovery code and a passkey on an MFA-pending session. It also covers the two enrolment legs, `POST /me/mfa/confirm` and a passkey registration, when they would satisfy a pending session ([BACKLOG #2389](BACKLOG.md)). One that arrives sooner after the session was minted gets the leg's ordinary failure: `401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`. The response says nothing about timing. It is audited with `reason=too_early`, charges no lockout and spends no code or passkey challenge. Under the default `require_action_step_up`, the confirm route has already spent its single-use password step-up, as it does for a wrong code. A session whose factor is already satisfied, or that owes none, is not floored. The default is a **provisional** human-timing floor from the keystroke-level model, derived in the comment on the setting. `0` turns it off |
 | `admin_new_ip_step_up` | bool | `true` | admin-interface contextual-risk signal (WP-L3-13, ASVS 8.4.2): when on, a step-up (sensitive admin) request from a client IP the session has not verified from emits an `auth.admin_action_new_ip` audit + notice and **forces a fresh step-up** (a re-verify from that address clears it). Step-up-forcing only — never changes an RBAC decision. Since vault BACKLOG #2620 at least the PHI reads and the paced writes refuse a new address the same way, and the base gate never asks; [SECURITY.md](SECURITY.md#administrative-interface-defense-in-depth-wp-l3-13-asvs-842) names the gates. The audit + notice are debounced and capped per session in each engine process, as [SECURITY.md](SECURITY.md#administrative-interface-defense-in-depth-wp-l3-13-asvs-842) states. **On by default** since BACKLOG #288, and a no-op on loopback (`127.0.0.1` and `::1` are treated as one host). Setting it `false` is a **loosening** once auth is on — `security_loosenings()` names it; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). See [SECURITY.md](SECURITY.md) "Administrative-interface defense-in-depth". |
 | `ad_enabled` | bool | `false` | **directory bind capability**: the engine binds to AD as the `ad_bind_dn` service account to resolve principals and their groups. Windows SSO (`kerberos_enabled`), OIDC (`oidc_enabled`) and the session reconciler each need it. It does **not** turn on a directory-password sign-in: that pathway is retired (BACKLOG #1137), and `POST /auth/login` with `provider=ad` is refused and audited. A bind **as the user** survives only as the step-up re-bind at `POST /me/reauth` and `POST /ui/reauth` |
 | `ad_server` | str | — | e.g. `ldaps://dc1.example.com:636` (required when `ad_enabled`) |
@@ -1006,7 +1011,7 @@ need separate engine processes.
 | | At `mode="subprocess"` |
 |---|---|
 | **Live enrichment** | `db_lookup` / `fhir_lookup` are **refused, fail-closed**. They re-enter the event loop and a process boundary breaks that. **A Handler needing either must run `mode="off"`** — that escape is supported and is not going away, and per the note above it applies to the whole engine, not to that Handler alone. |
-| **`wall_seconds`** | Only **enforced** here. At `mode="off"` there is no timeout at all, so this is a cap you gain by turning the sandbox on: a busy-loop Router/Handler can no longer wedge intake, and a legitimately slow one that used to finish now dead-letters. `startup_seconds` and the POSIX `cpu_seconds`/`mem_mb` arm with it. |
+| **`wall_seconds`** | Only **enforced** here. At `mode="off"` there is no timeout at all, so this is a cap you gain by turning the sandbox on: a busy-loop Router/Handler can no longer wedge intake, and a legitimately slow one that used to finish now dead-letters. `startup_seconds` and the POSIX `mem_mb` arm with it. |
 | **Throughput** | About **0.19 ms per dispatch** with no reference view; a 20k-entry crosswalk costs about **4.5 ms** marshalling and **6.2 ms** end-to-end, roughly 1.4x a pickle round-trip — inside the pipeline's existing per-interface bound. **One message is not one dispatch:** a message routed to one handler with an `accepts=` predicate costs **three** (router, predicate, transform), and fan-out to K handlers costs **1 + 2K**, each re-marshalling the reference view. |
 | **Imports** | The worker starts with the interpreter's remote debugging disabled. It starts by running a script, so it does not search the engine's working directory for imports. **One exception is a source checkout.** When the engine runs from its checkout, the worker has that checkout on its path too. That folder is often the working directory, so a module there would import in the worker. [DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 3, in its `_child_bootstrap.py` paragraphs, says where on the path the checkout goes. The worker also starts with `-P`, which keeps the engine package's own folder off its import path. Of an inherited `PYTHONPATH`, only the absolute entries reach it. A helper your config imports must be a `_`-prefixed file in the config directory, which the loader finds for its siblings, or an installed package. The same holds for each engine shard under `supervise`. `supervise` checks this rule before it starts a shard. It loads the config once in a child with an engine shard's import path, and refuses to start the fleet if that load fails. |
 | **Processes** | Per inbound **that receives traffic**: one child process (a full interpreter with its own re-loaded copy of your config dir), two parent daemon threads (frame reader + stderr relay), three parent pipe fds, and on Windows a job-object handle. Nothing is spawned for an idle inbound — the child starts lazily on first dispatch. |
@@ -1015,8 +1020,13 @@ need separate engine processes.
 **Two more things the setting does not reach.** `messagefoundry check` and `messagefoundry dryrun`
 always run Routers/Handlers **in-process** and never consult `mode`. On the default that costs nothing,
 because `serve` runs them in-process too; once you set `mode="subprocess"` the preview stops matching
-the engine, so a Handler calling `db_lookup`/`fhir_lookup` passes the pre-deploy gate green and then
-fails closed at `serve`, and `wall_seconds` is unenforced in the preview. And
+the engine in at least two ways. `wall_seconds` is unenforced in the preview, so test a slow Handler
+under `serve`. And config code there sees the full environment, not the worker's allowlist that the
+*Environment variables* row above describes. A Handler calling `db_lookup`/`fhir_lookup` is not one
+of these. The dry run has no lookup runner, so the call raises there in every mode. Unless the
+Handler catches that error, the fixture records `ERROR`. The gate then fails unless its `.expect`
+file declares `ERROR`. Under `subprocess` that matches `serve`, which refuses the lookup; at
+`mode="off"` it does not, because `serve` runs the lookup there. And
 `[pipeline].fuse_thread_hops` is **hard-disabled** whenever `mode="subprocess"`: fusion runs
 Router/Handler code in-process on an executor hop, so honouring both would silently unsandbox the code
 you asked to isolate. The runner fails closed to the async sandboxed path and logs it. To get fusion you
@@ -1075,8 +1085,7 @@ on a live feed; a Router that only reads is unaffected. Grep your config for `os
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `mode` | enum | `off` | `off` (in-process, byte-identical, no subprocess) or `subprocess` (persistent per-inbound worker child). |
-| `wall_seconds` | float (>0) | 5.0 | **Authoritative** wall-clock cap per Router/Handler call on **every** platform — the parent kills a worker that overruns it, so a pathological busy-loop can't wedge intake. |
-| `cpu_seconds` | float (>0) | 2.0 | POSIX-only `RLIMIT_CPU` backstop inside the child (a no-op on Windows, where `wall_seconds` governs). |
+| `wall_seconds` | float (>0) | 5.0 | **Authoritative** wall-clock cap per Router/Handler call on **every** platform — the parent kills a worker that overruns it, so a pathological busy-loop can't wedge intake. The worker sets no `RLIMIT_CPU`, so CPU that admin code spends outside a call, such as a thread left running or a grandchild that leaves the worker's process group, has no bound at all ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md), amendment of 2026-10-07). |
 | `mem_mb` | int (≥1) or null | 512 | POSIX-only `RLIMIT_AS` address-space cap (MiB) inside the child (no-op on Windows). `null` disables it. |
 | `pass_environment` | list of names | `[]` | Extra environment variable **names** the worker is given, beyond its allowlist. Use it for a variable your config code reads. Names only; the value comes from the engine's own environment at worker start. **Refused at load** if a name is one of the engine's own: any `MEFOR_*` name, and `VAULT_TOKEN` or `PGPASSWORD`. Give a variable your config reads a name outside `MEFOR_`. Whatever you list is readable by every Router and Handler, so do not list a secret of your own either. Env: `MEFOR_SANDBOX_PASS_ENVIRONMENT`, comma-separated. |
 | `startup_seconds` | float (>0) | 30.0 | Bound on the one-time child bootstrap (config load + guard install) before start fails closed. |
@@ -2003,16 +2012,12 @@ made since the last boot — it says nothing about the window between two boots,
 restarts never checks. The tee is the only control that sees the trail as it is written.
 
 ### `[engine]`
-**Not implemented.** There is **no `EngineSettings` model**, so an `[engine]` block in
-`messagefoundry.toml` is parsed and **silently dropped** (`ServiceSettings` is `extra="ignore"`). The rows
-below are the shape a future section would take, not knobs that do anything today. In particular
-`data_dir` does **not** anchor relative paths — reach for `[environments].base_dir` /
-`serve --project-root` for `env()` value files, and `--db` / `[store].path` for the store, instead.
-
-| Key | Type | Default | Notes |
-|---|---|---|---|
-| `shutdown_timeout_seconds` | int | — | **accepted-but-ignored** (proposed): graceful stop. The ASGI lifespan's `engine.stop()` is not bounded by a setting today |
-| `data_dir` | str | — | **accepted-but-ignored** (proposed): base for relative paths. Setting it anchors nothing |
+**Not a section.** There is **no `EngineSettings` model**, so an `[engine]` block in
+`messagefoundry.toml` is **refused at load** as an unknown section, like any other. Earlier versions of
+this page listed `shutdown_timeout_seconds` and `data_dir` here as proposed keys; neither does anything.
+The ASGI lifespan's `engine.stop()` is not bounded by a setting, and for relative paths use
+`[environments].base_dir` / `serve --project-root` for `env()` value files, and `--db` / `[store].path`
+for the store.
 
 ### `[service]` (NSSM / Windows)
 The NSSM **install** knobs — auto-restart, stdout/stderr log paths — live in `scripts/service/`. The

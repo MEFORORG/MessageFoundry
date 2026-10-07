@@ -22,6 +22,8 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
+from messagefoundry.redaction import log_timestamp
+
 __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
@@ -704,7 +706,7 @@ class LoggingAlertSink:
                 name,
                 path,
                 -days_remaining,
-                not_after,
+                log_timestamp(not_after),
             )
         else:
             log.warning(
@@ -712,7 +714,7 @@ class LoggingAlertSink:
                 name,
                 path,
                 days_remaining,
-                not_after,
+                log_timestamp(not_after),
             )
 
     def crl_expiry(
@@ -752,7 +754,7 @@ class LoggingAlertSink:
                 "its peer). Replace the file, and restart the engine if the scan still reports a running "
                 "hop holding the old copy: %s",
                 name,
-                not_after,
+                log_timestamp(not_after),
                 -days_remaining,
                 path,
             )
@@ -762,7 +764,7 @@ class LoggingAlertSink:
                 "or every TLS handshake it verifies will fail, and restart the engine if the scan "
                 "still reports a running hop holding the old copy: %s",
                 name,
-                not_after,
+                log_timestamp(not_after),
                 days_remaining,
                 path,
             )

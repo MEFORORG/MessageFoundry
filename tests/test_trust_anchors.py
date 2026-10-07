@@ -672,7 +672,7 @@ def test_group_writable_refusal_carries_its_own_fix(
         # /remove:g would take read away too, and the engine may read the anchor through the group.
         assert "/remove:g" not in message
         # The rights it names are the check's own, so the text cannot drift from the parser.
-        assert ", ".join(sorted(ta._WRITE_RIGHTS)) in message
+        assert "/".join(sorted(ta._WRITE_RIGHTS)) in message
         assert any(line.startswith(f"Then run icacls {q} again.") for line in lines)
     else:
         assert f"  chmod go-w {shlex.quote(str(p))}" in lines

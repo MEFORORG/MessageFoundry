@@ -251,10 +251,12 @@ async def test_ingest4_nul_ingress_persists_error_row(store) -> None:
         assert getattr(probe.value, "sqlstate", None) == "22021"
 
     for body in (_INGEST4_DECODE_ERR_NUL, _INGEST4_HAPPY_NUL):
-        before = {m["id"] for m in await store.list_messages(channel_id="IB_HL7")}
+        before = {
+            m["id"] for m in await store.list_messages(channel_id="IB_HL7", allowed_channels=None)
+        }
         ack = await runner._handle_inbound(ic, body)  # must NOT raise / drop the connection
         assert ack is not None and "MSA|AR" in ack  # AR NAK, not a dropped connection
-        after = await store.list_messages(channel_id="IB_HL7")
+        after = await store.list_messages(channel_id="IB_HL7", allowed_channels=None)
         new = [m for m in after if m["id"] not in before]
         assert len(new) == 1  # exactly one ERROR row persisted for this body
         erow = new[0]
@@ -700,15 +702,15 @@ async def _dead(store, channel_id: str, dest: str, *, now: float = 100.0) -> str
 async def test_list_count_and_replay_dead(store) -> None:
     await _dead(store, "IB", "OB1", now=100.0)
     await _dead(store, "IB2", "OB2", now=200.0)
-    assert await store.count_dead() == 2
-    rows = await store.list_dead()
+    assert await store.count_dead(allowed_channels=None) == 2
+    rows = await store.list_dead(allowed_channels=None)
     assert [r["destination_name"] for r in rows] == ["OB2", "OB1"]  # newest-failed first
     assert rows[0]["attempts"] == 1 and rows[0]["last_error"] == "boom"
-    assert await store.count_dead(destination_name="OB1") == 1
+    assert await store.count_dead(destination_name="OB1", allowed_channels=None) == 1
 
     assert await store.replay_dead(destination_name="OB1", now=300.0) == 1
-    assert await store.count_dead() == 1
-    assert (await store.list_dead())[0]["destination_name"] == "OB2"
+    assert await store.count_dead(allowed_channels=None) == 1
+    assert (await store.list_dead(allowed_channels=None))[0]["destination_name"] == "OB2"
 
 
 async def test_content_search_scan_decrypt(store) -> None:
@@ -722,22 +724,27 @@ async def test_content_search_scan_decrypt(store) -> None:
         channel_id="IB_B", raw=RAW, deliveries=[], control_id="MSG2", message_type="ADT^A01"
     )
     # Substring on decrypted raw (a SQL LIKE could never match the at-rest ciphertext).
-    res = await store.search_messages(make_spec(content="JANE", field_path=None, field_value=None))
+    res = await store.search_messages(
+        make_spec(content="JANE", field_path=None, field_value=None), allowed_channels=None
+    )
     assert res.matched == 1 and res.rows[0]["control_id"] == "MSG1"
     assert "raw" not in res.rows[0]  # metadata-only result
     # Field-path resolver against the decrypted body.
     res2 = await store.search_messages(
-        make_spec(content=None, field_path="PID-5.1", field_value="DOE")
+        make_spec(content=None, field_path="PID-5.1", field_value="DOE"), allowed_channels=None
     )
     assert res2.matched == 1 and res2.rows[0]["control_id"] == "MSG1"
     # Metadata pre-filter narrows the candidate set before any decrypt.
     res3 = await store.search_messages(
-        make_spec(content="ADT", field_path=None, field_value=None), channel_id="IB_A"
+        make_spec(content="ADT", field_path=None, field_value=None),
+        channel_id="IB_A",
+        allowed_channels=None,
     )
     assert res3.scanned == 1 and res3.matched == 1
     # Scan cap truncates.
     res4 = await store.search_messages(
-        make_spec(content="zzz-no-match", field_path=None, field_value=None, scan_limit=1)
+        make_spec(content="zzz-no-match", field_path=None, field_value=None, scan_limit=1),
+        allowed_channels=None,
     )
     assert res4.scanned == 1 and res4.truncated is True
 
@@ -1974,7 +1981,7 @@ async def test_legacy_plaintext_migrated_on_keyed_reopen(store) -> None:
             fetched = await keyed.get_message(qid)
             assert fetched is not None
             assert fetched["raw"] == RAW
-            assert (await keyed.list_dead())[0]["last_error"] == fail
+            assert (await keyed.list_dead(allowed_channels=None))[0]["last_error"] == fail
             assert keyed.state_view()[("ns", "k")] == {"mrn": "M-LEGACY-STATE"}
             assert keyed.reference_view()["providers"]["P1"] == {"mrn": "M-LEGACY-REF"}
         finally:
@@ -2967,7 +2974,8 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
         assert rec is not None
         assert rec["summary"] == summary and rec["metadata"] == metadata
         assert any(
-            m["summary"] == summary and m["metadata"] == metadata for m in await s.list_messages()
+            m["summary"] == summary and m["metadata"] == metadata
+            for m in await s.list_messages(allowed_channels=None)
         )
     finally:
         await s.close()
@@ -3137,7 +3145,7 @@ async def test_pt_handoff_produces_child_and_parent_processed_pg(store) -> None:
     pmsg = await store.get_message(parent)
     assert pmsg is not None and pmsg["status"] == MessageStatus.PROCESSED.value
     # Child: a distinct message on the PT channel, RECEIVED, correlated, with a pending INGRESS row.
-    msgs = await store.list_messages(channel_id="PT_NEXT")
+    msgs = await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)
     assert len(msgs) == 1
     child = msgs[0]
     assert child["id"] != parent
@@ -3167,7 +3175,9 @@ async def test_pt_child_id_is_content_addressed_pg(store) -> None:
     from messagefoundry.store.store import MessageStore
 
     expected = MessageStore._passthrough_message_id(routed, "PT_NEXT", "MSH|child")
-    assert (await store.list_messages(channel_id="PT_NEXT"))[0]["id"] == expected
+    assert (await store.list_messages(channel_id="PT_NEXT", allowed_channels=None))[0][
+        "id"
+    ] == expected
 
 
 async def test_pt_plus_outbound_in_one_handler_pg(store) -> None:
@@ -3186,7 +3196,7 @@ async def test_pt_plus_outbound_in_one_handler_pg(store) -> None:
     assert depth_out == 1
     assert (await store.get_message(parent))["status"] == MessageStatus.ROUTED.value
     # The PT child exists independently.
-    assert len(await store.list_messages(channel_id="PT_NEXT")) == 1
+    assert len(await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)) == 1
 
 
 async def test_pt_handoff_idempotent_rerun_pg(store) -> None:
@@ -3211,7 +3221,7 @@ async def test_pt_handoff_idempotent_rerun_pg(store) -> None:
         )
         is False
     )
-    assert len(await store.list_messages(channel_id="PT_NEXT")) == 1
+    assert len(await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)) == 1
 
 
 async def test_pt_depth_cap_drops_child_and_errors_parent_pg(store) -> None:
@@ -3234,7 +3244,7 @@ async def test_pt_depth_cap_drops_child_and_errors_parent_pg(store) -> None:
     )
     assert ok is True
     # No child produced; parent finalizes ERROR (the dead PT marker row).
-    assert await store.list_messages(channel_id="PT_NEXT") == []
+    assert await store.list_messages(channel_id="PT_NEXT", allowed_channels=None) == []
     pmsg = await store.get_message(parent)
     assert pmsg is not None and pmsg["status"] == MessageStatus.ERROR.value
 
@@ -3257,7 +3267,7 @@ async def test_pt_correlation_root_propagates_pg(store) -> None:
         pt_deliveries=[("PT_NEXT", "MSH|child")],
         now=110.0,
     )
-    child_id = (await store.list_messages(channel_id="PT_NEXT"))[0]["id"]
+    child_id = (await store.list_messages(channel_id="PT_NEXT", allowed_channels=None))[0]["id"]
     full = await store.get_message(child_id)
     assert full is not None
     meta = json.loads(full["metadata"])
@@ -4373,7 +4383,7 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=100.0
     )
-    (a,) = await store.list_active_alert_instances()
+    (a,) = await store.list_active_alert_instances(allowed_channels=None)
     assert a.status == "open" and a.count == 1 and a.first_seen == 100.0 and a.last_seen == 100.0
     assert a.severity == "critical"
 
@@ -4381,17 +4391,17 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=150.0
     )
-    (a2,) = await store.list_active_alert_instances()
+    (a2,) = await store.list_active_alert_instances(allowed_channels=None)
     assert a2.id == a.id and a2.count == 2 and a2.last_seen == 150.0 and a2.severity == "warning"
     # a DIFFERENT key opens a distinct instance.
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_Y", severity="critical", now=160.0
     )
-    assert len(await store.list_active_alert_instances()) == 2
+    assert len(await store.list_active_alert_instances(allowed_channels=None)) == 2
 
     # ack -> acknowledged + acked_by/at, excluded from the open count; unknown id -> False.
     assert await store.ack_alert_instance(a.id, actor="scott", now=200.0) is True
-    got = await store.get_alert_instance(a.id)
+    got = await store.get_alert_instance(a.id, allowed_channels=None)
     assert got is not None and got.status == "acknowledged"
     assert got.acked_by == "scott" and got.acked_at == 200.0
     assert await store.ack_alert_instance(999999, actor="scott") is False
@@ -4399,7 +4409,7 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
     # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
     # SQLite suite, so a dialect error in this leg is discoverable nowhere else.
-    assert await store.summarize_active_alert_instances() == AlertSummary(
+    assert await store.summarize_active_alert_instances(allowed_channels=None) == AlertSummary(
         total=2, worst_severity="critical"
     )
     assert await store.summarize_active_alert_instances(allowed_channels=["OB_Y"]) == AlertSummary(
@@ -4412,18 +4422,24 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=210.0
     )
-    got = await store.get_alert_instance(a.id)
+    got = await store.get_alert_instance(a.id, allowed_channels=None)
     assert got.status == "acknowledged" and got.count == 3
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
 
     # resolve closes it; the same key re-opens a FRESH distinct instance (partial index frees it).
     assert await store.resolve_alert_instance(a.id, now=300.0) is True
-    assert {r.connection for r in await store.list_active_alert_instances()} == {"OB_Y"}
+    assert {
+        r.connection for r in await store.list_active_alert_instances(allowed_channels=None)
+    } == {"OB_Y"}
     assert await store.resolve_alert_instance(a.id) is False
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=310.0
     )
-    (reopened,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_X"]
+    (reopened,) = [
+        r
+        for r in await store.list_active_alert_instances(allowed_channels=None)
+        if r.connection == "OB_X"
+    ]
     assert reopened.id != a.id and reopened.status == "open" and reopened.count == 1
 
     # inverse-signal resolver closes only the matching key; a no-match is a no-op (0).
@@ -4433,20 +4449,30 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
         )
         == 1
     )
-    assert {r.connection for r in await store.list_active_alert_instances()} == {"OB_Y"}
+    assert {
+        r.connection for r in await store.list_active_alert_instances(allowed_channels=None)
+    } == {"OB_Y"}
     assert (
         await store.resolve_alert_instances_for(event_type="connection_error", connection="NOPE")
         == 0
     )
 
     # purge: only RESOLVED rows older than the cutoff are pruned (open/ack survive).
-    (y,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_Y"]
+    (y,) = [
+        r
+        for r in await store.list_active_alert_instances(allowed_channels=None)
+        if r.connection == "OB_Y"
+    ]
     await store.resolve_alert_instance(y.id, now=100.0)  # resolved at 100.0 -> purgeable
     assert await store.purge_alert_instances(older_than=200.0) == 1
     await store.upsert_alert_instance(
         event_type="queue_buildup", connection="OB_R", severity="warning", now=500.0
     )
-    (rr,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_R"]
+    (rr,) = [
+        r
+        for r in await store.list_active_alert_instances(allowed_channels=None)
+        if r.connection == "OB_R"
+    ]
     await store.resolve_alert_instance(rr.id, now=500.0)  # too recent for older_than=200.0
     assert await store.purge_alert_instances(older_than=200.0) == 0
 
@@ -4474,7 +4500,11 @@ async def test_alert_reason_encrypted_at_rest_pg(store) -> None:
             reason="connect refused to 10.0.0.9",
             now=100.0,
         )
-        (a,) = [r for r in await s2.list_active_alert_instances() if r.connection == "OB_ENC"]
+        (a,) = [
+            r
+            for r in await s2.list_active_alert_instances(allowed_channels=None)
+            if r.connection == "OB_ENC"
+        ]
         assert a.reason == "connect refused to 10.0.0.9"  # decrypted at the boundary
     finally:
         await s2.close()
@@ -4668,7 +4698,7 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
 
     verify = await PostgresStore.open(settings, cipher=cipher_b)  # key_b alone, no retired
     try:
-        assert len(await verify.list_messages()) == 1
+        assert len(await verify.list_messages(allowed_channels=None)) == 1
         fetched = await verify.get_message(mid)
         assert fetched is not None
         assert fetched["raw"] == RAW  # decrypts under the new key alone
@@ -5227,7 +5257,7 @@ async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> 
             ),
         ]
     )
-    events = await store.list_connection_events()
+    events = await store.list_connection_events(allowed_channels=None)
     assert [(e.kind, e.reason) for e in events] == [
         ("connection_lost", "connect refused"),
         ("closed", "clean eof"),
@@ -5248,10 +5278,14 @@ async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> 
         )
     # Asserted on the CONTENT, not the count: what a missing rollback would leave behind is the
     # ts=200.0 row, and naming it is what tells "rolled back" from "never arrived".
-    assert sorted(e.ts for e in await store.list_connection_events()) == [100.0, 101.0, 102.0]
+    assert sorted(e.ts for e in await store.list_connection_events(allowed_channels=None)) == [
+        100.0,
+        101.0,
+        102.0,
+    ]
 
     await store.record_connection_events([])  # an empty burst is a no-op
-    assert len(await store.list_connection_events()) == 3
+    assert len(await store.list_connection_events(allowed_channels=None)) == 3
 
 
 async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(store) -> None:

@@ -554,7 +554,7 @@ class FhirDestination(DestinationConnector):
             # vault BACKLOG #2550, a listed loosening. Named by connection only: the ids are per message.
             logger.warning(
                 "FHIR destination %s sends updates in the PATH form (update_url_form='path'): each "
-                "message's resource id appears in the request URL, PUT {base}/{type}/{id}, and so in "
+                "message's resource id appears in the request URL (PUT {base}/{type}/{id}), and so in "
                 "the receiving server's access logs. This is a listed loosening of owner ruling R3 "
                 "(ASVS 14.2.1); see docs/SECURITY-LOOSENING.md",
                 config.name,

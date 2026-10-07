@@ -103,6 +103,7 @@ CLI_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "admin-unlock": "production",
         "provision-admin": "production",
         "admin-set-notify-email": "production",
+        "admin-reset-totp": "production",
         # Audit log.
         "audit-verify": "production",
         "audit-anchor": "production",

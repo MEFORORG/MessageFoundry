@@ -1872,7 +1872,7 @@ def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
             + ("" if removed else " (empty, could not be removed; delete it)")
             + "; the engine stages no plaintext there. Use a volume that keeps a directory's mode "
             "or ACL: move the SQLite store's data directory, [backup].destination for a server-DB "
-            "store, or TMP, TEMP or TMPDIR for a standalone restore-verify"
+            "store, or TMP/TEMP/TMPDIR for a standalone restore-verify"
         )
     try:
         fd = os.open(

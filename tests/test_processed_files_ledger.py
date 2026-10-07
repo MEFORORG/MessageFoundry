@@ -38,7 +38,7 @@ async def _wait_count(
     store: MessageStore, channel_id: str, want: int, timeout: float = 10.0
 ) -> None:
     elapsed = 0.0
-    while await store.count_messages(channel_id=channel_id) < want:
+    while await store.count_messages(channel_id=channel_id, allowed_channels=None) < want:
         await asyncio.sleep(0.02)
         elapsed += 0.02
         if elapsed > timeout:
@@ -122,7 +122,9 @@ async def test_leave_in_place_ingests_once_across_polls(
         await asyncio.sleep(0.2)  # many more poll cycles — must NOT re-ingest
     finally:
         await runner.stop()
-    assert await store.count_messages(channel_id="file_in") == 1  # ingested ONCE
+    assert (
+        await store.count_messages(channel_id="file_in", allowed_channels=None) == 1
+    )  # ingested ONCE
     assert (share / "a.hl7").exists()  # left in place
     assert not (share / ".processed" / "a.hl7").exists()  # never moved
     # The ledger recorded exactly one file for this connection (a HASHED key — no cleartext filename).

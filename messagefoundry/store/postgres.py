@@ -225,6 +225,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    tee_audits,
     totp_enable_term,
     verify_audit_rows,
 )
@@ -1681,7 +1682,7 @@ class PostgresStore:
         exc = StoreGrantsMissingError(
             f"the postgres store schema in database {self._settings.database!r} is provisioned and "
             f"current, but this role lacks row access to {len(rows)} object(s): {names}{more}. "
-            "Refusing to start rather than fail mid-pipeline. Grant SELECT, INSERT, UPDATE, DELETE on "
+            "Refusing to start rather than fail mid-pipeline. Grant SELECT/INSERT/UPDATE/DELETE on "
             "the tables, SELECT and INSERT only on audit_log, and USAGE on the "
             "sequences to the runtime role (docs/DEPLOY-SERVER-DB.md section 1.2); provision-schema "
             "cannot grant them"
@@ -2056,7 +2057,7 @@ class PostgresStore:
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
                     f"schema_management=external, so CREATE on schema {schema!r}, ownership of its "
-                    "objects, and UPDATE, DELETE, TRUNCATE or TRIGGER on audit_log are "
+                    "objects, and UPDATE/DELETE/TRUNCATE/TRIGGER on audit_log are "
                     "excess"
                     if external
                     else "schema_management=auto, so schema DDL rights are expected"
@@ -5132,7 +5133,7 @@ class PostgresStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where: list[str] = []
@@ -5227,7 +5228,7 @@ class PostgresStore:
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where = [_ACTIVE_ALERT_STATUS_SQL]
@@ -5246,7 +5247,7 @@ class PostgresStore:
         return [self._alert_instance_row(r) for r in rows]
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         # BACKLOG #1564 — see the SQLite twin: same active predicate, same RBAC scope, aggregate over
         # every row in scope rather than over a page. The rank CASE is shared so it cannot drift.
@@ -5267,7 +5268,7 @@ class PostgresStore:
         return _alert_summary(row)
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         where = ["id=$1"]
         params: list[Any] = [alert_id]
@@ -5351,7 +5352,7 @@ class PostgresStore:
         )
         if _rowcount(result) == 0:
             return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
         self, alert_id: int, *, now: float | None = None
@@ -5363,7 +5364,7 @@ class PostgresStore:
         )
         if _rowcount(result) == 0:
             return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         rows = await self._pool.fetch(
@@ -6719,7 +6720,7 @@ class PostgresStore:
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -6759,7 +6760,7 @@ class PostgresStore:
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int:
@@ -6784,7 +6785,7 @@ class PostgresStore:
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51) — see ``MessageStore.search_messages``.
         Pre-filter on the indexed metadata, then decrypt + match each candidate body in memory off the
@@ -6839,7 +6840,7 @@ class PostgresStore:
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[dict[str, Any]]:
         """Dead-lettered deliveries (one row per failed message→destination), newest first, joined
         with message metadata. Bodies omitted. ``allowed_channels`` restricts to a per-channel scope."""
@@ -6871,7 +6872,7 @@ class PostgresStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM queue o{where}", *params)
@@ -6882,7 +6883,7 @@ class PostgresStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
         narrowed by the two clauses :meth:`replay_dead` applies."""
@@ -7141,6 +7142,43 @@ class PostgresStore:
         )
         return AppendedAuditRow(int(new_id or 0), seq, row_hash)
 
+    async def _execute_with_audits(
+        self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float
+    ) -> None:
+        """Run one account write and append its ``audits`` in the same transaction.
+
+        The contract is ``AuthStore.create_user``'s. With no audits it is a plain :meth:`_execute`.
+        `record=False` as `_execute` passes: an account write is not a pipeline borrow.
+
+        THE WRITE HOLDS ITS ``users`` ROW WHILE IT WAITS FOR THE AUDIT ADVISORY LOCK. BACKLOG #2222
+        reviews that scope for a first sign-in's INSERT only; the directory repoint's UPDATE and
+        the administrator's create (BACKLOG #2221) widen it and are not yet in that item."""
+        if not audits:
+            await self._execute(sql, *params)
+            return
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.execute(sql, *params)
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
+
+    async def _append_audits(
+        self, conn: Any, audits: Sequence[AuditAppend], *, now: float
+    ) -> list[AppendedAuditRow]:
+        """Append each of a write's ``audits``, in order, inside its transaction on ``conn``
+        (BACKLOG #2100). The caller commits, then tees with :func:`tee_audits`."""
+        return [
+            await self._append_audit_row(
+                conn,
+                a.action,
+                actor=a.actor,
+                channel_id=None,
+                detail=a.detail,
+                client=a.client,
+                now=now,
+            )
+            for a in audits
+        ]
+
     @staticmethod
     def _audit_where(
         *,
@@ -7334,23 +7372,10 @@ class PostgresStore:
             elif on_repeat is not None:  # always, since `existing` is read only with on_repeat
                 held = str(existing)
                 append = on_repeat(held)
-            appended = None if append is None else await self._append_audit(conn, append, now)
-        if append is not None and appended is not None:
-            append.tee(ts=now, row=appended)
+            audits: tuple[AuditAppend, ...] = () if append is None else (append,)
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
         return held
-
-    async def _append_audit(self, conn: Any, audit: AuditAppend, now: float) -> AppendedAuditRow:
-        """:meth:`_append_audit_row` for an :class:`AuditAppend` a write carries into its own
-        transaction on ``conn`` (BACKLOG #2100). The caller commits, then tees."""
-        return await self._append_audit_row(
-            conn,
-            audit.action,
-            actor=audit.actor,
-            channel_id=None,
-            detail=audit.detail,
-            client=audit.client,
-            now=now,
-        )
 
     async def get_pending_approval(self, approval_id: str) -> Row | None:
         row: Row | None = await self._fetchone(
@@ -7411,9 +7436,9 @@ class PostgresStore:
             moved = _rowcount(await conn.execute(sql, *args)) > 0
             # Inside the transaction, so a failed append rolls the transition back. A transition
             # that matched no row writes no audit row.
-            appended = await self._append_audit(conn, audit, now) if moved else None
-        if appended is not None:
-            audit.tee(ts=now, row=appended)
+            audits: tuple[AuditAppend, ...] = (audit,) if moved else ()
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
         return moved
 
     async def list_executing_approvals(
@@ -7618,7 +7643,7 @@ class PostgresStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -7643,15 +7668,7 @@ class PostgresStore:
             directory_object_id,
             password_generated,
         )
-        if audit is None:
-            await self._execute(sql, *params)
-            return
-        # BACKLOG #2100. The audit row joins the INSERT's transaction, so a failed append rolls the
-        # account back. `record=False` as `_execute` passes: a sign-in is not a pipeline borrow.
-        async with self._timed_acquire(record=False) as conn, conn.transaction():
-            await conn.execute(sql, *params)
-            appended = await self._append_audit(conn, audit, now)
-        audit.tee(ts=now, row=appended)
+        await self._execute_with_audits(sql, params, audits, now=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=$1", user_id)
@@ -7808,6 +7825,54 @@ class PostgresStore:
         )
         return written > 0
 
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> int | None:
+        """See the SQLite twin (ADR 0171 Amendment B). The swap, the session sweep and the audit row
+        share one transaction. This leg is CI-only, so a divergence from the SQLite and SQL Server
+        bodies surfaces first in CI. ``IS NOT DISTINCT FROM`` is the null-safe compare-and-set."""
+        now = time.time() if now is None else now
+        # `record=False` as `create_user` passes: a CLI write is not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            result = await conn.execute(
+                "UPDATE users SET totp_secret=$1, totp_enrolled_at=$2, totp_recovery_codes=$3,"
+                " last_totp_step=$4, updated_at=$2"
+                " WHERE id=$5 AND totp_enabled=TRUE AND totp_secret IS NOT NULL"
+                " AND totp_enrolled_at IS NOT DISTINCT FROM $6",
+                self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+                now,
+                json.dumps(recovery_code_hashes),
+                step,
+                user_id,
+                expected_enrolled_at,
+            )
+            if _rowcount(result) <= 0:
+                return None  # nothing written, so nothing is revoked or audited
+            revoked = await conn.execute(
+                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
+                now,
+                user_id,
+            )
+            appended = await self._append_audit_row(
+                conn,
+                audit.action,
+                actor=audit.actor,
+                channel_id=None,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
+        audit.tee(ts=now, row=appended)
+        return _rowcount(revoked)
+
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -7881,18 +7946,19 @@ class PostgresStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits``: see
+        ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
-        await self._execute(
+        await self._execute_with_audits(
             "UPDATE users SET display_name=$1, email=$2, updated_at=$3 WHERE id=$4",
-            display_name,
-            email,
-            now,
-            user_id,
+            (display_name, email, now, user_id),
+            audits,
+            now=now,
         )
 
     async def set_user_notify_email(
@@ -9022,7 +9088,7 @@ class PostgresStore:
         from messagefoundry.store.base import DbaDelegatedError
 
         raise DbaDelegatedError(
-            "the postgres store backup is DBA-delegated (pg_dump / PITR, BACKLOG #52); the engine backs "
+            "the postgres store backup is DBA-delegated (pg_dump / PITR; BACKLOG #52); the engine backs "
             "up the config bundle only on a server-DB store (set [backup].config_only_on_server_db)"
         )
 

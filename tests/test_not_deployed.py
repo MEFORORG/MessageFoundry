@@ -482,7 +482,9 @@ async def test_already_queued_rows_are_retained_not_dead_lettered(
         await asyncio.sleep(0.15)  # nothing exists that could claim it
         depth, _ = await store.pending_depth("OB_OFF", stage=Stage.OUTBOUND.value)
         assert depth == 1  # RETAINED pending, never claimed connector-less, never dead-lettered
-        msgs = await store.list_messages(channel_id="IB", status=MessageStatus.ERROR.value)
+        msgs = await store.list_messages(
+            channel_id="IB", status=MessageStatus.ERROR.value, allowed_channels=None
+        )
         assert msgs == []
     finally:
         await runner.stop()
