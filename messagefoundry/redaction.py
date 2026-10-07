@@ -62,8 +62,11 @@ Pure stdlib, so it can be used from any engine package.
 
 from __future__ import annotations
 
+import encodings
+import encodings.aliases
 import hashlib
 import json
+import pkgutil
 import re
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
@@ -1939,13 +1942,121 @@ def safe_exc(
     it, routing a file source's error arm through this function would keep the OS diagnostic and leak
     the name anyway: a control that reports success while the hole stays open. The basename is
     replaced wherever it appears, so a full path is covered; the directory part is operator
-    configuration, not partner-chosen, and stays."""
+    configuration, not partner-chosen, and stays.
+
+    A ``UnicodeError`` never reaches :func:`redact` as text (vault BACKLOG #3033). Its ``str()`` quotes
+    the character or byte it failed on, which is a character of the message, and no pattern can tell
+    that apart from prose. :func:`_unicode_error_text` builds the text from the attributes instead.
+    That covers only the error itself: one rendered INTO another exception's message, as
+    ``f"bad frame: {exc}"``, still arrives here as text."""
+    if isinstance(exc, UnicodeError):
+        return safe_text(_unicode_error_text(exc), limit=limit)
     name = type(exc).__name__
     raw = str(exc)
     if file_name and (base := _basename(file_name)):
         raw = raw.replace(base, safe_name(file_name))
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
+
+
+#: A codec name as the codecs module spells one: the shape test runs before the set lookup.
+_CODEC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
+
+
+def _codec_key(name: str) -> str:
+    return name.replace("-", "").replace("_", "").lower()
+
+
+#: Every stdlib codec name and alias, normalized. Built from the ``encodings`` package rather than by
+#: ``codecs.lookup``, which runs third-party search functions and caches each name it misses: the very
+#: value this check declines to echo would stay in process memory. A third-party codec is not named.
+_KNOWN_CODECS = frozenset(
+    _codec_key(n)
+    for n in (
+        *encodings.aliases.aliases,
+        *encodings.aliases.aliases.values(),
+        *(m.name for m in pkgutil.iter_modules(encodings.__path__)),
+    )
+)
+
+#: ``.reason`` phrases known to be fixed text. At least the stdlib idna and punycode codecs put the
+#: offending label INTO ``.reason``, so a reason is rendered only from this list, never on trust.
+_FIXED_UNICODE_REASONS = frozenset(
+    {
+        "character maps to <undefined>",
+        "code pairs are not supported",
+        "code point in surrogate code point range(0xd800, 0xe000)",
+        "code point not in range(0x110000)",
+        "ill-formed sequence",
+        "illegal encoding",
+        "illegal multibyte sequence",
+        "illegal UTF-16 surrogate",
+        "incomplete multibyte sequence",
+        "invalid character",
+        "invalid continuation byte",
+        "invalid start byte",
+        "label empty or too long",
+        "label too long",
+        "non-zero padding bits in shift sequence",
+        "ordinal not in range(128)",
+        "ordinal not in range(256)",
+        "partial character in shift sequence",
+        "surrogates not allowed",
+        "truncated data",
+        "unexpected end of data",
+        "unexpected special character",
+        "unknown Unicode character name",
+        "unterminated shift sequence",
+    }
+)
+
+
+def _unicode_error_text(exc: UnicodeError) -> str:
+    """``exc`` as its class, codec, position and reason, and never the text it failed on.
+
+    ``str(UnicodeEncodeError)`` reads ``'ascii' codec can't encode character '\\xe9' in position 5``,
+    and a decode error names the byte the same way. Both are message content. ``.object`` holds the
+    whole input, so it is never read here. The position is an index, the same detail
+    ``encode_wire_body`` in transports/base.py already keeps.
+
+    The class name alone is the fallback: a bare ``UnicodeError``, or one whose attributes are missing,
+    not the standard types, or raise when read. A bare one's message is free text this function cannot
+    vouch for. ``.encoding`` is rendered only when it names a stdlib codec, so a value someone else set
+    there is not echoed. ``.reason`` is rendered only from a fixed list. Windows ``mbcs`` raises with
+    ``start == end``, so an empty span still names its position."""
+    name = type(exc).__name__
+    if isinstance(exc, UnicodeEncodeError):
+        verb = "encode"
+    elif isinstance(exc, UnicodeDecodeError):
+        verb = "decode"
+    elif isinstance(exc, UnicodeTranslateError):
+        verb = "translate"
+    else:
+        return name
+    # A subclass can make any of these a property that raises. This renderer runs inside other
+    # handlers' except arms, so it must not raise in their place. The class name still says what
+    # failed, and the caller's own arm is what logs it, so nothing is lost silently.
+    try:
+        start, end = exc.start, exc.end
+        reason = exc.reason
+        encoding = getattr(exc, "encoding", None)
+    except Exception:  # noqa: BLE001 - see above
+        return name
+    if type(start) is not int or type(end) is not int or not 0 <= start <= end:
+        return name
+    where = f"position {start}" if end <= start + 1 else f"positions {start}-{end - 1}"
+    codec = (
+        f"{encoding!r} codec "
+        if type(encoding) is str
+        and _CODEC_NAME.fullmatch(encoding)
+        and _codec_key(encoding) in _KNOWN_CODECS
+        else ""
+    )
+    text = f"{name}: {codec}cannot {verb} at {where}"
+    # `type(...) is str`, not isinstance: a str subclass can compare equal to a listed phrase.
+    if type(reason) is str and reason in _FIXED_UNICODE_REASONS:
+        text = f"{text}: {reason}"
+    return text
 
 
 def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:

@@ -34,7 +34,9 @@ class _FakeAuth:
     def allow_login_attempt(self, _client: str | None) -> bool:
         return True
 
-    async def audit_oidc_reject(self, _reason: str) -> None:  # pragma: no cover - not reached here
+    async def audit_oidc_reject(
+        self, _reason: str, *, client: str | None
+    ) -> None:  # pragma: no cover - not reached here
         return None
 
 

@@ -512,8 +512,8 @@ def test_mllp_verify_off_still_refuses_under_staging_phi() -> None:
 
 
 def test_credentialed_plain_ftp_still_refuses_under_staging_phi() -> None:
-    # The credentialed plain-ftp refusal (shipped, escape-keyed) is likewise not loosened: a
-    # staging-PHI credentialed ftp with no escape still refuses (cleartext credential on the wire).
+    # The credentialed plain-ftp refusal is likewise not loosened: a staging-PHI credentialed ftp
+    # still refuses (cleartext credential on the wire). Absolute since vault BACKLOG #2636.
     cfg = Destination(
         name="OB",
         type=ConnectorType.REMOTEFILE,

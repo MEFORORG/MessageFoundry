@@ -34,6 +34,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
+from messagefoundry.transports.mllp import MLLPSource
 from tests._admin_account import create_local_user_chosen
 
 if TYPE_CHECKING:  # the API rig below imports these lazily, inside the tests that use them
@@ -165,6 +166,13 @@ async def _viewer_headers(client: httpx.AsyncClient, username: str = "vw") -> di
     return {"Authorization": f"Bearer {r.json()['token']}"}
 
 
+def _sockport(runner: RegistryRunner, name: str) -> int:
+    """The port inbound ``name``'s listener actually bound, read off its socket."""
+    source = runner._sources[name]
+    assert isinstance(source, MLLPSource), type(source)
+    return source.sockport
+
+
 def _free_port() -> int:
     s = socket.socket()
     try:
@@ -192,6 +200,32 @@ async def test_duplicate_inbound_port_isolates_the_loser(store: MessageStore) ->
         assert set(runner.degraded_inbound()) == {"b"}  # 'a' bound first; 'b' is the loser
         assert "already bound by 'a'" in (runner.inbound_failed("b") or "")
         assert runner.inbound_running("a") and not runner.inbound_running("b")
+    finally:
+        await runner.stop()
+
+
+async def test_two_port_zero_listeners_both_bind(store: MessageStore) -> None:
+    # Port 0 is the OS's to choose at bind, so two listeners configured with it -- beside an API
+    # listener that is itself ephemeral -- each get a port. The runtime guard used to compare
+    # the configured 0s and isolate the second as "already bound" before anything had bound
+    # (merge-queue intermittent, DAST ingress port race, 2026-10-07).
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("a", MLLP(port=0), router="r"))
+    reg.add_inbound(build_inbound_connection("b", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        reserved_bindings=((API_LISTENER_LABEL, "127.0.0.1", 0),),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    try:
+        assert not runner.degraded_inbound()
+        assert runner.inbound_running("a") and runner.inbound_running("b")
+        ports = {_sockport(runner, name) for name in ("a", "b")}
+        assert len(ports) == 2 and 0 not in ports, ports
     finally:
         await runner.stop()
 

@@ -1149,7 +1149,20 @@ class ConnectionEventWrite(TypedDict):
 # The one sessions INSERT, shared by MessageStore.create_session's guarded and unguarded paths.
 _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-    " revoked_at, client, reauth_at, auth_mechanism) VALUES (?,?,?,?,?,NULL,?,?,?)"
+    " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
+    " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
+)
+
+
+# BACKLOG #2143: the IdP step-up's write-back of the auth_time it accepted, in the `?` dialect SQLite
+# and SQL Server share. Bind the new value three times. It only ever moves FORWARD, so two step-ups on
+# one session that land out of order cannot leave the older value behind for a replay to pass. A
+# NULL (every password re-proof) leaves the stored value as it was. Each placeholder is CAST, because
+# inside an expression SQL Server has no column to infer a NULL parameter's type from.
+_IDP_AUTH_TIME_FORWARD_SQL: Final = (
+    "CASE WHEN CAST(? AS FLOAT) IS NOT NULL"
+    " AND (idp_auth_time IS NULL OR CAST(? AS FLOAT) > idp_auth_time)"
+    " THEN CAST(? AS FLOAT) ELSE idp_auth_time END"
 )
 
 
@@ -1692,6 +1705,12 @@ class SessionRecord:
     #: leg runs. Set once at mint and carried forward by ``rotate_session``. NULL on a row written
     #: before the column existed, which takes the non-federated step-up.
     auth_mechanism: str | None = None
+    #: The IdP's ``auth_time`` for this session, as the IdP stated it (BACKLOG #2143): set at an
+    #: ``oidc`` mint and moved forward by each IdP step-up that succeeds. The step-up requires a
+    #: later one, IdP clock against IdP clock. NULL on every other session, and on an ``oidc`` row
+    #: written before the column existed, which the IdP step-up refuses as
+    #: ``step_up_idp_auth_time_missing``.
+    idp_auth_time: float | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -1706,6 +1725,7 @@ class SessionRecord:
             reauth_at=_opt_float(d.get("reauth_at")),
             mfa_verified_at=_opt_float(d.get("mfa_verified_at")),
             auth_mechanism=d.get("auth_mechanism"),
+            idp_auth_time=_opt_float(d.get("idp_auth_time")),
         )
 
     def is_live(self, *, now: float, idle_seconds: float) -> bool:
@@ -3205,6 +3225,7 @@ def delivery_key(
     *,
     control_id: str | None,
     message_id: str,
+    outbox_id: str,
     destination_name: str,
     handler_name: str | None,
     delivery_seq: int,
@@ -3212,21 +3233,33 @@ def delivery_key(
     """The idempotency-ledger key for one **completed** outbound delivery (H2) — a SHA-256 digest of
     re-run-stable, **non-PHI** identifiers only (ids + a counter; **never a body**).
 
-    Folds in the inbound control id (MSH-10) when present, else the internal ``message_id`` (so two
-    messages that happen to share a control id across channels stay distinct via the destination +
-    seq), the destination, the handler that produced the delivery (NULL → empty), and ``delivery_seq``
-    — ``1 + COUNT(prior ledger rows for this (message_id, destination))``, the same monotonic,
-    replay-stable counter shape as ``response_seq`` (ADR 0013). The seq is what distinguishes an
-    **operator replay** (a fresh, higher-seq delivery → a new key → re-sends, never deduped) from a
-    **crash-re-run** (the same row instance recovered before its completion committed — its prior
-    ledger row, if any, is keyed by ``outbox_id`` and caught at claim time, not by this hash).
+    Folds in the internal ``message_id``, the ``outbox_id`` of the queue row that delivered, the
+    inbound control id (MSH-10, NULL when absent), the destination, the handler that produced the
+    delivery (NULL → empty), and ``delivery_seq`` — ``1 + COUNT(prior ledger rows for this
+    (message_id, destination))``. A crash re-run re-derives every input (its prior completion rolled
+    back, so the COUNT is unchanged), so it re-derives the same key.
 
-    Shared verbatim by all three store backends so the digest is byte-identical across SQLite/Postgres/
-    SQL Server. control_id is a peek-derived MSH field — included as an *operator-facing correlation
-    aid* in the digest input only; it is hashed, never stored or logged in the clear here."""
+    **The ids are what make the key unique, never the control id or the seq** (vault BACKLOG #2768).
+    The callers write at most one ledger row per ``outbox_id`` (they return early when one exists),
+    so with the outbox id in the hash no two ledger rows can share a key. Neither weaker input is
+    unique on its own. A control id is sender-assigned: a retransmit recorded as a new message, or a
+    counter that restarts, gives two messages one control id, and a key that hashed it IN PLACE OF the
+    message id collided at the same destination, handler and seq. The seq is a COUNT, not a MAX: a
+    replay DELETEs the ledger rows of the rows it re-pends, so it can recompute an earlier seq, and a
+    scoped delete that keeps a sibling row's entry can recompute the sibling's seq. Every backend
+    INSERT ignores a key conflict, so a collision silently drops a ledger row rather than failing.
+
+    The claim-time skip looks the ledger up by ``outbox_id``; nothing recomputes this key to find a
+    row. Shared verbatim by all three store backends so the digest is byte-identical across SQLite/
+    Postgres/SQL Server. control_id adds no uniqueness and no correlation (nothing recomputes the key);
+    it stays an input only because #2768 kept it as an extra component. Dropping it would also drop the
+    per-delivery ``SELECT control_id`` its callers run, which the ADR 0071 statement inventory pins.
+    It is hashed, never stored or logged in the clear here."""
     canonical = json.dumps(
         [
-            control_id if control_id is not None else message_id,
+            message_id,
+            outbox_id,
+            control_id,
             destination_name,
             handler_name or "",
             delivery_seq,
@@ -4555,7 +4588,7 @@ CREATE INDEX IF NOT EXISTS ix_response_message ON response(message_id);
 -- is stored in the clear (nothing to decrypt; it is not part of the `_cipher` seam). A deliberate
 -- operator `replay` DELETEs the affected rows so the re-send is NOT deduped (replay-distinguishes).
 CREATE TABLE IF NOT EXISTS delivered_keys (
-    delivery_key     TEXT PRIMARY KEY,    -- sha256(control_id|message_id, dest, handler, seq) — no PHI
+    delivery_key     TEXT PRIMARY KEY,    -- sha256 of non-PHI ids, see delivery_key()
     outbox_id        TEXT NOT NULL,       -- the queue row that delivered (claim-time dedup lookup key)
     message_id       TEXT NOT NULL,
     destination_name TEXT NOT NULL,
@@ -4825,7 +4858,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     client       TEXT,
     reauth_at    REAL,                         -- last credential re-verification (login / /me/reauth)
     mfa_verified_at REAL,                      -- when the 2nd factor was satisfied; NULL = unsatisfied (WP-14)
-    auth_mechanism TEXT                        -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
+    auth_mechanism TEXT,                       -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
+    idp_auth_time REAL                         -- the IdP's auth_time for an oidc session (BACKLOG #2143)
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
@@ -6460,6 +6494,11 @@ class MessageStore:
         # non-federated step-up; nothing is backfilled, because nothing recorded the mechanism.
         if "auth_mechanism" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
+        # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with. Pre-existing
+        # rows get NULL, because nothing recorded the value to backfill. The IdP step-up refuses a
+        # NULL as step_up_idp_auth_time_missing.
+        if "idp_auth_time" not in session_cols:
+            await db.execute("ALTER TABLE sessions ADD COLUMN idp_auth_time REAL")
         # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing
         # DB's response table predates the three columns — ALTER them in (existing rows backfill
         # kind='response' via the DEFAULT). Metadata-only on SQLite (no table rewrite). Idempotent.
@@ -12429,6 +12468,7 @@ class MessageStore:
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for an
@@ -12443,6 +12483,7 @@ class MessageStore:
             client,
             now if seed_reauth else None,
             auth_mechanism,
+            idp_auth_time,
         )
         if require_federated_subject is None:
             async with _writer_guard(self._db, self._lock):
@@ -12505,15 +12546,21 @@ class MessageStore:
             await self._commit()
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
             # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
             await self._db.execute(
-                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client) WHERE token_hash=?",
-                (now, client, token_hash),
+                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
+                f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
+                (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
             )
             await self._commit()
 
@@ -13530,16 +13577,16 @@ class MessageStore:
 
         Only outbound rows deliver; ingress/routed rows (``destination_name`` NULL) own no external send
         and are skipped. ``delivery_seq`` is ``1 + COUNT`` of this row's prior ledger entries for the
-        ``(message_id, destination_name)`` pair — the same replay-stable counter shape as
-        ``response_seq``. The stored row carries hashes + ids only — never a body/PHI. The INSERT keys on
-        the content hash; a re-run that reaches here only after the prior completion rolled back finds
-        ``COUNT=0`` again and re-derives the same key (idempotent), while the claim-time skip
+        ``(message_id, destination_name)`` pair. It is a counter, not a unique id: a replay's DELETE can
+        make it repeat, and :func:`delivery_key` takes its uniqueness from the ids instead. The stored
+        row carries hashes + ids only — never a body/PHI. A re-run that reaches here only after the
+        prior completion rolled back re-derives the same key (idempotent), while the claim-time skip
         (:meth:`claim_next_fifo`) is what actually prevents the duplicate *send*."""
         if destination_name is None:
             return  # ingress/routed completions own no external delivery — nothing to dedupe
         # One ledger row per outbox row INSTANCE: a double mark_done of the same row (a re-completion, a
         # belt-and-suspenders re-call) must not accumulate a second entry. A deliberate replay re-send
-        # DELETEs this row's entry first, so its re-delivery is recorded fresh (a new, higher seq).
+        # DELETEs this row's entry first, so its re-delivery is recorded fresh (a new ledger row).
         cur = await self._db.execute(
             "SELECT 1 FROM delivered_keys WHERE outbox_id=? LIMIT 1", (outbox_id,)
         )
@@ -13557,6 +13604,7 @@ class MessageStore:
         key = delivery_key(
             control_id=control_id,
             message_id=message_id,
+            outbox_id=outbox_id,
             destination_name=destination_name,
             handler_name=handler_name,
             delivery_seq=seq,

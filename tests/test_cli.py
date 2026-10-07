@@ -1631,9 +1631,10 @@ def test_serve_loopback_prod_quiet_on_approvals(
     # instance with approvals off never emits the advisory. Retention windows + SMTP satisfy the
     # #186a/#188 prod gates so the serve reaches rc 0 and only the approvals posture is under test.
     #
-    # BACKLOG #326 re-keyed admin_exposed onto `instance_exposed` (off-loopback bind OR a declared
-    # TLS-terminating proxy). This case is unchanged BY CONSTRUCTION: `instance_exposed` is also False
-    # on a plain loopback bind with nothing declared, which is the property that keeps the loopback
+    # BACKLOG #326 re-keyed admin_exposed onto `instance_exposed` (an off-loopback bind, a declared
+    # TLS-terminating proxy, or since vault BACKLOG #2251 a set trusted_proxies). This case is unchanged
+    # BY CONSTRUCTION: `instance_exposed` is also False on a plain loopback bind with no proxy declared
+    # or trusted, which is the property that keeps the loopback
     # default quiet. test_plain_loopback_is_not_instance_exposed pins the same invariant against the
     # MFA arm; both must hold or the re-key widened more than it was meant to.
     rc = _dualctl_serve(
@@ -2168,7 +2169,8 @@ def test_plain_loopback_is_not_instance_exposed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # The byte-identity guard the re-key must not break, and the pin on the NARROW predicate. A plain
-    # loopback bind with nothing declared is not exposed, so neither the MFA refusal nor the #189
+    # loopback bind with no proxy declared or trusted is not exposed (vault BACKLOG #2251 counts a
+    # set trusted_proxies, which this case does not set), so neither the MFA refusal nor the #189
     # dual-control advisory may fire — even on a production PHI instance with both knobs off. This is
     # why `console_exposed` (which also counts a bare `public_origin`) was NOT reused here: nothing has
     # been declared in that case, so exposure is an INFERENCE, and an inference must not refuse. It
@@ -2185,6 +2187,116 @@ def test_plain_loopback_is_not_instance_exposed(
     err = capsys.readouterr().err
     assert "require_mfa off" not in err
     assert "approvals" not in err
+
+
+# --- vault BACKLOG #2251: a loopback bind that trusts a proxy is exposed ----------------------------
+#
+# `instance_exposed` used to read `not is_loopback or tls_terminated_upstream`, so a loopback bind
+# naming only [api].trusted_proxies counted as unexposed. The settings model admits that shape only
+# with an operator certificate (a proxy re-encrypting to the engine, BACKLOG #2055), and the proxy
+# puts the admin API on the network exactly as a terminator does. Each case below starts with rc 0
+# and no exposure output when the old predicate is swapped back in.
+_TRUSTED_PROXY_EXPOSURE_DESC = (
+    "admin interface reached through a declared reverse proxy ([api].trusted_proxies)"
+)
+
+
+def _trusted_proxy_only_api(tmp_path: Path) -> str:
+    """[api] for a loopback bind that trusts a proxy and serves an operator certificate, with no
+    declared terminator."""
+    from tests.test_api_tls import _self_signed
+
+    cert, key = _self_signed(tmp_path)
+    return (
+        '[api]\ntrusted_proxies = ["10.0.0.1"]\n'
+        f'tls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n'
+    )
+
+
+def test_trusted_proxies_only_loopback_requires_mfa_on_prod_phi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        _EXPOSURE_PRELUDE
+        + "security.require_mfa = false\n"
+        + _EXPOSURE_TAIL
+        + _trusted_proxy_only_api(tmp_path),
+        env="prod",
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "require_mfa off; refusing to start" in err
+    # The refusal names the field the operator set, not a terminator this config never declared.
+    assert f"error: {_TRUSTED_PROXY_EXPOSURE_DESC} on a production PHI instance" in err
+
+
+def test_trusted_proxies_only_loopback_warns_mfa_and_not_undeclared_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Under warn the MFA arm warns and names the field. With a public origin set too, the
+    # undeclared-proxy warning must stay quiet: the proxy IS declared, and the MFA arm now sees it.
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\n'
+        + _EXPOSURE_PRELUDE
+        + "security.require_mfa = false\n"
+        + 'security.web_console_public_address = "https://mefor.example.org"\n'
+        + _EXPOSURE_TAIL
+        + _trusted_proxy_only_api(tmp_path),
+        env="prod",
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert f"warning: {_TRUSTED_PROXY_EXPOSURE_DESC} in a PHI-carrying environment" in err
+    assert "require_mfa off" in err
+    assert "is set with no declared TLS terminator" not in err
+
+
+def test_trusted_proxies_only_loopback_warns_dual_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # require_mfa on clears the MFA gate, so the #189 dual-control advisory is the only exposure arm.
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\n'
+        + _EXPOSURE_PRELUDE
+        + "security.require_mfa = true\n"
+        + _EXPOSURE_TAIL
+        + _trusted_proxy_only_api(tmp_path),
+        env="prod",
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert f"warning: {_TRUSTED_PROXY_EXPOSURE_DESC} in a PHI-carrying environment" in err
+    assert "[approvals].enabled off" in err
+
+
+def test_trusted_proxies_only_loopback_meets_the_memory_declaration_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The ADR 0152 arm reads the same `instance_exposed`, so its opt-in refusal covers this shape too.
+    # The prelude's memory declaration is dropped and the opt-in set; nothing else refuses first.
+    prelude = _EXPOSURE_PRELUDE.replace("security.memory_encryption_operator_declared = true\n", "")
+    assert prelude != _EXPOSURE_PRELUDE
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        prelude
+        + "security.require_mfa = true\n"
+        + "security.require_memory_encryption_declaration = true\n"
+        + "approvals.enabled = true\n"
+        + _EXPOSURE_TAIL
+        + _trusted_proxy_only_api(tmp_path),
+        env="prod",
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "this EXPOSED production PHI instance" in err
+    assert "ASVS 11.7.1" in err
 
 
 def test_undeclared_proxy_warns_about_single_factor_admin(

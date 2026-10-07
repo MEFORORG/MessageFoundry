@@ -7886,10 +7886,13 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
     return AuthService(engine.store, _oidc_settings(**over), ldap=_FakeLdap())  # type: ignore[arg-type]
 
 
-def _oidc_client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
+def _oidc_client(
+    engine: Engine, service: AuthService, *, peer: str = "127.0.0.1"
+) -> httpx.AsyncClient:
     # public_origin is required: the redirect_uri derives from it, never from the Host header.
     app = create_app(engine, auth=service, serve_ui=True, public_origin="https://ops.example")
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    transport = httpx.ASGITransport(app=app, client=(peer, 123))
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
 async def _oidc_audits(engine: Engine) -> list[str]:
@@ -8008,15 +8011,24 @@ async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: 
 
 async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) -> None:
     """AC-7: a valid (state, code) pair with no browser binding must not mint a session - otherwise
-    whoever presents the pair gets the session minted into THEIR browser."""
+    whoever presents the pair gets the session minted into THEIR browser.
+
+    The reject row records the caller's address (vault BACKLOG #2132): a spray of cookie-less
+    callbacks is the cheapest one to send, and the operator needs its source."""
     service = _oidc_service(engine)
     await service.initialize()
-    async with _oidc_client(engine, service) as c:
+    async with _oidc_client(engine, service, peer="192.0.2.46") as c:
         r = await c.get("/ui/oidc/callback?code=abc&state=xyz", follow_redirects=False)
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/login?e=flow_binding_missing"
         assert "mf_session" not in r.headers.get("set-cookie", "")
         assert any("flow_binding_missing" in d for d in await _oidc_audits(engine))
+    [row] = [
+        a
+        for a in await engine.store.list_audit(action="auth.login_failed")
+        if "flow_binding_missing" in (a["detail"] or "")
+    ]
+    assert row["client"] == "192.0.2.46"
 
 
 async def test_oidc_callback_survives_a_cross_site_navigation(engine: Engine) -> None:

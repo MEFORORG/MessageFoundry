@@ -2120,11 +2120,19 @@ async def _noop_handler(raw: bytes) -> str | None:
     return None
 
 
-async def _until(cond, timeout: float = 2.0) -> None:
-    """Poll ``cond`` until true or timeout (avoids fixed sleeps in async tests)."""
-    elapsed = 0.0
+async def _until(cond, timeout: float = 30.0) -> None:
+    """Poll ``cond`` until true, or fail once ``timeout`` seconds of real time have passed.
+
+    A polling bound, not a wait: a met condition returns on the first poll that sees it, so the
+    bound costs a passing test nothing and only sets how long a broken one takes to fail. It is
+    measured by the clock, not by adding 0.01 per sleep, and sized for a loaded hosted runner.
+    A 2 s bound failed merge-group run 37535066947 (windows-2025) in
+    ``test_transports.py::test_file_source_routes_oversized_to_error``: the file source's
+    settle gate needs two polls to agree before it admits a file, and each filesystem step runs on
+    a worker thread, so on a busy runner the bound tripped before the source finished.
+    """
+    deadline = time.monotonic() + timeout
     while not cond():
-        await asyncio.sleep(0.01)
-        elapsed += 0.01
-        if elapsed > timeout:
+        if time.monotonic() > deadline:
             raise AssertionError("condition not met within timeout")
+        await asyncio.sleep(0.01)

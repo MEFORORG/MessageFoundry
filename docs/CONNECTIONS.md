@@ -168,7 +168,9 @@ transport = "mllp"
   `Loopback`/`PassThrough`) are **code-first only** today — declare them in a `.py` module. A name
   declared in **both** a `.py` module and `connections.toml` is a hard error (no silent shadowing).
 - **Edit it two ways, same file:** by hand, or via `messagefoundry connection list|upsert|remove`
-  (comment/format-preserving, validate-before-persist with rollback) — which is what the **VS Code
+  (comment/format-preserving; the edit is validated as a candidate and replaces the file only if it
+  loads, under a lock the engine's console writes take too: a hidden `.mefor-edit.lock`
+  beside the file, which stays there and is safe to ignore) — which is what the **VS Code
   connection editor** shells (the gear on a data-authored connection opens the form; a code-authored
   one opens its `.py`). `env()` secrets are never written inline.
 - **A GUI/CLI save preserves every read-schema field** (#234, 2026-07-16): the write schema is
@@ -406,10 +408,14 @@ RemoteFile, Timer, Loopback, PassThrough — none of them binds an interface).
 > start/reload — naming **both** connections, instead of aborting at the bare OS bind. The check is
 > **interface-aware**: two listeners on the same port but **different** explicit `bind_address`es (a
 > multi-NIC host) don't conflict, while a `0.0.0.0` (all-interfaces) bind conflicts with any specific
-> interface on that port. `env()`-resolved ports and the engine's own **API listener port** (`[api].port`)
-> are included in the start/reload pass. At runtime, a port already held by **another process** (a
-> second instance, an OS service) is reported as a clear, named conflict and the affected inbound is
-> **isolated** (the engine still comes up; see [ADR 0031](adr/0031-startup-connection-fault-isolation.md)).
+> interface on that port. A listener configured with `port = 0` is not compared: the OS chooses
+> the port at bind time, so several such listeners do not refuse each other. That port can change
+> whenever the listener rebinds and the engine does not report it, so a sending system cannot be
+> pointed at it: `port = 0` is for tests and embedding, not for a partner-facing listener.
+> `env()`-resolved ports and the engine's own **API listener port** (`[api].port`) are included in
+> the start/reload pass. At runtime, a port already held by **another process** (a second instance,
+> an OS service) is reported as a clear, named conflict and the affected inbound is **isolated**
+> (the engine still comes up; see [ADR 0031](adr/0031-startup-connection-fault-isolation.md)).
 
 #### Inspecting & testing a connection (API)
 
@@ -1224,8 +1230,13 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
-  Plain FTP is cleartext, so supplying a `username`/`password` over it is **refused** (the credential
-  itself would cross in the clear) — use FTPS or `Sftp(...)`; an *anonymous* plain-FTP hop is governed by
+  A hand-built spec that turns either check off (`tls_verify = false` or `tls_check_hostname = false`)
+  while a `username` or `password` is set is **refused outright**, with no escape variable or posture
+  to unlock it (vault BACKLOG #2636, as `Email`/`Direct` refuse a credentialed hop; they key on
+  `username` alone, FTP on either half); the escape governs only an anonymous FTPS hop.
+  Plain FTP is cleartext, so supplying a `username`/`password` over it is **refused outright**, with
+  no escape variable or posture to unlock it (the credential itself would cross in the clear; vault
+  BACKLOG #2636) — use FTPS or `Sftp(...)`; an *anonymous* plain-FTP hop is governed by
   the [`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted) declaration below.
 
 | Setting | Dir | Default | Meaning |
@@ -1233,13 +1244,13 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `host` | both | — (required) | the remote server — the `[egress].allowed_remote` key. Use `env()` for a DEV/PROD-specific host. |
 | `port` | both | `22` (`Sftp`) / `21` (`Ftp`) | server port |
 | `remote_dir` | both | — (required) | remote directory to poll / upload into |
-| `username` | both | — (unset) | login user (unset = anonymous, FTP only) |
+| `username` | both | — (unset) | login user (unset = anonymous, FTP only). Refused over plain `ftp`, alone or with a password. |
 | `password` | both | — (unset) | login password — a **secret**, via `env()`. Refused over plain `ftp`. |
 | `private_key` | both | — | **`Sftp` only** — the **text** of an **RSA** private key, not a path; a **secret**, via `env()`. See *RSA key text only* below the table. |
 | `key_password` | both | — | **`Sftp` only** — **refused** (BACKLOG #1352): an encrypted SFTP key cannot meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor), so supply `private_key` unencrypted through `env()`. Setting this fails at `check` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP. An FTPS **upload** to an off-box host is **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). The inbound FTPS poll has no such gate |
-| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**. It loads `[tls].crl_file` when one is set (vault BACKLOG #2370), but without one an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
+| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false`, which is refused outright when a `username` or `password` is set (#129, ADR 0094; vault BACKLOG #2636). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**. It loads `[tls].crl_file` when one is set (vault BACKLOG #2370), but without one an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
 | `tls_ca_file` | both | — | **`Ftp` only, FTPS** (#1180) — pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
 | `poll_seconds` | in | `5.0` | poll interval, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774). It is also the **settle window**: a file is read only once it lists at the same size, and the same modification time where the server lists one, as at the last poll that saw it (BACKLOG #2071, #2758), so every file waits at least one poll. The gate is always on and has no setting. On a server that lists no modification time (at least FTP without `MLSD`, an `MLSD` server without `modify`, and an SFTP server that omits the times) it reads the listed size alone, so there it cannot see a same-size rewrite, nor anything on a server that lists every file at size 0. |

@@ -42,6 +42,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports import DeliveryError, NegativeAckError, SourceConnector
 from messagefoundry.transports.mllp import MLLPDestination
+from tests.test_encode_wire_body import _escapes
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -1223,6 +1224,50 @@ async def test_internal_error_dead_letters_and_continues(
         await runner.stop()
     assert dest.calls == 1  # internal errors are not retried under the default policy
     assert (await store.stats()).get(OutboxStatus.DEAD.value) == 1
+
+
+class _BareEncoder:
+    """Test connector that encodes the payload with a bare ``str.encode`` and no guard."""
+
+    async def send(self, payload: str) -> None:
+        payload.encode("ascii")
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_an_unguarded_encode_stores_no_character_of_the_message(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # vault BACKLOG #3033: a connector that skips encode_wire_body raises a bare UnicodeEncodeError,
+    # whose str() quotes the offending character. The internal-error arm stores it through safe_exc,
+    # which must keep the codec and position and drop the character.
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    reg = _retry_registry(inbox, outdir, RetryPolicy())
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    await runner.start()
+    try:
+        replaced = runner._destinations["file_out"]
+        runner._destinations["file_out"] = _BareEncoder()
+        await replaced.aclose()
+        # U+015A: its bare hex, 15a, holds a letter, so no decimal position can match it.
+        (inbox / "a.hl7").write_bytes(ADT.replace("JANE", "JAN\u015a").encode("utf-8"))
+        await _until_stat(store, OutboxStatus.DEAD.value, 1)
+    finally:
+        await runner.stop()
+    cur = await store._db.execute("SELECT message_id, last_error FROM queue WHERE stage='outbound'")
+    [row] = await cur.fetchall()
+    stored = {
+        "last_error": store._cipher.decrypt(row["last_error"]),
+        "events": " ".join(e["detail"] or "" for e in await store.events_for(row["message_id"])),
+    }
+    for where, text in stored.items():
+        assert "UnicodeEncodeError: 'ascii' codec cannot encode at position" in text, where
+        for form in (*_escapes("\u015a"), "JAN"):
+            assert form not in text, f"a character of the message reached {where} as {form!r}"
 
 
 class _RecordingAlertSink:

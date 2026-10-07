@@ -2965,6 +2965,50 @@ async def test_mark_done_writes_one_ledger_row_pg(store) -> None:
     assert mid
 
 
+async def test_two_messages_sharing_a_control_id_each_get_a_ledger_row_pg(store) -> None:
+    # vault BACKLOG #2768: both messages compute delivery_seq=1 (the count is per message id), so a key
+    # that hashed the control id in place of the message id made the second ledger insert a no-op.
+    mids = [
+        await store.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB1", f"p{i}")], control_id="MSG1", now=100.0
+        )
+        for i in range(2)
+    ]
+    for t in (200.0, 201.0):
+        item = await store.claim_next_fifo("OB1", now=t)
+        assert item is not None
+        await store.mark_done(item.id, now=t + 50.0)
+    rows = await _pg_ledger(store)
+    assert sorted(r["message_id"] for r in rows) == sorted(mids)
+    assert [r["delivery_seq"] for r in rows] == [1, 1]
+    assert rows[0]["delivery_key"] != rows[1]["delivery_key"]
+
+
+async def test_a_seq_gap_does_not_collide_two_rows_of_one_message_pg(store) -> None:
+    # Mirrors the SQLite test: dropping one row's ledger entry (built directly, not via replay) makes
+    # its re-delivery recompute the sibling's seq; the outbox id in the key keeps the two keys apart.
+    await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB1", "p2")], now=100.0
+    )
+    first = await store.claim_next_fifo("OB1", now=200.0)
+    assert first is not None
+    await store.mark_done(first.id, now=250.0)
+    second = await store.claim_next_fifo("OB1", now=260.0)
+    assert second is not None
+    await store.mark_done(second.id, now=270.0)
+    async with store._pool.acquire() as conn:
+        await conn.execute("DELETE FROM delivered_keys WHERE outbox_id=$1", first.id)
+        await conn.execute(
+            "UPDATE queue SET status=$1 WHERE id=$2", OutboxStatus.PENDING.value, first.id
+        )
+    again = await store.claim_next_fifo("OB1", now=400.0)
+    assert again is not None and again.id == first.id
+    await store.mark_done(again.id, now=450.0)
+    rows = await _pg_ledger(store)
+    assert sorted(r["outbox_id"] for r in rows) == sorted([first.id, second.id])
+    assert len({r["delivery_key"] for r in rows}) == 2
+
+
 async def test_claim_skips_already_delivered_head_no_resend_pg(store) -> None:
     # Deliver → ledger + DONE; re-pend the DONE row (failover / post-commit reset) WITHOUT clearing the
     # ledger; the next claim skip-and-completes it in place (None) — no re-send, still exactly one row.

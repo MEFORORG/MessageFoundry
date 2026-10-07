@@ -1749,6 +1749,12 @@ def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -
     for slug in ("auth_time_missing", "auth_time_stale", "mfa_claim_missing"):
         assert f"`{slug}`" in block and slug in claims_module.REASONS, slug
     assert f"`{service_module.STEP_UP_NOT_FRESH}`" in block
+    # BACKLOG #2143: the OIDC step-up row cites the IdP-clock test's two reasons by slug.
+    for slug in (
+        service_module.STEP_UP_IDP_AUTH_TIME_NOT_LATER,
+        service_module.STEP_UP_IDP_AUTH_TIME_MISSING,
+    ):
+        assert f"`{slug}`" in block, slug
 
     # Kerberos minting at the minimum is pinned by
     # test_the_directory_rows_disclose_what_each_leg_actually_grants. This pins the OIDC half more
