@@ -150,6 +150,24 @@ async def test_the_sweep_removes_both_leftover_shapes_and_counts_them(tmp_path: 
     assert await store.prune_expired() == PruneResult()
 
 
+def test_an_aborted_sweep_stops_before_its_next_entry(tmp_path: Path) -> None:
+    """BACKLOG #2264, code review. A pass writes its audit rows only once the orphan sweep returns,
+    so a slow sweep over a large dir must stop on the pass's abort rather than hold those rows past
+    a stop. With the abort already set, an aged leftover is left for the next pass."""
+    store = _store(tmp_path)
+    root = tmp_path / "uploads"
+    root.mkdir(mode=0o700, parents=True)
+    stale_blob = root / f"{secrets.token_hex(16)}{_BLOB_SUFFIX}"
+    stale_blob.write_text("a body whose sidecar never landed", encoding="utf-8")
+    _backdate(stale_blob, seconds=2 * _ORPHAN_MIN_AGE_SECONDS)
+    aborted = threading.Event()
+    aborted.set()
+
+    assert store._sweep_orphans_sync(now=time.time(), abort=aborted) == 0
+    assert stale_blob.exists()
+    assert store._sweep_orphans_sync(now=time.time(), abort=threading.Event()) == 1
+
+
 async def test_a_leftover_younger_than_the_floor_is_left_alone(tmp_path: Path) -> None:
     """The floor is what stands in for a liveness check across processes, so it has to actually hold."""
     store = _store(tmp_path)

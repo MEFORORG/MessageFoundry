@@ -228,7 +228,8 @@ class UploadQuotaError(UploadError):
       slots. **So a leaked slot self-heals only once that uploader is otherwise IDLE** for the whole
       window, with no bound while activity continues. Any reserve, release or heartbeat for that
       uploader, from any shard, keeps it alive. A host whose clock runs ahead holds it longer by the
-      skew.
+      skew, up to one window: a stamp further ahead than that is not trusted, and the next reserve
+      or release overwrites it (:meth:`messagefoundry.store.base.Store.reserve_upload_quota`).
     * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a row with no activity
       for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow one.
       Every applied reserve moves the row's clock, and a live save touches it every
@@ -236,8 +237,9 @@ class UploadQuotaError(UploadError):
       keeps its slot. A live slot is still reclaimed in at least these cases: its holder lands no
       touch for the whole window while it is alive (a suspended process or VM, an event loop
       starved for minutes, or a store this shard cannot reach while a sibling can); its save
-      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; or the holder's host clock lags a sibling's
-      by a large part of the window. ``since`` is stamped from the writer's ``time.time()`` and
+      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; the holder's host clock lags a sibling's
+      by a large part of the window; or it runs more than a window ahead of a sibling's, whose next
+      reserve then reads the stamp as untrusted. ``since`` is stamped from the writer's ``time.time()`` and
       compared against the reader's, and the stamp never moves backwards, so a lagging host can no
       longer age a row a sibling keeps fresh, but a row only it touches still looks old to the
       sibling. A sibling then counts neither that file nor its slot, and the holder's later release
@@ -1708,8 +1710,8 @@ class UploadStore:
             # The orphan sweep runs AFTER the deletions, so a failure in it must not raise out of
             # here: that would drop `pruned`, and with it the audit rows (BACKLOG #2261).
             try:
-                orphans = self._sweep_orphans_sync(now=at)
-            except Exception:
+                orphans = self._sweep_orphans_sync(now=at, abort=stop)
+            except Exception:  # noqa: BLE001 — logged; a raise would drop the pass's audit rows
                 # ERROR, as the runner logged this before the catch moved here.
                 _log.exception("uploaded-logs orphan sweep failed; will retry next pass")
                 orphans = 0
@@ -1779,7 +1781,7 @@ class UploadStore:
             for meta in result.pruned:
                 try:
                     await audit(meta)
-                except Exception:
+                except Exception:  # noqa: BLE001 — logged; one bad row must not cost the rest
                     # ERROR: the file is gone and this was its only record, the level every other
                     # upload.prune audit gap logs at.
                     _log.exception(
@@ -1800,23 +1802,49 @@ class UploadStore:
         what the sweep's thread had deleted, so no ``upload.prune`` row was written for those files.
         The thread kept deleting with nobody left to audit it. This is the retention runner's
         treatment (#2065): a cancel sets the sweep's ``abort``, so it stops at its next file, and
-        the rows for what it removed are still written. See :meth:`_run_to_completion` for the wait."""
+        the rows for what it removed are still written. See :meth:`_run_to_completion` for the wait.
+
+        A sweep that then fails, or that shutdown cancels, is logged as the retention runner's stop
+        logs one, from a :class:`_SweepTally`: an ERROR naming each removed file with no row yet,
+        or a WARNING when no row is lost (BACKLOG #2264)."""
         abort = threading.Event()
+        tally = _SweepTally()
+
+        def _late(task: asyncio.Future[Any]) -> None:
+            if task.cancelled():
+                why = "was cancelled before it finished"
+            elif task.exception() is not None:
+                why = "failed after its request was cancelled"
+            else:
+                return
+            _log_unaudited(
+                f"the save-time upload prune {why}",
+                tally,
+                exc=None if task.cancelled() else task.exception(),
+            )
+
         return await self._run_to_completion(
-            self.prune_and_audit(audit, abort=abort), on_cancel=abort.set
+            self.prune_and_audit(audit, abort=abort, tally=tally),
+            on_cancel=lambda: tally.abort(abort),
+            on_late=_late,
         )
 
     async def _run_to_completion[T](
-        self, coro: Coroutine[Any, Any, T], *, on_cancel: Callable[[], None] | None = None
+        self,
+        coro: Coroutine[Any, Any, T],
+        *,
+        on_cancel: Callable[[], None] | None = None,
+        on_late: Callable[[asyncio.Future[Any]], None] | None = None,
     ) -> T:
         """Run ``coro`` as its own task, so a cancellation of the caller does not cut it short.
 
         The task is outside the caller's cancel scope, so the request deadline does not reach its
         awaits. A cancelled caller calls ``on_cancel`` first, then waits up to
         ``_LEDGER_CANCEL_WAIT_SECONDS`` for the task, then the cancellation propagates. A task
-        still running at that bound is logged and held until it finishes. A failure of the task
-        after the cancellation is logged at ERROR rather than raised, because the cancellation is
-        what propagates. Without one, the task's result or exception is the caller's."""
+        still running at that bound is logged and held until it finishes. Once the caller is
+        cancelled, ``on_late`` is given the finished task, since the cancellation is what
+        propagates and nothing else reads its outcome; without one, a failure is logged at ERROR.
+        Without a cancellation, the task's result or exception is the caller's."""
         task = asyncio.create_task(coro)
         try:
             return await _wait_to_completion(
@@ -1825,14 +1853,14 @@ class UploadStore:
         except asyncio.CancelledError:
             if not task.done():
                 _log.warning(
-                    "the save-time upload prune did not finish within %gs of its request's "
-                    "cancellation; it was left running",
+                    "a task its caller's cancellation could not cut short did not finish within "
+                    "%gs of it; it was left running",
                     _LEDGER_CANCEL_WAIT_SECONDS,
                 )
-            self._hold(task, _log_late_failure)
+            self._hold(task, on_late or _log_late_failure)
             raise
 
-    def _sweep_orphans_sync(self, *, now: float) -> int:
+    def _sweep_orphans_sync(self, *, now: float, abort: threading.Event | None = None) -> int:
         """Remove the write leftovers no other pass can reach, and return how many went (BACKLOG #1678).
 
         Two shapes, both meaning a write that started and never landed: a ``.<id>.<suffix>.<tag>.tmp``
@@ -1860,7 +1888,11 @@ class UploadStore:
         write, bounded by ``max_bytes`` — has been stalled for longer than the floor could have its temp
         removed underneath it. Its ``os.replace`` then raises and its ``save`` fails cleanly: nothing is
         published half-written, nothing is left behind, and the operator retries. An hour against a
-        25 MiB default bound is far outside that window."""
+        25 MiB default bound is far outside that window.
+
+        ``abort`` is :meth:`prune_expired`'s, checked before each entry. The pass's audit rows are
+        written only once this returns, so a slow sweep over a large dir must not hold them past a
+        stop (BACKLOG #2264). An aborted sweep returns what it removed so far; the next one resumes."""
         root = self._root
         if not root.is_dir():
             return 0
@@ -1869,6 +1901,8 @@ class UploadStore:
         reachable = {fid for fid, _ in self._iter_sidecars()}
         removed = 0
         for entry in root.iterdir():
+            if abort is not None and abort.is_set():
+                break
             name = entry.name
             stem = name[: -len(_BLOB_SUFFIX)] if name.endswith(_BLOB_SUFFIX) else ""
             if _ORPHAN_TMP_RE.match(name):
@@ -2002,11 +2036,14 @@ class UploadRetentionRunner:
         """Spawn the supervised prune loop (idempotent)."""
         if self._task is not None:
             return
-        self._stop.clear()
+        # A fresh event, not a clear(), for the same reason as _abort below: a loop a stop() is
+        # still waiting on holds the old one, and clearing it would keep that loop sweeping beside
+        # the new one, each replacing the tally the other's stop() reads.
+        self._stop = asyncio.Event()
         # A fresh event, not a clear(): a sweep thread a timed-out stop() left running still holds
         # the old one, and clearing it would let that thread resume deleting with nobody to audit.
         self._abort = threading.Event()
-        self._task = asyncio.create_task(self._run())
+        self._task = asyncio.create_task(self._run(self._stop))
         _log.info(
             "uploaded-logs retention prune enabled: older than %d days, every %gs",
             self._store.retention_days,
@@ -2050,50 +2087,33 @@ class UploadRetentionRunner:
             why = f"did not finish within {self._stop_timeout:g}s of shutdown"
         except asyncio.CancelledError:
             why = "was still running when shutdown itself was cancelled"
-        # Read before the cancel. Every id is logged, since this line is the only record of them.
-        lost = tally.unaudited()
+        # Read before the cancel. Every id is logged, since these lines are the only record of them.
         if self._audit is None:
             _log.warning(
                 "uploaded-logs retention sweep %s; cancelling it. The runner has no audit "
                 "callback, so it owed no upload.prune row",
                 why,
             )
-        elif lost:
-            # An audit write the cancel interrupts may still land, so "may".
-            _log.error(
-                "uploaded-logs retention sweep %s; cancelling it. %d file(s) it removed, or was "
-                "removing, may have no upload.prune audit row: %s",
-                why,
-                len(lost),
-                ", ".join(lost),
-            )
         else:
-            _log.warning(
-                "uploaded-logs retention sweep %s; cancelling it. It had removed no aged pair "
-                "it had not audited, so no upload.prune row is lost",
-                why,
-            )
+            _log_unaudited(f"uploaded-logs retention sweep {why}; cancelling it", tally)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    async def _run(self) -> None:
+    async def _run(self, stop: asyncio.Event) -> None:
         # One isolated sweep per interval; an error in a pass is logged and the loop continues (a prune
-        # must never take the engine down). Cooperatively cancellable via _stop.
-        while not self._stop.is_set():
+        # must never take the engine down). Cooperatively cancellable via ``stop``, this loop's own.
+        while not stop.is_set():
             try:
                 # The loop's sweep alone owns self._tally, so a direct run_once() never hides it.
                 self._tally = _SweepTally()
                 await self._sweep(self._tally)
             except Exception:
                 _log.exception("uploaded-logs retention prune failed; will retry next interval")
-            await self._sleep(self._interval)
-
-    async def _sleep(self, delay: float) -> None:
-        try:  # noqa: SIM105 — wake immediately on stop so shutdown isn't held by the interval
-            await asyncio.wait_for(self._stop.wait(), delay)
-        except TimeoutError:
-            pass
+            try:  # noqa: SIM105 — wake immediately on stop so shutdown isn't held by the interval
+                await asyncio.wait_for(stop.wait(), self._interval)
+            except TimeoutError:
+                pass
 
     async def run_once(self, now: float | None = None) -> PruneResult:
         """One :meth:`UploadStore.prune_and_audit` pass for ``now`` (default: the injected clock).
@@ -2148,19 +2168,45 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
 
 
 def _log_late_failure(task: asyncio.Future[Any]) -> None:
-    """Log the failure of a :meth:`UploadStore._run_to_completion` task whose caller was cancelled,
-    since nothing else will read it. A cancelled task (shutdown) is a failure too: a file it had
-    deleted and not yet audited has no row, the gap the retention runner's stop logs at ERROR."""
+    """Log the failure of a :meth:`UploadStore._run_to_completion` task whose caller was cancelled
+    and passed no ``on_late``, since nothing else will read it. A cancelled task (shutdown) is
+    logged too, since it stopped short of what it was run to finish."""
     if task.cancelled():
-        _log.error(
-            "the save-time upload prune was cancelled before it finished; a file it deleted "
-            "may have no upload.prune audit row"
-        )
+        _log.error("a task left running after its caller was cancelled was itself cancelled")
     elif (exc := task.exception()) is not None:
-        _log.error(
-            "the save-time upload prune failed after its request was cancelled; a file it "
-            "deleted may have no upload.prune audit row",
+        _log.error("a task left running after its caller was cancelled failed", exc_info=exc)
+
+
+# How many file_ids one audit-gap line names. A first sweep after a long outage can remove
+# thousands of pairs, and one line that long is handled badly by log shippers and NSSM's rotated
+# stdout. Every id is still logged, over as many lines as it takes: those lines are their only record.
+_UNAUDITED_IDS_PER_LINE = 50
+
+
+def _log_unaudited(what: str, tally: _SweepTally, *, exc: BaseException | None = None) -> None:
+    """Log what a sweep that stopped short of its audit rows lost, from its ``tally`` (BACKLOG
+    #2264). An ERROR names each removed file with no row yet, :data:`_UNAUDITED_IDS_PER_LINE` to a
+    line; a sweep that lost no row logs a WARNING. ``what`` says what happened to the sweep."""
+    lost = tally.unaudited()
+    if not lost:
+        _log.warning(
+            "%s. It had removed no aged pair it had not audited, so no upload.prune row is lost",
+            what,
             exc_info=exc,
+        )
+        return
+    for first in range(0, len(lost), _UNAUDITED_IDS_PER_LINE):
+        chunk = lost[first : first + _UNAUDITED_IDS_PER_LINE]
+        # An audit write the cancel interrupts may still land, so "may".
+        _log.error(
+            "%s. %d file(s) it removed, or was removing, may have no upload.prune audit row "
+            "(%d to %d): %s",
+            what,
+            len(lost),
+            first + 1,
+            first + len(chunk),
+            ", ".join(chunk),
+            exc_info=exc if first == 0 else None,
         )
 
 

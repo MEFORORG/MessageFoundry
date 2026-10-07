@@ -11691,6 +11691,9 @@ class MessageStore:
         exclusive across processes rather than across coroutines. ``rowcount`` discriminates applied
         from refused; the row is left untouched on a refusal."""
         now = time.time()
+        # A stamp further ahead than this is no clock within the window, so it is not trusted: it
+        # counts as stale and is overwritten with now, rather than pinning the row (base contract).
+        ahead = now + max(0.0, stale_after)
         if files <= 0:
             # RELEASE — always applies, clamped at zero so a double release cannot mint budget. Never
             # conditional: refusing a release would strand the reservation it is paying back.
@@ -11700,9 +11703,9 @@ class MessageStore:
                     " inflight_files = MAX(0, inflight_files + ?),"
                     " inflight_bytes = MAX(0, inflight_bytes + ?),"
                     # Never backwards: a host whose clock lags must not age a live row (#2648).
-                    " since = MAX(since, ?)"
+                    " since = CASE WHEN since > ? THEN ? ELSE MAX(since, ?) END"
                     " WHERE uploader_id = ?",
-                    (int(files), int(size_bytes), now, uploader_id),
+                    (int(files), int(size_bytes), ahead, now, now, uploader_id),
                 )
                 await self._commit()
             return True
@@ -11716,17 +11719,18 @@ class MessageStore:
                 "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
                 " VALUES (?,?,?,?)"
                 " ON CONFLICT(uploader_id) DO UPDATE SET"
-                " inflight_files ="
-                " CASE WHEN upload_quota.since <= ? THEN 0 ELSE upload_quota.inflight_files END + ?,"
-                " inflight_bytes ="
-                " CASE WHEN upload_quota.since <= ? THEN 0 ELSE upload_quota.inflight_bytes END + ?,"
+                " inflight_files = CASE WHEN (upload_quota.since <= ? OR upload_quota.since > ?)"
+                " THEN 0 ELSE upload_quota.inflight_files END + ?,"
+                " inflight_bytes = CASE WHEN (upload_quota.since <= ? OR upload_quota.since > ?)"
+                " THEN 0 ELSE upload_quota.inflight_bytes END + ?,"
                 # Every applied reserve refreshes `since`, as a release does: a live slot joining
                 # an old row must not be reclaimed along with it (BACKLOG #2648). Never backwards,
                 # so a host whose clock lags cannot age a row a sibling keeps fresh.
-                " since = MAX(upload_quota.since, ?)"
-                " WHERE (CASE WHEN upload_quota.since <= ? THEN 0"
+                " since = CASE WHEN upload_quota.since > ? THEN ?"
+                " ELSE MAX(upload_quota.since, ?) END"
+                " WHERE (CASE WHEN (upload_quota.since <= ? OR upload_quota.since > ?) THEN 0"
                 " ELSE upload_quota.inflight_files END) + ? <= ?"
-                " AND (CASE WHEN upload_quota.since <= ? THEN 0"
+                " AND (CASE WHEN (upload_quota.since <= ? OR upload_quota.since > ?) THEN 0"
                 " ELSE upload_quota.inflight_bytes END) + ? <= ?",
                 (
                     uploader_id,
@@ -11734,14 +11738,20 @@ class MessageStore:
                     int(size_bytes),
                     now,
                     stale,
+                    ahead,
                     int(files),
                     stale,
+                    ahead,
                     int(size_bytes),
+                    ahead,
+                    now,
                     now,
                     stale,
+                    ahead,
                     int(files),
                     int(max_files),
                     stale,
+                    ahead,
                     int(size_bytes),
                     int(max_total_bytes),
                 ),

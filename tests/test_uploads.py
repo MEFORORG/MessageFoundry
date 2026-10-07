@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import threading
@@ -635,7 +636,7 @@ async def test_a_refused_unlink_is_not_counted_as_an_audit_gap(
     monkeypatch.setattr(store, "_paths", lambda fid: (undeletable, real_paths(fid)[1]))
     paused, release = threading.Event(), threading.Event()
 
-    def _stuck_orphans(*, now: float) -> int:
+    def _stuck_orphans(*, now: float, abort: threading.Event | None = None) -> int:
         paused.set()
         release.wait(timeout=10)
         return 0
@@ -1390,7 +1391,44 @@ async def test_a_write_stuck_past_the_bound_is_left_to_finish(
         release.set()
         await _drain_stragglers(store)
         await asyncio.sleep(0)  # the done callback runs one loop pass after the task ends
-    assert "no upload.prune audit row" in caplog.text, caplog.text
+    assert "left running after its caller was cancelled failed" in caplog.text, caplog.text
+
+
+async def test_a_save_time_sweep_shutdown_cancels_names_each_unaudited_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #2264, code review. The save-time sweep removed three pairs and its audit write
+    hangs on the second. Its request is cancelled, the bound passes, and shutdown then cancels
+    the held sweep. The ERROR names exactly the two files with no row, as the runner's stop does,
+    rather than a bare "may have" that also fires for a sweep that removed nothing."""
+    monkeypatch.setattr("messagefoundry.uploads._LEDGER_CANCEL_WAIT_SECONDS", 0.05)
+    store = _quota_store(tmp_path, retention_days=30)
+    ids = await _save_aged(store, tmp_path / "uploads", 3)
+    hung = asyncio.Event()
+    written: list[str] = []
+
+    async def _audit(m: UploadedFileMeta) -> None:
+        if written:
+            hung.set()
+            await asyncio.Event().wait()  # hangs until shutdown cancels the sweep
+        written.append(m.file_id)
+
+    sweep = asyncio.create_task(store.prune_on_save(_audit))
+    await asyncio.wait_for(hung.wait(), 10)
+    sweep.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(sweep, 10)
+    [held] = list(store._stragglers)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        held.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await held
+        await asyncio.sleep(0)  # the done callback runs one loop pass after the task ends
+    [record] = [r for r in caplog.records if "save-time upload prune" in r.getMessage()]
+    assert record.levelno == logging.ERROR, record.getMessage()
+    assert "2 file(s) it removed, or was removing, may have no" in record.getMessage()
+    named = set(record.getMessage().rsplit(": ", 1)[1].split(", "))
+    assert named == ids - set(written) and len(written) == 1
 
 
 async def test_an_orphan_sweep_failure_keeps_the_pruned_pairs_reported(tmp_path: Path) -> None:
@@ -1399,7 +1437,7 @@ async def test_an_orphan_sweep_failure_keeps_the_pruned_pairs_reported(tmp_path:
     store = _quota_store(tmp_path, retention_days=30)
     ids = await _save_aged(store, tmp_path / "uploads", 2)
 
-    def _boom(*, now: float) -> int:
+    def _boom(*, now: float, abort: threading.Event | None = None) -> int:
         raise PermissionError("uploads root unreadable")
 
     store._sweep_orphans_sync = _boom  # type: ignore[method-assign]

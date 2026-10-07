@@ -11014,13 +11014,16 @@ class SqlServerStore:
         :meth:`add_cipher_invocations` uses. The budget predicate rides ``WHEN MATCHED AND``, so a
         refusal matches no rows and ``OUTPUT`` returns nothing."""
         now = time.time()
+        # A stamp further ahead than this is not trusted (see the SQLite twin and the contract).
+        ahead = now + max(0.0, stale_after)
         if files <= 0:
             # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
             await self._execute(
                 "UPDATE upload_quota SET"
                 " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
                 " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
-                " since = CASE WHEN since > ? THEN since ELSE ? END"  # never backwards (#2648)
+                # never backwards (#2648), unless the stamp is past `ahead`
+                " since = CASE WHEN since > ? AND since <= ? THEN since ELSE ? END"
                 " WHERE uploader_id = ?",
                 (
                     int(files),
@@ -11028,6 +11031,7 @@ class SqlServerStore:
                     int(size_bytes),
                     int(size_bytes),
                     now,
+                    ahead,
                     now,
                     uploader_id,
                 ),
@@ -11042,21 +11046,26 @@ class SqlServerStore:
                 await cur.execute(
                     "MERGE upload_quota WITH (HOLDLOCK) AS t"
                     " USING (SELECT ? AS uploader_id, ? AS files, ? AS size_bytes, ? AS now_ts,"
-                    " ? AS stale_ts, ? AS max_files, ? AS max_total_bytes) AS s"
+                    " ? AS stale_ts, ? AS max_files, ? AS max_total_bytes, ? AS ahead_ts) AS s"
                     " ON t.uploader_id = s.uploader_id"
                     " WHEN MATCHED AND"
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END)"
+                    " (CASE WHEN t.since <= s.stale_ts OR t.since > s.ahead_ts THEN 0"
+                    " ELSE t.inflight_files END)"
                     " + s.files <= s.max_files"
-                    " AND (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
+                    " AND (CASE WHEN t.since <= s.stale_ts OR t.since > s.ahead_ts THEN 0"
+                    " ELSE t.inflight_bytes END)"
                     " + s.size_bytes <= s.max_total_bytes"
                     " THEN UPDATE SET"
                     " t.inflight_files ="
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END) + s.files,"
+                    " (CASE WHEN t.since <= s.stale_ts OR t.since > s.ahead_ts THEN 0"
+                    " ELSE t.inflight_files END) + s.files,"
                     " t.inflight_bytes ="
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
-                    " + s.size_bytes,"
-                    # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
-                    " t.since = CASE WHEN t.since > s.now_ts THEN t.since ELSE s.now_ts END"
+                    " (CASE WHEN t.since <= s.stale_ts OR t.since > s.ahead_ts THEN 0"
+                    " ELSE t.inflight_bytes END) + s.size_bytes,"
+                    # Every applied reserve refreshes it, never backwards (BACKLOG #2648), unless
+                    # the stamp is past `ahead_ts`.
+                    " t.since = CASE WHEN t.since > s.now_ts AND t.since <= s.ahead_ts"
+                    " THEN t.since ELSE s.now_ts END"
                     " WHEN NOT MATCHED THEN"
                     " INSERT (uploader_id, inflight_files, inflight_bytes, since)"
                     " VALUES (s.uploader_id, s.files, s.size_bytes, s.now_ts)"
@@ -11069,6 +11078,7 @@ class SqlServerStore:
                         stale,
                         int(max_files),
                         int(max_total_bytes),
+                        ahead,
                     ),
                 )
                 row = await cur.fetchone()

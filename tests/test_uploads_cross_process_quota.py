@@ -327,8 +327,8 @@ def test_the_heartbeat_stops_at_its_lifetime_cap(
 def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:
     """BACKLOG #2648. ``since`` is stamped from each writer's own clock. A shard whose clock lags
     must not age a row a sibling keeps fresh, or the sibling's next reserve reclaims live slots.
-    The row is stamped an hour ahead to stand in for the sibling; a reserve, a release and a touch
-    from this host must all leave that stamp where it is."""
+    The row is stamped well ahead, but inside one window, to stand in for the sibling; a reserve,
+    a release and a touch from this host must all leave that stamp where it is."""
 
     async def _run() -> None:
         store = await MessageStore.open(tmp_path / "engine.db")
@@ -336,7 +336,7 @@ def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:
             assert await store.reserve_upload_quota(
                 "u-alice", files=1, size_bytes=10, max_files=5, max_total_bytes=100
             )
-            ahead = time.time() + 3600.0
+            ahead = time.time() + UPLOAD_RESERVATION_STALE_AFTER * 2 / 3
             await store._db.execute(
                 "UPDATE upload_quota SET since = ? WHERE uploader_id = ?", (ahead, "u-alice")
             )
@@ -351,6 +351,44 @@ def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:
             )
             row = await cur.fetchone()
             assert row is not None and float(row[0]) == ahead
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_a_stamp_more_than_a_window_ahead_does_not_pin_a_leaked_slot(tmp_path: Path) -> None:
+    """BACKLOG #2648, code review. Never-backwards alone let one write from a host whose clock ran
+    far ahead pin the row's clock in the future, so a slot leaked later never went stale. Here the
+    leaked slot fills the budget, so without the fix every reserve is refused and the row is never
+    written again. A stamp more than a window ahead is not trusted: the reserve reclaims the slot
+    and restamps the row with now. A release restamps it too."""
+
+    async def _run() -> None:
+        store = await MessageStore.open(tmp_path / "engine.db")
+        try:
+            assert await store.reserve_upload_quota(
+                "u-alice", files=1, size_bytes=10, max_files=1, max_total_bytes=100
+            )
+            year = time.time() + 365 * 86_400.0
+            for writer in ("reserve", "release"):
+                await store._db.execute(
+                    "UPDATE upload_quota SET since = ? WHERE uploader_id = ?", (year, "u-alice")
+                )
+                await store._db.commit()
+                before = time.time()
+                if writer == "reserve":
+                    assert await store.reserve_upload_quota(
+                        "u-alice", files=1, size_bytes=10, max_files=1, max_total_bytes=100
+                    ), "a slot under a future stamp was never reclaimed"
+                    assert await store.upload_quota_in_flight("u-alice") == (1, 10)
+                else:
+                    await store.reserve_upload_quota("u-alice", files=0, size_bytes=0)
+                cur = await store._db.execute(
+                    "SELECT since FROM upload_quota WHERE uploader_id = ?", ("u-alice",)
+                )
+                row = await cur.fetchone()
+                assert row is not None and before <= float(row[0]) <= time.time(), writer
         finally:
             await store.close()
 
