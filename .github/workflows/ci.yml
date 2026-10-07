@@ -1348,8 +1348,8 @@ jobs:
       # to get the dump back -- do not read the missing dump as the timeout having failed to fire.
       #
       # WINDOWS-2025's MARGIN CAP WENT FROM 6 TO 9, AND THE CAUSE WAS RUNNER VARIANCE RATHER THAN SUITE
-      # GROWTH. It is 8 now: the BACKLOG #1842 re-derivation under "THE MARGIN CAPS ARE RE-DERIVED"
-      # below re-sized it on a post-xdist pool. This paragraph is the 2026-09-13 reasoning for 9, kept
+      # GROWTH. The BACKLOG #1842 re-derivation under "THE MARGIN CAPS ARE RE-DERIVED" below re-sized it
+      # to 8 on a post-xdist pool, and the fourth re-derivation there to 12. This paragraph is the 2026-09-13 reasoning for 9, kept
       # as a record. Every "cap" in this note means `webconsole_margin_cap`, which is what these four
       # runs were measured against; it was spelled `webconsole_step_timeout` when the note was
       # written, because that one variable was then both the ruler and the wall. The numbers are
@@ -1388,9 +1388,9 @@ jobs:
       # and so admits a setup longer than the 5:22 alone would cover. Read the second column as
       # headroom the sum deliberately buys, not as time anyone has measured twice.
       #
-      #   ubuntu-latest   5:22 + 4:30 + kill  9:00 = 18:52   under 20:00, slack 1:08
+      #   ubuntu-latest   5:22 + 4:30 + kill 10:00 = 19:52   under 21:00, slack 1:08
       #   windows-2022    4:05 + 4:30 + kill 11:00 = 19:35   under 20:00, slack 0:25
-      #   windows-2025    2:32 + 4:30 + kill 12:00 = 19:02   under 20:00, slack 0:58
+      #   windows-2025    2:32 + 4:30 + kill 16:00 = 23:02   under 24:00, slack 0:58
       #
       # windows-2022 is the tightest and is the leg to watch, since the third re-derivation raised its
       # kill to 11. Its setup has to reach 9:00 before the JOB cap fires ahead of the step cap and the
@@ -1399,6 +1399,12 @@ jobs:
       # the tightest until then, at 0:58. The lever if it ever bites is `webconsole_job_timeout`, which is
       # a deadlock backstop rather than a tightness gate -- not a smaller kill, which would re-narrow
       # the observation window this change was made to open.
+      #
+      # THE FOURTH RE-DERIVATION PULLED THAT LEVER ON TWO LEGS, and moved each job cap by exactly what
+      # its kill moved, so each leg keeps the slack it had: ubuntu's kill 9 -> 10 and job cap 20 -> 21,
+      # windows-2025's kill 12 -> 16 and job cap 20 -> 24. Holding ubuntu at 20 would still have
+      # passed the sum, at 0:08 of slack, which leaves the pad as the only margin on the one leg where
+      # this note says the pad does real work.
       # tests/test_ci_step_margin.py parses this table and re-adds every row.
       #
       # THE RULER AND THE WALL: THE MARGIN CAP AND THE KILL ARE NOW TWO NUMBERS, DELIBERATELY.
@@ -1423,12 +1429,14 @@ jobs:
       # re-size together would bury the one change that can be reasoned about, so the re-size is
       # deliberately a later, separate change with its own measurement.
       #
-      # THE CAPS ARE NOW 6 / 8 / 8 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
+      # THE CAPS ARE NOW 7 / 8 / 12 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
       # "THE MARGIN CAPS ARE RE-DERIVED". BACKLOG #1879 did the first re-derivation this paragraph
       # defers and came back "unchanged". BACKLOG #1842 did the second, on the first hosted pool taken
       # under xdist, and moved windows-2025 from 9 to 8. The third, by owner request 2026-09-30, moved
       # ubuntu from 5 to 6 and windows-2022 from 6 to 8; it is "THE THIRD RE-DERIVATION", further down
-      # than the other two. The notes are far apart and could be
+      # than the other two. The fourth, the web console step-margin gate re-measure of 2026-10-07,
+      # moved ubuntu from 6 to 7 and windows-2025 from 8 to 12; it is "THE FOURTH RE-DERIVATION",
+      # directly after the third. The notes are far apart and could be
       # read as contradicting, which is the only reason this pointer exists. Do not restate the
       # arithmetic here -- one copy, per SDS-3.5.
       #
@@ -1440,9 +1448,10 @@ jobs:
       # of it -- why a decoupling and a re-size do not ship together -- is still the governing reason
       # and #1879 followed it. What that pool says about the caps is set out above the suite step.
       #
-      # THE KILLS ARE 9 / 11 / 12, and each is at least 1.30x its leg's margin cap. windows-2022's went
+      # THE KILLS ARE 10 / 11 / 16, and each is at least 1.30x its leg's margin cap. windows-2022's went
       # from 10 to 11 in the third re-derivation, because its margin cap went to 8 and 10 would be
-      # under 1.30x that -- the same ratio
+      # under 1.30x that; the fourth moved ubuntu's from 9 to 10 and windows-2025's from 12 to 16 for
+      # the same reason -- the same ratio
       # the gate's own floor reserves below the cap, so the band a run may be observed in ABOVE the cap
       # is at least as wide, in ratio, as the band the floor reserves below it.
       # tests/test_ci_step_margin.py asserts that headroom per leg, reading BOTH numbers out of the
@@ -1460,8 +1469,9 @@ jobs:
       # number until a warning stops. What it asks for is a cap derived from what the work takes. This cap
       # is derived from four measured runs and set so the OBSERVED WORST clears the floor, so it is the
       # second. The detector is not disarmed either: at 9:00 it warns again above 6:55, which is outside
-      # the entire observed range. That 9 is 8 now, re-sized by BACKLOG #1842 below; at 8:00 the gate
-      # warns above 6:09.
+      # the entire observed range. That 9 became 8, re-sized by BACKLOG #1842 below; at 8:00 the gate
+      # warned above 6:09. It is 12 now, re-sized by the fourth re-derivation; at 12:00 the gate warns
+      # above 9:13.
       #
       # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 a green suite came within 35 seconds of being
       # KILLED, because the 6:00 that was then the margin cap was also the `timeout-minutes` -- the
@@ -1484,10 +1494,11 @@ jobs:
       # 7:38 on 2026-09-22, nine days later. Not necessarily its FIRST: the pool above is twelve hours
       # wide, so it can date a breach and cannot date the earliest one.
       #
-      # THE MARGIN CAPS ARE RE-DERIVED, THREE TIMES. The first re-derivation came back "UNCHANGED" -- 5 /
+      # THE MARGIN CAPS ARE RE-DERIVED, FOUR TIMES. The first re-derivation came back "UNCHANGED" -- 5 /
       # 6 / 9 -- and saying so out loud is the point of the next few paragraphs. The second, BACKLOG
       # #1842, moved windows-2025 to 8; it is the group headed "THE SECOND RE-DERIVATION" below. The
-      # third moved ubuntu to 6 and windows-2022 to 8; it is "THE THIRD RE-DERIVATION". A cap that
+      # third moved ubuntu to 6 and windows-2022 to 8; it is "THE THIRD RE-DERIVATION". The fourth
+      # moved ubuntu to 7 and windows-2025 to 12; it is "THE FOURTH RE-DERIVATION". A cap that
       # nobody moved and a cap that was checked and found right look identical in a diff, so here is
       # the first one's arithmetic. Each cap divided by the 1.30x floor gives the longest the step may
       # take on that leg, set beside the WORST SERIAL run in the 66-observation pool above:
@@ -1547,7 +1558,7 @@ jobs:
       # LOWERING windows-2025 TO 8 HAS A COST, AND IT IS TAKEN ON PURPOSE. At 9 the gate reds above
       # 6:55; at 8 it reds above 6:09, 14 percent over the worst pooled run of 5:24. In that pool the
       # rule left windows-2022 10 percent (4:37 over 4:11) and ubuntu 20 percent (3:51 over 3:13), so 8
-      # put windows-2025 between them. The third re-derivation's figures supersede these. The rule keeps the ruler close to the work, so the gate speaks when
+      # put windows-2025 between them. The fourth re-derivation's figures supersede these. The rule keeps the ruler close to the work, so the gate speaks when
       # the suite grows. Holding 9 would keep a cap that no run in this pool supports, which is the
       # "bound derived from another bound" #344 closed. If windows-2025 starts ejecting merge groups
       # at 8, re-measure; do not restore 9 by hand.
@@ -1590,8 +1601,9 @@ jobs:
       # THE THIRD RE-DERIVATION, BY OWNER REQUEST 2026-09-30. The gate went red on windows-2022 with the
       # suite green on at least PRs 1810, 1829, 1833, 1836 and 1848 -- PR 1848 read 5:10 of a 6:00 cap,
       # 1.162x. The owner asked for a re-measured pool, never a hand-raised cap or a weaker gate. Same
-      # instrument and filter as the second. The pool's definition, n, min and median live ONCE, in the
-      # three web console rows of scripts/ci/step_margin_baseline.toml. The sizing input:
+      # instrument and filter as the second. The pool's definition, n, min and median live ONCE, in
+      # scripts/ci/step_margin_baseline.toml, which kept them in a comment when the fourth
+      # re-derivation replaced those rows. The sizing input:
       #
       #   leg             worst passing   x 1.35   cap
       #   ubuntu-latest   4:15            5:44     6   was 5
@@ -1617,6 +1629,42 @@ jobs:
       # percent over each leg's worst pooled run. When the next red comes, re-measure again. The
       # growth lever named above is splitting `test_webui.py`, not more workers.
       #
+      # THE FOURTH RE-DERIVATION, the web console step-margin gate re-measure of 2026-10-07. The
+      # prediction above came true within a week. Merge-group run 37567098557 reddened ubuntu at 4:41
+      # of its 6:00 cap with 907 passed and 3 skipped, and the queue ejected the group; a merge-group
+      # run for PR 2081 on 2026-10-06 reddened windows-2025 at 379.1s against its 369.2s red line, all
+      # tests passing. Same instrument, filter and rule as the third. The pool's definition, n, min and
+      # median live ONCE, in the three web console rows of scripts/ci/step_margin_baseline.toml. The
+      # sizing input:
+      #
+      #   leg             worst passing   x 1.35   cap
+      #   ubuntu-latest   4:41            6:19     7    was 6
+      #   windows-2022    5:50            7:53     8    unchanged
+      #   windows-2025    8:29            11:27    12   was 8
+      #
+      # The kills moved with the caps, to 10 and 16, so each stays at least 1.30x its cap. The job caps
+      # moved with the kills; the nesting table above carries both sums.
+      #
+      # windows-2025's 12 RESTS ON ONE RUN, AND THAT RUN IS RUNNER TIME, NOT SUITE TIME. The row's
+      # `source` names it and records the evidence: a 4:26 stretch with no test completing on any
+      # worker, and the same tree re-run on the same leg in 4:06. The row's next worst, 7:08, would
+      # size the leg at 10. It is kept for the reason the
+      # 2026-09-13 note above sized windows-2025 at 9: the gate reds a green suite whatever slowed it,
+      # so a cap that the observed variance on identical content does not clear ejects healthy pull
+      # requests. Excluding a run from the pool is a change to the sizing rule, which this re-measure
+      # did not make.
+      #
+      # AT THESE CAPS the gate reds at 5:24 or longer on ubuntu, 6:10 or longer on windows-2022 and 9:14
+      # or longer on windows-2025 -- 15, 5.5 and 9 percent over each leg's worst pooled run. windows-2022
+      # is the leg to watch: its cap did not move, and its three worst runs sit within four seconds of
+      # each other.
+      #
+      # THE STEP IS STILL GETTING SLOWER, AND MORE SLOWLY THAN BEFORE. Daily medians rose 3:35 -> 4:05
+      # on ubuntu, 4:24 -> 4:52 on windows-2022 and 4:46 -> 5:22 on windows-2025 from 2026-09-30 to
+      # 2026-10-07, about 12 percent. Test functions rose 725 -> 774, 7 percent, over main in the same
+      # window, and in `test_webui.py` 311 -> 330. The growth lever is still splitting the largest
+      # bucket under `--dist loadfile`, not more workers or a larger cap.
+      #
       # THE CONSOLE SUITE HAS ITS OWN TIMING-SENSITIVE TESTS, and contention is the cost this change
       # pays rather than one it avoids. `test_webui.py`'s TOTP helper mints a code only when 3s of the
       # 30s step remain, and `[auth].totp_skew_steps` defaults to 0. Its bucket does not contend with
@@ -1634,7 +1682,7 @@ jobs:
       #
       # WHAT IT DOES NOT BUY, SO NOBODY RELIES ON IT FOR MORE. The lead time is set by the sizing rule,
       # not the annotation: ceil_minute(1.35x) against a 1.30x floor puts the red line under a tenth
-      # over the row; "THE THIRD RE-DERIVATION" note above gives each leg's. A pull_request run shows
+      # over the row; "THE FOURTH RE-DERIVATION" note above gives each leg's. A pull_request run shows
       # the annotation first only when one pull request's growth crosses the row. Growth that crosses
       # it only when several queued pull requests combine is first annotated on a merge-group run,
       # which may land or, past the red line, eject them. Widening that band means changing the
@@ -1725,9 +1773,9 @@ jobs:
     # These are DEADLOCK BACKSTOPS, not tightness gates -- the same reasoning the engine matrix records
     # for its own 66/55. Sizing a cap close to the observed run buys no detection and costs red builds
     # on green suites, and a gate that cries wolf gets deleted. The engine Windows legs carry 66/55 for
-    # a bigger suite; 40/30 was proportionate here and well clear at -n 4. It is 45/35 now, and the
-    # paragraphs below are why -- that sentence about sizing a cap close to the observed run is the
-    # rule that moved it, applied to its own tier.
+    # a bigger suite; 40/30 was proportionate here and well clear at -n 4. It went to 45/35, and is
+    # 60/48 now; the paragraphs below are why -- that sentence about sizing a cap close to the observed
+    # run is the rule that moved it, applied to its own tier.
     #
     # RE-DERIVED FOR THE WINDOWS LEG'S -n 3 EXPERIMENT (BACKLOG #1109, against #1304), because the
     # trigger at the bottom of this note fires on its own change. The paragraphs above are the caps'
@@ -1834,6 +1882,67 @@ jobs:
     # BACKLOG #1109's call on #1109's evidence, not a side effect of the #1304 fix. Left running so
     # the reverting change reads a tier whose #1304 noise has been removed.
     #
+    # THE 29-MINUTE TRIGGER BELOW FIRED FOR A WEEK AND NOTHING READ IT, so the caps are re-derived
+    # again, 2026-10-07, after PR 2112's windows-2025 leg was killed AT the 35-minute step cap with
+    # pytest itself green: `5681 passed ... in 2095.07s (0:34:55)`, printed 0.6s before the kill (run
+    # 37565565121, job 112612644223). Pool: every ci.yml run created 2026-09-30T19:25:00Z to
+    # 2026-10-07T04:29:59Z UTC with event merge_group, pull_request, push or workflow_dispatch, each
+    # event listed on its own: 1275 runs. This job runs on the last three; the merge_group runs were
+    # listed and contribute no rows, and `schedule` was not listed. Jobs fetched with ?filter=all; a
+    # row is this job's `Harness tests (pytest)` STEP, keyed on THAT STEP's own conclusion, duration =
+    # its completed_at minus started_at, re-run copies with identical stamps dropped.
+    #
+    #   leg             green n   median   p90     p95     max     step failures
+    #   ubuntu-latest   649       17:48    19:00   19:17   20:29   17, longest 19:13
+    #   windows-2025    564       31:38    33:49   34:12   35:00   18, 10 of them killed at the cap
+    #
+    # 401 of the 564 windows-2025 greens sit above 29 minutes, the earliest in the pool's first hour.
+    # Ten runs were killed AT the cap, at 35:01 to 35:08: seven pull_request and three push, seven of
+    # them on 2026-10-06 alone. Only PR 2112's kill log was read; the other nine are counted, not
+    # attributed. Daily medians on that leg rose 30:52 -> 33:29 across the pool.
+    #
+    # SO THE WINDOWS MAXIMUM IS RIGHT-CENSORED, the same trap scripts/ci/step_margin.py records as its
+    # trap 3: 35:00 is the largest green that FIT under the 35-minute kill, and the runs that wanted
+    # longer were killed and left the green sample. It is a LOWER BOUND on the worst green.
+    #
+    # THE STEP CAP IS 48 = ceil_minute(1.35x 35:08), the largest killed step, which is the same 48 that
+    # 1.35x the censored 35:00 gives. This tier's earlier derivation fixed no multiple -- its 19
+    # percent was a by-product of the -n 3 bound -- so this one takes the rule the engine and web
+    # console caps in this file are sized by (#131's 1.35, `step_margin.sized_cap_minutes`). Sized on
+    # a lower bound, it is itself a lower bound on what the leg needs, which is why the trigger below
+    # also asks for a re-measure on time rather than only on a breach. The JOB cap is 60, and both
+    # legs share both literals, so the nesting sum is taken per leg. Its setup term is THIS job's own,
+    # read from the same pool: `Set up job` start to `Harness tests (pytest)` start, which covers the
+    # full-history checkout, Python, apt, uv and install, at most 5:06 on ubuntu (run 37383773400) and
+    # 3:13 on windows-2025 (run 36882874932). The 4:30 provisioning pad is the one the web console
+    # nesting table carries, for the same reason:
+    #
+    #   ubuntu-latest   setup 5:06, pad 4:30, step cap 48:00: 57:36 of 60:00, slack 2:24
+    #   windows-2025    setup 3:13, pad 4:30, step cap 48:00: 55:43 of 60:00, slack 4:17
+    #
+    # On ubuntu the pad is what absorbs the apt step running to its own 8-minute bound: 8:00 plus the
+    # rest of that setup is still under the 9:36 budgeted. Spelled differently from the web console
+    # table on purpose, because tests/test_ci_step_margin.py parses that table's row shape across this
+    # whole file and refuses a second row for one leg. The slack is also what the `if: always()`
+    # receipt and junit-upload steps after a killed step run in. The earlier 7 + 35 = 42 under 45 sum
+    # counted the windows setup only. Both caps are deadlock backstops, as above. The ubuntu leg, at a
+    # 20:29 worst, shares the literals and is not what sized them; a per-leg expression would keep its
+    # backstop nearer its own data, and is a separate change from this re-measure.
+    #
+    # NO SINGLE TEST IS THE CAUSE, which is the question to ask before raising a cap. The killed run's
+    # own `--durations=40` list tops out at 90.42s (test_session_mail.py's claim-verdict test) on a
+    # 35-minute step, and the tier executed 5681 tests against 3209 in the 2026-09-16 run read above:
+    # this is growth across the tier, not one slow test. The lever that is not a cap is the windows-2025
+    # worker count, which the -n 3 paragraphs above leave to BACKLOG #1109; this re-derivation does not
+    # touch it.
+    #
+    # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 36:55 -- the 48-minute cap
+    # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates, which do not
+    # include this one, so nothing reads this trigger for you -- or if TOOLING_WORKERS changes, and
+    # re-measure in any case once about a week of runs exists under the 48-minute kill, because the
+    # pool above could not see past 35:00. THE PARAGRAPH BELOW IS THE TRIGGER THIS REPLACES, kept as its
+    # record:
+    #
     # RE-DERIVE IF a GREEN Windows run of this tier is ever observed above 29 minutes at whatever worker
     # count it is actually running, or if TOOLING_WORKERS changes. 29, not the old 25, and the reason is
     # not that 25 was wrong: every one of the six -n 4 rows above is UNDER it, the worst by 44 seconds.
@@ -1843,7 +1952,7 @@ jobs:
     # or it stops meaning anything.
     # `pytest_workers` is NOT this tier's knob and never was -- see the TOOLING_WORKERS note on the
     # step below.
-    timeout-minutes: 45
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -1955,7 +2064,7 @@ jobs:
       # carry. It was deliberately not ported blind: it is a behaviour change whose zero cost was
       # measured on the engine tier's history and on no sample from this one. See BACKLOG #1304.
       - name: Harness tests (pytest)
-        timeout-minutes: 35 # see the job cap above for the derivation; must stay under it with setup
+        timeout-minutes: 48 # see the job cap above for the derivation; must stay under it with setup
         env:
           # Same reason as the apt step above: collection imports the Qt modules whether or not this
           # job executes them, and the shipped ones construct QApplication at import on some paths.
@@ -2270,15 +2379,15 @@ jobs:
           # different worst cases for the same leg 650 lines apart. A second copy is what a checked
           # copy exists to replace, so this one is a pointer now.
           #
-          # 20 clears it on every leg; the table states each leg's slack, and the tightest is small since
-          # the third re-derivation. It is a DEADLOCK BACKSTOP, not a tightness gate: the drift detector
-          # is the margin check against `webconsole_margin_cap`, so sizing this close to the observed
-          # run would buy no detection and cost false reds on green suites. That knob is the gate's
-          # ruler and `webconsole_step_timeout` is only the wall -- this sentence named the wall until
-          # they were split.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":6,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          # Each leg's value clears it; the table states each leg's slack, and the tightest is small since
+          # the third re-derivation. The values differ by leg since the fourth, which moved two kills. It
+          # is a DEADLOCK BACKSTOP, not a tightness gate: the drift detector is the margin check against
+          # `webconsole_margin_cap`, so sizing this close to the observed run would buy no detection and
+          # cost false reds on green suites. That knob is the gate's ruler and `webconsole_step_timeout`
+          # is only the wall -- this sentence named the wall until they were split.
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":7,"webconsole_step_timeout":10,"webconsole_job_timeout":21,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":8,"webconsole_step_timeout":11,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":8,"webconsole_step_timeout":12,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":12,"webconsole_step_timeout":16,"webconsole_job_timeout":24,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
