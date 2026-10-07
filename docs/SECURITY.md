@@ -4595,13 +4595,14 @@ break. The walk reports a break only when it finishes, so a break it had already
 The cause's class on the `FAIL` line is a hint, not a diagnosis: a refused row can also surface as
 a connection error. The open reads some of the chain's rows too, such as row 1 and the newest row.
 A driver, connection or decode error raised during those reads gets the same line and exits 1. So
-a lock or an outage at that moment also exits 1. The store marks those errors; the split is by
-where the error arose, not by its class. A driver or connection error raised anywhere else in
-the open is "could not start", exit 2. That covers at least a refused connection, a failed login
-and an unreadable path. A table, column or grant the read needs that is missing exits 2 too: it
-says the store does not match this build, not anything about a row. A failed close of the store never changes the exit code; it prints a warning
-naming the error's class. A server driver's error text is shown only through the same PHI
-redaction as the log.
+a lock or an outage at that moment also exits 1. The store marks those errors, so the split is
+by where the error arose. A driver or connection error raised anywhere else in the open is
+"could not start", exit 2. That covers at least a refused connection, a failed login
+and an unreadable path. One exception holds wherever it arises: a table, column or grant the
+read needs that is missing exits 2. It says the store does not match this build, not anything
+about a row. A failed close of the store never changes the exit code; it prints a warning
+naming the error's class. A server driver's error is shown as its class and SQLSTATE only,
+never its text, because a server message can quote a stored value.
 
 At least one older case also exits 2 and is not a finding about the chain. An audit log emptied
 out of band, verified in a shell that holds no key and whose settings require one, exits 2: the

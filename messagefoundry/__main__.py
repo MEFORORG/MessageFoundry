@@ -91,7 +91,7 @@ if TYPE_CHECKING:
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
-    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.settings import ServiceSettings, StoreSettings
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
@@ -7864,15 +7864,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         except walk_errors as exc:
             raise stopped(exc) from exc
         finally:
-            # Quietly, by class: a close that fails must not replace the verdict or the FAIL line
-            # above with a store-open error (vault BACKLOG #3054, item 10).
-            try:
-                await store.close()
-            except Exception as closing:
-                print(
-                    f"warning: closing the store failed ({type(closing).__name__})",
-                    file=sys.stderr,
-                )
+            await _close_store_quietly(store)
 
     try:
         verdict = run_guarded(run())
@@ -7902,13 +7894,9 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; a server backend's open lands here, so both guards stay live. Only an error
         # the open raised outside its read of the chain's rows: see the split in `run`.
-        # A server backend has no file: name it as the store names itself, server/database.
-        where = (
-            settings.store.path
-            if settings.store.backend == StoreBackend.SQLITE
-            else f"{settings.store.server}/{settings.store.database}"
+        return _emit_store_open_error(
+            cast(Exception, exc.__cause__), _store_label(settings.store), as_json=False
         )
-        return _emit_store_open_error(cast(Exception, exc.__cause__), where, as_json=False)
     ok, message = verdict
     if verdict.key_unavailable:
         if keyless_refusal is not None:
@@ -7967,7 +7955,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         )
         return 5
     print("OK: " + (message or ""))
-    if verdict.rows:
+    if verdict.rows > 0:  # -1, a verdict that does not say, takes the empty-log branch
         return 0
 
     # An empty log on a real audit database is legitimate, and at a glance indistinguishable from
@@ -8000,6 +7988,7 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
+        audit_chain_read_errors,
         open_store,
     )
 
@@ -8046,7 +8035,7 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         try:
             return await store.audit_anchor()
         finally:
-            await store.close()
+            await _close_store_quietly(store)
 
     try:
         count, head = run_guarded(run())
@@ -8057,8 +8046,10 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     ) as exc:  # #1916, #1780, #2725, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
-    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    except audit_chain_read_errors() as exc:  # #1670: not a database; #3054: no server
+        # This command has no FAIL verdict, so every driver, connection or row-read error is
+        # "could not start", exit 2. It reached the floor's exit 1 on a server backend.
+        return _emit_store_open_error(exc, _store_label(settings.store), as_json=args.json)
     anchor = f"{count}:{head}"
     if args.json:
         _print_json({"count": count, "head": head, "anchor": anchor}, compact=True)
@@ -9510,6 +9501,25 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
         raise _StoreKeyUnresolved(str(exc)) from exc
 
 
+async def _close_store_quietly(store: Store) -> None:
+    """Close ``store`` after ``audit-verify`` or ``audit-anchor`` has its result. A close that fails
+    prints a warning naming its class, and never replaces that result (vault BACKLOG #3054)."""
+    try:
+        await store.close()
+    except Exception as exc:
+        print(f"warning: closing the store failed ({type(exc).__name__})", file=sys.stderr)
+
+
+def _store_label(settings: StoreSettings) -> str:
+    """How a could-not-start line names the store: its path, or for a server backend, which has
+    no file, ``server/database`` as the store names itself."""
+    from messagefoundry.config.settings import StoreBackend
+
+    if settings.backend == StoreBackend.SQLITE:
+        return settings.path
+    return f"{settings.server}/{settings.database}"
+
+
 class _StoreUnreachable(RuntimeError):
     """A driver or connection error ``audit-verify``'s open raised outside its read of the chain's
     rows: "could not start", exit 2 (vault BACKLOG #3054, item 10). The error is its cause."""
@@ -9543,16 +9553,22 @@ def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
 
     A ROW'S TEXT IS CUT FROM THE MESSAGE. SQLite's decode error quotes the column's bytes, "Could
     not decode to UTF-8 column 'detail' with text '...'", and those bytes are a row's content, which
-    a job keeps in its log (vault BACKLOG #3054, item 10). The column name stays. Any other driver's
-    error, a server backend's, goes through ``safe_exc``, the PHI redaction every log line gets: its
-    text is not this command's to vouch for.
+    a job keeps in its log (vault BACKLOG #3054, item 10). The column name stays. A server driver's
+    error renders as its class and SQLSTATE only, never its text: a server message can quote a
+    stored value, such as SQL Server's "The duplicate key value is (...)", and ``safe_exc``'s
+    pattern redaction keeps that (measured in BACKLOG #1661). Anything else, a refused connection
+    among them, carries no row value by construction and goes through ``safe_exc``.
     """
     import re
 
     from messagefoundry.redaction import safe_exc
+    from messagefoundry.store.base import driver_sqlstate
 
+    state = driver_sqlstate(exc)
     if isinstance(exc, sqlite3.DatabaseError):
         shown = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
+    elif state is not None:
+        shown = f"{type(exc).__name__} [SQLSTATE {state}]"
     else:
         shown = safe_exc(exc)
     message = f"cannot open the store at {path}: {shown}"

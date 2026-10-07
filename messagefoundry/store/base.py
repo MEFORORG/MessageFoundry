@@ -3002,15 +3002,17 @@ def store_connect_errors() -> tuple[type[Exception], ...]:
     """What a store raises when it cannot reach its database, beyond :func:`store_driver_errors`
     (vault BACKLOG #3054, item 10). At least ``OSError``, which asyncpg raises for a refused
     connection, :class:`StoreAcquireTimeout`, a pool borrow that waited out a database that stopped
-    answering, and ``pyodbc.InterfaceError``, a failed login (SQLSTATE 28000). The pyodbc entry is
-    left out when it is not installed. Not pyodbc's ``Error`` root, which would take in a defect."""
+    answering, and pyodbc's ``Error`` root. pyodbc raises the root itself for every SQLSTATE it does
+    not map, such as a missing ODBC driver (01000) or a deadlock victim (40001), and its
+    ``InterfaceError`` for a failed login (28000). The pyodbc entry is left out when it is not
+    installed."""
     errors: list[type[Exception]] = [OSError, StoreAcquireTimeout]
     try:
         import pyodbc
     except ImportError:
         pass
     else:
-        errors.append(pyodbc.InterfaceError)
+        errors.append(pyodbc.Error)
     return tuple(errors)
 
 
@@ -3028,20 +3030,38 @@ def audit_chain_read_errors() -> tuple[type[Exception], ...]:
     return (*store_open_errors(), UnicodeError)
 
 
-def is_store_shape_error(exc: BaseException) -> bool:
-    """Whether ``exc`` says the store's tables, columns or grants are not what a read needs, and
-    not anything about a row: SQLite's schema-step error, or SQLSTATE class 42 from a server
-    driver (a missing table or column, or a permission denied). Row content cannot cause one."""
+def driver_sqlstate(exc: BaseException) -> str | None:
+    """The 5-character SQLSTATE a server driver's error carries, or ``None``: asyncpg's
+    ``sqlstate`` attribute, or pyodbc's first argument. A SQLite error carries none."""
     import sqlite3
 
+    state = getattr(exc, "sqlstate", None)
+    if state is None and not isinstance(exc, sqlite3.Error) and exc.args:
+        state = exc.args[0]
+    if isinstance(state, str) and len(state) == 5 and state.isalnum():
+        return state
+    return None
+
+
+#: SQLSTATEs that name a missing table or column, or a permission denied, and nothing else:
+#: Postgres 42P01, 42703 and 42501, ODBC 42S02 and 42S22. SQL Server reports a denied permission
+#: under the generic 42000, so that one counts only with its native error 229 or 230.
+_SHAPE_SQLSTATES = frozenset({"42P01", "42703", "42501", "42S02", "42S22"})
+
+
+def is_store_shape_error(exc: BaseException) -> bool:
+    """Whether ``exc`` says the store's tables, columns or grants are not what a read needs, and
+    not anything about a row: SQLite's schema-step error, or one of the SQLSTATEs above. Row content
+    cannot cause one. A broader class 42 would take in a lock timeout or a full log, which SQL
+    Server also reports as 42000."""
     from messagefoundry.store.schema_verify import is_schema_step_error
 
     if is_schema_step_error(exc):
         return True
-    state = getattr(exc, "sqlstate", None)  # asyncpg
-    if state is None and not isinstance(exc, sqlite3.Error) and exc.args:
-        state = exc.args[0]  # pyodbc: (sqlstate, message)
-    return isinstance(state, str) and state.startswith("42")
+    state = driver_sqlstate(exc)
+    if state in _SHAPE_SQLSTATES:
+        return True
+    return state == "42000" and any(f"({code})" in str(exc) for code in (229, 230))
 
 
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
@@ -3206,8 +3226,13 @@ async def _close_quietly(store: Store) -> None:
     try:
         await store.close()
     except Exception as exc:
-        # By class only: a driver's text is not this function's to vouch for (vault BACKLOG #3054).
-        log.warning("closing the store after a failed open also failed (%s)", type(exc).__name__)
+        # Class and SQLSTATE only: a driver's text is not this function's to vouch for (vault
+        # BACKLOG #3054), and those two are what a diagnosis needs.
+        log.warning(
+            "closing the store after a failed open also failed (%s, SQLSTATE %s)",
+            type(exc).__name__,
+            driver_sqlstate(exc),
+        )
 
 
 async def _open_backend(

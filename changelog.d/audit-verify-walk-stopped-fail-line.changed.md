@@ -5,8 +5,9 @@
   would have had nothing to read, or a code a planted row could pick. The line names the error's
   class and its cause's class, never its text. A store that cannot be reached at the open now
   exits 2 on every backend. That covers at least a refused connection and a failed login, which
-  on a server backend exited 1 at the last-resort handler. A server driver's error text goes through the
-  PHI redaction, and a failed close never changes the exit code. A store cipher the settings
+  on a server backend exited 1 at the last-resort handler. A server driver's error is shown as its class
+  and SQLSTATE, never its text, and a failed close never changes the exit code. `audit-anchor`
+  also exits 2 when its store cannot be reached. A store cipher the settings
   cannot build, a key that is not base64 of 32 bytes among them, now exits 2, could not start,
   from at least `audit-verify`, `audit-anchor`, `admin-unlock`, `admin-set-notify-email`,
   `admin-reset-totp`, `provision-admin` and `rotate-key`; it exited 1 at the last-resort handler.

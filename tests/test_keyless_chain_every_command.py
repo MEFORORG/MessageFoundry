@@ -794,17 +794,13 @@ class _InterfaceError(_PyodbcError):
 
 
 def _stand_in_drivers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every backend's driver and connection errors, whichever drivers this leg has installed."""
+    """The production lists, extended with stand-ins for the server drivers this leg may not have
+    installed, so a test exercises the real lists and not a copy of them."""
     from messagefoundry.store import base as store_base
 
-    monkeypatch.setattr(
-        store_base, "store_driver_errors", lambda: (sqlite3.DatabaseError, _ServerDriverError)
-    )
-    monkeypatch.setattr(
-        store_base,
-        "store_connect_errors",
-        lambda: (OSError, store_base.StoreAcquireTimeout, _PyodbcError),
-    )
+    drivers, connects = store_base.store_driver_errors(), store_base.store_connect_errors()
+    monkeypatch.setattr(store_base, "store_driver_errors", lambda: (*drivers, _ServerDriverError))
+    monkeypatch.setattr(store_base, "store_connect_errors", lambda: (*connects, _PyodbcError))
 
 
 _UNREACHABLE = [
@@ -970,8 +966,11 @@ def test_a_shape_error_reading_the_chain_is_not_tagged() -> None:
     asyncpg_like.sqlstate = "42P01"  # type: ignore[attr-defined]
     pyodbc_like = _ServerDriverError("42S22", "Invalid column name 'seq'.")
     lost = _ServerDriverError("08S01", "Communication link failure")
+    denied = _ServerDriverError("42000", "The SELECT permission was denied (229) (SQLExecDirectW)")
+    lock = _ServerDriverError("42000", "Lock request time out period exceeded. (1222)")
     assert is_store_shape_error(asyncpg_like) and is_store_shape_error(pyodbc_like)
-    assert not is_store_shape_error(lost)
+    assert is_store_shape_error(denied)
+    assert not is_store_shape_error(lost) and not is_store_shape_error(lock)
     assert not is_store_shape_error(sqlite3.OperationalError("42 is not a code"))
     with pytest.MonkeyPatch.context() as patch:
         _stand_in_drivers(patch)
@@ -1025,6 +1024,42 @@ def test_a_server_store_that_cannot_be_reached_is_named_by_server_and_database(
     assert "cannot open the store at db01/mefor: ConnectionRefusedError" in captured.err, (
         captured.err
     )
+
+
+def test_a_server_driver_error_with_a_sqlstate_prints_no_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A server message can quote a stored value, which ``safe_exc``'s patterns keep (BACKLOG
+    #1661 measured SQL Server's duplicate-key text). With a SQLSTATE, the line is the class and
+    the SQLSTATE only. The control shows the raw text holds the value."""
+    from messagefoundry.__main__ import _emit_store_open_error
+
+    exc = _ServerDriverError("23000", "The duplicate key value is (4242ROWMARKER).")
+    assert "ROWMARKER" in str(exc)  # the control
+    assert _emit_store_open_error(exc, "db01/mefor", as_json=False) == 2
+    err = capsys.readouterr().err
+    assert "_ServerDriverError [SQLSTATE 23000]" in err and "ROWMARKER" not in err, err
+
+
+def test_audit_anchor_exits_2_when_the_store_cannot_be_reached(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``audit-anchor`` has no FAIL verdict, so a refused connection is "could not start", exit 2,
+    as a JSON error under --json. It reached the floor's exit 1 on a server backend."""
+    from messagefoundry.store import base as store_base
+
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    _stand_in_drivers(monkeypatch)
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-anchor", "--db", str(db), "--json"])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert json.loads(captured.out)["error"].startswith(f"cannot open the store at {db}: ")
 
 
 def test_a_server_driver_error_at_the_open_is_redacted(

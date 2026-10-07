@@ -2574,7 +2574,7 @@ class AuditVerdict(tuple[bool, str | None]):
     It is set only with ``ok`` true. A caller whose settings require a key must not report it as a
     pass: ``audit-verify`` exits 5, "not checked", on it (vault BACKLOG #3054).
 
-    ``==`` and ``hash`` are the tuple's and ignore both flags; ``__reduce__`` keeps them through a
+    ``==`` and ``hash`` are the tuple's and ignore both flags and ``rows``; ``__reduce__`` keeps all three through a
     copy."""
 
     key_unavailable: bool
