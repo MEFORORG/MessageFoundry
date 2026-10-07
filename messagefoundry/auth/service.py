@@ -9102,13 +9102,22 @@ class AuthService:
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
         FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
-        token captured before the ceremony would be elevated in place on a first deployment."""
+        token captured before the ceremony would be elevated in place on a first deployment.
+
+        **So the login-to-MFA floor covers it too** (BACKLOG #2389): see
+        :meth:`_enrolment_too_early`. A confirm that would satisfy a pending session too soon after
+        sign-in is refused as a wrong code, before the code is checked, so no TOTP step is spent."""
+        arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
         secret = await self._store.get_totp_secret(identity.user_id)
         if not secret:
             raise ValueError("no enrollment in progress")
+        if await self._enrolment_too_early(
+            token, user, arrived_at, event="auth.mfa_failed", client=client
+        ):
+            return Elevation()
         # Verify the enrollment proof under the SAME configured clock-skew window as a login (BACKLOG
         # #187): default 0 = strict current-step only. Enrolling under the same window a login uses
         # avoids the trap of a skewed-clock authenticator that confirms enrollment yet then fails every
@@ -9347,6 +9356,7 @@ class AuthService:
         *,
         event: str,
         client: str | None,
+        phase: str | None = None,
     ) -> bool:
         """Whether a second factor arrived too soon after sign-in, auditing the refusal if so.
 
@@ -9358,22 +9368,64 @@ class AuthService:
         and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``.
 
         Called by :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, the legs that prove an
-        ENROLLED factor. The two enrollment legs, :meth:`confirm_mfa_enrollment` and
-        :meth:`finish_webauthn_registration`, also satisfy a pending session and are NOT floored:
-        they bind a new factor, a different flow, and flooring them is left open (BACKLOG #2301).
-        A new leg that proves an enrolled factor calls this."""
+        ENROLLED factor, and through :meth:`_enrolment_too_early` by the two enrolment legs,
+        :meth:`confirm_mfa_enrollment` and :meth:`finish_webauthn_registration`, which can also
+        satisfy a pending session (BACKLOG #2389). A new leg that can satisfy a pending session
+        calls one of the two."""
         floor = self._settings.mfa_verify_min_elapsed_seconds
         if floor <= 0 or session.mfa_verified_at is not None:
             return False
         if now - session.created_at >= floor:
             return False
-        await self._audit(
-            event,
-            actor=user.username,
-            detail=_json({"reason": TOO_EARLY}),
-            client=client,
-        )
+        # An enrolment leg names its phase, as its own wrong-code row does, so an investigator can
+        # tell someone binding a NEW authenticator from someone proving an enrolled one.
+        detail = {"reason": TOO_EARLY} if phase is None else {"reason": TOO_EARLY, "phase": phase}
+        await self._audit(event, actor=user.username, detail=_json(detail), client=client)
         return True
+
+    async def _enrolment_too_early(
+        self,
+        token: str,
+        user: UserRecord,
+        now: float,
+        *,
+        event: str,
+        client: str | None,
+    ) -> bool:
+        """Whether an enrolment leg would satisfy a PENDING session too soon after sign-in
+        (BACKLOG #2389), auditing the refusal if so, with ``phase=enroll``.
+
+        An enrolment stamps the session MFA-verified, so on a session that still owes its factor it
+        completes the same login-then-MFA pair :meth:`_second_factor_too_early` floors on the verify
+        legs. Unlike a verify leg, an enrolment can also run on a session that carries no stamp yet
+        owes NO factor. A Kerberos session always mints unstamped, and with ``[security].require_mfa``
+        off it owes nothing while its account has no factor. A local session reaches the same state
+        only when its roles or the settings change after it was minted, since a local sign-in that
+        owes nothing mints stamped. Such a session already passes every gate that reads
+        :meth:`mfa_satisfied`, so a fast enrolment on it gains nothing the floor exists to stop, and
+        the floor is skipped, as the floor's own rule skips a stamped session. "Owes a factor" is
+        :meth:`_unverified_session_owes_factor`, the one rule the access gate reads.
+
+        The cheap checks run first, so an enrolment that comes after the floor pays one session read,
+        and one on a site with the floor at ``0`` pays none. A missing or revoked session is not
+        refused here: the leg then fails the way it always did. The caller answers a refusal with
+        its ordinary failure and the service charges nothing. Under the default
+        ``[auth].require_action_step_up``, the route in front of ``POST /me/mfa/confirm`` has
+        already spent its single-use password step-up, exactly as it has for a wrong code, so a
+        refusal there costs the person one password re-proof."""
+        floor = self._settings.mfa_verify_min_elapsed_seconds
+        if floor <= 0:
+            return False
+        session = await self._store.get_session(hash_token(token))
+        if session is None or session.revoked_at is not None or session.mfa_verified_at is not None:
+            return False
+        if now - session.created_at >= floor:
+            return False
+        if not await self._unverified_session_owes_factor(user):
+            return False
+        return await self._second_factor_too_early(
+            session, user, now, event=event, client=client, phase="enroll"
+        )
 
     async def _mfa_lapsed(
         self,
@@ -9829,13 +9881,31 @@ class AuthService:
 
         The other first-enrolment promotion leg. For a passkey-only account this and
         :meth:`finish_webauthn_assertion` are the ONLY ways a session becomes MFA-satisfied, so a
-        7.2.4 build that rotated the TOTP legs alone would miss the passkey path entirely."""
+        7.2.4 build that rotated the TOTP legs alone would miss the passkey path entirely.
+
+        **So the login-to-MFA floor covers it too** (BACKLOG #2389): see
+        :meth:`_enrolment_too_early`. A registration that would satisfy a pending session too soon
+        after sign-in fails as a failed verification, before the challenge is popped, so the
+        ceremony stays in flight."""
+        arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
         label = label.strip()
         if not label or len(label) > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")
+        # No staged ceremony is answered BEFORE the floor, as confirm_mfa_enrollment answers "no
+        # enrollment in progress" before it: otherwise the same request would get "verification
+        # failed" inside the floor and "ceremony expired" outside it, which tells timing. A peek,
+        # so a floor refusal still leaves the ceremony in flight.
+        staged = self._webauthn_challenges.peek((hash_token(token), "register"))
+        if staged is None or staged.user_id != user.id:
+            self._webauthn_challenges.pop((hash_token(token), "register"))
+            raise ValueError(self._CEREMONY_EXPIRED)
+        if await self._enrolment_too_early(
+            token, user, arrived_at, event="auth.webauthn_failed", client=client
+        ):
+            return Elevation()
         pending = self._webauthn_challenges.pop((hash_token(token), "register"))
         if pending is None or pending.user_id != user.id:
             raise ValueError(self._CEREMONY_EXPIRED)

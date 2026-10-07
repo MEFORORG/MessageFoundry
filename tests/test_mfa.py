@@ -7,6 +7,10 @@ gate, the ``require_mfa`` administrator enforcement, recovery-code single-use, a
 disable/admin-reset — on a **local and a directory** account alike. The AD/Kerberos delegation
 guarantee this file used to pin is retired (BACKLOG #1144): a directory sign-in no longer clears the
 engine's MFA gates on an assertion the engine never receives.
+
+A test that enrols on the session it has just signed in sets ``mfa_verify_min_elapsed_seconds=0``.
+The login-to-MFA floor covers that enrolment (BACKLOG #2389), and these tests are not about the
+floor; ``tests/test_second_step_time_floors.py`` is.
 """
 
 from __future__ import annotations
@@ -65,7 +69,9 @@ async def test_enroll_confirm_status_and_recovery_codes() -> None:
     store = await _store()
     try:
         notifier = _FakeNotifier()
-        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0), security_notifier=notifier
+        )
         identity, token, _ = await login_admin(service)
 
         enroll = await service.begin_mfa_enrollment(identity)
@@ -135,7 +141,9 @@ async def test_enrollment_consumes_the_activating_step(monkeypatch: pytest.Monke
     # spent S0, not because the code went stale at a boundary.
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(mfa_recovery_code_count=1))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1)
+        )
         identity, _token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
 
@@ -898,7 +906,9 @@ async def test_disable_mfa_REFUSES_stripping_the_last_factor_when_mfa_is_require
     """
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())  # require_mfa defaults True
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0)
+        )  # require_mfa defaults True
         identity = await _enrol_totp(service, monkeypatch)
         with pytest.raises(ValueError) as exc:
             await service.disable_mfa(identity)
@@ -936,7 +946,9 @@ async def test_the_ADMIN_recovery_path_is_not_narrowed_by_the_guard(
     """
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())  # require_mfa defaults True
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0)
+        )  # require_mfa defaults True
         identity = await _enrol_totp(service, monkeypatch)
         await service.admin_reset_mfa(identity.user_id, actor="another-admin")
         assert (await service.mfa_status(identity)).enabled is False
@@ -1092,7 +1104,7 @@ async def test_the_totp_secret_is_returned_once_and_never_again() -> None:
     """
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
         identity, token, _ = await login_admin(service)
 
         staged = await service.begin_mfa_enrollment(identity)
@@ -2053,7 +2065,9 @@ async def test_a_session_revoked_mid_enrolment_leaves_mfa_off_and_retryable(
     store = await _store()
     try:
         notifier = _FakeNotifier()
-        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0), security_notifier=notifier
+        )
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         t0 = 1_000_000.0
@@ -2397,7 +2411,7 @@ async def test_a_session_revoked_after_rotation_still_delivers_the_codes(
     """
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
         identity, token, _ = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
 
@@ -2435,7 +2449,9 @@ async def test_a_reset_between_rotation_and_enable_leaves_mfa_off_with_no_null_s
     store = await _store()
     try:
         notifier = _FakeNotifier()
-        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0), security_notifier=notifier
+        )
         identity, token, _ = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
 
@@ -2482,7 +2498,7 @@ async def test_the_real_admin_reset_inside_the_window_leaves_mfa_off(
     rotation and the enable still leaves TOTP on over a NULL secret (BACKLOG #2224)."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
         identity, token, _ = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
 
@@ -2519,7 +2535,7 @@ async def test_a_second_confirm_that_enabled_first_keeps_the_winners_codes(
     """
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
         identity, token, _ = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
 
@@ -2609,7 +2625,9 @@ async def test_the_walk_from_creation_to_a_chosen_password_never_leaves_the_hold
 
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())  # require_mfa on, the shipped default
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0)
+        )  # require_mfa on, the shipped default
         user_id, issued = await _created_holder(service)
         assert _way_past(await store.get_user(user_id))
 
@@ -2704,7 +2722,7 @@ async def test_a_factor_reset_racing_the_rotation_refuses_the_rotation(
 
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
         user_id, issued = await _created_holder(service)
         out = await service.login("holder", issued)
         assert out.identity is not None and out.token is not None
@@ -2746,7 +2764,12 @@ async def test_admin_reset_mfa_issues_a_credential_before_it_clears_any_factor(
     store = await _store()
     try:
         threshold = 3
-        service = AuthService(store, AuthSettings(lockout_threshold=threshold, lockout_minutes=15))
+        service = AuthService(
+            store,
+            AuthSettings(
+                mfa_verify_min_elapsed_seconds=0, lockout_threshold=threshold, lockout_minutes=15
+            ),
+        )
         identity = await _enrol_totp(service, monkeypatch)
         order: list[str] = []
         real_set_password = store.set_password
@@ -2791,7 +2814,7 @@ async def test_disable_mfa_refuses_removing_totp_while_covered_even_beside_a_pas
     covered account keeps its TOTP however many passkeys it holds."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
         identity = await _enrol_totp(service, monkeypatch)
         await store.add_webauthn_credential(
             WebAuthnCredential(
@@ -2863,7 +2886,7 @@ async def test_the_census_names_an_enabled_totp_secret_the_engine_cannot_decrypt
 
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
         identity = await _enrol_totp(service, monkeypatch)
         assert (await service.lockable_account_census()).clean
         real = store.get_totp_secret
@@ -2887,7 +2910,7 @@ async def test_the_census_names_nothing_on_a_store_built_through_the_new_paths(
     """Every account made and claimed through the shipped paths is generated or holds TOTP."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
         user_id, issued = await _created_holder(service)
         out = await service.login("holder", issued)
         assert out.identity is not None and out.token is not None
@@ -2936,7 +2959,9 @@ async def test_the_mfa_enabled_notice_to_a_must_change_account_says_who_to_tell(
     store = await _store()
     try:
         notifier = _FakeNotifier()
-        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0), security_notifier=notifier
+        )
         _user_id, issued = await _created_holder(service)
         out = await service.login("holder", issued)
         assert out.identity is not None and out.token is not None
@@ -2970,7 +2995,9 @@ async def test_a_rotation_landing_between_the_resets_writes_cannot_leave_a_chose
     store = await _store()
     try:
         notifier = _FakeNotifier()
-        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0), security_notifier=notifier
+        )
         identity = await _enrol_totp(service, monkeypatch)
         real_disable = store.disable_totp
 
