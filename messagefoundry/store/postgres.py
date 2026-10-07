@@ -7598,8 +7598,7 @@ class PostgresStore:
             " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
             " inflight_bytes ="
             " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
-            " since = CASE WHEN upload_quota.since <= $5 OR upload_quota.inflight_files <= 0"
-            " THEN $4 ELSE upload_quota.since END"
+            " since = $4"  # every applied reserve refreshes it (BACKLOG #2648)
             " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
             " ELSE upload_quota.inflight_files END) + $2 <= $6"
             " AND (CASE WHEN upload_quota.since <= $5 THEN 0"

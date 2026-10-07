@@ -11054,8 +11054,7 @@ class SqlServerStore:
                     " t.inflight_bytes ="
                     " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
                     " + s.size_bytes,"
-                    " t.since = CASE WHEN t.since <= s.stale_ts OR t.inflight_files <= 0"
-                    " THEN s.now_ts ELSE t.since END"
+                    " t.since = s.now_ts"  # every applied reserve refreshes it (BACKLOG #2648)
                     " WHEN NOT MATCHED THEN"
                     " INSERT (uploader_id, inflight_files, inflight_bytes, since)"
                     " VALUES (s.uploader_id, s.files, s.size_bytes, s.now_ts)"
