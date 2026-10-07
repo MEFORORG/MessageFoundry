@@ -37,7 +37,9 @@ __all__ = [
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
 # trail — a fingerprint produced by v1 can never collide with one produced by a later revision.
-_SCHEME = b"mefor-cfg-fp:v1\n"
+# v2: a dot-named ``*.py`` is no longer hashed, because the loader no longer runs one (vault BACKLOG
+# #2781).
+_SCHEME = b"mefor-cfg-fp:v2\n"
 
 #: The scheme tag :func:`config_fingerprint_detail` records beside each digest. Two digests are
 #: comparable only under one scheme: a start compares its own digest with the store's last recorded
@@ -46,11 +48,13 @@ _SCHEME = b"mefor-cfg-fp:v1\n"
 FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
 
 # Every file ``load_config`` consumes that defines the running graph's behaviour, transport config,
-# or reference data. Globs are relative to the config dir. NB: ``*.py`` deliberately covers
-# ``_``-prefixed helpers — the loader skips them as *top-level modules*, but a sibling can import
-# them, so they are just as much "what runs" (the same candidate set ADR 0036's guard scans).
+# or reference data. Globs are relative to the config dir. The config modules themselves are not a
+# glob here: they come from ``config.wiring.config_py_files``, the one rule the loader and ADR 0036's
+# guard also use. It covers ``_``-prefixed helpers -- the loader skips them as *top-level modules*,
+# but a sibling can import them, so they are just as much "what runs" -- and skips a dot-named
+# ``.IB_OLD.py`` or AppleDouble ``._X.py``, which the loader never runs. The globs below are
+# unchanged: the code-set loader reads a dot-named table file, so hashing one is still right.
 _FINGERPRINT_GLOBS: tuple[str, ...] = (
-    "*.py",
     "connections.toml",
     "codesets/*.csv",
     "codesets/*.toml",
@@ -66,22 +70,25 @@ def _iter_entries(base: Path) -> list[tuple[str, bytes]]:
     byte-identical bundles at different paths fingerprint identically. An unreadable file is
     skipped rather than crashing the audit it feeds.
     """
+    # Lazy: wiring is the loader, and this module stays importable without pulling it in at import time.
+    from messagefoundry.config.wiring import config_py_files
+
     seen: set[Path] = set()
     entries: list[tuple[str, bytes]] = []
-    for pattern in _FINGERPRINT_GLOBS:
-        for path in base.glob(pattern):
-            if not path.is_file():
-                continue
-            resolved = path.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            try:
-                data = path.read_bytes()
-            except OSError:
-                continue
-            rel = path.relative_to(base).as_posix()
-            entries.append((rel, hashlib.sha256(data).digest()))
+    globbed = (path for pattern in _FINGERPRINT_GLOBS for path in base.glob(pattern))
+    for path in [*config_py_files(base), *globbed]:
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        rel = path.relative_to(base).as_posix()
+        entries.append((rel, hashlib.sha256(data).digest()))
     entries.sort()
     return entries
 

@@ -77,9 +77,11 @@ from messagefoundry.cli_surface import (  # noqa: E402  # pure data, stdlib-only
 from messagefoundry.console_streams import harden_console_streams  # noqa: E402
 from messagefoundry.logging_setup import (  # noqa: E402
     LOG_LEVELS,
+    PRODUCTION_DEBUG_REFUSED,
     LogFile,
     SyslogForward,
     configure_logging,
+    level_refused_on_production,
     query_sntp_offset,
 )
 from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
@@ -643,6 +645,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     import_corepoint.add_argument(
         "--out", required=True, help="config directory to write the generated modules into"
+    )
+    import_corepoint.add_argument(
+        "--force",
+        action="store_true",
+        help="replace modules already in --out under the names this import writes (without it, an "
+        "existing module is refused and nothing is written)",
     )
     import_corepoint.add_argument("--json", action="store_true", help="emit a JSON import summary")
 
@@ -2221,16 +2229,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     # Gate #1: DEBUG logging can surface PHI (full message bodies / raw field values) into the general
     # log. Refuse it fail-closed on a production instance — real PHI flows there. A non-production
-    # instance may use DEBUG for diagnostics.
-    if production and settings.logging.level.upper() == "DEBUG":
-        print(
-            "error: DEBUG logging is refused on a production instance "
-            "([security].production_instance=true) — it can surface PHI (full message bodies / raw "
-            "field values) into logs. Use INFO or higher in production (set "
-            "[security].production_instance=false on a non-production instance for verbose "
-            "diagnostics).",
-            file=sys.stderr,
-        )
+    # instance may use DEBUG for diagnostics. The predicate is shared with the run-time setter behind
+    # PATCH /logging/level, so a production instance refused DEBUG here is refused it there too
+    # (vault BACKLOG #2777).
+    if level_refused_on_production(settings.logging.level, production=production):
+        print(f"error: {PRODUCTION_DEBUG_REFUSED}", file=sys.stderr)
         return 2
 
     # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
@@ -2476,6 +2479,7 @@ def _serve(args: argparse.Namespace) -> int:
         attested_hops=(),
         revocation_attested_hops=(),
         api=settings.api,
+        approvals=settings.approvals,
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
@@ -5021,11 +5025,12 @@ def _import(args: argparse.Namespace) -> int:
 
     Writes one ``@router``/``@handler`` module per channel into ``--out`` and reports the count-and-log
     summary (mapped vs. unmapped actions). The export is untrusted data — a malformed export is a clean
-    error + exit 1, never a traceback."""
+    error + exit 1, never a traceback. A module already in ``--out`` under a name this import writes
+    is refused (exit 1, naming each file, nothing written) unless ``--force`` is given."""
     from messagefoundry.corepoint_import import CorepointImportError, import_corepoint
 
     try:
-        result = import_corepoint(args.export, args.out)
+        result = import_corepoint(args.export, args.out, force=args.force)
     except (CorepointImportError, OSError, RecursionError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
@@ -5094,10 +5099,14 @@ def _init(args: argparse.Namespace) -> int:
 
 def _service(args: argparse.Namespace) -> int:
     """Control the engine's Windows service (ADR 0088). ``status`` queries state (no elevation);
-    ``start``/``stop`` elevate once via UAC; ``install`` runs scripts/service/install-service.ps1
-    elevated. The engine can't stop/start its *own* hosting service through the API, so this is a
-    local, out-of-band CLI over the Windows SCM. Off Windows the actions are no-ops (return 1) and
-    ``status`` prints ``unavailable``."""
+    ``start``/``stop`` elevate once via UAC and wait for the elevated ``net`` command; ``install``
+    runs scripts/service/install-service.ps1 elevated. The engine can't stop/start its *own* hosting
+    service through the API, so this is a local, out-of-band CLI over the Windows SCM. Off Windows
+    the actions are no-ops (return 1) and ``status`` prints ``unavailable``.
+
+    A declined UAC prompt or a failed elevation exits 1 with the reason on stderr, so a wrapper
+    script never reads a refused action as success (vault BACKLOG #2787). A service already in the
+    requested state exits 0, so ``stop`` and ``start`` are idempotent."""
     from messagefoundry import service as svc
 
     action = args.action
@@ -5121,28 +5130,56 @@ def _service(args: argparse.Namespace) -> int:
             )
             return 2
         try:
-            started = svc.install_service(str(script), args.env)
+            launched = svc.install_service(str(script), args.env)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        if not started:
+        if launched is svc.ServiceControlOutcome.DISPATCHED:
+            print(f"launched the elevated installer for environment {args.env!r}")
+            return 0
+        if launched is svc.ServiceControlOutcome.UNSUPPORTED:
             print("error: `service install` is Windows-only", file=sys.stderr)
-            return 1
-        print(f"launched the elevated installer for environment {args.env!r}")
+        else:
+            print(
+                "error: the elevated installer did not launch: the UAC prompt was declined or the "
+                "launch failed; nothing was installed",
+                file=sys.stderr,
+            )
+        return 1
+    # start / stop. Already in the requested state is success, not a failure: `net stop` of a stopped
+    # service exits non-zero, and an operator script or the uninstall path that stops first must not
+    # abort on it. Asked BEFORE elevating, so a no-op raises no UAC prompt, and again after a FAILED,
+    # for a service that reached the state while this ran.
+    wanted = "stopped" if action == "stop" else "running"
+    already = f"service {args.name!r} is already {wanted}; nothing to {action}"
+    if svc.service_state(args.name) == wanted:
+        print(already)
         return 0
-    # start / stop
     try:
-        started = svc.control_service(action, args.name)
+        outcome = svc.control_service_ex(action, args.name)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if not started:
+    if outcome is svc.ServiceControlOutcome.DISPATCHED:
+        print(f"elevated `net {action}` of service {args.name!r} completed")
+        return 0
+    if outcome is svc.ServiceControlOutcome.UNSUPPORTED:
         print(f"error: `service {action}` is Windows-only", file=sys.stderr)
-        return 1
-    print(
-        f"requested elevated `{action}` of service {args.name!r}; poll `service status` for state"
-    )
-    return 0
+    elif outcome is svc.ServiceControlOutcome.CANCELLED:
+        print(
+            f"error: the UAC prompt was declined; `service {action}` of {args.name!r} did not run",
+            file=sys.stderr,
+        )
+    elif svc.service_state(args.name) == wanted:
+        print(already)
+        return 0
+    else:
+        print(
+            f"error: `service {action}` of {args.name!r} failed: elevation failed, `net {action}` "
+            "exited non-zero, or it did not finish in time; check `service status`",
+            file=sys.stderr,
+        )
+    return 1
 
 
 def _gen_key(_args: argparse.Namespace) -> int:
@@ -8602,6 +8639,7 @@ def _security(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         AlertsSettings,
         ApiSettings,
+        ApprovalsSettings,
         AuthSettings,
         SecretRotationSettings,
         SecuritySettings,
@@ -8613,7 +8651,7 @@ def _security(args: argparse.Namespace) -> int:
     path = args.service_config
 
     # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # [secret_rotation]/[api]/[approvals] deviations (ADR 0148: one posture). Resolve those from the whole file so the
     # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
@@ -8626,6 +8664,8 @@ def _security(args: argparse.Namespace) -> int:
     # BACKLOG #1179: [api].plaintext_upstream_hop_acknowledged is a loosening too. Same read, same
     # degradation marker.
     _api = ApiSettings()
+    # BACKLOG #2489: [approvals] carries the dual-control dwell and expiry. Same read, same marker.
+    _approvals = ApprovalsSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -8635,6 +8675,7 @@ def _security(args: argparse.Namespace) -> int:
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
             _rotation = _full.secret_rotation
             _api = _full.api
+            _approvals = _full.approvals
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -8668,6 +8709,7 @@ def _security(args: argparse.Namespace) -> int:
                 attested_hops=(),
                 revocation_attested_hops=(),
                 api=_api,
+                approvals=_approvals,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
@@ -8694,7 +8736,8 @@ def _security(args: argparse.Namespace) -> int:
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]); the per-connection "
+            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]); the "
+            "per-connection "
             "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
             "generic-ODBC database TLS, "
             "tls_hop_attested and "

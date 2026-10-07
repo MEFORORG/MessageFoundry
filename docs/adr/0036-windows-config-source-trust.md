@@ -253,6 +253,26 @@ suite spawns does not inherit the stand-in, and gets both variables where it nee
 **Who decided.** The Manager seat, on 2026-10-01, under the owner's standing rule. The owner may
 overturn it.
 
+## Amendment D (2026-10-06, vault BACKLOG #2780): item 5's premise was false, and the finder is gone
+
+**What was wrong.** Decision item 5 rests SEC-019 on "no stdlib/installed top-level module is"
+`_`-prefixed. That is false. `sys.stdlib_module_names` holds 103 `_`-prefixed names on Python 3.14
+(`_csv`, `_json`, `_strptime`, `_decimal`, ...), and installed packages add more (`_cffi_backend`,
+`_pytest`). While `_SiblingHelperFinder` sat at `sys.meta_path[0]` for a load, a first import of such
+a name anywhere in the process, on any thread, would have resolved to a same-named file in the config
+dir.
+
+**What replaced it.** The finder is removed, not narrowed. `_HelperImporter` in
+[config/wiring.py](../../messagefoundry/config/wiring.py) is bound into each config module and each
+helper as that module's own `__import__`, so nothing outside config code sees the config dir. A helper
+is registered in `sys.modules` only under its path-derived name, never its plain one. An imported
+helper whose name is a standard library, already-imported or installed module is refused with a
+`WiringError` naming the file. Item 5's SEC-019 property still holds: `os.py` or `json.py` in the
+config dir cannot shadow the real module, because only `_`-prefixed helper files are served, and only
+to config modules.
+
+Item 5 is left as written, as the record of what was decided on its date.
+
 ## Alternatives considered
 
 - **Keep the documented-delegation status quo** (no-op + install-time ACL). Rejected: Windows is the

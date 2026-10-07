@@ -17,9 +17,11 @@ supplies them. These tests pin at least these properties:
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -357,6 +359,26 @@ async def test_the_suffixed_form_is_screened_and_covers_a_missing_class(
         assert service.policy.violations(issued.password) == []
     finally:
         await store.close()
+
+
+def test_the_generator_reads_every_require_field_as_a_class_rule() -> None:
+    """BACKLOG #2359, finding 2. The generator offers the suffixed candidate only when a class rule
+    is on, and it asks ``requires_character_class`` rather than naming four fields. RED when the
+    property is written out by hand: the subclass's fifth rule then reads as off."""
+    names = [f.name for f in dataclasses.fields(PasswordPolicy) if f.name.startswith("require_")]
+    assert len(names) >= 4, names
+    base = PasswordPolicy(check_breached=False)
+    assert base.requires_character_class is False
+    for name in names:
+        changes: dict[str, Any] = {name: True}
+        assert dataclasses.replace(base, **changes).requires_character_class, name
+
+    @dataclasses.dataclass(frozen=True)
+    class LaterPolicy(PasswordPolicy):
+        require_extra: bool = False
+
+    assert LaterPolicy(check_breached=False, require_extra=True).requires_character_class
+    assert LaterPolicy(check_breached=False).requires_character_class is False
 
 
 async def test_a_site_term_formed_across_the_suffix_is_screened(

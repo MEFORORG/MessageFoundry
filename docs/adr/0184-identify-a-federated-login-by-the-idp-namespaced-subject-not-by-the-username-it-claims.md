@@ -122,8 +122,22 @@
   **What still asks by name:** at least the reconciler, for an id-less row with no binding. The
   remedy for an id-less row is unchanged: make the directory return `objectGUID`, remove the row,
   and re-create it with `POST /users/directory` or one Windows SSO sign-in.
+- **Amendment 2026-10-06 (BACKLOG #2434). The 2026-09-29 sentence "What still asks by name: at least
+  the reconciler, for an id-less row with no binding" no longer describes the code; it is kept as the
+  record.** `reconcile_directory_sessions` reads an id-less row with no binding as a new outcome,
+  UNKEYED, without a lookup, so nothing here asks the directory about an id-less row by name. The
+  decision sits in the reconciler's candidate loop, not in `_probe_principal`, whose other caller,
+  the step-up check, already refuses such a row first. Why: a name probe could read another
+  account's entry and write that account's roles onto the row, and no sign-in or step-up admits an
+  id-less row, so a session it holds is anomalous. UNKEYED writes no roles and plans as ABSENT does:
+  it strikes, and revokes at the threshold as `directory_object_id_missing`. The build first read
+  such a row as UNDETERMINED, and review found that feeds the ADR 0195 hold: two such rows would
+  latch it and never be revoked, and one revoked row would forfeit a later hold alert's clear. A
+  bound id-less row is still skipped and audited, as the slice C remainder says.
+  Pinned by `test_a_row_with_no_immutable_id_is_never_probed_by_name` in
+  `tests/test_ad_session_reconcile.py`.
 - **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25; slice C built 2026-09-25;
-  its remainder built 2026-09-26; amended 2026-09-29)
+  its remainder built 2026-09-26; amended 2026-09-29 and 2026-10-06)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session
   mechanism field serves) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)

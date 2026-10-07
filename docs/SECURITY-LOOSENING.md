@@ -80,6 +80,7 @@ section reference.
 | | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — the second a loosening only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
 | | `[auth].max_sessions_per_user` | `5` (`0` or less means unlimited, and so is named, as is any cap above `5`) |
 | | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
+| | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
@@ -99,12 +100,13 @@ section reference.
 keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
+`[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
 `[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies` and
 `[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed here anyway, and all but `update_url_form` are reported, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
-`[store]`/`[auth]`/`[secret_rotation]`/`[api]` sections; the per-connection
+`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[api]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot). At least one per-connection row is not passed in
 yet: `update_url_form`, whose entry names the two records it does have.
@@ -755,6 +757,24 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Compensating controls:** keep `[auth].oidc_flow_ttl_seconds` short, and front the sign-in routes with
   a proxy limiter.
 - **Reversible:** yes, immediately — restore `512` (or delete the line) and restart.
+
+### `[approvals].min_dwell_seconds` below `2.0` s, or `expiry_hours` above `72` h — a held action is released sooner, or later
+> **Conditional** on `[approvals].enabled` with at least one operation in `[approvals].operations`
+> ([BACKLOG #2489](BACKLOG.md), ASVS 2.3.5 and 2.4.2). Dual control ships off, so turning it off is the
+> shipped posture and is not named. The dwell is a floor: a floor below `2.0` s is named as looser, and
+> `0` as off. The expiry is a ceiling: one above `72` h is named as looser, and `0`, which never
+> expires, as off. A longer dwell or a shorter expiry refuses more and is not named.
+- **What you lose:** the dwell refuses an approve that comes before a second approver could read the
+  held purge, replay or reload. Below the default, a second approver, or a script holding that
+  approver's session, may release it at machine speed. A longer expiry keeps a held action releasable
+  after what it acts on has changed. The approver must still be a distinct user holding
+  `approvals:approve`.
+- **When acceptable:** an automated test harness on a host no untrusted client can reach, for the dwell.
+  A site whose approvers are not on shift within three days, for the expiry.
+- **Compensating controls:** compare each `approval.approved` audit row's time with its
+  `approval.requested` row, since a looser floor writes no `approval.too_early` row. Review the open
+  approval queue, and reject a stale request rather than leave it pending.
+- **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[api].trusted_proxies` covering every address, such as `0.0.0.0/0` or `::/0` — every peer may set its own source address
 > **Not conditional on sign-in** ([BACKLOG #1131](BACKLOG.md)): a forged source address poisons the audit

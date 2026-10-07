@@ -43,7 +43,7 @@ from messagefoundry.config.reachability import (
     ReferenceIndex,
     build_reference_index,
 )
-from messagefoundry.config.wiring import Registry, WiringError
+from messagefoundry.config.wiring import Registry, WiringError, config_py_files
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 from messagefoundry.controlchars import has_control_char
 
@@ -401,7 +401,9 @@ def _scan_declaration_span(
     ``factories`` whose first positional arg is the string literal ``old``. Best-effort: an unparseable
     module is skipped; the first match wins (a loaded graph holds the name once). Returns ``(None, None)``
     when nothing matches — the definition simply isn't rewritten, exactly as before this branch existed."""
-    for path in sorted(config_dir.rglob("*.py")):
+    # The loader's own file rule: a dot-named backup of a module (vault BACKLOG #2781) or a file in a
+    # subdirectory is never run, so a declaration in one must not take the definition edit.
+    for path in config_py_files(config_dir):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, ValueError, MemoryError, RecursionError):

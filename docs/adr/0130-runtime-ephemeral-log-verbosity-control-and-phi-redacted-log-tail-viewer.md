@@ -1,6 +1,7 @@
 # ADR 0130 — Runtime (ephemeral) log-verbosity control + PHI-redacted log-tail viewer
 
 - **Status:** Accepted (2026-07-17) — DEMAND-GATE-BACKLOG Wave 3 build (lane `dg-s7b`); pushes/PR owner-approved.
+  Amended 2026-10-06: a production instance refuses DEBUG at run time (vault BACKLOG #2777; see the end).
 - **Built:** Yes — additive. `set_runtime_level` / `current_log_level` in
   [`logging_setup.py`](../../messagefoundry/logging_setup.py); three routes on
   [`api/app.py`](../../messagefoundry/api/app.py) — `GET`/`PATCH /logging/level` (gated by
@@ -34,7 +35,9 @@ with the same RBAC + audit rigor as a message view — not as free operational t
 
 ### §1 — The runtime level override is EPHEMERAL and resets only on PROCESS RESTART
 
-`set_runtime_level(level)` validates `level` against `LOG_LEVELS` (raising `ValueError` otherwise) and
+`set_runtime_level(level, *, production)` validates `level` against `LOG_LEVELS` (raising `ValueError`
+otherwise; since the 2026-10-06 amendment it also raises `LogLevelRefused` for a level the production
+tier refuses) and
 sets the level on the **root logger** and the three `_UVICORN_LOGGERS`, mirroring exactly what
 `configure_logging` sets — but it does **not** rebuild handlers (no new stream/forwarder, no filter
 churn). The override lives only in the live `logging` module state. It is therefore **ephemeral**:
@@ -48,8 +51,11 @@ churn). The override lives only in the live `logging` module state. It is theref
 
 `PATCH /logging/level` applies the override and writes a `logging_level_change` audit row (actor + old →
 new level); `GET /logging/level` reports the current effective level, the configured baseline, and the
-valid choices. The level knob is **not PHI** — it is gated by `monitoring:diagnose` (the existing
-diagnostic tier the alert-ack / diagnose surface already uses), not the PHI permission.
+valid choices. The level knob is gated by `monitoring:diagnose` (the existing diagnostic tier the
+alert-ack / diagnose surface already uses), not the PHI permission. It is **not** PHI-neutral: the level
+decides whether PHI reaches the log, so a production instance refuses `DEBUG` through it exactly as
+serve's Gate #1 refuses to start at it. *(Corrected 2026-10-06. This sentence read "The level knob is
+**not PHI**", which contradicted Gate #1; see the amendment below.)*
 
 ### §2 — The viewer is a PHI read surface: `logs:view` + hop-guard + audit, redacted text ONLY
 
@@ -96,3 +102,41 @@ is the durable setting), and `/config/reload` intentionally does **not** reset i
 is best-effort (residual single-token PHI possible), mitigated by RBAC + audit, not eliminated. Only the
 newest log file is paged (rotated-away history stays in the bundle). Per-logger/per-area targeting is out
 of scope for the MVP (root + uvicorn only).
+
+## Amendment 2026-10-06: a production instance refuses DEBUG at run time, as it does at start-up
+
+Vault BACKLOG #2777. Decided by adversarial review under the owner's driver rule, which follows a clear
+recommendation on an undecided owner question.
+
+**What was wrong.** §1 said the level knob "is not PHI". That contradicts serve's Gate #1, whose whole
+premise is that DEBUG is the state that surfaces PHI (full message bodies, raw field values) into the
+general log and any off-box forwarder. Both cannot hold, and the gate is the one tied to a stated
+threat. This ADR never discussed production posture, so `PATCH /logging/level` applied DEBUG on a
+production instance with no check. A permission an Operator holds, and not a PHI permission, could
+reach a state serve refuses to start in. The override also survives `/config/reload`, so it could
+last until a restart nobody is obliged to perform. In the shipped code this would let a first
+deployment's production instance write PHI to its logs at run time.
+
+**Decision.** One predicate, `logging_setup.level_refused_on_production(level, production=...)`,
+decides both paths, and one text, `PRODUCTION_DEBUG_REFUSED`, explains both refusals. The predicate
+compares the numeric threshold, so anything at or below DEBUG is refused, including a level added to
+`LOG_LEVELS` later. `serve` uses it for Gate #1. `set_runtime_level` takes the tier as a required
+keyword and raises `LogLevelRefused` for a refused level, leaving the level untouched, so no run-time
+caller can switch the level without answering the posture question. `PATCH /logging/level` resolves
+the tier from the loaded `[ai]`/`[security]` posture, with an unresolved tier counting as production,
+and answers a refusal with a 403 that names the posture and the legitimate route: reproduce on a
+separate instance that is non-production from start-up, fed synthetic or de-identified messages. It
+says not to relabel the production instance or copy its feed, because either would put PHI in a log
+by another door. It audits the refusal as
+`logging_level_change_denied` (actor, current level, requested level, reason), best-effort so that a
+failed audit write cannot turn the refusal into a 500. `GET /logging/level` and the PATCH response
+list only the levels the instance accepts, so DEBUG is not offered on a production instance. A
+non-production instance keeps the full §1 behaviour.
+
+**Reload.** §1 still holds that `/config/reload` does not reset a run-time override, and the reload
+path does not re-level the log or change the posture. On a production instance there is no DEBUG
+override for it to carry, because both entry points refuse one.
+
+**Not decided here.** An audited break-glass with step-up and an expiry that reverts the level would
+be a production loosening. It needs its own owner ruling, a `security_loosenings()` entry and its own
+record. None exists, so production DEBUG is unreachable at run time exactly as it is at start-up.

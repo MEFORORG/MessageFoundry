@@ -27,7 +27,9 @@ Design rationale (captured here for a future ADR; see also ``docs/design/multipr
   one FIFO lane can invert per-lane delivery order, and crash recovery needs an unambiguous owner
   per lane. Every shard still *builds* every outbound connector (status/reload/dead-letter sweeps
   key off the full map); only claiming/delivering is gated to the owner. A shard's handlers may
-  Send to any outbound — a non-owned lane's rows are drained by the owning shard.
+  Send to any outbound — a non-owned lane's rows are drained by the owning shard. The same holds
+  for a Send into a pass-through inbound another shard owns: the child INGRESS row goes to the
+  unified store and the owning shard's router worker drains it (vault BACKLOG #2755).
 
 * **One SQLite db file + one API port per shard.** Each subprocess owns an independent WAL store
   (``<stem>_<shard>.db``) so there is no cross-process write contention on the message store, and an
@@ -53,6 +55,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from types import MappingProxyType
 
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import Registry
@@ -159,8 +162,9 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
     outbound-lane gates, and the shard-set reload refusal — plus the whole config's Loopback inbound
     names (``all_loopback_inbound``), pinned for the same reason the shard universe is: the ADR 0013
     ``reingress_to`` rule is a fact about the CONFIG, and a shard that doesn't own the loopback must
-    still validate it. A single-shard config attaches none of them — it stays byte-identical to plain
-    ``serve`` everywhere.
+    still validate it. The whole config's inbound names (``all_inbound``) and pass-through inbounds
+    (``all_pt_inbound``) are pinned the same way. A single-shard config attaches none of them — it
+    stays byte-identical to plain ``serve`` everywhere.
 
     Raising is intentionally avoided for an empty result — a shard id that matches no inbound yields
     an empty-intake registry; the caller (``serve --shard``) decides whether that is an error.
@@ -197,4 +201,14 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         # for every sibling shard's inbound and dead-letter their live ingress/routed/response rows.
         # Derived from the SOURCE registry, as above.
         all_inbound=frozenset(registry.inbound) if sharded else None,
+        # Pin the UNFILTERED pass-through inbounds (name -> deployed) for the same reason (vault
+        # BACKLOG #2755): a Handler's Send into a PT is a fact about the CONFIG, and the PT may live on
+        # a sibling shard. Without this, transform_one looked the target up in `selected`, missed it,
+        # and every message on that path failed at transform after its sender had been ACKed. The
+        # child INGRESS row goes to the unified store; the owning shard drains it. Derived from the
+        # SOURCE registry, as above.
+        # Read-only view: every shard must decide a PT Send identically, so no caller may edit it.
+        all_pt_inbound=(
+            MappingProxyType(dict(registry.passthrough_inbounds())) if sharded else None
+        ),
     )

@@ -2586,7 +2586,9 @@ jobs:
           # asserts while matching no other arm here. This lock is listed rather than its siblings
           # because it is the file the test READS -- uv.lock and requirements.lock move with it in one
           # re-export, but a uv.lock edit that was never exported has not changed the guard's subject.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          # `ci/npm-tools/` is the same shape again (vault BACKLOG #2793): a Dependabot bump there
+          # touches only that lock, and the manifest tests that read it would otherwise run nowhere.
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else
@@ -2700,12 +2702,22 @@ jobs:
     # version-specific T-SQL / engine regression can't merge. fail-fast: false keeps a 2025-only hiccup
     # from cancelling the 2022 leg (and vice-versa). The `changes` path-filter still gates this on PRs, so
     # matrixing only doubles the (rate-limited) mcr pulls on server-DB PRs + the nightly run.
+    #
+    # EVERY SERVICE IMAGE IN THIS FILE AND IN benchmark.yml IS PINNED BY DIGEST (vault BACKLOG #2793).
+    # A tag such as `2022-latest` or `16` moves whenever the registry rebuilds it, so a leg the CI gate
+    # rolls up could change its result with no commit here. In `repo:tag@sha256:...` the digest is what
+    # is pulled; the tag only records what the digest was read from. Read 2026-10-06: `2022-latest`
+    # was SQL Server 16.0.4295.3, `2025-latest` 17.0.5005.3, and postgres `16` was 16.15. Nothing in
+    # .github/dependabot.yml moves these digests (its docker entry scans /docker only), so moving one
+    # is a deliberate edit: read the tag's current digest from the registry and change every site of
+    # that image, here and in benchmark.yml, in one commit. tests/test_ci_tool_and_image_pins.py
+    # refuses a service image with no digest.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { image: "mcr.microsoft.com/mssql/server:2022-latest", label: "2022" }
-          - { image: "mcr.microsoft.com/mssql/server:2025-latest", label: "2025" }
+          - { image: "mcr.microsoft.com/mssql/server:2022-latest@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090", label: "2022" }
+          - { image: "mcr.microsoft.com/mssql/server:2025-latest@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726", label: "2025" }
     services:
       mssql:
         image: ${{ matrix.image }}
@@ -3090,7 +3102,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # Digest-pinned; why, and how to move it, is at the sqlserver-store matrix above.
+        image: postgres:16@sha256:65b16a8b326e0cfbdf33fa7e783f2a0cb352a61448616ccccfd616ef42aa0f65
         env:
           POSTGRES_PASSWORD: mefor
           POSTGRES_DB: messagefoundry
@@ -3469,13 +3482,14 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     # Smoke the end-to-end SQL Server store path on every supported major (2022/2025). Push/dispatch-only,
-    # so no PR cost; fail-fast: false keeps the two legs independent.
+    # so no PR cost; fail-fast: false keeps the two legs independent. Digest-pinned; why, and how to
+    # move a digest, is at the sqlserver-store matrix above.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { image: "mcr.microsoft.com/mssql/server:2022-latest", label: "2022" }
-          - { image: "mcr.microsoft.com/mssql/server:2025-latest", label: "2025" }
+          - { image: "mcr.microsoft.com/mssql/server:2022-latest@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090", label: "2022" }
+          - { image: "mcr.microsoft.com/mssql/server:2025-latest@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726", label: "2025" }
     services:
       mssql:
         image: ${{ matrix.image }}

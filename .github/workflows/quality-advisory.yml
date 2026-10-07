@@ -319,6 +319,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install jscpd from the committed lock
+        # A setup step, so not continue-on-error (see _ANALYSIS_MARKERS in
+        # tests/test_quality_advisory_invariants.py). Why a committed lock and not npx, and why
+        # jscpd stays on 4.x: the description in ci/npm-tools/package.json (vault BACKLOG #2793).
+        # Retried, because a registry blip is not a dead gate; three failures are.
+        run: |
+          n=0
+          until npm ci --prefix ci/npm-tools --ignore-scripts --no-audit --no-fund; do
+            n=$((n + 1)); [ "$n" -ge 3 ] && exit 1; sleep $((n * 15))
+          done
       - name: jscpd clone report (advisory - never gates)
         continue-on-error: true
         run: |
@@ -327,8 +337,7 @@ jobs:
           # carries exactly ONE location -- whichever file jscpd scanned first -- so the case this
           # signal exists for (a PR copy-pasting an existing block into a new place) anchors on the
           # untouched twin about half the time. That is a coin flip, not a diff-scoped signal.
-          # Keep the 4.x pin: npm `latest` is a 5.x Rust rewrite with a different CLI.
-          npx --yes jscpd@4.0.5 messagefoundry \
+          ci/npm-tools/node_modules/.bin/jscpd messagefoundry \
             --min-tokens 60 \
             --ignore "**/store/sqlserver.py,**/store/postgres.py" \
             --reporters console,markdown \
