@@ -2412,6 +2412,15 @@ declared (proxy not sending `X-Forwarded-Proto`, or its peer IP not matched by `
 Settings validation refuses `trusted_proxies` without either posture (BACKLOG #2055), so no
 forwarded scheme can reach the cookie decision while `exposure_protected` is false.
 
+**Known gap: a planted session cookie would lock a browser out (BACKLOG #2454).** The console
+refuses a request that carries its session cookie twice with `400`, and the default
+`__Host-mf_session` name cannot be planted from another host. The opt-out names can be. Under
+`MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING` the cookie is `__Secure-mf_session`, and on a cleartext
+origin it is `mf_session`. Either way a sibling host could set a copy for the parent domain. The
+browser would then send two copies, and the console would answer `400` on every page, sign-in
+included, until the planted cookie is cleared. No mitigation is built; the cookie names are
+listed in [BROWSER-SUPPORT.md](BROWSER-SUPPORT.md#two-configurations-turn-the-warnings-off).
+
 **Browser AD login (L5b).** The browser AD **password** sign-in is **retired** (BACKLOG #1137).
 `/ui/login` has no provider selector. Its only form is local username and password, and Windows SSO
 and OIDC appear as links when available (`kerberos_available`, `oidc_available`). A POST that still carries `provider=ad` is charged to the

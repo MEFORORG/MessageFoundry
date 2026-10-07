@@ -146,6 +146,12 @@ Over HTTPS the opt-out withholds only the `__Host-` prefix. The cookies keep `Se
 `__Secure-` prefix requires. Nothing is left unprotected, but you also get no banner, so do not read a
 clean page as evidence that the browser is conforming. If you set the variable, record why.
 
+**The opt-out names can be planted; `__Host-mf_session` cannot (BACKLOG #2454).** A sibling host
+could set a `__Secure-mf_session` or `mf_session` copy for the parent domain. The browser would
+then send two copies, and the console refuses a repeated session cookie with `400`, so every page
+would answer `400` until the planted cookie is cleared. No mitigation is built; this is a known
+gap, recorded in [SECURITY.md](SECURITY.md).
+
 ---
 
 ## The engine's API pages load third-party scripts
