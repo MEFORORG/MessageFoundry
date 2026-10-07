@@ -1370,9 +1370,10 @@ invariant rather than a property of the moved row):
    ...`) does not dominate a read after the loop, because a loop may run zero times. A binding inside
    a `with` body does not dominate a read after the block (Manager decision 2026-10-07, after review,
    adopting the R1 code's stricter rule). The R1 code's dominance check differs from this text in
-   both directions for at least a `match` walrus, an `if` whose other arm returns, and a `try` whose
-   handlers raise; this text is the target. A For Each header dominates only reads inside its own
-   body, so a row that uses its index, such as `occurrence=i`, may not move out of the loop (Manager
+   both directions: it is stricter for at least a `match` walrus, which it refuses, and laxer for at
+   least an `except ... as e` name, whose later read it accepts though Python unbinds `e` when the
+   handler ends. This text is the target. A For Each header dominates only reads inside its own body,
+   so a row that uses its index, such as `occurrence=i`, may not move out of the loop (Manager
    decision 2026-10-07, after review). A move of either end, a binding or a reading row, that breaks
    this is refused, and so is a delete of a binding that leaves a read undominated. Each of those
    would leave a read unbound, at least whenever a condition is false. A block that holds a Read
@@ -1413,10 +1414,10 @@ stricter than this text, this text adopts the code's rule, because the code is t
 closed (Manager decision 2026-10-07, after review, adopting the R1 code's stricter rule). At least
 two of its refusals are conservative, refusing some edits that would be safe:
 
-- an edit that renumbers a protected block with the same header as another, a delete included, is
-  refused when one of the blocks holds a typed `return` or `raise`;
-- a new read after a `with` block of a name bound in its body, or bound by its `as` target, is
-  refused, though the body always runs and Python binds the `as` target before it.
+- an edit that renumbers a block with the same header as another, a delete included, is refused
+  when one of the renumbered blocks holds a typed `return` or `raise`, or a `code` row;
+- a new read after a `with` block of its `as` target is refused, though Python binds the `as`
+  target before the body runs.
 
 ### G.7 The R1 fix: values a typed edit may write
 
@@ -1535,17 +1536,19 @@ least: `getattr(h, "__globals__")`, `from sys import modules as mm`, and
 is stricter than the code; item 8 is a limit. The list is at least these, not a complete one:
 
 1. A `msg.field(...)` read inside a Set Field value accepts `occurrence=0`, `occurrence=OCC` and
-   `repetition=0`. The insert writes a `msg.set` that raises ValueError on every message. Being
-   closed in PR 2155's current repair round.
+   `repetition=0`. With `0`, or with `OCC` bound below 1, the insert writes a `msg.set` that raises
+   ValueError on every message; with any `OCC`, it admits a module-level name the rule refuses. Being
+   closed in PR 2155's current repair round, as of 2026-10-07.
 2. `_read_sites` scoping: a lambda default such as `col=col`, a comprehension's first iterable, an
    attribute or subscript target in a comprehension, and a lambda nested in a default are not
-   scoped correctly. Being closed in PR 2155's current repair round.
+   scoped correctly. Being closed in PR 2155's current repair round, as of 2026-10-07.
 3. Alias forms of `builtins` do not void inert names, as `builtins.globals` does. Being closed in PR
-   2155's current repair round.
-4. `range(1, *rest)` is read as a 1-based loop. Being closed in PR 2155's current repair round.
-5. `_refuse_non_text_value` refuses literals and numeric names but admits any other name, so a
-   module-level `NONE = None`, `FLAG = True` or `TUP = ("a", "b")` passes as a Set Field value and
-   writes a `msg.set` that fails on every message.
+   2155's current repair round, as of 2026-10-07.
+4. `range(1, *rest)` is read as a 1-based loop. Being closed in PR 2155's current repair round, as of
+   2026-10-07.
+5. `_refuse_non_text_value` refuses non-string literals and numeric names but admits any other
+   name, so a module-level `NONE = None`, `FLAG = True` or `TUP = ("a", "b")` passes as a Set
+   Field or Add Repetition value and writes a `msg.set` that fails on every message.
 6. A typed row may move below a typed `return Send(...)`, a typed `raise` or a filter `return []`,
    where it never runs (rule 8).
 7. Only `set_params` honours a message parameter that is not named `msg`. The other edits assume
