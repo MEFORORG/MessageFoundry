@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 import httpx
+import pytest
 from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
@@ -30,6 +32,8 @@ from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection, Registry
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.base import ResendError
+from messagefoundry_webconsole import _auth
 from messagefoundry_webconsole._html import text
 from messagefoundry_webconsole.pages.messages import (
     RESEND_TAIL_WARNING,
@@ -476,7 +480,11 @@ async def test_a_target_that_cannot_take_a_delivery_is_reported_as_blocked(
         await engine.start()
         again = await _post_resend(c, mid, to="OB2", mint=False)
         assert again.status_code == 303 and again.headers["location"].startswith("/ui/reauth?")
-    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    # The log is not empty (the refusal is audited, with the sign-in and the re-auth), so the
+    # absence of a resend row below is read over real rows, not over nothing.
+    audit = await engine.store.list_audit()
+    assert audit
+    rows = [a for a in audit if a["action"] == "message_resend"]
     assert rows == []
 
 
@@ -632,6 +640,57 @@ async def test_two_submits_in_flight_together_ride_one_proof(
         assert sum("Already resent" in a.text for a in answers) == 1
     rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
     assert len(rows) == 1
+
+
+async def test_a_repeat_in_flight_waits_and_asks_for_its_own_proof_when_the_first_is_refused(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2625. The second POST of a pair leaves while the first holds the spent proof,
+    and the first is then refused AFTER the spend. The second used to ride that spend and deliver
+    with no proof of its own (same key and target, another source). It now waits for the first to
+    settle, and a refused first sends it to re-auth. The audit count is the control: nothing ran."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    entered, release, rider_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    real_resend = engine.resend
+    calls = 0
+
+    async def refused_after_the_spend(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return await real_resend(*args, **kwargs)
+        entered.set()
+        await release.wait()
+        raise ResendError("refused for the test")
+
+    monkeypatch.setattr(engine, "resend", refused_after_the_spend)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        await _mint(c, mid)  # the one proof
+        first = asyncio.create_task(_post_resend(c, mid, mint=False))
+        await entered.wait()  # the first has spent the proof and is inside the handler
+        real_wait = _auth._SPENT_FOR_KEY.wait
+
+        async def noted_wait(*args: Any, **kwargs: Any) -> bool:
+            rider_waiting.set()
+            return await real_wait(*args, **kwargs)
+
+        monkeypatch.setattr(_auth._SPENT_FOR_KEY, "wait", noted_wait)
+        rider = asyncio.create_task(_post_resend(c, mid, source="other", mint=False))
+        await rider_waiting.wait()
+        release.set()
+        refused, second = await asyncio.gather(first, rider)
+        assert refused.status_code == 400 and str(text(RESEND_BLOCKED_NOTICE)) in refused.text
+        assert second.status_code == 303 and second.headers["location"].startswith("/ui/reauth?")
+    assert calls == 1  # the rider never reached the engine
+    audit = await engine.store.list_audit()
+    assert audit
+    rows = [a for a in audit if a["action"] == "message_resend"]
+    assert rows == []
 
 
 async def test_a_key_used_for_another_target_is_not_a_repeat(
