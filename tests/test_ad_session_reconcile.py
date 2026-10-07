@@ -33,6 +33,7 @@ from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
     AdPrincipal,
     DirectoryAnswer,
+    DirectoryBind,
     DirectoryProbe,
     LdapError,
     LdapReferralError,
@@ -127,10 +128,13 @@ class _FakeLdap:
         self.probes: list[str] = []
         self.probe_keys: list[tuple[str, str]] = []
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
         # Login/step-up binds are deliberately NOT counted in ``probes``; that list measures the
         # reconciler's directory load only.
-        return self._lookup(username)
+        principal = self._lookup(username)
+        if principal is None:
+            return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+        return DirectoryBind(DirectoryAnswer.FOUND, principal)
 
     def resolve_principal(
         self, username: str, *, object_id: str | None = None
@@ -3439,6 +3443,8 @@ _NOTICE_FOR_REASON: dict[str, str | None] = {
     "directory_disabled": ACCOUNT_DISABLED,
     "directory_absent": DIRECTORY_SESSIONS_ENDED,
     "directory_undetermined": DIRECTORY_SESSIONS_ENDED,
+    # BACKLOG #2434. The row was never probed, so nothing read the disabled bit.
+    "directory_object_id_missing": DIRECTORY_SESSIONS_ENDED,
     "roles_changed": ROLES_CHANGED,
     reconcile.SCOPE_CHANGED: None,
 }

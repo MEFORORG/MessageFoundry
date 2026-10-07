@@ -45,7 +45,7 @@ import messagefoundry.auth.service as svc
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -363,8 +363,10 @@ def _sso_service(engine: Engine, *, conflicting_local: bool = False) -> AuthServ
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             # A resolvable principal costs a directory search; an unresolvable one does not. That

@@ -19,7 +19,7 @@ import pytest
 from messagefoundry.api.security import pending_credential_deadline
 from messagefoundry.auth import Role, hash_password, hash_token
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.notifications import (
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
@@ -400,8 +400,10 @@ async def test_ad_login_syncs_roles_from_group_map() -> None:
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-                return principal if (username == "jdoe" and password == "pw") else None
+            def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+                if username != "jdoe":
+                    return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+                return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
             def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
@@ -785,8 +787,10 @@ async def test_notifier_fires_on_ad_driven_role_change() -> None:
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-                return principal if (username == "jdoe" and password == "pw") else None
+            def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+                if username != "jdoe":
+                    return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+                return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
             def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
@@ -867,8 +871,11 @@ async def test_a_directory_repoint_cannot_redirect_the_accounts_notices() -> Non
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-                return None  # simple bind is retired (BACKLOG #1137); logins go through the tail
+            def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+                # Simple bind is retired (BACKLOG #1137); logins go through the tail. The account resolves,
+                # so a bind here is one the directory refused.
+                found = username == "jdoe"
+                return DirectoryBind(DirectoryAnswer.FOUND if found else DirectoryAnswer.NOT_FOUND)
 
             def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return original if username == "jdoe" else None
