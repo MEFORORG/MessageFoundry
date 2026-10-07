@@ -400,7 +400,7 @@ from messagefoundry.store.content_search import (
 )
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.store import AuditAppend, ReingressOutcome, ResendOutcome
+from messagefoundry.store.store import AuditAppend, OperatorAudit, ReingressOutcome, ResendOutcome
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -787,7 +787,7 @@ def _dead_letter_replay_audit(
     channel_id: str | None,
     destination_name: str | None,
     client: str | None,
-) -> Callable[[int], AuditAppend | None]:
+) -> OperatorAudit[int]:
     """The ``dead_letter_replay`` row the inline route and the released replay both commit with the
     re-queue (BACKLOG #1646, #2624). Only when PHI was actually re-transmitted (review M-4)."""
 
@@ -5594,7 +5594,7 @@ def create_app(
         client = client_ip(request)
 
         def _audit(outcome: ResendOutcome) -> AuditAppend | None:
-            # An actual re-transmission of PHI to a new partner: attribute it (from→to), NEVER the
+            # An actual re-transmission of PHI to a new partner: attribute it (from and to), NEVER the
             # body, in the resend's own transaction (BACKLOG #2624). A duplicate records nothing.
             if outcome.status != "resent":
                 return None
@@ -5623,7 +5623,7 @@ def create_app(
             )
         except ResendError as exc:
             # No delivered source body / retention-nulled body / ambiguous source / idempotency-key
-            # reused for a different message-or-target → 409 (ADR 0090 §4/§5/§7).
+            # reused for a different message-or-target gives 409 (ADR 0090 §4/§5/§7).
             raise HTTPException(409, str(exc)) from None
         return ResendResult(
             message_id=message_id,
@@ -5722,7 +5722,7 @@ def create_app(
                     audit=_direct_audit,
                 )
             except ResendError as exc:
-                # Empty edited body / idempotency-key reused for a different target → 409. str(exc)
+                # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
                 # carries ids only (never the body — the messages don't interpolate ``raw``).
                 raise HTTPException(409, str(exc)) from None
             return EditResendResult(

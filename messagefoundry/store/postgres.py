@@ -7831,7 +7831,7 @@ class PostgresStore:
                 conn,
                 audit.action,
                 actor=audit.actor,
-                channel_id=None,
+                channel_id=audit.channel_id,
                 detail=audit.detail,
                 client=audit.client,
                 now=now,

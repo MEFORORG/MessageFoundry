@@ -2618,9 +2618,9 @@ class Engine:
         This is deliberately **not** :meth:`edit_resend_reroute`/``reingress``: that presupposes an
         origin ``messages`` row (for its channel + correlation), which an uploaded, never-ingested file
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
-        validation (registered/running) + RBAC are the API's job, and the API builds the
-        ``audit`` row that commits with the message (BACKLOG #2624), and so are the target inbound's
-        ingress guards (BACKLOG #1911). Returns the new message id."""
+        validation (registered/running), RBAC and the target inbound's ingress guards (BACKLOG
+        #1911) are the API's job. The API also builds the ``audit`` row that commits with the message
+        (BACKLOG #2624). Returns the new message id."""
         mid = await self.store.enqueue_ingress(
             channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata, audit=audit
         )

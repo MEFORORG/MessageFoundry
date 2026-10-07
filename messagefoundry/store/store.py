@@ -4113,7 +4113,9 @@ before the one commit. So a crash, or a failed append, keeps both or neither. ``
 result records nothing, as a replay that re-queued no row records nothing. The row's detail can
 carry the result, such as a count, which is why this is a function and not a row.
 
-It must be pure and quick: it runs under the writer lock and the audit chain's lock."""
+It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
+row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
+not read chain state."""
 
 
 def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
@@ -4129,8 +4131,10 @@ class AuditedWrite:
 
     The write appends its rows inside its own transaction and hands them to :meth:`add`. Enter this
     OUTSIDE the transaction and the writer lock, so it exits after both: a clean exit means the rows
-    are durable and tees them, outside the lock, as ``record_audit`` does. An exception, a failed
-    commit included, tees nothing, because nothing persisted. Holding the rows here, not in a local,
+    are durable and tees them, outside the lock, as ``record_audit`` does. An exception tees nothing.
+    That is right for a failed commit. It also drops the tee when the exception comes after the
+    commit, such as a cancellation while the pool takes the connection back; ``record_audit`` has the
+    same window. The tee is the off-box copy, and the committed row stays in the chain. Holding the rows here, not in a local,
     is what lets a write with several ``return`` paths inside its transaction tee from every one.
     """
 
@@ -11993,7 +11997,7 @@ class MessageStore:
             appended = await self._append_audit_row(
                 audit.action,
                 actor=audit.actor,
-                channel_id=None,
+                channel_id=audit.channel_id,
                 detail=audit.detail,
                 client=audit.client,
                 now=now,

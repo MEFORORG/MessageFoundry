@@ -857,9 +857,8 @@ async def test_pending_approval_store_contract(store) -> None:
 
 
 async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
-    """BACKLOG #2624 on the real SQL Server backend: each operator mutation holds the in-process
-    audit gate and takes the audit applock inside its own transaction, so a failed append rolls it
-    back. The applock needs that transaction open, and each mutation's first statement opens it."""
+    """BACKLOG #2624 on the real SQL Server backend: each operator mutation takes the audit applock
+    inside its own transaction, at the append, so a failed append rolls it back. The applock needs that transaction open, and each mutation's first statement opens it."""
     from tests._operator_audit_atomic_contract import assert_operator_audit_atomic
 
     await assert_operator_audit_atomic(store)
