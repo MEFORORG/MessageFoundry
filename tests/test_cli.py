@@ -613,7 +613,7 @@ def test_rotate_key_warns_when_an_uploaded_file_could_not_be_resealed(
     _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
     assert main(["rotate-key", "--db", str(db)]) == 0
     err = capsys.readouterr().err
-    assert "could not be read and were NOT re-sealed" in err
+    assert "could not be read and were NOT fully re-sealed" in err
     assert "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED" in err
 
 

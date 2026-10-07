@@ -281,11 +281,6 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + _UPLOAD_MISS,
     ),
     _Allowed(
-        f"{_APP}._authorized_upload_meta::UploadUnreadableError" + _HTTP,
-        _SAFE + _UPLOAD_MISS,
-        count=2,
-    ),
-    _Allowed(
         f"{_APP}.browse_uploaded_file::(UploadPathError, UploadNotFoundError)" + _HTTP,
         _SAFE + _UPLOAD_MISS,
     ),
