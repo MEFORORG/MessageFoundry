@@ -38,12 +38,15 @@ from starlette.types import Message, Receive, Scope, Send
 
 from messagefoundry.api.app import create_app
 from messagefoundry.api.header_floor import (
+    BASE_URI_CSP,
     BASELINE_SECURITY_HEADERS,
     CSP_HEADER,
+    FLOOR_CSP,
     FRAME_ANCESTORS_CSP,
     HSTS_HEADER,
     HSTS_VALUE,
     SecurityHeaderFloorMiddleware,
+    csp_names_directive,
     csp_names_frame_ancestors,
     host_is_ip_literal,
     hsts_notable,
@@ -126,8 +129,8 @@ async def _drive(app: Any, **kwargs: Any) -> tuple[int, dict[str, str]]:
     return status, dict(raw)
 
 
-def _frame_ancestors_values(raw: list[tuple[str, str]]) -> list[str]:
-    """Every ``frame-ancestors`` source list across every CSP field on the response.
+def _directive_values(raw: list[tuple[str, str]], directive: str) -> list[str]:
+    """Every ``directive`` source list across every CSP field on the response.
 
     Re-derived here rather than imported from the module under test: an instrument that shares the
     implementation's parser cannot report that the parser is wrong."""
@@ -137,9 +140,21 @@ def _frame_ancestors_values(raw: list[tuple[str, str]]) -> list[str]:
             continue
         for serialized in value.split(";"):
             parts = serialized.strip().split(None, 1)
-            if parts and parts[0].casefold() == "frame-ancestors":
+            if parts and parts[0].casefold() == directive:
                 found.append(parts[1].strip() if len(parts) > 1 else "")
     return found
+
+
+def _frame_ancestors_values(raw: list[tuple[str, str]]) -> list[str]:
+    return _directive_values(raw, "frame-ancestors")
+
+
+def _assert_base_uri_denied(raw: list[tuple[str, str]], label: str) -> None:
+    """ASVS 3.4.3, BACKLOG #2341: ``base-uri`` takes no fallback from ``default-src``, so the EFFECTIVE
+    value is ``'none'`` only when some policy names it and none names it with anything weaker."""
+    values = _directive_values(raw, "base-uri")
+    assert values, f"{label}: no policy on the response names base-uri ({raw})"
+    assert set(values) == {"'none'"}, f"{label}: effective base-uri is {values}, not 'none'"
 
 
 def _assert_framing_denied(raw: list[tuple[str, str]], label: str) -> None:
@@ -180,11 +195,13 @@ async def test_the_driver_reports_a_missing_header_as_missing() -> None:
         f"the driver must observe absence for this file's assertions to mean anything; got {headers}"
     )
     assert _frame_ancestors_values(raw) == [], "the CSP instrument must observe absence too"
+    assert _directive_values(raw, "base-uri") == [], "and absence of base-uri"
 
     status, raw = await _drive_raw(SecurityHeaderFloorMiddleware(bare))
     assert status == 413, "the floor must not alter the status"
     assert [n for n in _BASELINE_NAMES if n in dict(raw)] == list(_BASELINE_NAMES)
     _assert_framing_denied(raw, "a bare response wrapped in the floor")
+    _assert_base_uri_denied(raw, "a bare response wrapped in the floor")
 
 
 async def test_the_floor_never_overwrites_a_header_an_inner_emitter_assigned() -> None:
@@ -211,28 +228,67 @@ async def test_the_floor_appends_a_second_policy_rather_than_replacing_the_sandb
     sandbox is the headline case. So the carrier APPENDS.
 
     Two policy fields is the correct shape, not a workaround: CSP Level 3 enforces each independently
-    and the effect is their intersection, so a second field naming only frame-ancestors cannot weaken
-    the first. Both halves are asserted: the sandbox survives byte-for-byte AND framing is denied."""
+    and the effect is their intersection, so a second field naming only frame-ancestors and base-uri
+    cannot weaken the first. Both halves are asserted: the sandbox survives byte-for-byte AND framing
+    and base-uri are denied (ASVS 3.4.6 / 3.4.3, BACKLOG #2341)."""
     sandbox = b"default-src 'none'; sandbox"
     app = SecurityHeaderFloorMiddleware(
         _BareApp(status=200, headers=((CSP_HEADER.lower().encode(), sandbox),))
     )
     _, raw = await _drive_raw(app)
     policies = [value for name, value in raw if name == CSP_HEADER.lower()]
-    assert policies == [sandbox.decode(), FRAME_ANCESTORS_CSP], policies
+    assert policies == [sandbox.decode(), FLOOR_CSP], policies
     _assert_framing_denied(raw, "a response already carrying the attachment sandbox")
+    _assert_base_uri_denied(raw, "a response already carrying the attachment sandbox")
 
 
 async def test_the_floor_leaves_a_policy_that_already_decided_framing_alone() -> None:
     """A writer that HAS made a frame-ancestors decision keeps it — the floor is a floor, not an
-    override. Asserted on a value the floor would never write, so the test cannot pass by accident."""
+    override. Asserted on a value the floor would never write, so the test cannot pass by accident.
+    The same policy made no base-uri decision, so the floor appends that directive ALONE: each
+    directive is judged on its own (BACKLOG #2341)."""
     decided = b"default-src 'self'; frame-ancestors 'self'"
     app = SecurityHeaderFloorMiddleware(
         _BareApp(status=200, headers=((CSP_HEADER.lower().encode(), decided),))
     )
     _, raw = await _drive_raw(app)
-    assert [value for name, value in raw if name == CSP_HEADER.lower()] == [decided.decode()]
+    policies = [value for name, value in raw if name == CSP_HEADER.lower()]
+    assert policies == [decided.decode(), BASE_URI_CSP], policies
     assert _frame_ancestors_values(raw) == ["'self'"]
+    _assert_base_uri_denied(raw, "a policy that decided framing only")
+
+
+async def test_the_floor_leaves_a_policy_that_already_decided_base_uri_alone() -> None:
+    """The mirror case: a writer that HAS made a base-uri decision keeps it, and only frame-ancestors
+    is appended. Asserted on ``'self'``, a value the floor never writes."""
+    decided = b"default-src 'self'; base-uri 'self'"
+    app = SecurityHeaderFloorMiddleware(
+        _BareApp(status=200, headers=((CSP_HEADER.lower().encode(), decided),))
+    )
+    _, raw = await _drive_raw(app)
+    policies = [value for name, value in raw if name == CSP_HEADER.lower()]
+    assert policies == [decided.decode(), FRAME_ANCESTORS_CSP], policies
+    assert _directive_values(raw, "base-uri") == ["'self'"]
+    _assert_framing_denied(raw, "a policy that decided base-uri only")
+
+
+async def test_the_floor_appends_nothing_to_a_policy_that_decided_both() -> None:
+    """Both directives named, so no second field at all: the console's nonce policy and the client
+    network denial pages are this shape, and they must stay one policy."""
+    decided = b"default-src 'self'; base-uri 'none'; frame-ancestors 'none'"
+    app = SecurityHeaderFloorMiddleware(
+        _BareApp(status=200, headers=((CSP_HEADER.lower().encode(), decided),))
+    )
+    _, raw = await _drive_raw(app)
+    assert [value for name, value in raw if name == CSP_HEADER.lower()] == [decided.decode()]
+
+
+def test_csp_names_directive_parses_base_uri_as_a_directive() -> None:
+    assert csp_names_directive(["base-uri 'none'"], "base-uri")
+    assert csp_names_directive(["default-src 'none'", "BASE-URI 'self'"], "base-uri")
+    assert not csp_names_directive(["default-src 'none'; frame-ancestors 'none'"], "base-uri")
+    assert not csp_names_directive(["report-uri /base-uri"], "base-uri")
+    assert f"{FRAME_ANCESTORS_CSP}; {BASE_URI_CSP}" == FLOOR_CSP
 
 
 def test_csp_names_frame_ancestors_parses_directives_not_substrings() -> None:
@@ -298,6 +354,8 @@ async def test_every_response_family_is_governed_by_frame_ancestors_none(
     status, raw = await _drive_raw(app, method=method, path=path, headers=request_headers)
     assert status == expected_status, label
     _assert_framing_denied(raw, label)
+    # ASVS 3.4.3, BACKLOG #2341: these are the floor-only responses, so base-uri comes from the floor.
+    _assert_base_uri_denied(raw, label)
 
 
 async def test_the_unhandled_500_carries_frame_ancestors_the_floor_cannot_reach() -> None:
@@ -314,6 +372,7 @@ async def test_the_unhandled_500_carries_frame_ancestors_the_floor_cannot_reach(
     status, raw = await _drive_raw(app, path="/_test/boom_csp", expect_raise=True)
     assert status == 500
     _assert_framing_denied(raw, "the unhandled 500")
+    _assert_base_uri_denied(raw, "the unhandled 500")
 
 
 async def test_both_client_network_denial_arms_deny_framing() -> None:
@@ -326,12 +385,18 @@ async def test_both_client_network_denial_arms_deny_framing() -> None:
     status, raw = await _drive_raw(app, path="/status", client=denied)
     assert status == 403
     _assert_framing_denied(raw, "the JSON denial arm")
+    _assert_base_uri_denied(raw, "the JSON denial arm")
+    # Both directives named by the arm's own constant, so the floor appends no second field.
+    assert [value for name, value in raw if name == CSP_HEADER.lower()] == [
+        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    ]
 
     status, raw = await _drive_raw(
         app, path="/status", client=denied, headers=(("accept", "text/html,*/*"),)
     )
     assert status == 403
     _assert_framing_denied(raw, "the HTML denial page")
+    _assert_base_uri_denied(raw, "the HTML denial page")
     # The page's own carve-out for its single inline <style> block must survive the addition.
     policies = [value for name, value in raw if name == CSP_HEADER.lower()]
     assert policies == [
@@ -340,14 +405,28 @@ async def test_both_client_network_denial_arms_deny_framing() -> None:
 
 
 async def test_the_attachment_sandbox_is_not_split_into_two_policies() -> None:
-    """The sandbox constant names the directive itself, so the carrier skips it and the response
-    carries ONE policy. That is not cosmetic: it is what keeps the constant, and not the floor, the
+    """The sandbox constant names both floor directives itself (frame-ancestors, and base-uri since
+    BACKLOG #2341), so the carrier skips it and the response carries ONE policy. That is not cosmetic: it is what keeps the constant, and not the floor, the
     thing the attachment response is governed by if the floor is ever removed or re-ordered."""
     from messagefoundry.api.app import _ATTACHMENT_CSP
 
-    assert _ATTACHMENT_CSP == "default-src 'none'; sandbox; frame-ancestors 'none'"
+    assert _ATTACHMENT_CSP == "default-src 'none'; sandbox; frame-ancestors 'none'; base-uri 'none'"
     assert csp_names_frame_ancestors([_ATTACHMENT_CSP])
     assert _frame_ancestors_values([(CSP_HEADER.lower(), _ATTACHMENT_CSP)]) == ["'none'"]
+    assert _directive_values([(CSP_HEADER.lower(), _ATTACHMENT_CSP)], "base-uri") == ["'none'"]
+
+
+async def test_an_attachment_response_through_the_floor_stays_one_policy_with_base_uri() -> None:
+    """The attachment constant driven through the floor: one field, base-uri denied (BACKLOG #2341).
+    Before the fix the floor would have appended nothing and the response carried no base-uri."""
+    from messagefoundry.api.app import _ATTACHMENT_CSP
+
+    app = SecurityHeaderFloorMiddleware(
+        _BareApp(status=200, headers=((CSP_HEADER.lower().encode(), _ATTACHMENT_CSP.encode()),))
+    )
+    _, raw = await _drive_raw(app)
+    assert [value for name, value in raw if name == CSP_HEADER.lower()] == [_ATTACHMENT_CSP]
+    _assert_base_uri_denied(raw, "the attachment response")
 
 
 # --- the baseline set on the escaped paths -------------------------------------------------------

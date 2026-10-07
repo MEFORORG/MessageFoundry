@@ -1254,7 +1254,7 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   `image/svg+xml` or `application/hta` is simply not on it, so it is declared `application/octet-stream`,
   and the same table gives the download name a `.bin` extension instead of `.svg`/`.html`/`.hta`. The
   response carries `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` and
-  `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'` on both the
+  `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'; base-uri 'none'` on both the
   JSON route and the `/ui` delegate.
   No served representation can execute in the application origin, and
   none can be framed -- `frame-ancestors` is named in that policy rather than left to the API's

@@ -549,7 +549,7 @@ async def test_download_carries_sandbox_csp(engine: Engine, client: httpx.AsyncC
     mid, ref = await _seed_streaming(engine)
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
-    expected = "default-src 'none'; sandbox; frame-ancestors 'none'"
+    expected = "default-src 'none'; sandbox; frame-ancestors 'none'; base-uri 'none'"
     assert r.headers["content-security-policy"] == expected
     assert expected == _ATTACHMENT_CSP  # the constant the product actually ships
     # ASVS 3.4.6: `frame-ancestors` takes no fallback from `default-src`, so this policy NAMES it.
@@ -557,6 +557,9 @@ async def test_download_carries_sandbox_csp(engine: Engine, client: httpx.AsyncC
     # policy only where none names the directive, so this response stays governed by its own
     # constant and would still deny framing if the floor were removed or re-ordered.
     assert r.headers.get_list("content-security-policy") == [_ATTACHMENT_CSP]
+    # ASVS 3.4.3 (BACKLOG #2341): `base-uri` takes no fallback from `default-src` either, and the
+    # one-field assertion above is what proves the CONSTANT names it rather than the floor's append.
+    assert "base-uri 'none'" in [d.strip() for d in _ATTACHMENT_CSP.split(";")]
     # The pre-existing layers are unchanged — the CSP is the fourth, not a replacement.
     assert r.headers["content-disposition"].startswith("attachment;")
     assert r.headers["x-content-type-options"] == "nosniff"

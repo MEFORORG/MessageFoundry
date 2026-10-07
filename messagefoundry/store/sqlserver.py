@@ -139,13 +139,13 @@ from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
-    MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     PASSWORD_CHANGE_LOCKOUT_CLEAR,
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    VIEWED_EVENT,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -201,6 +201,7 @@ from messagefoundry.store.store import (
     audit_seal_next,
     birth_notify_email,
     build_audit_mac_keys,
+    check_caller_event_kind,
     check_password_generated,
     delivery_key,
     load_audit_chain,
@@ -10747,7 +10748,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await self._event(cur, message_id, "viewed", None, actor or "", now)
+                await self._event(cur, message_id, VIEWED_EVENT, None, actor or "", now)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -10766,11 +10767,7 @@ class SqlServerStore:
 
         See :meth:`MessageStore.record_message_event` — same contract, same runtime kind validation
         (the static literal-call-site guard cannot see a forwarded variable), same verbosity gate."""
-        if event not in MESSAGE_EVENT_KINDS:
-            raise ValueError(
-                f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
-                "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
-            )
+        check_caller_event_kind(event)
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
