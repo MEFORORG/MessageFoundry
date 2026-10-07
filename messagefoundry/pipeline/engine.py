@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from messagefoundry.auth.trust_anchors import LaneAnchorCheck
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -260,6 +261,7 @@ class Engine:
         log_dir: str | None = None,
         registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
         settings_preflight: Callable[[], Awaitable[None]] | None = None,
+        lane_anchor_check: LaneAnchorCheck | None = None,
     ) -> None:
         self.store = store
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
@@ -283,6 +285,10 @@ class Engine:
         # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
         # (BACKLOG #1142, slice 3); None = no preflight.
         self._registry_preflight = registry_preflight
+        # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check the runner
+        # awaits for each lane it builds, at start, at an operator start and before a reload. `serve`
+        # passes it; None = no check. Not handed to a dry-run checker, which builds nothing live.
+        self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
         # Dry runs skip it, because it writes audit rows. It raises WiringError to refuse. `serve`
@@ -1002,6 +1008,7 @@ class Engine:
             egress=self._egress_settings,
             hop_posture=self._hop_posture,
             trust_anchor_policy=self._trust_anchor_policy,
+            lane_anchor_check=self._lane_anchor_check,
             simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             active_environment=self._active_environment,

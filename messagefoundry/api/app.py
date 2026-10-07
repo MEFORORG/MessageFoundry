@@ -259,6 +259,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
+    make_lane_anchor_check,
     make_registry_anchor_preflight,
     make_settings_anchor_preflight,
     run_anchor_preflight,
@@ -2140,6 +2141,8 @@ async def _run_connection_test(
         )
 
     try:
+        # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
+        await rr.check_test_anchor(name)
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
@@ -3433,6 +3436,7 @@ def create_app(
         want_out = role in (None, "destination")
         if rr is not None and want_in and name in rr.registry.inbound:
             await _control_guard(engine, identity, name, client)
+            anchor_refused = False
             try:
                 if action == "start":
                     await rr.start_inbound(name)
@@ -3445,6 +3449,16 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
+            except TrustAnchorError:
+                # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
+                # and logged why. Raised below, outside this handler, so the refusal, which names
+                # the CA's path and SHA-256, is not left on the 409's __context__.
+                anchor_refused = True
+            if anchor_refused:
+                await _record_control_audit(
+                    engine, identity, name, action, role="source", running=False, client=client
+                )
+                raise HTTPException(409, _ANCHOR_REFUSED_DETAIL)
             running = rr.inbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="source", running=running, client=client
@@ -8911,11 +8925,17 @@ def create_managed_app(
             registry_guard=registry_guard,
             # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
             # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
-            # every real reload. Each connector's own build then enforces again and loads the bytes
-            # it read. Dormant when no inbound names a CA: no store call, no audit row.
+            # every real reload. Each listener's own build then enforces again and loads the bytes
+            # it read. Since vault BACKLOG #2371 it also checks each FhirLookup's CA; the lane
+            # CAs are the runner's, below. Module item 9 of auth/trust_anchors.py says when.
+            # Dormant when no connection names a CA: no store call, no audit row.
             registry_preflight=make_registry_anchor_preflight(
                 store, enforcing=trust_anchors_enforcing
             ),
+            # vault BACKLOG #2371: the same check, per lane, as the runner builds an outbound or
+            # binds an Ftp poller, so a refused CA fails that lane only (ADR 0031), and before a
+            # reload for each lane that reload builds or keeps running.
+            lane_anchor_check=make_lane_anchor_check(store, enforcing=trust_anchors_enforcing),
             # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA), re-verified by
             # the engine on EVERY real reload, not only the direct /config/reload route. None when
             # no settings anchor is configured.
