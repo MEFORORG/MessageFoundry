@@ -866,13 +866,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         and ``as_of`` pins the pages to the snapshot the first one read (BACKLOG #2438): the
         caller's own requests elsewhere keep writing ``auth.*`` rows under their name. The pin is a
         timestamp, never a row id, for the reason :mod:`messagefoundry.api.paging` gives."""
-        user = identity.username
 
+        # Pass ``identity.username`` at each call, never through a local alias: the username
+        # access-key screen reads the argument's own text, so an alias hides both calls from it.
         async def read(n: int, skip: int, pin: float | None) -> list[dict[str, Any]]:
-            return await service.security_events_for(user, limit=n, offset=skip, until=pin)
+            return await service.security_events_for(
+                identity.username, limit=n, offset=skip, until=pin
+            )
 
         async def count(pin: float | None) -> int:
-            return await service.count_security_events_for(user, until=pin)
+            return await service.count_security_events_for(identity.username, until=pin)
 
         rows, total, as_of = await ts_pinned_page(
             as_of, limit=limit, offset=offset, read=read, count=count, ts_of=lambda r: r["ts"]
