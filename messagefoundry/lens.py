@@ -4591,7 +4591,17 @@ _NO_NAMES = _Scope(frozenset({"msg"}), frozenset(), frozenset())
 _GLOBALS_WRITERS = frozenset({"globals", "vars", "exec", "eval", "setattr", "__import__"})
 
 #: Attributes that reach a module's globals: ``h.__globals__``, ``sys.modules``, ``mod.__dict__``.
-_GLOBALS_ATTRS = frozenset({"__globals__", "__dict__", "__builtins__", "modules"})
+_GLOBALS_ATTRS = frozenset(
+    {
+        "__globals__",
+        "__dict__",
+        "__builtins__",
+        "modules",
+        "f_globals",
+        "__getattribute__",
+        "attrgetter",
+    }
+)
 
 
 def _message_scope(
@@ -4737,28 +4747,45 @@ def _imported_from_messagefoundry(tree: ast.Module, name: str) -> bool:
 _BUILTINS_ROUTES = frozenset({"builtins", "__builtins__", "importlib"})
 
 
-def _reaches_globals(n: ast.AST) -> bool:
+def _reaches_globals(n: ast.AST, safe_getattr: set[int]) -> bool:
     """Whether ``n`` may let the module rebind its own globals where the inert check cannot see.
 
     Covered: a :data:`_GLOBALS_WRITERS` name; a :data:`_GLOBALS_ATTRS` attribute (``h.__globals__``,
     ``sys.modules``); ANY touch of ``builtins``, ``__builtins__`` or ``importlib``, whether by name,
     import or alias (``import builtins as b``, ``from builtins import globals as g``); and a
-    ``getattr`` whose name is not a non-dunder string literal (Lander review of 71fe1207f4, finding
-    4). A bypass not listed here may remain: this is a static check."""
+    ``getattr`` used any way but a direct call with a non-dunder string literal name, so an alias
+    (``ga = getattr``) counts too (Lander review of 71fe1207f4, finding 4). ``safe_getattr`` holds
+    the ``id`` of each ``getattr`` name node that IS such a direct call. A frame's ``f_globals``,
+    ``__getattribute__`` and ``operator.attrgetter`` count as attributes. A relative import from a
+    sibling module named ``builtins`` does not count. A bypass not listed here may remain: this is a
+    static check."""
     if isinstance(n, ast.Name):
+        if n.id == "getattr":
+            return id(n) not in safe_getattr
         return n.id in _GLOBALS_WRITERS or n.id in _BUILTINS_ROUTES
     if isinstance(n, ast.Attribute):
         return n.attr in _GLOBALS_ATTRS
     if isinstance(n, ast.Import):
         return any(al.name.split(".")[0] in _BUILTINS_ROUTES for al in n.names)
     if isinstance(n, ast.ImportFrom):
-        return (n.module or "").split(".")[0] in _BUILTINS_ROUTES
-    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "getattr":
-        name = n.args[1] if len(n.args) >= 2 else None
-        if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
-            return True
-        return _is_dunder(name.value)
+        return not n.level and (n.module or "").split(".")[0] in _BUILTINS_ROUTES
     return False
+
+
+def _safe_getattr_names(tree: ast.Module) -> set[int]:
+    """The ``id`` of each ``getattr`` name that is called directly with a non-dunder string literal
+    as its attribute name (:func:`_reaches_globals`)."""
+    out: set[int] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "getattr":
+            name = n.args[1] if len(n.args) >= 2 else None
+            if (
+                isinstance(name, ast.Constant)
+                and isinstance(name.value, str)
+                and not _is_dunder(name.value)
+            ):
+                out.add(id(n.func))
+    return out
 
 
 def _root_name(node: ast.expr) -> str | None:
@@ -4807,8 +4834,9 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
             binds[name] = binds.get(name, 0) + 1
         pending.extend(ast.iter_child_nodes(node))
     mutated: set[str] = set()
+    safe_getattr = _safe_getattr_names(tree)
     for n in ast.walk(tree):
-        if _reaches_globals(n):
+        if _reaches_globals(n, safe_getattr):
             return {}
         if isinstance(n, ast.ImportFrom) and any(al.name == "*" for al in n.names):
             return {}

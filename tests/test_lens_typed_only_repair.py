@@ -1172,3 +1172,39 @@ def test_r6_finding_2_a_starred_range_is_not_1_based(header: str, ok: bool) -> N
     else:
         with pytest.raises(LensRewriteError, match="not a whole number"):
             rewrite_source(src, edit)
+
+
+# --- review of 71fe1207f4..11f5ddd5c4 -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        "import sys\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    sys._getframe().f_globals["OB_DEST"] = 1\n',
+        "def poke(h):  # type: ignore[no-untyped-def]\n"
+        "    ga = getattr\n"
+        '    ga(h, "x")["OB_DEST"] = 1\n',
+        "def poke(h, n):  # type: ignore[no-untyped-def]\n"
+        '    object.__getattribute__(h, n)["OB_DEST"] = 1\n',
+        "import operator\n\n\ndef poke(h):  # type: ignore[no-untyped-def]\n"
+        '    operator.attrgetter("x")(h)["OB_DEST"] = 1\n',
+    ],
+    ids=["f_globals", "getattr-alias", "getattribute", "attrgetter"],
+)
+def test_r7_more_routes_to_module_globals_void_inert_names(write: str) -> None:
+    src = (
+        f'OB_DEST = "OB_X"\n\n\n{write}\n\n@handler("H")\ndef h(msg):\n    return Send("OB", msg)\n'
+    )
+    line = len(src.splitlines())
+    _refused(src, _edit("set_params", line, params={"to": {"expr": "OB_DEST"}}), match=REFUSED)
+
+
+def test_r7_control_a_relative_builtins_module_keeps_inert_names() -> None:
+    src = (
+        'from .builtins import helper\n\nOB_DEST = "OB_X"\n\n\n'
+        '@handler("H")\ndef h(msg):\n    return Send("OB", msg)\n'
+    )
+    line = len(src.splitlines())
+    edit = _edit("set_params", line, params={"to": {"expr": "OB_DEST"}})
+    assert "return Send(OB_DEST, msg)" in rewrite_source(src, edit)
