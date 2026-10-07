@@ -1482,16 +1482,36 @@ connected stays connected until it reconnects or you restart. Every reload stays
 store. After `crl_max_reloads` reloads of one file, a hop refuses the next and asks for a restart.
 
 Until a hop is current, the scan judges the copy it holds as well as the new file. So the alert does
-not clear on the file alone, and the alert's date can be the held copy's rather than the new file's. A
-replaced file that is not near expiry raises no alert. Each scan still logs a warning that a running
-hop holds an older copy, and why. If the file cannot be read, the scan judges the held copy instead of
-skipping it. At least two cases still need a restart: a CRL placed inside a CA bundle, which the engine
-does not track, and a replacement refused under rule 3. A hop may hold a CRL from a path no setting
-above names, such as an inbound `tls_crl_file` given through `env()`. The scan then adds a row for it,
-labelled `held-crl:` and the path. The `[store].ssl_crl_file` hop builds a fresh context for every new
-pool connection and records no held copy. If another setting names the same file, that file's row still
-reports those hops' copies. CRLs share `warn_days` with certificates. So a CRL reissued more often than
-`warn_days` sits inside the window and alerts on every scan.
+not clear on the file alone, and the alert's date can be the held copy's rather than the new file's.
+When it is, the notifier event carries `held_copy` set to `true` (vault BACKLOG #2319). Its `detail`
+names the setting whose hop holds the copy, and says what to do: wait for the reload, fix the file, or
+restart. The log line says the same. A replaced file that is not near expiry raises no alert. Each
+scan still logs a warning that a running hop holds an older copy, and why. If the file cannot be read,
+the scan judges the held copy instead of skipping it.
+
+**A held copy is matched by its file, not by its hop.** When two settings or connections name one
+CRL file, each gets its own row, and a copy that one hop holds is reported under both. Each alert
+then lists the other rows in `shared_with`. Its `detail` names the setting that holds the copy, so
+read that, not the row's label, to find the hop to restart.
+
+**A CRL inside a CA file counts too, on an outbound hop that checks revocation** (vault BACKLOG
+#2319). The outbound hops that resolve a trust anchor load `[tls].internal_ca_file`, or a
+connection's own `tls_ca_file`, whole, CRL blocks included. So does the syslog forwarder with
+`[logging].forward_tls_ca_file`. Once a CRL setting turns revocation checking on for that hop, those
+CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer. The scan watches
+each one in a row labelled `held-crl:` and the CA file's path. The reload does not apply a changed CA
+file, so a refreshed CRL inside one needs a restart, and the alert's `detail` says so. Put a CRL in
+the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
+only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
+The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.
+
+At least two cases still need a restart: a CRL inside a CA file, and a replacement refused under rule
+3. A hop may hold a CRL from a path no setting above names, such as an inbound `tls_crl_file` given
+through `env()`. The scan then adds a row for it, labelled `held-crl:` and the path. The
+`[store].ssl_crl_file` hop builds a fresh context for every new pool connection and records no held
+copy. If another setting names the same file, that file's row still reports those hops' copies. CRLs
+share `warn_days` with certificates. So a CRL reissued more often than `warn_days` sits inside the
+window and alerts on every scan.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|

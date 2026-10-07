@@ -1170,6 +1170,7 @@ only, so §5's out-of-scope fetch bullet and ADR 0078's offline reasoning are un
 fetch"*. A reload from the configured file is that, for every hop whose load is recorded. This note
 records the fact and does not re-decide §2. Whether the clause has fired, for the scorecard, is the
 ASVS record's question. **Still needing a restart, at least:** a CRL block inside a CA bundle, which
-nothing records, and a replacement the reload refused. A reload also reaches only the next full handshake: an established connection, or a resumed session, keeps the verdict it was made with. The §5 bullet that an operator who enables
+the expiry monitor judges since vault BACKLOG #2319 and the reload does not apply, and a
+replacement the reload refused. A reload also reaches only the next full handshake: an established connection, or a resumed session, keeps the verdict it was made with. The §5 bullet that an operator who enables
 direction 3 *takes on CRL refresh* still holds: the engine applies a refreshed file, it does not
 obtain one.
