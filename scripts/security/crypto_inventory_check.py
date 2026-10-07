@@ -818,7 +818,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # weakened-TLS escape is clamped exactly as the db_lookup executor's is. Builds no context.
     "messagefoundry/pipeline/reference_sync.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/security_notify.py": frozenset({"messagefoundry.config.tls_policy"}),
-    "messagefoundry/pipeline/wiring_runner.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # Vault BACKLOG #2756: also imports CipherError from store.crypto, only to classify a decrypt
+    # failure on the pre-send store read as a content fault. Calls no crypto itself.
+    "messagefoundry/pipeline/wiring_runner.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
+    ),
     "messagefoundry/transports/ai_broker.py": frozenset({"messagefoundry.config.tls_policy"}),
     # Vault BACKLOG #2579: reads the cleartext-hop authority's loopback predicate
     # (is_loopback_hop_host), so a proxy handler never carries a hop that authority calls on-box.
@@ -880,7 +884,8 @@ IMPORT_ONLY: dict[str, str] = {
     ),
     "messagefoundry/pipeline/wiring_runner.py": (
         "INSTRUMENT LIMIT. Decides whether a plaintext hop is allowed (is_loopback_hop_host, "
-        "active_hop_posture): a TLS posture decision with no crypto-shaped call in it"
+        "active_hop_posture): a TLS posture decision with no crypto-shaped call in it; and names "
+        "store.crypto's CipherError only to classify a decrypt failure, calling no cipher"
     ),
     "messagefoundry/store/cipher_cells.py": (
         "builds a cell AAD with cell_aad, which is byte framing and not a primitive; the decrypt "
@@ -1129,7 +1134,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
         }
     ),
-    "messagefoundry/integrity.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/integrity.py": frozenset(
+        {
+            "hash:hashlib.sha256",  # record_verdict: one RECORD row, for the start-up code inventory
+            # vault BACKLOG #2763: the attestation classifier streams SHA-256 over each attested file
+            # against its RECORD row, so a module swapped for a link to a huge file is not read whole.
+            "hash:hashlib.file_digest[sha256]",
+        }
+    ),
     # BACKLOG #1352 / #1171: the private-key wrap check every loader calls before it decrypts. It
     # parses the wrap with a stdlib DER reader, then makes the one load_cert_chain call every TLS
     # key site goes through (its import row above is ssl, for that call).
@@ -1631,6 +1643,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/verify/checks.py": frozenset(
         {"csprng:via messagefoundry.auth.service", "mac:via messagefoundry.auth.service"}
     ),
+    # Vault BACKLOG #2764: the issued step-up continuations are keyed by the session token's SHA-256
+    # (hash_token), so the table never holds a raw token. A lookup key, not a credential check.
+    "messagefoundry_webconsole/_auth.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
     "messagefoundry_webconsole/routes/account.py": frozenset(
         {"hash:via messagefoundry.auth.tokens"}
     ),

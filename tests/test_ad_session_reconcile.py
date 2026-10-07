@@ -33,11 +33,17 @@ from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
     AdPrincipal,
     DirectoryAnswer,
+    DirectoryBind,
     DirectoryProbe,
     LdapError,
     LdapReferralError,
 )
-from messagefoundry.auth.notifications import USERNAME_CHANGED
+from messagefoundry.auth.notifications import (
+    ACCOUNT_DISABLED,
+    DIRECTORY_SESSIONS_ENDED,
+    ROLES_CHANGED,
+    USERNAME_CHANGED,
+)
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
@@ -122,10 +128,13 @@ class _FakeLdap:
         self.probes: list[str] = []
         self.probe_keys: list[tuple[str, str]] = []
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
         # Login/step-up binds are deliberately NOT counted in ``probes``; that list measures the
         # reconciler's directory load only.
-        return self._lookup(username)
+        principal = self._lookup(username)
+        if principal is None:
+            return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+        return DirectoryBind(DirectoryAnswer.FOUND, principal)
 
     def resolve_principal(
         self, username: str, *, object_id: str | None = None
@@ -540,6 +549,39 @@ def test_the_outcome_record_caps_undetermined_entries_last() -> None:
     ledger = {"u1": U, "u2": P}
     reconcile.prune_ledger(ledger, ["u1"], rank=reconcile.outcome_rank)
     assert ledger == {"u1": U}
+
+
+def test_an_unkeyed_probe_strikes_like_an_absent_one_and_never_moves_the_hold() -> None:
+    """BACKLOG #2434, the pure layer. UNKEYED strikes and revokes at the threshold as
+    ``directory_object_id_missing``. Two of them are not a wave: no hold, nothing held, no latch."""
+    k = reconcile.ProbeOutcome.UNKEYED
+    probes = [reconcile.Probe("k1", "k1", k), reconcile.Probe("k2", "k2", k)]
+    first = _plan(probes)
+    assert first.revocations == () and first.strikes == {"k1": 1, "k2": 1}
+    second = _plan(probes, prior_strikes=dict(first.strikes), prior_outcomes=dict(first.outcomes))
+    assert sorted((r.user_id, r.reason) for r in second.revocations) == [
+        ("k1", "directory_object_id_missing"),
+        ("k2", "directory_object_id_missing"),
+    ]
+    assert not (first.hold or second.hold or first.latched or second.latched)
+    assert first.undetermined == 0 and first.readable == 0
+
+
+def test_an_unkeyed_probe_does_not_hide_an_outage_or_a_referral_only_pass() -> None:
+    """BACKLOG #2434. An UNKEYED row was never asked, so it says nothing about the directory: a
+    pass whose every ASKED probe failed is still an outage, and one of referrals is still that."""
+    unkeyed = reconcile.Probe("k", "k", reconcile.ProbeOutcome.UNKEYED)
+    down = reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE)
+    referred = reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED)
+    outage = _plan([down, unkeyed])
+    assert outage.aborted == "directory_unavailable"
+    assert (outage.probed, outage.asked) == (2, 1)
+    referral = _plan([referred, unkeyed])
+    assert referral.aborted == reconcile.REFERRAL_ABORT
+    assert (referral.probed, referral.asked) == (2, 1)
+    # CONTROL: a pass of UNKEYED rows alone is judged, not read as an outage.
+    alone = _plan([unkeyed])
+    assert alone.aborted is None and (alone.probed, alone.asked) == (1, 0)
 
 
 def test_breaker_ceiling_reports_the_larger_of_the_two_thresholds() -> None:
@@ -1170,7 +1212,11 @@ async def test_a_user_whose_only_session_is_idle_is_still_probed() -> None:
         now = time.time()
         for username, last_used in (("idler", now - idle - 60), ("active", now - idle + 60)):
             await store.create_user(
-                user_id=username, username=username, auth_provider="ad", password_generated=False
+                user_id=username,
+                username=username,
+                auth_provider="ad",
+                password_generated=False,
+                directory_object_id=_object_id_for(username),
             )
             await store.create_session(
                 token_hash=f"{username}-hash",
@@ -1334,27 +1380,169 @@ async def test_the_probe_is_keyed_on_the_immutable_id_when_the_row_carries_one()
         await store.close()
 
 
-async def test_a_row_with_no_immutable_id_still_probes_by_name() -> None:
-    """The residual path, and it is a DIRECTORY's property rather than a choice here.
+async def test_a_row_with_no_immutable_id_is_never_probed_by_name() -> None:
+    """BACKLOG #2434. A row with no ``objectGUID`` is read as UNKEYED without a lookup.
 
-    A row with no ``objectGUID`` gives the engine no identifier to key on. No sign-in mints such a
-    row since BACKLOG #2027, which refuses a principal with no id, so this is a row made before that
-    or planted in the store (the fixture plants it). The pass keeps the pre-#1471 behaviour for it,
-    rename wart included. Asserted so the fallback is a stated arm rather than something a later
-    change silently deletes.
+    No sign-in or step-up admits such a row since BACKLOG #2027, so these are rows made before that
+    or planted in the store (the fixture plants them). A name probe would ask a question another
+    account can answer: here each name now resolves to an entry whose groups map to Administrator.
+    The pass must not ask, must not write that entry's roles onto the row, and must end the rows'
+    sessions at the strike threshold. Two id-less rows at once is the case that would latch the
+    ADR 0195 hold, and hold them forever, had they been read as UNDETERMINED; so the hold must stay
+    off. ``alice`` is an id-bearing control, probed by her id and left alone.
     """
+    admin_group = "CN=mf-admins,OU=Groups,DC=test,DC=invalid"
+    idless = ("jdoe", "jroe")
     store = await MessageStore.open(":memory:")
     try:
-        ldap = _FakeLdap({"jdoe": replace(_principal("jdoe"), directory_object_id=None)})
+        ldap = _FakeLdap(
+            {
+                **{n: replace(_principal(n), directory_object_id=None) for n in idless},
+                "alice": _principal("alice"),
+            }
+        )
         service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
         await service.initialize()
-        await _signed_in_ad_user(service, store, "jdoe")
-        row = await store.get_user_by_username("jdoe")
-        assert row is not None and row.directory_object_id is None
+        await service.set_ad_group_map([(admin_group, Role.ADMINISTRATOR.value)], actor="test")
+        tokens = [await _signed_in_ad_user(service, store, n) for n in idless]
+        assert await _signed_in_ad_user(service, store, "alice") is not None
+        rows = [await store.get_user_by_username(n) for n in idless]
+        assert all(r is not None and r.directory_object_id is None for r in rows)
+        ids = sorted(r.id for r in rows if r is not None)
+        roles_before = {i: await store.get_user_role_ids(i) for i in ids}
+        for n in idless:
+            # What a name probe would now read: another account's entry, in the Administrator group.
+            ldap.present[n] = replace(
+                _principal(n, admin_group, object_id=_object_id_for("mallory")),
+                directory_object_id=None,
+            )
         ldap.probe_keys.clear()
 
-        await service.reconcile_directory_sessions()
-        assert ldap.probe_keys == [("username", "jdoe")]
+        plans = [await service.reconcile_directory_sessions() for _ in range(2)]
+
+        assert [k for k in ldap.probe_keys if k[0] == "username"] == [], (
+            "an id-less row was probed by name"
+        )
+        assert ldap.probe_keys == [("object_id", _object_id_for("alice"))] * 2
+        assert {i: await store.get_user_role_ids(i) for i in ids} == roles_before, (
+            "roles were written onto an id-less row"
+        )
+        assert plans[0].revocations == ()
+        assert sorted((r.user_id, r.reason) for r in plans[1].revocations) == [
+            (i, "directory_object_id_missing") for i in ids
+        ]
+        assert not any(plan.hold or plan.held or plan.latched for plan in plans)
+        assert service.directory_reconcile_hold is None
+        assert service._reconcile_hold_standing != "forfeit"
+        for token in tokens:
+            assert token is not None and await service.identity_for_token(token) is None
+    finally:
+        await store.close()
+
+
+async def test_a_referral_does_not_mark_an_id_less_row_it_can_never_confirm() -> None:
+    """BACKLOG #2434. A referral marks every candidate until a pass reads it PRESENT. An id-less
+    row is never probed, so it could never be confirmed, and its UNKEYED revocation would forfeit
+    the referral's clear. It is left unmarked; the id-bearing accounts are marked as before."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "alice": _principal("alice"),
+                "bob": _principal("bob"),
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in ("alice", "bob", "jdoe"):
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ids = {n: (await store.get_user_by_username(n)).id for n in ("alice", "bob", "jdoe")}  # type: ignore[union-attr]
+        ldap.referring.add("alice")
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert plan.referred == (ids["alice"],)
+        assert service._reconcile_referred == {ids["alice"], ids["bob"]}
+    finally:
+        await store.close()
+
+
+async def test_a_breaker_trip_does_not_mark_an_id_less_row_or_forfeit_its_clear() -> None:
+    """BACKLOG #2434, the breaker's half of the referral test above. A trip marks every candidate
+    unconfirmed until a pass reads it PRESENT, and revoking a marked account forfeits the clear. An
+    id-less row is never probed, so marked, its UNKEYED revocation on the first clean pass would
+    forfeit the clear every time. It is left unmarked, and that pass is evidence the trip cleared.
+    """
+    names = [f"user{i:02d}" for i in range(12)]
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                **{n: _principal(n) for n in names},
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in [*names, "jdoe"]:
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ids = {n: (await store.get_user_by_username(n)).id for n in [*names, "jdoe"]}  # type: ignore[union-attr]
+        present = {n: ldap.present.pop(n) for n in names}  # a wrong search base: nobody is found
+
+        assert (await service.reconcile_directory_sessions()).aborted is None  # strike 1
+        tripped = await service.reconcile_directory_sessions()  # strike 2: 13 revocations
+        assert tripped.aborted == "mass_revoke_breaker"
+        assert service._reconcile_unconfirmed == {ids[n] for n in names}, (
+            "the id-less row was marked by the trip"
+        )
+
+        ldap.present.update(present)  # the operator fixes the search base
+        clean = await service.reconcile_directory_sessions()
+
+        assert [(r.user_id, r.reason) for r in clean.revocations] == [
+            (ids["jdoe"], "directory_object_id_missing")
+        ]
+        assert service._reconcile_breaker_standing == "tripped", "the clear was forfeited"
+        assert clean.breaker_clear
+    finally:
+        await store.close()
+
+
+async def test_an_outage_beside_an_id_less_row_counts_only_the_probes_asked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #2434. An id-less row is never asked, so it is no part of an outage: the pass is
+    still named one, and its warning and its ``auth.ad_reconcile_skipped`` row count the two
+    probes that failed, not the three rows the pass judged."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "alice": _principal("alice"),
+                "bob": _principal("bob"),
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in ("alice", "bob", "jdoe"):
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ldap.unreachable = {"alice", "bob"}  # the DC goes away
+
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+
+        assert plan.aborted == "directory_unavailable"
+        skipped = [
+            json.loads(a["detail"])
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_reconcile_skipped"
+        ]
+        assert skipped == [{"reason": "directory_unavailable", "asked": 2}]
+        warned = [r.getMessage() for r in caplog.records if "probes failed" in r.getMessage()]
+        assert len(warned) == 1 and "ALL 2 probes failed" in warned[0]
+        assert (plan.probed, plan.asked, plan.unavailable) == (3, 2, 2)
     finally:
         await store.close()
 
@@ -1408,14 +1596,10 @@ async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id(
         await service.reconcile_directory_sessions()
 
         bound = {u.username for u in await store.list_users() if u.oidc_subject is not None}
-        # AC-5 ITSELF: no bound row was asked about by name.
-        assert [key for key in ldap.probe_keys if key[0] == "username" and key[1] in bound] == []
-        # CONTROL: the pass did probe by name -- the unbound id-less row -- so the check above had
-        # a name-keyed probe to find, and the bound row was probed by its id.
-        assert sorted(ldap.probe_keys) == [
-            ("object_id", _object_id_for("jdoe")),
-            ("username", "nobody"),
-        ]
+        # AC-5 ITSELF, and since BACKLOG #2434 more: no row at all was asked about by name. The
+        # unbound id-less row is read as unkeyed unasked, and the bound row by its id.
+        assert [key for key in ldap.probe_keys if key[0] == "username"] == []
+        assert ldap.probe_keys == [("object_id", _object_id_for("jdoe"))]
         assert refused and bound == {"jdoe"}
     finally:
         await store.close()
@@ -1429,9 +1613,9 @@ async def test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name() -> Non
     name, so the pass must not ask about it at all. It is skipped the way an account the pass cannot
     ask about is skipped: its session is left alone, not revoked, and the skip is audited once.
 
-    Two controls share the pass. An id-bearing bound row is still probed by its id, and an UNBOUND
-    id-less row is still probed by name, so the name-keyed arm is narrowed to exactly the bound
-    rows rather than switched off.
+    Two controls share the pass. An id-bearing bound row is still probed by its id. An UNBOUND
+    id-less row is not probed either, but unlike the bound one it is judged: it reads as
+    unkeyed, strikes and is revoked (BACKLOG #2434), so the skip is the binding's alone.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -1470,15 +1654,17 @@ async def test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name() -> Non
         ldap.present.pop("legacy")  # gone from the directory: a name probe would strike it
 
         ldap.probe_keys.clear()
+        nobody = await store.get_user_by_username("nobody")
+        assert nobody is not None
+        revoked: list[str] = []
         for _ in range(3):  # past the strike threshold, so a name probe would have revoked
             plan = await service.reconcile_directory_sessions()
-            assert plan.aborted is None and plan.revocations == ()
+            assert plan.aborted is None
+            revoked += [r.user_id for r in plan.revocations]
 
+        assert revoked == [nobody.id], "the bound id-less row was revoked, or the unbound one not"
         assert ("username", "legacy") not in ldap.probe_keys
-        assert sorted(set(ldap.probe_keys)) == [
-            ("object_id", _object_id_for("jdoe")),
-            ("username", "nobody"),
-        ]
+        assert sorted(set(ldap.probe_keys)) == [("object_id", _object_id_for("jdoe"))]
         assert token is not None and await service.identity_for_token(token) is not None
         skipped = [
             json.loads(a["detail"])
@@ -1536,7 +1722,8 @@ async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins()
 
     A mark kept only for signed-in rows would drop whenever the sessions lapse, and the account
     would be reported again on its next sign-in. After the unbind the row is ordinary again, so its
-    mark goes, and the pass probes it by name like any unbound id-less row.
+    mark goes, and the pass reads it as unkeyed unasked like any unbound id-less row (BACKLOG
+    #2434).
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -1576,8 +1763,9 @@ async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins()
         )
         await _signed_in_ad_user(service, store, "legacy")
         ldap.probe_keys.clear()
-        await service.reconcile_directory_sessions()
-        assert ldap.probe_keys == [("username", "legacy")]
+        plan = await service.reconcile_directory_sessions()
+        assert ldap.probe_keys == []
+        assert plan.outcomes == {legacy.id: reconcile.ProbeOutcome.UNKEYED} and not plan.hold
         assert await reported() == 1
     finally:
         await store.close()
@@ -3244,5 +3432,70 @@ async def test_a_scope_revocation_sends_no_account_disabled_notice() -> None:
         plan = await service.reconcile_directory_sessions()
         assert [r.reason for r in plan.revocations] == [reconcile.SCOPE_CHANGED]
         assert notifier.sent == []
+    finally:
+        await store.close()
+
+
+#: vault BACKLOG #2140. The notice each revocation reason sends, decided once. ``None`` is no notice.
+#: ACCOUNT_DISABLED says an administrator disabled the account, so only the reason that READ the
+#: disabled bit may send it.
+_NOTICE_FOR_REASON: dict[str, str | None] = {
+    "directory_disabled": ACCOUNT_DISABLED,
+    "directory_absent": DIRECTORY_SESSIONS_ENDED,
+    "directory_undetermined": DIRECTORY_SESSIONS_ENDED,
+    # BACKLOG #2434. The row was never probed, so nothing read the disabled bit.
+    "directory_object_id_missing": DIRECTORY_SESSIONS_ENDED,
+    "roles_changed": ROLES_CHANGED,
+    reconcile.SCOPE_CHANGED: None,
+}
+
+#: Every revocation reason the reconciler can plan, read from the code rather than listed here, so a
+#: new reason fails the test below until its notice is decided in the table above.
+_ALL_REVOCATION_REASONS = sorted(
+    {*reconcile.REVOKE_REASONS.values(), "roles_changed", reconcile.SCOPE_CHANGED}
+)
+
+
+@pytest.mark.parametrize("reason", _ALL_REVOCATION_REASONS)
+async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> None:
+    """vault BACKLOG #2140. ``directory_absent`` and ``directory_undetermined`` never read the
+    disabled bit, so they must not send ACCOUNT_DISABLED. Applied directly, so each reason is
+    exercised whether or not a fixture directory can produce it."""
+    assert reason in _NOTICE_FOR_REASON, f"no notice decided for revocation reason {reason!r}"
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        extra: dict[str, Any] = {}
+        if reason == "roles_changed":
+            extra["role_ids"] = ()
+        if reason == reconcile.SCOPE_CHANGED:
+            extra.update(scope_changed=True, scope_from=user.channel_scope, scope_to=None)
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason, **extra)
+        assert await service._apply_reconcile_revocation(revocation)
+        expected = _NOTICE_FOR_REASON[reason]
+        assert [e.event_type for e in notifier.sent] == ([] if expected is None else [expected])
+        if expected is not None:
+            assert notifier.sent[0].detail == {"reason": reason}
+    finally:
+        await store.close()
+
+
+async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -> None:
+    """vault BACKLOG #2140. Only a READ disabled bit may say "disabled", so a whole-account reason
+    the apply step does not name gets the neutral notice, never ACCOUNT_DISABLED."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="directory_synthetic_new_reason"
+        )
+        assert await service._apply_reconcile_revocation(revocation)
+        assert [e.event_type for e in notifier.sent] == [DIRECTORY_SESSIONS_ENDED]
     finally:
         await store.close()

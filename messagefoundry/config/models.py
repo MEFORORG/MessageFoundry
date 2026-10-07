@@ -180,12 +180,41 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
     STOP = "stop"
 
 
+def require_flag(value: object, key: str) -> bool:
+    """Return ``value`` if it is a real ``bool``; refuse anything else, naming ``key`` (vault BACKLOG #2232).
+
+    For the hop-policy flags (``tls_hop_attested``, ``tls_revocation_attested``,
+    ``cleartext_accepted``). ``bool("false")`` is ``True``, so a lax read would honour the string
+    ``"false"`` as the flag SET; an ``env()`` reference is truthy too. ``connections.toml`` already
+    refuses both (``connections_file._require_bool``); this is the same rule for the code-first
+    factories and the settings-driven seams. A typed pydantic field (``Source``, ``Destination``,
+    ``[logging].forward_hop_attested``) is lax ``bool`` and coerces before this runs."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false, not {type(value).__name__}")
+    return value
+
+
+def flag_from_settings(settings: Mapping[str, Any], key: str) -> bool:
+    """The one reader of a hop-policy flag out of a raw settings mapping (vault BACKLOG #2232).
+
+    Absent, or ``None``, means ``False``. A real ``bool`` is returned as is. Anything else raises
+    :class:`ValueError` naming ``key`` (:func:`require_flag`), so a mapping that was written past
+    every factory cannot cross a refusal on a truthy string."""
+    value = settings.get(key)
+    return False if value is None else require_flag(value, key)
+
+
 def _check_flag_with_reason(
     flag: bool, reason: str | None, *, flag_name: str, reason_name: str, flag_means: str, why: str
 ) -> None:
     """The three fail-loud rules every flag-plus-mandatory-reason pair shares: a reason without the
     flag, the flag without a reason, and a blank reason. One body, so the pairs cannot drift apart;
-    each caller supplies only its names and the sentence saying why the reason is required."""
+    each caller supplies only its names and the sentence saying why the reason is required.
+
+    The flag must be a real ``bool`` (vault BACKLOG #2232). A code-first factory passes the author's
+    value straight here, and the string ``"false"`` is truthy, so it would otherwise pass as a set flag
+    and be mirrored into settings as ``True``."""
+    require_flag(flag, flag_name)
     if reason is not None and not flag:
         raise ValueError(
             f"{reason_name} is set without {flag_name}=true — set the flag to {flag_means}, "
@@ -226,18 +255,21 @@ def _check_hop_attestation(attested: bool, reason: str | None) -> None:
 
 
 def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
-    """Read and load-validate the insecure-hop attestation pair out of a raw settings mapping
-    (BACKLOG #1666), for the two DB cells that have no :class:`Source`/:class:`Destination` model to
-    carry it: the ``db_lookup`` executor and the SQL-backed reference source.
+    """Read and load-validate the insecure-hop attestation pair out of a resolved settings mapping
+    (BACKLOG #1666), for the carriers that have no :class:`Source`/:class:`Destination` model to hold
+    it: the ``db_lookup`` executor, the SQL-backed reference source and the ``FhirLookup`` read
+    executor.
 
     Same three fail-loud rules as :func:`_check_hop_attestation` — this is that validator with the
-    mapping read in front of it, so the two cells cannot drift from the modelled ones or each other.
+    mapping read in front of it, so these carriers cannot drift from the modelled ones or each other.
 
-    A mapping is the ONLY carrier for those cells. ``DatabaseLookup()`` and ``DatabaseRef()`` write the
-    pair into it from their own ``tls_hop_attested`` parameters (owner ruling 2026-09-24), and
-    ``config.wiring.attested_secure_hops`` reads the same mapping, so the loosening report names every
-    attestation this reader honours."""
-    attested = bool(settings.get("tls_hop_attested", False))
+    ``DatabaseLookup()``, ``DatabaseRef()`` and ``FhirLookup()`` write the pair into the mapping from
+    their own ``tls_hop_attested`` parameters (owner ruling 2026-09-24). The mapping stays mutable, so
+    this reader can meet a value no factory wrote. ``config.wiring.attested_secure_hops`` lists every
+    flag that is not ``None`` or ``False``, which covers every value this reader honours, and
+    ``config.wiring.refuse_unresolved_hop_flags`` refuses a non-bool flag at load, before ``env()``
+    resolves (vault BACKLOG #2232)."""
+    attested = flag_from_settings(settings, "tls_hop_attested")
     reason = settings.get("tls_hop_attested_reason")
     _check_hop_attestation(attested, None if reason is None else str(reason))
     return attested
@@ -353,12 +385,44 @@ class RetryPolicy(BaseModel):
     decision for a partner that must never advance past a message, rather than what you get by saying
     nothing. Under FIFO a forever-retrying head blocks its lane until it succeeds or an operator
     purges it. A permanent ``AR`` reject is the exception to all of this — it fails fast without
-    consuming the budget (see :class:`~messagefoundry.transports.base.NegativeAckError`)."""
+    consuming the budget (see :class:`~messagefoundry.transports.base.NegativeAckError`).
+
+    The three backoff fields are bounded (vault BACKLOG #2761): a positive, finite base and cap, and
+    a finite multiplier of at least 1. A zero or negative base loaded clean and retried a down
+    partner in a tight loop; an infinite cap scheduled a retry that never comes due. ``max_attempts``
+    is deliberately left unfloored here: ``RetryPolicy(max_attempts=0)`` is the internal idiom for a
+    permanent, no-retry failure, and the operator-facing floor lives on the ``[delivery]`` twin."""
+
+    # Assignment is validated too, so a code-first ``policy.backoff_seconds = 0`` cannot step around
+    # the bounds below.
+    model_config = ConfigDict(validate_assignment=True)
 
     max_attempts: int | None = 100
-    backoff_seconds: float = 5.0
-    backoff_multiplier: float = 2.0
-    max_backoff_seconds: float = 300.0
+    backoff_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    backoff_multiplier: float = Field(default=2.0, ge=1, allow_inf_nan=False)
+    max_backoff_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+
+    def backoff_for(self, attempts: int) -> float:
+        """The delay before the next attempt of a row whose post-claim attempt count is ``attempts``:
+        ``min(max_backoff_seconds, backoff_seconds * backoff_multiplier ** (attempts - 1))``, the
+        exponent floored at 0. The one formula every store's ``mark_failed`` and batch head use.
+
+        Computed without ever raising (vault BACKLOG #2761). The power is evaluated before the
+        ``min``, so under retry-forever with the shipped multiplier of 2 it raised ``OverflowError``
+        at attempt 1025, from inside a delivery failure arm. Past that point the delay is the cap, so
+        the lane keeps the cap's pace at any attempt count. Below it the result is the plain formula,
+        bit for bit. An attempt count of 0 (a replay or release reset under a late worker) floors to
+        the base, so a multiplier of 0 reaching here unvalidated cannot raise ``ZeroDivisionError``
+        either (ADR 0157 Amendment A)."""
+        exponent = max(attempts - 1, 0)
+        try:
+            return min(
+                self.max_backoff_seconds, self.backoff_seconds * self.backoff_multiplier**exponent
+            )
+        except OverflowError:
+            # The power left float range (past 1.8e308), so the true delay is at or past the cap: for
+            # any cap under 1e15 seconds the base would have to be below 1e-293 for it not to be.
+            return self.max_backoff_seconds
 
 
 class BuildupThreshold(BaseModel):

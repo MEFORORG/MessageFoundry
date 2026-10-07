@@ -31,13 +31,18 @@ from .._auth import (
 # Neither POST is registered. A stepdown is never auto-re-POSTed across a re-auth; a stale POST maps back
 # to its confirm page instead (reauth_next below), so the operator reads the consequence again first.
 register_ui_action(
-    r"^/ui/cluster/stepdown-confirm$", Permission.CLUSTER_CONTROL, auto_retry=False, unlock=True
+    r"^/ui/cluster/stepdown-confirm$",
+    Permission.CLUSTER_CONTROL,
+    auto_retry=False,
+    unlock=True,
+    label="Open the cluster step-down confirmation",
 )
 register_ui_action(
     r"^/ui/cluster/force-stepdown-confirm$",
     Permission.CLUSTER_CONTROL,
     auto_retry=False,
     unlock=True,
+    label="Open the forced cluster step-down confirmation",
 )
 
 

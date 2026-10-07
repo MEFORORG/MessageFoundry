@@ -23,6 +23,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
+    DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
@@ -72,6 +73,7 @@ _SUBJECTS = {
     FEDERATED_IDENTITY_UNBOUND: "An external sign-in identity was removed from your MessageFoundry account",
     FIRST_ADMINISTRATOR_TAKEOVER: "Your MessageFoundry account was made an Administrator from the host",
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
+    DIRECTORY_SESSIONS_ENDED: "Your MessageFoundry sessions were ended by a directory check",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
     MFA_CREDENTIAL_REMOVED: "A second factor was removed from your MessageFoundry account",
@@ -107,6 +109,11 @@ _DESCRIPTIONS = {
         "no longer works."
     ),
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
+    # vault BACKLOG #2140. Says only what the engine did. The probe either could not match the
+    # account or could not read whether it is disabled, so this must not say disabled or deleted.
+    DIRECTORY_SESSIONS_ENDED: (
+        "A check against your organization's directory ended your MessageFoundry sessions."
+    ),
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",
     # BACKLOG #1139: this arm reports WHAT CHANGED and states what still stands. It must not borrow
@@ -458,11 +465,13 @@ def _build_body(event: SecurityEvent) -> str:
             USERNAME_CHANGED,
             FEDERATED_IDENTITY_BOUND,
             FEDERATED_IDENTITY_UNBOUND,
+            DIRECTORY_SESSIONS_ENDED,
         )
     ):
         # A directory rename or email change is an administrator's act, so "if this was you"
         # cannot apply to it (the email half is BACKLOG #2291). Nor to a federated link or unlink:
-        # both routes refuse an administrator changing their own account's binding.
+        # both routes refuse an administrator changing their own account's binding. Nor to the
+        # engine ending sessions on a directory answer (vault BACKLOG #2140).
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."

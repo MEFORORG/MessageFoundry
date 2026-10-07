@@ -35,7 +35,7 @@ from _totp_clock import fresh_totp
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import Identity
-from messagefoundry.auth.ldap import AdPrincipal, LdapError
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, LdapError
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     LOGIN_AFTER_FAILURES,
@@ -562,6 +562,8 @@ async def test_the_reauth_crossing_attempt_audits_account_locked_once_and_notifi
         assert '"session_revoked": true' in str(reauths[0]["detail"])
         assert '"session_revoked": false' in str(reauths[-1]["detail"])
 
+        # The lock notice runs as a background task (BACKLOG #2216); finish it, never sleep.
+        await service.drain_background()
         notices = [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
         assert len(notices) == 1
         # ADR 0197: the notice also names the lock and its cycle count, a closed-set detail.
@@ -633,11 +635,13 @@ class _FakeDirectory:
         self.down = False
         self.known = True  # False = the directory has no such principal (renamed, disabled, ...)
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
         self.binds += 1
         if self.down:
             raise LdapError("synthetic: directory unreachable")
-        return _principal() if password == AD_GOOD and self.known else None
+        if not self.known:
+            return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+        return DirectoryBind(DirectoryAnswer.FOUND, _principal() if password == AD_GOOD else None)
 
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return _principal() if self.known else None

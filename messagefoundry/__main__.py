@@ -51,7 +51,7 @@ import logging  # noqa: E402
 import sqlite3  # noqa: E402  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys  # noqa: E402
 import tomllib  # noqa: E402  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
-from collections.abc import Awaitable, Mapping, Sequence  # noqa: E402
+from collections.abc import Awaitable, Callable, Mapping, Sequence  # noqa: E402
 from pathlib import (  # noqa: E402
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
@@ -77,9 +77,11 @@ from messagefoundry.cli_surface import (  # noqa: E402  # pure data, stdlib-only
 from messagefoundry.console_streams import harden_console_streams  # noqa: E402
 from messagefoundry.logging_setup import (  # noqa: E402
     LOG_LEVELS,
+    PRODUCTION_DEBUG_REFUSED,
     LogFile,
     SyslogForward,
     configure_logging,
+    level_refused_on_production,
     query_sntp_offset,
 )
 from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
@@ -643,6 +645,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     import_corepoint.add_argument(
         "--out", required=True, help="config directory to write the generated modules into"
+    )
+    import_corepoint.add_argument(
+        "--force",
+        action="store_true",
+        help="replace modules already in --out under the names this import writes (without it, an "
+        "existing module is refused and nothing is written)",
     )
     import_corepoint.add_argument("--json", action="store_true", help="emit a JSON import summary")
 
@@ -1671,8 +1679,10 @@ def _load_service_settings(
     """Load the service settings for a BOOT-PATH command, returning ``(settings, detail)``.
 
     It has more callers than the boot path now, at least ``audit-anchor`` and ``audit-verify``
-    (BACKLOG #2094, vault BACKLOG #3054), whose output is meant to be safe to keep in a ticket. The
-    section below on why it exists still describes the two boot-path commands it was written for.
+    (BACKLOG #2094, vault BACKLOG #3054), whose output is meant to be safe to keep in a ticket, and
+    since vault BACKLOG #2760 the operator commands that load the whole file; its call sites are
+    the list, and ``tests/test_cli_settings_error_render.py`` exercises them. The section below on
+    why it exists still describes the two boot-path commands it was written for.
 
     Exactly one side is non-``None``. The PAIR rather than a printed line, because that is the
     shape :func:`messagefoundry.verify.runner._load_settings` already has for the same load, and
@@ -1690,8 +1700,9 @@ def _load_service_settings(
     log on every start attempt, with no operator present to see it happen, and support-bundle
     assembly collects those logs afterwards. Nothing runs this engine yet, so that is what a first
     deployment WOULD hit rather than something anyone is living with -- which is the reason there
-    is still time to render it properly. The other ``ValidationError`` arms in this module answer
-    an operator standing at a terminal; they are a separate question, deliberately untouched here.
+    is still time to render it properly. The operator commands answer someone at a terminal, but a
+    scheduled ``backup`` or ``rotate-key`` writes its output to a job log just the same, which is
+    why vault BACKLOG #2760 moved them here too.
 
     ``OSError`` IS IN THE CATCH, AND THIS IS THE ONE PLACE THAT SAYS WHY. A ``--service-config``
     naming a DIRECTORY passes ``load_settings``'s ``Path.exists()`` guard and then raises at the
@@ -1715,6 +1726,26 @@ def _load_service_settings(
         return load_settings(config_path=config_path, cli=cli), None
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
         return None, settings_error_detail(exc)
+
+
+def _post_write_settings_check(refusal: type[ValueError]) -> Callable[[Path], None]:
+    """The ``validate`` callback ``security set`` and ``alert add``/``remove`` hand their editor.
+
+    It re-loads the edited file exactly as the engine does, so a bad write fails at edit time and the
+    editor rolls it back rather than the engine refusing at the next start. That reload is the WHOLE
+    file plus the environment layer, not the JSON the operator typed, so its failure goes through
+    :func:`_load_service_settings` and is raised as ``refusal`` already rendered (vault BACKLOG
+    #2760); the editor modules stay outside the settings import graph and cannot render it."""
+
+    def validate(settings_path: Path) -> None:
+        settings, detail = _load_service_settings(str(settings_path))
+        if settings is None:
+            raise refusal(
+                "the settings do not load with this edit applied (the file plus any MEFOR_* "
+                f"environment overrides), so the edit was not saved: {detail}"
+            )
+
+    return validate
 
 
 def _forward_spool_dir(settings: ServiceSettings, shard: str | None) -> str:
@@ -2198,16 +2229,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     # Gate #1: DEBUG logging can surface PHI (full message bodies / raw field values) into the general
     # log. Refuse it fail-closed on a production instance — real PHI flows there. A non-production
-    # instance may use DEBUG for diagnostics.
-    if production and settings.logging.level.upper() == "DEBUG":
-        print(
-            "error: DEBUG logging is refused on a production instance "
-            "([security].production_instance=true) — it can surface PHI (full message bodies / raw "
-            "field values) into logs. Use INFO or higher in production (set "
-            "[security].production_instance=false on a non-production instance for verbose "
-            "diagnostics).",
-            file=sys.stderr,
-        )
+    # instance may use DEBUG for diagnostics. The predicate is shared with the run-time setter behind
+    # PATCH /logging/level, so a production instance refused DEBUG here is refused it there too
+    # (vault BACKLOG #2777).
+    if level_refused_on_production(settings.logging.level, production=production):
+        print(f"error: {PRODUCTION_DEBUG_REFUSED}", file=sys.stderr)
         return 2
 
     # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
@@ -2453,6 +2479,7 @@ def _serve(args: argparse.Namespace) -> int:
         attested_hops=(),
         revocation_attested_hops=(),
         api=settings.api,
+        approvals=settings.approvals,
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
@@ -4998,11 +5025,12 @@ def _import(args: argparse.Namespace) -> int:
 
     Writes one ``@router``/``@handler`` module per channel into ``--out`` and reports the count-and-log
     summary (mapped vs. unmapped actions). The export is untrusted data — a malformed export is a clean
-    error + exit 1, never a traceback."""
+    error + exit 1, never a traceback. A module already in ``--out`` under a name this import writes
+    is refused (exit 1, naming each file, nothing written) unless ``--force`` is given."""
     from messagefoundry.corepoint_import import CorepointImportError, import_corepoint
 
     try:
-        result = import_corepoint(args.export, args.out)
+        result = import_corepoint(args.export, args.out, force=args.force)
     except (CorepointImportError, OSError, RecursionError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
@@ -5071,10 +5099,14 @@ def _init(args: argparse.Namespace) -> int:
 
 def _service(args: argparse.Namespace) -> int:
     """Control the engine's Windows service (ADR 0088). ``status`` queries state (no elevation);
-    ``start``/``stop`` elevate once via UAC; ``install`` runs scripts/service/install-service.ps1
-    elevated. The engine can't stop/start its *own* hosting service through the API, so this is a
-    local, out-of-band CLI over the Windows SCM. Off Windows the actions are no-ops (return 1) and
-    ``status`` prints ``unavailable``."""
+    ``start``/``stop`` elevate once via UAC and wait for the elevated ``net`` command; ``install``
+    runs scripts/service/install-service.ps1 elevated. The engine can't stop/start its *own* hosting
+    service through the API, so this is a local, out-of-band CLI over the Windows SCM. Off Windows
+    the actions are no-ops (return 1) and ``status`` prints ``unavailable``.
+
+    A declined UAC prompt or a failed elevation exits 1 with the reason on stderr, so a wrapper
+    script never reads a refused action as success (vault BACKLOG #2787). A service already in the
+    requested state exits 0, so ``stop`` and ``start`` are idempotent."""
     from messagefoundry import service as svc
 
     action = args.action
@@ -5098,28 +5130,56 @@ def _service(args: argparse.Namespace) -> int:
             )
             return 2
         try:
-            started = svc.install_service(str(script), args.env)
+            launched = svc.install_service(str(script), args.env)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        if not started:
+        if launched is svc.ServiceControlOutcome.DISPATCHED:
+            print(f"launched the elevated installer for environment {args.env!r}")
+            return 0
+        if launched is svc.ServiceControlOutcome.UNSUPPORTED:
             print("error: `service install` is Windows-only", file=sys.stderr)
-            return 1
-        print(f"launched the elevated installer for environment {args.env!r}")
+        else:
+            print(
+                "error: the elevated installer did not launch: the UAC prompt was declined or the "
+                "launch failed; nothing was installed",
+                file=sys.stderr,
+            )
+        return 1
+    # start / stop. Already in the requested state is success, not a failure: `net stop` of a stopped
+    # service exits non-zero, and an operator script or the uninstall path that stops first must not
+    # abort on it. Asked BEFORE elevating, so a no-op raises no UAC prompt, and again after a FAILED,
+    # for a service that reached the state while this ran.
+    wanted = "stopped" if action == "stop" else "running"
+    already = f"service {args.name!r} is already {wanted}; nothing to {action}"
+    if svc.service_state(args.name) == wanted:
+        print(already)
         return 0
-    # start / stop
     try:
-        started = svc.control_service(action, args.name)
+        outcome = svc.control_service_ex(action, args.name)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if not started:
+    if outcome is svc.ServiceControlOutcome.DISPATCHED:
+        print(f"elevated `net {action}` of service {args.name!r} completed")
+        return 0
+    if outcome is svc.ServiceControlOutcome.UNSUPPORTED:
         print(f"error: `service {action}` is Windows-only", file=sys.stderr)
-        return 1
-    print(
-        f"requested elevated `{action}` of service {args.name!r}; poll `service status` for state"
-    )
-    return 0
+    elif outcome is svc.ServiceControlOutcome.CANCELLED:
+        print(
+            f"error: the UAC prompt was declined; `service {action}` of {args.name!r} did not run",
+            file=sys.stderr,
+        )
+    elif svc.service_state(args.name) == wanted:
+        print(already)
+        return 0
+    else:
+        print(
+            f"error: `service {action}` of {args.name!r} failed: elevation failed, `net {action}` "
+            "exited non-zero, or it did not finish in time; check `service status`",
+            file=sys.stderr,
+        )
+    return 1
 
 
 def _gen_key(_args: argparse.Namespace) -> int:
@@ -5300,14 +5360,10 @@ def _cert_inventory(args: argparse.Namespace) -> int:
     client_certs: Sequence[str] = ()
     settings_crls: list[MonitoredCert] = []
     if args.service_config:
-        from pydantic import ValidationError
-
-        from messagefoundry.config.settings import load_settings
-
-        try:
-            settings = load_settings(config_path=args.service_config)
-        except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-            return _cert_fail(f"cannot load --service-config: {exc}", as_json=args.json)
+        # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+        settings, detail = _load_service_settings(args.service_config)
+        if settings is None:
+            return _cert_fail(f"cannot load --service-config: {detail}", as_json=args.json)
         # The cert the bind SERVES with, which is no longer the same question as
         # `[api].tls_cert_file`.
         api_plan = plan_api_tls_material(
@@ -5642,17 +5698,15 @@ def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | in
     """
     from pathlib import Path
 
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.config.settings import StoreBackend
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
         cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
+    # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        return _emit_error(detail or "could not load the service settings", as_json=args.json)
 
     # The same M-31 guard _audit_verify carries. Before #1780 a SQLite store was CREATED on open, so a
     # typo'd path yielded a fresh empty DB and a false "no such user". open_store now refuses an absent
@@ -6490,8 +6544,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
     """
     import getpass
 
-    from pydantic import ValidationError
-
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.policy import BreachCorpusUnavailable, PasswordPolicy
     from messagefoundry.auth.service import (
@@ -6507,7 +6559,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         keyless_opt_out_refusal,
-        load_settings,
     )
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import KeylessAuditChainRefused, open_store
@@ -6515,10 +6566,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
         cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
+    # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        return _emit_error(detail or "could not load the service settings", as_json=args.json)
 
     # AC-15: the argument checks, before the prompt and before any open. The limits are the web
     # console's (`UserCreateRequest`), so this offline surface admits nothing the console refuses,
@@ -7486,9 +7537,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     """
     from pathlib import Path
 
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.config.settings import StoreBackend
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
@@ -7497,10 +7546,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
         cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        print(f"error: {detail}", file=sys.stderr)
         return 2
 
     try:
@@ -7671,10 +7720,8 @@ def _backup(args: argparse.Namespace) -> int:
     store, bundle the config dir, encrypt to a ``.mfbak`` archive at the destination, restore-verify,
     and prune to keep-N. PHI-safe output (paths/counts/fingerprints only — never a body or key bytes).
     Run any time; it is read-only against the live store and writes one ``dr_backup`` audit row."""
-    from pydantic import ValidationError
-
     from messagefoundry import __version__
-    from messagefoundry.config.settings import keyless_opt_out_refusal, load_settings
+    from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
@@ -7689,10 +7736,10 @@ def _backup(args: argparse.Namespace) -> int:
     # On-demand backup is opt-in by invocation, so enable it for this run regardless of [backup].enabled
     # (the file flag governs only the SCHEDULED loop). The destination must still resolve.
     cli.setdefault("backup", {})["enabled"] = True
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
+    # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        return _emit_error(detail or "could not load the service settings", as_json=args.json)
     if not settings.backup.destination.strip():
         return _emit_error(
             "no backup destination — pass --destination or set [backup].destination (a LOCAL/UNC path)",
@@ -7788,9 +7835,6 @@ def _restore_verify(args: argparse.Namespace) -> int:
     + a reason only, never a body)."""
     from pathlib import Path
 
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import load_settings
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import run_restore_verify
 
@@ -7799,10 +7843,10 @@ def _restore_verify(args: argparse.Namespace) -> int:
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
         cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
+    # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        return _emit_error(detail or "could not load the service settings", as_json=args.json)
 
     # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
     # call is inside `_full_open_check`, which already catches broadly and reports FAIL with a
@@ -7841,16 +7885,13 @@ def _restore(args: argparse.Namespace) -> int:
     refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. **Never
     overwrites:** an existing destination is refused rather than clobbered. PHI-safe output (paths,
     counts, fingerprints — never a body or key bytes)."""
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import load_settings
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import BackupError, run_restore
 
-    try:
-        settings = load_settings(config_path=args.service_config)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
+    # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+    settings, detail = _load_service_settings(args.service_config)
+    if settings is None:
+        return _emit_error(detail or "could not load the service settings", as_json=args.json)
 
     try:
         # `run_restore` carries no `allow_unencrypted` knob at all (unlike `run_restore_verify`): the
@@ -8104,8 +8145,6 @@ def _connection(args: argparse.Namespace) -> int:
     import os
     from pathlib import Path
 
-    from pydantic import ValidationError
-
     from messagefoundry.config import connections_edit
     from messagefoundry.config.environments import (
         load_environment_values,
@@ -8115,7 +8154,6 @@ def _connection(args: argparse.Namespace) -> int:
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         hop_posture_from_ai,
         insecure_bind_escape,
-        load_settings,
     )
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
@@ -8140,10 +8178,10 @@ def _connection(args: argparse.Namespace) -> int:
     # upsert / remove: validate the candidate dir against this instance's [egress] allowlist + active
     # environment before persisting, so a GUI edit pointing at a non-allowlisted host fails at edit
     # time exactly as it would at reload.
-    try:
-        settings = load_settings(config_path=args.service_config)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
+    # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+    settings, detail = _load_service_settings(args.service_config)
+    if settings is None:
+        return _emit_error(detail or "could not load the service settings", as_json=args.json)
     env_name = settings.ai.environment
     # Anchor environments/<env>.toml the same way serve does (honor [environments].base_dir), so a
     # GUI/CLI edit validates against the same env() values the running instance will resolve.
@@ -8441,7 +8479,7 @@ def _support_bundle(args: argparse.Namespace) -> int:
     bundle is still produced (support is most wanted when something is already broken)."""
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.settings import load_settings, settings_error_detail
     from messagefoundry.support import build_bundle
 
     settings = None
@@ -8453,11 +8491,28 @@ def _support_bundle(args: argparse.Namespace) -> int:
         if args.service_config is not None:
             print(f"error: service config not found: {args.service_config}", file=sys.stderr)
             return 2
+    except OSError as exc:
+        # An explicit --service-config that cannot be read (a directory named as the file: see
+        # `_load_service_settings`) is the same user error as one that does not exist.
+        if args.service_config is not None:
+            print(
+                f"error: cannot read --service-config: {settings_error_detail(exc)}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"warning: could not load service settings ({settings_error_detail(exc)}); "
+            "status/log omitted",
+            file=sys.stderr,
+        )
     except (ValueError, ValidationError) as exc:
         # A broken settings file shouldn't block the bundle, but warn so the operator knows the status
-        # snapshot/log tail are absent because of it.
+        # snapshot/log tail are absent because of it. Rendered, never stringified (vault BACKLOG
+        # #2760): see `_load_service_settings`.
         print(
-            f"warning: could not load service settings ({exc}); status/log omitted", file=sys.stderr
+            f"warning: could not load service settings ({settings_error_detail(exc)}); "
+            "status/log omitted",
+            file=sys.stderr,
         )
 
     kwargs: dict[str, Any] = {"config_dir": args.config, "settings": settings}
@@ -8500,10 +8555,7 @@ def _alert(args: argparse.Namespace) -> int:
         _print_json(rules, compact=args.json)
         return 0
 
-    def validate(settings_path: Path) -> None:
-        # Re-load the file exactly as the engine does, so a structurally-broken write (or a rule the
-        # full model rejects) fails at edit time and rolls back rather than at next startup.
-        load_settings(config_path=settings_path)
+    validate = _post_write_settings_check(alerts_edit.AlertRuleError)
 
     try:
         if args.action == "add":
@@ -8587,6 +8639,7 @@ def _security(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         AlertsSettings,
         ApiSettings,
+        ApprovalsSettings,
         AuthSettings,
         SecretRotationSettings,
         SecuritySettings,
@@ -8598,7 +8651,7 @@ def _security(args: argparse.Namespace) -> int:
     path = args.service_config
 
     # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # [secret_rotation]/[api]/[approvals] deviations (ADR 0148: one posture). Resolve those from the whole file so the
     # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
@@ -8611,6 +8664,8 @@ def _security(args: argparse.Namespace) -> int:
     # BACKLOG #1179: [api].plaintext_upstream_hop_acknowledged is a loosening too. Same read, same
     # degradation marker.
     _api = ApiSettings()
+    # BACKLOG #2489: [approvals] carries the dual-control dwell and expiry. Same read, same marker.
+    _approvals = ApprovalsSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -8620,6 +8675,7 @@ def _security(args: argparse.Namespace) -> int:
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
             _rotation = _full.secret_rotation
             _api = _full.api
+            _approvals = _full.approvals
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -8653,6 +8709,7 @@ def _security(args: argparse.Namespace) -> int:
                 attested_hops=(),
                 revocation_attested_hops=(),
                 api=_api,
+                approvals=_approvals,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
@@ -8679,7 +8736,8 @@ def _security(args: argparse.Namespace) -> int:
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]); the per-connection "
+            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]); the "
+            "per-connection "
             "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
             "generic-ODBC database TLS, "
             "tls_hop_attested and "
@@ -8717,10 +8775,8 @@ def _security(args: argparse.Namespace) -> int:
         )
         return 0
 
-    def validate(settings_path: Path) -> None:
-        # Re-load exactly as the engine does, so a bad value OR a relocated legacy key fails at edit time
-        # and rolls back rather than at next startup.
-        load_settings(config_path=settings_path)
+    # Also how a relocated legacy key is refused at edit time rather than at the next start.
+    validate = _post_write_settings_check(security_edit.SecurityEditError)
 
     try:
         data = args.data if args.data is not None else sys.stdin.read()

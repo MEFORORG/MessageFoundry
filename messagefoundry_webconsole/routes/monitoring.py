@@ -33,12 +33,14 @@ register_ui_action(
     Permission.MESSAGES_VIEW_SUMMARY,
     auto_retry=False,
     unlock=True,
+    label="View the reason for an alert",
 )
 register_ui_action(
     r"^/ui/events/[^/?#]+/reason(\?[^#]*)?$",
     Permission.MESSAGES_VIEW_SUMMARY,
     auto_retry=False,
     unlock=True,
+    label="View the reason for an event",
 )
 
 

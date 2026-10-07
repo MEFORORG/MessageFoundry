@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from messagefoundry.api import auth_models, models
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, DirectoryProbe
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     MFA_DISABLED,
@@ -319,8 +319,10 @@ async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-                return principal if (username == "jdoe" and password == "pw") else None
+            def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+                if username != "jdoe":
+                    return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+                return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
             def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
@@ -487,7 +489,7 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout(
         assert user is not None and user.failed_attempts == threshold  # none lost, none past it
         refused = await service.login(ADMIN_USERNAME, password)
         assert not refused.ok and refused.error == "account locked"  # the RIGHT password is refused
-        assert sum(1 for e in notifier.events if e.event_type == ACCOUNT_LOCKED) == 1
+        assert len(await _lock_notices(service, notifier)) == 1
 
         # Clear the lock the way a lapsed window would, so arm 2 starts from an unlocked account.
         # This is the raw lockout-state write (ADR 0171's offline unlock), not the counting path.
@@ -536,6 +538,9 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout(
 
         # The per-account queue leaves no entry behind once every attempt has left it.
         assert service._credential_locks == {}, "the per-account lock entry must not leak"
+        # Arms 2 and 3 set locks too; finish their background notices before the store closes
+        # (BACKLOG #2216), so none runs on into a later test on the shared loop.
+        await service.drain_background()
     finally:
         await store.close()
 
@@ -1613,7 +1618,7 @@ async def test_AC11_parallel_combined_sign_ins_each_count_on_the_second_step(
         assert [o.error for o in outs].count("account locked") == burst - threshold
         assert user.second_step_locked_until is not None and user.second_step_lock_cycles == 1
         assert (user.failed_attempts, user.locked_until) == (0, None)
-        assert sum(1 for e in notifier.events if e.event_type == ACCOUNT_LOCKED) == 1
+        assert len(await _lock_notices(service, notifier)) == 1
     finally:
         await store.close()
 
@@ -2130,8 +2135,18 @@ async def _notice_harness(
     return store, service, notifier, clock, admin.user_id
 
 
-def _lock_notices(notifier: _FakeNotifier) -> list[SecurityEvent]:
+async def _lock_notices(service: AuthService, notifier: _FakeNotifier) -> list[SecurityEvent]:
+    """The ACCOUNT_LOCKED mails sent so far. A wired notifier's lock notice runs as a background task
+    (BACKLOG #2216), so this awaits the service's drain first rather than sleeping."""
+    await service.drain_background()
     return [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
+
+
+async def _refuse(service: AuthService, username: str) -> None:
+    """One refused sign-in, with its lock notice finished before the test moves the clock on, so
+    the notice's throttle reads the same instant the lock was set at (BACKLOG #2216)."""
+    assert not (await service.login(username, "wrong-passphrase")).ok
+    await service.drain_background()
 
 
 async def test_AC10_a_lock_every_15_minutes_for_25_hours_mails_exactly_twice(
@@ -2140,13 +2155,13 @@ async def test_AC10_a_lock_every_15_minutes_for_25_hours_mails_exactly_twice(
     store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
     try:
         for _ in range(100):  # 100 x 15 minutes = 25 hours
-            assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+            await _refuse(service, ADMIN_USERNAME)
             clock.now += 15 * 60 + 1
         user = await store.get_user(user_id)
         assert user is not None and user.lock_cycles == 100
         rows = await store.list_audit(actor=ADMIN_USERNAME, action="auth.account_locked", limit=500)
         assert len(rows) == 100, "the auth.account_locked row must still be written every cycle"
-        notices = _lock_notices(notifier)
+        notices = await _lock_notices(service, notifier)
         assert len(notices) == 2, f"expected two mails in 25 hours, got {len(notices)}"
         assert notices[0].detail["lock"] == "sign_in" and notices[0].detail["cycle"] == 1
         assert notices[1].detail["cycle"] > 90
@@ -2162,13 +2177,13 @@ async def test_AC10_an_unlock_then_a_new_lock_at_a_high_cycle_count_still_mails(
     store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
     try:
         for _ in range(40):
-            assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+            await _refuse(service, ADMIN_USERNAME)
             clock.now += 15 * 60 + 1
-        assert len(_lock_notices(notifier)) == 1
+        assert len(await _lock_notices(service, notifier)) == 1
         await store.clear_lockout(user_id)
         clock.now += 86_400 + 1
-        assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
-        notices = _lock_notices(notifier)
+        await _refuse(service, ADMIN_USERNAME)
+        notices = await _lock_notices(service, notifier)
         assert len(notices) == 2, "the first lock after a quiet day sent no mail"
         assert notices[-1].detail["cycle"] == 41
     finally:
@@ -2180,7 +2195,7 @@ async def test_AC10_the_two_lock_kinds_are_throttled_separately(
 ) -> None:
     store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
     try:
-        assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+        await _refuse(service, ADMIN_USERNAME)
         user = await store.get_user(user_id)
         assert user is not None
         # A second-step lock minutes later is a different lock kind, so it mails too.
@@ -2195,7 +2210,7 @@ async def test_AC10_the_two_lock_kinds_are_throttled_separately(
         )
         assert result.just_locked
         await service._record_lock(user, "second_step", result, client=None, factor="password")
-        kinds = [e.detail["lock"] for e in _lock_notices(notifier)]
+        kinds = [e.detail["lock"] for e in await _lock_notices(service, notifier)]
         assert kinds == ["sign_in", "second_step"]
     finally:
         await store.close()
@@ -2257,14 +2272,16 @@ async def test_an_addressless_lock_notice_does_not_hold_back_a_later_mailable_on
         bare = await store.get_user("u-noaddr")
         assert bare is not None and not bare.notify_email
         for _ in range(3):
-            assert not (await service.login("no-address", "wrong-passphrase")).ok
+            await _refuse(service, "no-address")
             clock.now += 15 * 60 + 1
         rows = await store.list_audit(actor="no-address", action="auth.lock_notice", limit=10)
         assert len(rows) == 1 and '"mailed": false' in str(rows[0]["detail"])
         await store.set_user_notify_email("u-noaddr", email="later@example.org")
-        before = len(_lock_notices(notifier))
-        assert not (await service.login("no-address", "wrong-passphrase")).ok
-        assert len(_lock_notices(notifier)) == before + 1, "the first mailable lock was held back"
+        before = len(await _lock_notices(service, notifier))
+        await _refuse(service, "no-address")
+        assert len(await _lock_notices(service, notifier)) == before + 1, (
+            "the first mailable lock was held back"
+        )
     finally:
         await store.close()
 
@@ -2297,7 +2314,7 @@ async def test_a_directory_second_step_lock_names_the_directory_sign_in(
             now=clock.now,
         )
         await service._record_lock(ad, "second_step", result, client=None, factor="first_step")
-        notice = _lock_notices(notifier)[-1]
+        notice = (await _lock_notices(service, notifier))[-1]
         assert notice.detail["factor_right"] == "directory"
         body = _build_body(notice)
         assert "directory sign-in succeeded" in body and "password reset" not in body
@@ -2388,9 +2405,9 @@ async def test_a_session_revoked_after_rotation_still_delivers_the_codes(
 
         async def revoke_then_enable(
             user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-        ) -> None:
+        ) -> bool:
             await store.revoke_user_sessions(user_id)
-            await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
 
         monkeypatch.setattr(store, "enable_totp", revoke_then_enable)
         enrolled = await service.confirm_mfa_enrollment(
@@ -2400,6 +2417,132 @@ async def test_a_session_revoked_after_rotation_still_delivers_the_codes(
         assert (await service.mfa_status(identity)).enabled is True
         hashes = await store.get_recovery_code_hashes(identity.user_id)
         assert len(hashes) == len(enrolled.recovery_codes)
+    finally:
+        await store.close()
+
+
+async def test_a_reset_between_rotation_and_enable_leaves_mfa_off_with_no_null_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: ``enable_totp`` turns TOTP on over a secret a reset cleared (BACKLOG #2224).
+
+    #1902 moved the enable after the rotation, which opened a window: an administrator's
+    ``admin_reset_mfa`` landing between the two cleared the staged secret, and the unconditional
+    enable then set ``totp_enabled`` over a NULL ``totp_secret``. The reset lands in exactly that
+    window here. The confirm must turn nothing on, hand back no codes, end the session it rotated,
+    and say why in the audit trail.
+    """
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        identity, token, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+
+        real_enable = store.enable_totp
+
+        async def reset_then_enable(
+            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        ) -> bool:
+            # The factor clear of ``admin_reset_mfa``, and none of its session revocation, so the
+            # rotated session is still live when the enable runs and only this fix can end it.
+            await store.disable_totp(user_id)
+            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+
+        monkeypatch.setattr(store, "enable_totp", reset_then_enable)
+        refused = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert refused.ok is False and refused.session_lost is True
+        assert refused.recovery_codes == ()
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.totp_enabled is False, (
+            "TOTP was turned on over a secret the reset cleared"
+        )
+        assert await store.get_totp_secret(identity.user_id) is None
+        assert await store.get_recovery_code_hashes(identity.user_id) == []
+        assert await store.list_sessions(identity.user_id) == [], (
+            "the rotated session, stamped MFA-verified against a cleared factor, is still live"
+        )
+        assert not any(e.event_type == MFA_ENABLED for e in notifier.events)
+        rows = await store.list_audit(
+            actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
+        )
+        assert len(rows) == 1 and '"reason": "secret_cleared"' in str(rows[0]["detail"])
+        actions = [e["action"] for e in await service.security_events_for(ADMIN_USERNAME)]
+        assert "auth.mfa_enrolled" not in actions
+    finally:
+        await store.close()
+
+
+async def test_the_real_admin_reset_inside_the_window_leaves_mfa_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the whole ``admin_reset_mfa``, not just its factor clear, landing between the
+    rotation and the enable still leaves TOTP on over a NULL secret (BACKLOG #2224)."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, token, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+
+        real_enable = store.enable_totp
+
+        async def admin_reset_then_enable(
+            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        ) -> bool:
+            await service.admin_reset_mfa(user_id, actor="other-admin")
+            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+
+        monkeypatch.setattr(store, "enable_totp", admin_reset_then_enable)
+        refused = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert refused.ok is False and refused.session_lost is True
+        assert refused.recovery_codes == ()
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.totp_enabled is False
+        assert await store.get_totp_secret(identity.user_id) is None
+        assert await store.get_recovery_code_hashes(identity.user_id) == []
+        assert await store.list_sessions(identity.user_id) == []
+    finally:
+        await store.close()
+
+
+async def test_a_second_confirm_that_enabled_first_keeps_the_winners_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a losing confirm overwrites the recovery codes a winning one handed out (#2224).
+
+    Two confirms of one staged secret can both pass their code check. The one whose enable lands
+    second must match no row, so the codes the first one handed back stay the live ones.
+    """
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, token, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+
+        real_enable = store.enable_totp
+
+        async def other_confirm_first(
+            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        ) -> bool:
+            assert await real_enable(user_id, recovery_code_hashes=["winner-hash"], now=now)
+            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+
+        monkeypatch.setattr(store, "enable_totp", other_confirm_first)
+        refused = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert refused.ok is False and refused.session_lost is True
+        assert refused.recovery_codes == ()
+        assert await store.get_recovery_code_hashes(identity.user_id) == ["winner-hash"]
+        assert (await service.mfa_status(identity)).enabled is True
+        rows = await store.list_audit(
+            actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
+        )
+        assert len(rows) == 1 and '"reason": "already_enabled"' in str(rows[0]["detail"])
     finally:
         await store.close()
 
@@ -2690,7 +2833,7 @@ async def test_the_census_names_a_covered_chosen_password_with_no_totp_and_only_
         await _created_holder(service, username="generated")
         enrolled_id, _ = await _created_holder(service, username="enrolled")
         await store.set_totp_secret(enrolled_id, secret="JBSWY3DPEHPK3PXP")
-        await store.enable_totp(enrolled_id, recovery_code_hashes=[])
+        assert await store.enable_totp(enrolled_id, recovery_code_hashes=[])
         disabled_id, _ = await _created_holder(service, username="disabled")
         await store.set_password(
             disabled_id, password_hash="h", password_generated=False, must_change_password=False
@@ -2868,7 +3011,7 @@ async def test_the_census_reads_every_account_it_should_and_nothing_it_should_no
             user_id="dir-totp", username="directory", auth_provider="ad", password_generated=False
         )
         await store.set_totp_secret("dir-totp", secret="JBSWY3DPEHPK3PXP")
-        await store.enable_totp("dir-totp", recovery_code_hashes=[])
+        assert await store.enable_totp("dir-totp", recovery_code_hashes=[])
         await store.create_user(
             user_id="hashless",
             username="half-built",

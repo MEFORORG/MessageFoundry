@@ -224,6 +224,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    totp_enable_term,
     verify_audit_rows,
 )
 from messagefoundry.support.redact import redact_log_line
@@ -3742,10 +3743,22 @@ class PostgresStore:
         to a skewed-standby clock across failover. This is correct **only because there is exactly ONE
         serial writer per (stage, lane-key)** (the per-inbound listener/router/transform worker; the
         destination_name fan-in is multi-writer but seq is still DB-assigned in commit order, so the
-        first committer gets the lower seq, and ``FOR UPDATE SKIP LOCKED`` never skips the true locked
-        head). With ``created_at`` no longer an ordering backstop, a future second-writer-per-lane or
-        delete+reinsert-on-retry (re-minting seq) would break FIFO. ``FOR UPDATE SKIP LOCKED`` on the
-        head keeps concurrent pollers non-blocking. ``None`` when nothing is pending or the head isn't due.
+        first committer gets the lower seq). With ``created_at`` no longer an ordering backstop, a future
+        second-writer-per-lane or delete+reinsert-on-retry (re-minting seq) would break FIFO. ``FOR
+        UPDATE SKIP LOCKED`` on the head keeps concurrent pollers non-blocking. ``None`` when nothing is
+        pending or the head isn't due.
+
+        **KNOWN HOLE: ``SKIP LOCKED`` CAN skip the true head (ADR 0066 section 3.4).** The serial-writer
+        argument covers a producer's *uncommitted* row, which is invisible to the scan. It does not cover
+        a *visible, committed* head that another transaction holds locked -- for example a message
+        :meth:`replay` re-stamping a backing-off pending head. ``ORDER BY seq LIMIT 1 FOR UPDATE SKIP
+        LOCKED`` passes over that head, and if seq N+1 is due it is claimed first: a per-lane FIFO
+        reorder, not one empty cycle. The pooled default claims each lane's head through
+        :meth:`claim_fifo_heads`, which carries the ADR 0066 head-pin and turns the same schedule into
+        an EMPTY cycle -- but the pooled path does not avoid this method entirely. Every caller of this
+        single-row claim is exposed: at least the ``per_lane`` claim mode's stage workers, and the
+        outbound batch-coalescing window in EITHER claim mode, which tops up a batch with this method.
+        Whether this path should get the head-pin is a separate, open decision (vault BACKLOG #2769).
 
         FAILOVER FIFO SAFETY (active-passive HA): the claim runs in ONE transaction that FIRST reclaims
         this lane's stranded head — a crashed/fenced prior leader's claimed rows are still ``inflight``
@@ -5371,10 +5384,8 @@ class PostgresStore:
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
-                    )
+                    # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                    backoff = retry.backoff_for(attempts)
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1 — the epoch fence guards the DEAD branch ONLY. The retry branch returns
                 # the row to PENDING; fencing THAT would leave it INFLIGHT instead — converting a
@@ -5463,11 +5474,8 @@ class PostgresStore:
                 if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds
-                        * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
-                    )
+                    # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                    backoff = retry.backoff_for(head_attempts)
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1 — the identical DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the whole loop: a fence on any member raises out
@@ -5702,23 +5710,31 @@ class PostgresStore:
         sha256 of the VERBATIM concatenated plaintext). Each chunk is AES-GCM-sealed independently (a
         bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
-        hasher = hashlib.sha256()
-        total = 0
-        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the attachment_id is
-        # the content hash — known only after the full plaintext is hashed. Buffer the verbatim slices,
-        # hash, then seal each under (ref, seq); the source is an already-materialized OBX-5.5 value, so
-        # this adds no order-of-magnitude memory and each seal still consumes one chunk. Mirrors SQLite.
-        plaintext_chunks: list[str] = []
-        for chunk in chunks:
-            data = chunk.encode("utf-8")
-            hasher.update(data)
-            total += len(data)
-            plaintext_chunks.append(chunk)
-        ref = hasher.hexdigest()
-        sealed: list[str] = [
-            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
-            for seq, c in enumerate(plaintext_chunks)
-        ]
+
+        def _seal() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
+            # work in proportion to its size, and nothing else would run meanwhile.
+            hasher = hashlib.sha256()
+            total = 0
+            # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the
+            # attachment_id is the content hash — known only after the full plaintext is hashed.
+            # Buffer the verbatim slices, hash, then seal each under (ref, seq); the source is an
+            # already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory and each
+            # seal still consumes one chunk. Mirrors SQLite.
+            plaintext_chunks: list[str] = []
+            for chunk in chunks:
+                data = chunk.encode("utf-8")
+                hasher.update(data)
+                total += len(data)
+                plaintext_chunks.append(chunk)
+            ref = hasher.hexdigest()
+            sealed: list[str] = [
+                self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+                for seq, c in enumerate(plaintext_chunks)
+            ]
+            return ref, total, sealed
+
+        ref, total, sealed = await asyncio.to_thread(_seal)
         now = time.time()
         async with self._timed_acquire() as conn, conn.transaction():
             if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is not None:
@@ -6186,11 +6202,12 @@ class PostgresStore:
             )
             count = _rowcount(result)
             if count:
+                # RECEIVED only for a pending INGRESS row; a re-pended routed row is ROUTED, or the
+                # finalizer could never settle it (vault BACKLOG #2723; MessageStore.replay says why).
                 pre = await conn.fetchrow(
-                    "SELECT 1 FROM queue WHERE message_id=$1 AND stage = ANY($2::text[])"
-                    " AND status=$3 LIMIT 1",
+                    "SELECT 1 FROM queue WHERE message_id=$1 AND stage=$2 AND status=$3 LIMIT 1",
                     message_id,
-                    [Stage.INGRESS.value, Stage.ROUTED.value],
+                    Stage.INGRESS.value,
                     OutboxStatus.PENDING.value,
                 )
                 status = MessageStatus.RECEIVED.value if pre else MessageStatus.ROUTED.value
@@ -6600,20 +6617,32 @@ class PostgresStore:
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, log a
         ``cancelled`` event each, and finalize any message whose deliveries are now all terminal.
-        ``channel_id=None`` cancels across all producers; ``top_only`` cancels just the head. Returns
-        the number cancelled."""
+        ``channel_id=None`` cancels across all producers; ``top_only`` cancels just the FIFO head --
+        the oldest pending row by ``seq``, the lane predicate and key :meth:`claim_next_fifo` uses --
+        even while it is backing off and not yet due (ADR 0059). With a ``channel_id`` it is the
+        oldest row from that producer, the lane head only when no other inbound feeds the
+        destination. Returns the number cancelled."""
         now = time.time() if now is None else now
-        # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match the
-        # claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
+        # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
+        # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the
+        # younger rows behind it, so that key would pick a healthy younger row and leave the
+        # backing-off head blocking the lane (vault BACKLOG #2754).
         query = (
             "SELECT id, message_id FROM queue"
-            " WHERE destination_name=$1 AND status=$2 AND ($3::text IS NULL OR channel_id=$3)"
-            " ORDER BY next_attempt_at, seq"
+            " WHERE stage=$4 AND destination_name=$1 AND status=$2"
+            " AND ($3::text IS NULL OR channel_id=$3)"
+            " ORDER BY seq"
         )
         if top_only:
             query += " LIMIT 1"
         async with self._timed_acquire() as conn, conn.transaction():
-            rows = await conn.fetch(query, destination_name, OutboxStatus.PENDING.value, channel_id)
+            rows = await conn.fetch(
+                query,
+                destination_name,
+                OutboxStatus.PENDING.value,
+                channel_id,
+                Stage.OUTBOUND.value,
+            )
             if not rows:
                 return 0
             ids = [r["id"] for r in rows]
@@ -7095,20 +7124,21 @@ class PostgresStore:
         )
         return AppendedAuditRow(int(new_id or 0), seq, row_hash)
 
-    async def list_audit(
-        self,
+    @staticmethod
+    def _audit_where(
         *,
-        limit: int = 50,
-        actor: str | None = None,
-        action: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        exclude: AuditExclusion | None = None,
-    ) -> Sequence[Row]:
-        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        exclude: AuditExclusion | None,
+        before_id: int | None,
+    ) -> tuple[str, list[Any]]:
+        """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
         Filters are ANDed as bound ``$N`` parameters — only the fixed column/operator template is
-        formatted into the SQL, never a value — so a filter value cannot inject."""
+        formatted into the SQL, never a value — so a filter value cannot inject. The caller binds
+        its ``LIMIT`` value after these, as the next ``$N``."""
         clauses: list[str] = []
         params: list[Any] = []
         if actor is not None:
@@ -7130,10 +7160,65 @@ class PostgresStore:
                 return f"${len(params)}"
 
             clauses.extend(exclude.clauses(bind))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if before_id is not None:
+            params.append(before_id)
+            clauses.append(f"id < ${len(params)}")
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> Sequence[Row]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
+        Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
         params.append(limit)
         sql = f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ${len(params)}"
         return await self._fetchall(sql, *params)
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, without reading
+        them (vault BACKLOG #2776). Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
+        params.append(limit)
+        sql = (
+            f"SELECT COUNT(*) AS n FROM (SELECT id FROM audit_log{where}"
+            f" ORDER BY id DESC LIMIT ${len(params)}) t"
+        )
+        row = await self._fetchone(sql, *params)
+        return int(row["n"]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
         """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault
@@ -7615,15 +7700,17 @@ class PostgresStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
-        await self._execute(
+        # Conditional, and the count says whether it wrote: see ``totp_enable_term`` (#2224).
+        written = await self._execute(
             "UPDATE users SET totp_enabled=TRUE, totp_enrolled_at=$1, totp_recovery_codes=$2,"
-            " updated_at=$1 WHERE id=$3",
+            f" updated_at=$1 WHERE id=$3{totp_enable_term('FALSE')}",
             now,
             json.dumps(recovery_code_hashes),
             user_id,
         )
+        return written > 0
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now

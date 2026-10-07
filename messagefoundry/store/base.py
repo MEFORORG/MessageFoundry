@@ -1682,6 +1682,7 @@ class AuditStore(Protocol):
         since: float | None = None,
         until: float | None = None,
         exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
     ) -> Sequence[Row]:
         """Most-recent-first audit entries, optionally scoped (BACKLOG #170).
 
@@ -1694,7 +1695,27 @@ class AuditStore(Protocol):
         every backend) — are ANDed. Every value is passed as a bound parameter (never interpolated),
         so an attacker-influenced filter can never inject SQL. Ordering, ``limit``, and the hash-chain
         read semantics are unchanged; passing no filter is byte-identical to the limit-only query.
+
+        ``before_id`` is a keyset cursor (vault BACKLOG #2776): only rows whose ``id`` is below it.
+        A reader pages the trail newest first by passing the last ``id`` of one page as the next
+        page's ``before_id``, so it never holds more than one page; ``GET /audit/export`` does this.
         """
+        ...
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, counted in the
+        database rather than read (vault BACKLOG #2776). ``GET /audit/export`` records it in its
+        ``audit.export`` row before the body, when its first page alone cannot settle the count."""
         ...
 
     async def security_events_for_user(
@@ -2049,9 +2070,16 @@ class AuthStore(Protocol):
 
     async def get_totp_secret(self, user_id: str) -> str | None: ...
 
+    # CONDITIONAL (BACKLOG #2224): writes only where a secret is staged (``totp_secret IS NOT NULL``)
+    # and TOTP is still off, in the same UPDATE, and returns whether a row was written. An
+    # ``admin_reset_mfa`` that clears the secret, or a second confirm that enables first, between
+    # the caller's checks and this write makes it match no row. A caller must refuse on False and
+    # never treat MFA as on, the way ``set_password(require_totp=...)`` callers do. It does not
+    # check that the staged secret is the one the caller verified; a re-stage in the window is
+    # not caught.
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None: ...
+    ) -> bool: ...
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None: ...
 

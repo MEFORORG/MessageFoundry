@@ -506,15 +506,17 @@ def test_a_refusal_through_load_settings_echoes_no_secret(
     _assert_clean(caught.value, fragment)
 
 
-def test_a_cli_command_that_prints_str_exc_echoes_no_secret(
+def test_a_cli_command_echoes_no_secret_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``rotate-key`` prints ``str(exc)`` for a settings failure, not ``settings_error_detail``.
+    """One CLI command, end to end, with the secrets this file plants.
 
-    At least ``serve``, ``supervise``, ``audit-anchor`` and ``audit-verify`` render through
-    ``settings_error_detail``; commands like this one are the remaining exposure, and the
-    model-level wrap is what covers them. This test used ``audit-verify`` until vault BACKLOG #3054
-    moved it onto the renderer, which would have left it with no ``str(exc)`` path to test.
+    This test was written against a command that printed ``str(exc)``, so that the model-level wrap
+    was all that stood between the secret and the output. Since vault BACKLOG #2760 no CLI arm that
+    loads the whole file does that (``rotate-key`` was the last one this test used, and
+    ``audit-verify`` before it until vault BACKLOG #3054), so this now holds both layers together.
+    The model layer alone is held by the ``load_settings`` cases above, and the renderer alone by
+    ``tests/test_cli_settings_error_render.py``.
     """
     monkeypatch.chdir(tmp_path)
     for name, value in _env(MEFOR_AUTH_OIDC_TOKEN_ENDPOINT="http://idp.example/token").items():

@@ -20,9 +20,7 @@ owns the **priority-feed startup** half (the DR run-profile in
    same fail-closed abort (AC-14), distinct from the in-archive decrypt failure (AC-9). Verifying the
    archive is not loading it — the restore is the operator's separate ``messagefoundry restore`` step —
    so activation then **also** refuses when the DR store does not carry the verified seed
-   (:meth:`DrCoordinator._verify_seeded_store`), rather than promoting onto an empty store. Last
-   in this step, the optional ``profile_preflight`` callback refuses a run-profile step 4 is already
-   bound to fail, such as one whose config dir has gone, so the VIP never moves for it.
+   (:meth:`DrCoordinator._verify_seeded_store`), rather than promoting onto an empty store.
 2. **Recover the cold-restored store + start a NEW audit-chain segment.** ``reset_stale_inflight``
    recovers in-flight rows of every stage carried in the backup (AC-15), then a ``dr_seed`` marker
    (seed-marker genesis = source-snapshot SHA-256 + config/DEK fingerprints + the restored chain's tip
@@ -34,12 +32,16 @@ owns the **priority-feed startup** half (the DR run-profile in
    is done by the engine callback in step 4.
 4. **Begin serving under the DR run-profile.** The engine activates the run-profile (bind only the
    connections at priority >= ``[dr].priority_threshold``; the rest report ``status:"filtered"``) via
-   the injected ``activate_profile`` callback, and a ``dr.activate`` audit row records the promotion.
+   the injected ``activate_profile`` callback, and a ``dr.activate`` audit row records the promotion,
+   with the fields the optional ``profile_provenance`` callback returns. The engine's callback re-applies the graph
+   it is already running and reads no config dir to do it (vault BACKLOG #3067), so a config dir that
+   has gone with the failed site cannot refuse this step.
 
 :meth:`release` is **drain-then-hand-back**: release the VIP (the optional ``release_hook`` / let the
 passive LB return it to the recovered primary), wait for convergence, unbind intake while the workers
-drain the staged queue to completion (delivered/dead-lettered) — preserving at-least-once + idempotency
-**within the DR store** — then record ``dr.release``. **Cross-store** reconciliation with the recovered
+drain the staged queue (delivered/dead-lettered) — preserving at-least-once + idempotency **within the
+DR store** — then record ``dr.release``. The drain is bounded, and rows held on outbounds the engine
+parks are left out of it; ``dr.release`` records how many rows are left and how many are held. **Cross-store** reconciliation with the recovered
 primary is operator-verified per the runbook (the engine gives NO cross-store loss/duplicate guarantee).
 
 This module is engine-side and dependency-light (stdlib + the store/settings/dr_backup seams), so it
@@ -54,7 +56,7 @@ import json
 import logging
 import socket
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -80,6 +82,10 @@ _ACTION_SEED = "dr_seed"
 _ACTION_ACTIVATE = "dr.activate"
 _ACTION_RELEASE = "dr.release"
 _ACTION_ABORTED = "dr_activation_aborted"
+#: A release that did not hand back: its drain raised, or it was cancelled partway (vault BACKLOG
+#: #2752). The box stays active and the release can be retried. Kept apart from ``dr.release``, which
+#: only a completed hand-back writes, so a filter on that action still finds only fail-backs.
+_ACTION_RELEASE_FAILED = "dr_release_failed"
 
 #: The one answer for every refused request archive, whichever check refused it. It names the
 #: setting and no part of the path, so the refusal says nothing about what exists on the DR box.
@@ -91,9 +97,12 @@ _REQUEST_ARCHIVE_REFUSED = (
 
 
 class DrActivationError(RuntimeError):
-    """Activation (or release) was refused. Carries a ``kind`` (``seed``/``key``/``vip``/``profile``/
-    ``state``) so the caller (the API endpoint) can map it to an HTTP error and the operator sees the
-    failing phase. The message is ``safe_exc``-scrubbed (PHI-free)."""
+    """Activation (or release) was refused. Carries a ``kind`` (at least ``seed``/``key``/``vip``/
+    ``profile``/``state``/``audit``) so the caller (the API endpoint) can map it to an HTTP error and
+    the operator sees the failing phase. ``audit`` is the one kind that is not an abort: the box's
+    posture already changed and the audit row recording that could not be written, so the call
+    refuses rather than answer success with no row (vault BACKLOG #2751, #2752). The message is
+    ``safe_exc``-scrubbed (PHI-free)."""
 
     def __init__(self, kind: str, message: str) -> None:
         super().__init__(message)
@@ -112,14 +121,31 @@ class DrResult:
     verify_status: str | None = None  # the restore-verify result (PASS), activate only
     seed_segment: str | None = None  # the new audit-chain segment marker's own row hash digest
     vip_hook_ran: bool = False  # whether the optional takeover/release hook was invoked
+    #: Release only: the staged-queue depth left when the drain ended (0 = drained), or ``None``
+    #: when the engine callback reported none (vault BACKLOG #2752, finding D-V1).
+    depth_left: int | None = None
+    #: Release only: whether every DRAINABLE row drained. Rows held on outbounds the engine parks
+    #: cannot drain, so the drain leaves them out and counts them in ``held_on_parked_outbounds``
+    #: (vault BACKLOG #3067). ``None`` when the engine callback reported neither.
+    drained: bool | None = None
+    held_on_parked_outbounds: int | None = None
+
+
+@dataclass
+class _ActivationProgress:
+    """How far one activation got, read by its cancellation arm (vault BACKLOG #2751)."""
+
+    step: str = "seed"  # seed | store | vip | profile
+    profile_applied: bool = False
 
 
 class DrCoordinator:
     """Manual, audited DR promotion/fail-back (ADR 0048). Construct with the open store + ``[dr]``
     settings + the store settings (the KeyProvider seam for restore-verify) + two engine callbacks that
-    flip the DR run-profile (``activate_profile`` reloads the graph with the run-profile ON;
-    ``deactivate_profile`` unbinds intake + drains, then turns it OFF), and optional callbacks for
-    the seed marker's config digest and a run-profile preflight. Single-writer: the API serializes
+    flip the DR run-profile (``activate_profile`` re-applies the graph with the run-profile ON;
+    ``deactivate_profile`` unbinds intake + drains, then turns it OFF, and returns the drain's
+    outcome fields for the ``dr.release`` row), and optional callbacks for the seed marker's config
+    digest and for provenance fields on the ``dr.activate`` row. Single-writer: the API serializes
     activate/release behind ``[approvals]``-style RBAC; this object additionally guards against a
     concurrent activate/release with its own lock."""
 
@@ -130,12 +156,12 @@ class DrCoordinator:
         *,
         store_settings: object,
         activate_profile: Callable[[], Awaitable[None]],
-        deactivate_profile: Callable[[], Awaitable[None]],
+        deactivate_profile: Callable[[], Awaitable[Mapping[str, object] | None]],
         config_fingerprint_provider: Callable[[], Awaitable[str | None]] | None = None,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
         owned_lanes: Callable[[], OwnedLanes | None] | None = None,
-        profile_preflight: Callable[[], Awaitable[None]] | None = None,
+        profile_provenance: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -143,12 +169,12 @@ class DrCoordinator:
         # encrypted under. Typed loosely to avoid importing StoreSettings here; run_restore_verify takes it.
         self._store_settings = store_settings
         self._activate_profile = activate_profile
+        # Extra fields for the dr.activate row, such as the activated graph's digest. Awaited after
+        # the profile is applied; a fault is recorded on the row and never fails the activation.
+        self._provenance = profile_provenance
         self._deactivate_profile = deactivate_profile
         # Awaited per activation, so building the coordinator reads no file (vault BACKLOG #2839).
         self._config_fingerprint_provider = config_fingerprint_provider
-        # Raises OSError when activate_profile is already bound to fail, such as when the config dir
-        # it would reload has gone. Run before any store change or VIP step (vault BACKLOG #2840).
-        self._profile_preflight = profile_preflight
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         # #145: the DR box label carried in dr_activated / dr_released alerts (also the throttle /
         # auto-resolve key). The hostname is stable across an activate/release pair (same box), so the
@@ -164,6 +190,19 @@ class DrCoordinator:
         # Whether the DR run-profile is currently on (mirrors the engine's _dr_active; the engine seeds
         # it from [dr].activate at construction and this coordinator flips it on activate/release).
         self._active = bool(settings.enabled and settings.activate)
+        # An activation whose run-profile is applied but whose dr.activate row is not yet known to be
+        # written: (detail, actor, now). Set before the write and cleared after it, so a write that a
+        # cancellation or a store error cut short is written by the next activate or release call
+        # rather than that call answering success with no row (vault BACKLOG #2751). Held in memory
+        # only, so a restart loses it; the refusal and its log line are what record that. A box active
+        # from [dr].activate at boot never set it: that activation is the configuration's.
+        self._unrecorded_activation: tuple[dict[str, object], str, float] | None = None
+        # The same for a completed hand-back whose dr.release row is not yet known to be written
+        # (vault BACKLOG #2752). The next activate or release call writes it first.
+        self._unrecorded_release: tuple[dict[str, object], str, float] | None = None
+        # The last completed hand-back, so a retry that finds the box passive answers with that
+        # release's outcome (its depth left) rather than with nothing known.
+        self._last_release: DrResult | None = None
         # Serialize activate/release so a double-promotion can't race the cold-seed/VIP/profile steps.
         self._lock = asyncio.Lock()
 
@@ -175,18 +214,6 @@ class DrCoordinator:
     @property
     def settings(self) -> DrSettings:
         return self._settings
-
-    @staticmethod
-    def _profile_failure(exc: BaseException, *, before_vip: bool) -> str:
-        """The abort reason for a run-profile that cannot be applied. The preflight and the profile
-        step share it, and it says which one refused, because only the second runs after the
-        takeover hook: an operator must know whether the VIP may have moved."""
-        where = (
-            "refused before the VIP step; the takeover hook did not run"
-            if before_vip
-            else "the engine could not bind the priority feeds"
-        )
-        return f"DR run-profile activation failed ({where}): {safe_exc(exc)}"
 
     # --- activate ------------------------------------------------------------
 
@@ -220,124 +247,157 @@ class DrCoordinator:
             if self._active:
                 # Idempotent: already serving the critical feeds. Report the current posture rather than
                 # re-running the cold seed (which would re-verify + re-mark — wasteful and confusing).
+                # But never as success for an activation with no dr.activate row: write the one a
+                # cut-short activation owes first, or refuse (vault BACKLOG #2751).
+                if self._unrecorded_activation is not None:
+                    await self._record_owed_activation()
                 return DrResult(
                     action="activate",
                     active=True,
                     threshold=self._settings.priority_threshold.value,
                 )
-            seed = archive or self._settings.seed_archive
+            # A hand-back still owed its row is recorded before a new promotion can follow it.
+            if self._unrecorded_release is not None:
+                await self._record_owed_release()
             now = self._clock()
-            if archive:
-                seed = await self._confine_request_archive(archive, actor, now)
-
-            # (1) Cold-seed restore-verify — FAIL-CLOSED, BEFORE any VIP step (AC-9/AC-14). A missing
-            # seed path is itself an abort: a DR box must never promote onto an unverified store.
-            if not seed:
-                await self._record_aborted(
-                    "seed",
-                    "no [dr].seed_archive configured and no archive supplied — refusing to activate "
-                    "without a restore-verified cold seed (ADR 0048 fail-closed)",
-                    actor,
-                    now,
-                )
-            verify = await self._verify_seed(seed, actor, now)
-
-            # (1b) SERVER-DB LIVE SEED GATE (BACKLOG #102, fail-closed, BEFORE any store mutation or VIP
-            # step). A config-only cold-seed archive (server-DB store) verifies only that the tar/config
-            # decrypt — it NEVER restores or inspects the DBA-managed live ``mefor`` DB, so step (1) alone
-            # could bless promotion against a fresh/unrestored server store (non-empty only because
-            # provision-admin, engine startup and operator sign-in wrote to audit_log). Require an
-            # explicit DBA attestation AND a restore-provenance probe here. No-op on SQLite (the
-            # archive verified the whole store already).
-            await self._verify_live_server_seed(dba_attests_restored, actor, now)
-
-            # (1c) COLD-SEED *LOAD* GATE (fail-closed, BEFORE any store mutation or VIP step). Step (1)
-            # proved the ARCHIVE is good; this proves the box's own store carries it. The SQLite twin of
-            # the server-DB gate above.
-            await self._verify_seeded_store(verify, actor, now)
-
-            # (1d) RUN-PROFILE PREFLIGHT (fail-closed, BEFORE any store mutation or VIP step). Step (4)
-            # reloads the config dir the running graph came from; if that dir has gone or cannot be
-            # read, step (4) would abort AFTER the takeover hook moved the VIP, leaving it on a box
-            # that is NOT running the DR run-profile. Step (4) keeps its own check: the dir can
-            # still go in between.
-            if self._profile_preflight is not None:
-                try:
-                    await self._profile_preflight()
-                except OSError as exc:
-                    reason = self._profile_failure(exc, before_vip=True)
-                    await self._record_aborted("profile", reason, actor, now)
-
-            # (2) Recover the cold-restored store (every stage, AC-15) + open a NEW audit-chain segment
-            # (the seed-marker genesis; do NOT blindly extend the restored chain — ADR 0049/0041).
-            # Ownership-scoped when sharded (ADR 0073) — see _owned_lanes in __init__.
+            progress = _ActivationProgress()
             try:
-                await self._store.reset_stale_inflight(
-                    owned=self._owned_lanes() if self._owned_lanes is not None else None
+                return await self._activate_locked(
+                    archive=archive,
+                    dba_attests_restored=dba_attests_restored,
+                    actor=actor,
+                    now=now,
+                    progress=progress,
                 )
-            except (
-                Exception
-            ) as exc:  # a store that can't recover its own residue can't safely serve
-                await self._record_aborted(
-                    "state",
-                    f"cold-restored store recovery (reset_stale_inflight) failed: {safe_exc(exc)}",
-                    actor,
-                    now,
-                )
-            seed_segment = await self._record_seed_marker(seed, verify, now)
+            except BaseException as exc:
+                # A cancellation is not an Exception, so neither step 4's arm nor any abort path
+                # sees one (vault BACKLOG #2751). The API runs activation so that a request
+                # deadline does not cancel it (api/outlive.py); this arm is for what still can,
+                # such as a shutdown. It puts the flag back unless the run-profile was applied,
+                # records the outcome, and re-raises.
+                if not isinstance(exc, Exception):
+                    if not progress.profile_applied:
+                        self._active = False
+                    if isinstance(exc, asyncio.CancelledError):
+                        await self._record_interrupted_activation(progress, actor, now)
+                raise
 
-            # (3) Acquire-VIP-or-abort (ADR 0048). The optional takeover_hook is belt-and-braces for a
-            # non-LB topology; an ADR-0047 LB deployment omits it (the passive LB moves the VIP once the
-            # listeners bind in step 4). A hook failure/timeout ABORTS before any listener serves the VIP.
-            hook_ran = await self._run_vip_hook(
-                self._settings.takeover_hook, phase="takeover", actor=actor, now=now
-            )
+    async def _activate_locked(
+        self,
+        *,
+        archive: str | None,
+        dba_attests_restored: bool,
+        actor: str,
+        now: float,
+        progress: _ActivationProgress,
+    ) -> DrResult:
+        """Steps 1 to 4 of :meth:`activate`, run under its lock. ``progress`` records the step
+        reached, for the cancellation arm there."""
+        seed = archive or self._settings.seed_archive
+        if archive:
+            seed = await self._confine_request_archive(archive, actor, now)
 
-            # (4) Serve under the DR run-profile: bind only the connections at/above the threshold (the
-            # rest report status:"filtered"). The engine reloads the graph with the run-profile ON.
-            try:
-                self._active = True
-                await self._activate_profile()
-            except Exception as exc:
-                self._active = False
-                reason = self._profile_failure(exc, before_vip=False)
-                await self._record_aborted("profile", reason, actor, now)
-
-            await self._store.record_audit(
-                _ACTION_ACTIVATE,
-                actor=actor,
-                detail=json.dumps(
-                    {
-                        "archive": _basename(seed),
-                        "verify": verify.status,
-                        "threshold": self._settings.priority_threshold.value,
-                        "seed_segment": seed_segment,
-                        "vip_hook_ran": hook_ran,
-                    },
-                    sort_keys=True,
-                ),
-                now=now,
-            )
-            log.warning(
-                "DR activated by %s: serving feeds at priority >= %s; cold seed %s verified %s "
-                "(new audit-chain segment opened)",
+        # (1) Cold-seed restore-verify — FAIL-CLOSED, BEFORE any VIP step (AC-9/AC-14). A missing
+        # seed path is itself an abort: a DR box must never promote onto an unverified store.
+        if not seed:
+            await self._record_aborted(
+                "seed",
+                "no [dr].seed_archive configured and no archive supplied — refusing to activate "
+                "without a restore-verified cold seed (ADR 0048 fail-closed)",
                 actor,
-                self._settings.priority_threshold.value,
-                _basename(seed),
-                verify.status,
+                now,
             )
-            # #145: page on the promotion — the primary is down and this box is now serving. Never-raise:
-            # a sink failure must not undo a completed activation. dr_released is the auto-resolving inverse.
-            self._alert_dr("dr_activated")
-            return DrResult(
-                action="activate",
-                active=True,
-                threshold=self._settings.priority_threshold.value,
-                archive=_basename(seed),
-                verify_status=verify.status,
-                seed_segment=seed_segment,
-                vip_hook_ran=hook_ran,
+        verify = await self._verify_seed(seed, actor, now)
+
+        # (1b) SERVER-DB LIVE SEED GATE (BACKLOG #102, fail-closed, BEFORE any store mutation or VIP
+        # step). A config-only cold-seed archive (server-DB store) verifies only that the tar/config
+        # decrypt — it NEVER restores or inspects the DBA-managed live ``mefor`` DB, so step (1) alone
+        # could bless promotion against a fresh/unrestored server store (non-empty only because
+        # provision-admin, engine startup and operator sign-in wrote to audit_log). Require an
+        # explicit DBA attestation AND a restore-provenance probe here. No-op on SQLite (the
+        # archive verified the whole store already).
+        await self._verify_live_server_seed(dba_attests_restored, actor, now)
+
+        # (1c) COLD-SEED *LOAD* GATE (fail-closed, BEFORE any store mutation or VIP step). Step (1)
+        # proved the ARCHIVE is good; this proves the box's own store carries it. The SQLite twin of
+        # the server-DB gate above.
+        await self._verify_seeded_store(verify, actor, now)
+
+        # (2) Recover the cold-restored store (every stage, AC-15) + open a NEW audit-chain segment
+        # (the seed-marker genesis; do NOT blindly extend the restored chain — ADR 0049/0041).
+        # Ownership-scoped when sharded (ADR 0073) — see _owned_lanes in __init__.
+        progress.step = "store"
+        try:
+            await self._store.reset_stale_inflight(
+                owned=self._owned_lanes() if self._owned_lanes is not None else None
             )
+        except Exception as exc:  # a store that can't recover its own residue can't safely serve
+            await self._record_aborted(
+                "state",
+                f"cold-restored store recovery (reset_stale_inflight) failed: {safe_exc(exc)}",
+                actor,
+                now,
+            )
+        seed_segment = await self._record_seed_marker(seed, verify, now)
+
+        # (3) Acquire-VIP-or-abort (ADR 0048). The optional takeover_hook is belt-and-braces for a
+        # non-LB topology; an ADR-0047 LB deployment omits it (the passive LB moves the VIP once the
+        # listeners bind in step 4). A hook failure/timeout ABORTS before any listener serves the VIP.
+        progress.step = "vip"
+        hook_ran = await self._run_vip_hook(
+            self._settings.takeover_hook, phase="takeover", actor=actor, now=now
+        )
+
+        # (4) Serve under the DR run-profile: bind only the connections at/above the threshold (the
+        # rest report status:"filtered"). The engine re-applies its running graph with the
+        # run-profile ON. A cancellation here is not an Exception and passes this arm; activate()'s
+        # own arm puts the flag back, and the engine's reload rolls its intake back (vault BACKLOG
+        # #2751).
+        progress.step = "profile"
+        try:
+            self._active = True
+            self._last_release = None  # an earlier fail-back's outcome no longer describes this box
+            await self._activate_profile()
+        except Exception as exc:
+            self._active = False
+            reason = (
+                "DR run-profile activation failed (the engine could not bind the priority "
+                f"feeds): {safe_exc(exc)}"
+            )
+            await self._record_aborted("profile", reason, actor, now)
+        progress.profile_applied = True
+
+        # Owed from here: a write cut short is made good by the next activate or release call.
+        detail: dict[str, object] = {
+            "archive": _basename(seed),
+            "verify": verify.status,
+            "threshold": self._settings.priority_threshold.value,
+            "seed_segment": seed_segment,
+            "vip_hook_ran": hook_ran,
+        }
+        self._unrecorded_activation = (detail, actor, now)
+        # Provenance is read only once the profile is applied and the row is owed, so a cancellation
+        # while it is read still leaves the box recorded as active (vault BACKLOG #3067). Its fields
+        # never replace the coordinator's own.
+        if self._provenance is not None:
+            try:
+                provenance = await self._provenance()
+            except Exception as exc:
+                # The profile is live, so a provenance fault must not fail the activation.
+                log.warning("DR activation: could not read the provenance fields", exc_info=True)
+                provenance = {"provenance_error": safe_exc(exc)}
+            for key, value in provenance.items():
+                detail.setdefault(key, value)
+        await self._record_owed_activation(late=False)
+        return DrResult(
+            action="activate",
+            active=True,
+            threshold=self._settings.priority_threshold.value,
+            archive=_basename(seed),
+            verify_status=verify.status,
+            seed_segment=seed_segment,
+            vip_hook_ran=hook_ran,
+        )
 
     # --- release (fail-back) -------------------------------------------------
 
@@ -352,49 +412,278 @@ class DrCoordinator:
         async with self._lock:
             now = self._clock()
             if not self._active:
-                return DrResult(
+                # Never success for a hand-back with no dr.release row: write the one a cut-short
+                # release owes first, or refuse (vault BACKLOG #2752).
+                if self._unrecorded_release is not None:
+                    await self._record_owed_release()
+                return self._last_release or DrResult(
                     action="release",
                     active=False,
                     threshold=self._settings.priority_threshold.value,
                 )
+            # An activation still owed its row is recorded before the hand-back that ends it, or the
+            # release is refused (vault BACKLOG #2751).
+            if self._unrecorded_activation is not None:
+                await self._record_owed_activation()
             # Release the VIP FIRST (so partners reconnect to the primary), then unbind intake + drain.
             # Order matters: the VIP must be off the DR box before — or as — intake stops, so no message
             # is dual-accepted while the VIP moves.
-            hook_ran = await self._run_vip_hook(
-                self._settings.release_hook, phase="release", actor=actor, now=now
-            )
+            phase = "release_hook"
+            hook_ran = False
+            detail: dict[str, object] = {}
             try:
-                await (
-                    self._deactivate_profile()
-                )  # unbind listeners, drain the staged queue to completion
-            except Exception as exc:
-                # A failed drain leaves the box active (still draining) — report it loudly, do NOT claim a
-                # clean hand-back (a half-drained release would risk cross-store divergence the runbook
-                # can't account for).
-                raise DrActivationError(
-                    "state",
-                    f"DR release drain failed; the box stays active (retry release): {safe_exc(exc)}",
-                ) from exc
-            self._active = False
+                hook_ran = await self._run_vip_hook(
+                    self._settings.release_hook, phase="release", actor=actor, now=now
+                )
+                phase = "drain"
+                try:
+                    # Unbind listeners and drain the staged queue. Its fields (the depth left, the
+                    # drained verdict and the rows held on parked outbounds) go on the dr.release row.
+                    drain = await self._deactivate_profile()
+                except Exception as exc:
+                    # A failed drain leaves the box active (still draining) — report it loudly, do NOT
+                    # claim a clean hand-back (a half-drained release would risk cross-store divergence
+                    # the runbook can't account for). The failure has its own row (vault BACKLOG #2752).
+                    await self._record_release_failed(
+                        "drain_failed", phase, hook_ran, actor, now, error=exc
+                    )
+                    raise DrActivationError(
+                        "state",
+                        f"DR release drain failed; the box stays active (retry release): {safe_exc(exc)}",
+                    ) from exc
+                phase = "record"
+                self._active = False
+                detail = _release_detail(hook_ran, drain)
+                self._last_release = self._release_result(detail)
+                # Owed from here: a write cut short is made good by the next activate or release.
+                self._unrecorded_release = (detail, actor, now)
+                await self._record_owed_release(late=False)
+            except asyncio.CancelledError:
+                # A cancellation is not an Exception, so the drain's arm above never sees one (vault
+                # BACKLOG #2752). The API runs a release so that a request deadline does not cancel it
+                # (api/outlive.py); this arm is for what still can, such as a shutdown. Before the
+                # record step the box stays active, as for a failed drain, and the release can be
+                # retried; it is never flipped to passive with intake still to account for.
+                if phase == "record":
+                    # The hand-back completed and only its row was cut short: write it late.
+                    try:
+                        await self._record_owed_release()
+                    except DrActivationError:
+                        log.warning(
+                            "DR: an interrupted release handed back, and its dr.release row is "
+                            "still owed; the next activate or release call writes it",
+                            exc_info=True,
+                        )
+                else:
+                    # After a drain failure whose own row was being written this may be a second
+                    # row for one release; a duplicate is the safer of the two failures.
+                    if phase == "release_hook":
+                        # The hook was started, and a release hook is not killed (vault BACKLOG #2622).
+                        hook_ran = bool(self._settings.release_hook)
+                    await self._record_release_failed("interrupted", phase, hook_ran, actor, now)
+                raise
+            return self._release_result(detail)
+
+    def _release_result(self, detail: Mapping[str, object]) -> DrResult:
+        """The :class:`DrResult` of a completed hand-back, read from its ``dr.release`` detail."""
+        return DrResult(
+            action="release",
+            active=False,
+            threshold=self._settings.priority_threshold.value,
+            vip_hook_ran=detail.get("vip_hook_ran") is True,
+            depth_left=_count(detail.get("depth_left")),
+            drained=_flag(detail.get("drained")),
+            held_on_parked_outbounds=_count(detail.get("held_on_parked_outbounds")),
+        )
+
+    # --- outcome rows for a cut-short activate or release (vault BACKLOG #2751, #2752) ---------
+
+    async def _record_owed_activation(self, *, late: bool = True) -> None:
+        """Write the ``dr.activate`` row for an activation whose run-profile is applied, then log and
+        alert. ``late`` marks a row written by a later call than the one that activated (a retry, or
+        the cancellation arm), and the row says so.
+
+        A store error is a refusal, not a success: the activation stays owed, and the caller's
+        request fails rather than answering success with no row. A cancellation that lands after
+        the write committed can leave the row written twice, the second marked late; a duplicate is
+        the safer of the two failures."""
+        owed = self._unrecorded_activation
+        if owed is None:
+            return
+        detail, actor, now = owed
+        try:
+            await self._store.record_audit(
+                _ACTION_ACTIVATE,
+                actor=actor,
+                detail=json.dumps(
+                    {**detail, **({"recorded_late": True} if late else {})},
+                    sort_keys=True,
+                    # The profile is live by now, so a callback field json cannot encode must
+                    # not stop the row from being written.
+                    default=str,
+                ),
+                now=now,
+            )
+        except Exception as exc:
+            # Kind "audit" on every call, so the route answers 503 with this message rather than a
+            # bare 500 that hides that the activation happened.
+            raise DrActivationError(
+                "audit",
+                "this box is serving the DR run-profile, but the dr.activate audit row for that "
+                "activation could not be written, so DR calls are refused until it is; retry once "
+                f"the audit log accepts writes: {safe_exc(exc)}",
+            ) from exc
+        self._unrecorded_activation = None
+        log.warning(
+            "DR activated by %s: serving feeds at priority >= %s; cold seed %s verified %s "
+            "(new audit-chain segment opened)%s",
+            actor,
+            detail["threshold"],
+            detail["archive"],
+            detail["verify"],
+            " -- the dr.activate row was written late" if late else "",
+        )
+        # #145: page on the promotion — the primary is down and this box is now serving. Never-raise:
+        # a sink failure must not undo a completed activation. dr_released is the auto-resolving inverse.
+        self._alert_dr("dr_activated")
+
+    async def _record_interrupted_activation(
+        self, progress: _ActivationProgress, actor: str, now: float
+    ) -> None:
+        """The outcome row for an activation a cancellation cut short. Best-effort: it runs on the
+        way out of a cancellation, so a store error is logged and the cancellation still raises.
+
+        Once the run-profile is applied the box IS active, and what is owed is the ``dr.activate``
+        row. Before that, the box stays passive and a ``dr_activation_aborted`` row of kind
+        ``interrupted`` names the step reached; from the VIP step on, the takeover hook may have
+        run, so the row says the address may have moved."""
+        if progress.profile_applied:
+            try:
+                await self._record_owed_activation()
+            except DrActivationError:
+                log.warning(
+                    "DR: an interrupted activation left the run-profile applied, and its dr.activate "
+                    "row is still owed; the next activate or release call writes it",
+                    exc_info=True,
+                )
+            return
+        reason = f"activation interrupted during the {progress.step} step; the box stays passive"
+        if progress.step in ("vip", "profile"):
+            reason += (
+                ". The takeover hook may have run, so the VIP may have moved to this box with no "
+                "priority listener bound -- check the load balancer before retrying"
+            )
+        await self._write_aborted_row("interrupted", reason, actor, now)
+
+    async def _record_release_failed(
+        self,
+        reason: str,
+        phase: str,
+        hook_ran: bool,
+        actor: str,
+        now: float,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        """A ``dr_release_failed`` row: the release did not hand back, and the box stays active.
+        ``phase`` is how far it got (``release_hook`` or ``drain``). Best-effort, like
+        :meth:`_write_aborted_row`: the refusal it records must still reach the caller."""
+        detail: dict[str, object] = {"reason": reason, "phase": phase, "vip_hook_ran": hook_ran}
+        if error is not None:
+            detail["error"] = safe_exc(error)
+        if phase == "release_hook":
+            # A release hook is not killed when its caller is cancelled (_run_vip_hook, vault
+            # BACKLOG #2622), so it may still hand the address back to the primary.
+            detail["hook_left_running"] = hook_ran
+        try:
+            await self._store.record_audit(
+                _ACTION_RELEASE_FAILED,
+                actor=actor,
+                detail=json.dumps(detail, sort_keys=True),
+                now=now,
+            )
+        except Exception:
+            log.warning("DR: could not record the dr_release_failed audit row", exc_info=True)
+        log.warning(
+            "DR release did not complete (%s during the %s phase); the box stays active -- retry "
+            "the release%s",
+            reason,
+            phase,
+            (
+                ". The release hook was left running and may still move the VIP to the primary"
+                if phase == "release_hook"
+                else ""
+            ),
+        )
+
+    async def _record_owed_release(self, *, late: bool = True) -> None:
+        """Write the ``dr.release`` row for a hand-back that completed, then log and alert. The
+        twin of :meth:`_record_owed_activation`, with the same ``late`` marking, the same refusal on
+        a store error and the same possible duplicate."""
+        owed = self._unrecorded_release
+        if owed is None:
+            return
+        detail, actor, now = owed
+        try:
             await self._store.record_audit(
                 _ACTION_RELEASE,
                 actor=actor,
-                detail=json.dumps({"vip_hook_ran": hook_ran, "drained": True}, sort_keys=True),
+                detail=json.dumps(
+                    {**detail, **({"recorded_late": True} if late else {})},
+                    sort_keys=True,
+                    # The profile is live by now, so a callback field json cannot encode must
+                    # not stop the row from being written.
+                    default=str,
+                ),
                 now=now,
             )
+        except Exception as exc:
+            raise DrActivationError(
+                "audit",
+                "this box has handed back, but the dr.release audit row for that release could "
+                "not be written, so DR calls are refused until it is; retry once the audit log "
+                f"accepts writes: {safe_exc(exc)}",
+            ) from exc
+        self._unrecorded_release = None
+        depth = detail.get("depth_left")
+        held = detail.get("held_on_parked_outbounds")
+        if detail.get("drained") is True and held:
+            # Rows on outbounds the engine parks cannot drain on this box (vault BACKLOG #3067).
+            # They stay PENDING with no attempt charged.
+            log.warning(
+                "DR released by %s: VIP handed back, intake unbound, every drainable row drained; "
+                "%s row(s) stay held on parked outbounds until those outbounds come up — reconcile "
+                "per the runbook",
+                actor,
+                held,
+            )
+        elif depth == 0:
             log.warning(
                 "DR released by %s: VIP handed back, intake unbound, staged queue drained — the "
-                "recovered primary resumes (cross-store reconciliation is operator-verified per the runbook)",
+                "recovered primary resumes (cross-store reconciliation is operator-verified per the "
+                "runbook)",
                 actor,
             )
-            # #145: the inverse — auto-resolves the open dr_activated instance (no page on a clean fail-back).
-            self._alert_dr("dr_released")
-            return DrResult(
-                action="release",
-                active=False,
-                threshold=self._settings.priority_threshold.value,
-                vip_hook_ran=hook_ran,
+        elif depth is None:
+            log.warning(
+                "DR released by %s: VIP handed back, intake unbound; the drain reported no queue "
+                "depth, so whether rows remain is unknown — reconcile per the runbook",
+                actor,
             )
+        else:
+            # D-V1 (vault BACKLOG #2752): the drain gave up at its bound. Say so, and how many.
+            # Held rows were never waited for, so they are not among those that did not drain.
+            if isinstance(depth, int) and isinstance(held, int):
+                depth = max(depth - held, 0)
+            log.warning(
+                "DR released by %s: VIP handed back, intake unbound, but %s staged row(s) did not "
+                "drain within the bound and stay queued + replayable — reconcile them with the "
+                "recovered primary per the runbook",
+                actor,
+                depth,
+            )
+        # #145: the inverse — auto-resolves the open dr_activated instance (no page on a clean fail-back).
+        self._alert_dr("dr_released")
 
     # --- internals -----------------------------------------------------------
 
@@ -844,6 +1133,14 @@ class DrCoordinator:
         single fail path for every refused activation, so an aborted promotion always leaves an audit
         trail and the caller gets the failing phase. Never returns (always raises). ``requested`` is
         a refused request path: it goes in the audit row and never in the raised message."""
+        await self._write_aborted_row(kind, message, actor, now, requested=requested)
+        raise DrActivationError(kind, message)
+
+    async def _write_aborted_row(
+        self, kind: str, message: str, actor: str, now: float, *, requested: str | None = None
+    ) -> None:
+        """The ``dr_activation_aborted`` row and its log line, without the raise. Best-effort:
+        recording the abort must never mask the abort itself."""
         detail = {"kind": kind, "reason": message}
         if requested is not None:
             detail["requested"] = requested
@@ -858,7 +1155,6 @@ class DrCoordinator:
             # Recording the abort must itself never mask the abort — log and proceed to raise.
             log.warning("DR: could not record the dr_activation_aborted audit row", exc_info=True)
         log.warning("DR activation ABORTED (%s): %s", kind, message)
-        raise DrActivationError(kind, message)
 
     def _alert_dr(self, event: str) -> None:
         """Emit a #145 DR transition alert (``dr_activated`` on promotion / ``dr_released`` on fail-back)
@@ -1004,6 +1300,34 @@ def _confined_archive(archive: str, seed_dir: str) -> Path | None:
         resolved=[root],
         what="DR request archive",
     )
+
+
+def _count(value: object) -> int | None:
+    """``value`` if it is a count (an ``int`` that is not a ``bool``), else ``None``."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _flag(value: object) -> bool | None:
+    """``value`` if it is a ``bool``, else ``None``."""
+    return value if isinstance(value, bool) else None
+
+
+def _release_detail(hook_ran: bool, drain: Mapping[str, object] | None) -> dict[str, object]:
+    """The ``dr.release`` row's detail, from the engine callback's ``drain`` fields. ``drained`` is
+    the drain's real result, never a constant (vault BACKLOG #2752, finding D-V1). The engine
+    reports it, because only the engine knows which rows are held on parked outbounds and so
+    cannot drain (vault BACKLOG #3067). A callback that reports a depth and no verdict reads as
+    drained when that depth is ``0``; one that reports neither leaves ``drained`` ``None``."""
+    fields = drain or {}
+    depth = _count(fields.get("depth_left"))
+    drained = _flag(fields.get("drained"))
+    if drained is None and depth is not None:
+        drained = depth == 0
+    detail: dict[str, object] = {"vip_hook_ran": hook_ran, "drained": drained, "depth_left": depth}
+    held = _count(fields.get("held_on_parked_outbounds"))
+    if held is not None:
+        detail["held_on_parked_outbounds"] = held
+    return detail
 
 
 def _basename(path: str) -> str:

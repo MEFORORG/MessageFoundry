@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import os
 import re
+import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote, urlsplit
 
 from fastapi import HTTPException, Request, Response, WebSocket, status
@@ -28,6 +30,7 @@ from messagefoundry.api.security import (
 )
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token
 
 __all__ = [
     "BROWSER_HARDENING_OPT_OUT_ENV",
@@ -51,6 +54,9 @@ __all__ = [
     "ENROL_FIRST_UI_ROUTES",
     "clear_session_cookie",
     "confined_before_its_factor",
+    "consume_continuation",
+    "continues_after_reauth",
+    "continuation_issued",
     "effective_https",
     "is_safe_ui_action",
     "is_unlock_action",
@@ -58,7 +64,9 @@ __all__ = [
     "lookup_ui_action",
     "must_change_target",
     "oidc_flow_cookie_name",
+    "reauth_landing",
     "register_ui_action",
+    "rekey_continuations",
     "rotation_comes_first",
     "require_ui",
     "require_ui_reauth_only",
@@ -518,13 +526,10 @@ def require_ui(
         # its confinement page, so a refusal would loop. Such a session reaches this point only on
         # the password page, whose JSON twin /me/password is neither paced nor asked.
         if new_address_check and not identity.must_change_password and (phi or write):
-            landing = (
-                WRITE_REAUTH_LANDING
-                if identity.has(Permission.MONITORING_READ)
-                else ACCOUNT_REAUTH_LANDING
-            )
             await _refuse_from_new_address(
-                auth, request, next_path=_new_address_continuation(request, landing=landing)
+                auth,
+                request,
+                next_path=_new_address_continuation(request, landing=reauth_landing(identity)),
             )
         if phi and not auth.allow_phi_read(identity.user_id):
             raise HTTPException(
@@ -656,7 +661,7 @@ class UiWriteAction:
     Exactly one continuation style applies:
 
     * ``auto_retry`` — a URL-complete, **body-less POST** the re-auth flow may **re-POST** (auto-submit)
-      once the window is fresh (replay, purge, config-reload). The re-POST carries no body, so every
+      once the window is fresh (replay, config-reload). The re-POST carries no body, so every
       parameter must live in the PATH.
     * ``unlock`` — a **GET form page** (L4a admin forms) the re-auth flow may **303-GET-redirect** to
       after step-up, so the form re-opens inside a fresh window and the operator submits the body-carrying
@@ -681,12 +686,18 @@ class UiWriteAction:
     # continuation (None = mint nothing = a pure session-window refresh, today's default). Set on the
     # browser factor-binding lanes so their /ui/reauth re-proof mints exactly that action's grant.
     action: str | None = None
+    # Vault BACKLOG #2764: what the operator is confirming, in words, rendered on the re-auth page
+    # ("Confirm it's you to: <label>") and on the continuation. A page that says only "this action"
+    # cannot be checked by the person typing the password, so a registration without one is refused.
+    label: str = field(kw_only=True)
 
     def __post_init__(self) -> None:
         # Guard against a mis-registration that would let the re-auth flow POST-auto-submit a GET form
         # page (or GET-redirect to a state-changing POST): the continuation branch keys off these flags.
         if self.auto_retry and self.unlock:
             raise ValueError("a /ui action cannot be both auto_retry (POST) and unlock (GET)")
+        if not self.label.strip():
+            raise ValueError("a /ui action needs a label naming it on the re-auth page")
 
 
 # The write-action registry — the extensible replacement for the former single ``_SAFE_UI_ACTION_RE``
@@ -705,8 +716,13 @@ def register_ui_action(
     auto_retry: bool = True,
     unlock: bool = False,
     action: str | None = None,
+    label: str,
 ) -> UiWriteAction:
     """Register a state-changing /ui action into the write-action registry. Idempotent by ``pattern``.
+
+    ``label`` is REQUIRED: the operator-facing name of the action, rendered on ``/ui/reauth`` as
+    "Confirm it's you to: <label>" (vault BACKLOG #2764). Write it as an imperative an operator would
+    recognise ("Replay all dead letters"), never a path.
 
     ``pattern`` MUST be a fully-anchored regex for the exact path (e.g. ``r"^/ui/alerts/[^/?#]+/ack$"``).
     ``auto_retry`` entries are the only paths the step-up re-auth may **re-POST** — keep it ``True`` only
@@ -715,7 +731,9 @@ def register_ui_action(
     body-carrying admin forms); register those as ``auto_retry=False, unlock=True`` (the two are mutually
     exclusive — :class:`UiWriteAction` rejects both).
     """
-    entry = UiWriteAction(re.compile(pattern), permission, step_up, auto_retry, unlock, action)
+    entry = UiWriteAction(
+        re.compile(pattern), permission, step_up, auto_retry, unlock, action, label=label
+    )
     if not any(a.path_re.pattern == entry.path_re.pattern for a in _UI_WRITE_ACTIONS):
         _UI_WRITE_ACTIONS.append(entry)
     return entry
@@ -725,23 +743,35 @@ def register_ui_action(
 # dead deliveries for one channel, or the dead deliveries for one (channel, destination). All params are
 # in the PATH (opaque ids / channel + destination names, each a single slash/query/fragment-free
 # segment), so the body-less auto-retry re-POST carries everything it needs.
-register_ui_action(r"^/ui/messages/[^/?#]+/replay$", Permission.MESSAGES_REPLAY)
-register_ui_action(r"^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$", Permission.MESSAGES_REPLAY)
+register_ui_action(
+    r"^/ui/messages/[^/?#]+/replay$", Permission.MESSAGES_REPLAY, label="Replay a message"
+)
+register_ui_action(
+    r"^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$",
+    Permission.MESSAGES_REPLAY,
+    label="Replay the dead letters of one connection",
+)
 # L6b (#75 parity): replay ALL dead deliveries across EVERY channel — a body-less step-up POST, so
 # the /ui/reauth flow may auto-retry it. The literal `replay-all` segment is NOT matched by the
 # per-channel pattern above (it has no `/replay` suffix), so it needs its own allow-list entry.
-register_ui_action(r"^/ui/dead-letters/replay-all$", Permission.MESSAGES_REPLAY)
+register_ui_action(
+    r"^/ui/dead-letters/replay-all$", Permission.MESSAGES_REPLAY, label="Replay all dead letters"
+)
 
 #: Where ``/ui/reauth`` sends an operator whose WRITE was refused for a new address (vault BACKLOG
 #: #2620). A write's body cannot ride the re-auth, and most of these writes are not registered
 #: continuations, so the re-auth lands on the dashboard and the operator clicks again. Registered as
 #: an unlock page so ``/ui/reauth`` accepts it; ``/ui`` serves GET only, so this is no POST gadget.
 WRITE_REAUTH_LANDING = "/ui"
-register_ui_action(r"^/ui$", None, auto_retry=False, unlock=True)
+register_ui_action(
+    r"^/ui$", None, auto_retry=False, unlock=True, label="Continue to the console dashboard"
+)
 #: The landing for a session without ``monitoring:read``, which ``/ui`` would refuse: a custom role
 #: may hold a write permission without it (ADR 0045). Every signed-in session may load this page.
 ACCOUNT_REAUTH_LANDING = "/ui/account"
-register_ui_action(r"^/ui/account$", None, auto_retry=False, unlock=True)
+register_ui_action(
+    r"^/ui/account$", None, auto_retry=False, unlock=True, label="Continue to your account page"
+)
 #: ``GET /ui/reauth``'s own cap on ``next`` (its ``max_length``). A longer continuation would be
 #: answered 422 there, with no re-auth form.
 _REAUTH_NEXT_MAX = 512
@@ -822,6 +852,155 @@ def is_unlock_action(next_path: str | None) -> bool:
     )
 
 
+def reauth_landing(identity: Identity) -> str:
+    """Where ``/ui/reauth`` sends an operator when there is nothing it may continue to: ``/ui``, or
+    ``/ui/account`` for a session without ``monitoring:read``, which ``/ui`` would refuse."""
+    return (
+        WRITE_REAUTH_LANDING if identity.has(Permission.MONITORING_READ) else ACCOUNT_REAUTH_LANDING
+    )
+
+
+#: How long an issued continuation stays consumable, in seconds (vault BACKLOG #2764). Long enough
+#: to type a password and a code, or to complete the identity provider's prompt; short because an
+#: entry that lapses costs only the auto-submit: the re-auth ends on a page saying nothing ran.
+REAUTH_CONTINUATION_TTL_SECONDS = 300.0
+#: Bounds on the issued-continuation table. A session holds at most this many (its oldest is dropped),
+#: so a session that keeps getting refused cannot crowd out anyone else's; the table holds at most
+#: this many sessions (the least recently issued is dropped). Each drop is fail-safe for the same
+#: reason a lapse is: it costs the auto-submit and nothing else.
+_REAUTH_CONTINUATIONS_PER_SESSION = 8
+_REAUTH_CONTINUATION_SESSIONS_MAX = 4096
+
+
+class _IssuedContinuations:
+    """The ``auto_retry`` continuations this process issued, each bound to ONE session (#2764).
+
+    ``/ui/reauth`` used to auto-submit whichever registered action its ``next`` named, and nothing
+    recorded that the server had asked for it, so a typed, bookmarked or clicked link to
+    ``/ui/reauth?next=<a destructive action>`` turned a routine re-auth into that action. Now a
+    step-up gate that refuses a request records the continuation it hands out
+    (:func:`_reauth_redirect`), and ``/ui/reauth`` auto-submits only an entry recorded for the
+    session presenting it, consuming it as it does (single use).
+
+    Keyed by ``hash_token(session token)`` and then ``next``, so the raw token is never held and a
+    second session cannot consume another's entry. The console routes that rotate a session's token
+    call :meth:`rekey`; a rotation this table did not see (the federated step-up callback, which
+    never holds the old token) strands the session's other entries, which costs their auto-submit
+    and nothing else. Process-local, bounded and TTL'd on the monotonic clock, with the same
+    per-process caveat as the engine's single-use step-up grants.
+
+    Sessions are ordered least recently issued or re-keyed first, which is the order eviction
+    drops them in. A re-key moves a session to the back with its deadlines unchanged, so that order
+    is NOT deadline order, and pruning walks every session rather than stopping at the first live
+    one. That walk is bounded by the session cap and costs one dict read per session.
+    """
+
+    def __init__(self) -> None:
+        self._sessions: OrderedDict[str, OrderedDict[str, float]] = OrderedDict()
+
+    def _prune(self, now: float) -> None:
+        """Drop every session whose newest entry (its last; entries are in issue order) lapsed."""
+        lapsed = [
+            h for h, entries in self._sessions.items() if next(reversed(entries.values())) <= now
+        ]
+        for session_hash in lapsed:
+            del self._sessions[session_hash]
+
+    def issue(self, token: str, next_path: str) -> None:
+        now = time.monotonic()
+        self._prune(now)
+        session_hash = hash_token(token)
+        entries = self._sessions.pop(session_hash, None) or OrderedDict()
+        entries.pop(next_path, None)  # re-issuing refreshes the entry and moves it to the back
+        entries[next_path] = now + REAUTH_CONTINUATION_TTL_SECONDS
+        while len(entries) > _REAUTH_CONTINUATIONS_PER_SESSION:
+            entries.popitem(last=False)
+        self._sessions[session_hash] = entries
+        while len(self._sessions) > _REAUTH_CONTINUATION_SESSIONS_MAX:
+            self._sessions.popitem(last=False)
+
+    def issued(self, token: str | None, next_path: str) -> bool:
+        """Whether a live entry exists for this session and ``next_path``. Does not consume it."""
+        entries = self._sessions.get(hash_token(token)) if token else None
+        deadline = entries.get(next_path) if entries else None
+        return deadline is not None and deadline > time.monotonic()
+
+    def consume(self, token: str | None, next_path: str) -> bool:
+        """Pop the entry for this session and ``next_path``; whether it was live (single use)."""
+        if not token:
+            return False
+        session_hash = hash_token(token)
+        entries = self._sessions.get(session_hash)
+        if entries is None:
+            return False
+        deadline = entries.pop(next_path, None)
+        if not entries:
+            del self._sessions[session_hash]
+        return deadline is not None and deadline > time.monotonic()
+
+    def rekey(self, old_token: str | None, new_token: str | None) -> None:
+        """Carry this session's entries across a token rotation, deadlines unchanged."""
+        if not old_token or not new_token or old_token == new_token:
+            return
+        entries = self._sessions.pop(hash_token(old_token), None)
+        if entries:
+            self._sessions[hash_token(new_token)] = entries
+
+
+_ISSUED_CONTINUATIONS = _IssuedContinuations()
+
+
+def continuation_issued(token: str | None, next_path: str) -> bool:
+    """Whether :func:`_reauth_redirect` issued ``next_path`` to this session and it is still live."""
+    return _ISSUED_CONTINUATIONS.issued(token, next_path)
+
+
+def consume_continuation(token: str | None, next_path: str) -> bool:
+    """Spend the continuation issued to this session for ``next_path``; True only once."""
+    return _ISSUED_CONTINUATIONS.consume(token, next_path)
+
+
+def continues_after_reauth(action: UiWriteAction, token: str | None, next_path: str) -> bool:
+    """Whether a re-auth for ``next_path`` will hand control back to it: always for an ``unlock``
+    page (a GET the operator still submits from), and for an ``auto_retry`` action only when it was
+    issued to this session (vault BACKLOG #2764). Ask it of the CURRENT token; a ceremony rotates."""
+    return action.unlock or continuation_issued(token, next_path)
+
+
+def rekey_continuations(old_token: str | None, new_token: str | None) -> None:
+    """Move this session's issued continuations onto its rotated token."""
+    _ISSUED_CONTINUATIONS.rekey(old_token, new_token)
+
+
+def _request_is_same_origin(request: Request) -> bool:
+    """:func:`assert_same_origin` as a predicate."""
+    try:
+        assert_same_origin(request)
+    except HTTPException:
+        return False
+    return True
+
+
+def _issue_continuation(request: Request, next_path: str) -> None:
+    """Record ``next_path`` as a continuation this session may auto-submit after its re-auth.
+
+    Only for an ``auto_retry`` target, only when the refused request was itself a same-origin POST,
+    and only for a request with a session. The POST condition is what ties the record to an action
+    the operator actually submitted from this console: a GET is what a link produces, and a
+    same-site POST from a sibling host carries the SameSite=Strict cookie but fails the origin check
+    (the MFA-pending refusal fires before ``require_ui`` asserts provenance, so it is checked here)."""
+    token = session_token(request)
+    if (
+        token
+        and request.method == "POST"
+        # GET /ui/reauth answers 422 past its cap, so a longer entry could never be consumed.
+        and len(next_path) <= _REAUTH_NEXT_MAX
+        and is_safe_ui_action(next_path)
+        and _request_is_same_origin(request)
+    ):
+        _ISSUED_CONTINUATIONS.issue(token, next_path)
+
+
 def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPException:
     """303 a browser to the /ui re-auth page, remembering the action to continue with.
 
@@ -829,8 +1008,14 @@ def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPExce
     POST actions to point the re-auth at their **unlock form page** instead of the POST path (which is
     deliberately not a registered continuation). Either way the value is only ever *acted on* after
     ``/ui/reauth`` re-validates it against the write-action registry, so a bad override fails closed.
+
+    An ``auto_retry`` continuation is also RECORDED against this session (vault BACKLOG #2764, see
+    :class:`_IssuedContinuations`); ``/ui/reauth`` auto-submits only a recorded one. The ``next`` in
+    the URL stays what it was, so the record, not the URL, is what authorises the auto-submit.
     """
-    nxt = quote(next_path if next_path is not None else request.url.path, safe="/")
+    target = next_path if next_path is not None else request.url.path
+    _issue_continuation(request, target)
+    nxt = quote(target, safe="/")
     return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": f"/ui/reauth?next={nxt}"})
 
 

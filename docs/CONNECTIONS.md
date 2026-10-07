@@ -210,7 +210,13 @@ _<feed>_transforms.py       the field-level transform steps the handler delegate
 - **Transforms → a `_`-prefixed helper** keeps the Handler a thin *filter → delegate → Send*; the many
   field manipulations a ported Corepoint child accumulates live in the helper as small, reviewable,
   unit-testable functions rather than a wall of inline code. Shared helpers are imported from siblings
-  (the loader skips `_*` as feeds but resolves them as imports).
+  (the loader skips `_*` as feeds but resolves them as imports). An `import _helper` statement works
+  at module top level and inside a Router or Handler body alike, because every helper a function
+  body names in an `import` statement is loaded with the config, whether or not that line would run.
+  A helper whose own import fails under an `except ImportError` in the body is left to that guard,
+  with a WARNING. `importlib.import_module` does not find a helper. A helper may not share its name with a standard library or installed module
+  (`_csv.py`, `_json.py`): the load refuses one that is imported. A file whose name starts with `.`
+  (an editor backup such as `.IB_OLD.py`, a macOS `._` file) is not config and is never run.
 
 A **runnable worked example** ships in [`samples/config/`](../samples/config/): `IB_DEMO_ORU` is
 authored exactly this way — the connections in [`connections.toml`](../samples/config/connections.toml),
@@ -748,7 +754,7 @@ def route(msg):
 |---------|-----|---------|---------|
 | `directory` | both | — (required) | folder to poll / write into |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
-| `poll_seconds` | in | `1.0` | poll interval. It is also the **settle window**: a file is read only once its size and modification time are unchanged since the last poll that saw it (BACKLOG #1811), so every file waits at least one poll. The settle gate is always on and has no setting, but a very small `poll_seconds` narrows its window to almost nothing. |
+| `poll_seconds` | in | `1.0` | poll interval, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774). It is also the **settle window**: a file is read only once its size and modification time are unchanged since the last poll that saw it (BACKLOG #1811), so every file waits at least one poll. The settle gate is always on and has no setting, but a very small `poll_seconds` narrows its window to almost nothing. |
 | `min_age_seconds` | in | `0` | skip files modified within this window. This is an extra wait on top of the settle gate, not the gate itself; set it for a partner that pauses between writes for longer than `poll_seconds`. |
 | `after_read` | in | `move` | `move` (→ `.processed`), `delete`, or `leave` (process **in place** — never move/delete the source file, for a read-only share / a directory another system owns; a hashed dedup ledger ensures a left file is ingested **once**, #142) |
 | `sort` | in | `name` | process order: `name` or `mtime` |
@@ -809,14 +815,21 @@ inbound(
 another system owns, a source may **leave** each file untouched instead of moving/deleting it. To avoid
 re-ingesting the same file every poll, the engine keeps a durable **processed-file dedup ledger** (the
 store's `processed_files` table, all three backends) keyed on a **hash** of the file's identity — the
-file's **path relative to the watch root** + mtime + size locally, or the **full remote path** + size for
-SFTP/FTP (a remote listing carries no reliable mtime, so size is the change signal) — **never a
+file's **path relative to the watch root** + mtime + size locally, or the **full remote path** + size +
+the listed modification time for SFTP/FTP (SFTP `st_mtime`, FTP `MLSD` `modify`; BACKLOG #2758) — **never a
 cleartext path** (a filename/path can embed an MRN), and never logged. Folding the *path* (not just the
 basename) in keeps two same-named files in different `recursive` subdirs distinct, so both are ingested.
 A file is recorded **after** its message(s) emit successfully, with the **file** (not each split message)
 as the dedup unit; a crash before recording re-emits the whole file (at-least-once). An **updated** file
-(new mtime/size → new hash) is re-ingested. The ledger is bounded by an age + count prune. In `leave`
-mode the `.processed`/`.error` subdirs are created best-effort (a read-only share doesn't fail start),
+(new mtime/size → new hash) is re-ingested. **A remote server that lists no modification time** (an FTP
+server without `MLSD`, an SFTP server that omits the times) leaves the remote key at path + size, so a
+replacement at the same size, or any replacement on a server that lists no size either, is **not**
+re-ingested. The source logs that skip at INFO, once per file per process, naming the file through its
+safe label; for such a server use `move` or `delete`, or have the partner write each version under a new
+name. Even where a time is listed, a same-size replacement within its resolution (whole seconds for SFTP
+and many `MLSD` servers) is not re-ingested, and nothing logs it. In the other direction, a remote file
+whose listed time moves with its bytes unchanged is ingested again, a duplicate. The ledger is bounded
+by an age + count prune. In `leave` mode the `.processed`/`.error` subdirs are created best-effort (a read-only share doesn't fail start),
 so a malformed file on a truly read-only share that can't be moved to `.error` re-logs each poll — fix it
 at the source.
 
@@ -1069,8 +1082,8 @@ its own policy block below):
   that pauses for longer than `poll_seconds`, a same-length rewrite inside the share's modification-time
   resolution, and a copier that sets the final size first and holds the modification time fixed while
   it fills the file in. For those, use the partner's write-then-rename, or for the first a
-  `min_age_seconds` longer than its pause. The SFTP/FTP source has the same gate on the listed size
-  alone (BACKLOG #2071); `RemoteFileSource._settled` says where it differs. As a backstop, the source also compares a file's
+  `min_age_seconds` longer than its pause. The SFTP/FTP source has the same gate on the listed size and,
+  where the server lists one, the listed modification time (BACKLOG #2071, #2758); `RemoteFileSource._settled` says where it differs. As a backstop, the source also compares a file's
   size and modification time on each side of the
   read (BACKLOG #116). A file that changes **during** the read is not emitted that scan. One that
   changes **after** it is not moved or deleted, so the next scan reads it whole, and a WARNING says the
@@ -1229,9 +1242,9 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**. It loads `[tls].crl_file` when one is set (vault BACKLOG #2370), but without one an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
 | `tls_ca_file` | both | — | **`Ftp` only, FTPS** (#1180) — pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
-| `poll_seconds` | in | `5.0` | poll interval. It is also the **settle window**: a file is read only once it lists at the same size as at the last poll that saw it (BACKLOG #2071), so every file waits at least one poll. The gate is always on and has no setting. It reads the listed size alone, so it cannot see a same-size rewrite, nor anything on a server that lists every file at size 0. |
-| `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it (a remote directory listing carries no reliable mtime). Only `File(...)` implements it; the settle gate on `poll_seconds` above, and the partner's own write-then-rename, are what guard against partial reads here. |
-| `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size ensures a left file is ingested once) |
+| `poll_seconds` | in | `5.0` | poll interval, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774). It is also the **settle window**: a file is read only once it lists at the same size, and the same modification time where the server lists one, as at the last poll that saw it (BACKLOG #2071, #2758), so every file waits at least one poll. The gate is always on and has no setting. On a server that lists no modification time (at least FTP without `MLSD`, an `MLSD` server without `modify`, and an SFTP server that omits the times) it reads the listed size alone, so there it cannot see a same-size rewrite, nor anything on a server that lists every file at size 0. |
+| `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it. Only `File(...)` implements it; the settle gate on `poll_seconds` above, and the partner's own write-then-rename, are what guard against partial reads here. |
+| `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size + the listed modification time where the server gives one ensures a left file is ingested once; see *Process-in-place* for what a server that lists no modification time misses) |
 | `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal quarantines the file to `error_subdir` and logs it — never a silent drop, and never left in place to be re-pulled every poll. `None`/`0` = unlimited, in both charges. |
 | `poll_max_files` | in | `500` | most files one poll will take. The rest stay on the share and the next poll takes them — a **deferral, not a drop**. Identical in shape and reasoning to the `File(...)` row; see [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time. The probe is a **listing** — it never creates. **Out:** the upload dir is then never `ensure_dir`ed either, on send or by `POST /connections/{name}/test`. Instead every send first **lists** `remote_dir`, so the account needs list permission there even with `overwrite = true`, at one extra round trip per delivery. An upload into a vanished dir then fails **retryably** rather than dead-lettering on the partner's permanent no-such-dir; a credential refusal on that listing stops the lane. Left off (the default) the upload dir is still created on first send, but the creation is now logged as a `WARNING`. |
@@ -1828,7 +1841,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 | `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id` |
 | `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
-| `poll_seconds` | `5.0` | interval between polls |
+| `poll_seconds` | `5.0` | interval between polls, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774) |
 | `poll_max_rows` | `500` | most rows one poll will **hand off** from `poll_statement`'s result set. The rest are left in the table — not read, not marked, not errored — and the next poll selects them again. Still charged at the **fetch**, so a long-unattended table is not materialised whole into memory; a row the source cannot turn into a body does not spend a slot, and the poll asks the driver for the shortfall instead (at most 64 such rows per poll, then it defers the rest). Progress needs `mark_statement` to take a handled row out of the `poll_statement` predicate, which is the shape this connector already requires. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `encoding` | `utf-8` | charset for the body bytes handed to the pipeline |
 | `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls an OS-installed ODBC driver (PostgreSQL / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--mysql) |

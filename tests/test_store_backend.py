@@ -74,6 +74,7 @@ def test_messagestore_satisfies_store_protocol() -> None:
         "record_view",
         "record_audit",
         "list_audit",
+        "count_audit",
         "create_user",
         "get_user",
         "get_user_by_username",

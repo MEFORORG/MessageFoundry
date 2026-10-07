@@ -32,7 +32,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from messagefoundry.config.loaded_crls import HeldCrlSnapshot, crl_fingerprint
+from messagefoundry.config.loaded_crls import (
+    HeldCrlSnapshot,
+    ca_bundle_fingerprint,
+    crl_fingerprint,
+    crl_path_key,
+)
 from messagefoundry.config.loaded_crls import snapshot as held_crl_snapshot
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -92,6 +97,12 @@ class CertCheck:
     not_after_iso: str
     days_remaining: int
     kind: str = "cert"
+    #: True when ``not_after_iso`` is not the file's but an older copy's that a running hop holds
+    #: and that lapses first (vault BACKLOG #2319). Only ever True for a CRL.
+    held_copy: bool = False
+    #: What the scan found about held copies of this CRL, and what to do, or ``""`` when no running
+    #: hop holds a copy that differs from the file. Config metadata only, no PHI.
+    detail: str = ""
 
     @property
     def expired(self) -> bool:
@@ -317,19 +328,28 @@ class CertExpiryRunner:
         now = self._clock() if now is None else now
         held = self._held_snapshot()
         checks: list[CertCheck] = []
-        for cert in self._rows(held):
+        rows = self._rows(held)
+        sharing = _rows_by_crl_file(rows)
+        for cert in rows:
             check = self._inspect(cert, now, held)
             if check is None:
                 continue
             checks.append(check)
             if check.days_remaining <= self._settings.warn_days:
                 if check.kind == "crl":
+                    # Vault BACKLOG #2319: the other rows naming this file. A held copy is matched
+                    # by its file, not its hop, so it is reported under each of them.
+                    shared = sharing.get(crl_path_key(check.path), ())
+                    shared_with = tuple(label for label in shared if label != check.label)
                     try:
                         self._alert_sink.crl_expiry(
                             check.label,
                             path=check.path,
                             not_after=check.not_after_iso,
                             days_remaining=check.days_remaining,
+                            held_copy=check.held_copy,
+                            detail=check.detail,
+                            shared_with=shared_with,
                         )
                     except Exception:
                         log.warning(
@@ -417,6 +437,20 @@ class CertExpiryRunner:
         )
 
 
+def _rows_by_crl_file(rows: Sequence[MonitoredCert]) -> dict[str, tuple[str, ...]]:
+    """The labels of the CRL rows naming each file, keyed as held copies are (vault BACKLOG #2319).
+
+    Several settings or connections can name one CRL file, and each gets its own row, since each
+    hop depends on it. A held copy is matched by its file, so each of those rows reports it."""
+    by_file: dict[str, list[str]] = {}
+    for row in rows:
+        if row.kind == "crl":
+            labels = by_file.setdefault(crl_path_key(row.path), [])
+            if row.label not in labels:
+                labels.append(row.label)
+    return {key: tuple(labels) for key, labels in by_file.items()}
+
+
 def held_crl_label(path: str) -> str:
     """The alert label for a CRL file a live hop holds that no configured row names (BACKLOG #299).
 
@@ -445,20 +479,58 @@ def _judge_crl(
     it. A copy the reload refused names the refusal in the log line. A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
     silences the check while a hop still holds a copy of it. ``None`` only when nothing can be judged.
     A failure judging the held copies is logged and leaves the file's own verdict standing."""
+    from messagefoundry.pki import crl_pem_blocks
+
     stale: list[CrlFacts] = []
+    detail = ""
     try:
         copies = held.copies(cert.path)
         fingerprint = crl_fingerprint(pem) if copies and pem is not None else None
-        copies = [copy for copy in copies if copy.fingerprint != fingerprint]
+        # Vault BACKLOG #2319: a CA-bundle copy is a copy of the file's CRLs alone, so it is
+        # compared on those, and a certificate added beside an unchanged CRL is not a stale copy.
+        bundle_fp = (
+            ca_bundle_fingerprint(pem)
+            if pem is not None and any(c.ca_bundle for c in copies)
+            else None
+        )
+        copies = [
+            copy
+            for copy in copies
+            if copy.fingerprint != (bundle_fp if copy.ca_bundle else fingerprint)
+        ]
         # One verdict per distinct copy: many hops sharing one file hold identical copies.
         stale = [copy.facts.at(now) for copy in {c.fingerprint: c for c in copies}.values()]
         if copies:
             oldest = soonest_crl(stale)
+            bundle_only = all(copy.ca_bundle for copy in copies)
             if pem is None:
+                what = "CA file" if bundle_only else "CRL file"
                 why, remedy = (
                     "whose file cannot be read",
-                    "Restore a readable CRL file before restarting: the engine refuses to "
+                    f"Restore a readable {what} before restarting: the engine refuses to "
                     "start on one it cannot read",
+                )
+            elif bundle_only and file_facts is not None and file_facts.expired:
+                # Vault BACKLOG #2319: nothing judges a CA file's CRL at start, so a restart would
+                # load this expired CRL and refuse every peer under its issuer now.
+                why, remedy = (
+                    "whose CA file now holds an expired CRL",
+                    "Replace the CRL in the CA file with a current one before restarting: a "
+                    "restart would load the expired one",
+                )
+            elif bundle_only and (file_facts is not None or not crl_pem_blocks(pem)):
+                # Vault BACKLOG #2319: the reload pass never applies a CA file, so no wait helps.
+                # A CA file whose CRL was moved out still starts, so a restart is safe then too.
+                why, remedy = (
+                    "that it loaded from its CA file, which the engine does not reload",
+                    "Restart the engine to apply the CA file. A CRL in the hop's CRL setting "
+                    "instead is applied without a restart",
+                )
+            elif bundle_only:
+                why, remedy = (
+                    "whose CA file now holds a CRL the engine cannot judge",
+                    "Fix or remove the CRL in the CA file before restarting: a restart loads "
+                    "the CA file whole",
                 )
             elif file_facts is None:
                 why, remedy = (
@@ -469,7 +541,8 @@ def _judge_crl(
             elif fingerprint is not None and (refused := held.refusal(cert.path, fingerprint)):
                 # BACKLOG #299: the reload pass tried the file on the running hop and refused it.
                 why = "that differs from the file, which the engine refused to apply to it"
-                remedy = f"Reason: {refused.reason}. {refused.remedy}"
+                # The remedy leads: the alert instance keeps only the start of it (#2319).
+                remedy = f"{refused.remedy}. Reason: {refused.reason}"
             else:
                 # No refusal recorded: the reload pass (pipeline/crl_reload.py) has not judged
                 # these bytes yet, and will within its interval.
@@ -478,7 +551,14 @@ def _judge_crl(
                     "A reload is pending: the engine applies the file to the running hop within "
                     f"{RELOAD_INTERVAL_SECONDS:g} seconds, unless it refuses the file and logs why",
                 )
-            holders = sorted({copy.setting or "a connection's tls_crl_file" for copy in copies})
+            holders = sorted({copy.setting or "an unnamed setting" for copy in copies})
+            if not bundle_only and any(copy.ca_bundle for copy in copies):
+                # Vault BACKLOG #2319: the hops that loaded it as a CA file take no reload.
+                remedy += ". A hop that loaded this file as its CA file needs a restart either way"
+            # Vault BACKLOG #2319: the same account for the alert, which the log line below gives
+            # only to the log. The remedy leads, because the alert instance keeps only the start
+            # of it. The date is the alert's own not_after, so it is not repeated here.
+            detail = f"{remedy}. Held by: {', '.join(holders)}."
             log.warning(
                 "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d load(s), "
                 "from %s). The hop keeps the copy it read when it built its context; the soonest "
@@ -510,4 +590,8 @@ def _judge_crl(
         not_after_iso=facts.next_update_iso,
         days_remaining=facts.days_remaining,
         kind="crl",
+        # The file comes first in ``judged``, and soonest_crl keeps the first of a tie, so a held
+        # copy that lapses with the file does not take the date from it (vault BACKLOG #2319).
+        held_copy=facts is not file_facts,
+        detail=detail if stale else "",
     )

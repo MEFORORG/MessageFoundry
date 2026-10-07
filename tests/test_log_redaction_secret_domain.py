@@ -545,6 +545,14 @@ def test_the_family_table_covers_every_applied_pattern() -> None:
     # The exemption set is exact, so widening it is a visible edit rather than a quiet one.
     assert {"_LEADING_TS"} == NOT_A_SECRET_PATTERN
 
+    # The second credential layer (BACKLOG #2694). ``redact_log_line`` calls ``scrub_credentials``,
+    # which applies ``secretscrub._run``'s patterns. Every one must carry a name this module applies
+    # too, or the mutation test above, which disables by name in both modules, would leave a pattern
+    # of the second layer running and its family would go green on the other layer's work.
+    shared = _applied_pattern_names(scrub_mod, "_run")
+    assert len(shared) >= 5, f"AST derivation found only {sorted(shared)} -- instrument is broken"
+    assert shared <= applied, f"applied only by the shared layer: {sorted(shared - applied)}"
+
 
 @pytest.mark.parametrize("fam", FAMILIES, ids=lambda f: f.name)
 def test_no_family_secret_is_reachable_by_the_long_base64_backstop(fam: Family) -> None:
@@ -578,9 +586,16 @@ def test_each_family_survives_when_its_own_patterns_are_disabled(
 
     A pass here means the declared patterns are the ones doing the work. A failure means something
     else in the chain -- the shared PHI pass, the long-base64 sweep, another secret pattern -- is
-    covering this family, so the family's own green is not evidence about its own pattern."""
+    covering this family, so the family's own green is not evidence about its own pattern.
+
+    Each name is disabled in BOTH credential layers. ``redact_log_line`` runs this module's copy and
+    then ``secretscrub``'s pattern of the same name (BACKLOG #2694), so disabling one copy leaves the
+    other doing the work. ``test_the_family_table_covers_every_applied_pattern`` checks the two layers
+    use the same names, so this cannot quietly disable only one."""
     for name in fam.patterns:
         monkeypatch.setattr(redact_mod, name, NEVER_MATCHES)
+        if isinstance(getattr(scrub_mod, name, None), re.Pattern):
+            monkeypatch.setattr(scrub_mod, name, NEVER_MATCHES)
     out = redact_log_line(fam.line)
     assert fam.secret in out, (
         f"{fam.name}: disabling {list(fam.patterns)} did NOT make the secret leak -- something else "
@@ -2284,6 +2299,14 @@ def _is_known_residual(first: str, sep: str, second: str) -> bool:
     return sep in ".-" and same and second in ("ad_bind_password", "bearer_token")
 
 
+def _is_known_bundle_residual(sep: str, second: str) -> bool:
+    """The part of :func:`_is_known_residual` that ``redact_log_line`` still prints: a ``MEFOR_``
+    name glued on by "_". Its second credential layer (BACKLOG #2694) closes the same-family shapes,
+    because it runs on the text after the first layer's placeholder, where the second label now
+    starts a piece of its own. Nothing reads ``X_MEFOR_...`` as a label in either layer."""
+    return sep == "_" and second.startswith("MEFOR_")
+
+
 #: Every surface the stop protects: the write-time pass, the handler filter that calls it, and the
 #: read-time bundle redactor.
 _SWALLOW_SURFACES: tuple[tuple[str, Callable[[str], str]], ...] = (
@@ -2319,11 +2342,16 @@ def test_no_two_label_line_prints_either_value() -> None:
     closed without this test being edited to say so."""
     cases = _swallow_family_cases()
     assert len(cases) == 9 * 9 * 9 * 2
-    residual = {
+    write_time_residual = {
         line for first, sep, second, line in cases if _is_known_residual(first, sep, second)
     }
-    assert residual, "the residual predicate matched nothing, so its half of this test is vacuous"
+    bundle_residual = {
+        line for first, sep, second, line in cases if _is_known_bundle_residual(sep, second)
+    }
+    assert bundle_residual < write_time_residual, "the bundle residual must be a strict subset"
     for surface, apply in _SWALLOW_SURFACES:
+        residual = bundle_residual if apply is redact_log_line else write_time_residual
+        assert residual, f"{surface}: the residual predicate matched nothing, so half is vacuous"
         printed = {
             line
             for _first, _sep, _second, line in cases
@@ -2548,6 +2576,12 @@ def _structured_lines(count: int) -> list[str]:
 
 _ATOM = re.compile(r"vq\d+(?!\d)")
 
+
+def _prints(atom: str, text: str) -> bool:
+    """Whether ``text`` still carries the value atom ``atom`` whole."""
+    return re.search(re.escape(atom) + r"(?!\d)", text) is not None
+
+
 #: Every keyword a label can end in, in either copy's spelling.
 _ANY_KEYWORD = (
     r"(?i:passphrase|password|passwd|pass|pwd|secret|credential|authorization|bearer|token"
@@ -2622,8 +2656,8 @@ def _newly_printed_atoms(
     for surface, _apply in _DIFFERENTIAL_SURFACES:
         for line, before, after in zip(corpus, old[surface], new[surface], strict=True):
             for atom in set(_ATOM.findall(line)):
-                printed_before = re.search(re.escape(atom) + r"(?!\d)", before) is not None
-                printed_after = re.search(re.escape(atom) + r"(?!\d)", after) is not None
+                printed_before = _prints(atom, before)
+                printed_after = _prints(atom, after)
                 if (
                     printed_after
                     and not printed_before
@@ -3105,3 +3139,115 @@ def test_the_run_on_walks_grow_linearly_in_line_length() -> None:
                 f"{module.__name__}._CREDENTIAL_KV grew {growth:.1f}x for 8x the length on "
                 f"{shape(16)!r}"
             )
+
+
+# --- BACKLOG #2694: the bundle's second credential layer is the write-time vocabulary ------------
+
+#: A credential word no vocabulary knows, and a value for it. Synthetic.
+_NEW_WORD = "zqvault"
+_NEW_WORD_VALUE = "zq-Vocab_Val-41"
+_NEW_WORD_LINE = f"unseal failed {_NEW_WORD}={_NEW_WORD_VALUE} for svc"
+
+
+def test_a_word_added_to_the_shared_vocabulary_reaches_both_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A word added to ``secretscrub`` is scrubbed by the write-time pass, the handler filter and the
+    bundle redactor, with no edit to ``support/redact.py``: closing step 2 of BACKLOG #2694, in the
+    direction #2694 closes. The other direction stays open. A word added only to the bundle's own
+    copy does not reach the write-time filters, which is why that copy is still kept in step by hand.
+
+    The word goes in the way a real edit would: into ``_CREDENTIAL_WORDS``' alternation in the
+    pattern, and into the admission gates, so the gate cannot refuse the line before the pattern
+    runs. The control first shows every surface prints the value while no vocabulary knows it."""
+    printed = [
+        name for name, apply in _SWALLOW_SURFACES if _NEW_WORD_VALUE in apply(_NEW_WORD_LINE)
+    ]
+    assert len(printed) == len(_SWALLOW_SURFACES), f"control: only {printed} printed the value"
+
+    words = (*scrub_mod._CREDENTIAL_WORDS, _NEW_WORD)
+    # The label group only. The same words also sit inside the value classes' stop, as part of a
+    # longer alternation, and this test is about the label.
+    label_group = "(?:" + scrub_mod._alternation(scrub_mod._CREDENTIAL_WORDS) + "))"
+    source = scrub_mod._CREDENTIAL_KV.pattern
+    assert source.count(label_group) == 1, "the vocabulary's label group moved; rebuild this"
+    monkeypatch.setattr(
+        scrub_mod,
+        "_CREDENTIAL_KV",
+        re.compile(source.replace(label_group, "(?:" + scrub_mod._alternation(words) + "))")),
+    )
+    monkeypatch.setattr(scrub_mod, "_CREDENTIAL_HINT", scrub_mod._folded(words))
+    monkeypatch.setattr(scrub_mod, "_ANY_HINT", (*scrub_mod._ANY_HINT, _NEW_WORD))
+
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(_NEW_WORD_LINE)
+        assert _NEW_WORD_VALUE not in out, f"{surface}: the new word's value printed -- {out!r}"
+        assert f"{_NEW_WORD}=" in out, f"{surface}: the new word's label was lost -- {out!r}"
+
+
+def _fold_head_two_label_lines() -> list[str]:
+    """Two-label lines whose FIRST label has a fold-character head: the shape on which the shared
+    pass alone printed values the bundle's own copy hid (BACKLOG #2694). The heads are every
+    character :func:`_measured_letter_folds` finds. The labels and separators are a subset of the
+    swallow family's, picked from the shapes that printed, so each line carries ``vq`` atoms."""
+    return [
+        f"connect failed {head}_{first}=vq1-a_b{sep}{second}={value} for svc"
+        for head in sorted(_measured_letter_folds())
+        for first in ("password", "authorization", "private_key", "token")
+        for sep in ("_", ".", "-", ":", "|")
+        for second in ("password", "ad_password", "token", "private_key")
+        for value in ("'vq2 vq3'", '"vq4 vq5"', "{vq6;vq7}")
+    ]
+
+
+def _newly_printed(corpus: list[str], before: list[str], after: list[str]) -> list[str]:
+    """Lines where ``after`` prints a value atom that ``before`` hid. Unlike
+    :func:`_newly_printed_atoms` it excuses no atom printed as a label prefix: both sides here run
+    the same first layer, so that trade, where it happens, happens on both."""
+    return [
+        line
+        for line, old, new in zip(corpus, before, after, strict=True)
+        if any(_prints(atom, new) and not _prints(atom, old) for atom in set(_ATOM.findall(line)))
+    ]
+
+
+def test_the_bundle_prints_nothing_its_own_passes_hid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The second layer may only hide more. Whole ``redact_log_line``, PHI pass included, with and
+    without ``scrub_credentials``: no value atom the bundle's own passes hid may print.
+
+    The full probe behind ``redact_log_line``'s comment ran 822,616 lines; this is the slice that
+    found the defect, plus a seeded structured corpus. Two other arms keep it honest. The layer must
+    hide something, or it is dead weight. And the shared pass ALONE (the own patterns disabled) must
+    still print something the own copy hid ON THE FOLD-HEAD LINES: that is the measured reason the
+    copy stays, and it is the control showing this comparison can fail. That arm reads the fold-head
+    slice only, because the shared pass alone also prints on some ASCII structured lines, and those
+    would keep it green after the fold-head residual closed."""
+    fold_head = _fold_head_two_label_lines()
+    corpus = [*fold_head, *_structured_lines(3000), *_REVIEW_SHAPES]
+    shipped = [redact_log_line(line) for line in corpus]
+    with monkeypatch.context() as patch:
+        patch.setattr(redact_mod, "scrub_credentials", lambda text, *, placeholder: text)
+        own_only = [redact_log_line(line) for line in corpus]
+    with monkeypatch.context() as patch:
+        for name in _applied_pattern_names(scrub_mod, "_run"):
+            patch.setattr(redact_mod, name, NEVER_MATCHES)
+        shared_only = [redact_log_line(line) for line in corpus]
+
+    weaker = _newly_printed(corpus, own_only, shipped)
+    assert not weaker, f"{len(weaker)} lines print a value the own passes hid, first {weaker[:3]}"
+    assert _newly_printed(corpus, shipped, own_only), "the second layer hid nothing on this corpus"
+    n = len(fold_head)
+    assert _newly_printed(fold_head, own_only[:n], shared_only[:n]), (
+        "the shared pass alone no longer prints anything the bundle's own copy hid. If secretscrub "
+        "closed the fold-head residual, BACKLOG #2694's remainder may be ready: try deleting the "
+        "copy in support/redact.py and re-run the probe described above redact_log_line."
+    )
+
+
+def test_a_line_that_arrives_holding_the_placeholder_is_not_split_at_it() -> None:
+    """The second layer splits at this module's placeholder, so a value written with the placeholder
+    text in front of it must not cut a fold-head label off from its value. The first layer cannot
+    read a fold-head label, so only the second layer stands between this value and the archive."""
+    line = f"connect failed {chr(0x212A)}_password=[REDACTED]zq-Lit_Val-52 for svc"
+    out = redact_log_line(line)
+    assert "zq-Lit_Val-52" not in out, out

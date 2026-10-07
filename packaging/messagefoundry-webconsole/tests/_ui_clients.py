@@ -143,3 +143,16 @@ async def create_local_user_chosen(service: AuthService, *, password: str, **kwa
         password_generated=False,
     )
     return created.user_id
+
+
+def issue_continuation(client: httpx.AsyncClient, next_path: str) -> None:
+    """Record ``next_path`` as a continuation the console issued to ``client``'s session.
+
+    Stands in for the step-up gate's 303, which records it (vault BACKLOG #2764): ``/ui/reauth``
+    auto-submits only an issued continuation. For a test whose subject is what the continuation
+    DOES, not how it was issued; the issuing itself is driven end to end in ``test_webui.py``."""
+    from messagefoundry_webconsole._auth import _ISSUED_CONTINUATIONS
+
+    token = client.cookies.get("mf_session")
+    assert token, "issue_continuation needs a signed-in client"
+    _ISSUED_CONTINUATIONS.issue(token, next_path)

@@ -1,0 +1,9 @@
+{
+  "name": "messagefoundry-ci-npm-tools",
+  "private": true,
+  "description": "The npm tools CI runs: jscpd (quality-advisory.yml) and cyclonedx-npm (security.yml). CI installs them with `npm ci --ignore-scripts` from the committed package-lock.json, which pins every transitive dependency by integrity hash. The `npx --yes <tool>@<version>` this replaced pinned the top package only and resolved the rest fresh on every run (vault BACKLOG #2793). jscpd stays on 4.x: npm `latest` is a 5.x rewrite with a different CLI.",
+  "dependencies": {
+    "@cyclonedx/cyclonedx-npm": "6.0.0",
+    "jscpd": "4.0.5"
+  }
+}

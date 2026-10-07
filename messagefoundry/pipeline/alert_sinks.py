@@ -53,7 +53,11 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
-from messagefoundry.pipeline.alerts import config_changed_detail, intake_pause_detail
+from messagefoundry.pipeline.alerts import (
+    config_changed_detail,
+    crl_expiry_detail,
+    intake_pause_detail,
+)
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
@@ -369,12 +373,15 @@ class WebhookTransport:
         if scheme == "http" and not weakened_tls_escape_permitted(posture):
             raise ValueError(
                 "[alerts].webhook_url uses plaintext http; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use https"
+                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
+                "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
+                "or with no posture) — use https"
             )
         if scheme == "http":
             log.warning(
-                "webhook target uses plaintext http; permitted only because %s is set "
-                "(cleartext, MITM-able — trusted-network/dev use only)",
+                "webhook target uses plaintext http; permitted only because %s is set on an instance "
+                "at [security].enforcement = warn (cleartext, MITM-able — trusted-network/dev use "
+                "only)",
                 INSECURE_TLS_ESCAPE_ENV,
             )
         # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
@@ -928,14 +935,40 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
-    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+    def crl_expiry(
+        self,
+        name: str,
+        *,
+        path: str,
+        not_after: str,
+        days_remaining: int,
+        held_copy: bool = False,
+        detail: str = "",
+        shared_with: tuple[str, ...] = (),
+    ) -> None:
         """BACKLOG #1005. Routed exactly like :meth:`cert_expiry` -- same fan-out, same redaction --
         because a CRL path is config metadata and carries no PHI. Kept a SEPARATE method because an
         expired CRL fails every handshake it verifies, inbound or outbound, rather than degrading one
-        identity, so an operator filtering on it is asking a different question."""
-        self.cert_expiry(
-            f"{name} (CRL)", path=path, not_after=not_after, days_remaining=days_remaining
-        )
+        identity, so an operator filtering on it is asking a different question.
+
+        Vault BACKLOG #2319: a date that is a running hop's held copy says so. The event gains
+        ``held_copy``, ``shared_with`` and a ``detail`` only when there is something to say, so a
+        plain CRL alert's payload is what it was. ``detail`` also becomes the alert instance's
+        reason, which the store cuts to about 200 characters, so it leads with the remedy."""
+        event: dict[str, Any] = {
+            "type": "cert_expiry",
+            "connection": f"{name} (CRL)",
+            "path": path,
+            "not_after": not_after,
+            "days_remaining": days_remaining,
+        }
+        if held_copy:
+            event["held_copy"] = True
+        if shared_with:
+            event["shared_with"] = list(shared_with)
+        if note := crl_expiry_detail(held_copy=held_copy, detail=detail, shared_with=shared_with):
+            event["detail"] = note
+        self._emit(event)
 
     def secret_rotation_due(
         self,
@@ -1024,10 +1057,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def audit_write_failed(self, name: str, *, action: str) -> None:
+        # vault BACKLOG #2255: an audit row was lost. `approval:<id>` stands in for "connection", as
+        # for approval_too_early, so each request is its own instance. The action name lands in the
+        # reason column; the lost row's detail stays in the ERROR log line beside it. No PHI.
+        self._emit(
+            {
+                "type": "audit_write_failed",
+                "connection": name,
+                "action": action,
+                "reason": f"the {action} audit row was not written",
+            }
+        )
+
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
         # BACKLOG #315: the Administrator role was granted. `user:<username>` or `ad-group:<group>`
-        # stands in for "connection" (the key's grammar is on AlertSink). The granting administrator
-        # is an operator account name, not message content.
+        # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
+        # administrator's operator account name, or the fixed marker `<directory>` when a directory
+        # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
         self._emit(
             {
                 "type": "administrator_granted",

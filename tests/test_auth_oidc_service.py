@@ -37,7 +37,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     FEDERATED_IDENTITY_BOUND,
@@ -201,8 +201,10 @@ class _FakeLdap:
         self._by_username = by_username
         self.resolved: list[str] = []
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return self._principal
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+        if self._principal is None:
+            return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+        return DirectoryBind(DirectoryAnswer.FOUND, self._principal)
 
     def resolve_principal(
         self, username: str, *, object_id: str | None = None

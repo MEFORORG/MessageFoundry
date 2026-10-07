@@ -8,6 +8,7 @@ import os
 import sys
 import textwrap
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -24,6 +25,7 @@ from messagefoundry.config.wiring import (
     Send,
     Sftp,
     WiringError,
+    _assert_safe_config_source,
     build_inbound_connection,
     build_outbound_connection,
     inbound_binding_conflicts,
@@ -51,19 +53,121 @@ def test_validate_config_missing_dir_reports_error(tmp_path: Path) -> None:
     assert diags and "not found" in diags[0].message
 
 
+_SERVICE_UID = 10001  # the container image's engine account
+_OTHER_UID = 4242  # a third, unprivileged account that is neither root nor the engine
+
+
+def _report_owner(monkeypatch: pytest.MonkeyPatch, owners: dict[Path, int]) -> None:
+    """Make ``Path.stat`` report the given owner for each path, keeping every other field real.
+
+    Ownership cannot be faked with ``chown`` on a non-root CI runner, and the root arm cannot be
+    reached at all by patching the engine's uid against a real root-owned ``tmp_path``. So the owner
+    is substituted in the stat result instead, which is the only field the owner rule reads."""
+    real_stat = Path.stat
+
+    def fake_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        st = real_stat(self, follow_symlinks=follow_symlinks)
+        uid = owners.get(self)
+        if uid is None:
+            return st
+        seq, extra = cast(tuple[tuple[Any, ...], dict[str, Any]], st.__reduce__()[1])
+        return os.stat_result((*seq[:4], uid, *seq[5:]), extra)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+
+
+def _run_as(monkeypatch: pytest.MonkeyPatch, *, euid: int, ruid: int) -> None:
+    """Set the engine's effective uid, with a deliberately different REAL uid as a decoy.
+
+    The rule must read the effective uid, which is the account the executed code runs as. A decoy
+    real uid equal to the file's owner makes a getuid-based rule accept where it must refuse."""
+    monkeypatch.setattr(os, "geteuid", lambda: euid)
+    monkeypatch.setattr(os, "getuid", lambda: ruid)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership check (CONFIG-2 / review M-21)")
 def test_load_config_refuses_foreign_owned_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # M-21: a config dir owned by a different (non-root) user is refused — the engine would otherwise
-    # execute code that user can rewrite. Simulate by making the running uid differ from the owner.
+    # M-21: a config dir owned by a different (non-root) user is refused -- the engine would otherwise
+    # execute code that user can rewrite.
     _write(
         tmp_path, "from messagefoundry import outbound, File\noutbound('o', File(directory='.'))\n"
     )
-    owner_uid = os.stat(tmp_path).st_uid
-    monkeypatch.setattr(os, "getuid", lambda: owner_uid + 1)  # pretend we run as a different user
+    _report_owner(monkeypatch, {tmp_path: _OTHER_UID})
+    _run_as(monkeypatch, euid=_SERVICE_UID, ruid=_OTHER_UID)
     with pytest.raises(WiringError, match="owned by uid"):
         load_config(tmp_path)
+
+
+# The POSIX owner rule (vault BACKLOG #2759): trust an owner that is root or the engine's effective
+# uid; a root engine trusts only root. It used to exempt a root ENGINE instead of a root OWNER, so a
+# root engine ran config any user owned and a service-account engine refused a root-owned config.
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership check (vault BACKLOG #2759)")
+@pytest.mark.parametrize(
+    ("euid", "owner", "refused"),
+    [
+        pytest.param(0, _OTHER_UID, True, id="root-engine-refuses-another-uid"),
+        pytest.param(0, _SERVICE_UID, True, id="root-engine-refuses-the-service-uid"),
+        pytest.param(0, 0, False, id="root-engine-accepts-root"),
+        pytest.param(_SERVICE_UID, 0, False, id="service-engine-accepts-root"),
+        pytest.param(_SERVICE_UID, _SERVICE_UID, False, id="service-engine-accepts-itself"),
+        pytest.param(_SERVICE_UID, _OTHER_UID, True, id="service-engine-refuses-a-third-uid"),
+    ],
+)
+def test_config_source_owner_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, euid: int, owner: int, refused: bool
+) -> None:
+    module = _write(tmp_path, "X = 1\n") / "cfg.py"
+    # 0644 files in a 0755 directory: only the owner can write, so the owner is the whole question.
+    tmp_path.chmod(0o755)
+    module.chmod(0o644)
+    _report_owner(monkeypatch, {tmp_path: owner, module: owner})
+    # The decoy real uid: equal to the owner where the row refuses, so a rule reading getuid would
+    # accept; a third uid where the row accepts, which the old root-engine exemption refused.
+    _run_as(monkeypatch, euid=euid, ruid=owner if refused else _OTHER_UID)
+    if refused:
+        with pytest.raises(
+            WiringError, match=f"owned by uid {owner} -- the engine runs as uid {euid}"
+        ):
+            _assert_safe_config_source(tmp_path)
+    else:
+        _assert_safe_config_source(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership check (vault BACKLOG #2759)")
+def test_config_source_owner_rule_vets_each_module_not_only_the_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A trusted directory does not vouch for a module in it: a root-owned dir holding a helper owned
+    # by a third uid is refused under a root engine, and the refusal names the module.
+    helper = tmp_path / "_helpers.py"
+    helper.write_text("X = 1\n", encoding="utf-8")
+    helper.chmod(0o644)
+    _report_owner(monkeypatch, {tmp_path: 0, helper: _OTHER_UID})
+    _run_as(monkeypatch, euid=0, ruid=0)
+    with pytest.raises(WiringError, match="_helpers.py owned by uid 4242"):
+        _assert_safe_config_source(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership check (vault BACKLOG #2759)")
+def test_load_config_accepts_a_root_owned_config_under_a_service_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The safest POSIX layout -- a root-owned, read-only config the engine's own account cannot
+    # rewrite -- loads end to end, rather than only passing the check in isolation.
+    module = (
+        _write(
+            tmp_path,
+            "from messagefoundry import outbound, File\noutbound('o', File(directory='.'))\n",
+        )
+        / "cfg.py"
+    )
+    tmp_path.chmod(0o755)
+    module.chmod(0o644)
+    _report_owner(monkeypatch, {tmp_path: 0, module: 0})
+    _run_as(monkeypatch, euid=_SERVICE_UID, ruid=_SERVICE_UID)
+    assert set(load_config(tmp_path).outbound) == {"o"}
 
 
 def test_load_config_populates_registry(tmp_path: Path) -> None:
@@ -149,7 +253,8 @@ def test_loader_skips_underscore_modules(tmp_path: Path) -> None:
 
 def test_config_module_can_import_sibling_helper(tmp_path: Path) -> None:
     # low-10: CLAUDE.md §4 documents sharing `_`-prefixed helpers imported from sibling config
-    # modules. A scoped finder resolves the import against the config dir; it isn't left in sys.modules.
+    # modules. The load's helper importer resolves it against the config dir; it is never registered
+    # under its plain name in sys.modules.
     (tmp_path / "_shared.py").write_text("ROUTER = 'adt_router'\n", encoding="utf-8")
     _write(
         tmp_path,
@@ -693,8 +798,8 @@ def test_validate_config_refuses_unsafe_source(
     # low-11: validate_config must apply the same safe-source check as load_config before executing
     # any config Python — it executes code too.
     _write(tmp_path, "raise RuntimeError('must not execute from an unsafe source')\n")
-    owner_uid = os.stat(tmp_path).st_uid
-    monkeypatch.setattr(os, "getuid", lambda: owner_uid + 1)
+    _report_owner(monkeypatch, {tmp_path: _OTHER_UID})
+    _run_as(monkeypatch, euid=_SERVICE_UID, ruid=_OTHER_UID)
     diags = validate_config(tmp_path)
     assert diags and "owned by uid" in diags[0].message
 

@@ -70,13 +70,14 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 from messagefoundry.config.models import (
     ConnectorType,
     ContentType,
     Destination,
     Source,
+    flag_from_settings,
     remote_file_protocol,
 )
 from messagefoundry.config.settings import (
@@ -112,6 +113,7 @@ from messagefoundry.transports.base import (
     SourceStartupError,
     encode_wire_body,
     intake_open,
+    poll_interval,
     positive_cap,
     register_destination,
     register_source,
@@ -408,6 +410,17 @@ class _BoundedSink:
         return self._buf.getvalue()
 
 
+class _Listed(NamedTuple):
+    """One regular file in a remote listing. ``size`` is 0 where the server reports none. ``mtime``
+    is the server's own modification-time text (SFTP ``st_mtime`` in seconds, FTP ``MLSD``
+    ``modify``), or ``None`` where it reports none. It is compared for equality only, never parsed,
+    so a server's own format and resolution carry through unchanged."""
+
+    name: str
+    size: int
+    mtime: str | None
+
+
 class _RemoteClient(abc.ABC):
     """Connect-per-operation remote-file client. Implementations are **synchronous** (blocking I/O);
     the connector calls them via :func:`asyncio.to_thread`. Each method opens its own connection, does
@@ -423,6 +436,13 @@ class _RemoteClient(abc.ABC):
     @abc.abstractmethod
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
         """``(name, size)`` for each regular file directly in ``remote_dir`` (no recursion)."""
+
+    def list_entries(self, remote_dir: str) -> list[_Listed]:
+        """:meth:`list_dir`, with each file's listed modification time where the server gives one
+        (vault BACKLOG #2758). The poll reads this, so its leave-mode dedup key can tell a same-size
+        replacement from the file already ingested. The SFTP and FTP clients override it; the
+        default, for a client whose listing has no modification time, lists none."""
+        return [_Listed(name, size, None) for name, size in self.list_dir(remote_dir)]
 
     def list_names(self, remote_dir: str) -> set[str]:
         """The name of EVERY entry directly in ``remote_dir``, whatever its type: a directory, a
@@ -524,8 +544,9 @@ def _ftps_ssl_context(
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
             "REMOTEFILE ftps tls_verify=false disables server-certificate verification (MITM risk). "
-            f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a "
-            "trusted-network bind (refused on a production-PHI instance even with the escape, #200)."
+            f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+            "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
+            "effect while enforcing, the default, or with no posture)."
         )
     ca = settings.get("tls_ca_file")
     if verify and trust_anchor_policy is not None:
@@ -552,7 +573,8 @@ def _ftps_ssl_context(
     else:
         logger.warning(
             "REMOTEFILE ftps TLS certificate verification is DISABLED (tls_verify=false, permitted "
-            "by %s) — MITM-able; for a trusted-network dev/test bind only.",
+            "by %s at [security].enforcement = warn) — MITM-able; for a trusted-network dev/test "
+            "bind only.",
             INSECURE_TLS_ESCAPE_ENV,
         )
         ctx.check_hostname = False
@@ -842,17 +864,24 @@ class _FtpClient(_RemoteClient):
         return ftp
 
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
+        return [(entry.name, entry.size) for entry in self.list_entries(remote_dir)]
+
+    def list_entries(self, remote_dir: str) -> list[_Listed]:
         return self._op(lambda ftp: self._list(ftp, remote_dir))
 
     @staticmethod
-    def _list(ftp: ftplib.FTP, remote_dir: str) -> list[tuple[str, int]]:
-        out: list[tuple[str, int]] = []
-        # MLSD gives a reliable type + size; fall back to NLST + SIZE where the server lacks it.
+    def _list(ftp: ftplib.FTP, remote_dir: str) -> list[_Listed]:
+        out: list[_Listed] = []
+        # MLSD gives a reliable type + size, and a `modify` fact on most servers; fall back to NLST
+        # + SIZE where the server lacks it. That fallback lists no modification time: a per-file
+        # MDTM would add a round trip per file per poll, and the leave-mode dedup logs what it
+        # cannot tell apart instead (vault BACKLOG #2758).
         try:
             for name, facts in ftp.mlsd(remote_dir):
-                if name in (".", "..") or facts.get("type") != "file":
+                # RFC 3659 fact values are case-insensitive; _names lowercases them too.
+                if name in (".", "..") or facts.get("type", "").lower() != "file":
                     continue
-                out.append((name, int(facts.get("size", 0))))
+                out.append(_Listed(name, int(facts.get("size", 0)), facts.get("modify") or None))
             return out
         except (ftplib.error_perm, ftplib.error_proto):
             pass
@@ -862,7 +891,7 @@ class _FtpClient(_RemoteClient):
                 continue
             # A directory or an un-sizable entry lists as 0 (the oversize check skips it).
             size = _ftp_size(ftp, posixpath.join(remote_dir, base)) or 0
-            out.append((base, int(size)))
+            out.append(_Listed(base, int(size), None))
         return out
 
     def list_names(self, remote_dir: str) -> set[str]:
@@ -1437,7 +1466,8 @@ class _SftpClient(_RemoteClient):
         if self._accept_unknown:
             logger.warning(
                 "REMOTEFILE sftp %s accepts UNKNOWN host keys (AutoAddPolicy) because %s is set "
-                "— MITM-able; for a trusted-network dev/test bind only",
+                "on an instance at [security].enforcement = warn — MITM-able; for a trusted-network "
+                "dev/test bind only",
                 self._host,
                 INSECURE_TLS_ESCAPE_ENV,
             )
@@ -1561,14 +1591,25 @@ class _SftpClient(_RemoteClient):
         return key
 
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
+        return [(entry.name, entry.size) for entry in self.list_entries(remote_dir)]
+
+    def list_entries(self, remote_dir: str) -> list[_Listed]:
         import stat as _stat
 
-        def run(sftp: Any) -> list[tuple[str, int]]:
-            out: list[tuple[str, int]] = []
+        def run(sftp: Any) -> list[_Listed]:
+            out: list[_Listed] = []
             for entry in sftp.listdir_attr(remote_dir):
                 mode = getattr(entry, "st_mode", 0) or 0
                 if _stat.S_ISREG(mode):
-                    out.append((entry.filename, int(getattr(entry, "st_size", 0) or 0)))
+                    # paramiko leaves st_mtime None when the server omits the times (BACKLOG #2758).
+                    mtime = getattr(entry, "st_mtime", None)
+                    out.append(
+                        _Listed(
+                            entry.filename,
+                            int(getattr(entry, "st_size", 0) or 0),
+                            None if mtime is None else str(int(mtime)),
+                        )
+                    )
             return out
 
         return self._op(run)
@@ -1794,7 +1835,7 @@ def _anon_ftp_guard(
         port=int(s.get("port", 21)),
         cell="REMOTEFILE ftp",
         description="cleartext anonymous FTP egress",
-        attested=bool(s.get("tls_hop_attested", False)),
+        attested=flag_from_settings(s, "tls_hop_attested"),
         attested_reason=None if reason is None else str(reason),
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
@@ -1832,8 +1873,9 @@ def _validate_common(
             raise ValueError(
                 f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in "
                 "CLEARTEXT; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set — use ftps (tls=True) or sftp (refused on a "
-                "production-PHI instance even with the escape, #200)"
+                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
+                "(the escape has no effect while enforcing, the default, or with no posture) — use "
+                "ftps (tls=True) or sftp"
             )
         logger.warning(
             "%sREMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",
@@ -2151,7 +2193,7 @@ class RemoteFileSource(SourceConnector):
         # None setting is utf-8): the batch split decodes with it to find the MSH boundaries (ADR
         # 0206 rule 5). A name the codec registry lacks makes the split hand the file over whole.
         self._encoding: str = s.get("encoding") or "utf-8"
-        self._poll_seconds: float = float(s.get("poll_seconds", 5.0))
+        self._poll_seconds: float = poll_interval(s, default=5.0, transport="REMOTEFILE source")
         self._after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
         if self._after_read not in ("move", "delete", "leave"):
             raise ValueError(
@@ -2162,10 +2204,13 @@ class RemoteFileSource(SourceConnector):
         # ledger's own count cap. A miss falls through to ledger.is_processed(); eviction never causes a
         # false re-ingest. Never a cleartext filename; never logged at INFO+.
         self._processed_seen: OrderedDict[str, None] = OrderedDict()
-        # BACKLOG #2071 settle gate: the listed size each not-yet-admitted file showed at the poll that
-        # last saw it, and how many polls in a row have since failed to list it, keyed by name. In
-        # memory only and never logged. See _settled.
-        self._settle_seen: dict[str, tuple[int, int]] = {}
+        # BACKLOG #2758: hashed keys of left files already reported as skipped on a key that cannot
+        # see a same-size replacement, so each is reported at INFO once. See _log_undetectable_skip.
+        self._undetectable_logged: OrderedDict[str, None] = OrderedDict()
+        # BACKLOG #2071 settle gate: the listed (size, mtime) each not-yet-admitted file showed at the
+        # poll that last saw it, and how many polls in a row have since failed to list it, keyed by
+        # name. In memory only and never logged. See _settled.
+        self._settle_seen: dict[str, tuple[tuple[int, str | None], int]] = {}
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
         self._validate_directory: bool = bool(s.get("validate_directory", False))
@@ -2288,12 +2333,13 @@ class RemoteFileSource(SourceConnector):
         assert self._handler is not None
         await asyncio.to_thread(self._client.ensure_dir, self._processed_dir)
         await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
-        entries = await asyncio.to_thread(self._client.list_dir, self._remote_dir)
+        entries = await asyncio.to_thread(self._client.list_entries, self._remote_dir)
         newly_recorded = 0  # #142: files marked processed THIS poll — gates one end-of-poll prune
-        listing = sorted(entries)
+        # Keyed so two entries that list one name never compare a None mtime with a str.
+        listing = sorted(entries, key=lambda entry: (entry.name, entry.size))
         self._prune_settle(listing)
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
-        for position, (name, size) in enumerate(listing):
+        for position, (name, size, mtime) in enumerate(listing):
             if self._stop.is_set():
                 break  # shutting down — leave the rest for the next start (at-least-once)
             if self._at_ceiling(disposed, len(listing) - position):
@@ -2325,13 +2371,15 @@ class RemoteFileSource(SourceConnector):
                 continue
             path = posixpath.join(self._remote_dir, name)
             # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
-            # then the durable ledger). Keyed on a HASHED id (name+size — a remote listing carries no
-            # mtime) — never a cleartext filename, never logged at INFO+.
-            file_key = self._file_key(name, size) if self._after_read == "leave" else None
+            # then the durable ledger). Keyed on a HASHED id (path + size + the listed mtime where the
+            # server gives one, BACKLOG #2758) — never a cleartext filename.
+            file_key = self._file_key(name, size, mtime) if self._after_read == "leave" else None
             if file_key is not None and await self._leave_already_ingested(file_key):
+                if mtime is None:
+                    self._log_undetectable_skip(name, size, file_key)
                 continue
-            if not self._settled(name, size):
-                # BACKLOG #2071: first sighting, or the listed size changed since the last poll.
+            if not self._settled(name, size, mtime):
+                # BACKLOG #2071: first sighting, or the listed size or mtime changed since the last poll.
                 # Nothing is read, moved or charged against the per-tick budget.
                 continue
             if self._max_file_bytes is not None and size > self._max_file_bytes:
@@ -2382,7 +2430,7 @@ class RemoteFileSource(SourceConnector):
                     exc.after,
                 )
                 # Still moving, so it must settle again from its latest size (#2071).
-                self._remember_size(name, exc.read if exc.after is None else exc.after)
+                self._remember_size(name, exc.read if exc.after is None else exc.after, mtime)
                 continue
             except _RemoteError as exc:
                 # Transient (locked / vanished mid-poll): leave it in place to retry next poll rather
@@ -2529,27 +2577,35 @@ class RemoteFileSource(SourceConnector):
         )
         return True
 
-    def _settled(self, name: str, size: int) -> bool:
-        """True when ``name`` lists at the same size it listed at the last poll that looked at it,
-        which admits it for reading (BACKLOG #2071). Otherwise remember ``size`` and return False, so
-        the file waits for a later poll.
+    def _settled(self, name: str, size: int, mtime: str | None) -> bool:
+        """True when ``name`` lists at the same size and listed modification time as at the last
+        poll that looked at it, which admits it for reading (BACKLOG #2071). Otherwise remember them
+        and return False, so the file waits for a later poll.
 
         This is the local File source's settle gate (#1811) ported here, and
         :meth:`~messagefoundry.transports.file.FileSource._settled` states the rule in full: why it
         exists beside #116, why it is always on with no setting, and why ``poll_seconds`` is its
         window. It shares that source's memory bounds, ``SETTLE_SEEN_MAX`` and ``SETTLE_MISS_LIMIT``.
 
-        **Where it differs.** A remote listing carries no reliable modification time, so the signal
-        is the listed size alone, the one :meth:`_file_key` already uses. So besides what the local
-        gate cannot see, this one also misses a same-size rewrite, and a server that lists every
+        **Where it differs.** The modification time is the server's listed one, SFTP ``st_mtime``
+        or FTP ``MLSD`` ``modify`` (vault BACKLOG #2758). It joined the signal when the leave-mode
+        :meth:`_file_key` began folding it in: a same-size rewrite then gets a new key, so this gate
+        must not admit one whose mtime is still moving. The mtimes are compared only when both
+        sightings carry one, so a listing that loses its mtime for a poll (an ``MLSD`` refusal that
+        falls back to ``NLST``) does not hold a file back. A server that lists no mtime (FTP without
+        ``MLSD``, an ``MLSD`` server without ``modify``, an SFTP server that omits the times) leaves
+        the listed size alone as the signal. So besides what the local gate cannot see, on such a
+        server this one also misses a same-size rewrite, and a server that lists every
         file at the same size, or at 0, as an FTP server without ``MLSD`` or ``SIZE`` does. On such
         a server every file waits one poll and nothing more. The key is the name, since every
         listed file sits in the one ``remote_dir``."""
         seen = self._settle_seen.get(name)
-        if seen is not None and seen[0] == size:
-            del self._settle_seen[name]
-            return True
-        recorded = self._remember_size(name, size)
+        if seen is not None:
+            seen_size, seen_mtime = seen[0]
+            if seen_size == size and (seen_mtime is None or mtime is None or seen_mtime == mtime):
+                del self._settle_seen[name]
+                return True
+        recorded = self._remember_size(name, size, mtime)
         # safe_name hashes the name, so skip it when nobody reads the line.
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -2563,42 +2619,92 @@ class RemoteFileSource(SourceConnector):
             )
         return False
 
-    def _remember_size(self, name: str, size: int) -> bool:
-        """Record ``size`` as this poll's sighting of ``name`` and return True. At ``SETTLE_SEEN_MAX``
-        a name not already recorded is left out and this returns False, so it waits for room; the
-        local source's constant says why that is not eviction."""
+    def _remember_size(self, name: str, size: int, mtime: str | None) -> bool:
+        """Record ``size`` and ``mtime`` as this poll's sighting of ``name`` and return True. At
+        ``SETTLE_SEEN_MAX`` a name not already recorded is left out and this returns False, so it
+        waits for room; the local source's constant says why that is not eviction."""
         if name in self._settle_seen or len(self._settle_seen) < SETTLE_SEEN_MAX:
-            self._settle_seen[name] = (size, 0)
+            self._settle_seen[name] = ((size, mtime), 0)
             return True
         return False
 
-    def _prune_settle(self, listing: list[tuple[str, int]]) -> None:
+    def _prune_settle(self, listing: list[_Listed]) -> None:
         """Forget a file once ``SETTLE_MISS_LIMIT`` polls in a row have not listed it (moved, deleted,
         renamed away), so the settle map is bounded by the poll directory. A file listed again has its
         count reset. A failed listing raises before this runs, so it never counts as a miss."""
         if not self._settle_seen:
             return
-        listed = {name for name, _ in listing}
-        for name, (size, missed) in list(self._settle_seen.items()):
+        listed = {entry.name for entry in listing}
+        for name, (sighting, missed) in list(self._settle_seen.items()):
             if name in listed:
                 if missed:
-                    self._settle_seen[name] = (size, 0)
+                    self._settle_seen[name] = (sighting, 0)
             elif missed + 1 >= SETTLE_MISS_LIMIT:
                 del self._settle_seen[name]
             else:
-                self._settle_seen[name] = (size, missed + 1)
+                self._settle_seen[name] = (sighting, missed + 1)
 
-    def _file_key(self, name: str, size: int) -> str:
+    def _file_key(self, name: str, size: int, mtime: str | None) -> str:
         """A stable, HASHED identity for a remote source file, for the leave-in-place dedup ledger
-        (#142). SHA-256 over the file's FULL REMOTE PATH (``remote_dir``/``name``) + size — folding the
-        full path, not just the basename, keeps two same-named files that live under different bases (or
-        a re-pointed ``remote_dir``) DISTINCT so both are ingested (never one silently deduped away — the
-        count-and-log invariant). A remote directory listing carries no reliable mtime, so size is the
-        change signal (a same-path file whose SIZE changes is re-ingested); on a read-only share (the
-        target use case) files are stable. The path — which, like a filename, can embed an MRN — is never
-        stored or logged in the clear (the ledger holds this derived id only; never log the path)."""
+        (#142). SHA-256 over the file's FULL REMOTE PATH (``remote_dir``/``name``) + size + the listed
+        modification time where the server gives one — folding the full path, not just the basename,
+        keeps two same-named files that live under different bases (or a re-pointed ``remote_dir``)
+        DISTINCT so both are ingested (never one silently deduped away — the count-and-log invariant).
+
+        **The modification time is folded in because a size alone misses a replacement (vault
+        BACKLOG #2758).** This used to say a remote listing carries no reliable mtime, and keyed on
+        size alone. It was wrong: SFTP lists ``st_mtime`` and FTP ``MLSD`` lists a ``modify`` fact,
+        and the shipped key could not tell a same-length rewrite of one fixed name (a fixed-width
+        extract, a daily ``ADT.txt``) from the file already read, so on first deployment such a new
+        version would not have been read. Now a same-path file
+        whose size OR listed mtime changes is re-ingested, as the local File source's key already does.
+        Where the server lists no mtime (FTP without ``MLSD``, an ``MLSD`` server without
+        ``modify``, an SFTP server that omits the times)
+        the key is path + size exactly as before, a same-size replacement is still not told apart,
+        and :meth:`_log_undetectable_skip` says so rather than skipping silently.
+
+        **What it still misses, and what it re-reads.** A same-size replacement inside the server's
+        mtime resolution (whole seconds for SFTP and many ``MLSD`` servers) keeps its key and is not
+        read, and that skip is not logged, since nothing in the listing shows it. In the other
+        direction, a file whose mtime moves with its bytes unchanged (a re-upload of the same
+        content, a timestamp refresh), or a poll whose listing loses the mtime (an ``MLSD`` refusal
+        that falls back to ``NLST``), gets a new key and is read again: a duplicate, which
+        at-least-once already allows, never a loss.
+
+        The path — which, like a filename, can embed an MRN — is never stored or logged in the clear
+        (the ledger holds this derived id only; never log the path)."""
         full = posixpath.join(self._remote_dir, name)
-        return hashlib.sha256(f"{full}\x00{size}".encode("utf-8", "surrogatepass")).hexdigest()
+        identity = f"{full}\x00{size}" if mtime is None else f"{full}\x00{size}\x00{mtime}"
+        return hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def _log_undetectable_skip(self, name: str, size: int, file_key: str) -> None:
+        """Say, once per file version per process, that a leave-mode file was skipped as already
+        ingested on a key that cannot see a same-size replacement (vault BACKLOG #2758): the server
+        listed no modification time, and a size of 0 may mean it lists no size either. INFO the
+        first time, so the skip is never silent; DEBUG on every later poll, since a left file is
+        skipped on every poll by design and an INFO line each time would bury it. On such a server
+        that is one INFO line per left file after each start; the ledger row asked for the skip to
+        be logged with the file's safe label, so it is per file rather than once per connection.
+        The name goes through ``safe_name``; the memory holds only the hashed key, bounded at
+        ``LEAVE_SEEN_CACHE_MAX``."""
+        first = file_key not in self._undetectable_logged
+        if first:
+            self._undetectable_logged[file_key] = None
+            while len(self._undetectable_logged) > LEAVE_SEEN_CACHE_MAX:
+                self._undetectable_logged.popitem(last=False)
+        level = logging.INFO if first else logging.DEBUG
+        if not logger.isEnabledFor(level):
+            return
+        logger.log(
+            level,
+            "REMOTEFILE %s: %s skipped as already ingested (leave mode); the server listed no "
+            "modification time%s for it, so a new version under the same name%s is not told apart "
+            "from the one already read",
+            _redact(self._host, self._remote_dir),
+            safe_name(name),
+            " and a size of 0" if size == 0 else "",
+            "" if size == 0 else " and size",
+        )
 
     def _seen_touch(self, file_key: str) -> bool:
         """True if ``file_key`` is in the bounded in-memory fast-path (and refresh its LRU recency)."""

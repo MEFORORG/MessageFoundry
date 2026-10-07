@@ -239,7 +239,9 @@ def test_authenticate_builds_only_finitely_timed_ldap_objects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rec = _install_fakes(monkeypatch)
-    principal = LdapAuthenticator(_ad_settings()).authenticate("alice", "synthetic-user-pw")
+    principal = (
+        LdapAuthenticator(_ad_settings()).authenticate("alice", "synthetic-user-pw").principal
+    )
 
     assert principal is not None and principal.username == "alice"
     # The login path is: service-account bind (Server+Connection) then the password-verifying user
@@ -330,7 +332,9 @@ def _drive(
     with pytest.MonkeyPatch.context() as mp:
         rec = _install_fakes(mp, bind_ok=bind_ok)
         _shape_search(mp, uac=uac)
-        principal = LdapAuthenticator(_ad_settings()).authenticate(username, "synthetic-user-pw")
+        principal = (
+            LdapAuthenticator(_ad_settings()).authenticate(username, "synthetic-user-pw").principal
+        )
     return rec, principal
 
 
@@ -659,7 +663,8 @@ def test_a_rejected_password_still_unbinds_the_user_connection(
     # auto_bind=True, which these doubles do not honour, so it never takes the explicit-bind path.
     rec = _install_fakes(monkeypatch, bind_ok=False)
 
-    assert LdapAuthenticator(_ad_settings()).authenticate("alice", "wrong-password") is None, (
+    rejected = LdapAuthenticator(_ad_settings()).authenticate("alice", "wrong-password")
+    assert rejected.principal is None, (
         "the fake user bind returned False, so authentication must fail"
     )
     assert len(rec.connections) == 2, (

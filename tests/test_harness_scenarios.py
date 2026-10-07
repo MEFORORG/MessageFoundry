@@ -67,9 +67,30 @@ def test_the_registry_still_holds_the_original_five_scenarios() -> None:
     assert set(_ORIGINAL_FIVE) <= set(SCENARIOS)
 
 
+# Generous: dead_letter rides the real graph's retry policy (3 attempts, 1s and 2s backoff), and a
+# refused loopback connect costs about 2s per attempt on Windows.
+_SCENARIO_BUDGET_SECONDS = 60.0
+
+# hostile_oversize_field carries about 40 MB through every stage (a 4 MiB and a near-16 MiB message,
+# each over MLLP and over a file), so its time scales with the runner. Measured 2026-10-06 on a 4-core
+# Linux box: 8.7 s idle, 31.7 s beside 8 busy processes, and 35.1 s there with the poll and sweep set
+# to an hour, every message advancing on wakes alone, so a slow run is not a lost wake. A
+# windows-2025 merge-group run that day went past 60 s with three of the four messages short of
+# PROCESSED. Its pytest-timeout rises with it, past the 60 s (ubuntu) and 120 s (Windows) per-test
+# watchdog, which would otherwise kill the xdist worker before the scenario could report.
+_LARGE_SCENARIO_BUDGET_SECONDS = {"hostile_oversize_field": 180.0}
+
+
+def _real_graph_scenarios() -> Iterator[object]:
+    for name in sorted(n for n, s in SCENARIOS.items() if not s.graph):
+        budget = _LARGE_SCENARIO_BUDGET_SECONDS.get(name)
+        marks = [pytest.mark.timeout(budget + 60.0)] if budget else []
+        yield pytest.param(name, marks=marks, id=name)
+
+
 # A scenario whose graph lives in a harness/config SUBDIRECTORY (BaseScenario.graph) runs in its
 # family's own test, which serves that graph and provides what it needs; the rest run here.
-@pytest.mark.parametrize("name", sorted(n for n, s in SCENARIOS.items() if not s.graph))
+@pytest.mark.parametrize("name", _real_graph_scenarios())
 def test_every_registered_scenario_passes_against_the_real_graph(
     server: tuple[str, Endpoints], name: str
 ) -> None:
@@ -77,10 +98,9 @@ def test_every_registered_scenario_passes_against_the_real_graph(
     if reason:
         pytest.skip(reason)  # a missing optional extra is reported, never passed
     api_url, eps = server
+    budget = _LARGE_SCENARIO_BUDGET_SECONDS.get(name, _SCENARIO_BUDGET_SECONDS)
     with EngineClient(api_url) as client:
-        # Generous: dead_letter rides the real graph's retry policy (3 attempts, 1s and 2s backoff),
-        # and a refused loopback connect costs about 2s per attempt on Windows.
-        result = run_scenario(SCENARIOS[name], client, timeout=60.0, endpoints=eps)
+        result = run_scenario(SCENARIOS[name], client, timeout=budget, endpoints=eps)
     if result.skipped:
         # A family whose precondition (an external server, an extra) is absent here: a skip, not a pass.
         pytest.skip(result.detail)

@@ -293,11 +293,21 @@ _SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
         # the route to require_ui_reauth_only -- MFA gate OFF, password window kept -- and updating
         # the one doc row ran GREEN across the whole console suite, all 42 doc-drift tests and the 6
         # golden-surface tests. OB_X need not exist: this gate refuses above the handler.
+        # Vault BACKLOG #2764 then gave the purge a reauth_next (its confirm page), because it is no
+        # longer a registered continuation, so the purge row now pins that remap and replay-all is
+        # the shape with no reauth_next.
         pytest.param(
             "POST",
             "/ui/connections/OB_X/purge/all",
             Role.OPERATOR,
-            "/ui/reauth?next=/ui/connections/OB_X/purge/all",
+            "/ui/reauth?next=/ui/connections/purge-confirm",
+            id="step_up-post-purge",
+        ),
+        pytest.param(
+            "POST",
+            "/ui/dead-letters/replay-all",
+            Role.OPERATOR,
+            "/ui/reauth?next=/ui/dead-letters/replay-all",
             id="step_up-post-no-reauth_next",
         ),
     ],
