@@ -78,6 +78,7 @@ __all__ = [
     "session_token",
     "set_oidc_flow_cookie",
     "set_session_cookie",
+    "spend_ui_action_step_up",
 ]
 
 COOKIE_NAME = "mf_session"
@@ -1191,22 +1192,46 @@ async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: st
     return await auth.has_recent_step_up(token)
 
 
+async def _ui_action_step_up_held(auth: AuthService, token: str | None, action: str) -> bool:
+    """:func:`_ui_action_step_up_ok` without spending the grant (vault BACKLOG #2625), for a gate
+    with ``spend=False``. Same factor-binding refusal and the same org opt-out fork."""
+    if await auth.factor_binding_is_blocked(token, action):
+        return False
+    if auth.action_step_up_required:
+        return await auth.holds_action_step_up(token, action)
+    return await auth.has_recent_step_up(token)
+
+
 def require_ui_step_up_action(
     action: str,
     *permissions: Permission,
+    phi: bool = False,
     reauth_next: Callable[[Request], str] | None = None,
+    spend: bool = True,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_ui_step_up`, but the step-up must be a fresh proof **bound to** ``action``
     (single-use, ADR 0077 / ASVS 7.5.1), not the shared session window. Keeps the MFA gate — used for
-    the durable-takeover browser factor ops (**disable-MFA**, **webauthn-delete**). Falls back to the
-    session window under ``[auth].require_action_step_up = false``. ``new_ip`` is checked FIRST so a
-    forced new-IP step-up short-circuits and leaves the single-use grant UNCONSUMED (mirrors
-    ``api.security.require_step_up_action``)."""
+    the durable-takeover browser factor ops (**disable-MFA**, **webauthn-delete**) and, since vault
+    BACKLOG #2625, the injection and bulk lanes (resend, edit-resend, upload resend, purge, reload).
+    Falls back to the session window under ``[auth].require_action_step_up = false``. ``new_ip`` is
+    checked FIRST so a forced new-IP step-up short-circuits and leaves the single-use grant
+    UNCONSUMED (mirrors ``api.security.require_step_up_action``).
+
+    ``phi`` forwards to :func:`require_ui` exactly as :func:`require_ui_step_up`'s does.
+
+    ``spend=False`` asks only that the grant is HELD, and leaves it for a later request to spend.
+    It is for a page that opens an action without performing it, so the operator proves who they
+    are before doing work a re-auth would throw away. The route that performs the action must
+    still spend it, either through its own gate or through :func:`spend_ui_action_step_up`."""
     # mfa_refusal, NOT allow_mfa_pending: the base's gate refuses and audits a pending session, and
     # the hook only points it at /ui/reauth with the continuation. See require_ui_step_up for why.
     base = require_ui(
-        *permissions, mfa_refusal=_reauth_refusal(reauth_next), new_address_check=False
+        *permissions,
+        phi=phi,
+        mfa_refusal=_reauth_refusal(reauth_next),
+        new_address_check=False,
     )
+    decide = _ui_action_step_up_ok if spend else _ui_action_step_up_held
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
@@ -1219,11 +1244,23 @@ def require_ui_step_up_action(
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-        if new_ip or not await _ui_action_step_up_ok(auth, token, action):
+        if new_ip or not await decide(auth, token, action):
             raise _reauth_redirect(request, nxt)
         return identity
 
     return mark_route_gate(dependency)
+
+
+async def spend_ui_action_step_up(request: Request, action: str, *, reauth_next: str) -> None:
+    """Spend the grant a ``spend=False`` gate let through, just before the action runs (vault
+    BACKLOG #2625). A route takes this split when it checks its own input first: a refusal of that
+    input then costs the operator no proof. Sends the browser to ``/ui/reauth`` when the grant is
+    gone, for instance spent by a second tab. No-op with auth off, as the gate is."""
+    auth = get_auth(request)
+    if auth is None or not auth.enabled:
+        return
+    if not await _ui_action_step_up_ok(auth, session_token(request), action):
+        raise _reauth_redirect(request, reauth_next)
 
 
 def require_ui_reauth_only_action(

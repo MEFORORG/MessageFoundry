@@ -34,7 +34,13 @@ from messagefoundry.api.security import (
 from messagefoundry.api.validation import EPOCH_SECONDS_MAX, ConnectionName, EpochSeconds
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.service import AuthService, Elevation, MfaStatus
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
+    STEP_UP_ACTION_MESSAGE_RESEND,
+    AuthService,
+    Elevation,
+    MfaStatus,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.parsing import HL7PeekError, parse_tree
 from messagefoundry.parsing.tree import ParseTreeTooLargeError
@@ -63,9 +69,11 @@ from .._auth import (
     rekey_continuations,
     require_ui,
     require_ui_step_up,
+    require_ui_step_up_action,
     rotation_comes_first,
     session_token,
     set_session_cookie,
+    spend_ui_action_step_up,
     webauthn_rp,
 )
 from .._html import CSP_PROBE_SRC
@@ -184,11 +192,14 @@ class _MsgFilters(TypedDict):
 # continuation (a GET form the re-auth flow can 303-GET-redirect back to); the body-carrying POST
 # `/edit-resend` is deliberately NOT a registered continuation — its `reauth_next` maps a stale-window
 # step-up to this /edit page, so the operator re-submits inside a fresh window (mirrors /ui/users).
+# The re-auth mints the edit-resend grant (vault BACKLOG #2625). The editor only checks that it is
+# held, and the POST spends it, so the operator proves who they are BEFORE typing an edit.
 register_ui_action(
     r"^/ui/messages/[^/?#]+/edit$",
     Permission.MESSAGES_EDIT,
     auto_retry=False,
     unlock=True,
+    action=STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
     label="Open the message edit page",
 )
 
@@ -248,11 +259,13 @@ register_ui_action(
 # dead-end the flow at /ui with the selection silently gone.
 # KEEP THE OPTIONAL GROUP rather than pinning `\?to=...`: this form also fullmatches the bare route
 # TEMPLATE, which is what keeps the coverage guard in test_webui.py able to see this entry.
+# The re-auth mints the resend grant (vault BACKLOG #2625), which the POST behind the page spends.
 register_ui_action(
     r"^/ui/messages/[^/?#]+/resend-confirm(\?[^#]*)?$",
     Permission.MESSAGES_RESEND,
     auto_retry=False,
     unlock=True,
+    action=STEP_UP_ACTION_MESSAGE_RESEND,
     label="Open the message resend confirmation",
 )
 
@@ -1105,8 +1118,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         source: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
         idempotency_key: str = Query(..., min_length=1, max_length=128),
         engine: Any = Depends(deps.get_engine),
+        # Action-bound, as POST /messages/{id}/resend is (vault BACKLOG #2625).
         identity: Identity = Depends(
-            require_ui_step_up(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_MESSAGE_RESEND,
                 Permission.MESSAGES_RESEND,
                 # A stale-window step-up re-opens the CONFIRM page, never this POST path. The target
                 # and source are carried back so the operator is not stranded mid-task; the stale
@@ -1185,8 +1200,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         message_id: str,
         request: Request,
         engine: Any = Depends(deps.get_engine),
+        # The edit-resend grant must be HELD to open the editor, and is not spent here (vault BACKLOG
+        # #2625). Asked at submit time instead, the re-auth would re-open this page and drop the edit.
         identity: Identity = Depends(
-            require_ui_step_up(Permission.MESSAGES_EDIT, Permission.MESSAGES_VIEW_RAW, phi=True)
+            require_ui_step_up_action(
+                STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
+                Permission.MESSAGES_EDIT,
+                Permission.MESSAGES_VIEW_RAW,
+                phi=True,
+                spend=False,
+            )
         ),
     ) -> HTMLResponse:
         detail = await _open_message(message_id, request, engine, identity)
@@ -1206,14 +1229,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         message_id: str,
         request: Request,
         engine: Any = Depends(deps.get_engine),
+        # Held, not spent, in the gate (vault BACKLOG #2625): the grant is spent below, after this
+        # route's own input checks, so a mistyped destination costs the operator no proof.
         identity: Identity = Depends(
-            require_ui_step_up(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
                 Permission.MESSAGES_EDIT,
                 Permission.MESSAGES_VIEW_RAW,
                 phi=True,
-                # Stale-window step-up on this body-carrying POST → re-open the /edit form (fresh
-                # window), never the POST path (a re-POST would drop the edited body).
+                # A missing proof on this body-carrying POST → re-open the /edit form, never the
+                # POST path (a re-POST would drop the edited body).
                 reauth_next=lambda r: r.url.path.removesuffix("/edit-resend") + "/edit",
+                spend=False,
             )
         ),
     ) -> Response:
@@ -1260,6 +1287,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except ValidationError:
             # PHI-safe: a bad edited body must never be echoed — a generic message only.
             return await _reject("invalid input")
+        # The engine handler's own action-bound gate does not run on a direct call, so the grant
+        # the gate above only checked is spent here, immediately before the resubmit.
+        await spend_ui_action_step_up(
+            request,
+            STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
+            reauth_next=request.url.path.removesuffix("/edit-resend") + "/edit",
+        )
         try:
             result = await core.edit_resend_message(
                 message_id, body=body, engine=engine, identity=identity, request=request

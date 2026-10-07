@@ -42,6 +42,7 @@ from messagefoundry.api.models import (
     UploadResendRequest,
 )
 from messagefoundry.auth import Identity, Permission
+from messagefoundry.auth.service import STEP_UP_ACTION_UPLOAD_RESEND
 
 from .. import pages
 from .._auth import (
@@ -49,6 +50,7 @@ from .._auth import (
     register_ui_action,
     require_ui,
     require_ui_step_up,
+    require_ui_step_up_action,
 )
 from ..pages._common import _seg
 from ._common import _form_pairs
@@ -59,7 +61,8 @@ from ._common import _form_pairs
 # body-less + step-up, so it may be auto-retried after re-auth. NONE of the three body-carrying POSTs
 # here — filter, upload, resend — is registered; each instead maps its ``reauth_next`` to a GET page
 # that IS registered: filter to the browse GET it was carved out of, upload to the form below, resend
-# to the confirm page below. That is the same shape messages' edit-resend uses.
+# to the confirm page below. That is the same shape messages' edit-resend uses. The re-auth for the
+# confirm page mints the upload-resend grant (vault BACKLOG #2625), which the resend POST spends.
 register_ui_action(
     r"^/ui/uploaded-logs/file/[^/?#]+$",
     Permission.FILES_BROWSE,
@@ -87,6 +90,7 @@ register_ui_action(
     Permission.FILES_BROWSE,
     auto_retry=False,
     unlock=True,
+    action=STEP_UP_ACTION_UPLOAD_RESEND,
     label="Open the uploaded-message resend confirmation",
 )
 # The upload FORM page (BACKLOG #1739), the unlock continuation for the body-carrying upload POST.
@@ -624,8 +628,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         index: int = Query(..., ge=0),
         to: str = Query(..., min_length=1, max_length=256),
         engine: Any = Depends(deps.get_engine),
+        # Vault BACKLOG #2625: the JSON gate's two permissions and its action-bound proof. A resend
+        # injects a message, so `files:browse` alone, a read, no longer reaches it.
         identity: Identity = Depends(
-            require_ui_step_up(Permission.FILES_BROWSE, reauth_next=_resend_confirm_next)
+            require_ui_step_up_action(
+                STEP_UP_ACTION_UPLOAD_RESEND,
+                Permission.FILES_BROWSE,
+                Permission.MESSAGES_EDIT,
+                reauth_next=_resend_confirm_next,
+            )
         ),
     ) -> Response:
         # BACKLOG #1227. The old premise here was "the browse page it posts from is already
@@ -685,8 +696,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         index: int = Query(..., ge=0),
         to: str = Query(..., min_length=1, max_length=256),
         engine: Any = Depends(deps.get_engine),
+        # `messages:edit` as well as the POST, so a role that cannot resend is told so here rather
+        # than after it confirms (vault BACKLOG #2625). The window, not the bound proof: the re-auth
+        # for this page mints that proof, and the POST spends it.
         identity: Identity = Depends(
-            require_ui_step_up(Permission.FILES_BROWSE, reauth_next=_resend_confirm_next)
+            require_ui_step_up(
+                Permission.FILES_BROWSE, Permission.MESSAGES_EDIT, reauth_next=_resend_confirm_next
+            )
         ),
     ) -> Response:
         # The confirm step for resend (BACKLOG #1227). STEP-UP-GATED since BACKLOG #1822, matching

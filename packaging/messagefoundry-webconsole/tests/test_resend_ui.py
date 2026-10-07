@@ -15,7 +15,7 @@ which injects into an INBOUND. Both live in test_webui.py / test_uploaded_logs_u
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 import httpx
 from _ui_clients import create_local_user_chosen
@@ -303,9 +303,30 @@ def _registry(tmp_path: Path) -> Registry:
     return reg
 
 
+async def _mint(c: httpx.AsyncClient, mid: str) -> None:
+    """Mint the resend's bound proof the way the console does (vault BACKLOG #2625): a re-auth that
+    continues to the confirm page. The grant names the action, not the target, so one selection
+    serves every target a test posts."""
+    nxt = f"/ui/messages/{mid}/resend-confirm?" + urlencode({"to": "OB2", "source": "archive"})
+    r = await c.post(
+        "/ui/reauth",
+        data={"next": nxt, "password": PW},
+        headers={"Sec-Fetch-Site": "same-origin"},
+    )
+    assert r.status_code == 303 and r.headers["location"] == nxt, r.text
+
+
 async def _post_resend(
-    c: httpx.AsyncClient, mid: str, *, to: str = "OB2", source: str = "archive", key: str = "k1"
+    c: httpx.AsyncClient,
+    mid: str,
+    *,
+    to: str = "OB2",
+    source: str = "archive",
+    key: str = "k1",
+    mint: bool = True,
 ) -> httpx.Response:
+    if mint:
+        await _mint(c, mid)
     return await c.post(
         f"/ui/messages/{mid}/resend?to={to}&source={source}&idempotency_key={key}",
         headers={"Sec-Fetch-Site": "same-origin"},
@@ -513,7 +534,7 @@ async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engin
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _login(c, "op")
-        r = await _post_resend(c, mid)
+        r = await _post_resend(c, mid, mint=False)
         assert r.status_code == 303
         location = r.headers["location"]
         assert location.startswith("/ui/reauth?next=")
@@ -547,7 +568,7 @@ async def test_the_longest_accepted_names_still_fit_the_reauth_continuation(
     longest = "A" * _RESEND_NAME_MAX
     async with _client(engine, service) as c:
         await _login(c, "op")
-        r = await _post_resend(c, mid, to=longest, source=longest)
+        r = await _post_resend(c, mid, to=longest, source=longest, mint=False)
         assert r.status_code == 303
         follow = await c.get(r.headers["location"])
         # The re-auth page renders; it does not 422 on a `next` this route was willing to build.

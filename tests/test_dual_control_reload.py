@@ -86,8 +86,13 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 async def _service(engine: Engine) -> AuthService:
     # Dual-control reload is a step-up admin flow, not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the reload before the approval path.
+    # Dual control is this file's subject, so a reload keeps the session window here.
+    # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
     service = AuthService(
-        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0, require_mfa=False, require_action_step_up=False
+        ),
     )
     await service.initialize()
     return service

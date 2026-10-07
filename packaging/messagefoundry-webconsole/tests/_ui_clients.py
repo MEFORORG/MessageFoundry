@@ -163,6 +163,18 @@ def issue_continuation(client: httpx.AsyncClient, next_path: str) -> None:
     _ISSUED_CONTINUATIONS.issue(token, next_path)
 
 
+async def mint_bound_proof(client: httpx.AsyncClient, next_path: str) -> None:
+    """Re-authenticate toward ``next_path`` so ``/ui/reauth`` mints the action-bound grant that
+    continuation's registration names (vault BACKLOG #2625). The continuation is issued first, as
+    the step-up gate's refusal would issue it, so an auto-retry target takes the grant as well as an
+    unlock page does. For a test whose subject is what the action does, not the proof it takes."""
+    issue_continuation(client, next_path)
+    r = await client.post(
+        "/ui/reauth", data={"next": next_path, "password": PW}, headers=SAME_ORIGIN
+    )
+    assert r.status_code in (200, 303), f"re-auth toward {next_path!r} returned {r.status_code}"
+
+
 @contextmanager
 def held_totp_code(secret: str) -> Iterator[str]:
     """A live TOTP code for ``secret``, with the ``totp`` clock held at the instant it was made.

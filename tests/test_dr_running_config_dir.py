@@ -32,6 +32,8 @@ from typing import Any, NamedTuple
 import pytest
 
 from messagefoundry.api.app import _alert_control_action
+from messagefoundry.auth.service import STEP_UP_ACTION_CONNECTION_PURGE
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config import fingerprint as fp
 from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
@@ -506,7 +508,10 @@ async def test_a_dr_parked_outbound_can_be_purged(box: _Box) -> None:
     message_id = await _activate_with_a_held_row(engine)
     with pytest.raises(DrParkedError):
         await rr.stop_outbound("OB_NORM_ADT")
-    client, _app = await _admin_client(engine, deadline=30.0)
+    client, app = await _admin_client(engine, deadline=30.0)
+    # A purge takes a proof bound to it (vault BACKLOG #2625); this test is about the lane.
+    token = client.headers["Authorization"].removeprefix("Bearer ")
+    app.state.auth._grant_action_step_up(hash_token(token), STEP_UP_ACTION_CONNECTION_PURGE)
     async with client:
         r = await asyncio.wait_for(client.post("/connections/OB_NORM_ADT/purge"), 10)
     assert r.status_code == 200, r.text

@@ -300,12 +300,18 @@ from typing import Any
 #: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
 #: signatures changed.
 #:
+#: Vault BACKLOG #2625: ``AuthService`` gained ``holds_action_step_up``, which the console's
+#: message editor calls to ask for an action-bound proof without spending it, and the console imports
+#: five new step-up action constants, for the resend, edit-resend, upload-resend, purge and reload
+#: lanes (export has no console route). A method the console calls, so a skew would be an
+#: AttributeError at request time; it forces a bump. Unnumbered, as above.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "90ecacf8dcf22a10"
+ENGINE_UI_SEAM: str = "ef12c8e7e68d7d70"
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,10 +348,13 @@ class CoreHandlers:
     restart_connection: Callable[..., Awaitable[Any]]
     replay_message: Callable[..., Awaitable[Any]]
     # Resend a stored body to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500). Its JSON
-    # gate is require_step_up(MESSAGES_RESEND) and NOTHING more: the handler returns ids only and
-    # never a body, so the /ui route in front of it asserts that one permission and passes no
-    # ``phi=``. Copying the edit verbs' MESSAGES_VIEW_RAW + phi=True here would charge the PHI
-    # budget for a route that emits none, and would lock out a role narrowed to resend alone.
+    # gate is require_step_up_action(message_resend, MESSAGES_RESEND) and NOTHING more: the handler
+    # returns ids only and never a body, so the /ui route in front of it asserts that one permission
+    # with the same bound proof and passes no ``phi=``. Copying the edit verbs' MESSAGES_VIEW_RAW +
+    # phi=True here would charge the PHI budget for a route that emits none, and would lock out a
+    # role narrowed to resend alone. Vault BACKLOG #2625 bound the proof on this handler and on
+    # ``edit_resend_message``, ``resend_uploaded_message``, ``purge_connection`` and
+    # ``reload_config``; each /ui route in front of one re-asserts the same action.
     resend_message: Callable[..., Awaitable[Any]]
     edit_resend_message: Callable[..., Awaitable[Any]]  # edit-and-resubmit (ADR 0090 §9, seam v2)
     replay_dead_letters: Callable[..., Awaitable[Any]]

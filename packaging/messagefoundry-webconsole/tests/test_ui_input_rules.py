@@ -30,6 +30,7 @@ from _ui_clients import (
     auth_service,
     bearer,
     cookie_login,
+    mint_bound_proof,
     provision,
     seed_message,
     ui_client,
@@ -253,6 +254,10 @@ async def test_per_name_control_refuses_a_bad_connection_name(
 ) -> None:
     """422 on the path segment, before the handler runs. Only a hand-built URL gets here: the console
     renders these names into form actions out of the live registry."""
+    if action.startswith("purge"):
+        # The purge gate runs before the path is validated, and wants its bound proof (vault
+        # BACKLOG #2625). Without one this would measure the re-auth redirect, not the name rule.
+        await mint_bound_proof(admin, "/ui/connections/purge-confirm")
     r = await admin.post(f"/ui/connections/{BAD_NAME}/{action}", headers=SAME_ORIGIN)
     assert r.status_code == 422
 
@@ -314,6 +319,7 @@ async def test_purge_bulk_refuses_one_dest_without_aborting_the_batch(
 ) -> None:
     """The same shape on the bulk purge, whose ``dest`` values ride the body as plain form fields --
     and which, pre-fix, echoed an unvalidated one straight onto its own result table."""
+    await mint_bound_proof(admin, "/ui/connections/purge-confirm")  # vault BACKLOG #2625
     r = await admin.post(
         "/ui/connections/purge-bulk",
         data={"scope": "all", "dest": [BAD_NAME, "OB_NOT_REGISTERED"]},
@@ -473,6 +479,7 @@ async def test_the_bulk_routes_still_audit_a_channel_scoped_attempt(engine: Engi
             headers=SAME_ORIGIN,
         )
         assert r.status_code == 200
+        await mint_bound_proof(c, "/ui/connections/purge-confirm")  # vault BACKLOG #2625
         r = await c.post(
             "/ui/connections/purge-bulk",
             data={"scope": "all", "dest": BAD_NAME},

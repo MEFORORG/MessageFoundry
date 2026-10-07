@@ -11,9 +11,9 @@
 ^/ui/alerts/[^/?#]+/reason(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1	View the reason for an alert
 ^/ui/cluster/force-stepdown-confirm$	-	step_up=1,auto_retry=0,unlock=1	Open the forced cluster step-down confirmation
 ^/ui/cluster/stepdown-confirm$	-	step_up=1,auto_retry=0,unlock=1	Open the cluster step-down confirmation
-^/ui/config/reload$	-	step_up=1,auto_retry=1,unlock=0	Reload the engine configuration
+^/ui/config/reload$	config_reload	step_up=1,auto_retry=1,unlock=0	Reload the engine configuration
 ^/ui/connection/[^/?#]+/events/[^/?#]+/reason(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1	View the reason for a connection event
-^/ui/connections/purge-confirm$	-	step_up=1,auto_retry=0,unlock=1	Open the queue purge confirmation
+^/ui/connections/purge-confirm$	connection_purge	step_up=1,auto_retry=0,unlock=1	Open the queue purge confirmation
 ^/ui/dead-letters(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1	View the dead letters
 ^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$	-	step_up=1,auto_retry=1,unlock=0	Replay the dead letters of one connection
 ^/ui/dead-letters/replay-all$	-	step_up=1,auto_retry=1,unlock=0	Replay all dead letters
@@ -21,9 +21,9 @@
 ^/ui/messages(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1	View the message list
 ^/ui/messages/(?!search(?:$|[/?#]))[^/?#]+(/(summary|body|errors|parse-tree))?(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1	View a message
 ^/ui/messages/[^/?#]+/attachments/[^/?#]+(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1	View a message attachment
-^/ui/messages/[^/?#]+/edit$	-	step_up=1,auto_retry=0,unlock=1	Open the message edit page
+^/ui/messages/[^/?#]+/edit$	message_edit_resend	step_up=1,auto_retry=0,unlock=1	Open the message edit page
 ^/ui/messages/[^/?#]+/replay$	-	step_up=1,auto_retry=1,unlock=0	Replay a message
-^/ui/messages/[^/?#]+/resend-confirm(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1	Open the message resend confirmation
+^/ui/messages/[^/?#]+/resend-confirm(\?[^#]*)?$	message_resend	step_up=1,auto_retry=0,unlock=1	Open the message resend confirmation
 ^/ui/messages/search$	-	step_up=1,auto_retry=0,unlock=1	Search message content
 ^/ui/messages/search/layered$	-	step_up=1,auto_retry=0,unlock=1	Run a layered message search
 ^/ui/roles/[^/?#]+/edit$	-	step_up=1,auto_retry=0,unlock=1	Edit a role
@@ -32,7 +32,7 @@
 ^/ui/status$	-	step_up=1,auto_retry=0,unlock=1	Open the status page
 ^/ui/uploaded-logs/file/[^/?#]+$	-	step_up=1,auto_retry=0,unlock=1	View an uploaded file
 ^/ui/uploaded-logs/file/[^/?#]+/delete$	-	step_up=1,auto_retry=1,unlock=0	Delete an uploaded file
-^/ui/uploaded-logs/file/[^/?#]+/resend-confirm(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1	Open the uploaded-message resend confirmation
+^/ui/uploaded-logs/file/[^/?#]+/resend-confirm(\?[^#]*)?$	upload_resend	step_up=1,auto_retry=0,unlock=1	Open the uploaded-message resend confirmation
 ^/ui/uploaded-logs/upload-form$	-	step_up=1,auto_retry=0,unlock=1	Open the file upload form
 ^/ui/users/[^/?#]+$	admin_user_update	step_up=1,auto_retry=0,unlock=1	Open a user's account settings
 ^/ui/users/[^/?#]+/delete$	-	step_up=1,auto_retry=1,unlock=0	Delete a user

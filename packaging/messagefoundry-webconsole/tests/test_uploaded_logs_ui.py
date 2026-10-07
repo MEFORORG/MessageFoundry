@@ -75,6 +75,8 @@ async def _service(
     # PHI-read budget in a single test (see test_webui.py:616 test_edit_editor_charges_the_phi_read_budget).
     # step_up_max_age mirrors AuthSettings' default (300); pass -1 to make every step-up window stale
     # on arrival, the idiom the rest of the console suite uses to exercise the /ui/reauth bounce.
+    # The resend's action-bound proof (vault BACKLOG #2625) is pinned in test_ui_bound_step_up.py;
+    # this module is about the uploaded-logs lane itself, so its resends keep the session window.
     service = AuthService(
         engine.store,
         AuthSettings(
@@ -82,6 +84,7 @@ async def _service(
             require_mfa=False,
             phi_read_rate_limit_per_actor=per_actor,
             step_up_max_age_seconds=step_up_max_age,
+            require_action_step_up=False,
         ),
     )
     await service.initialize()

@@ -184,7 +184,10 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     imports change, and never widen it to a membership check.
 
     Recorded 2026-09-29. The filing named three ``admin.py`` constants; the tree had five names
-    there by then, and ``OidcStepUp`` in ``routes/oidc.py`` was new since the filing too."""
+    there by then, and ``OidcStepUp`` in ``routes/oidc.py`` was new since the filing too.
+
+    Vault BACKLOG #2625 added the five constants of the injection and bulk lanes the console has a
+    route for (resend, edit-resend, upload resend, purge, reload)."""
     assert surface.auth_service_symbols == (
         "AuthService",
         "Elevation",
@@ -196,10 +199,15 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
         "STEP_UP_ACTION_ADMIN_RESET_MFA",
         "STEP_UP_ACTION_ADMIN_RESET_PASSWORD",
         "STEP_UP_ACTION_ADMIN_USER_UPDATE",
+        "STEP_UP_ACTION_CONFIG_RELOAD",
+        "STEP_UP_ACTION_CONNECTION_PURGE",
+        "STEP_UP_ACTION_MESSAGE_EDIT_RESEND",
+        "STEP_UP_ACTION_MESSAGE_RESEND",
         "STEP_UP_ACTION_MFA_CONFIRM",
         "STEP_UP_ACTION_MFA_DISABLE",
         "STEP_UP_ACTION_MFA_ENROLL",
         "STEP_UP_ACTION_SESSION_TERMINATE",
+        "STEP_UP_ACTION_UPLOAD_RESEND",
         "STEP_UP_ACTION_WEBAUTHN_DELETE",
         "STEP_UP_ACTION_WEBAUTHN_ENROLL",
     )

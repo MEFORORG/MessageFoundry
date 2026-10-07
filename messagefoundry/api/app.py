@@ -227,6 +227,7 @@ from messagefoundry.api.security import (
     require_phi_read,
     require_service_cert,
     require_step_up,
+    require_step_up_action,
     ws_token,
 )
 from messagefoundry.api.svg_sanitize import SvgRejected, may_be_svg, sanitize_if_svg
@@ -253,7 +254,15 @@ from messagefoundry.api.validation import (
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import HOLD_REASON, REFERRAL_ABORT, ReconcilePlan
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_CONFIG_RELOAD,
+    STEP_UP_ACTION_CONNECTION_PURGE,
+    STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
+    STEP_UP_ACTION_MESSAGE_EXPORT,
+    STEP_UP_ACTION_MESSAGE_RESEND,
+    STEP_UP_ACTION_UPLOAD_RESEND,
+    AuthService,
+)
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
@@ -3742,7 +3751,9 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         scope: str = Query("all", pattern="^(top|all)$"),
-        identity: Identity = Depends(require_step_up(Permission.MESSAGES_PURGE)),
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_CONNECTION_PURGE, Permission.MESSAGES_PURGE)
+        ),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> PurgeResult | PendingApprovalResponse:
         """Soft-cancel queued deliveries to an outbound connection (across all inbounds)."""
@@ -4588,7 +4599,9 @@ def create_app(
         response: Response,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        user: Identity = Depends(require_step_up(Permission.CONFIG_DEPLOY)),
+        user: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_CONFIG_RELOAD, Permission.CONFIG_DEPLOY)
+        ),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ReloadResult | PendingApprovalResponse:
         """Load the code-first graph and atomically apply it to the running engine (quiesce-and-swap;
@@ -5046,7 +5059,11 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(
-            require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
+            require_step_up_action(
+                STEP_UP_ACTION_MESSAGE_EXPORT,
+                Permission.MESSAGES_EXPORT,
+                Permission.MESSAGES_VIEW_RAW,
+            )
         ),
         ids: list[ResourceId] = Query(default=[], max_length=MAX_EXPORT_IDS),  # noqa: B006 — FastAPI repeated ?ids=
         field_path: str | None = Query(None, max_length=32),
@@ -5085,7 +5102,11 @@ def create_app(
         criteria: MessageExportRequest,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(
-            require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
+            require_step_up_action(
+                STEP_UP_ACTION_MESSAGE_EXPORT,
+                Permission.MESSAGES_EXPORT,
+                Permission.MESSAGES_VIEW_RAW,
+            )
         ),
     ) -> StreamingResponse:
         """The needle-bearing shape of the export above (BACKLOG #1184): same gate, same per-row channel
@@ -5554,7 +5575,9 @@ def create_app(
         body: ResendRequest,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_step_up(Permission.MESSAGES_RESEND)),
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_MESSAGE_RESEND, Permission.MESSAGES_RESEND)
+        ),
     ) -> ResendResult:
         """Resend a stored message's transformed body to an ALTERNATE outbound connection (ADR 0090,
         BACKLOG #123). Ships exactly what we sent (the retained transformed body) — never a re-run
@@ -5636,7 +5659,9 @@ def create_app(
         body: EditResendRequest,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_step_up(Permission.MESSAGES_EDIT)),
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_MESSAGE_EDIT_RESEND, Permission.MESSAGES_EDIT)
+        ),
     ) -> EditResendResult:
         """Edit a stored message and resubmit the EDITED body (ADR 0090 §9, BACKLOG #153). The edit is
         client-side + ephemeral (no server draft); this endpoint receives the final edited ``raw``. By
@@ -6262,7 +6287,14 @@ def create_app(
         file_id: ResourceId,
         body: UploadResendRequest,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
+        # Vault BACKLOG #2625: `messages:edit` beside `files:browse`, because this injects a message
+        # and `files:browse` reads as, and is documented as, a read. `edit-resend` with a reroute is
+        # the same power under `messages:edit` already, so no permission or role is new.
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_UPLOAD_RESEND, Permission.FILES_BROWSE, Permission.MESSAGES_EDIT
+            )
+        ),
     ) -> UploadResendResult:
         """Inject one message from an uploaded file INTO a chosen inbound connection (BACKLOG #125). Uses
         the DISTINCT inject path ``engine.inject_message`` (``enqueue_ingress``) — a fresh ``RECEIVED`` on

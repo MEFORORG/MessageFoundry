@@ -29,6 +29,14 @@ this line.**
 
 ### Security
 
+- **Resend, edit-resend, upload resend, queue purge and config reload each take a proof bound to
+  that action.** A fresh session window no longer reaches them. Each needs a re-authentication made
+  for it, which it spends. The re-auth page mints that proof when it continues to the action's
+  confirm page, editor or auto-retry. The message editor asks for it before it opens, so a re-auth
+  never drops a typed edit, and the resubmit spends it only after its own input checks pass. Upload
+  resend also needs `messages:edit`, on the confirm page and on the POST. Seam change:
+  `AuthService.holds_action_step_up` is new, and the console imports five new step-up action
+  constants. (vault BACKLOG #2625)
 - **A route-level sign-in reject records where it came from.** The `/ui/oidc` start and callback
   legs and `GET /ui/sso` refuse some sign-ins themselves. Examples are a missing flow cookie, an
   IdP error, a malformed callback or Negotiate token, a failed start, and a non-navigation fetch.
