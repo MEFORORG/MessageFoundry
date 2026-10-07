@@ -414,12 +414,13 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   in a code-first module, or `{ env = "acme_allow_expired", cast = "bool" }` in `connections.toml`.
   Both read `true`, `1`, `yes` and `on` as true, and `false`, `0`, `no` and `off` as false, in any
   case. A TOML `true` or `false` in `<env>.toml` works as written. Any other value, such as `maybe`,
-  stops the load with an error that names the setting and the key. Before vault BACKLOG #3138, a
-  code-first `cast=bool` used Python's own `bool`, which reads any non-empty text as true. A
-  `MEFOR_VALUE_*` of `false` would then have turned on `tls_allow_expired` or
-  `trust_server_certificate`. A `default=` is not cast, so give a boolean default as `True` or
-  `False`. A cast you write yourself, such as `cast=lambda s: bool(s)`, runs as written and keeps
-  that trap.
+  stops the load with an error that names the setting and the key. A code-first `default=` given
+  with `cast=bool` is read the same way. Before vault BACKLOG #3138, a code-first `cast=bool` used
+  Python's own `bool`, which reads any non-empty text as true. A `MEFOR_VALUE_*` of `false` would
+  then have turned on a loosening such as `tls_allow_expired` or `trust_server_certificate`.
+  **Always give a boolean setting this cast.** An `env()` with no cast, or with a `str` cast, hands
+  the setting text, and a connector reads any non-empty text as true. A cast you write yourself,
+  such as `cast=lambda s: bool(s)`, runs as written and keeps that trap.
 - **Per-face logic inside a transform:** `env()` is a *deferred reference* resolved only when a
   **connection** spec is built — using it in a handler is an always-truthy object (a bug). To branch a
   Router/Handler on the deployment, read the active environment **name** with

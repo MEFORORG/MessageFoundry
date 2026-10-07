@@ -238,6 +238,17 @@ class EnvRef:
         # ``object.__setattr__``; ``_cast_bool`` is defined below and only looked up at call time.
         if self.cast is bool:
             object.__setattr__(self, "cast", _cast_bool)
+            # A default is never cast at resolve time, so ``default="false"`` would reach the
+            # connector as text and read True there. Read it strictly here instead, once, at authoring.
+            # ``None`` stays a deliberate None. The value is withheld for the reason ``_cast_bool`` gives.
+            if self.default is not _UNSET and self.default is not None:
+                try:
+                    object.__setattr__(self, "default", _cast_bool(self.default))
+                except ValueError:
+                    raise WiringError(
+                        f"env({self.key!r}, cast=bool): default= is not a boolean "
+                        f"({', '.join(sorted(_BOOL_SPELLINGS))}, or True/False; value withheld)"
+                    ) from None
 
 
 def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = None) -> EnvRef:
@@ -260,8 +271,10 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     ``false``/``0``/``no``/``off`` read False, case-insensitively, and any other value is refused at
     resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
-    string as True. A ``default=`` is not cast, so give a boolean default as ``True``/``False``.
-    Any other callable runs as given, so ``cast=lambda s: bool(s)`` keeps the builtin's trap."""
+    string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
+    made, and an unreadable one is refused then. Any other callable runs as given, so
+    ``cast=lambda s: bool(s)`` keeps the builtin's trap, and an uncast ``env()`` hands a boolean
+    setting text, which a connector reads as true when it is non-empty."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
@@ -283,6 +296,9 @@ _BOOL_SPELLINGS: dict[str, bool] = {
 def _cast_bool(raw: Any) -> bool:
     """Parse an environment value's boolean spelling — the ``cast = "bool"`` named cast (ADR 0007).
 
+    It is also what a code-first ``env(..., cast=bool)`` runs: :class:`EnvRef` swaps the builtin
+    ``bool`` for it (vault BACKLOG #3138), so the two authoring routes read one value one way.
+
     The builtin ``bool`` cannot do this job. An environment value arrives as a **string**, and
     ``bool(str)`` is true for every non-empty one, so ``MEFOR_VALUE_X=false`` (and ``0``/``no``/``off``)
     would resolve to ``True`` — the inverse of what the operator wrote, silently, with only an unset or
@@ -295,7 +311,7 @@ def _cast_bool(raw: Any) -> bool:
     strings ``"0"``/``"1"`` are already accepted, so refusing only the typed form would be an arbitrary
     seam. Any other int (``2``, ``-1``) has no unambiguous reading and raises.
 
-    Raises ``ValueError`` — what both cast call sites already catch, so the failure is batched and
+    Raises ``ValueError`` — what every cast call site catches, so the failure is batched and
     redacted by :func:`resolve_env_settings` rather than propagating raw. See the raise below for why
     the message must not name the value."""
     if isinstance(raw, bool):
@@ -707,6 +723,29 @@ def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool
                 "accepted on a hop-policy flag)"
             ) from exc
     return settings_hop_attestation(settings, where)
+
+
+def refuse_resolved_verify_off(
+    type_: ConnectorType, settings: Mapping[str, Any], where: str
+) -> None:
+    """Re-run the two ``verify_tls=False`` refusals the factories make, on RESOLVED settings.
+
+    The factories see an ``env()`` reference, which is truthy, so they pass it. Once ``env(...,
+    cast=bool)`` reads ``false`` as False (vault BACKLOG #3138), the resolved value can be the False
+    those checks refuse as a literal: a DICOMweb ``tls_ca_file`` nothing would read, and a SOAP client
+    cert offered to an unverified peer. Only a real ``False`` fires, the literal's own test."""
+    if settings.get("verify_tls") is not False:
+        return
+    if type_ is ConnectorType.DICOMWEB and settings.get("tls_ca_file"):
+        raise WiringError(
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to false, which "
+            "verifies nothing, and DICOMweb has no token hop."
+        )
+    if type_ is ConnectorType.SOAP and settings.get("client_cert_file"):
+        raise WiringError(
+            f"{where}: SOAP client cert is incompatible with verify_tls=false, which it resolved to "
+            "(presenting an identity to an unverified peer is incoherent) (ADR 0015)."
+        )
 
 
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:

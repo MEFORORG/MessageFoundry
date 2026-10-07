@@ -4,8 +4,9 @@
 
 ``env()`` used to store the builtin ``bool`` as its cast, and ``resolve_env_settings`` called it on the
 raw value. Every ``MEFOR_VALUE_*`` variable is text, and ``bool("false")`` is True, so an operator who
-wrote ``false`` would have got the insecure side of a code-first boolean setting, silently:
-``tls_allow_expired`` on a Rest, FHIR or SOAP hop, ``trust_server_certificate`` on a Database hop.
+wrote ``false`` would have got the insecure side of a code-first boolean setting, silently. Two
+examples are ``tls_allow_expired`` and ``trust_server_certificate``; at least the Rest, FHIR, SOAP,
+MLLP, DICOM and Ftp factories take the first, and the Database family the second.
 ``cast=bool`` now means the same strict spelling cast ``connections.toml``'s ``cast = "bool"`` uses.
 
 The FALSE spellings are the half that carries the guard: the builtin ``bool`` reads every TRUE
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -80,6 +82,30 @@ def test_an_env_ref_built_directly_with_the_builtin_bool_is_held_to_the_same_rea
 def test_a_cast_other_than_the_builtin_bool_is_left_alone() -> None:
     assert env("port", cast=int).cast is int
     assert env("host").cast is None
+
+
+@pytest.mark.parametrize(
+    ("default", "want"),
+    [("false", False), ("off", False), (False, False), (0, False), ("true", True), (True, True)],
+)
+def test_a_cast_bool_default_is_read_strictly(default: object, want: bool) -> None:
+    # A default is not cast at resolve time, so "false" used to reach the connector as text and read
+    # True there. It is read once, when the reference is made.
+    out = resolve_env_settings({"flag": env("flag", default=default, cast=bool)}, {})
+    assert out["flag"] is want
+
+
+def test_a_cast_bool_default_of_none_stays_none() -> None:
+    assert resolve_env_settings({"flag": env("flag", default=None, cast=bool)}, {})["flag"] is None
+
+
+@pytest.mark.parametrize("default", ["maybe", "", 2])
+def test_an_unreadable_cast_bool_default_is_refused_naming_the_key(default: object) -> None:
+    with pytest.raises(WiringError) as ei:
+        env("acme_flag", default=default, cast=bool)
+    msg = str(ei.value)
+    assert "'acme_flag'" in msg and "default=" in msg and "value withheld" in msg
+    assert "maybe" not in msg
 
 
 # --- end to end: a code-first module, the instance's values, the outbound build choke point ---------
@@ -150,3 +176,39 @@ def test_an_unknown_spelling_is_refused_end_to_end_naming_the_key(tmp_path: Path
     msg = str(ei.value)
     assert "'tls_allow_expired'" in msg and "'rest_allow_expired'" in msg
     assert "maybe" not in msg
+
+
+# --- a verify_tls that RESOLVES false meets the refusals its literal form meets at the factory ------
+# The factories test the literal; an env() reference is truthy there, so they pass it. Now that "false"
+# reads False, the resolved value can be the one they refuse.
+
+_VERIFY_MODULE = """
+from messagefoundry import DICOMweb, Soap, env, outbound
+outbound("OB_DW", DICOMweb(url="https://pacs.example.org/dw", tls_ca_file="ca.pem",
+                           verify_tls=env("dw_verify", cast=bool)))
+outbound("OB_SOAP", Soap(url="https://ws.example.org/ws", client_cert_file="c.pem",
+                         client_key_file="k.pem", verify_tls=env("soap_verify", cast=bool)))
+"""
+
+
+def _verify_dest(tmp_path: Path, name: str, values: dict[str, str]) -> Any:
+    (tmp_path / "cfg.py").write_text(textwrap.dedent(_VERIFY_MODULE), encoding="utf-8")
+    reg = load_config(tmp_path)
+    return _dest_config(reg.outbound[name], values, None, EgressSettings(deny_by_default=False))
+
+
+@pytest.mark.parametrize(
+    ("name", "needle"),
+    [("OB_DW", "tls_ca_file would never be read"), ("OB_SOAP", "client cert is incompatible")],
+)
+def test_a_verify_tls_that_resolves_false_is_refused(
+    tmp_path: Path, name: str, needle: str
+) -> None:
+    with pytest.raises(WiringError, match=needle):
+        _verify_dest(tmp_path, name, {"dw_verify": "false", "soap_verify": "false"})
+
+
+@pytest.mark.parametrize("name", ["OB_DW", "OB_SOAP"])
+def test_a_verify_tls_that_resolves_true_builds(tmp_path: Path, name: str) -> None:
+    dest = _verify_dest(tmp_path, name, {"dw_verify": "true", "soap_verify": "true"})
+    assert dest.settings["verify_tls"] is True
