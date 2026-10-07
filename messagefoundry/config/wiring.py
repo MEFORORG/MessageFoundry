@@ -3794,7 +3794,8 @@ def Ftp(
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
-    # unless a hand-built spec sets tls_check_hostname=False.
+    # unless a hand-built spec sets tls_check_hostname=False. That key, and tls_verify=False, are
+    # refused outright when a username or password is set (vault BACKLOG #2636).
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
     username: str | EnvRef | None = None,
@@ -3820,9 +3821,11 @@ def Ftp(
     destination (stdlib ``ftplib`` — no extra). Same poll/upload shape as :func:`Sftp`.
 
     Plain ``ftp`` transmits credentials in **cleartext**: supplying a ``username``/``password`` over
-    plain ``ftp`` is **refused** unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (use ``tls=True`` for FTPS,
-    or :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there. Put
-    secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
+    plain ``ftp`` is **refused** outright, with no escape (use ``tls=True`` for FTPS, or
+    :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there while
+    the server certificate is verified, name included: a hand-built spec that sets
+    ``tls_verify=False`` or ``tls_check_hostname=False`` with a ``username`` or ``password`` is
+    refused outright, with no escape (vault BACKLOG #2636). Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
     directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
     ``poll_max_files`` behave exactly as they do on :func:`Sftp`.
 
@@ -4400,6 +4403,7 @@ class OutboundConnection:
 # statically — Registry.port_collisions at validate/check/load (literal ports), inbound_binding_conflicts
 # (env-resolved + reserved-port aware) at the runner's start/reload — and the RegistryRunner also
 # classifies the runtime bind failure, so a conflict always names the connection(s) + the contended port.
+# A configured ``port = 0`` is never compared; see _EPHEMERAL_PORT.
 
 #: Connector types that bind a local listening port (so a port conflict is possible). File/Timer/
 #: Loopback/RemoteFile sources never bind a listening port. A DATABASE poll source carries a ``port``
@@ -4464,12 +4468,27 @@ def _hosts_overlap(a: str | None, b: str | None) -> bool:
     return a == b
 
 
+#: ``port = 0`` asks the OS to choose the port at bind time, so two listeners configured with it do
+#: not contend with each other, and treating the 0 as a concrete port refused a valid graph. Every
+#: comparison below therefore skips it; a non-zero pair is compared exactly as before. What this
+#: does NOT cover: the port the OS hands out is unknown until the bind, so a concrete-port listener
+#: that happens to name it is not caught here, and the runner's bind reports it as an ordinary
+#: EADDRINUSE conflict. This is the one statement of the rule; the docstrings below point here.
+_EPHEMERAL_PORT = 0
+
+
+def _ports_contend(port_a: int, port_b: int) -> bool:
+    """Whether two configured listener ports name the same socket port: equal and not ephemeral."""
+    return port_a == port_b and port_a != _EPHEMERAL_PORT
+
+
 def _binding_conflicts(bindings: list[_Binding]) -> list[tuple[_Binding, _Binding]]:
-    """Every pair of bindings sharing a port on overlapping interfaces, in declaration order."""
+    """Every pair of bindings sharing a non-ephemeral port on overlapping interfaces, in declaration
+    order."""
     out: list[tuple[_Binding, _Binding]] = []
     for i, a in enumerate(bindings):
         for b in bindings[i + 1 :]:
-            if a.port == b.port and _hosts_overlap(a.host, b.host):
+            if _ports_contend(a.port, b.port) and _hosts_overlap(a.host, b.host):
                 out.append((a, b))
     return out
 
@@ -4525,8 +4544,9 @@ def resolve_listener_binding(
 
 def bindings_overlap(host_a: str | None, port_a: int, host_b: str | None, port_b: int) -> bool:
     """Whether two resolved ``(host, port)`` listener bindings contend for the same socket. Hosts are
-    (re-)normalized defensively, so a caller may pass a raw reserved host (e.g. ``"0.0.0.0"``)."""
-    return port_a == port_b and _hosts_overlap(
+    (re-)normalized defensively, so a caller may pass a raw reserved host (e.g. ``"0.0.0.0"``). A
+    configured port 0 is skipped (:data:`_EPHEMERAL_PORT`)."""
+    return _ports_contend(port_a, port_b) and _hosts_overlap(
         _normalize_bind_host(host_a), _normalize_bind_host(host_b)
     )
 
@@ -4545,7 +4565,8 @@ def inbound_binding_conflicts(
     ports and the EFFECTIVE bind host (a connection's ``bind_address`` else the service ``bind_host``),
     and checks each listener against the ``reserved`` service bindings — each a ``(label, host, port)``,
     e.g. the engine's API listener — so an inbound that would steal the API's port is caught here rather
-    than as a bare bind failure. Returns ``[]`` when there is no conflict."""
+    than as a bare bind failure. A ``port = 0`` listener is skipped (:data:`_EPHEMERAL_PORT`).
+    Returns ``[]`` when there is no conflict."""
     listeners: list[_Binding] = []
     for conn in registry.inbound.values():
         binding = resolve_listener_binding(conn, bind_host=bind_host, env_values=env_values)
@@ -4939,7 +4960,8 @@ class Registry:
         port, and only an ``int`` literal is checkable (an ``EnvRef`` port resolves per environment —
         the runner's :func:`inbound_binding_conflicts` covers those, plus the reserved API port, at
         start/reload). A ``deployed=False`` inbound (#233, ADR 0111) is excluded: it never binds, so it
-        cannot collide — see :func:`resolve_listener_binding`, which excludes it on the resolved path."""
+        cannot collide — see :func:`resolve_listener_binding`, which excludes it on the resolved path.
+        A ``port = 0`` listener is skipped too (:data:`_EPHEMERAL_PORT`)."""
         bindings = [
             _Binding(conn.name, _normalize_bind_host(conn.bind_address), port)
             for conn in self.inbound.values()
@@ -7218,11 +7240,13 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
     # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
     # duplicate WiringError via add_inbound/add_outbound (no silent precedence).
     from messagefoundry.config.connections_file import (
-        CONNECTIONS_FILE_NAME,
+        connections_file_path,
         load_connections_file,
     )
 
-    conn_file = directory / CONNECTIONS_FILE_NAME
+    # The live file, or the candidate a `connections_edit` write is validating before it replaces the
+    # live one (vault BACKLOG #2782).
+    conn_file = connections_file_path(directory)
     if conn_file.is_file():
         load_connections_file(conn_file, registry)
     registry.validate(allow_empty=allow_empty)
@@ -8056,10 +8080,13 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     # *.py ones and the router/port checks below cover TOML-authored connections. Lazy import (cycle).
     from messagefoundry.config.connections_file import (
         CONNECTIONS_FILE_NAME,
+        connections_file_path,
         load_connections_file,
     )
 
-    conn_file = directory / CONNECTIONS_FILE_NAME
+    # The candidate a `connections_edit` write is validating, when this runs inside one (vault
+    # BACKLOG #2782), as `load_config` does.
+    conn_file = connections_file_path(directory)
     if conn_file.is_file():
         try:
             load_connections_file(conn_file, registry)

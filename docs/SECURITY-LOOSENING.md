@@ -362,17 +362,23 @@ false premise.
   `[auth].oidc_require_mfa_claim` is on. This ack **downgrades that refusal to a loud, audited warning** (the same
   warn-and-start `enforcement = warn` takes, but scoped to this one control), so the instance boots
   single-factor while staying at `enforce`.
-- **Scope correction ([BACKLOG #326](BACKLOG.md)):** "a declared reverse proxy" above means exactly
-  `[api].tls_terminated_upstream` — the bind-and-proxy posture, **independent of the browser console**. The
+- **Scope correction ([BACKLOG #326](BACKLOG.md)):** "a declared reverse proxy" above means
+  `[api].tls_terminated_upstream` or a set `[api].trusted_proxies` — the bind-and-proxy posture,
+  **independent of the browser console**. The
   shipped predicate additionally required the console to be *served*, which the ADR 0143 auto-degrade had
   already turned off, so a loopback-behind-a-declared-proxy instance would not have reached this refusal at
   all on first deployment and this ack would have had nothing to lift there. The wording in this section was
   already the intended scope; the code now matches it, and the ack itself is unchanged. An **undeclared**
-  proxy (a set `web_console_public_address` with no `tls_terminated_upstream`) stays outside the predicate
+  proxy (a set `web_console_public_address` with neither `tls_terminated_upstream` nor `trusted_proxies`)
+  stays outside the predicate
   — nothing was declared, so exposure there is an inference, and an inference must not refuse. It has its
   own startup **warning**, which names single-factor sign-in directly on a PHI instance with `require_mfa`
   off; read that arm, not the ADR 0068 §8 undeclared-proxy warning, as the control for this case (§8 is
   about the `/ui` cookie and HSTS, and the ADR 0143 auto-degrade suppresses it in the same posture).
+- **Corrected by vault BACKLOG #2251:** the scope correction above read "means exactly
+  `[api].tls_terminated_upstream`". A loopback bind naming only `[api].trusted_proxies`, a proxy
+  re-encrypting to an operator `[api].tls_cert_file`, therefore did not reach this refusal. It does now,
+  and the refusal names `[api].trusted_proxies` as the trigger.
 - **When acceptable:** a production exposure where the second factor is supplied by a **compensating control
   outside MessageFoundry** — an authenticating reverse proxy / mTLS admin gateway. AD/Kerberos MFA
   delegated to the directory is **no longer** one of them: BACKLOG #1144 retired that delegation, so
@@ -973,7 +979,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 > `MLLP` one is also a `connections.toml` `[settings]` key, because `Email` and `Direct` are not
 > `connections.toml` transports. `Ftp()` does not take it, so a `[settings]` table cannot set it on FTPS
 > either, but the FTPS context honours it from a hand-built `ConnectionSpec`, so it is a loosening
-> there too. ASVS 12.3.2.
+> there too, for an anonymous login only. ASVS 12.3.2.
 - **What you lose:** the check that the server certificate names the host the engine dialled. The
   chain is still verified, so the certificate must come from the hop's trust anchor. But any
   certificate from that anchor is accepted, whatever host it was issued to. On the public trust store
@@ -985,7 +991,14 @@ This section is kept rather than deleted, because the claim it used to make is t
   as an IP address, while they reissue it. Prefer a private trust anchor in `tls_ca_file`, which narrows
   "any certificate from the anchor" to the partner's own CA.
 - **Compensating controls:** a private `tls_ca_file` is the one that matters. With credentials it is
-  not available at all: `Email` and `Direct` refuse it outright when they carry an SMTP credential.
+  not available at all: `Email` and `Direct` refuse it outright when they carry an SMTP credential,
+  and FTPS refuses it outright, in both directions, when a `username` or `password` is set (vault
+  BACKLOG #2636). No escape variable or posture unlocks either refusal. CORRECTED 2026-10-06: FTPS
+  was warned and not refused here, so a credentialed FTPS hop with the name check off would have
+  sent its login to any peer holding a certificate from the anchor. The weaker FTPS posture is
+  refused the same way: a credentialed FTPS hop with `tls_verify = false` is refused outright, as
+  `Email` and `Direct` refuse it, and the clamped `MEFOR_ALLOW_INSECURE_TLS` escape governs only an
+  anonymous FTPS hop.
 - **It is never silent:** a WARNING at each construction naming the connection and the host; a
   `tls-check-hostname` line in `messagefoundry check` naming every declaring connection and its peer;
   and a `tls_check_hostname` entry in `security_loosenings()`, and so in `GET /security/posture` on a
@@ -996,8 +1009,9 @@ This section is kept rather than deleted, because the claim it used to make is t
   Direct without credentials, and on a hand-built FTPS spec, and the posture floor test exempted it as
   "gated by the ADR 0092 hop cell", which was false. **Not** the serve-time loosening warning, which
   fires before the graph is loaded, as for `tls_allow_expired`.
-- **What it cannot do:** it is **advisory only**, on the `tls_allow_expired` precedent. No posture gate
-  keys on it, and `[security].enforcement = enforce` does not refuse it. Where it is NOT reported is the
+- **What it cannot do:** on a hop with no credential it is **advisory only**, on the
+  `tls_allow_expired` precedent. No posture gate keys on it, and `[security].enforcement = enforce`
+  does not refuse it. The credentialed refusals above are absolute and do not depend on enforcement. Where it is NOT reported is the
   same list as `cleartext_accepted` above: `messagefoundry security show` and a graphless
   `GET /security/posture` say so in `loosenings_scope`.
 

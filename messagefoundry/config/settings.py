@@ -442,7 +442,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
     ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
-    and FTPS ``tls_verify=false`` contexts and the credentialed plain-``ftp`` guard, **and — since #329 —**
+    and the anonymous FTPS ``tls_verify=false`` context (a credential on FTPS verify-off or on plain
+    ``ftp`` is refused outright, vault BACKLOG #2636), **and — since #329 —**
     the LDAPS ``ad_tls_verify=false`` bind (:mod:`messagefoundry.auth.ldap`), the SFTP unknown-host-key
     acceptance (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
     cleartext-``http`` hops. Pass the construction-time
@@ -1363,8 +1364,10 @@ class ApiSettings(_Section):
 
     @property
     def is_loopback(self) -> bool:
-        """Whether the API binds a loopback host — i.e. is **not** exposed off-box, so the exposed-bind
-        TLS gate and the MFA-at-exposure advisory (``serve``) don't apply. The host set is
+        """Whether the API binds a loopback host, so the exposed-bind TLS gate (``serve``) does not
+        apply. It is not the whole exposure test: ``serve``'s MFA-at-exposure, dual-control and ADR 0152
+        arms read :attr:`host_is_browser_origin`, which also counts a declared or trusted proxy in front
+        of a loopback bind (vault BACKLOG #2251). The host set is
         :data:`_LOOPBACK_HOSTS`, shared with the ``[security]`` desugar so one definition serves every
         off-box decision."""
         return self.host in _LOOPBACK_HOSTS
@@ -1372,8 +1375,10 @@ class ApiSettings(_Section):
     @property
     def host_is_browser_origin(self) -> bool:
         """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
-        engine off-box or through a proxy, which is also what ``serve``'s console exposure checks
-        test (BACKLOG #2218)."""
+        engine off-box or through a proxy. ``serve`` reads it for the console exposure checks
+        (BACKLOG #2218) and as ``instance_exposed``, the single exposure test its refusing arms read:
+        MFA-at-exposure, dual-control and the ADR 0152 declaration (vault BACKLOG #2251). A change to
+        :func:`request_host_is_browser_origin` therefore moves those security refusals too."""
         return request_host_is_browser_origin(
             loopback=self.is_loopback,
             trusted_proxies=self.trusted_proxies,
@@ -2749,6 +2754,10 @@ EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 #: real directory round trip and far below the point where a socket timeout overflows.
 _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
+#: The widest ``[auth].oidc_issuer`` the engine loads, in UTF-16 units (BACKLOG #2331): the width of
+#: the narrowest issuer column a federated binding is stored in, SQL Server ``NVARCHAR(256)``.
+_OIDC_ISSUER_MAX = 256
+
 
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
@@ -3058,7 +3067,10 @@ class AuthSettings(_Section):
     # principal with no on-prem AD object is refused. Endpoints are operator-pinned (no .well-known
     # discovery), so no attacker-influenced URL exists.
     oidc_enabled: bool = False
-    oidc_issuer: str | None = None  # https; exact-matched against the id_token `iss`
+    # https; exact-matched against the id_token `iss`. At most 256 UTF-16 units, refused at load
+    # (_issuer_fits_the_column): a bind stores it, and the narrowest issuer column is SQL Server
+    # NVARCHAR(256), so a longer one could be configured and never bound (BACKLOG #2331).
+    oidc_issuer: str | None = None
     oidc_client_id: str | None = None  # also the required `aud`/`azp`
     # The confidential-client secret. ENV ONLY (MEFOR_AUTH_OIDC_CLIENT_SECRET) — never the config file
     # (_FILE_SECRET_KEYS warns) — or via a [secrets].provider reference in oidc_client_secret_ref. The
@@ -3520,6 +3532,23 @@ class AuthSettings(_Section):
         return (
             self.ad_enabled and self.ad_server is not None and not is_ldaps_address(self.ad_server)
         )
+
+    @field_validator("oidc_issuer")
+    @classmethod
+    def _issuer_fits_the_column(cls, value: str | None) -> str | None:
+        """BACKLOG #2331. Counted in UTF-16 units, not code points: the column this protects, SQL
+        Server ``NVARCHAR(256)``, counts units, and a character outside the Basic Multilingual Plane
+        takes two. ``surrogatepass`` so a lone surrogate is counted rather than raising an encoding
+        error that quotes it. The message names the limit, never the value."""
+        if (
+            value is not None
+            and len(value.encode("utf-16-le", "surrogatepass")) // 2 > _OIDC_ISSUER_MAX
+        ):
+            raise ValueError(
+                f"[auth].oidc_issuer must be at most {_OIDC_ISSUER_MAX} UTF-16 code units, the"
+                " width of the column a federated binding stores it in"
+            )
+        return value
 
     @model_validator(mode="after")
     def _require_ad_fields(self) -> AuthSettings:

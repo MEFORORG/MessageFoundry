@@ -321,7 +321,7 @@ async def test_an_enrolled_account_cannot_self_promote_by_binding_a_second_facto
     enrollment = await service.begin_mfa_enrollment(identity)
     assert (
         await service.confirm_mfa_enrollment(
-            identity, totp.totp(enrollment.secret), token=setup.token
+            identity, fresh_totp(enrollment.secret), token=setup.token
         )
     ).ok
 
@@ -1211,7 +1211,7 @@ async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_en
     # The confinement is survivable: the ceremony accepts the directory account.
     enroll = await service.begin_mfa_enrollment(out.identity)
     confirmed = await service.confirm_mfa_enrollment(
-        out.identity, totp.totp(enroll.secret), token=out.token
+        out.identity, fresh_totp(enroll.secret), token=out.token
     )
     assert confirmed.recovery_codes
     # Confirming ROTATES the session (ASVS 7.2.4, BACKLOG #1146): the gate lifts on the NEW token,

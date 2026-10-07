@@ -1731,9 +1731,9 @@ def _load_service_settings(
 def _post_write_settings_check(refusal: type[ValueError]) -> Callable[[Path], None]:
     """The ``validate`` callback ``security set`` and ``alert add``/``remove`` hand their editor.
 
-    It re-loads the edited file exactly as the engine does, so a bad write fails at edit time and the
-    editor rolls it back rather than the engine refusing at the next start. That reload is the WHOLE
-    file plus the environment layer, not the JSON the operator typed, so its failure goes through
+    It loads the editor's candidate exactly as the engine loads the file, so a bad edit fails at
+    edit time and never replaces the file, rather than the engine refusing at the next start. That
+    load is the WHOLE file plus the environment layer, not the JSON the operator typed, so its failure goes through
     :func:`_load_service_settings` and is raised as ``refusal`` already rendered (vault BACKLOG
     #2760); the editor modules stay outside the settings import graph and cannot render it."""
 
@@ -1874,11 +1874,14 @@ def _serve(args: argparse.Namespace) -> int:
     if effective_root is not None and not Path(settings.store.path).is_absolute():
         settings.store.path = str(effective_root / settings.store.path)
 
-    # THE SINGLE DEFINITION of "this instance is exposed" (BACKLOG #326): an off-loopback bind OR a
-    # declared upstream TLS terminator. The full rationale (why not `serve_ui`, why deliberately
-    # narrow) sits at the MFA-at-exposure gate that is its first consumer. Defined ONCE: a second copy
-    # is exactly how the ASVS 11.7.1 and 6.3.3 arms once disagreed about the same boot (#326).
-    instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream
+    # THE SINGLE DEFINITION of "this instance is exposed" (BACKLOG #326): an off-loopback bind, a
+    # declared upstream TLS terminator, or a set [api].trusted_proxies (vault BACKLOG #2251). It is
+    # the console flags' rule (`host_is_browser_origin`, BACKLOG #2218): a loopback bind that trusts
+    # a proxy has one in front, re-encrypting to an operator certificate if not terminating, so the
+    # admin API is on the network. The full rationale (why not `serve_ui`, why a set `public_origin`
+    # alone does not count) sits at the MFA-at-exposure gate that is its first consumer. Defined
+    # ONCE: a second copy is how the ASVS 11.7.1 and 6.3.3 arms once disagreed about one boot (#326).
+    instance_exposed = not settings.api.host_is_browser_origin
 
     if settings.store.backend is StoreBackend.SQLSERVER:
         import importlib.util
@@ -2897,10 +2900,10 @@ def _serve(args: argparse.Namespace) -> int:
     # create_managed_app (mirrors the package-absent soft-degrade above and the existing in-place flips).
     # A set trusted_proxies counts too (BACKLOG #2218): on a loopback bind it declares a proxy in front
     # (settings accept it only with a terminator or an operator certificate, #2055), so the browser is
-    # off-box. It trips no refusal below, so the reason to degrade there is the one above: an off-box
-    # console must be asked for by name. `not host_is_browser_origin` is the bind-and-proxy half,
-    # shared with ui_exposed below.
-    console_offbox = not settings.api.host_is_browser_origin
+    # off-box. It trips none of the /ui refusals below, so the reason to degrade there is the one
+    # above: an off-box console must be asked for by name. The bind-and-proxy half is
+    # `instance_exposed`, defined once above and shared with ui_exposed below (vault BACKLOG #2251).
+    console_offbox = instance_exposed
     console_exposed = console_offbox or bool(settings.api.public_origin)
     if (
         settings.api.serve_ui
@@ -3054,8 +3057,9 @@ def _serve(args: argparse.Namespace) -> int:
             "until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
             file=sys.stderr,
         )
-    # Only the two advisories below read this. The refusing arms read the narrower instance_exposed,
-    # which does not count trusted_proxies (BACKLOG #326, #2218).
+    # Only the two advisories below read this: instance_exposed plus the serve_ui term. The refusing
+    # arms read instance_exposed alone, since serve_ui is rewritten in place above (BACKLOG #326,
+    # #2218, vault BACKLOG #2251).
     ui_exposed = settings.api.serve_ui and console_offbox
     if ui_exposed:
         # The ASVS 8.4.2 managed-admin-host / reverse-proxy-mTLS posture is deployment-delegated
@@ -3130,11 +3134,10 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-    # THE SINGLE DEFINITION OF "this instance is exposed" (BACKLOG #326) is derived above, beside the
-    # auth-off arm (which since vault BACKLOG #2719 refuses on every bind), from two fields no earlier
-    # arm reassigns —
-    # `is_loopback` and `tls_terminated_upstream` are read straight off the loaded config and are never
-    # mutated in place, unlike `serve_ui`.
+    # THE SINGLE DEFINITION OF "this instance is exposed" (BACKLOG #326) is derived above, just after
+    # the settings load, from three fields no earlier arm reassigns: `is_loopback`, `trusted_proxies`
+    # and `tls_terminated_upstream` (through `host_is_browser_origin`, vault BACKLOG #2251) are read
+    # straight off the loaded config and are never mutated in place, unlike `serve_ui`.
     #
     # WHY IT CANNOT READ `settings.api.serve_ui`: that field is flipped to False IN PLACE twice above —
     # the ADR 0143 soft-degrade when the console wheel is absent, and the ADR 0143 auto-degrade when a
@@ -3189,13 +3192,21 @@ def _serve(args: argparse.Namespace) -> int:
     # it points back at the sentence that names it rather than printing it twice.
     oidc_exception = oidc_second_factor_claim_exception(settings.auth)
     directory_exception = ", with the OIDC exception above" if oidc_exception else ""
+    # What made this instance exposed, named once for the MFA and dual-control arms below. It names
+    # the field the operator set, so a loopback bind that only trusts a proxy (re-encrypting to an
+    # operator certificate) is told [api].trusted_proxies, not a terminator it never declared
+    # (vault BACKLOG #2251). Empty when not exposed, and read only when admin_exposed.
+    exposure_desc = (
+        f"API bound to non-loopback host {settings.api.host!r}"
+        if not settings.api.is_loopback
+        else "admin interface reached through a declared reverse proxy "
+        "([api].tls_terminated_upstream)"
+        if settings.api.tls_terminated_upstream
+        else "admin interface reached through a declared reverse proxy ([api].trusted_proxies)"
+        if settings.api.trusted_proxies
+        else ""
+    )
     if admin_exposed and not settings.auth.require_mfa:
-        exposure_desc = (
-            f"API bound to non-loopback host {settings.api.host!r}"
-            if not settings.api.is_loopback
-            else "admin interface reached through a declared reverse proxy "
-            "([api].tls_terminated_upstream)"
-        )
         if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
             print(
                 f"error: {exposure_desc} on a {'production ' if production else ''}PHI "
@@ -3233,15 +3244,17 @@ def _serve(args: argparse.Namespace) -> int:
 
     # --- the UNDECLARED-proxy residual of the gate above, made visible (BACKLOG #326) ---------------
     # `instance_exposed` is deliberately narrow, so a set `public_origin` on a loopback bind with no
-    # declared terminator does not refuse. That is the right call — nothing was declared, so the engine
-    # is inferring — but it must not be SILENT, and until this arm existed it was: the only other thing
-    # that could have spoken is the ADR 0068 §8 undeclared-proxy warning above, which is scoped to the
-    # /ui cookie and HSTS and is suppressed outright when the ADR 0143 auto-degrade clears `serve_ui`
-    # (which that same `public_origin` triggers). So the documented compensating control did not exist
-    # on the commonest shape of this posture. WARN, never refuse: the ruling that tightened the gate
-    # above was about a DECLARED proxy, and promoting an inference to a refusal is a different decision.
-    # Scoped as tightly as the refusal is: only where require_mfa was EXPLICITLY opted out. It reads
-    # no PHI or data-class condition, because every instance is a PHI instance.
+    # declared terminator and no trusted_proxies does not refuse (either one now counts, vault
+    # BACKLOG #2251, so this arm fires only where no proxy is named at all). That is the right call —
+    # nothing was declared, so the engine is inferring — but it must not be SILENT, and until this arm
+    # existed it was: the only other thing that could have spoken is the ADR 0068 §8 undeclared-proxy
+    # warning above, which is scoped to the /ui cookie and HSTS and is suppressed outright when the
+    # ADR 0143 auto-degrade clears `serve_ui` (which that same `public_origin` triggers). So the
+    # documented compensating control did not exist on the commonest shape of this posture. WARN,
+    # never refuse: the ruling that tightened the gate above was about a DECLARED proxy, and promoting
+    # an inference to a refusal is a different decision. Scoped as tightly as the refusal is: only
+    # where require_mfa was EXPLICITLY opted out. It reads no PHI or data-class condition, because
+    # every instance is a PHI instance.
     if not instance_exposed and settings.api.public_origin and not settings.auth.require_mfa:
         print(
             "warning: [security].web_console_public_address is set with no declared TLS terminator "
@@ -3261,10 +3274,11 @@ def _serve(args: argparse.Namespace) -> int:
     # approvals:approve releases the request). On an off-box admin surface that concentration is the
     # weakest link: one compromised/coerced admin session can replay full-PHI dead-letters or purge a
     # connection with no second sign-off. Key on the SAME exposure signal as the MFA gate above
-    # (admin_exposed = instance_exposed = off-loopback bind OR a declared TLS-terminating proxy), so a
-    # plain loopback default is byte-identical (admin_exposed is False → this never trips, BACKLOG #326
-    # preserved that property deliberately). It used to stay quiet on an instance declared synthetic;
-    # that declaration is retired (BACKLOG #1279).
+    # (admin_exposed = instance_exposed = off-loopback bind, a declared TLS-terminating proxy, or a set
+    # trusted_proxies, vault BACKLOG #2251), so a plain loopback default is byte-identical
+    # (admin_exposed is False → this never trips, BACKLOG #326 preserved that property deliberately).
+    # It used to stay quiet on an instance declared synthetic; that declaration is retired
+    # (BACKLOG #1279).
     # This is WARN-ONLY by design (the reviewed default): dual-control is
     # off-by-default precisely so a genuine single-operator hospital deployment is never wedged, so
     # refusing to start on its absence would break a supported topology.
@@ -3274,14 +3288,8 @@ def _serve(args: argparse.Namespace) -> int:
     # warning is an owner decision — kept WARN-only here until adjudicated; flip by adding the
     # `if production: ... return 2` arm and an audited [approvals].allow_single_control override.
     if admin_exposed and not settings.approvals.enabled:
-        approvals_exposure_desc = (
-            f"API bound to non-loopback host {settings.api.host!r}"
-            if not settings.api.is_loopback
-            else "admin interface reached through a declared reverse proxy "
-            "([api].tls_terminated_upstream)"
-        )
         print(
-            f"warning: {approvals_exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
+            f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
             "[approvals].enabled off — high-value actions (dead_letter_replay, connection_purge) each "
             "complete on a single caller's authority with no second sign-off (ASVS 2.3.5). Enable "
             "dual-control with [approvals].enabled=true so a distinct approver (approvals:approve) must "
@@ -3290,7 +3298,7 @@ def _serve(args: argparse.Namespace) -> int:
         )
 
     # --- startup TLS-floor probe of the declared front door (ASVS 12.1.1) ---------------------------
-    # ORDER MATTERS: this sits AFTER the config-only exposure refusals (auth-off, /ui exposure,
+    # ORDER MATTERS: this sits AFTER the config-only exposure refusals (/ui exposure,
     # MFA-at-exposure) deliberately. It is the only gate that makes NETWORK CALLS, and pre-empting
     # a config refusal with three handshake round-trips means an operator fixes the TLS floor,
     # restarts, and only then learns MFA was off — two trips for one boot. Cheap refusals first.
@@ -8141,7 +8149,8 @@ def _connection(args: argparse.Namespace) -> int:
     """Manage the data-authored ``connections.toml`` (ADR 0007): ``list`` to populate the VS Code
     editor, ``upsert``/``remove`` to save (a developer can also hand-edit the file). ``upsert``/
     ``remove`` validate the whole config dir (structure + connector/egress build-check) BEFORE
-    persisting and roll back on failure. Offline: touches no network, starts no server."""
+    persisting, so a refused edit never touches the file. Offline: touches no network, starts no
+    server."""
     import os
     from pathlib import Path
 
@@ -8264,13 +8273,13 @@ def _codeset(args: argparse.Namespace) -> int:
     ``upsert`` / ``rename`` / ``remove`` to save (a developer can also hand-edit the files). Offline:
     touches no network, starts no server, loads no config modules — validating a code set means
     "does this file load as a CodeSet", done by re-running the code_sets.py loader on the candidate.
-    ``upsert`` writes ``.csv`` atomically with owner-only perms and rolls back on a load failure."""
+    ``upsert`` loads an owner-only candidate ``.csv`` and replaces the live file only if it loads."""
     from messagefoundry.config import codeset_edit
     from messagefoundry.config.code_sets import CodeSetError, load_code_set
     from messagefoundry.config.wiring import WiringError
 
-    # The post-write check is the REAL loader on the written file (no egress/env build-check — a code
-    # set is standalone data): if the candidate .csv doesn't load, the writer rolls back.
+    # The pre-replace check is the REAL loader on the candidate (no egress/env build-check — a code
+    # set is standalone data): if the candidate .csv doesn't load, the live file is never touched.
     def validate(path: Path) -> None:
         load_code_set(path)
 
@@ -8632,7 +8641,8 @@ def _security(args: argparse.Namespace) -> int:
     the VS Code ``[security]`` editor (resolved values + which are explicitly set + the secure defaults +
     the active loosenings); ``set`` saves an update JSON (a ``null`` value resets a switch to its secure
     default). ``set`` re-loads the whole settings file BEFORE persisting — which also **rejects the
-    relocated legacy keys** — and rolls back on failure. Offline; applies on the next engine restart."""
+    relocated legacy keys** — so a refused edit never touches the file. Offline; applies on the next
+    engine restart."""
     from pydantic import ValidationError
 
     from messagefoundry.config import security_edit

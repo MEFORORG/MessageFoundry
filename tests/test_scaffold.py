@@ -72,6 +72,12 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     ignored = set(gitignore.splitlines())
     for minted in _generated_pair(repo):
         assert minted.name in ignored
+    # ...and the config editors' lock file and a killed edit's candidate directory (vault BACKLOG
+    # #2782), named from the module that creates them.
+    from messagefoundry.config import atomic_edit
+
+    assert atomic_edit.LOCK_FILE_NAME in ignored
+    assert f".*.????????{atomic_edit.CANDIDATE_DIR_SUFFIX}/" in ignored
     # the template + README teach WS-1's env-anchor so a config repo run under a service (CWD != repo
     # root) still resolves environments/<env>.toml (ADR 0017): base_dir in the toml, --project-root in docs
     assert "base_dir" in toml

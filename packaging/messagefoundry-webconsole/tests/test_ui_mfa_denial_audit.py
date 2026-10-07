@@ -23,13 +23,13 @@ from typing import Any
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_chosen
+from _ui_clients import create_local_user_chosen, held_totp_code
 from fastapi import Request, WebSocket
 
 import messagefoundry_webconsole._auth as ui_auth
 from messagefoundry.api import create_app
 from messagefoundry.api.security import client_ip
-from messagefoundry.auth import Role, totp
+from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -463,9 +463,8 @@ async def _enroll_totp(service: AuthService, username: str = "op") -> None:
     outcome = await service.login(username, PW)
     assert outcome.ok and outcome.token is not None
     enrollment = await service.begin_mfa_enrollment(identity)
-    confirmed = await service.confirm_mfa_enrollment(
-        identity, totp.totp(enrollment.secret), token=outcome.token
-    )
+    with held_totp_code(enrollment.secret) as code:  # no step boundary between code and check
+        confirmed = await service.confirm_mfa_enrollment(identity, code, token=outcome.token)
     assert confirmed.ok  # `.ok`: an Elevation is a frozen dataclass and always truthy
 
 

@@ -18,6 +18,9 @@ implementation would pass without it:
 * ``expires_at`` carried forward is what stops repeated rotation extending the absolute session cap.
 * ``mfa_verified_at`` carried forward is what stops a rotation stranding the caller behind the ASVS
   6.3.3 MFA access gate holding a token that gate has never seen verified.
+* ``idp_auth_time`` (BACKLOG #2143) carried forward, and moved only by ``mark_session_reauthed``, is
+  what the IdP step-up's freshness test compares with. A rotation that dropped it would refuse every
+  later step-up; a write-back that did not land would let the IdP replay the last answer.
 """
 
 from __future__ import annotations
@@ -77,11 +80,14 @@ async def assert_session_rotation_contract(store: Any, *, user_id: str = "rot-u1
         client="10.9.8.7",
         now=now,
         auth_mechanism="oidc",
+        # A distinctive fractional value, so a column truncated to whole seconds cannot pass.
+        idp_auth_time=now - 17.25,
     )
     await store.mark_session_mfa_verified(old, now=now)
     before = await store.get_session(old)
     assert before is not None
     assert before.auth_mechanism == "oidc", "the session mechanism was not persisted at mint"
+    assert before.idp_auth_time == now - 17.25, "the IdP auth_time was not persisted at mint"
 
     assert await store.rotate_session(old, new_token_hash=new) is True
 
@@ -107,13 +113,35 @@ async def assert_session_rotation_contract(store: Any, *, user_id: str = "rot-u1
         "auth_mechanism was dropped — a rotated OIDC session would fall to the password step-up "
         "leg, which ADR 0142 Amendment B forbids (BACKLOG #296)"
     )
+    assert after.idp_auth_time == before.idp_auth_time, (
+        "idp_auth_time was dropped — every later IdP step-up would be refused as "
+        "step_up_idp_auth_time_missing (BACKLOG #2143)"
+    )
     assert await _count_sessions(store, user_id) == 1, "rotation must not leave a second row behind"
+
+    # The IdP step-up's write-back (BACKLOG #2143): the value moves in the reauth statement, and a
+    # re-proof that passes none (every password leg) leaves it where it was.
+    await store.mark_session_reauthed(new, now=now + 2, client=None, idp_auth_time=now + 1.5)
+    stepped = await store.get_session(new)
+    assert stepped is not None and stepped.idp_auth_time == now + 1.5, "the write-back did not land"
+    assert stepped.reauth_at == now + 2 and stepped.client == "10.9.8.7"
+    await store.mark_session_reauthed(new, now=now + 3, client="10.9.8.6")
+    kept = await store.get_session(new)
+    assert kept is not None and kept.idp_auth_time == now + 1.5, "a reauth with none cleared it"
+    assert kept.reauth_at == now + 3 and kept.client == "10.9.8.6"
+    # Two step-ups landing out of order: the older value must not replace the newer one, or a
+    # replay of the newer answer would pass the next freshness test.
+    await store.mark_session_reauthed(new, now=now + 4, idp_auth_time=now + 0.5)
+    forward = await store.get_session(new)
+    assert forward is not None and forward.idp_auth_time == now + 1.5, "the value moved backwards"
+    assert forward.reauth_at == now + 4
 
     # A session minted without a mechanism reads NULL, as a row from before the column does.
     legacy = _h()
     await store.create_session(token_hash=legacy, user_id=user_id, expires_at=expires, now=now)
     legacy_row = await store.get_session(legacy)
     assert legacy_row is not None and legacy_row.auth_mechanism is None
+    assert legacy_row.idp_auth_time is None
     await store.revoke_session(legacy, now=now)
 
     # --- replay: the old hash is spent ---------------------------------------------------------
@@ -160,6 +188,7 @@ async def assert_session_supersession_contract(store: Any, *, user_id: str = "su
         client="10.1.2.3",
         now=now,
         auth_mechanism="oidc",
+        idp_auth_time=now - 3.5,
     )
     await store.mark_session_mfa_verified(live, now=now + 1)
     before = await store.get_session(live)
@@ -179,6 +208,7 @@ async def assert_session_supersession_contract(store: Any, *, user_id: str = "su
     assert ended.reauth_at == before.reauth_at and ended.reauth_at is not None
     assert ended.mfa_verified_at == now + 1
     assert ended.auth_mechanism == "oidc"
+    assert ended.idp_auth_time == now - 3.5
     assert ended.revoked_at == now + 5
     stored = await store.get_session(live)
     assert stored is not None and stored.revoked_at == now + 5, "the revoke was not persisted"
