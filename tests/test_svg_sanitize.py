@@ -19,6 +19,7 @@ from xml.etree.ElementTree import Element
 import pytest
 
 from messagefoundry._vendor.defusedxml.ElementTree import fromstring
+from messagefoundry.api import svg_sanitize
 from messagefoundry.api.svg_sanitize import (
     SVG_NS,
     SvgRejected,
@@ -280,6 +281,18 @@ def test_a_gzip_bomb_is_bounded() -> None:
 # --- BACKLOG #2391: SVG below a root that is not svg -----------------------------------------------
 
 _XHTML = b'<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+#: ``ESC ( B`` decodes to nothing in ISO-2022-JP, so a browser and Python's codec both read
+#: ``<s ESC ( B vg`` as ``<svg``, while no byte scan sees the name.
+_ISO2022_SVG = (
+    b'<?xml version="1.0" encoding="ISO-2022-JP"?><s\x1b(Bvg xmlns="http://www.w3.org/2000/s\x1b(Bvg">'
+    b"<script>alert(1)</script></s\x1b(Bvg>"
+)
+
+
+def test_the_iso_2022_jp_probe_really_decodes_to_svg() -> None:
+    """Control for the refusal cases below: the bytes are an SVG once decoded."""
+    assert "<svg" in _ISO2022_SVG.decode("iso2022_jp")
+    assert b"<svg" not in _ISO2022_SVG
 
 
 @pytest.mark.parametrize(
@@ -321,6 +334,24 @@ _XHTML = b'<html xmlns="http://www.w3.org/1999/xhtml"><body>'
                      id="entity-yielding-an-ampersand"),
         pytest.param(b"<html><body><!-- <svg onload=x> --><br></body></html>",
                      id="html-svg-in-a-comment-errs-toward-refusal"),
+        pytest.param(_ISO2022_SVG, id="iso-2022-jp-svg-root"),
+        pytest.param(b'<?xml version="1.0" encoding="ISO-2022-JP"?><r><s\x1b(Bvg xmlns="http://'
+                     b'www.w3.org/2000/s\x1b(Bvg"><script>alert(1)</script></s\x1b(Bvg></r>',
+                     id="iso-2022-jp-svg-below-another-root"),
+        pytest.param(b'<!DOCTYPE r [<!ENTITY n "http&#58;//www.w3.org/2000/svg">'
+                     b'<!ATTLIST script xmlns CDATA #FIXED "&n;">]><r><script>alert(1)</script></r>',
+                     id="attlist-default-namespace-through-an-entity"),
+        pytest.param(b'<?xml version="1.0" encoding="Shift_JIS"?><!DOCTYPE r [<!ATTLIST script xmlns'
+                     b' CDATA #FIXED "http&#58;//www.w3.org/2000/svg">]><r><script>alert(1)</script></r>',
+                     id="attlist-default-namespace-under-an-unsupported-encoding"),
+        pytest.param(b"<html><body><!--><svg onload=alert(1)>--></body></html>",
+                     id="html-empty-comment"),
+        pytest.param(b"<html><body><![CDATA[><svg onload=alert(1)>]]></body></html>",
+                     id="html-cdata"),
+        pytest.param(b"<html><body><?x ><svg onload=alert(1)>?></body></html>",
+                     id="html-processing-instruction"),
+        pytest.param(b'<!DOCTYPE html SYSTEM "x><svg onload=alert(1)>"><html/>',
+                     id="html-doctype-literal"),
     ],
 )  # fmt: skip
 def test_markup_carrying_svg_below_another_root_is_refused(data: bytes) -> None:
@@ -342,6 +373,10 @@ def test_markup_carrying_svg_below_another_root_is_refused(data: bytes) -> None:
         b"<doc><svgish/><x:svgs xmlns:x='urn:x'/></doc>",
         b"<html><body><code>xmlns=&quot;urn:x&quot;</code><br></body></html>",
         b"<!DOCTYPE d [<!ENTITY nbsp '&#160;'><!ENTITY co 'Synthetic &#169; Org'>]><doc>&co;</doc>",
+        b'<html xmlns="http://www.w3.org/1999/xhtml" xmlns:svg="http://www.w3.org/2000/svg">'
+        b"<body><p>report</p></body></html>",
+        b"<html><body><p>see http://www.w3.org/2000/svg spec</p></body></html>",
+        b'<doc xmlns:a="urn:x&#58;y"><a:note/></doc>',
     ],
 )
 def test_markup_without_svg_is_unchanged(data: bytes) -> None:
@@ -367,6 +402,66 @@ def test_the_embedded_svg_scan_is_linear(data: bytes) -> None:
     started = time.perf_counter()
     assert sanitize_if_svg("text/html", data) is data
     assert time.perf_counter() - started < 10
+
+
+@pytest.mark.parametrize("compress", [False, True], ids=["plain", "gzip"])
+def test_a_long_declaration_is_skipped_by_the_regex_engine(
+    compress: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The declaration scan stepped byte by byte in Python once. Through gzip this 32 KB body took
+    4.7 s of CPU per download; it is now skipped between tokens in one regex search."""
+    doc = b'<!DOCTYPE r [<!ENTITY a "x"> ' + b"a" * (32 * 1024 * 1024 - 100)
+    body = gzip.compress(doc, mtime=0) if compress else doc
+    steps: list[int] = []
+    real = svg_sanitize._ScanBudget.spend
+
+    def counting(self: svg_sanitize._ScanBudget) -> None:
+        steps.append(1)
+        real(self)
+
+    monkeypatch.setattr(svg_sanitize._ScanBudget, "spend", counting)
+    started = time.perf_counter()
+    assert sanitize_if_svg("application/xml", body) is body
+    # The steady assertion: a handful of tokens, not one step per byte. The clock is a loose backstop
+    # (about 1 s here, against 5 s or more for the old loop).
+    assert 0 < len(steps) < 20
+    assert time.perf_counter() - started < 20
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(b'<?xml version="1.0"?><ClinicalDocument><title>synthetic</title>'
+                     b"</ClinicalDocument>", id="cda"),
+        pytest.param(b"<html><body><p>a&nbsp;b</p><br></body></html>", id="html-nbsp"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY nbsp "&#160;">]><doc>a&nbsp;b</doc>', id="entity-160"),
+        pytest.param('<?xml version="1.0" encoding="Shift_JIS"?><doc>日本</doc>'.encode(
+                     "shift_jis"), id="shift-jis-without-escape"),
+        pytest.param(b'<?xml version="1.0" encoding="x-bogus"?><doc>synthetic</doc>', id="x-bogus"),
+    ],
+)  # fmt: skip
+def test_ordinary_documents_on_both_paths_are_unchanged(data: bytes) -> None:
+    """The no-false-refusal controls for the fail-closed fallback, pinned together."""
+    assert sanitize_if_svg("application/xml", data) is data
+
+
+def test_an_iso_2022_jp_document_is_refused_even_without_svg() -> None:
+    """The recorded trade. pyexpat cannot read ISO-2022-JP, so it always reaches the byte scan, and
+    Japanese text in it always carries the escape byte. It is refused rather than decoded."""
+    doc = '<?xml version="1.0" encoding="ISO-2022-JP"?><r>日本</r>'.encode("iso2022_jp")
+    assert b"\x1b" in doc
+    with pytest.raises(SvgRejected):
+        sanitize_if_svg("application/xml", doc)
+
+
+def test_a_root_scan_that_runs_out_of_steps_is_refused() -> None:
+    """Each bracket costs one step. Past the budget the root is unknown, so the document is treated
+    as SVG and refused, never served unread."""
+    doc = b'<!DOCTYPE r [<!ENTITY a "x">' + b"[]" * 200_000 + b"]><r/>"
+    started = time.perf_counter()
+    with pytest.raises(SvgRejected):
+        sanitize_if_svg("application/xml", doc)
+    assert time.perf_counter() - started < 3
 
 
 @pytest.mark.parametrize("label", ["text/xml", "text/plain", "application/octet-stream", None])

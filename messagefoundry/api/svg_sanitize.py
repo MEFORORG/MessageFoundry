@@ -71,6 +71,9 @@ _GZIP_SNIFF_BYTES: Final = 64 * 1024
 #: and in any case, the SVG namespace name, or a namespace name spelled with a reference, which can
 #: hide it. Possessive quantifiers, and name classes that exclude ``<`` and ``:``, keep the scan
 #: linear: no run is scanned from more than one start.
+#: The first alternative alone is :data:`_SVG_TAG_RE`: what an HTML parser makes an SVG element
+#: from.
+_SVG_TAG_RE: Final = re.compile(rb"<(?:[^\s/<>!?:&]*+:)?svg(?![^\s/>])", re.IGNORECASE)
 _SVG_TRACE_RE: Final = re.compile(
     rb"<(?:[^\s/<>!?:&]*+:)?svg(?![^\s/>])"
     rb"|http://www\.w3\.org/2000/svg"
@@ -90,6 +93,23 @@ _ENTITY_VALUE_RE: Final = re.compile(
 #: A reference in an entity value that yields ``<`` or ``&``, from which markup can be built in a
 #: later step.
 _LT_OR_AMP_REF_RE: Final = re.compile(rb"&#0*+(?:60|38);|&#x0*+(?:3c|26);", re.IGNORECASE)
+#: An attribute-list declaration. Its defaults reach every element it names, ``xmlns`` included, with
+#: no ``xmlns=`` written on the element and with the value spelled through references, so the byte
+#: scan cannot rule one out.
+_ATTLIST_DECL_RE: Final = re.compile(rb"<!ATTLIST", re.IGNORECASE)
+#: The escape byte that switches ISO-2022-JP between character sets. ``ESC ( B`` decodes to nothing,
+#: so ``<s ESC ( B vg`` reads as ``<svg`` to a browser while no byte scan sees it. That is the one
+#: stateful encoding a browser decodes; every other one it supports keeps ASCII bytes as ASCII, or
+#: is UTF-16 or UTF-32, which the scans read after removing NUL bytes. Markup holding it is not
+#: well-formed XML, so it reaches only the byte scans, which refuse it.
+_ESC: Final = b"\x1b"
+#: The most steps the root scan may take: one per comment, processing instruction, declaration, quote
+#: or bracket. A real prolog takes a few dozen. Past this the scan stops and the document is treated
+#: as SVG, so it is refused rather than served unread.
+_MAX_ROOT_SCAN_STEPS: Final = 100_000
+#: What the declaration scan stops at: a quote, a bracket of the internal subset, the closing ``>``,
+#: or a comment. Everything between is skipped by the regex engine, not byte by byte.
+_DECL_TOKEN_RE: Final = re.compile(rb"[\"'\[\]>]|<!--")
 
 
 def _entity_may_build_markup(data: bytes) -> bool:
@@ -235,41 +255,62 @@ def _is_markup(body: bytes) -> bool:
     return first is not None and first.group() == b"<"
 
 
-def _skip_declaration(data: bytes, i: int) -> int:
+class _ScanBudget:
+    """The steps left to the root scan. :meth:`spend` raises :class:`_ScanExhausted` when none are."""
+
+    def __init__(self, steps: int) -> None:
+        self.steps = steps
+
+    def spend(self) -> None:
+        self.steps -= 1
+        if self.steps < 0:
+            raise _ScanExhausted
+
+
+class _ScanExhausted(Exception):
+    """The root scan ran out of steps before it found the root."""
+
+
+def _skip_declaration(data: bytes, i: int, budget: _ScanBudget) -> int:
     """The index just past the ``<!...>`` declaration starting at ``i``, or -1 if it never closes.
 
     Tracks quotes and the internal subset's brackets, and skips comments inside the subset, so a ``>``
-    or a quote inside an entity value or a comment does not end the declaration early."""
-    depth, quote, j, n = 0, 0, i + 2, len(data)
-    while j < n:
-        c = data[j]
-        if quote:
-            if c == quote:
-                quote = 0
-        elif c in b"\"'":
-            quote = c
-        elif data.startswith(b"<!--", j):
-            end = data.find(b"-->", j + 4)
+    or a quote inside an entity value or a comment does not end the declaration early. The regex
+    engine skips the bytes between those tokens, and each token costs one step of ``budget``."""
+    depth, j = 0, i + 2
+    while True:
+        budget.spend()
+        token = _DECL_TOKEN_RE.search(data, j)
+        if token is None:
+            return -1
+        found, j = token.group(), token.end()
+        if found in (b'"', b"'"):
+            end = data.find(found, j)
+            if end < 0:
+                return -1
+            j = end + 1
+        elif found == b"<!--":
+            end = data.find(b"-->", j)
             if end < 0:
                 return -1
             j = end + 3
-            continue
-        elif c == ord("["):
+        elif found == b"[":
             depth += 1
-        elif c == ord("]"):
+        elif found == b"]":
             depth -= 1
-        elif c == ord(">") and depth <= 0:
-            return j + 1
-        j += 1
-    return -1
+        elif depth <= 0:
+            return j
 
 
 def _first_element_name(data: bytes) -> bytes | None:
     """The first element name in ``data`` by a byte scan, or ``None`` if there is none.
 
-    Used only when the parser cannot reach the root. Linear: every step moves forward."""
+    Used only when the parser cannot reach the root. Linear: every step moves forward. Raises
+    :class:`_ScanExhausted` after :data:`_MAX_ROOT_SCAN_STEPS` steps."""
+    budget = _ScanBudget(_MAX_ROOT_SCAN_STEPS)
     i = 0
     while (i := data.find(b"<", i)) >= 0:
+        budget.spend()
         if data.startswith(b"<?", i):
             end = data.find(b"?>", i + 2)
             i = -1 if end < 0 else end + 2
@@ -277,7 +318,7 @@ def _first_element_name(data: bytes) -> bytes | None:
             end = data.find(b"-->", i + 4)
             i = -1 if end < 0 else end + 3
         elif data.startswith(b"<!", i):
-            i = _skip_declaration(data, i)
+            i = _skip_declaration(data, i, budget)
         else:
             match = _ELEMENT_NAME_RE.match(data, i + 1)
             return match.group() if match else b""
@@ -286,11 +327,19 @@ def _first_element_name(data: bytes) -> bytes | None:
     return None
 
 
+def _without_nul(body: bytes) -> bytes:
+    """``body`` less its NUL bytes, so the ASCII patterns see UTF-16 and UTF-32 text. Only a body
+    holding a NUL pays for the copy."""
+    return body.replace(b"\x00", b"") if b"\x00" in body else body
+
+
 def _root_is_svg(body: bytes) -> bool:
     """Whether the markup ``body`` is an SVG document, reading no further than its root start tag.
 
     When the parser cannot reach the root, :func:`_first_element_name` answers instead, since a
-    browser may still read the document as SVG. That fallback compares case-insensitively."""
+    browser may still read the document as SVG. That fallback compares case-insensitively. It
+    answers yes, so the document is refused, when it cannot read the bytes as a browser would: they
+    hold the ISO-2022-JP escape, or the scan runs out of steps."""
     parser = DefusedXMLParser(
         target=_RootTarget(), forbid_dtd=False, forbid_entities=True, forbid_external=True
     )
@@ -300,7 +349,13 @@ def _root_is_svg(body: bytes) -> bool:
         return _split(found.args[0])[1] == "svg"
     except (ParseError, DefusedXmlException, ValueError, LookupError):
         # ValueError and LookupError are pyexpat's answers to an encoding it does not support.
-        name = _first_element_name(body.replace(b"\x00", b""))
+        data = _without_nul(body)
+        if _ESC in data:
+            return True
+        try:
+            name = _first_element_name(data)
+        except _ScanExhausted:
+            return True
         return name is not None and name.rpartition(b":")[2].lower() == b"svg"
     return False
 
@@ -310,7 +365,9 @@ def _contains_svg(body: bytes) -> bool:
 
     The refusing parser reads the whole document when it can. When it stops, on an entity declaration,
     an encoding it does not support or a syntax error, a byte scan decides instead, and it errs toward
-    yes. Both are linear in the document, and neither expands an entity."""
+    yes. It answers yes for any trace of SVG, for the ISO-2022-JP escape, for any attribute-list
+    declaration, and for an entity that could expand to markup. Both are linear in the document, and
+    neither expands an entity."""
     parser = DefusedXMLParser(
         target=_SvgFinder(), forbid_dtd=False, forbid_entities=True, forbid_external=True
     )
@@ -320,15 +377,18 @@ def _contains_svg(body: bytes) -> bool:
     except _SvgFound:
         return True
     except (ParseError, DefusedXmlException, ValueError, LookupError):
-        # Stripping NUL lets the ASCII patterns see UTF-16 and UTF-32 text, as the root scan does.
-        # Only a body holding a NUL pays for the copy.
-        data = body.replace(b"\x00", b"") if b"\x00" in body else body
-        if _SVG_TRACE_RE.search(data):
+        data = _without_nul(body)
+        if _ESC in data or _SVG_TRACE_RE.search(data) or _ATTLIST_DECL_RE.search(data):
             return True
         if not _ENTITY_DECL_RE.search(data):
             return False
         return bool(_ENTITY_MARKUP_RE.search(data)) or _entity_may_build_markup(data)
-    return False
+    # Well-formed XML is not the only way the bytes are read. An HTML parser takes ``<!-->`` as an
+    # empty comment and reads no CDATA section or processing instruction, so an ``<svg`` that XML
+    # holds as text there is a live element to it. Only a literal ``<svg`` makes one there: the
+    # namespace parts of the trace add nothing, since expat resolved the namespaces and HTML
+    # ignores them, so a well-formed document that only declares or names the namespace is served.
+    return _SVG_TAG_RE.search(_without_nul(body)) is not None
 
 
 def _gunzip_bounded(body: bytes, limit: int) -> tuple[bytes, bool]:

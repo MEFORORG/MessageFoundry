@@ -682,15 +682,41 @@ change the parts that are not SVG, which are verbatim clinical content, so it is
 The refusing parser reads the whole document where it can. Where it stops, on an entity declaration,
 an encoding it does not support or a syntax error, a byte scan decides. The scan looks for an `svg`
 start tag under any prefix and in any case, for the SVG namespace name, and for a namespace name
-spelled with a reference. When the document declares an entity, it is also refused if
-any entity could expand to markup: a value holding `<`, or a reference that yields `<` or `&`, or a
-parameter entity. Any byte of an element or namespace name can be a reference, so no scan of
-spellings can rule such an entity out. A text-only entity such as `&#160;` is accepted. No entity is expanded. The scan errs toward refusal, so a document it cannot parse that
-mentions the SVG namespace name in text, or holds `<svg` in a comment, is refused too.
+spelled with a reference. Where the parse stops, the document is also refused when any of these
+holds:
 
-**What this leaves open.** A gzip inside a gzip is served as stored, since no SVG reader inflates
-twice. A gzip body whose markup inflates past 32 MiB is refused even when it holds no SVG. Every
-download of markup now reads the whole document rather than stopping at its root. The byte scan
-reads ASCII-compatible encodings, and UTF-16 and UTF-32 after removing NUL bytes, as the root scan
-already did. A gzip body that inflates to only NUL or byte-order-mark bytes up to the bound is
-refused, since those count as leading noise.
+- It holds the ISO-2022-JP escape byte. `ESC ( B` decodes to nothing, so `<s ESC ( B vg` reads as
+  `<svg` to a browser while no byte scan sees it. It is the one stateful encoding a browser decodes.
+  Every other one keeps ASCII as ASCII, or is UTF-16 or UTF-32, which the scans read after removing
+  NUL bytes. The root scan treats such a document as SVG, so an SVG root hidden this way is refused
+  too.
+- It has an attribute-list declaration. Its defaults can put an element in the SVG namespace with no
+  `xmlns=` on the element, and with the namespace spelled through references.
+- It declares an entity that could expand to markup: a value holding `<`, a reference that yields
+  `<` or `&`, or a parameter entity. Any byte of a name can be a reference, so no scan of spellings
+  can rule such an entity out. A text-only entity such as `&#160;` is accepted.
+
+No entity is expanded. The scan errs toward refusal, so a document it cannot parse that mentions the
+SVG namespace name in text, or holds `<svg` in a comment, is refused too. The root scan skips a
+declaration with the regex engine between its quotes, brackets and comments. It stops after 100,000
+of those steps and then treats the document as SVG, so it is refused rather than served unread.
+
+The trace scan also runs on a document the parser read cleanly. An HTML parser takes `<!-->` as an
+empty comment and reads no CDATA section or processing instruction, so an `<svg` that XML holds as
+text in one of those is a live element to it. So a well-formed document that writes `<svg` anywhere,
+even in a comment, is refused too. Only that tag counts on this path: a well-formed document that
+declares or names the SVG namespace without using it is served.
+
+**What this leaves open.**
+
+- A gzip inside a gzip is served as stored, since no SVG reader inflates twice.
+- A gzip body whose markup inflates past 32 MiB is refused even when it holds no SVG. So is one that
+  inflates to only NUL or byte-order-mark bytes up to the bound, since those count as leading noise.
+- Every download of markup now reads the whole document rather than stopping at its root.
+- The byte scan reads ASCII-compatible encodings, and UTF-16 and UTF-32 after removing NUL bytes.
+- These refusals catch documents with no SVG in them, by design:
+  - every ISO-2022-JP document, since pyexpat cannot read it and its Japanese text always holds the
+    escape byte;
+  - any document the parser cannot read that has an attribute-list declaration, even one that sets
+    no `xmlns`;
+  - any document whose root scan runs out of steps.
