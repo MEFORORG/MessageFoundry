@@ -898,7 +898,9 @@ def _build_approval_gate(
 
         async def _apply() -> dict[str, Any]:
             try:
-                outcome = await _reload_or_record_interruption(
+                # BACKLOG #1940: the row's write never raises after the swap; see
+                # _record_reload_audit.
+                outcome, failures = await _reload_and_record(
                     engine, config_dir, actor=actor, client=None
                 )
             except _RELOAD_REFUSALS as exc:
@@ -922,13 +924,6 @@ def _build_approval_gate(
                 )
                 raise ApprovalError(422, answer) from exc
             registry = outcome.registry
-            # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
-            failures = await _record_reload_audit(
-                engine,
-                actor=actor,
-                failed_steps=[f.step for f in outcome.failures],
-                loaded=_LoadedConfig.of(outcome),
-            )
             return {
                 "inbound": len(registry.inbound),
                 "outbound": len(registry.outbound),
@@ -1109,37 +1104,38 @@ class _LoadedConfig:
     registry: Registry | None
 
     @classmethod
-    def read(cls, engine: Engine) -> _LoadedConfig:
-        """The engine's live state now. A reload rebinds the fingerprint rather than editing it, and
-        the copy keeps the snapshot safe even if that changes."""
-        rr = engine.registry_runner
-        directory = engine.running_config_dir
-        fingerprint = engine.loaded_config_fingerprint
+    def _of(
+        cls,
+        directory: Path | None,
+        registry: Registry | None,
+        fingerprint: Mapping[str, object] | None,
+    ) -> _LoadedConfig:
+        # A reload rebinds the fingerprint rather than editing it; the copy keeps the snapshot safe
+        # even if that changes.
         return cls(
             directory=str(directory) if directory else None,
-            shard=rr.registry.shard_id if rr else None,
-            inbound=len(rr.registry.inbound) if rr else 0,
-            outbound=len(rr.registry.outbound) if rr else 0,
+            shard=registry.shard_id if registry else None,
+            inbound=len(registry.inbound) if registry else 0,
+            outbound=len(registry.outbound) if registry else 0,
             fingerprint=dict(fingerprint) if fingerprint is not None else None,
-            registry=rr.registry if rr else None,
+            registry=registry,
+        )
+
+    @classmethod
+    def read(cls, engine: Engine) -> _LoadedConfig:
+        """The engine's live state now."""
+        rr = engine.registry_runner
+        return cls._of(
+            engine.running_config_dir,
+            rr.registry if rr else None,
+            engine.loaded_config_fingerprint,
         )
 
     @classmethod
     def of(cls, outcome: ReloadOutcome) -> _LoadedConfig:
-        """What an applied reload itself loaded, read off its own outcome (vault BACKLOG #2257).
-
-        A reload's row is written after its swap, and the swap lock is released by then. A second
-        reload can swap again in between, so a live :meth:`read` at the write could name the second
-        reload's graph on the first one's row."""
-        registry = outcome.registry
-        return cls(
-            directory=str(outcome.directory),
-            shard=registry.shard_id,
-            inbound=len(registry.inbound),
-            outbound=len(registry.outbound),
-            fingerprint=dict(outcome.fingerprint) if outcome.fingerprint is not None else None,
-            registry=registry,
-        )
+        """What an applied reload itself loaded, read off its own outcome (vault BACKLOG #2257), so
+        the row names that reload's graph whatever the engine runs by the time it is written."""
+        return cls._of(outcome.directory, outcome.registry, outcome.fingerprint)
 
     def swapped(self, engine: Engine) -> bool:
         """Whether the engine's graph is no longer the one this snapshot read: a reload has
@@ -1185,6 +1181,31 @@ async def _reload_or_record_interruption(
         raise
 
 
+async def _reload_and_record(
+    engine: Engine, config_dir: str | None, *, actor: str, client: str | None
+) -> tuple[ReloadOutcome, list[str]]:
+    """Apply a real reload and write its ``config_reload`` row, holding
+    :attr:`Engine.reload_record_lock` across both (vault BACKLOG #2257).
+
+    The row is written after the swap. Without the lock, a second reload could swap again first,
+    and the newest row would name a graph the engine no longer runs; a start compares its digest
+    with that newest row. The inline route and the released executor share this. A refusal the
+    reload raises propagates, with nothing swapped and no row written here. Returns the outcome and
+    the failed steps to report, ``audit`` among them when the row was lost."""
+    async with engine.reload_record_lock:
+        outcome = await _reload_or_record_interruption(
+            engine, config_dir, actor=actor, client=client
+        )
+        failures = await _record_reload_audit(
+            engine,
+            actor=actor,
+            client=client,
+            failed_steps=[f.step for f in outcome.failures],
+            outcome=outcome,
+        )
+    return outcome, failures
+
+
 async def _record_reload_audit(
     engine: Engine,
     *,
@@ -1194,6 +1215,7 @@ async def _record_reload_audit(
     failed_steps: Sequence[str] = (),
     extra: Mapping[str, object] | None = None,
     loaded: _LoadedConfig | None = None,
+    outcome: ReloadOutcome | None = None,
 ) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
@@ -1213,12 +1235,13 @@ async def _record_reload_audit(
     written without it.
 
     ``loaded`` is what the row names as loaded: the directory, shard, counts and fingerprint. The
-    inline route and the released executor pass :meth:`_LoadedConfig.of` their own outcome, so a
-    second reload that swaps before this row is written cannot put its graph on it (vault BACKLOG
-    #2257). Left ``None``, the row reads them live, at the write, which the cluster convergence
-    reload still does. The start always passes one: the snapshot it took at its first load, or
-    :data:`_UNKNOWN_LOADED` when it could not take one (vault BACKLOG #2838); see
-    :class:`_LoadedConfig`.
+    start always passes one: the snapshot it took at its first load, or :data:`_UNKNOWN_LOADED`
+    when it could not take one (vault BACKLOG #2838); see :class:`_LoadedConfig`. A reload passes
+    its ``outcome`` instead, and the row names what that reload loaded (vault BACKLOG #2257). The
+    snapshot is built inside the guard below, so a fault building it is caught like a failed write.
+    With neither, the row reads them live, at the write, which the cluster convergence reload
+    still does. That reload holds :attr:`Engine.reload_record_lock` across the swap and this row,
+    so no other reload can move the live state in between.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -1242,7 +1265,12 @@ async def _record_reload_audit(
     A cancellation still propagates: it is not a failure of this helper."""
     detail: str | None = None
     try:
-        state = loaded if loaded is not None else _LoadedConfig.read(engine)
+        if loaded is not None:
+            state = loaded
+        elif outcome is not None:
+            state = _LoadedConfig.of(outcome)
+        else:
+            state = _LoadedConfig.read(engine)
         detail = json.dumps(
             {
                 "dir": state.directory,
@@ -4730,6 +4758,7 @@ def create_app(
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
+                failures = [f.step for f in outcome.failures]
             else:
                 # vault BACKLOG #2254: only an ungated reload gets here, with no approval row first.
                 await _audit_reload_attempt(
@@ -4739,7 +4768,7 @@ def create_app(
                     client=client_ip(request),
                     alert_sink=alert_sink_for(request.app.state),
                 )
-                outcome = await _reload_or_record_interruption(
+                outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
                 )
             registry = outcome.registry
@@ -4757,9 +4786,8 @@ def create_app(
         # only counts, so two reloads of the same dir with different on-disk code were
         # indistinguishable. Computed off the event loop (it reads files) and best-effort — a
         # fingerprint failure must never block the audit of a successful reload. The non-dry-run path
-        # shares _record_reload_audit with the dual-control executor so a held-then-approved reload
-        # records the identical fingerprint-bearing row, and reports a failed row the same way (#1940).
-        failures = [f.step for f in outcome.failures]
+        # wrote its row in _reload_and_record, which the dual-control executor shares, so a
+        # held-then-approved reload records the identical row and reports a failed one the same way.
         if req.dry_run:
             # The directory this dry run checked comes from the outcome, never from
             # engine.last_reload_dir: a dry run does not move that field (vault BACKLOG #2598).
@@ -4778,14 +4806,6 @@ def create_app(
                     }
                 ),
                 client=client_ip(request),
-            )
-        else:
-            failures = await _record_reload_audit(
-                engine,
-                actor=user.username,
-                client=client_ip(request),
-                failed_steps=failures,
-                loaded=_LoadedConfig.of(outcome),
             )
         rr = engine.registry_runner
         return ReloadResult(

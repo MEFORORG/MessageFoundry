@@ -375,7 +375,8 @@ class AlertSink(Protocol):
         503) or went ahead (the operation had already run). It is not a connection-scoped event, so no
         rule's ``control_action`` fires on it (BACKLOG #1898), and the colon keeps ``name`` outside
         the connection-name grammar. Repeated failures on one request fold into one instance, and
-        nothing resolves it, so an operator resolves it. Carries the key and the action name only:
+        every inline reload's into the one ``config_reload:inline`` instance until an operator
+        resolves it. Nothing resolves it automatically. Carries the key and the action name only:
         no username, no params, no PHI."""
         ...
 
