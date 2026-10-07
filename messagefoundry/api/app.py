@@ -5456,29 +5456,30 @@ def create_app(
             # Each of this handler's two 422s is an attempted PHI read by an authorized actor, so it
             # goes in the tamper-evident chain under its own action (BACKLOG #2387). No reader
             # filtering on attachment_download then counts it as a document that left. No
-            # record_view, since nothing was viewed. The caller calls this AFTER its except block
-            # ends, so no caught error rides the chain: a failed audit write must not carry the
-            # parser's sender-controlled text into a logged traceback (BACKLOG #1796).
+            # record_view, since nothing was viewed. Callers call this after their except block
+            # ends, so a failed audit write chains no caught error into a logged traceback
+            # (BACKLOG #1796). The WARNING follows the row, so the log never names a refusal the
+            # chain lacks.
+            await audit("attachment_download_refused", reason=reason)
             _log.warning(
                 "attachment download refused: %s (message=%s attachment=%s)",
                 reason,
                 message_id,
                 attachment_id,
             )
-            await audit("attachment_download_refused", reason=reason)
             raise HTTPException(422, answer)
 
         try:
             body: bytes | None = base64.b64decode("".join(verbatim.split()), validate=True)
         except (binascii.Error, ValueError):
             # Not clean base64: store corruption, or a sender value that was never base64 (detach
-            # does not validate it). Refused below, outside this handler; never the bytes.
+            # does not validate it). Refused below, after this except ends; never the bytes.
             body = None
         if body is None:
             await refuse("undecodable", "attachment content is not decodable")
         # ASVS 1.3.4 (ADR 0105, amendment 2026-09-28): an SVG is served as its tag and attribute
         # allow-listed copy. Only the SERVED bytes change; the stored OBX-5.5 value stays verbatim. An
-        # SVG the parser cannot vet is refused, outside the handler, since no byte of it leaves.
+        # SVG the parser cannot vet is refused and audited as a refusal, since no byte of it leaves.
         # The pre-check keeps a PDF or an image off the thread pool. The audit row says when the
         # served bytes are a sanitized copy, so they are never mistaken for the stored document's.
         served_as: dict[str, str] = {}
