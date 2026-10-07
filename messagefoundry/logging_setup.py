@@ -49,6 +49,7 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
     harden_verify_flags,
     narrow_to_approved_suites,
+    record_ca_bundle_crls,
 )
 
 # The escape table and this function were DEFINED here until BACKLOG #1591 and now live in
@@ -81,6 +82,9 @@ __all__ = [
     "ensure_logger_sink",
     "set_runtime_level",
     "current_log_level",
+    "LogLevelRefused",
+    "PRODUCTION_DEBUG_REFUSED",
+    "level_refused_on_production",
     "ControlCharScrubFilter",
     "RedactionFilter",
     "JsonFormatter",
@@ -649,6 +653,8 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
             # and any client chain, so harden_crl_check's "the CRL really landed" assertion answers for
             # the final trust store.
             harden_crl_check(ctx, forward.tls_crl_file, setting="[logging].forward_tls_crl_file")
+            # Vault BACKLOG #2319: the CA file loaded by cafile= above, so a CRL in it is live too.
+            record_ca_bundle_crls(ctx, forward.tls_ca_file, setting="[logging].forward_tls_ca_file")
         # #1498: strict RFC 5280 path validation. An ASSERTION here rather than a fix -- this builder
         # uses create_default_context, which already sets the flag. The reasoning and both measured arms
         # live at tests/test_hop_refusal_revocation.py::
@@ -1536,13 +1542,61 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     return handler
 
 
-def set_runtime_level(level: str) -> str:
+def level_refused_on_production(level: str, *, production: bool) -> bool:
+    """Whether ``level`` is refused on an instance whose production tier is ``production``.
+
+    This is serve's Gate #1 predicate, and the ONE place it is written: ``serve`` refuses to START at
+    such a level and :func:`set_runtime_level` refuses to SWITCH to it, so the start-up and run-time
+    paths cannot disagree (vault BACKLOG #2777). DEBUG can surface PHI (full message bodies, raw field
+    values) into the general log and any off-box forwarder, which is why a production instance refuses
+    it on both paths. ``production`` is the caller's resolved tier; a caller that cannot resolve it
+    passes ``True``, the strictest answer.
+
+    It compares the numeric threshold, not the name, so a level more verbose than DEBUG (``NOTSET``,
+    or one a later change adds to :data:`LOG_LEVELS`) is refused too, and a name ``logging`` does not
+    know is refused rather than waved through."""
+    if not production:
+        return False
+    try:
+        return _resolve_level(level) <= logging.DEBUG
+    except ValueError:
+        return True
+
+
+class LogLevelRefused(Exception):
+    """:func:`set_runtime_level` refused a level the instance's production tier does not allow.
+
+    Deliberately NOT a ``ValueError``: an invalid level name is a bad request, while this is a valid
+    level that policy refuses, and a caller mapping the two to HTTP must be able to tell them apart."""
+
+
+#: Why a production instance refuses DEBUG, shared by serve's start-up refusal and the
+#: :class:`LogLevelRefused` raised at run time, so the two cannot drift apart. It names the posture and
+#: the legitimate route without inviting a reader to relabel a production instance, which would put
+#: PHI in its logs by another door (SDS-3.4).
+PRODUCTION_DEBUG_REFUSED = (
+    "DEBUG logging is refused on a production instance (the --env prod tier, or "
+    "[security].production_instance = true): it can surface PHI (full message bodies, raw field "
+    "values) into logs. Use INFO or higher here. DEBUG is available only on an instance that is "
+    "non-production from start-up, so reproduce the problem on a separate non-production instance "
+    "fed synthetic or de-identified messages, never a copy of the production feed; do not relabel "
+    "this one."
+)
+
+
+def set_runtime_level(level: str, *, production: bool) -> str:
     """Change the live root + uvicorn log level at runtime (BACKLOG #171, ADR 0130), WITHOUT rebuilding
     handlers — the surgical counterpart of :func:`configure_logging`, which owns the stream/off-box
     handlers + PHI/scrub filters. ``level`` is validated against :data:`LOG_LEVELS` (a ``ValueError`` is
     raised otherwise, so a caller can 4xx a bad value) and applied to the **root logger** and the three
     ``_UVICORN_LOGGERS`` — exactly the level surface ``configure_logging`` sets, so the override re-levels
     whatever handlers are installed (leaving room for a later file handler to build on this cleanly).
+
+    ``production`` is the instance's production tier, and it is keyword-only and required so that no
+    run-time caller can switch the level without answering the posture question. A level
+    :func:`level_refused_on_production` refuses raises :class:`LogLevelRefused` and leaves the level
+    untouched: a production instance that serve refused to START at DEBUG cannot be switched to DEBUG
+    once running (vault BACKLOG #2777, ADR 0130 amendment of 2026-10-06).
 
     The override is **process-in-memory and ephemeral**: a **process restart** re-runs
     ``configure_logging(settings.logging.level, …)`` and re-asserts the configured baseline, so the
@@ -1552,6 +1606,8 @@ def set_runtime_level(level: str) -> str:
     normalized = level.upper()
     if normalized not in LOG_LEVELS:
         raise ValueError(f"invalid log level: {level!r}; expected one of {', '.join(LOG_LEVELS)}")
+    if level_refused_on_production(normalized, production=production):
+        raise LogLevelRefused(f"{PRODUCTION_DEBUG_REFUSED} The level was not changed.")
     numeric = _resolve_level(normalized)
     logging.getLogger().setLevel(numeric)
     for name in _UVICORN_LOGGERS:

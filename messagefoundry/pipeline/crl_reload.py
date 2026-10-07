@@ -63,7 +63,9 @@ under that key.
 
 * an established TLS connection, or a session resumed from an earlier handshake. A reload changes what
   the NEXT full handshake checks; a long-lived MLLP connection from a newly revoked partner stays up;
-* a CRL block inside a CA bundle, which nothing records;
+* a CRL block inside a CA bundle. The expiry monitor judges the copy a hop loaded from one, but
+  this pass skips it (vault BACKLOG #2319). Its rules are a CRL setting's, so a CA file that
+  gained a CA would be refused as a file to fix, when the file is right and a restart applies it;
 * a hop whose CRL load was not recorded. The Postgres store records none, and needs no reload: it
   builds a fresh context per pool connection, so a new connection reads the file;
 * a replacement this module refuses.
@@ -626,8 +628,16 @@ def _finish(
 
 
 def _held_by_path() -> dict[str, list[tuple[ssl.SSLContext, HeldCrl]]]:
+    """Every held CRL file this pass may reload, with the contexts holding it.
+
+    A copy from a CA bundle is left out (vault BACKLOG #2319). The rules here are a CRL setting's:
+    a CA file that gained a CA would be refused as a file to fix and told to hold a bare CRL, when
+    the CA file is right and a restart applies it. The expiry monitor still judges that copy and
+    names a restart as the remedy."""
     by_path: dict[str, list[tuple[ssl.SSLContext, HeldCrl]]] = {}
     for ctx, held in held_contexts():
+        if held.ca_bundle:
+            continue
         by_path.setdefault(held.path_key, []).append((ctx, held))
     return by_path
 

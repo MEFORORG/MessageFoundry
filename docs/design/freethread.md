@@ -159,6 +159,9 @@ threads, so a future free-threading adoption knows exactly what to harden.
   the one genuinely thread-shared mutation was already written for thread-safety, not GIL-atomicity.
   (`sys.meta_path`/`sys.modules` are process-global CPython state; this lock is what keeps a reload
   from corrupting them, GIL or not.)
+  *Amended 2026-10-06 (vault BACKLOG #2780): the loader no longer touches `sys.meta_path` at all; the
+  lock now guards `_active` and the `sys.modules` entries a load registers for its config modules and
+  helpers.*
 
 ### Per-engine mutable state — single-loop today, would need locks under true threading → FLAG
 

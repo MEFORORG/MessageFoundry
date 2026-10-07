@@ -290,7 +290,7 @@ async def test_delivery_item_retry_rehydrates_identically(store: MessageStore) -
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     col = _Collector(fail_times=1)
     runner._destinations[DEST] = col
-    runner._retry[DEST] = RetryPolicy(backoff_seconds=0.0, backoff_multiplier=1.0)
+    runner._retry[DEST] = RetryPolicy(backoff_seconds=0.01, backoff_multiplier=1.0)
 
     item = await store.claim_next_fifo(DEST)
     assert item is not None
@@ -298,7 +298,8 @@ async def test_delivery_item_retry_rehydrates_identically(store: MessageStore) -
     assert retry_until is not None  # re-pended, not delivered
     assert col.deliveries == []
 
-    item2 = await store.claim_next_fifo(DEST)
+    # Claim as of a moment past the 0.01 s backoff; a zero backoff is refused (vault BACKLOG #2761).
+    item2 = await store.claim_next_fifo(DEST, now=time.time() + 1.0)
     assert item2 is not None
     await runner._process_delivery_item(DEST, item2)
     assert _obx5_5(col.deliveries[0]) == b64  # retry delivered the identical verbatim frame

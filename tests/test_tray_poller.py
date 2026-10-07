@@ -965,19 +965,60 @@ def renewable_engine(tmp_path: Path) -> Iterator[_RenewableEngine]:
         engine.close()
 
 
+#: The request deadline the renewal tests give the probe client in place of the product's
+#: ``DEFAULT_TIMEOUT_S``, 2.5x the 2 s a hosted runner overran. The ceiling is the per-test cap, not
+#: taste: the longest renewal test polls 5 times with 2 probes each, and 10 probes at 5 s is 50 s,
+#: inside the 60 s ubuntu cap, so a probe that hangs to its deadline every time still fails as one
+#: test rather than as a killed worker.
+_RENEWAL_PROBE_TIMEOUT_S = 5.0
+
+
 @contextmanager
 def _pinned_poller(engine: _RenewableEngine) -> Iterator[StatusPoller]:
-    """A poller with the DEFAULT client factory and the real probes, pinned to the engine's cert."""
-    poller = StatusPoller(
-        TrayConfig(engine_url=engine.url, engine_cacert=str(engine.pin)),
-        on_update=lambda _r: None,
-        scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
-    )
-    poller._open_client()  # what start() does, minus the thread
-    try:
-        yield poller
-    finally:
-        poller.stop()
+    """A poller with the default client factory and the real probes, pinned to the engine's cert.
+
+    ONE THING DIFFERS FROM THE DEFAULT, THE REQUEST DEADLINE, and it is what these tests are not
+    about. They test which certificate the client trusts, and they read that through the probe:
+    a refused pin reads DOWN. A probe past its deadline also reads DOWN, because the probe folds
+    every transport error into one answer, so on a starved runner the product's 2 s budget lets
+    the scheduler fail a test about trust. That happened on ``test (windows-2025, py3.14)``,
+    merge-group run 37523262941: tick 1 of ``test_an_unchanged_pin_never_rebuilds_the_client``
+    read DOWN. The server log is what places the fault. The fake engine reached ``do_GET`` and
+    failed on the BODY write with ``ConnectionAbortedError`` 10053, after its header write was
+    accepted. So the handshake had passed, the request had arrived, and the client had already
+    closed. Over a fresh HTTP/1.0 connection per probe, measured here at two accepts per tick and
+    an empty pool after each one, the only path on which httpx closes after sending is its
+    deadline. Stalling ``do_GET`` for 2.2 s once reproduced both halves on Linux, a DOWN tick and
+    the same body-write traceback (``BrokenPipeError`` there). With this deadline the same stall
+    reads OK.
+
+    A refused pin is unaffected. Its handshake fails at once, so
+    ``test_the_pin_is_still_enforced_after_a_rebuild`` still reads DOWN without waiting on the
+    deadline.
+    """
+    import functools
+
+    from messagefoundry.tray import poller as poller_mod
+    from messagefoundry.tray import probe
+
+    with pytest.MonkeyPatch.context() as patch:
+        # The poller reads this global both for its default factory, bound in __init__, and when
+        # it adopts a pin, so the patch must be in place before the poller is built.
+        patch.setattr(
+            poller_mod,
+            "make_probe_client",
+            functools.partial(probe.make_probe_client, timeout=_RENEWAL_PROBE_TIMEOUT_S),
+        )
+        poller = StatusPoller(
+            TrayConfig(engine_url=engine.url, engine_cacert=str(engine.pin)),
+            on_update=lambda _r: None,
+            scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
+        )
+        poller._open_client()  # what start() does, minus the thread
+        try:
+            yield poller
+        finally:
+            poller.stop()
 
 
 def _health(poller: StatusPoller, now: float) -> HealthProbe:
@@ -996,6 +1037,32 @@ def test_a_renewed_certificate_is_followed_without_restarting_the_poller(
         assert _health(poller, 0.0) is HealthProbe.OK
         renewable_engine.serve(renewable_engine.renew_pin())
         assert _health(poller, 1.0) is HealthProbe.OK
+
+
+def test_the_renewal_harness_deadline_reaches_every_client_it_builds(
+    renewable_engine: _RenewableEngine,
+) -> None:
+    """The longer deadline in ``_pinned_poller`` holds on every path that builds a client.
+
+    The patch works only while the poller reaches ``make_probe_client`` through its module global.
+    If that path changes, the clients silently go back to the 2 s budget and the renewal tests
+    can again be failed by a stall, so this reads the deadline each client actually carries: the
+    first pinned build, a rebuild after renewal, and the default factory bound in ``__init__``,
+    which builds the client when the pin does not load yet.
+    """
+    with _pinned_poller(renewable_engine) as poller:
+        assert poller._client is not None
+        assert poller._client.timeout.read == _RENEWAL_PROBE_TIMEOUT_S
+        first = poller._client
+        renewable_engine.serve(renewable_engine.renew_pin())
+        assert _health(poller, 1.0) is HealthProbe.OK
+        assert poller._client is not first
+        assert poller._client.timeout.read == _RENEWAL_PROBE_TIMEOUT_S
+        unpinned = poller._client_factory(renewable_engine.url)
+        try:
+            assert unpinned.timeout.read == _RENEWAL_PROBE_TIMEOUT_S
+        finally:
+            unpinned.close()
 
 
 def test_an_unchanged_pin_never_rebuilds_the_client(renewable_engine: _RenewableEngine) -> None:

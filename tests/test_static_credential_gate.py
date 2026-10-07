@@ -25,6 +25,7 @@ from pydantic import ValidationError
 from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
+    ApprovalsSettings,
     AuthSettings,
     EgressSettings,
     SecretRotationSettings,
@@ -151,6 +152,7 @@ def _loosening_names(sec: SecuritySettings) -> list[str]:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
