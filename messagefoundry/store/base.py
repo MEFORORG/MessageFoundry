@@ -85,6 +85,7 @@ from messagefoundry.store.store import (
     MessageSearchResult,
     MessageStatus,
     MessageStore,
+    OperatorAudit,
     OutboxItem,
     OwnedLanes,
     ReingressOriginMissing,
@@ -343,6 +344,7 @@ class QueueStore(StoreLifecycle, Protocol):
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
+        audit: OperatorAudit[str] | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the ingress stage (status ``RECEIVED`` +
         one ``stage='ingress'`` queue row) in one transaction — the staged pipeline's ACK-on-receipt
@@ -351,7 +353,10 @@ class QueueStore(StoreLifecycle, Protocol):
         ``attachment_refs`` (#149, ADR 0105 Phase 1a) are the content addresses of documents the ingress
         detach lifted into the attachment substrate; each distinct ref is increffed in the SAME
         transaction as the skeleton row (the two-object commit). Only a backend whose
-        :attr:`supports_streaming_attachments` is True ever receives a non-empty value."""
+        :attr:`supports_streaming_attachments` is True ever receives a non-empty value.
+
+        ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
+        message id, commits in the same transaction. A live receipt passes none."""
         ...
 
     async def handoff(
@@ -1018,7 +1023,15 @@ class QueueStore(StoreLifecycle, Protocol):
         :attr:`supports_streaming_attachments` is ``False``."""
         ...
 
-    async def replay(self, message_id: str, now: float | None = None) -> int: ...
+    # The operator mutations. Each takes an ``audit`` that builds the operator's audit row from the
+    # result, and the row commits in the mutation's own transaction (BACKLOG #2624, OperatorAudit).
+    async def replay(
+        self,
+        message_id: str,
+        now: float | None = None,
+        *,
+        audit: OperatorAudit[int] | None = None,
+    ) -> int: ...
 
     async def resend_to(
         self,
@@ -1029,6 +1042,7 @@ class QueueStore(StoreLifecycle, Protocol):
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[ResendOutcome] | None = None,
     ) -> ResendOutcome: ...
 
     async def reingress(
@@ -1038,6 +1052,7 @@ class QueueStore(StoreLifecycle, Protocol):
         raw: str,
         idempotency_key: str,
         now: float | None = None,
+        audit: OperatorAudit[ReingressOutcome] | None = None,
     ) -> ReingressOutcome: ...
 
     async def replay_dead(
@@ -1046,6 +1061,7 @@ class QueueStore(StoreLifecycle, Protocol):
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int: ...
 
     async def cancel_queued(
@@ -1055,6 +1071,7 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         top_only: bool = False,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int: ...
 
     # --- read helpers (API / console) ----------------------------------------

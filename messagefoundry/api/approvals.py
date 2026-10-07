@@ -69,9 +69,11 @@ log = logging.getLogger(__name__)
 #: **A raise means the operation did not complete.** The gate compensates it to ``failed``. So an
 #: executor raises only BEFORE its effects happen, and after them it reports trouble in its result
 #: instead. In particular, a domain audit row it writes after acting must be fail-soft (BACKLOG
-#: #1940). The gate does not write that row for it: the row is the one the operation's inline route
-#: writes, built from detail only the executor holds, and the inline route shares the writer (vault
-#: BACKLOG #2255, finding 1).
+#: #1940). A row that commits WITH the effect, as the released replay's does (BACKLOG #2624), may
+#: raise: a failed append rolls the effect back, so the operation did not complete. The gate does
+#: not write either row for it: the row is the one the operation's inline route writes, built from
+#: detail only the executor holds, and the inline route shares the writer (vault BACKLOG #2255,
+#: finding 1).
 Executor = Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]
 
 #: Resolves a ``users.id`` to its CURRENT :class:`Identity` (roles, custom-role overlay, channel scope),

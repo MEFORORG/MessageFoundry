@@ -151,6 +151,7 @@ from messagefoundry.store.store import (
     AlertSummary,
     AppendedAuditRow,
     AuditAppend,
+    AuditedWrite,
     AuditVerdict,
     CapturedResponse,
     ChannelScopeSource,
@@ -171,6 +172,7 @@ from messagefoundry.store.store import (
     MessageSearchResult,
     MessageStatus,
     MessageStore,
+    OperatorAudit,
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
@@ -207,6 +209,7 @@ from messagefoundry.store.store import (
     lockout_escalates,
     next_lockout_state,
     not_deployed_detail,
+    operator_audits,
     owned_lane_scope,
     password_claim_set,
     require_notify_email,
@@ -5301,6 +5304,7 @@ class SqlServerStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
+        audit: OperatorAudit[str] | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the ingress stage (status RECEIVED + one
         ``stage='ingress'`` queue row holding the raw) in ONE transaction — the staged pipeline's
@@ -5319,72 +5323,81 @@ class SqlServerStore:
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
         refs = list(dict.fromkeys(attachment_refs or ()))
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # BACKLOG #2624: an operator's inject passes an ``audit``; a live receipt passes none and
+        # takes no audit lock.
+        async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
-                await cur.execute(
-                    "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-                    " message_type, raw, status, error, summary, metadata)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        mid,
-                        channel_id,
-                        now,
-                        source_type,
-                        control_id,
-                        message_type,
-                        self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
-                        MessageStatus.RECEIVED.value,
-                        None,
-                        # EF-3: MRN/name is PHI — ciphered at rest
-                        self._enc(summary, aad=cell_aad("messages", "summary", mid)),
-                        self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
-                    ),
-                )
-                # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
-                created_at = now
-                # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
-                ingress_row_id = uuid4().hex
-                await cur.execute(
-                    "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
-                    " handler_name, payload, status, attempts, next_attempt_at, owner,"
-                    " lease_expires_at, created_at, updated_at)"
-                    " VALUES (?,?,?,?,NULL,NULL,?,?,0,?,NULL,NULL,?,?)",
-                    (
-                        ingress_row_id,
-                        mid,
-                        Stage.INGRESS.value,
-                        channel_id,
-                        self._cipher.encrypt(raw, aad=cell_aad("queue", "payload", ingress_row_id)),
-                        OutboxStatus.PENDING.value,
-                        now,
-                        created_at,
-                        now,
-                    ),
-                )
-                # A1: enqueue_ingress writes TWO durable raw copies — messages.raw (above) and the ingress
-                # queue.payload (just now) — the 2 of the 2+H+N amplification.
-                self.body_copies += 2
-                await self._event(cur, mid, "received", None, "ingress", now)
-                # #149 two-object commit: incref each detached attachment AND record its
-                # message→attachment linkage row in THIS transaction (same commit as the skeleton row),
-                # so the refcount that keeps the chunks alive — and the linkage retention releases from —
-                # land atomically with the row that references them. put_attachment already committed the
-                # chunks at refcount 0; a missing row here means it was GC'd/never stored, so fail loud
-                # (the enclosing transaction rolls back → no ACK). `refs` is de-duplicated, so the
-                # message_attachment PK never conflicts and the refcount is bumped once per distinct ref.
-                for ref in refs:
+                async with self._cursor(conn) as cur:
                     await cur.execute(
-                        "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
+                        "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
+                        " message_type, raw, status, error, summary, metadata)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            mid,
+                            channel_id,
+                            now,
+                            source_type,
+                            control_id,
+                            message_type,
+                            self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
+                            MessageStatus.RECEIVED.value,
+                            None,
+                            # EF-3: MRN/name is PHI — ciphered at rest
+                            self._enc(summary, aad=cell_aad("messages", "summary", mid)),
+                            self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                        ),
                     )
-                    if not cur.rowcount:
-                        raise KeyError(f"attachment {ref!r} not found for ingress incref")
+                    # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
+                    created_at = now
+                    # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+                    ingress_row_id = uuid4().hex
                     await cur.execute(
-                        "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
-                        (mid, ref),
+                        "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
+                        " handler_name, payload, status, attempts, next_attempt_at, owner,"
+                        " lease_expires_at, created_at, updated_at)"
+                        " VALUES (?,?,?,?,NULL,NULL,?,?,0,?,NULL,NULL,?,?)",
+                        (
+                            ingress_row_id,
+                            mid,
+                            Stage.INGRESS.value,
+                            channel_id,
+                            self._cipher.encrypt(
+                                raw, aad=cell_aad("queue", "payload", ingress_row_id)
+                            ),
+                            OutboxStatus.PENDING.value,
+                            now,
+                            created_at,
+                            now,
+                        ),
                     )
-                await self._commit(conn)
+                    # A1: enqueue_ingress writes TWO durable raw copies — messages.raw (above) and the ingress
+                    # queue.payload (just now) — the 2 of the 2+H+N amplification.
+                    self.body_copies += 2
+                    await self._event(cur, mid, "received", None, "ingress", now)
+                    # #149 two-object commit: incref each detached attachment AND record its
+                    # message→attachment linkage row in THIS transaction (same commit as the skeleton row),
+                    # so the refcount that keeps the chunks alive — and the linkage retention releases from —
+                    # land atomically with the row that references them. put_attachment already committed the
+                    # chunks at refcount 0; a missing row here means it was GC'd/never stored, so fail loud
+                    # (the enclosing transaction rolls back → no ACK). `refs` is de-duplicated, so the
+                    # message_attachment PK never conflicts and the refcount is bumped once per distinct ref.
+                    for ref in refs:
+                        await cur.execute(
+                            "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
+                        )
+                        if not cur.rowcount:
+                            raise KeyError(f"attachment {ref!r} not found for ingress incref")
+                        await cur.execute(
+                            "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
+                            (mid, ref),
+                        )
+                    if audit is not None:
+                        await self._append_operator_audit(cur, written, audit, mid)
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # BACKLOG #2624: the transaction may hold the audit applock and an
+                # audit row. After the cursor closes, so a detached close cannot race it.
+                await self._rollback_or_discard(conn)
                 raise
         return mid
 
@@ -9841,7 +9854,13 @@ class SqlServerStore:
         )
         return len(orphans)
 
-    async def replay(self, message_id: str, now: float | None = None) -> int:
+    async def replay(
+        self,
+        message_id: str,
+        now: float | None = None,
+        *,
+        audit: OperatorAudit[int] | None = None,
+    ) -> int:
         """Re-queue a message's stuck/dead deliveries — or, if none are stuck, re-send the delivered
         ones. Two-mode (M-2): if any row is dead/pending, replay ONLY those (never re-fire a DONE
         sibling); else replay the done rows. messages.status -> RECEIVED if a pending ingress row
@@ -9851,63 +9870,68 @@ class SqlServerStore:
         #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
         idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
-        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580)."""
+        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
+        ``audit``'s row commits with the replay (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
-                await cur.execute(
-                    "SELECT COUNT(*) FROM queue WHERE message_id=? AND status IN (?, ?)",
-                    (message_id, OutboxStatus.DEAD.value, OutboxStatus.PENDING.value),
-                )
-                row = await cur.fetchone()
-                stuck = int(row[0]) if row and row[0] is not None else 0
-                replay_from = (
-                    (OutboxStatus.DEAD.value, OutboxStatus.PENDING.value)
-                    if stuck
-                    else (OutboxStatus.DONE.value,)
-                )
-                if not stuck:
-                    # RE-SEND branch (H2): drop the idempotency-ledger entries of THIS message's DONE rows
-                    # (the exact set re-pended below) so a deliberate re-send is NOT skip-and-completed as
-                    # a crash-re-run duplicate. Scoped to this message only.
+                async with self._cursor(conn) as cur:
                     await cur.execute(
-                        "DELETE FROM delivered_keys WHERE outbox_id IN"
-                        " (SELECT id FROM queue WHERE message_id=? AND status=?"
-                        f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER})",
-                        (message_id, OutboxStatus.DONE.value),
+                        "SELECT COUNT(*) FROM queue WHERE message_id=? AND status IN (?, ?)",
+                        (message_id, OutboxStatus.DEAD.value, OutboxStatus.PENDING.value),
                     )
-                placeholders = ",".join("?" * len(replay_from))
-                await cur.execute(
-                    f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                    f" updated_at=? WHERE message_id=? AND status IN ({placeholders})"
-                    f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
-                    (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
-                )
-                count = cur.rowcount
-                if (
-                    count
-                ):  # no rows => errored/filtered/unrouted: don't falsify it or strand it (M-2)
-                    # RECEIVED only for a pending INGRESS row; a re-pended routed row is ROUTED, or the
-                    # finalizer could never settle it (vault BACKLOG #2723; MessageStore.replay says why).
+                    row = await cur.fetchone()
+                    stuck = int(row[0]) if row and row[0] is not None else 0
+                    replay_from = (
+                        (OutboxStatus.DEAD.value, OutboxStatus.PENDING.value)
+                        if stuck
+                        else (OutboxStatus.DONE.value,)
+                    )
+                    if not stuck:
+                        # RE-SEND branch (H2): drop the idempotency-ledger entries of THIS message's DONE rows
+                        # (the exact set re-pended below) so a deliberate re-send is NOT skip-and-completed as
+                        # a crash-re-run duplicate. Scoped to this message only.
+                        await cur.execute(
+                            "DELETE FROM delivered_keys WHERE outbox_id IN"
+                            " (SELECT id FROM queue WHERE message_id=? AND status=?"
+                            f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER})",
+                            (message_id, OutboxStatus.DONE.value),
+                        )
+                    placeholders = ",".join("?" * len(replay_from))
                     await cur.execute(
-                        "SELECT 1 FROM queue WHERE message_id=? AND stage=? AND status=?",
-                        (message_id, Stage.INGRESS.value, OutboxStatus.PENDING.value),
+                        f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
+                        f" updated_at=? WHERE message_id=? AND status IN ({placeholders})"
+                        f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
+                        (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
                     )
-                    new_status = (
-                        MessageStatus.RECEIVED.value
-                        if await cur.fetchone()
-                        else MessageStatus.ROUTED.value
-                    )
-                    await cur.execute(
-                        "UPDATE messages SET status=?, error=NULL WHERE id=?",
-                        (new_status, message_id),
-                    )
-                    await self._event(
-                        cur, message_id, "replayed", None, f"{count} destination(s)", now
-                    )
-                await self._commit(conn)
+                    count = cur.rowcount
+                    if (
+                        count
+                    ):  # no rows => errored/filtered/unrouted: don't falsify it or strand it (M-2)
+                        # RECEIVED only for a pending INGRESS row; a re-pended routed row is ROUTED, or the
+                        # finalizer could never settle it (vault BACKLOG #2723; MessageStore.replay says why).
+                        await cur.execute(
+                            "SELECT 1 FROM queue WHERE message_id=? AND stage=? AND status=?",
+                            (message_id, Stage.INGRESS.value, OutboxStatus.PENDING.value),
+                        )
+                        new_status = (
+                            MessageStatus.RECEIVED.value
+                            if await cur.fetchone()
+                            else MessageStatus.ROUTED.value
+                        )
+                        await cur.execute(
+                            "UPDATE messages SET status=?, error=NULL WHERE id=?",
+                            (new_status, message_id),
+                        )
+                        await self._event(
+                            cur, message_id, "replayed", None, f"{count} destination(s)", now
+                        )
+                    await self._append_operator_audit(cur, written, audit, int(count))
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # BACKLOG #2624: the transaction may hold the audit applock and an
+                # audit row. After the cursor closes, so a detached close cannot race it.
+                await self._rollback_or_discard(conn)
                 raise
         return int(count)
 
@@ -9920,6 +9944,7 @@ class SqlServerStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[ResendOutcome] | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
         Mirrors :meth:`MessageStore.resend_to`. When ``body_override`` is set this is the edit-and-resend
@@ -9946,207 +9971,227 @@ class SqlServerStore:
 
         Idempotency: a per-key ``sp_getapplock`` serializes same-key inserts, then the ``resend_log``
         ``INSERT … WHERE NOT EXISTS`` + ``rowcount`` is the atomic gate; the outbound row is created only
-        when it made a row (ADR 0090 §4)."""
+        when it made a row (ADR 0090 §4). ``audit``'s row commits with the resend, a duplicate included
+        (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
-                # Serialize concurrent same-key resends so the NOT-EXISTS gate is race-free (must-fix #5).
-                await self._applock(cur, f"mefor:resend:{idempotency_key}")
-                await cur.execute(
-                    "INSERT INTO resend_log (resend_key, message_id, to_destination,"
-                    " from_destination, outbox_id, created_at)"
-                    " SELECT ?,?,?,?,NULL,? WHERE NOT EXISTS"
-                    " (SELECT 1 FROM resend_log WHERE resend_key=?)",
-                    (idempotency_key, message_id, to, from_ or "", now, idempotency_key),
-                )
-                if not cur.rowcount:
-                    # Bind the key to its (message_id, to) request — a key reused for a DIFFERENT
-                    # message/target is a conflict (raise -> 409), never a silent no-op (ADR 0090 §4,
-                    # review #123-4).
+                async with self._cursor(conn) as cur:
+                    # Serialize concurrent same-key resends so the NOT-EXISTS gate is race-free (must-fix #5).
+                    await self._applock(cur, f"mefor:resend:{idempotency_key}")
                     await cur.execute(
-                        "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
-                        " WHERE resend_key=?",
-                        (idempotency_key,),
+                        "INSERT INTO resend_log (resend_key, message_id, to_destination,"
+                        " from_destination, outbox_id, created_at)"
+                        " SELECT ?,?,?,?,NULL,? WHERE NOT EXISTS"
+                        " (SELECT 1 FROM resend_log WHERE resend_key=?)",
+                        (idempotency_key, message_id, to, from_ or "", now, idempotency_key),
                     )
-                    pr = await cur.fetchone()
-                    if pr is not None and (pr[0] != message_id or pr[1] != to):
-                        raise ResendKeyConflict(
-                            f"idempotency key {idempotency_key!r} was already used to resend message"
-                            f" {pr[0]!r} to {pr[1]!r}; it cannot be reused for message {message_id!r}"
-                            f" to {to!r}"
+                    if not cur.rowcount:
+                        # Bind the key to its (message_id, to) request — a key reused for a DIFFERENT
+                        # message/target is a conflict (raise -> 409), never a silent no-op (ADR 0090 §4,
+                        # review #123-4).
+                        await cur.execute(
+                            "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
+                            " WHERE resend_key=?",
+                            (idempotency_key,),
                         )
-                    await self._commit(conn)
-                    return ResendOutcome(
-                        status="duplicate",
+                        pr = await cur.fetchone()
+                        if pr is not None and (pr[0] != message_id or pr[1] != to):
+                            raise ResendKeyConflict(
+                                f"idempotency key {idempotency_key!r} was already used to resend message"
+                                f" {pr[0]!r} to {pr[1]!r}; it cannot be reused for message {message_id!r}"
+                                f" to {to!r}"
+                            )
+                        outcome = ResendOutcome(
+                            status="duplicate",
+                            message_id=message_id,
+                            to_destination=pr[1] if pr else to,
+                            from_destination=pr[2] if pr else (from_ or ""),
+                            outbox_id=pr[3] if pr else None,
+                        )
+                        await self._append_operator_audit(cur, written, audit, outcome)
+                        await self._commit(conn)
+                        return outcome
+                    if body_override is not None:
+                        # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
+                        # operator's EDITED body to `to` as a NEW, correlated CHILD delivery; the ORIGIN row
+                        # is only READ (channel/type + correlation metadata) and NEVER written (#153 "the
+                        # original must NOT change"; review #153-1/#153-2). The outbound row hangs off the
+                        # CHILD, so the finalizer recomputes the CHILD's disposition, never the origin's.
+                        await cur.execute(
+                            "SELECT channel_id, source_type, message_type, metadata"
+                            " FROM messages WHERE id=?",
+                            (message_id,),
+                        )
+                        mrow = await cur.fetchone()
+                        if mrow is None:
+                            raise ReingressOriginMissing(
+                                f"message {message_id} no longer exists -- cannot edit-and-resend"
+                            )
+                        src_channel = mrow[0]
+                        src_dest = from_ or ""
+                        body = body_override
+                        if not body:
+                            raise ResendSourceEmpty(
+                                f"message {message_id} edited body is empty -- cannot resend"
+                            )
+                        # Correlate the child to the origin (mirrors `reingress`).
+                        raw_meta = self._dec(
+                            mrow[3], aad=cell_aad("messages", "metadata", message_id)
+                        )
+                        try:
+                            parent_meta = json.loads(raw_meta) if raw_meta else {}
+                        except (ValueError, TypeError):
+                            parent_meta = {}
+                        if not isinstance(parent_meta, dict):
+                            parent_meta = {}
+                        child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+                        root = parent_meta.get("correlation_root_id") or message_id
+                        child_meta = json.dumps(
+                            {
+                                "correlation_id": message_id,
+                                "correlation_root_id": root,
+                                "correlation_depth": child_depth,
+                                "edited_from": message_id,
+                            }
+                        )
+                        # ROUTED child with its single outbound delivery already in flight (skips router/
+                        # transform); the finalizer drives it. Idempotency is the resend_log gate above.
+                        child_mid = uuid4().hex
+                        await cur.execute(
+                            _SQL_INSERT_MESSAGE,
+                            (
+                                child_mid,
+                                src_channel,
+                                now,
+                                mrow[1],  # source_type
+                                None,
+                                mrow[2],  # message_type
+                                self._cipher.encrypt(
+                                    body, aad=cell_aad("messages", "raw", child_mid)
+                                ),
+                                MessageStatus.ROUTED.value,
+                                None,
+                                None,
+                                self._enc(
+                                    child_meta, aad=cell_aad("messages", "metadata", child_mid)
+                                ),
+                            ),
+                        )
+                        self.body_copies += 1  # A1: the child messages.raw copy
+                        await self._event(
+                            cur, child_mid, "received", None, f"edit-resend from {message_id}", now
+                        )
+                        await self._event(
+                            cur, message_id, "edit_resend", to, f"-> {child_mid}", now
+                        )
+                        outbox_id = uuid4().hex
+                        await cur.execute(
+                            _SQL_INSERT_QUEUE_OUTBOUND,
+                            _insert_outbound_params(
+                                outbox_id,
+                                child_mid,
+                                src_channel,
+                                to,
+                                self._cipher.encrypt(
+                                    body, aad=cell_aad("queue", "payload", outbox_id)
+                                ),
+                                now,
+                            ),
+                        )
+                        self.body_copies += (
+                            1  # A1: one inline transformed-body copy (parity with _insert_outbound)
+                        )
+                    else:
+                        # Resolve the source + its stored body (deref a shared body via COALESCE). A
+                        # pass-through completion marker is never a source (no body, BACKLOG #1580).
+                        # Every other retained stage='outbound' row is an eligible source
+                        # (done/cancelled/dead/pending) — the transform already produced its body;
+                        # diverting a permanently-failed (dead) delivery to a standby is a marquee use
+                        # case (ADR 0090 §1). `from_destination` names the source LANE, not a delivery
+                        # claim (review #123-3).
+                        src_where = f"message_id=? AND stage=? AND {_NOT_PT_MARKER}"
+                        src_params: list[Any] = [message_id, Stage.OUTBOUND.value]
+                        if from_ is not None:
+                            src_where += " AND destination_name=?"
+                            src_params.append(from_)
+                        await cur.execute(
+                            "SELECT q.destination_name, q.channel_id,"
+                            " COALESCE(sb.body, q.payload) AS body_ciphertext, q.id, q.body_ref"
+                            " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
+                            f" WHERE {src_where} ORDER BY q.destination_name",
+                            tuple(src_params),
+                        )
+                        rows = await cur.fetchall()
+                        if not rows:
+                            raise ResendSourceNotFound(
+                                f"message {message_id} has no delivered body"
+                                + (f" for source {from_!r}" if from_ is not None else "")
+                                + " to resend"
+                            )
+                        if from_ is None and len({r[0] for r in rows}) > 1:
+                            raise ResendSourceAmbiguous(
+                                f"message {message_id} was delivered to multiple destinations --"
+                                " specify the source destination (from) to resend"
+                            )
+                        src_dest, src_channel, body_ciphertext = rows[0][0], rows[0][1], rows[0][2]
+                        src_queue_id, src_body_ref = rows[0][3], rows[0][4]
+                        # The body's cell depends on its source (store-once shared body vs inline payload).
+                        src_body_aad = (
+                            cell_aad("shared_body", "body", src_body_ref)
+                            if src_body_ref is not None
+                            else cell_aad("queue", "payload", src_queue_id)
+                        )
+                        decoded = self._dec(body_ciphertext, aad=src_body_aad)
+                        if not decoded:
+                            raise ResendSourceEmpty(
+                                f"message {message_id} source body was purged by retention -- cannot resend"
+                            )
+                        body = decoded
+                        # #123 stored-body path: another delivery of the SAME logged message — outbound row
+                        # on the ORIGIN message_id + flip the ORIGIN to ROUTED (finalizer recomputes).
+                        outbox_id = uuid4().hex
+                        await cur.execute(
+                            _SQL_INSERT_QUEUE_OUTBOUND,
+                            _insert_outbound_params(
+                                outbox_id,
+                                message_id,
+                                src_channel,
+                                to,
+                                self._cipher.encrypt(
+                                    body, aad=cell_aad("queue", "payload", outbox_id)
+                                ),
+                                now,
+                            ),
+                        )
+                        self.body_copies += (
+                            1  # A1: one inline transformed-body copy (parity with _insert_outbound)
+                        )
+                        await cur.execute(
+                            "UPDATE messages SET status=?, error=NULL WHERE id=?",
+                            (MessageStatus.ROUTED.value, message_id),
+                        )
+                        await self._event(
+                            cur, message_id, "resent", to, f"resend {src_dest or '?'}->{to}", now
+                        )
+                    await cur.execute(
+                        "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
+                        (outbox_id, idempotency_key),
+                    )
+                    outcome = ResendOutcome(
+                        status="resent",
                         message_id=message_id,
-                        to_destination=pr[1] if pr else to,
-                        from_destination=pr[2] if pr else (from_ or ""),
-                        outbox_id=pr[3] if pr else None,
+                        to_destination=to,
+                        from_destination=str(src_dest),
+                        outbox_id=outbox_id,
                     )
-                if body_override is not None:
-                    # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
-                    # operator's EDITED body to `to` as a NEW, correlated CHILD delivery; the ORIGIN row
-                    # is only READ (channel/type + correlation metadata) and NEVER written (#153 "the
-                    # original must NOT change"; review #153-1/#153-2). The outbound row hangs off the
-                    # CHILD, so the finalizer recomputes the CHILD's disposition, never the origin's.
-                    await cur.execute(
-                        "SELECT channel_id, source_type, message_type, metadata"
-                        " FROM messages WHERE id=?",
-                        (message_id,),
-                    )
-                    mrow = await cur.fetchone()
-                    if mrow is None:
-                        raise ReingressOriginMissing(
-                            f"message {message_id} no longer exists -- cannot edit-and-resend"
-                        )
-                    src_channel = mrow[0]
-                    src_dest = from_ or ""
-                    body = body_override
-                    if not body:
-                        raise ResendSourceEmpty(
-                            f"message {message_id} edited body is empty -- cannot resend"
-                        )
-                    # Correlate the child to the origin (mirrors `reingress`).
-                    raw_meta = self._dec(mrow[3], aad=cell_aad("messages", "metadata", message_id))
-                    try:
-                        parent_meta = json.loads(raw_meta) if raw_meta else {}
-                    except (ValueError, TypeError):
-                        parent_meta = {}
-                    if not isinstance(parent_meta, dict):
-                        parent_meta = {}
-                    child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                    root = parent_meta.get("correlation_root_id") or message_id
-                    child_meta = json.dumps(
-                        {
-                            "correlation_id": message_id,
-                            "correlation_root_id": root,
-                            "correlation_depth": child_depth,
-                            "edited_from": message_id,
-                        }
-                    )
-                    # ROUTED child with its single outbound delivery already in flight (skips router/
-                    # transform); the finalizer drives it. Idempotency is the resend_log gate above.
-                    child_mid = uuid4().hex
-                    await cur.execute(
-                        _SQL_INSERT_MESSAGE,
-                        (
-                            child_mid,
-                            src_channel,
-                            now,
-                            mrow[1],  # source_type
-                            None,
-                            mrow[2],  # message_type
-                            self._cipher.encrypt(body, aad=cell_aad("messages", "raw", child_mid)),
-                            MessageStatus.ROUTED.value,
-                            None,
-                            None,
-                            self._enc(child_meta, aad=cell_aad("messages", "metadata", child_mid)),
-                        ),
-                    )
-                    self.body_copies += 1  # A1: the child messages.raw copy
-                    await self._event(
-                        cur, child_mid, "received", None, f"edit-resend from {message_id}", now
-                    )
-                    await self._event(cur, message_id, "edit_resend", to, f"-> {child_mid}", now)
-                    outbox_id = uuid4().hex
-                    await cur.execute(
-                        _SQL_INSERT_QUEUE_OUTBOUND,
-                        _insert_outbound_params(
-                            outbox_id,
-                            child_mid,
-                            src_channel,
-                            to,
-                            self._cipher.encrypt(body, aad=cell_aad("queue", "payload", outbox_id)),
-                            now,
-                        ),
-                    )
-                    self.body_copies += (
-                        1  # A1: one inline transformed-body copy (parity with _insert_outbound)
-                    )
-                else:
-                    # Resolve the source + its stored body (deref a shared body via COALESCE). A
-                    # pass-through completion marker is never a source (no body, BACKLOG #1580).
-                    # Every other retained stage='outbound' row is an eligible source
-                    # (done/cancelled/dead/pending) — the transform already produced its body;
-                    # diverting a permanently-failed (dead) delivery to a standby is a marquee use
-                    # case (ADR 0090 §1). `from_destination` names the source LANE, not a delivery
-                    # claim (review #123-3).
-                    src_where = f"message_id=? AND stage=? AND {_NOT_PT_MARKER}"
-                    src_params: list[Any] = [message_id, Stage.OUTBOUND.value]
-                    if from_ is not None:
-                        src_where += " AND destination_name=?"
-                        src_params.append(from_)
-                    await cur.execute(
-                        "SELECT q.destination_name, q.channel_id,"
-                        " COALESCE(sb.body, q.payload) AS body_ciphertext, q.id, q.body_ref"
-                        " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
-                        f" WHERE {src_where} ORDER BY q.destination_name",
-                        tuple(src_params),
-                    )
-                    rows = await cur.fetchall()
-                    if not rows:
-                        raise ResendSourceNotFound(
-                            f"message {message_id} has no delivered body"
-                            + (f" for source {from_!r}" if from_ is not None else "")
-                            + " to resend"
-                        )
-                    if from_ is None and len({r[0] for r in rows}) > 1:
-                        raise ResendSourceAmbiguous(
-                            f"message {message_id} was delivered to multiple destinations --"
-                            " specify the source destination (from) to resend"
-                        )
-                    src_dest, src_channel, body_ciphertext = rows[0][0], rows[0][1], rows[0][2]
-                    src_queue_id, src_body_ref = rows[0][3], rows[0][4]
-                    # The body's cell depends on its source (store-once shared body vs inline payload).
-                    src_body_aad = (
-                        cell_aad("shared_body", "body", src_body_ref)
-                        if src_body_ref is not None
-                        else cell_aad("queue", "payload", src_queue_id)
-                    )
-                    decoded = self._dec(body_ciphertext, aad=src_body_aad)
-                    if not decoded:
-                        raise ResendSourceEmpty(
-                            f"message {message_id} source body was purged by retention -- cannot resend"
-                        )
-                    body = decoded
-                    # #123 stored-body path: another delivery of the SAME logged message — outbound row
-                    # on the ORIGIN message_id + flip the ORIGIN to ROUTED (finalizer recomputes).
-                    outbox_id = uuid4().hex
-                    await cur.execute(
-                        _SQL_INSERT_QUEUE_OUTBOUND,
-                        _insert_outbound_params(
-                            outbox_id,
-                            message_id,
-                            src_channel,
-                            to,
-                            self._cipher.encrypt(body, aad=cell_aad("queue", "payload", outbox_id)),
-                            now,
-                        ),
-                    )
-                    self.body_copies += (
-                        1  # A1: one inline transformed-body copy (parity with _insert_outbound)
-                    )
-                    await cur.execute(
-                        "UPDATE messages SET status=?, error=NULL WHERE id=?",
-                        (MessageStatus.ROUTED.value, message_id),
-                    )
-                    await self._event(
-                        cur, message_id, "resent", to, f"resend {src_dest or '?'}->{to}", now
-                    )
-                await cur.execute(
-                    "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
-                    (outbox_id, idempotency_key),
-                )
-                await self._commit(conn)
-                return ResendOutcome(
-                    status="resent",
-                    message_id=message_id,
-                    to_destination=to,
-                    from_destination=str(src_dest),
-                    outbox_id=outbox_id,
-                )
+                    await self._append_operator_audit(cur, written, audit, outcome)
+                    await self._commit(conn)
+                    return outcome
             except Exception:
-                await conn.rollback()
+                # BACKLOG #2624: the transaction may hold the audit applock and an
+                # audit row. After the cursor closes, so a detached close cannot race it.
+                await self._rollback_or_discard(conn)
                 raise
 
     async def reingress(
@@ -10156,136 +10201,149 @@ class SqlServerStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
+        audit: OperatorAudit[ReingressOutcome] | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
         fresh, correlated ``RECEIVED`` child message at the origin channel's ingress stage; the origin
         row is READ (channel + correlation metadata), never written. Idempotency: a per-key
         ``sp_getapplock`` serializes same-key inserts, then the ``resend_log`` ``INSERT … WHERE NOT
         EXISTS`` + ``rowcount`` gate (keyed to ``(origin, "@reingress:<channel>")``) admits exactly one;
-        the deterministic content-addressed child id is the partial-rollback defense."""
+        the deterministic content-addressed child id is the partial-rollback defense. ``audit``'s row
+        commits with the resubmit, a duplicate included (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
-                await cur.execute(
-                    "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=?",
-                    (origin_message_id,),
-                )
-                orow = await cur.fetchone()
-                if orow is None:
-                    raise ReingressOriginMissing(
-                        f"message {origin_message_id} no longer exists -- cannot edit-and-resubmit"
-                    )
-                channel_id = str(orow[0])
-                source_type, message_type, metadata_ciphertext = orow[1], orow[2], orow[3]
-                target = f"{REINGRESS_TARGET_PREFIX}{channel_id}"
-                await self._applock(cur, f"mefor:resend:{idempotency_key}")
-                await cur.execute(
-                    "INSERT INTO resend_log (resend_key, message_id, to_destination,"
-                    " from_destination, outbox_id, created_at)"
-                    " SELECT ?,?,?,'',NULL,? WHERE NOT EXISTS"
-                    " (SELECT 1 FROM resend_log WHERE resend_key=?)",
-                    (idempotency_key, origin_message_id, target, now, idempotency_key),
-                )
-                if not cur.rowcount:
+                async with self._cursor(conn) as cur:
                     await cur.execute(
-                        "SELECT message_id, to_destination, outbox_id FROM resend_log WHERE resend_key=?",
-                        (idempotency_key,),
+                        "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=?",
+                        (origin_message_id,),
                     )
-                    pr = await cur.fetchone()
-                    if pr is not None and (pr[0] != origin_message_id or pr[1] != target):
-                        raise ResendKeyConflict(
-                            f"idempotency key {idempotency_key!r} was already used for a different"
-                            f" resubmit ({pr[0]!r} -> {pr[1]!r}); it cannot be reused for message"
-                            f" {origin_message_id!r}"
+                    orow = await cur.fetchone()
+                    if orow is None:
+                        raise ReingressOriginMissing(
+                            f"message {origin_message_id} no longer exists -- cannot edit-and-resubmit"
                         )
-                    await self._commit(conn)
-                    return ReingressOutcome(
-                        status="duplicate",
+                    channel_id = str(orow[0])
+                    source_type, message_type, metadata_ciphertext = orow[1], orow[2], orow[3]
+                    target = f"{REINGRESS_TARGET_PREFIX}{channel_id}"
+                    await self._applock(cur, f"mefor:resend:{idempotency_key}")
+                    await cur.execute(
+                        "INSERT INTO resend_log (resend_key, message_id, to_destination,"
+                        " from_destination, outbox_id, created_at)"
+                        " SELECT ?,?,?,'',NULL,? WHERE NOT EXISTS"
+                        " (SELECT 1 FROM resend_log WHERE resend_key=?)",
+                        (idempotency_key, origin_message_id, target, now, idempotency_key),
+                    )
+                    if not cur.rowcount:
+                        await cur.execute(
+                            "SELECT message_id, to_destination, outbox_id FROM resend_log WHERE resend_key=?",
+                            (idempotency_key,),
+                        )
+                        pr = await cur.fetchone()
+                        if pr is not None and (pr[0] != origin_message_id or pr[1] != target):
+                            raise ResendKeyConflict(
+                                f"idempotency key {idempotency_key!r} was already used for a different"
+                                f" resubmit ({pr[0]!r} -> {pr[1]!r}); it cannot be reused for message"
+                                f" {origin_message_id!r}"
+                            )
+                        outcome = ReingressOutcome(
+                            status="duplicate",
+                            message_id=origin_message_id,
+                            new_message_id=(pr[2] if pr else "") or "",
+                            channel_id=channel_id,
+                        )
+                        await self._append_operator_audit(cur, written, audit, outcome)
+                        await self._commit(conn)
+                        return outcome
+                    raw_meta = self._dec(
+                        metadata_ciphertext, aad=cell_aad("messages", "metadata", origin_message_id)
+                    )
+                    try:
+                        parent_meta = json.loads(raw_meta) if raw_meta else {}
+                    except (ValueError, TypeError):
+                        parent_meta = {}
+                    if not isinstance(parent_meta, dict):
+                        parent_meta = {}
+                    child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+                    root = parent_meta.get("correlation_root_id") or origin_message_id
+                    child_meta = json.dumps(
+                        {
+                            "correlation_id": origin_message_id,
+                            "correlation_root_id": root,
+                            "correlation_depth": child_depth,
+                            "edited_from": origin_message_id,
+                        }
+                    )
+                    new_mid = MessageStore._edit_resubmit_message_id(
+                        idempotency_key, channel_id, raw
+                    )
+                    await cur.execute(_SQL_SELECT_MESSAGE_EXISTS, (new_mid,))
+                    if await cur.fetchone() is None:
+                        await cur.execute(
+                            _SQL_INSERT_MESSAGE,
+                            (
+                                new_mid,
+                                channel_id,
+                                now,
+                                source_type,
+                                None,
+                                message_type,
+                                self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", new_mid)),
+                                MessageStatus.RECEIVED.value,
+                                None,
+                                None,
+                                self._enc(
+                                    child_meta, aad=cell_aad("messages", "metadata", new_mid)
+                                ),
+                            ),
+                        )
+                        # Hoist the row id so the payload binds to its own queue cell.
+                        resubmit_row_id = uuid4().hex
+                        await cur.execute(
+                            _SQL_INSERT_QUEUE_INGRESS,
+                            (
+                                resubmit_row_id,
+                                new_mid,
+                                Stage.INGRESS.value,
+                                channel_id,
+                                self._cipher.encrypt(
+                                    raw, aad=cell_aad("queue", "payload", resubmit_row_id)
+                                ),
+                                OutboxStatus.PENDING.value,
+                                now,
+                                now,
+                                now,
+                            ),
+                        )
+                        self.body_copies += 2
+                        await self._event(
+                            cur,
+                            new_mid,
+                            "received",
+                            None,
+                            f"edit-resubmit from {origin_message_id}",
+                            now,
+                        )
+                        await self._event(
+                            cur, origin_message_id, "edit_resubmit", None, f"-> {new_mid}", now
+                        )
+                    await cur.execute(
+                        "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
+                        (new_mid, idempotency_key),
+                    )
+                    outcome = ReingressOutcome(
+                        status="resubmitted",
                         message_id=origin_message_id,
-                        new_message_id=(pr[2] if pr else "") or "",
+                        new_message_id=new_mid,
                         channel_id=channel_id,
                     )
-                raw_meta = self._dec(
-                    metadata_ciphertext, aad=cell_aad("messages", "metadata", origin_message_id)
-                )
-                try:
-                    parent_meta = json.loads(raw_meta) if raw_meta else {}
-                except (ValueError, TypeError):
-                    parent_meta = {}
-                if not isinstance(parent_meta, dict):
-                    parent_meta = {}
-                child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                root = parent_meta.get("correlation_root_id") or origin_message_id
-                child_meta = json.dumps(
-                    {
-                        "correlation_id": origin_message_id,
-                        "correlation_root_id": root,
-                        "correlation_depth": child_depth,
-                        "edited_from": origin_message_id,
-                    }
-                )
-                new_mid = MessageStore._edit_resubmit_message_id(idempotency_key, channel_id, raw)
-                await cur.execute(_SQL_SELECT_MESSAGE_EXISTS, (new_mid,))
-                if await cur.fetchone() is None:
-                    await cur.execute(
-                        _SQL_INSERT_MESSAGE,
-                        (
-                            new_mid,
-                            channel_id,
-                            now,
-                            source_type,
-                            None,
-                            message_type,
-                            self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", new_mid)),
-                            MessageStatus.RECEIVED.value,
-                            None,
-                            None,
-                            self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
-                        ),
-                    )
-                    # Hoist the row id so the payload binds to its own queue cell.
-                    resubmit_row_id = uuid4().hex
-                    await cur.execute(
-                        _SQL_INSERT_QUEUE_INGRESS,
-                        (
-                            resubmit_row_id,
-                            new_mid,
-                            Stage.INGRESS.value,
-                            channel_id,
-                            self._cipher.encrypt(
-                                raw, aad=cell_aad("queue", "payload", resubmit_row_id)
-                            ),
-                            OutboxStatus.PENDING.value,
-                            now,
-                            now,
-                            now,
-                        ),
-                    )
-                    self.body_copies += 2
-                    await self._event(
-                        cur,
-                        new_mid,
-                        "received",
-                        None,
-                        f"edit-resubmit from {origin_message_id}",
-                        now,
-                    )
-                    await self._event(
-                        cur, origin_message_id, "edit_resubmit", None, f"-> {new_mid}", now
-                    )
-                await cur.execute(
-                    "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
-                    (new_mid, idempotency_key),
-                )
-                await self._commit(conn)
-                return ReingressOutcome(
-                    status="resubmitted",
-                    message_id=origin_message_id,
-                    new_message_id=new_mid,
-                    channel_id=channel_id,
-                )
+                    await self._append_operator_audit(cur, written, audit, outcome)
+                    await self._commit(conn)
+                    return outcome
             except Exception:
-                await conn.rollback()
+                # BACKLOG #2624: the transaction may hold the audit applock and an
+                # audit row. After the cursor closes, so a detached close cannot race it.
+                await self._rollback_or_discard(conn)
                 raise
 
     async def replay_dead(
@@ -10294,6 +10352,7 @@ class SqlServerStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Re-queue dead-lettered outbound deliveries (optionally scoped), reverting each affected
         message from ``error`` to ``routed``. Mirrors :meth:`MessageStore.replay_dead`.
@@ -10314,30 +10373,38 @@ class SqlServerStore:
             where.append("destination_name=?")
             params.append(destination_name)
         clause = " AND ".join(where)
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # BACKLOG #2624: ``audit``'s row commits with the replay, zero included.
+        async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
-                await cur.execute(
-                    f"SELECT DISTINCT message_id FROM queue WHERE {clause}", tuple(params)
-                )
-                message_ids = [r[0] for r in await cur.fetchall()]
-                if not message_ids:
-                    await self._commit(conn)
-                    return 0
-                await cur.execute(
-                    f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                    f" updated_at=? WHERE {clause}",
-                    (OutboxStatus.PENDING.value, now, now, *params),
-                )
-                count = cur.rowcount
-                for message_id in message_ids:
+                async with self._cursor(conn) as cur:
                     await cur.execute(
-                        "UPDATE messages SET status=?, error=NULL WHERE id=? AND status=?",
-                        (MessageStatus.ROUTED.value, message_id, MessageStatus.ERROR.value),
+                        f"SELECT DISTINCT message_id FROM queue WHERE {clause}", tuple(params)
                     )
-                    await self._event(cur, message_id, "replayed", None, "dead-letter replay", now)
-                await self._commit(conn)
+                    message_ids = [r[0] for r in await cur.fetchall()]
+                    if not message_ids:
+                        await self._append_operator_audit(cur, written, audit, 0)
+                        await self._commit(conn)
+                        return 0
+                    await cur.execute(
+                        f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
+                        f" updated_at=? WHERE {clause}",
+                        (OutboxStatus.PENDING.value, now, now, *params),
+                    )
+                    count = cur.rowcount
+                    for message_id in message_ids:
+                        await cur.execute(
+                            "UPDATE messages SET status=?, error=NULL WHERE id=? AND status=?",
+                            (MessageStatus.ROUTED.value, message_id, MessageStatus.ERROR.value),
+                        )
+                        await self._event(
+                            cur, message_id, "replayed", None, "dead-letter replay", now
+                        )
+                    await self._append_operator_audit(cur, written, audit, int(count))
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # BACKLOG #2624: the transaction may hold the audit applock and an
+                # audit row. After the cursor closes, so a detached close cannot race it.
+                await self._rollback_or_discard(conn)
                 raise
         return int(count)
 
@@ -10348,6 +10415,7 @@ class SqlServerStore:
         *,
         top_only: bool = False,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]
@@ -10356,39 +10424,45 @@ class SqlServerStore:
             where.insert(1, "channel_id=?")
             params.insert(1, channel_id)
         top = "TOP (1) " if top_only else ""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
+        async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
-                # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
-                # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
-                # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
-                # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
-                # #2754).
-                await cur.execute(
-                    f"SELECT {top}id, message_id FROM queue WHERE {' AND '.join(where)}"
-                    " ORDER BY seq",
-                    tuple(params),
-                )
-                rows = [(r[0], r[1]) for r in await cur.fetchall()]
-                if not rows:
-                    await self._commit(conn)
-                    return 0
-                ids = [r[0] for r in rows]
-                placeholders = ",".join("?" * len(ids))
-                await cur.execute(
-                    f"UPDATE queue SET status=?, updated_at=? WHERE id IN ({placeholders})",
-                    (OutboxStatus.CANCELLED.value, now, *ids),
-                )
-                for _id, message_id in rows:
-                    await self._event(
-                        cur, message_id, "cancelled", destination_name, "manual purge", now
+                async with self._cursor(conn) as cur:
+                    # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
+                    # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
+                    # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
+                    # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
+                    # #2754).
+                    await cur.execute(
+                        f"SELECT {top}id, message_id FROM queue WHERE {' AND '.join(where)}"
+                        " ORDER BY seq",
+                        tuple(params),
                     )
-                mids = {r[1] for r in rows}
-                await self._lock_finalize_batch(cur, mids)
-                for message_id in sorted(mids):
-                    await self._maybe_finalize(cur, message_id, now)
-                await self._commit(conn)
+                    rows = [(r[0], r[1]) for r in await cur.fetchall()]
+                    if not rows:
+                        await self._append_operator_audit(cur, written, audit, 0)
+                        await self._commit(conn)
+                        return 0
+                    ids = [r[0] for r in rows]
+                    placeholders = ",".join("?" * len(ids))
+                    await cur.execute(
+                        f"UPDATE queue SET status=?, updated_at=? WHERE id IN ({placeholders})",
+                        (OutboxStatus.CANCELLED.value, now, *ids),
+                    )
+                    for _id, message_id in rows:
+                        await self._event(
+                            cur, message_id, "cancelled", destination_name, "manual purge", now
+                        )
+                    mids = {r[1] for r in rows}
+                    await self._lock_finalize_batch(cur, mids)
+                    for message_id in sorted(mids):
+                        await self._maybe_finalize(cur, message_id, now)
+                    await self._append_operator_audit(cur, written, audit, len(ids))
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # BACKLOG #2624: the transaction may hold the audit applock and an
+                # audit row. After the cursor closes, so a detached close cannot race it.
+                await self._rollback_or_discard(conn)
                 raise
         return len(ids)
 
@@ -11289,25 +11363,6 @@ class SqlServerStore:
         await cur.fetchall()
         await self._applock(cur, _AUDIT_APPEND_LOCK)
 
-    async def _append_audits(
-        self, cur: Any, audits: Sequence[AuditAppend], *, now: float
-    ) -> list[AppendedAuditRow]:
-        """Append each of a write's ``audits``, in order, inside its transaction on ``cur``
-        (BACKLOG #2100). The caller holds ``_audit_lock``, commits, then tees with
-        :func:`tee_audits`."""
-        return [
-            await self._append_audit_row(
-                cur,
-                a.action,
-                actor=a.actor,
-                channel_id=None,
-                detail=a.detail,
-                client=a.client,
-                now=now,
-            )
-            for a in audits
-        ]
-
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(
             "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
@@ -11439,6 +11494,38 @@ class SqlServerStore:
                     await self._rollback_or_discard(conn)
                     raise
         tee_audits(audits, appended, ts=now)
+
+    async def _append_audits(
+        self, cur: Any, audits: Sequence[AuditAppend], *, now: float
+    ) -> list[AppendedAuditRow]:
+        """Append each of a write's ``audits``, in order, on ``cur`` inside its open transaction."""
+        return [
+            await self._append_audit_row(
+                cur,
+                a.action,
+                actor=a.actor,
+                channel_id=a.channel_id,
+                detail=a.detail,
+                client=a.client,
+                now=now,
+            )
+            for a in audits
+        ]
+
+    async def _append_operator_audit[R](
+        self, cur: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+    ) -> None:
+        """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
+        that fails rolls the mutation back. The caller's first statement opened the transaction the
+        applock needs. ``written`` tees after commit.
+
+        It does NOT take the in-process ``_audit_lock``. That lock is only the cheap near gate
+        :meth:`record_audit` describes; ``_AUDIT_APPEND_LOCK`` is what serialises the chain, and it
+        is taken here, at the tail, after the mutation's own writes. Holding ``_audit_lock`` across a
+        whole mutation would queue every audit write in this process, sign-ins included, behind a
+        bulk replay or purge."""
+        audits = operator_audits(audit, result)
+        written.add(audits, await self._append_audits(cur, audits, now=written.now))
 
     async def create_user(
         self,

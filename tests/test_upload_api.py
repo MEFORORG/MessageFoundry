@@ -38,6 +38,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
+from messagefoundry.store.store import AuditAppend
 from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
@@ -544,12 +545,20 @@ async def test_resend_unknown_and_not_running_inbound(engine: Engine, tmp_path: 
 
 async def test_engine_inject_message_creates_received(engine: Engine) -> None:
     # The distinct inject primitive at the engine level: a fresh RECEIVED message + ingress row, NO origin.
-    mid = await engine.inject_message(channel_id="in1", raw=ADT, source_type="upload")
+    # The audit is required, and its row commits with the message (BACKLOG #2624).
+    mid = await engine.inject_message(
+        channel_id="in1",
+        raw=ADT,
+        source_type="upload",
+        audit=lambda new_mid: AuditAppend("upload.resend", actor="op", detail=new_mid),
+    )
     row = await engine.store.get_message(mid)
     assert row is not None
     assert row["channel_id"] == "in1"
     assert row["status"] == MessageStatus.RECEIVED.value
     assert row["source_type"] == "upload"
+    [audit] = await engine.store.list_audit(action="upload.resend")
+    assert (audit["actor"], audit["detail"]) == ("op", mid)
 
 
 async def test_browse_requires_step_up_and_audits_shape(engine: Engine, tmp_path: Path) -> None:

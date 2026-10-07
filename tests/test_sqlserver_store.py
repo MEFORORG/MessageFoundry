@@ -872,6 +872,14 @@ async def test_approval_repeat_request_contract(store) -> None:
     await _assert_repeat_request_contract(store)
 
 
+async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
+    """BACKLOG #2624 on the real SQL Server backend: each operator mutation takes the audit applock
+    inside its own transaction, at the append, so a failed append rolls it back. The applock needs that transaction open, and each mutation's first statement opens it."""
+    from tests._operator_audit_atomic_contract import assert_operator_audit_atomic
+
+    await assert_operator_audit_atomic(store)
+
+
 async def test_approval_release_outcome_contract(store) -> None:
     """BACKLOG #1562: a release is ``executing`` until settled to ``approved``, ``failed`` or
     ``interrupted``, each through a ``from_status``-guarded update this backend's SQL performs."""
