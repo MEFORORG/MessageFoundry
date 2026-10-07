@@ -1060,7 +1060,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def audit_write_failed(self, name: str, *, action: str) -> None:
         # vault BACKLOG #2255: an audit row was lost. `approval:<id>` stands in for "connection", as
         # for approval_too_early, so each request is its own instance. The action name lands in the
-        # reason column; the lost row's detail stays in the ERROR log line beside it. No PHI.
+        # reason column. The ERROR log line beside it carries the row's detail on some paths and
+        # only the exception on others (docs/SECURITY.md). No PHI.
         self._emit(
             {
                 "type": "audit_write_failed",

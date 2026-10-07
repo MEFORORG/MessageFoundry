@@ -4,8 +4,9 @@
 
 Engine PR 1607's review named five findings in the gate's audit contract that #1940 did not carry.
 This file pins the three that are code: a refusal's own audit row, and a status write the store
-refuses, answer a mapped status rather than a raw 500 (finding 3), and every audit row the gate
-loses raises the ``audit_write_failed`` alert (finding 4).
+refuses, answer a mapped status rather than a raw 500 (finding 3), and a lost audit row pages
+``audit_write_failed`` on at least the paths these tests name (finding 4). Not every lost row
+pages; docs/SECURITY.md lists at least the exceptions.
 
 The gate runs over a real SQLite store. Only the faults are injected, by a wrapper that fails the
 named audit actions or status writes with the error a full disk gives.
@@ -255,7 +256,7 @@ async def test_a_resolution_the_store_refuses_answers_503(store: MessageStore) -
     assert await _status(store, approval_id) == "interrupted"
 
 
-# --- finding 4: every lost audit row pages -------------------------------------------------------
+# --- finding 4: a lost audit row pages, on at least these paths ----------------------------------
 
 
 async def test_a_lost_approval_approved_row_pages(store: MessageStore) -> None:
