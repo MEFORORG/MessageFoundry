@@ -620,9 +620,14 @@ def code_set(name: str) -> CodeSet:
 #: fields and refuses these keys in its transport settings (see :func:`refuse_raw_hop_attestation`).
 HOP_ATTESTATION_KEYS = ("tls_hop_attested", "tls_hop_attested_reason")
 
-#: Appended to a hop-policy flag refusal only when the value IS an ``env()`` reference, so a plain
-#: string such as ``"false"`` is not told about a reference it never held (vault BACKLOG #3139).
-_ENV_FLAG_HINT = " (an env() reference is not accepted on a hop-policy flag; write True or False)"
+
+def _flag_hint(value: object) -> str:
+    """The remedy appended to a hop-policy flag refusal. It names ``env()`` only when the value IS
+    an ``env()`` reference, so a plain string such as ``"false"`` is not told about a reference it
+    never held (vault BACKLOG #3139). One spelling for the factory path and the raw-settings path."""
+    if isinstance(value, EnvRef):
+        return " (an env() reference is not accepted on a hop-policy flag; write True or False)"
+    return " (write a literal True or False)"
 
 
 def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> dict[str, Any]:
@@ -636,7 +641,7 @@ def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> 
     if not isinstance(attested, bool):
         raise WiringError(
             f"{where}: tls_hop_attested must be true or false, not {type(attested).__name__}"
-            f"{_ENV_FLAG_HINT if isinstance(attested, EnvRef) else ''}"
+            f"{_flag_hint(attested)}"
         )
     try:
         _check_hop_attestation(attested, require_hop_reason(reason))
@@ -684,12 +689,7 @@ def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool
         try:
             flag_from_settings(settings, key)
         except ValueError as exc:
-            hint = (
-                _ENV_FLAG_HINT
-                if isinstance(settings.get(key), EnvRef)
-                else " (write a literal True or False)"
-            )
-            raise WiringError(f"{where}: {exc}{hint}") from exc
+            raise WiringError(f"{where}: {exc}{_flag_hint(settings.get(key))}") from exc
     return settings_hop_attestation(settings, where)
 
 
@@ -5238,21 +5238,28 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     report can run without them, so it marks such an entry :data:`REFUSED_ATTESTATION_MARK` rather
     than let a reader take it as a hop the engine crosses (vault BACKLOG #3139).
 
-    A reason is shown with its control characters escaped, so a reason holding a newline that was
-    written past every factory cannot split a ``check`` line or a log line (vault BACKLOG #3139).
+    A name and a reason are shown with their control characters escaped, so a reason holding a
+    newline that was written past every factory cannot split a ``check`` line or a log line, and an
+    ``env()`` reason is shown by its key only, never its default (vault BACKLOG #3139).
 
     Pure: it reads the loaded graph and touches nothing else."""
 
     def _reason(value: object) -> str:
-        return scrub_control_chars(str(value)) if value else "(none recorded)"
+        if not value:
+            return "(none recorded)"
+        # An env() reason written past the factory: name its key only, never its default.
+        return _envref_label(value) if _is_nested_envref(value) else scrub_control_chars(str(value))
 
     def _listed(flag: object) -> bool:
         return flag is not None and flag is not False
 
-    def _carrier_reason(name: str, settings: Mapping[str, Any]) -> str:
+    def _carrier_reason(name: str, settings: Mapping[str, Any], accepted: bool = False) -> str:
         reason = _reason(settings.get("tls_hop_attested_reason"))
         try:
             refuse_unresolved_hop_flags(settings, name)
+            # A FhirLookup's typed cleartext_accepted with an attestation written into its settings
+            # is refused by the lookup settings builder, so it is marked too.
+            _refuse_attested_and_accepted(name, True, accepted)
         except WiringError:
             return f"{reason} {REFUSED_ATTESTATION_MARK}"
         return reason
@@ -5267,17 +5274,22 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)
     ]
-    settings_carriers: list[tuple[str, Mapping[str, Any]]] = [
-        *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
-        *((f"db_lookup:{s.name}", s.settings) for s in registry.lookups.values()),
-        *((f"reference:{r.name}", r.source.settings) for r in registry.references.values()),
+    settings_carriers: list[tuple[str, Mapping[str, Any], bool]] = [
+        *(
+            (fhir_lookup_record_name(s.name), s.settings, s.cleartext_accepted)
+            for s in registry.fhir_lookups.values()
+        ),
+        *((f"db_lookup:{s.name}", s.settings, False) for s in registry.lookups.values()),
+        *((f"reference:{r.name}", r.source.settings, False) for r in registry.references.values()),
     ]
     out += [
-        (name, _carrier_reason(name, settings))
-        for name, settings in settings_carriers
+        (name, _carrier_reason(name, settings, accepted))
+        for name, settings, accepted in settings_carriers
         if _listed(settings.get("tls_hop_attested"))
     ]
-    return sorted(out)
+    # A reference set's or a lookup's name is not held to the connection-name pattern, so it is
+    # escaped too, or a newline in it could split the `check` line (vault BACKLOG #3139).
+    return sorted((scrub_control_chars(name), reason) for name, reason in out)
 
 
 #: What :func:`_peer_label` says when an address does not parse as scheme, host and port. It is fixed

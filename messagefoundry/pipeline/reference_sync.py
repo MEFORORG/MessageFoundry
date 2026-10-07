@@ -408,7 +408,8 @@ class ReferenceSyncRunner:
             # a reference key. This refusal's text is config only: the set's name, the flag and a
             # type name, never a value or the reason. So it is logged whole, or the operator learns
             # nothing beyond "WiringError".
-            log.error("reference set %r refused: %s", spec.name, exc)
+            # The text already leads with "reference set '<name>': ", so it is not repeated.
+            log.error("%s (not synced)", exc)
             raise
         settings = resolve_env_settings(spec.source.settings, self._env_values)
         kind = spec.source.kind

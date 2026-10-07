@@ -10024,9 +10024,10 @@ def _build_check_connectors(
     # the statement checks stay at sync. Builds no pool and opens no socket. A source whose env()
     # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
     # refuse the whole graph.
+    # Every source kind, and before the unresolved-env skip below: this refusal needs no value. The
+    # same call Engine.start makes (vault BACKLOG #3139).
+    refuse_reference_hop_flags(registry)
     for rname, rspec in registry.references.items():
-        # Every source kind, and before the unresolved-env skip below: this refusal needs no value.
-        refuse_unresolved_hop_flags(rspec.source.settings, f"reference set {rname!r}")
         if rspec.source.kind != "database":
             continue
         try:
