@@ -2607,7 +2607,7 @@ class RegistryRunner:
         are written again under them, so the scheduler and an alert rule still leave a feed below
         the threshold down. That includes a feed parked before the release and one a reload
         parked during it. It errs toward parking: a below-threshold feed an operator started
-        before the release is parked too, when the park stopped it. Nothing is bound here. The
+        before the release is parked too, when the park stopped it and it is still down. Nothing is bound here. The
         listeners at or above the threshold that the park unbound come back on the next reload,
         except an ``auto_start = false`` one, which the reload skips."""
         self._dr_threshold = state.threshold
