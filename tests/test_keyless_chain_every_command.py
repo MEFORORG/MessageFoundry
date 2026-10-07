@@ -41,8 +41,9 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.base import open_store
-from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
+from messagefoundry.store.keyprovider import KeyProviderError
+from messagefoundry.store.store import AuditVerdict, MessageStore
 from tests.test_audit_keyless_chain_flagged import _AT_REST_ENV
 from tests.test_provision_first_administrator import _tty
 
@@ -474,6 +475,57 @@ def test_an_edit_inside_a_closed_key_range_exits_1_with_no_key(
     assert "does not match the range it closes" in capsys.readouterr().out
 
 
+def _walk_with_no_key(
+    rows: list[dict[str, object]], *, expected_prefix: tuple[int, str] | None = None
+) -> AuditVerdict:
+    """The one walk every backend runs, by a process that holds no key."""
+    from messagefoundry.store.store import verify_audit_rows
+
+    return verify_audit_rows(
+        rows, mac_keys={}, mac_fn=None, capable=False, expected_prefix=expected_prefix
+    )
+
+
+def test_a_cut_tail_against_an_expected_prefix_is_a_break_with_no_key() -> None:
+    """Vault BACKLOG #3054, item 4: the expected-prefix check, pinned where no key is held. The
+    engine's start check passes the anchor file as a prefix. A tail cut after that anchor needs no
+    key to see, so it is a break, never "not checked". Fails if the prefix check is removed, or if
+    the not-checked return moves above it. The control is the same anchor on the intact chain."""
+    from messagefoundry.store.store import AUDIT_PREFIX_BREAK_MARKER
+    from tests.test_audit_key_rotation import _A, _B, _rows_across_a_rotation
+
+    rows = _rows_across_a_rotation(_A, _B)
+    anchor = (len(rows), str(rows[-1]["row_hash"]))
+    intact = _walk_with_no_key(rows, expected_prefix=anchor)
+    assert not intact[0] and intact.key_unavailable, intact
+
+    cut = _walk_with_no_key(rows[:-1], expected_prefix=anchor)
+    ok, message = cut
+    assert not ok and not cut.key_unavailable, message
+    assert AUDIT_PREFIX_BREAK_MARKER in (message or ""), message
+
+
+def test_a_range_rows_link_is_checked_with_no_key() -> None:
+    """Vault BACKLOG #3054, item 4: the range link check, pinned where no key is held. A range row's
+    recorded link to the chain below it needs no key to compare, so a changed link is a break, never
+    "not checked". Only the link differs here: the range's fields and digest still match. Fails if
+    the link check is removed or held back to a process with a key. The controls are the same rows
+    with the key held, a break too, and the intact rows with no key, not checked."""
+    from tests.test_audit_key_rotation import _A, _B, _rows_across_a_rotation, _verify_rows
+
+    intact = _walk_with_no_key(_rows_across_a_rotation(_A, _B))
+    assert not intact[0] and intact.key_unavailable, intact
+
+    relinked = _rows_across_a_rotation(_A, _B, closes_edit={"prev_hash": "f" * 64})
+    ok, message = _verify_rows(relinked, (_A, _B))
+    assert not ok and "no longer match the link" in (message or ""), message
+
+    verdict = _walk_with_no_key(relinked)
+    ok, message = verdict
+    assert not ok and not verdict.key_unavailable, message
+    assert "no longer match the link" in (message or ""), message
+
+
 def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -510,7 +562,26 @@ def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
     assert out.startswith("FAIL: audit chain broken") and "run keyless" in out, out
 
 
-@pytest.mark.parametrize("command", ["audit-verify", "audit-anchor"])
+#: The commands that route a store key that does not resolve to exit 2. The admin pair joined in
+#: vault BACKLOG #3054, item 11; each exited 1 at the dispatch floor before.
+_KEY_REFUSING_COMMANDS = ["audit-verify", "audit-anchor", "admin-unlock", "admin-set-notify-email"]
+
+
+#: The commands `_argv` runs with no --json, so their refusal is a line on stderr.
+_TEXT_COMMANDS = {"audit-verify", "rotate-key"}
+
+
+def _refusal_text(command: str, out: str, err: str) -> str:
+    """The refusal line: the commands `_argv` runs without --json write it to stderr; the rest write
+    a JSON error to stdout."""
+    return err if command in _TEXT_COMMANDS else str(json.loads(out)["error"])
+
+
+#: Not base64, so the key fails to decode. The text a refusal may print is the setting's name.
+_MALFORMED_KEY = "not-a-key-MALFORMEDKEYMARKER!"
+
+
+@pytest.mark.parametrize("command", _KEY_REFUSING_COMMANDS)
 def test_a_key_that_does_not_resolve_exits_2(
     command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -523,8 +594,32 @@ def test_a_key_that_does_not_resolve_exits_2(
     rc = main(_argv(command, db, shell))
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
-    text = json.loads(captured.out)["error"] if command == "audit-anchor" else captured.err
+    text = _refusal_text(command, captured.out, captured.err)
     assert "MEFOR_STORE_TRANSIT_KEY" in text, text
+
+
+@pytest.mark.parametrize("command", [*_KEY_REFUSING_COMMANDS, "admin-reset-totp", "rotate-key"])
+def test_a_malformed_key_exits_2_and_never_prints_it(
+    command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3054, item 8. A key that is not base64 of 32 bytes is refused while the store
+    opens, before a row is read, so it is "could not start", exit 2. It reached the dispatch floor
+    and exited 1 with no FAIL line, a broken chain's code. The line names the setting, never the key.
+    The control is the same store with its real key, which opens."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    assert main(["audit-verify", "--db", str(db)]) == 0  # the control
+    capsys.readouterr()
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", _MALFORMED_KEY)
+    rc = main(_argv(command, db, shell))
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    text = _refusal_text(command, captured.out, captured.err)
+    assert "must be valid base64" in text and "MEFOR_STORE_ENCRYPTION_KEY" in text, text
+    assert "MALFORMEDKEYMARKER" not in captured.out + captured.err
 
 
 def test_the_verdict_keeps_its_flag_through_a_copy() -> None:
@@ -575,6 +670,7 @@ def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_5(
     assert "OK" not in captured.out, captured.out
     assert "WARNING: the audit chain is keyless" in captured.err, captured.err
     assert "require a store key" in captured.err, captured.err
+    assert "rewritten as keyless" in captured.err, captured.err  # the control for the anchored run
     assert "row-content-marker" not in captured.out + captured.err
 
     # A matching anchor does not change it: the walk was still not keyed, which is what the settings
@@ -582,7 +678,12 @@ def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_5(
     assert main(["audit-anchor", "--db", str(db)]) == 0
     anchor = capsys.readouterr().out.strip()
     assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 5
-    assert capsys.readouterr().out.startswith("NOT CHECKED: ")
+    captured = capsys.readouterr()
+    assert captured.out.startswith("NOT CHECKED: ")
+    # Vault BACKLOG #3110, item 2: a matched anchor rules out a rewrite only since it was taken, and
+    # `audit-anchor` verifies nothing, so the WARNING still names a rewrite, scoped to before it.
+    assert "before the expected anchor was taken" in captured.err, captured.err
+    assert "which a keyless check cannot see" not in captured.err, captured.err
 
 
 @pytest.mark.parametrize("allow_empty", [False, True])
@@ -642,27 +743,457 @@ def test_a_keyless_chain_under_the_opt_out_does_not_warn(
     assert "WARNING" not in capsys.readouterr().err
 
 
-def test_a_key_error_raised_after_the_open_is_not_reported_as_could_not_start(
+@pytest.mark.parametrize(
+    ("seq", "column", "opt_out"),
+    [(1, "actor", True), (2, "actor", True), (3, "actor", True), (3, "row_hash", False)],
+    ids=["seq1-genesis-read", "seq2", "seq3", "seq3-anchor-read-no-opt-out"],
+)
+def test_a_row_that_is_not_utf8_fails_the_check_and_its_text_is_not_printed(
+    seq: int,
+    column: str,
+    opt_out: bool,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Vault BACKLOG #3054, item 10. A row holding text that is not valid UTF-8 exited 2, "could not
+    start", with the row's text in the line. The driver refuses it during the walk, after the open,
+    so a writer could plant one to turn a broken chain into a 2. It is exit 1 with a FAIL line that
+    names the error's classes only. The control is the same chain before the write, which exits 0
+    under the opt-out, or 5 without it. Row 1 is read by the open, not the walk, and so is the
+    newest row's hash where the settings require a key (the open's empty-log check): both get the
+    same line."""
+    if opt_out:
+        _opt_out(monkeypatch)
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    assert main(["audit-verify", "--db", str(db)]) == (0 if opt_out else 5)  # the control
+    capsys.readouterr()
+    _write(
+        db,
+        f"UPDATE audit_log SET {column} = CAST(x'ff524f574d41524b4552' AS TEXT) WHERE seq = {seq}",
+    )
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: the audit chain check stopped part way"), captured.out
+    assert "(OperationalError)" in captured.out, captured.out
+    assert "ROWMARKER" not in captured.out + captured.err, captured.err
+
+
+class _ServerDriverError(Exception):
+    """Stands in for asyncpg's or pyodbc's DatabaseError base, which subclasses no SQLite type."""
+
+
+class _PyodbcError(Exception):
+    """Stands in for pyodbc's ``Error`` root, which is not installed on every leg."""
+
+
+class _InterfaceError(_PyodbcError):
+    """Stands in for ``pyodbc.InterfaceError``: a failed login, SQLSTATE 28000."""
+
+
+def _stand_in_drivers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The production lists, extended with stand-ins for the server drivers this leg may not have
+    installed, so a test exercises the real lists and not a copy of them."""
+    from messagefoundry.store import base as store_base
+
+    drivers, connects = store_base.store_driver_errors(), store_base.store_connect_errors()
+    monkeypatch.setattr(store_base, "store_driver_errors", lambda: (*drivers, _ServerDriverError))
+    monkeypatch.setattr(store_base, "store_connect_errors", lambda: (*connects, _PyodbcError))
+
+
+_UNREACHABLE = [
+    sqlite3.OperationalError("unable to open database file"),
+    _ServerDriverError("connection refused"),
+    OSError("Connect call failed ('10.0.0.5', 5432)"),
+    ConnectionRefusedError(111, "Connection refused"),
+    _InterfaceError("28000", "[28000] Login failed for user 'svc'"),
+    _ServerDriverError("42P01", 'relation "audit_log" does not exist'),
+]
+
+
+@pytest.mark.parametrize("error", _UNREACHABLE, ids=lambda e: type(e).__name__)
+def test_a_store_that_cannot_be_reached_at_the_open_exits_2(
+    error: Exception,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The control for the row arm above (vault BACKLOG #3054, item 10). An error the open raised
+    outside its read of the chain's rows carries no tag, so it is "could not start", exit 2: at
+    least a refused connection, as asyncpg raises it (OSError) or as the OS reports it, and a
+    failed login, pyodbc's InterfaceError. They reached the dispatch floor and exited 1, a broken
+    chain's code, while only SQLite's errors were caught."""
+    from messagefoundry.store import base as store_base
+
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    _stand_in_drivers(monkeypatch)
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert "cannot open the store at" in captured.err and "FAIL" not in captured.out
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("connection reset"),
+        _InterfaceError("08S01", "link failure"),
+        UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "illegal UTF-16 surrogate"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+def test_an_error_while_the_open_reads_the_chain_fails_the_check(
+    error: Exception,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The other half of the split: the same kinds of error, raised while the open read the
+    chain's rows, carry the store's tag, so they are the walk's FAIL line and exit 1, an outage
+    part way included. A lone surrogate SQL Server decodes is a UnicodeDecodeError."""
+    from messagefoundry.store import base as store_base
+    from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE
+
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    _stand_in_drivers(monkeypatch)
+    error.add_note(AUDIT_CHAIN_READ_NOTE)
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: the audit chain check stopped part way"), captured.out
+    assert f"({type(error).__name__})" in captured.out, captured.out
+
+
+def test_the_store_tags_a_connection_error_raised_reading_the_chain() -> None:
+    """The tag is added by class: driver, connection and decode errors, and nothing else."""
+    from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE, note_audit_chain_read
+
+    for tagged in (
+        OSError("reset"),
+        sqlite3.OperationalError("x"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"),
+    ):
+        note_audit_chain_read(tagged)
+        assert AUDIT_CHAIN_READ_NOTE in getattr(tagged, "__notes__", ()), tagged
+    untagged = RuntimeError("an engine refusal")
+    note_audit_chain_read(untagged)
+    assert not hasattr(untagged, "__notes__")
+
+
+@pytest.mark.parametrize("arm", ["fail-verdict", "walk-stopped"])
+def test_a_close_that_fails_keeps_the_checks_exit_code(
+    arm: str,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A server driver error from ``close()`` must not turn a FAIL verdict or a stopped walk into
+    "cannot open the store", exit 2 (Lander hold on PR 2141). The close is quiet, by class."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    _stand_in_drivers(monkeypatch)
+    if arm == "fail-verdict":
+        _write(db, _DELETE_ROW_2)
+    else:
+
+        async def raising(self: MessageStore, **kwargs: object) -> object:
+            raise CipherError("Transit audit HMAC failed")
+
+        monkeypatch.setattr(MessageStore, "verify_audit_chain", raising)
+    real_close = MessageStore.close
+
+    async def failing_close(self: MessageStore) -> None:
+        await real_close(self)
+        raise _ServerDriverError("ROWMARKER in a close error")
+
+    monkeypatch.setattr(MessageStore, "close", failing_close)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: "), captured.out
+    assert "cannot open the store" not in captured.err, captured.err
+    assert "closing the store failed (_ServerDriverError)" in captured.err, captured.err
+    assert "ROWMARKER" not in captured.out + captured.err
+
+
+def test_a_driver_error_in_a_real_open_of_the_chain_fails_the_check(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Through the real read-only open, not a stand-in for it: a driver error raised while the open
+    reads the genesis row is tagged by ``load_audit_chain`` and survives ``_load_read_only``, so it
+    is the FAIL line and exit 1. The control is the same open with no error, which exits 0."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    assert main(["audit-verify", "--db", str(db)]) == 0  # the control
+    capsys.readouterr()
+
+    async def failing(self: MessageStore) -> object:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(MessageStore, "_audit_genesis_row", failing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: the audit chain check stopped part way"), captured.out
+
+
+def test_a_shape_error_reading_the_chain_is_not_tagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing table, column or grant says nothing about a row, so the store does not tag it,
+    and the open reports it as "could not start". SQLSTATE class 42, as asyncpg names it and as
+    pyodbc puts it first in ``args``. The controls are a connection error and a lock timeout."""
+    from messagefoundry.store.base import is_store_shape_error
+    from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE, note_audit_chain_read
+
+    _stand_in_drivers(monkeypatch)
+    asyncpg_like = _ServerDriverError('relation "audit_log" does not exist')
+    asyncpg_like.sqlstate = "42P01"  # type: ignore[attr-defined]
+    pyodbc_like = _ServerDriverError("42S22", "Invalid column name 'seq'.")
+    lost = _ServerDriverError("08S01", "Communication link failure")
+    denied = _ServerDriverError("42000", "The SELECT permission was denied (229) (SQLExecDirectW)")
+    lock = _ServerDriverError("42000", "Lock request time out period exceeded. (1222)")
+    assert is_store_shape_error(asyncpg_like) and is_store_shape_error(pyodbc_like)
+    assert is_store_shape_error(denied)
+    assert not is_store_shape_error(lost) and not is_store_shape_error(lock)
+    retyped = _ServerDriverError("operator does not exist: text = integer")
+    retyped.sqlstate = "42883"  # type: ignore[attr-defined]
+    assert is_store_shape_error(retyped)  # a column of another type: Postgres class 42
+    assert not is_store_shape_error(sqlite3.OperationalError("42 is not a code"))
+    for shape in (asyncpg_like, pyodbc_like):
+        note_audit_chain_read(shape)
+        assert AUDIT_CHAIN_READ_NOTE not in getattr(shape, "__notes__", ()), shape
+    note_audit_chain_read(lost)
+    assert AUDIT_CHAIN_READ_NOTE in getattr(lost, "__notes__", ())
+
+
+def test_a_clean_walk_needs_no_second_query_for_its_count(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The verdict carries the walk's own row count. A count query that failed after a clean walk
+    turned an OK into "stopped part way"; there is no such query now."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+
+    async def failing(self: MessageStore) -> object:
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(MessageStore, "audit_anchor", failing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 0, (captured.out, captured.err)
+    assert captured.out.startswith("OK: verified 3 audit row(s)"), captured.out
+
+
+def test_a_server_store_that_cannot_be_reached_is_named_by_server_and_database(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A server backend has no file, so the could-not-start line names it as the store names
+    itself, server/database, not the unused SQLite path."""
+    from messagefoundry.store import base as store_base
+
+    _stand_in_drivers(monkeypatch)
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "postgres")
+    monkeypatch.setenv("MEFOR_STORE_SERVER", "db01")
+    monkeypatch.setenv("MEFOR_STORE_DATABASE", "mefor")
+    monkeypatch.setenv("MEFOR_STORE_USERNAME", "svc")
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-verify"])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert "cannot open the store at db01/mefor: ConnectionRefusedError" in captured.err, (
+        captured.err
+    )
+
+
+def test_a_server_driver_error_with_a_sqlstate_prints_no_text(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A server message can quote a stored value, which ``safe_exc``'s patterns keep (BACKLOG
+    #1661 measured SQL Server's duplicate-key text). With a SQLSTATE, the line is the class and
+    the SQLSTATE only. The control shows the raw text holds the value."""
+    from messagefoundry.__main__ import _emit_store_open_error
+
+    _stand_in_drivers(monkeypatch)
+    exc = _ServerDriverError("23000", "The duplicate key value is (4242ROWMARKER).")
+    assert "ROWMARKER" in str(exc)  # the control
+    assert _emit_store_open_error(exc, "db01/mefor", as_json=False) == 2
+    err = capsys.readouterr().err
+    assert "_ServerDriverError [SQLSTATE 23000]" in err and "ROWMARKER" not in err, err
+
+
+def test_only_a_server_drivers_error_is_read_for_a_sqlstate(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``OSError("reset")`` has a five-letter first argument and is no driver's error, so it gets
+    no SQLSTATE; a driver's connect error keeps its native number and drops its text."""
+    from messagefoundry.__main__ import _emit_store_open_error
+    from messagefoundry.store.base import driver_sqlstate
+
+    _stand_in_drivers(monkeypatch)
+    assert driver_sqlstate(OSError("reset")) is None
+    assert driver_sqlstate(TimeoutError("timed")) is None
+    refused = _ServerDriverError(
+        "08001", "[08001] TCP Provider: No connection ROWMARKER (10061) (SQLDriverConnect)"
+    )
+    assert driver_sqlstate(refused) == "08001"
+    assert _emit_store_open_error(refused, "db01/mefor", as_json=False) == 2
+    err = capsys.readouterr().err
+    assert "[SQLSTATE 08001] native error 10061" in err and "ROWMARKER" not in err, err
+
+
+def test_a_shape_error_in_the_walk_exits_2(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A column or grant gone between the open and the walk says nothing about a row: exit 2, as
+    at the open. The control for the FAIL arm is the walk-stopped test above."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    _stand_in_drivers(monkeypatch)
+
+    async def revoked(self: MessageStore, **kwargs: object) -> object:
+        raise _ServerDriverError("42S22", "Invalid column name 'seq'.")
+
+    monkeypatch.setattr(MessageStore, "verify_audit_chain", revoked)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert "cannot open the store at" in captured.err and "FAIL" not in captured.out
+
+
+def test_audit_anchor_exits_2_when_the_store_cannot_be_reached(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``audit-anchor`` has no FAIL verdict, so a refused connection is "could not start", exit 2,
+    as a JSON error under --json. It reached the floor's exit 1 on a server backend."""
+    from messagefoundry.store import base as store_base
+
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    _stand_in_drivers(monkeypatch)
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-anchor", "--db", str(db), "--json"])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert json.loads(captured.out)["error"].startswith(f"cannot open the store at {db}: ")
+
+
+def test_a_server_driver_error_at_the_open_is_redacted(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Section 9: a server driver's error text is not this command's to vouch for, so the
+    store-open line renders it through ``safe_exc``. The planted value is an HL7 segment a row
+    could carry; the control shows the raw text holds it."""
+    from messagefoundry.__main__ import _emit_store_open_error
+
+    exc = _ServerDriverError("server said: PID|1||123456789^^^MRN||DOE^JOHN")
+    assert "123456789" in str(exc)  # the control
+    assert _emit_store_open_error(exc, "db", as_json=False) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error: cannot open the store at db: _ServerDriverError"), err
+    assert "123456789" not in err and "DOE^JOHN" not in err, err
+
+
+def test_a_store_open_error_cuts_the_row_text_sqlite_quotes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The store-open refusal prints the driver's error, and SQLite's decode error quotes the
+    column's bytes, a row's content. The line keeps the column and cuts the text."""
+    from messagefoundry.__main__ import _emit_store_open_error
+
+    exc = sqlite3.OperationalError("Could not decode to UTF-8 column 'actor' with text 'ROWMARKER'")
+    assert _emit_store_open_error(exc, "x.db", as_json=False) == 2
+    err = capsys.readouterr().err
+    assert "'actor'" in err and "its text is not shown" in err, err
+    assert "ROWMARKER" not in err, err
+
+
+@pytest.mark.parametrize("error", [KeyProviderError, CipherError], ids=lambda e: e.__name__)
+def test_a_key_error_raised_after_the_open_is_not_reported_as_could_not_start(
+    error: type[Exception],
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Pins where the exit-2 key arm sits: around the OPEN only. Once rows are read, a key error is
     not "could not start", because a row's content might be what raised it. Here the verify itself
-    raises the key error. Catching key errors around the whole run would turn this into exit 2."""
-    from messagefoundry.store.keyprovider import KeyProviderError
+    raises the key error. Catching key errors around the whole run would turn this into exit 2.
 
+    Since vault BACKLOG #3054, item 8, it is still exit 1, now with a FAIL line, where it reached
+    the dispatch floor and printed none. Not a softer code: under Transit a row the provider refuses
+    raises this, so a "not checked" code would let a planted row hide every later break.
+    `CipherError` is what a Transit HMAC that fails for a row raises. The line names the class and
+    its cause's class, which tells an outage from a refused row, and never the error's text."""
     db = shell / "keyed.db"
     key = generate_key()
     _keyed_chain(db, key)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
 
     async def raising(self: MessageStore, **kwargs: object) -> object:
-        raise KeyProviderError("raised after the open")
+        if error is CipherError:
+            raise error("Transit audit HMAC failed (key='TEXTMARKER')") from ConnectionError("gone")
+        raise error("Transit audit HMAC failed (key='TEXTMARKER')")
 
     monkeypatch.setattr(MessageStore, "verify_audit_chain", raising)
     rc = main(["audit-verify", "--db", str(db)])
-    capsys.readouterr()
-    assert rc != 2, "a key error after the open was reported as could-not-start"
-    assert rc != 0
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: "), captured.out
+    named = "CipherError from ConnectionError" if error is CipherError else "KeyProviderError"
+    assert f"({named})" in captured.out, captured.out
+    assert "NOT CHECKED" not in captured.out and "OK" not in captured.out, captured.out
+    assert "gone" not in captured.out + captured.err, (captured.out, captured.err)
+    assert "TEXTMARKER" not in captured.out + captured.err, (captured.out, captured.err)
+
+
+def test_a_cipher_error_at_the_open_fails_the_check(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The read-only open reads the chain's first row and, under Transit, MACs it there, so a
+    Transit refusal can come from the open as well as the walk. It is the same FAIL line and exit
+    1, not the last-resort handler's line. Code review round 2 of vault BACKLOG #3054, item 8."""
+    from messagefoundry.store import base as store_base
+
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise CipherError("Transit audit HMAC failed (key='TEXTMARKER')")
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: ") and "(CipherError)" in captured.out, captured.out
+    assert "TEXTMARKER" not in captured.out + captured.err
 
 
 _FORGE_GENESIS = (

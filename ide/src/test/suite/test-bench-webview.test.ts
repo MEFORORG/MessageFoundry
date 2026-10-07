@@ -5,7 +5,7 @@ import * as assert from "assert";
 import { hexdump } from "../../hexdump";
 import { diffMessages } from "../../hl7diff";
 import { testBenchScript } from "../../testBenchWebview";
-import { judgeCollectionRun } from "../../testCollections";
+import { heldAfterIncoming, judgeCollectionRun, pickCaseDetail, releaseRun } from "../../testCollections";
 import { buildTraceDetail, type TraceEntry } from "../../traceView";
 import { CHANNEL_FIELD } from "../../webviewMessaging";
 
@@ -104,6 +104,9 @@ function bench(state: Record<string, unknown> | null = null): Bench {
   script.textContent = testBenchScript(TOKEN);
   window.document.body.appendChild(script);
   assert.deepStrictEqual(errors.map(String), [], "the Test Bench script threw while loading");
+  // The page announces each load once (BACKLOG #2441). Taken off here, so each test sees only the
+  // messages its own actions post.
+  assert.deepStrictEqual(posted.splice(0), [{ command: "ready" }], "the page did not post ready once on load");
   const detail = window.document.getElementById("detail");
   const results = window.document.getElementById("results");
   return {
@@ -623,5 +626,82 @@ suite("Test Bench webview — a collection run reveals values one case at a time
     b.deliver(p);
     assert.strictEqual(b.detail.querySelector("img"), null, "a difference value became an element");
     assert.ok(b.detail.textContent.includes("<img"), "the value was dropped rather than escaped");
+  });
+});
+
+// BACKLOG #2441: leaving the run view tells the host, and the host then answers no caseDetail for it.
+suite("Test Bench webview — leaving the run view releases the run the host holds", () => {
+  teardown(closeWindows);
+
+  type Held = { id: number; details: typeof JUDGED.details } | null;
+  const leave = { command: "leaveRun", run: RUN_ID };
+  function leaves(b: Bench): Payload[] {
+    return b.posted.filter((m) => m.command === "leaveRun");
+  }
+  /** Play the host's half: apply each posted message to the held run, as testBench.ts onMessage does. */
+  function hostAfter(b: Bench): Held {
+    let held: Held = { id: RUN_ID, details: JUDGED.details };
+    for (const m of b.posted) {
+      held = heldAfterIncoming(held, m);
+    }
+    return held;
+  }
+
+  test("on the run view the host still answers a caseDetail (control)", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.detail.querySelector('button[data-case-detail="0"]').click();
+    assert.deepStrictEqual(leaves(b), [], "the run view posted leaveRun while still on screen");
+    assert.strictEqual(pickCaseDetail(hostAfter(b), RUN_ID, 0), JUDGED.details[0]);
+  });
+
+  test("Back posts leaveRun once, and the host then answers no caseDetail for that run", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.window.document.getElementById("back").click();
+    assert.deepStrictEqual(leaves(b), [leave]);
+    assert.strictEqual(pickCaseDetail(hostAfter(b), RUN_ID, 0), null, "a released run was answered");
+    b.deliver(clone(COLLECTIONS)); // the run view is already gone, so nothing is left again
+    assert.deepStrictEqual(leaves(b), [leave], "a second leave was posted");
+  });
+
+  test("another view replacing the run view posts leaveRun, and the host answers nothing after", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.deliver(clone(COLLECTIONS));
+    assert.deepStrictEqual(leaves(b), [leave]);
+    assert.strictEqual(pickCaseDetail(hostAfter(b), RUN_ID, 1), null, "a released run was answered");
+  });
+
+  test("each other view type replacing the run view posts leaveRun", () => {
+    for (const [why, payload] of [
+      ["detail", DETAIL],
+      ["trace", TRACE],
+      ["hex", HEX],
+    ] as [string, Payload][]) {
+      const b = assertRendered(RUN, "collectionRun");
+      b.deliver(clone(payload));
+      assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw`);
+      assert.deepStrictEqual(leaves(b), [leave], why);
+    }
+  });
+
+  test("a caseDetail reply does not count as leaving the run view", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.detail.querySelector('button[data-case-detail="0"]').click();
+    b.deliver(caseDetail(0));
+    assert.deepStrictEqual(leaves(b), []);
+  });
+
+  test("a newer run replacing the view releases only the old run id", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.deliver({ ...clone(RUN), run: RUN_ID + 1 });
+    assert.deepStrictEqual(leaves(b), [leave]);
+    const newer = { id: RUN_ID + 1, details: JUDGED.details };
+    assert.strictEqual(releaseRun(newer, RUN_ID), newer, "the old run's leave dropped the newer run");
+  });
+
+  test("no run view on screen means nothing to leave", () => {
+    const b = bench();
+    b.deliver(clone(COLLECTIONS));
+    b.window.document.getElementById("back").click();
+    assert.deepStrictEqual(leaves(b), []);
   });
 });

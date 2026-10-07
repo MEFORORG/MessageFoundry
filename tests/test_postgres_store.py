@@ -1065,6 +1065,22 @@ async def test_pending_approval_store_contract(store) -> None:
     await _assert_pending_approval_contract(store)
 
 
+async def test_approval_transition_audit_contract(store) -> None:
+    """vault BACKLOG #2255 on the Postgres backend: a request or a transition and its audit row
+    commit or roll back together, and a transition that matches no row writes no row."""
+    from tests._pending_approval_store_contract import _assert_transition_audit_contract
+
+    await _assert_transition_audit_contract(store)
+
+
+async def test_approval_repeat_request_contract(store) -> None:
+    """vault BACKLOG #2445 on the Postgres backend: a repeat request joins the open one, and
+    concurrent repeats file one request between them."""
+    from tests._pending_approval_store_contract import _assert_repeat_request_contract
+
+    await _assert_repeat_request_contract(store)
+
+
 async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
     """BACKLOG #2624 on the real Postgres backend: each operator mutation appends its audit row
     under the audit advisory lock inside its own transaction, so a failed append rolls it back."""
@@ -1087,6 +1103,14 @@ async def test_interrupted_approval_resolution_contract(store) -> None:
     from tests._pending_approval_store_contract import _assert_interrupted_resolution_contract
 
     await _assert_interrupted_resolution_contract(store)
+
+
+async def test_restart_reconcile_contract(store) -> None:
+    """BACKLOG #1562: the claim writes this backend's ``claim_owner`` column, and a restarted gate
+    moves only its own ``executing`` rows (and unowned ones) to ``interrupted``."""
+    from tests._pending_approval_store_contract import _assert_restart_reconcile_contract
+
+    await _assert_restart_reconcile_contract(store)
 
 
 async def test_directory_identity_store_contract(store) -> None:
@@ -4556,7 +4580,7 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     it), then run the CLI OFF the event loop — ``_audit_verify`` calls ``asyncio.run`` internally, which
     raises inside a running loop, so ``asyncio.to_thread`` gives it a fresh loop + its own pool."""
     from messagefoundry.__main__ import main
-    from tests._phi_gate_provisions import setenv_at_rest_opt_out
+    from tests._phi_gate_provisions import delenv_at_rest_opt_out, setenv_at_rest_opt_out
 
     # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
     # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
@@ -4567,6 +4591,16 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     assert rc == 0
     out = capsys.readouterr().out
     assert "OK:" in out and "verified 2" in out
+
+    # Vault BACKLOG #3110, item 3: the same clean keyless chain from a shell whose settings require
+    # a key exits 5 on this backend too. The exit is decided in the CLI, so this pins that nothing
+    # backend-specific sits between the walk's flag and the code.
+    delenv_at_rest_opt_out(monkeypatch)
+    rc = await asyncio.to_thread(main, ["audit-verify"])
+    captured = capsys.readouterr()
+    assert rc == 5, (captured.out, captured.err)
+    assert captured.out.startswith("NOT CHECKED: "), captured.out
+    assert "WARNING: the audit chain is keyless" in captured.err, captured.err
 
 
 async def test_audit_anchor_cli_server(store, capsys, monkeypatch) -> None:

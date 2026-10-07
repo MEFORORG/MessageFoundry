@@ -164,6 +164,11 @@ _ALLOWED: tuple[_Allowed, ...] = (
         "the new message is that same text",
     ),
     _Allowed(
+        "messagefoundry/config/wiring.py::EnvRef.__post_init__::ValueError::WiringError",
+        _SAFE + "_cast_bool's fixed text withholds the value and lists the spellings, which the "
+        "new message also lists",
+    ),
+    _Allowed(
         "messagefoundry/framing.py::codec_for::KeyError::ValueError",
         _SAFE + "KeyError carries the framing preset name, which the new message also quotes",
     ),
@@ -279,11 +284,6 @@ _ALLOWED: tuple[_Allowed, ...] = (
     _Allowed(
         f"{_APP}._authorized_upload_meta::(UploadPathError, UploadNotFoundError)" + _HTTP,
         _SAFE + _UPLOAD_MISS,
-    ),
-    _Allowed(
-        f"{_APP}._authorized_upload_meta::UploadUnreadableError" + _HTTP,
-        _SAFE + _UPLOAD_MISS,
-        count=2,
     ),
     _Allowed(
         f"{_APP}.browse_uploaded_file::(UploadPathError, UploadNotFoundError)" + _HTTP,

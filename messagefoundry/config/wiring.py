@@ -229,6 +229,28 @@ class EnvRef:
     default: Any = _UNSET
     cast: Callable[[Any], Any] | None = None
 
+    def __post_init__(self) -> None:
+        # vault BACKLOG #3138: the builtin ``bool`` is the wrong cast for an environment value. Every
+        # ``MEFOR_VALUE_*`` variable is text, and ``bool("false")``/``bool("0")`` are True, so
+        # ``env("x", cast=bool)`` used to turn "false" into True on a ``tls_allow_expired`` or a
+        # ``trust_server_certificate``, silently. Swap in the strict spelling cast here rather than
+        # only in :func:`env`, so an ``EnvRef`` built directly is held to the same reading. Frozen, so
+        # ``object.__setattr__``; ``_cast_bool`` is defined below and only looked up at call time.
+        if self.cast is bool:
+            object.__setattr__(self, "cast", _cast_bool)
+        # A default is never cast at resolve time, so ``default="false"`` would reach the connector
+        # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
+        # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
+        # the reason ``_cast_bool`` gives.
+        if self.cast is _cast_bool and self.default is not _UNSET and self.default is not None:
+            try:
+                object.__setattr__(self, "default", _cast_bool(self.default))
+            except ValueError:
+                raise WiringError(
+                    f"env reference {self.key!r} with a bool cast: default= is not a boolean "
+                    f"({', '.join(sorted(_BOOL_SPELLINGS))}, or True/False; value withheld)"
+                ) from None
+
 
 def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = None) -> EnvRef:
     """Reference an environment-specific value, resolved per running instance (DEV/PROD).
@@ -243,7 +265,17 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     ``default`` makes the engine refuse to load/promote that graph — never a silent blank.
 
     The key is matched case-insensitively (lower-cased here, as it is on the value side), so
-    ``env("EPIC_HOST")``, the file key ``epic_host``, and ``MEFOR_VALUE_EPIC_HOST`` all line up."""
+    ``env("EPIC_HOST")``, the file key ``epic_host``, and ``MEFOR_VALUE_EPIC_HOST`` all line up.
+
+    ``cast=bool`` means the strict boolean reading, the same one ``connections.toml``'s
+    ``cast = "bool"`` gets (vault BACKLOG #3138): ``true``/``1``/``yes``/``on`` read True,
+    ``false``/``0``/``no``/``off`` read False, case-insensitively, and any other value is refused at
+    resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
+    ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
+    string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
+    made, and an unreadable one is refused then. Any other callable runs as given, so
+    ``cast=lambda s: bool(s)`` keeps the builtin's trap, and an uncast ``env()`` hands a boolean
+    setting text, which a connector reads as true when it is non-empty."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
@@ -265,6 +297,9 @@ _BOOL_SPELLINGS: dict[str, bool] = {
 def _cast_bool(raw: Any) -> bool:
     """Parse an environment value's boolean spelling — the ``cast = "bool"`` named cast (ADR 0007).
 
+    It is also what a code-first ``env(..., cast=bool)`` runs: :class:`EnvRef` swaps the builtin
+    ``bool`` for it (vault BACKLOG #3138), so the two authoring routes read one value one way.
+
     The builtin ``bool`` cannot do this job. An environment value arrives as a **string**, and
     ``bool(str)`` is true for every non-empty one, so ``MEFOR_VALUE_X=false`` (and ``0``/``no``/``off``)
     would resolve to ``True`` — the inverse of what the operator wrote, silently, with only an unset or
@@ -277,7 +312,7 @@ def _cast_bool(raw: Any) -> bool:
     strings ``"0"``/``"1"`` are already accepted, so refusing only the typed form would be an arbitrary
     seam. Any other int (``2``, ``-1``) has no unambiguous reading and raises.
 
-    Raises ``ValueError`` — what both cast call sites already catch, so the failure is batched and
+    Raises ``ValueError`` — what every cast call site catches, so the failure is batched and
     redacted by :func:`resolve_env_settings` rather than propagating raw. See the raise below for why
     the message must not name the value."""
     if isinstance(raw, bool):
@@ -570,14 +605,19 @@ def parse_env_setting(value: Any) -> Any:
     :class:`EnvRef` — the inverse of :func:`display_settings`'s ``{"env": key[, "default"]}`` encoding;
     ``cast`` is a **named** cast (``"int"``/``"float"``/``"bool"``/``"str"``) since a file can't carry a
     Python callable. Any other value (a scalar, list, or a plain dict like a REST ``headers`` map) is
-    returned verbatim. Raises :class:`WiringError` on a malformed env marker or an unknown cast name."""
+    returned verbatim. Raises :class:`WiringError` on a malformed env marker, an unknown cast name, or
+    a ``cast = "bool"`` default that is not a boolean spelling (vault BACKLOG #3138; :class:`EnvRef`
+    reads that default when it is made). The message names neither the connection nor the setting;
+    ``connections_file._build_spec`` adds both."""
     if not _is_env_marker(value):
         return value
     key = value["env"]
     if not isinstance(key, str) or not key:
         raise WiringError(f"env reference must name a non-empty string key, got {key!r}")
     cast_name = value.get("cast")
-    if cast_name is not None and cast_name not in _NAMED_CASTS:
+    # `not isinstance(str)` first: a TOML array or table is unhashable, and the dict lookup would raise
+    # a raw TypeError that no caller turns into a message naming the connection.
+    if cast_name is not None and (not isinstance(cast_name, str) or cast_name not in _NAMED_CASTS):
         raise WiringError(
             f"env reference {key!r}: unknown cast {cast_name!r} "
             f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
@@ -670,8 +710,10 @@ def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool
 
     Runs on the RAW settings, before ``env()`` resolves (vault BACKLOG #2232). The factories already
     refuse an ``env()`` flag. A reference written into the dict after them would resolve through its
-    own cast, and ``env(..., cast=bool)`` turns the string ``"false"`` into ``True``. So the flag is
-    refused while it is still an :class:`EnvRef`. The attestation pair then goes through
+    own cast, and when this was written ``env(..., cast=bool)`` turned the string ``"false"`` into
+    ``True``. Vault BACKLOG #3138 made ``cast=bool`` strict, but any other callable still runs as
+    given, and the factories refuse ``env()`` on these flags outright. So the flag is still refused
+    while it is an :class:`EnvRef`. The attestation pair then goes through
     :func:`settings_hop_attestation`, so a ``DatabaseLookup`` or ``DatabaseRef`` reason is held to
     the same type and control-character rules as a ``FhirLookup`` one.
 
@@ -687,6 +729,25 @@ def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool
                 "accepted on a hop-policy flag)"
             ) from exc
     return settings_hop_attestation(settings, where)
+
+
+def refuse_resolved_verify_off(
+    type_: ConnectorType, settings: Mapping[str, Any], where: str
+) -> None:
+    """Re-run the DICOMweb factory's unread-CA refusal on RESOLVED settings.
+
+    The factory refuses ``tls_ca_file`` with a falsy literal ``verify_tls``, because nothing would
+    read the CA. An ``env()`` reference is truthy there, so it passes. Once it resolves, it can be
+    falsy, and more often since vault BACKLOG #3138 made ``cast=bool`` read ``false`` as False. So
+    the same test runs here, on the value the connector will read. SOAP needs no copy: its
+    connector refuses a client cert with verification off when it is built."""
+    if type_ is not ConnectorType.DICOMWEB or "verify_tls" not in settings:
+        return
+    if not settings["verify_tls"] and settings.get("tls_ca_file"):
+        raise WiringError(
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false, empty "
+            "or unset value, which verifies nothing, and DICOMweb has no token hop."
+        )
 
 
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:

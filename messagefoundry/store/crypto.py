@@ -1361,7 +1361,14 @@ def make_cipher(
     ``[store].allow_unmarked_ciphertext``: off, a keyed cipher refuses a non-blank unmarked value."""
     if not key_b64:
         return IdentityCipher()
-    active = _decode_key(key_b64, "MEFOR_STORE_ENCRYPTION_KEY")
+    # Named by role, not by one variable: the active key may come from MEFOR_STORE_ENCRYPTION_KEY,
+    # a DPAPI key file or another provider, and an error naming only the variable sends an operator
+    # to a source that is not set (vault BACKLOG #3054, item 8).
+    active = _decode_key(
+        key_b64,
+        "the active store key (MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the "
+        "[store].key_provider)",
+    )
     retired = [_decode_key(k, "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED") for k in retired_b64 if k]
     return AesGcmCipher(active, retired, write_v2=write_v2, allow_unmarked=allow_unmarked)
 

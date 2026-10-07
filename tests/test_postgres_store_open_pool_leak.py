@@ -17,6 +17,7 @@ no real Postgres server involved.
 
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from typing import Any
@@ -30,11 +31,14 @@ from messagefoundry.store.postgres import PostgresStore
 class _FakePool:
     """Records whether (and how many times) ``close()`` was awaited."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, close_fails: bool = False) -> None:
         self.closed = 0
+        self._close_fails = close_fails
 
     async def close(self) -> None:
         self.closed += 1
+        if self._close_fails:
+            raise ConnectionResetError("pool close wedged")
 
 
 def _install_fake_asyncpg(monkeypatch: pytest.MonkeyPatch, pool: _FakePool) -> None:
@@ -71,6 +75,30 @@ async def test_open_closes_the_pool_when_ensure_schema_raises(
         await PostgresStore.open(_settings())
 
     assert pool.closed == 1
+
+
+async def test_a_pool_close_that_fails_does_not_replace_the_opens_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3054: the cleanup's failure is logged by class, and the OPEN's error
+    propagates. Before, the cleanup's error escaped and hid why the open failed, a tagged audit
+    chain read that `audit-verify` must report among others."""
+    pool = _FakePool(close_fails=True)
+    _install_fake_asyncpg(monkeypatch, pool)
+
+    async def _boom(self: PostgresStore, **_kwargs: object) -> bool:
+        raise RuntimeError("schema boom")
+
+    monkeypatch.setattr(PostgresStore, "_ensure_schema", _boom)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.store.postgres"),
+        pytest.raises(RuntimeError, match="schema boom"),
+    ):
+        await PostgresStore.open(_settings())
+    assert pool.closed == 1
+    assert "closing the pool after a failed open also failed (ConnectionResetError)" in caplog.text
+    assert "pool close wedged" not in caplog.text  # by class only
 
 
 async def test_open_closes_the_pool_when_a_later_init_step_raises(

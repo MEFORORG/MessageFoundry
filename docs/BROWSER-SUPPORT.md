@@ -100,7 +100,7 @@ paired with a control that does not depend on the browser.
 | `Strict-Transport-Security` | The browser's own downgrade protection. The engine sends it only when you supplied a certificate chain or declared a TLS terminator. It is absent on the engine's minted self-signed certificate, which is the shipped default, and on any IP-literal host such as `127.0.0.1`. RFC 6797 tells a browser to ignore it in both places anyway. | The engine's own listener speaks only TLS unless `[api].tls_terminated_upstream` declares a proxy in front of it. Behind such a proxy, redirecting cleartext to HTTPS is the proxy's job, and nothing in the engine checks that it does. The insecure-connection banner above makes a cleartext hop visible in the page. |
 | Session cookie `__Host-` prefix (`__Secure-` under the opt-out below), `Secure`, `HttpOnly` | Prefix and transport binding on the session cookie. | `HttpOnly` is what makes these invisible to a page script in the first place. They are only ever set where a browser will honour them, session termination is server-side, and every state-changing `/ui` POST carries a server-side `Sec-Fetch-Site` / `Origin` check. |
 | Session cookie `SameSite=Strict` | The browser's own cross-site request block. | That same server-side `Sec-Fetch-Site` / `Origin` check, on every state-changing `/ui` POST including login and logout. A browser that ignores `SameSite` still cannot be driven cross-site, as long as it sends one of those two headers. The request-header table below says what happens when it sends neither. |
-| `sandbox` in the attachment download's `Content-Security-Policy` | On `/ui/messages/<id>/attachments/<id>`, the engine serves the file under `default-src 'none'; sandbox; frame-ancestors 'none'`. A browser that ignores `sandbox` no longer puts the file in a unique, script-less origin of its own. | The response is always `Content-Disposition: attachment`, so the browser saves the file rather than showing it. Its declared type is an allow-listed inert type (PDF, image, plain text, CSV, JSON, DICOM) or `application/octet-stream`, and `nosniff` applies. The same policy's `default-src 'none'` still blocks every script in a browser that enforces CSP at all. Only a browser that ignored `sandbox`, `Content-Disposition` and `default-src` together would open the file in the console's origin, and nothing would warn you. |
+| `sandbox` in the attachment download's `Content-Security-Policy` | On `/ui/messages/<id>/attachments/<id>`, the engine serves the file under `default-src 'none'; sandbox; frame-ancestors 'none'; base-uri 'none'`. A browser that ignores `sandbox` no longer puts the file in a unique, script-less origin of its own. | The response is always `Content-Disposition: attachment`, so the browser saves the file rather than showing it. Its declared type is an allow-listed inert type (PDF, image, plain text, CSV, JSON, DICOM) or `application/octet-stream`, and `nosniff` applies. The same policy's `default-src 'none'` still blocks every script in a browser that enforces CSP at all. Only a browser that ignored `sandbox`, `Content-Disposition` and `default-src` together would open the file in the console's origin, and nothing would warn you. |
 
 ### Request headers the browser sends
 
@@ -165,9 +165,9 @@ These URLs are FastAPI's defaults and can change when FastAPI is upgraded.
 
 What that means for a browser:
 
-- **Their only CSP is `frame-ancestors 'none'`.** It blocks framing and nothing else, so no script
-  source is restricted, and the files carry no integrity hash. What runs is whatever those hosts
-  serve that day.
+- **Their only CSP is `frame-ancestors 'none'; base-uri 'none'`.** It blocks framing and `<base>`
+  injection and nothing else, so no script source is restricted, and the files carry no integrity
+  hash. What runs is whatever those hosts serve that day.
 - **They need JavaScript and a route to those hosts.** Without either, the page renders blank, and
   nothing tells you why.
 - The engine still sends `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and

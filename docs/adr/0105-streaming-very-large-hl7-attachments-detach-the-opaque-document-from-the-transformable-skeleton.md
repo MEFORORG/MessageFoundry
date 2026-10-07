@@ -611,7 +611,9 @@ Comments, processing instructions and any `<!DOCTYPE>` do not reach the output.
 - it nests more than 256 elements deep;
 - it is larger than 32 MiB.
 
-The refusal comes before the download is audited, because no byte leaves. Serving the original bytes
+The refusal writes no `attachment_download` row, because no byte leaves. *Amended 2026-10-07
+(BACKLOG #2387):* it writes an `attachment_download_refused` row instead, described under
+"What this leaves open" below. Serving the original bytes
 instead would hand an unvetted SVG to exactly the case the parser could not check. A browser honours
 an internal DTD that `defusedxml` refuses. A `<!DOCTYPE>` with no entity declaration is accepted,
 since common editors still write the SVG 1.1 one. Illustrator files that declare entities are
@@ -636,6 +638,12 @@ them.
   embeds an `<svg>` element, is not sanitized. It is served as before, under the inert-type downgrade
   and the sandbox CSP. That is the same exposure any other active XML or HTML attachment has, and it
   sits outside 1.3.4's SVG scope.
-- A refused download writes a WARNING log line and no audit row, as the route's other 422 does for
-  an undecodable stored value. Whether a refusal belongs in the tamper-evident chain is open.
+- *Closed 2026-10-07 (BACKLOG #2387).* This bullet read: a refused download writes a WARNING log
+  line and no audit row, as the route's other 422 does for an undecodable stored value, and whether
+  a refusal belongs in the tamper-evident chain is open. That bullet was wrong in one respect: the
+  undecodable 422 wrote no log line either. Both 422s now log a content-free WARNING and write one
+  `attachment_download_refused` row. It names the acting user, the channel, the id pair and a
+  `reason` of `svg_unsanitizable` or `undecodable`, and never a byte of the document. It is its own
+  action, so a reader filtering on `attachment_download` never counts a refusal as a document that
+  left. A refusal writes no `record_view`, since nothing was viewed.
 - No real browser has been run against the download.

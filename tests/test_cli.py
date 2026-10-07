@@ -613,7 +613,7 @@ def test_rotate_key_warns_when_an_uploaded_file_could_not_be_resealed(
     _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
     assert main(["rotate-key", "--db", str(db)]) == 0
     err = capsys.readouterr().err
-    assert "could not be read and were NOT re-sealed" in err
+    assert "could not be read and were NOT fully re-sealed" in err
     assert "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED" in err
 
 
@@ -3217,7 +3217,8 @@ def test_admin_unlock_refuses_a_missing_store_rather_than_creating_one(
     # "no such user" -- which reads as a wrong USERNAME when the truth is a wrong DATABASE.
     monkeypatch.chdir(tmp_path)
     missing = tmp_path / "nope.db"
-    assert main(["admin-unlock", "--username", "admin", "--db", str(missing), "--json"]) == 1
+    # 2, could not start (vault BACKLOG #3110, item 4); it was 1, the code for an account refusal.
+    assert main(["admin-unlock", "--username", "admin", "--db", str(missing), "--json"]) == 2
     payload = json.loads(capsys.readouterr().out)
     assert "refusing to create one" in payload["error"]
     assert not missing.exists(), "the refusal still created the database"
