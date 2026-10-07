@@ -7,8 +7,8 @@
 > **and** the server-DB keys), **`[api]`**, **`[inbound]`**, **`[delivery]`** (the retry policy, queue
 > ordering and alert thresholds an outbound inherits when it declares none), **`[environments]`** (`dir`;
 > active env = `[ai].environment`), **`[logging]`**, **`[auth]`**, **`[ai]`**, **`[retention]`** (enforced
-> by the retention/purge + SQLite-maintenance pass), and the rest — **except `[engine]`**, which has no
-> model at all. The four sections that used to be built-but-uncatalogued now have their own entries:
+> by the retention/purge + SQLite-maintenance pass), and the rest. **`[engine]` is not one of them**: it
+> has no model, so it is refused at load like any other unknown section ([`[engine]`](#engine)). The four sections that used to be built-but-uncatalogued now have their own entries:
 > **`[tls]`** (client trust anchors, [ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)),
 > **`[reference]`**, **`[backup]`** ([ADR 0049](adr/0049-turnkey-dr-backup-restore-verify.md)) and
 > **`[dr]`** ([ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md)).
@@ -16,8 +16,13 @@
 > **An unrecognized KEY in `messagefoundry.toml` is REFUSED at load** — a key its section does not
 > define fails the start, naming the section, the key and the nearest real field name. It used to be
 > accepted silently, which left the setting it was meant to apply un-applied with nothing anywhere
-> reporting a problem. An unknown top-level **SECTION** is still tolerated (`[engine]`, see
-> [`[engine]`](#engine)), so a forward-looking file that adds a whole section still loads.
+> reporting a problem. **An unknown top-level SECTION, or a key written above the first `[section]`
+> header, is refused the same way**, naming it and, when one fits, the section it was probably meant
+> for. So is a top-level section written as anything but one table (`[[integrity]]`). A misspelt section
+> used to drop every key under it at once: `[integrty]` with `fail_closed_on_drift = true` loaded clean
+> and left the tripwire alert-only. So a file that adds a section from newer docs no longer loads on an
+> engine that does not model it. The refusal never repeats the offending value, because this file can
+> carry secrets.
 >
 > **The refusal covers the FILE, and the CLI refuses an unknown flag too. Env mostly does not — check
 > `MEFOR_*` spellings yourself.** An unknown `serve` flag stops the command: argparse prints
@@ -1976,16 +1981,12 @@ made since the last boot — it says nothing about the window between two boots,
 restarts never checks. The tee is the only control that sees the trail as it is written.
 
 ### `[engine]`
-**Not implemented.** There is **no `EngineSettings` model**, so an `[engine]` block in
-`messagefoundry.toml` is parsed and **silently dropped** (`ServiceSettings` is `extra="ignore"`). The rows
-below are the shape a future section would take, not knobs that do anything today. In particular
-`data_dir` does **not** anchor relative paths — reach for `[environments].base_dir` /
-`serve --project-root` for `env()` value files, and `--db` / `[store].path` for the store, instead.
-
-| Key | Type | Default | Notes |
-|---|---|---|---|
-| `shutdown_timeout_seconds` | int | — | **accepted-but-ignored** (proposed): graceful stop. The ASGI lifespan's `engine.stop()` is not bounded by a setting today |
-| `data_dir` | str | — | **accepted-but-ignored** (proposed): base for relative paths. Setting it anchors nothing |
+**Not a section.** There is **no `EngineSettings` model**, so an `[engine]` block in
+`messagefoundry.toml` is **refused at load** as an unknown section, like any other. Earlier versions of
+this page listed `shutdown_timeout_seconds` and `data_dir` here as proposed keys; neither does anything.
+The ASGI lifespan's `engine.stop()` is not bounded by a setting, and for relative paths use
+`[environments].base_dir` / `serve --project-root` for `env()` value files, and `--db` / `[store].path`
+for the store.
 
 ### `[service]` (NSSM / Windows)
 The NSSM **install** knobs — auto-restart, stdout/stderr log paths — live in `scripts/service/`. The
