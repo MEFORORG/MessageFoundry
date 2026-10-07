@@ -45,6 +45,7 @@ from messagefoundry.config.settings import (
     AuthSettings,
     EgressSettings,
 )
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
@@ -858,6 +859,69 @@ async def test_the_other_lost_reload_rows_cannot_forge_a_log_line(
         "requested": _FORGING_DIR,
         "dry_run": False,
     }
+
+
+async def _keep_audit(action: str, **kwargs: Any) -> None:
+    return None
+
+
+#: An engine whose audit log takes every write, so a refusal logs its WARNING and nothing else.
+_AUDIT_UP = cast(Engine, SimpleNamespace(store=SimpleNamespace(record_audit=_keep_audit)))
+
+
+def _refusal_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "messagefoundry.api.app"
+        and r.levelno == logging.WARNING
+        and r.getMessage().startswith("config reload ")
+    ]
+
+
+async def test_a_missing_dir_refusal_logs_the_whole_long_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Lander hold on PR 2115. The refusal WARNING is the only place the real reload error is
+    written, and ``safe_exc``'s default 200-character cut dropped the directory from a long config
+    path. The whole path must reach the line, past where the old cut fell."""
+    long_dir = "/opt/messagefoundry/" + "/".join(f"site-{i:02d}-feeds" for i in range(25))
+    assert len(long_dir) > 300
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        status, answer = await _audit_refused_reload(
+            _AUDIT_UP,
+            FileNotFoundError(f"config directory not found: {long_dir}"),
+            actor="alice",
+            requested=long_dir,
+            dry_run=False,
+        )
+    assert (status, answer) == (404, "config directory not found")
+    [warning] = _refusal_warnings(caplog)
+    assert warning == (
+        f"config reload failed (missing dir): FileNotFoundError: config directory not found: {long_dir}"
+    )
+
+
+async def test_an_invalid_config_refusal_cannot_forge_a_log_line_and_keeps_its_fix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The 422 WiringError arm of the same WARNING. A CR/LF in the error text must not start a new
+    log line, and a long error keeps its tail, which is where a WiringError puts its fix."""
+    fix = "fix: point tls_ca_file at a readable PEM bundle"
+    padding = " ".join(f"step-{i:02d}-checked" for i in range(20))
+    error = WiringError(
+        f"inbound IB_X_ADT at {_FORGING_DIR}: tls_ca_file unreadable; {padding}; {fix}"
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        status, answer = await _audit_refused_reload(
+            _AUDIT_UP, error, actor="alice", requested=_FORGING_DIR, dry_run=False
+        )
+    assert (status, answer) == (422, "invalid configuration")
+    _assert_no_forged_line(caplog)
+    [warning] = _refusal_warnings(caplog)
+    assert warning.startswith("config reload failed (invalid config): WiringError: ")
+    assert "/cfg\\r\\nFORGED config reload succeeded" in warning
+    assert warning.endswith(fix)
 
 
 async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(

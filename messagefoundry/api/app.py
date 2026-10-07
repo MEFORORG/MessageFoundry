@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -1409,6 +1410,14 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     WiringError,
 )
 
+#: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for its refusal WARNINGs.
+#: Those WARNINGs are the only place the real reload error is written, so they keep all of it:
+#: ``safe_exc``'s default 200-character cut dropped the directory from a long config path, and a long
+#: WiringError lost its fix instruction. ``safe_exc`` still redacts the text, and ``safe_text`` still
+#: bounds the redactor's scan to its own window, so this lifts the answer cut and nothing else. The
+#: line is then as long as the handler's RedactionFilter keeps any log argument.
+_REFUSAL_LOG_LIMIT: Final = sys.maxsize
+
 
 async def _audit_refused_reload(
     engine: Engine,
@@ -1432,7 +1441,9 @@ async def _audit_refused_reload(
     vanished or left the reload roots before its release is refused and recorded the way an inline
     one is, rather than escaping the approve route as a 500 (vault BACKLOG #2459). The detail text
     is generic on purpose: the real error is logged here, never returned, so a ``config:deploy``
-    holder cannot probe the filesystem through it.
+    holder cannot probe the filesystem through it. The 404 and 422 WARNINGs log the whole error,
+    redacted by ``safe_exc`` and with every line break escaped, and are not cut to a fixed length
+    (:data:`_REFUSAL_LOG_LIMIT`). The 403 writes no WARNING.
 
     ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.
 
@@ -1444,7 +1455,10 @@ async def _audit_refused_reload(
         action = "config_reload_denied"
         status, answer = 403, "config directory is not an allowed reload root"
     elif isinstance(exc, FileNotFoundError):
-        _log.warning("config reload failed (missing dir): %s", scrub_log_argument(safe_exc(exc)))
+        _log.warning(
+            "config reload failed (missing dir): %s",
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+        )
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     else:
@@ -1452,7 +1466,7 @@ async def _audit_refused_reload(
         _log.warning(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
-            scrub_log_argument(safe_exc(exc)),
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
         )
         action = "config_reload_failed"
         detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
