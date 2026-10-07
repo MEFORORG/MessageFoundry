@@ -18,13 +18,19 @@ the code meets them.
   Comments and processing instructions never reach the tree.
 - When the parser cannot reach a document's root, :func:`_first_element_name` finds it by scanning the
   bytes, skipping comments, processing instructions and declarations. So an SVG cannot escape the
-  sanitizer by making the parser fail first, and an HTML page that merely embeds an ``<svg>`` is not
-  mistaken for one.
+  sanitizer by making the parser fail first.
+- Markup whose root is not ``svg`` but which carries an SVG element anywhere, such as XHTML or an HTML
+  page with an inline ``<svg>``, is refused rather than rewritten (BACKLOG #2391). Rewriting would
+  change the parts that are not SVG, and those are verbatim clinical content.
+- A gzip body, which is what an SVGZ file is, is inflated under the same size bound and vetted like
+  plain bytes. A sanitized SVG inside is served gzipped again (BACKLOG #2391).
 """
 
 from __future__ import annotations
 
+import gzip
 import re
+import zlib
 from typing import Final
 from xml.etree.ElementTree import (  # nosec B405 -- types only; every parse goes through defusedxml
     Element,
@@ -54,6 +60,48 @@ _FIRST_CONTENT_BYTE_RE: Final = re.compile(rb"[^ \t\r\n\x0b\x0c\x00\xef\xbb\xbf\
 #: An element name after ``<``: every byte up to whitespace, ``/`` or ``>``. Bytes rather than a word
 #: class, so a prefix in any encoding compatible with ASCII is taken whole.
 _ELEMENT_NAME_RE: Final = re.compile(rb"[^\s/>]*")
+#: The two leading bytes of every gzip member (RFC 1952). An SVGZ file is a gzipped SVG.
+_GZIP_MAGIC: Final = b"\x1f\x8b"
+#: The most gzip members one body may hold. Each member after the first costs a copy of what remains,
+#: so an unbounded count of tiny members would cost quadratic time.
+_MAX_GZIP_MEMBERS: Final = 16
+#: How much of a gzip body is inflated first, to clear one that is plainly not markup cheaply.
+_GZIP_SNIFF_BYTES: Final = 64 * 1024
+#: Traces of SVG in markup the parser could not read through: an ``svg`` start tag under any prefix
+#: and in any case, the SVG namespace name, or a namespace name spelled with a reference, which can
+#: hide it. Possessive quantifiers, and name classes that exclude ``<`` and ``:``, keep the scan
+#: linear: no run is scanned from more than one start.
+_SVG_TRACE_RE: Final = re.compile(
+    rb"<(?:[^\s/<>!?:&]*+:)?svg(?![^\s/>])"
+    rb"|http://www\.w3\.org/2000/svg"
+    rb"|xmlns(?::[^\s=<>:]*+)?\s*+=\s*+(?:[\"'][^\"'<&]*+)?&(?!(?:quot|apos|amp|lt|gt);)",
+    re.IGNORECASE,
+)
+#: An internal entity could build an SVG element out of bytes the scan above cannot read, since any
+#: byte of a name or a namespace can be a reference. Checked only when the document declares an
+#: entity, since an HTML report may well write ``&#60;`` as text.
+_ENTITY_DECL_RE: Final = re.compile(rb"<!ENTITY", re.IGNORECASE)
+_ENTITY_MARKUP_RE: Final = re.compile(rb"&#0*+60;|&#x0*+3c;|<[^\s/<>!?&]*+&", re.IGNORECASE)
+#: One entity declaration: group 1 is ``%`` for a parameter entity, and group 2 or 3 its quoted value.
+#: The class before the value excludes ``<``, so no run is scanned from two declarations.
+_ENTITY_VALUE_RE: Final = re.compile(
+    rb"<!ENTITY\s++(%?)[^\"'<>]*+(?:\"([^\"]*+)\"|'([^']*+)')", re.IGNORECASE
+)
+#: A reference in an entity value that yields ``<`` or ``&``, from which markup can be built in a
+#: later step.
+_LT_OR_AMP_REF_RE: Final = re.compile(rb"&#0*+(?:60|38);|&#x0*+(?:3c|26);", re.IGNORECASE)
+
+
+def _entity_may_build_markup(data: bytes) -> bool:
+    """Whether any internal entity in ``data`` could expand to markup. Only a value holding ``<``,
+    directly or through a reference, can make an element, and a parameter entity can assemble one
+    from parts, so either is enough. A text-only entity such as ``&#160;`` is not."""
+    for match in _ENTITY_VALUE_RE.finditer(data):
+        value = match.group(2) or match.group(3) or b""
+        if match.group(1) or b"<" in value or _LT_OR_AMP_REF_RE.search(value):
+            return True
+    return False
+
 
 #: SVG drawing elements that carry no script, no navigation and no external fetch of their own.
 _ALLOWED_ELEMENTS: Final = frozenset(
@@ -155,6 +203,24 @@ class _RootTarget:
         raise _RootFound(tag)
 
 
+class _SvgFound(Exception):
+    """Raised from :class:`_SvgFinder` at the first SVG element."""
+
+
+class _SvgFinder:
+    """A parser target that stops the parse at the first element in the SVG namespace, or named
+    ``svg`` in any namespace or none. It builds no tree, so its memory does not grow with the
+    document."""
+
+    def start(self, tag: str, attrib: dict[str, str]) -> None:
+        ns, local = _split(tag)
+        if ns == SVG_NS or local.casefold() == "svg":
+            raise _SvgFound
+
+    def close(self) -> None:
+        return None
+
+
 def _split(tag: str) -> tuple[str, str]:
     """``{ns}local`` as ``(ns, local)``; an unqualified name has the empty namespace."""
     if tag.startswith("{"):
@@ -237,6 +303,95 @@ def _root_is_svg(body: bytes) -> bool:
         name = _first_element_name(body.replace(b"\x00", b""))
         return name is not None and name.rpartition(b":")[2].lower() == b"svg"
     return False
+
+
+def _contains_svg(body: bytes) -> bool:
+    """Whether the markup ``body`` holds an SVG element anywhere below a root that is not ``svg``.
+
+    The refusing parser reads the whole document when it can. When it stops, on an entity declaration,
+    an encoding it does not support or a syntax error, a byte scan decides instead, and it errs toward
+    yes. Both are linear in the document, and neither expands an entity."""
+    parser = DefusedXMLParser(
+        target=_SvgFinder(), forbid_dtd=False, forbid_entities=True, forbid_external=True
+    )
+    try:
+        parser.feed(body)
+        parser.close()
+    except _SvgFound:
+        return True
+    except (ParseError, DefusedXmlException, ValueError, LookupError):
+        # Stripping NUL lets the ASCII patterns see UTF-16 and UTF-32 text, as the root scan does.
+        # Only a body holding a NUL pays for the copy.
+        data = body.replace(b"\x00", b"") if b"\x00" in body else body
+        if _SVG_TRACE_RE.search(data):
+            return True
+        if not _ENTITY_DECL_RE.search(data):
+            return False
+        return bool(_ENTITY_MARKUP_RE.search(data)) or _entity_may_build_markup(data)
+    return False
+
+
+def _gunzip_bounded(body: bytes, limit: int) -> tuple[bytes, bool]:
+    """Inflate the gzip ``body``, keeping at most ``limit + 1`` bytes.
+
+    Returns the bytes inflated and whether they are the whole document. They are not when the output
+    passes ``limit``, a member is cut short or corrupt, there are more than :data:`_MAX_GZIP_MEMBERS`
+    members, or anything but NUL padding follows the last one. The bound is enforced while inflating,
+    so a small body that inflates to gigabytes costs no more than ``limit`` bytes of work."""
+    out = bytearray()
+    rest = body
+    for _ in range(_MAX_GZIP_MEMBERS):
+        inflater = zlib.decompressobj(wbits=31)
+        try:
+            out += inflater.decompress(rest, limit + 1 - len(out))
+        except zlib.error:
+            return bytes(out), False
+        if len(out) > limit or not inflater.eof:
+            return bytes(out), False
+        rest = inflater.unused_data
+        if not rest.strip(b"\x00"):
+            return bytes(out), True
+        if not rest.startswith(_GZIP_MAGIC):
+            return bytes(out), False
+    return bytes(out), False
+
+
+def _vet_markup(label: str | None, body: bytes) -> bytes:
+    """:func:`sanitize_if_svg` for bytes that are not gzip."""
+    if not _is_markup(body):
+        return body
+    if "svg" in (label or "").casefold() or _root_is_svg(body):
+        return sanitize_svg(body)
+    if _contains_svg(body):
+        raise SvgRejected("document whose root is not svg carries an SVG element")
+    return body
+
+
+def _vet_gzip(label: str | None, body: bytes) -> bytes:
+    """:func:`sanitize_if_svg` for a gzip body. Only markup inside it is the sanitizer's business.
+
+    A body is cleared as not markup only once its first byte past leading noise is seen and is not
+    ``<``. A body that inflates to nothing but whitespace within the bound has not shown that byte,
+    so it is treated as markup: a reader that inflates the rest may find an SVG there."""
+    head, _ = _gunzip_bounded(body, _GZIP_SNIFF_BYTES)
+    first = _FIRST_CONTENT_BYTE_RE.search(head)
+    if first is not None and first.group() != b"<":
+        return body
+    inner, whole = _gunzip_bounded(body, _MAX_SVG_BYTES)
+    first = _FIRST_CONTENT_BYTE_RE.search(inner)
+    if first is not None and first.group() != b"<":
+        return body
+    if first is None and (whole or not inner):
+        # Empty or only whitespace to its end, or nothing inflated at all: there is nothing to show.
+        return body
+    if not whole:
+        # Markup that cannot be read to its end cannot be vetted, and a reader may still show the part
+        # that did inflate.
+        raise SvgRejected("gzip markup is corrupt, truncated or larger than the bound")
+    vetted = _vet_markup(label, inner)
+    if vetted is inner:
+        return body
+    return gzip.compress(vetted, mtime=0)
 
 
 def _safe_value(value: str) -> bool:
@@ -370,15 +525,20 @@ def sanitize_svg(body: bytes) -> bytes:
 def may_be_svg(body: bytes) -> bool:
     """A cheap, non-blocking pre-check: ``False`` means :func:`sanitize_if_svg` would return ``body``
     unchanged whatever its label, so the caller can skip the thread hop for a PDF or an image. Only
-    markup can be SVG: no SVG reader renders bytes that do not start with ``<``."""
-    return _is_markup(body)
+    markup can be SVG, and no SVG reader renders bytes that do not start with ``<``. The one
+    exception is gzip, since an SVGZ reader inflates it first."""
+    return body.startswith(_GZIP_MAGIC) or _is_markup(body)
 
 
 def sanitize_if_svg(label: str | None, body: bytes) -> bytes:
-    """``body`` unchanged unless it is SVG, in which case the sanitized copy.
+    """``body`` unchanged unless it carries SVG, in which case the sanitized copy.
+
+    An SVG document is sanitized. Markup whose root is not ``svg`` but which holds an SVG element is
+    refused. A gzip body is judged by what it inflates to, and a sanitized SVG inside it is gzipped
+    again.
 
     Raises :class:`SvgRejected` for SVG that cannot be vetted. Blocking work: run it off the event
     loop."""
-    if may_be_svg(body) and ("svg" in (label or "").casefold() or _root_is_svg(body)):
-        return sanitize_svg(body)
-    return body
+    if body.startswith(_GZIP_MAGIC):
+        return _vet_gzip(label, body)
+    return _vet_markup(label, body)
