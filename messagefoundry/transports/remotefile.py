@@ -1485,8 +1485,8 @@ class _SftpClient(_RemoteClient):
         self._user = settings.get("username")
         self._password = settings.get("password")
         self._private_key = settings.get("private_key")
-        self._key_password = settings.get("key_password")
-        _refuse_sftp_key_wrap(self._private_key, self._key_password)
+        # Read only to refuse it: a key_password never reaches paramiko (BACKLOG #2423).
+        _refuse_sftp_key_wrap(self._private_key, settings.get("key_password"))
         self._known_hosts = settings.get("known_hosts")
         self._timeout = float(settings.get("connect_timeout", 30.0))
         # Fail fast at construction (build_check time): an unknown-host-key posture without the escape

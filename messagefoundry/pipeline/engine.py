@@ -93,6 +93,7 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
+from messagefoundry.store.crypto import rotation_fingerprint_keys
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
     AuditAnchorError,
@@ -1603,6 +1604,9 @@ class Engine:
                         # they ride the SAME keyed-MAC fingerprint mechanism as the fixed MEFOR_* classes
                         # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
                         extra_values=self._connector_secret_env_values(),
+                        # BACKLOG #2242: the keys a retired DEK derives, so a DEK rotation re-keys
+                        # the fingerprints instead of reading every class as rotated.
+                        prior_fingerprint_keys=rotation_fingerprint_keys(self.store.cipher()),
                     )
                 except Exception:
                     # A reconcile failure must never take the engine down — the runner still works off the

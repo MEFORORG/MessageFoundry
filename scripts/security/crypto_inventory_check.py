@@ -813,7 +813,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # alert_sinks also imports smtplib: the alert SMTP hop's STARTTLS posture. This is the file
     # BACKLOG #1323 named as the worked example of a seam the store-only set could not match.
     "messagefoundry/pipeline/alert_sinks.py": frozenset({"messagefoundry.config.tls_policy"}),
-    "messagefoundry/pipeline/engine.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # BACKLOG #2242: also imports rotation_fingerprint_keys from store.crypto, the retired-DEK
+    # fingerprint keys the secret-rotation reconcile needs to tell a re-key from a rotation.
+    "messagefoundry/pipeline/engine.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
+    ),
     # Vault BACKLOG #2354: stamps the instance hop posture around the DatabaseRef DSN build, so the
     # weakened-TLS escape is clamped exactly as the db_lookup executor's is. Builds no context.
     "messagefoundry/pipeline/reference_sync.py": frozenset({"messagefoundry.config.tls_policy"}),
@@ -1215,6 +1219,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #2839: fingerprint_bundle_blocking calls config_fingerprint_detail
             # directly (fingerprint_bundle runs it in asyncio.to_thread), so this scanner sees the fold.
             "hash:via messagefoundry.config.fingerprint",
+            # BACKLOG #2242: derives the secret-rotation fingerprint keys of the active and retired
+            # DEKs (rotation_fingerprint_keys) for the reconcile, so a DEK rotation is a re-key.
+            "kdf:via messagefoundry.store.crypto",
             "mac:via messagefoundry.pipeline.secret_rotation",
         }
     ),

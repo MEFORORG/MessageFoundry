@@ -2878,13 +2878,26 @@ scrypt passes at its Appendix C floor.
 openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in <old key> -out <new key>
 ```
 
-**A PKCS#12 bundle for `cert import`** must have PBES2 bags at the floor and a **PBMAC1** MAC at
-the floor. A MAC keyed by the PKCS#12 KDF is refused even over SHA-256, and that is what most
-exports carry, OpenSSL's default included. **The MAC rule holds when the bags are not encrypted**
-(`-keypbe NONE -certpbe NONE`): that MAC still runs the passphrase through the PKCS#12 KDF, so it is
-refused too. So is `cryptography`'s `NoEncryption` output, whose MAC uses an empty passphrase. An
-unencrypted bundle with no MAC at all (`-nomac`) passes with no passphrase, since nothing in it
-comes from a password. Re-export with OpenSSL 3.4 or later:
+**A PKCS#12 bundle for `cert import`** passes in one of two shapes:
+
+- PBES2 bags at the floor, or unencrypted bags, with a **PBMAC1** MAC at the floor;
+- unencrypted bags with no MAC at all (`openssl pkcs12 -export -keypbe NONE -certpbe NONE -nomac
+  -in <cert> -inkey <key> -out <new pfx>`). Nothing in it comes from a password, so it needs no
+  passphrase. **It also has no integrity check**: nothing detects a change to the file, the same as
+  a PEM key file.
+
+A MAC keyed by an empty passphrase passes at the floor too, but it checks no more than no MAC does:
+anyone can recompute it.
+
+Every other MAC is refused, unencrypted bags or not, because it runs the passphrase through the
+PKCS#12 KDF. That holds even over SHA-256, and it is what most exports carry, OpenSSL's default
+included. It also holds when the passphrase is empty, as in `cryptography`'s `NoEncryption` output.
+
+The passphrase comes from `MEFOR_PFX_PASSWORD`. A bundle whose passphrase is empty needs that
+variable set to the empty string; unset means no passphrase. PowerShell and cmd cannot set an empty
+variable, so from those, re-export the bundle with a passphrase.
+
+Re-export with OpenSSL 3.4 or later:
 
 ```
 openssl pkcs12 -export -keypbe AES-256-CBC -certpbe AES-256-CBC -iter 600000 -pbmac1_pbkdf2 -pbmac1_pbkdf2_md sha256 -in <cert> -inkey <key> -out <new pfx>
@@ -2896,9 +2909,16 @@ Or skip PKCS#12 and give the certificate and key as PEM files.
 native API client's key. An encrypted key there is refused; supply it unencrypted and protect the
 file or secret store instead. The SFTP key must also be RSA-2048 or larger.
 
-**A database driver's client key** (`sslkey` in a generic `Database(...)`'s `odbc_params`, with
-`sslpassword` for its passphrase) is checked the same way before the connection string reaches the
-driver. The driver still decrypts it.
+**A database driver's client key named by `sslkey`** in a generic `Database(...)`'s `odbc_params`
+(with `sslpassword` for its passphrase) is checked the same way before the connection string reaches
+the driver. The driver still decrypts it. That keyword is the only key the engine checks, and the
+check binds only a driver that reads `sslkey` itself. A key the driver finds by itself is not checked.
+
+**On psqlODBC, no client key is checked.** As the generic-dialect section above says, psqlODBC takes
+a client key only through `pqopt`, and `pqopt` is refused. So libpq finds the key on its own, from
+at least the service's `PGSSLKEY` environment variable, a connection service file, or its default
+key file: `%APPDATA%\postgresql\postgresql.key` on Windows, `~/.postgresql/postgresql.key`
+elsewhere. Keep a weakly wrapped key out of those places.
 
 ## Declaring a cleartext hop (`cleartext_accepted`)
 
