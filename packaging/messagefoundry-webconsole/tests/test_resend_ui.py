@@ -642,13 +642,14 @@ async def test_two_submits_in_flight_together_ride_one_proof(
     assert len(rows) == 1
 
 
-async def test_a_repeat_in_flight_waits_and_asks_for_its_own_proof_when_the_first_is_refused(
+async def test_a_repeat_in_flight_waits_and_takes_the_first_ones_refusal(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #2625. The second POST of a pair leaves while the first holds the spent proof,
-    and the first is then refused AFTER the spend. The second used to ride that spend and deliver
-    with no proof of its own (same key and target, another source). It now waits for the first to
-    settle, and a refused first sends it to re-auth. The audit count is the control: nothing ran."""
+    """Vault BACKLOG #2625. A double-click's second POST leaves while the first holds the spent
+    proof, and the handler then refuses the first AFTER the spend. A repeat used to ride that spend
+    and could deliver with no proof of its own. It now waits for the first to settle and is
+    answered with the first one's refusal, without running. The record goes with the refusal, so
+    the same submit again asks for a proof. The engine call count and the audit are the controls."""
     engine.add_registry(_registry(tmp_path))
     await engine.start()
     service = await _service(engine)
@@ -667,30 +668,71 @@ async def test_a_repeat_in_flight_waits_and_asks_for_its_own_proof_when_the_firs
         await release.wait()
         raise ResendError("refused for the test")
 
+    real_await = _auth._SPENT_FOR_KEY.await_settled
+
+    async def noted_await(spend: Any) -> None:
+        rider_waiting.set()
+        await real_await(spend)
+
     monkeypatch.setattr(engine, "resend", refused_after_the_spend)
+    monkeypatch.setattr(_auth._SPENT_FOR_KEY, "await_settled", noted_await)
     async with _client(engine, service) as c:
         await _login(c, "op")
         await _mint(c, mid)  # the one proof
         first = asyncio.create_task(_post_resend(c, mid, mint=False))
         await entered.wait()  # the first has spent the proof and is inside the handler
-        real_wait = _auth._SPENT_FOR_KEY.wait
-
-        async def noted_wait(*args: Any, **kwargs: Any) -> bool:
-            rider_waiting.set()
-            return await real_wait(*args, **kwargs)
-
-        monkeypatch.setattr(_auth._SPENT_FOR_KEY, "wait", noted_wait)
-        rider = asyncio.create_task(_post_resend(c, mid, source="other", mint=False))
+        rider = asyncio.create_task(_post_resend(c, mid, mint=False))
         await rider_waiting.wait()
         release.set()
-        refused, second = await asyncio.gather(first, rider)
-        assert refused.status_code == 400 and str(text(RESEND_BLOCKED_NOTICE)) in refused.text
-        assert second.status_code == 303 and second.headers["location"].startswith("/ui/reauth?")
-    assert calls == 1  # the rider never reached the engine
+        answers = await asyncio.gather(first, rider)
+        for answer in answers:
+            assert answer.status_code == 400
+            assert str(text(RESEND_BLOCKED_NOTICE)) in answer.text
+        again = await _post_resend(c, mid, mint=False)
+        assert again.status_code == 303 and again.headers["location"].startswith("/ui/reauth?")
+    assert calls == 1  # neither the repeat nor the resubmit reached the engine
     audit = await engine.store.list_audit()
     assert audit
     rows = [a for a in audit if a["action"] == "message_resend"]
     assert rows == []
+
+
+async def test_the_same_key_with_another_source_is_no_repeat(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2625. Only an identical request rides. A POST with the same key and target
+    but another source, sent while the first holds the spent proof, is a request of its own: it
+    needs its own proof, so it goes to re-auth at once, without waiting or running."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_resend = engine.resend
+    calls = 0
+
+    async def held(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return await real_resend(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "resend", held)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        await _mint(c, mid)  # the one proof
+        first = asyncio.create_task(_post_resend(c, mid, mint=False))
+        await entered.wait()
+        other = await _post_resend(c, mid, source="other", mint=False)
+        assert other.status_code == 303 and other.headers["location"].startswith("/ui/reauth?")
+        release.set()
+        done = await first
+        assert done.status_code == 200 and "Resend queued" in done.text
+    assert calls == 1
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert len(rows) == 1
 
 
 async def test_a_key_used_for_another_target_is_not_a_repeat(

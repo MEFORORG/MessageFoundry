@@ -37,11 +37,13 @@ this line.**
   spend, so the next submit asks again and re-opens the editor. A completed resend now answers with
   a 303 to a new GET outcome page, `/ui/messages/{id}/resend-done` (post-redirect-get), so a
   refresh re-renders the outcome and sends nothing. The confirm page always mints its own
-  idempotency key; one in its query string is ignored. A same-key repeat of a resend or
-  edit-resend (a double-click) asks for no fresh proof. One that arrives while the first is still
-  running waits for it. If the engine refused the first, the repeat asks for a proof again; a
-  repeat of a request the store committed is answered as a duplicate, a request cancelled after
-  that commit included. Upload resend also needs `messages:edit`, on the confirm page and on the
+  idempotency key; one in its query string is ignored. A double-click on a resend or an
+  edit-resend asks for no second proof. Only an identical request counts as the repeat: the same
+  key, target and source, or the same edited body. One that arrives while the first is still
+  running waits for it. If the engine refused the first, the repeat gets the same refusal and
+  runs nothing, and the next submit asks for a proof again. A repeat of a request the store
+  committed is answered as a duplicate, a request cancelled after that commit included. Upload
+  resend also needs `messages:edit`, on the confirm page and on the
   POST, and the browse page offers its form only to a role that holds it. Seam change:
   `AuthService.holds_action_step_up` and the core handler `prior_resend` are new, and the console
   imports five new step-up action constants. (vault BACKLOG #2625)

@@ -2090,17 +2090,19 @@ grant before it opens and the resubmit spends it after its own input checks, so 
 drops an edit the operator is about to type, and a refusal of the console's own input costs no proof.
 A refusal from the engine handler comes after the spend: the next submit asks again and re-opens the
 editor from the stored body, as an expired grant (300 s by default) does. The console resend checks
-its own input before it spends the proof too. On both, a same-key repeat asks for no fresh proof
-when the session spent the proof on that same request and the handler did not refuse it, or, for a
-plain resend only, when the key has a `resend_log` row. A repeat that arrives while the first
-request is still running waits for it to finish, for 30 seconds at most, and past that asks
-for a proof of its own. If the handler refused the first, the repeat asks
-for a proof of its own, as the next submit does. A request that ends any other way keeps its mark,
-an error or a cancel by a timeout or a disconnect included, because the store may already have
-committed it. The store answers a repeat of a committed request as ADR 0090's duplicate. A repeat of
-one that never committed runs once, on the proof that request spent, so one proof still gives one
-delivery at most. A double-clicked resend lands on "already resent"; a repeated edit-resend lands
-on the child the first one made. One grant covers one request, and a bulk purge from the console is one request. The
+its own input before it spends the proof too. On both, a double-click asks for no second proof.
+The console marks each request it spends a proof on, and only an identical request counts as its
+repeat: the same key, target and source, or for edit-resend the same edited body. A repeat of a
+plain resend also counts when the key already has a `resend_log` row. A repeat that arrives while
+the first request runs waits for it, up to the request timeout. If the handler refused the first,
+the repeat gets the same refusal and runs nothing. The mark goes with that refusal, so the next
+submit asks for a proof again. A refusal of a repeat drops the mark too. A request that ends any
+other way keeps its mark, an error or a cancel by a timeout or a disconnect included. The store may
+already have committed it, and the repeat must then reach the store's duplicate check. The store
+answers a repeat of a committed request as ADR 0090's duplicate. If the first never committed, each
+repeat while the mark lasts (300 s) runs the handler on the proof the first one spent. The key lets
+at most one of them commit, so one proof still gives one delivery at most. A double-clicked resend
+lands on "already resent"; a repeated edit-resend lands on the child the first one made. One grant covers one request, and a bulk purge from the console is one request. The
 grant is keyed on the session and the action, not on a target. The rest of the step-up surface keeps
 the shared window on purpose: a bound proof is a typed password per action, and an operator replaying
 dead letters during an incident would type it per message. `[auth].require_action_step_up = false`
