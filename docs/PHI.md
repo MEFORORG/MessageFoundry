@@ -511,8 +511,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    in the future. The quota bills it to the uploader its sidecar names, at the body's size on disk.
    When the prune removes its body, the audit row, like the store's `delete()`, carries its path id
    with blank owner fields, since its owner cannot be verified. A missing body leaves no row, as for
-   any body-less pair. A blank or non-UTF-8 sidecar is still outside retention. The API's by-id routes still refuse it, so it cannot be deleted through
-   the API either.
+   any body-less pair. An operator holding `files:access_any` can also delete it through
+   `DELETE /uploads/{id}`, which writes the same blank-owner `upload.delete` row. Its owner cannot,
+   and gets 404. A blank or non-UTF-8 sidecar is still outside retention, and the API cannot delete
+   that kind.
    **Under `cipher_provider = "vault_transit"` a plaintext upload still reads back as plaintext.**
    `rotate-key` refuses to run in that mode: it needs a local active key, and the store's own
    rotation raises there (BACKLOG #1165). So no command could ever seal the upload, and refusing it

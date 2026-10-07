@@ -5685,14 +5685,22 @@ def create_app(
     # can also be a file under a key that is no longer configured. 423 Locked says the file exists and
     # needs an operator, where an unhandled CipherError answered 500. It is not 409, which the resend
     # route already spends on "inbound not running" and the web console maps to that text. No file
-    # detail is in the body. One text serves every refused shape, and rotate-key never seals a
-    # plaintext sidecar over a missing or non-text body (BACKLOG #2322), so it must not promise to.
+    # detail is in the body. One text serves every refused shape, and rotate-key does not seal every
+    # one (BACKLOG #2322), so the text offers remedies and promises none of them.
     _UPLOAD_UNREADABLE_STATUS = 423
     _UPLOAD_UNREADABLE = (
-        "this uploaded file cannot be read under the configured store key; an operator must seal it "
-        "with 'messagefoundry rotate-key', restore the retired key it was sealed under, or, if its "
-        "body is missing or is not text, delete it"
+        "this uploaded file cannot be read under the configured store key. An operator may be able "
+        "to seal it with 'messagefoundry rotate-key', or to read it by restoring the retired key it "
+        "was sealed under; one that rotate-key reports as unsealable can only be deleted"
     )
+
+    class _UploadSidecarRefused(HTTPException):
+        """The 423 an override holder gets when an upload's sidecar is refused. Every other route
+        answers it as is. DELETE catches it, because ``UploadStore.delete`` can still remove an
+        upload ``rotate-key`` never seals, whose refused sidecar hides the owner (BACKLOG #2322)."""
+
+        def __init__(self) -> None:
+            super().__init__(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE)
 
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
@@ -5710,9 +5718,7 @@ def create_app(
 
         Every by-id route calls this BEFORE it decrypts a body or unlinks anything, which is the point:
         the check has to sit in the handler BODY, not in a ``Depends`` gate, because the web console
-        invokes these handlers directly through the CoreHandlers seam and never runs their gates.
-        DELETE skips it for an override holder, for whom it decides nothing ``UploadStore.delete``
-        does not already decide (BACKLOG #2322)."""
+        invokes these handlers directly through the CoreHandlers seam and never runs their gates."""
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
@@ -5722,7 +5728,7 @@ def create_app(
             # for everyone but an override holder, who may see any file anyway and is the one who
             # can act on it; the refused sidecar is not an existence oracle for anyone else.
             if identity.has(Permission.FILES_ACCESS_ANY):
-                raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+                raise _UploadSidecarRefused() from None
             raise HTTPException(404, "no such uploaded file") from None
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
@@ -6205,11 +6211,10 @@ def create_app(
         after it has already unlinked both sidecars — a check bolted onto that call would fire too
         late. The age-based retention sweep is deliberately owner-blind and unaffected.
 
-        An override holder may access any file, so the owner check is skipped for it. That lets it
-        delete an upload ``rotate-key`` can never seal, whose refused sidecar hides the owner
-        (BACKLOG #2322); ``UploadStore.delete`` still refuses every other refused upload."""
+        An override holder whose file has a refused sidecar goes on to ``UploadStore.delete``, which
+        removes an upload ``rotate-key`` never seals and refuses every other one (BACKLOG #2322)."""
         us = _require_upload_store(request)
-        if not identity.has(Permission.FILES_ACCESS_ANY):
+        with suppress(_UploadSidecarRefused):
             await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
         try:
             meta = await us.delete(file_id)

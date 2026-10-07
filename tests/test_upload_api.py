@@ -38,8 +38,9 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
+from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.uploads import UploadStore
 from tests._admin_account import create_local_user_chosen
-from tests.test_uploads_orphans import _store as _keyed_store
 from tests.test_uploads_strict_ciphertext import _BREAKS
 
 PW = "Correct-Horse-Battery-Staple-9"
@@ -63,6 +64,12 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 def _uploads_settings(tmp_path: Path) -> StoreSettings:
     return StoreSettings(uploads_dir=str(tmp_path / "uploads"), max_upload_bytes=1_000_000)
+
+
+def _keyed_store(root: Path) -> UploadStore:
+    """A store over ``root`` under a fresh key: the engine here is keyless, so swapping this in for
+    the app's own store is "the key is now enabled" for every upload already on disk."""
+    return UploadStore(root, make_cipher(generate_key(), write_v2=True), max_bytes=10**6)
 
 
 async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
@@ -1086,8 +1093,6 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
     * No body names the file."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
-    from messagefoundry.store.crypto import generate_key, make_cipher
-    from messagefoundry.uploads import UploadStore
 
     engine.add_registry(_running_registry(tmp_path))
     await engine.start()
@@ -1108,7 +1113,7 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
             for i in range(2)
         ]  # the test engine is keyless, so both are plaintext uploads
         plain = app.state.upload_store
-        keyed = UploadStore(root, make_cipher(generate_key(), write_v2=True), max_bytes=10**6)
+        keyed = _keyed_store(root)
         # The second upload: seal only its sidecar, the shape a body swapped in behind it leaves.
         half = fids[1]
         (root / f"{half}.meta").write_text(
@@ -1161,11 +1166,14 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
         fid = r.json()["file_id"]  # the test engine is keyless, so this is a plaintext upload
         blob, sidecar = root / f"{fid}.blob", root / f"{fid}.meta"
         break_body(blob)
-        app.state.upload_store = _keyed_store(tmp_path)  # the key is now enabled
+        had_body = blob.exists()
+        app.state.upload_store = _keyed_store(root)  # the key is now enabled
 
         r = await c.delete(f"/uploads/{fid}", headers=h)
         assert r.status_code == 404, r.text  # the owner is unreadable: no existence oracle
-        assert sidecar.exists(), "a caller without FILES_ACCESS_ANY removed the upload"
+        assert sidecar.exists() and blob.exists() == had_body, (
+            "a caller without FILES_ACCESS_ANY removed part of the upload"
+        )
 
         r = await c.delete(f"/uploads/{fid}", headers=ha)
         assert r.status_code == 200, r.text
