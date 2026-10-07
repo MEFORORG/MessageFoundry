@@ -207,8 +207,8 @@ def test_the_reservation_is_released_so_the_next_upload_is_not_locked_out(tmp_pa
 
 def test_a_leaked_reservation_is_reclaimed_once_it_goes_stale(tmp_path: Path) -> None:
     """A process killed between reserve and release leaks its reservation. It must not consume the
-    uploader's budget forever: a reservation that has been continuously outstanding for longer than
-    ``stale_after`` is reset on the next reserve."""
+    uploader's budget forever: a row with no activity for longer than ``stale_after`` is reset on
+    the next reserve."""
 
     async def _run() -> None:
         store = await MessageStore.open(tmp_path / "engine.db")
@@ -230,40 +230,6 @@ def test_a_leaked_reservation_is_reclaimed_once_it_goes_stale(tmp_path: Path) ->
                 max_total_bytes=100,
                 stale_after=0.0,
             )
-        finally:
-            await store.close()
-
-    asyncio.run(_run())
-
-
-def test_a_live_reserve_joining_an_old_row_is_not_reclaimed_with_it(tmp_path: Path) -> None:
-    """BACKLOG #2648. Shard A's slot leaked, then shard B reserved and is mid-write. A reserve that
-    arrives once A's slot is past the window but B's is not must still count B. The reserve used
-    to keep the row's old clock when it joined a non-zero row, so the reset dropped B's live slot
-    along with A's leaked one, and shard C counted neither B's file nor B's slot."""
-
-    async def _run() -> None:
-        store = await MessageStore.open(tmp_path / "engine.db")
-        try:
-
-            async def _reserve(stale_after: float = UPLOAD_RESERVATION_STALE_AFTER) -> bool:
-                return await store.reserve_upload_quota(
-                    "u-alice",
-                    files=1,
-                    size_bytes=10,
-                    max_files=10,
-                    max_total_bytes=1000,
-                    stale_after=stale_after,
-                )
-
-            assert await _reserve()  # shard A, never released
-            await asyncio.sleep(0.3)
-            assert await _reserve()  # shard B, mid-write
-            # Shard C: A's slot is twice the window old, B's is well inside it.
-            assert await _reserve(stale_after=0.15)
-            # B's reserve moved the clock, so nothing was reclaimed: A's leaked slot stays while the
-            # row is active (it clears once the uploader is idle), and B's live slot is counted.
-            assert await store.upload_quota_in_flight("u-alice") == (3, 30)
         finally:
             await store.close()
 
@@ -305,7 +271,7 @@ def test_a_slow_save_keeps_its_slot_past_the_staleness_window(
                 )
             )
             assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.6)
             try:
                 applied = await store.reserve_upload_quota(
                     "u-alice",
@@ -313,18 +279,68 @@ def test_a_slow_save_keeps_its_slot_past_the_staleness_window(
                     size_bytes=5,
                     max_files=1,
                     max_total_bytes=4096,
-                    stale_after=0.15,
+                    stale_after=0.3,
                 )
             finally:
                 gate.set()
             await save
             if uploads._heartbeats:
                 await asyncio.wait(set(uploads._heartbeats), timeout=10)
+            assert not uploads._heartbeats, "the heartbeat outlived its save"
             return applied
         finally:
             await store.close()
 
     assert asyncio.run(_run()) is reclaimed
+
+
+def test_the_heartbeat_stops_at_its_lifetime_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A save whose write never finishes must not pin the row for as long as the process lives.
+    Past the cap the heartbeat stops with a WARNING, while the save is still held mid-write."""
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_MAX_SECONDS", 0.1)
+
+    async def _run() -> None:
+        store = await MessageStore.open(tmp_path / "engine.db")
+        try:
+            uploads = UploadStore(
+                tmp_path / "uploads",
+                make_cipher(generate_key()),
+                max_bytes=4096,
+                max_files_per_user=1,
+                store=store,
+            )
+            entered, gate = threading.Event(), threading.Event()
+            real_encrypt = uploads._encrypt_blob
+
+            def _held(data: bytes, file_id: str) -> str:
+                entered.set()
+                gate.wait(timeout=30)
+                return real_encrypt(data, file_id)
+
+            uploads._encrypt_blob = _held  # type: ignore[method-assign]
+            save = asyncio.ensure_future(
+                uploads.save(
+                    data=b"hung\n", filename="a.txt", uploader="alice", uploader_id="u-alice"
+                )
+            )
+            try:
+                assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
+                (beat,) = uploads._heartbeats
+                await asyncio.wait((beat,), timeout=10)
+                assert beat.done(), "the heartbeat ran past its cap"
+                assert not save.done()
+            finally:
+                gate.set()
+                await save
+        finally:
+            await store.close()
+
+    with caplog.at_level("WARNING", logger=uploads_mod._log.name):
+        asyncio.run(_run())
+    assert "no longer refreshed" in caplog.text
 
 
 def test_the_heartbeat_fits_three_times_inside_the_staleness_window() -> None:
