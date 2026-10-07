@@ -498,14 +498,16 @@ async def test_inline_handoff_store_fault_repends_not_dead_lettered(
         else:
             raise AssertionError("the faulted ingress row never re-pended")
         assert "router error" not in (row["last_error"] or "")
-        assert not await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+        assert not await store.list_messages(
+            channel_id="file_in", status=MessageStatus.ERROR.value, allowed_channels=None
+        )
         await _until_stat(store, OutboxStatus.DONE.value, 1, timeout=8.0)
     finally:
         await runner.stop()
 
     assert calls[0] == 2  # the fault, then the re-pended row's successful fused commit
     assert sink.stopped == []  # no lane halted: neither the STOP policy nor the infra bound fired
-    msgs = await store.list_messages(channel_id="file_in")
+    msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert len(msgs) == 1 and msgs[0]["status"] == MessageStatus.PROCESSED.value
     assert len(await store.outbox_for(msgs[0]["id"])) == 1  # no duplicate from the re-run
     assert "FOUNDRY" in (outdir / "MSG1.hl7").read_bytes().decode("utf-8")
@@ -542,7 +544,9 @@ async def test_inline_persistent_handoff_store_fault_counts_toward_pooled_infra_
         await runner.stop()
 
     assert calls[0] == 2  # STOPPED at the bound, not looping
-    assert not await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+    assert not await store.list_messages(
+        channel_id="file_in", status=MessageStatus.ERROR.value, allowed_channels=None
+    )
     row = await _ingress_row(store)
     assert row is not None and row["status"] != OutboxStatus.DEAD.value  # preserved, not dead
     assert "router error" not in (row["last_error"] or "")

@@ -119,6 +119,7 @@ ROUTES: dict[str, tuple[str, str]] = {
     "PUT /users/{user_id}/roles": (ADMINISTRATOR_ONLY, "users:manage"),
     "POST /users/{user_id}/reset-password": (ADMINISTRATOR_ONLY, "users:manage"),
     "POST /users/{user_id}/reset-mfa": (ADMINISTRATOR_ONLY, "users:manage"),
+    "GET /users/{user_id}/federated-identity": (ADMINISTRATOR_ONLY, "users:manage"),
     "PUT /users/{user_id}/federated-identity": (ADMINISTRATOR_ONLY, "users:manage"),
     "DELETE /users/{user_id}/federated-identity": (ADMINISTRATOR_ONLY, "users:manage"),
     "GET /users/{user_id}/channel-scope": (ADMINISTRATOR_ONLY, "users:manage"),
