@@ -118,6 +118,7 @@ __all__ = [
     "SandboxCodecError",
     "SandboxPolicy",
     "SandboxSession",
+    "SandboxSessionClosed",
     "GraphShape",
     "graph_shape",
     "graph_differences",
@@ -529,6 +530,17 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None) -> None:
 # --- the persistent worker session (parent side) -----------------------------
 
 
+class SandboxSessionClosed(SandboxError):
+    """A dispatch reached a session that was already closed, so that dispatch did not run.
+
+    It says nothing about the message: the engine closes a session when a reload replaces its worker,
+    and a router or transform worker may have resolved that session just before. An earlier dispatch
+    on the same session may have run (``route_only`` runs the Router, then each ``accepts=``
+    predicate), which is safe to repeat because Routers are pure. The runner retries on a fresh
+    session or re-pends the row, and never dead-letters it as a Router or Handler fault (vault
+    BACKLOG #2772)."""
+
+
 class SandboxSession:
     """A persistent per-inbound sandbox worker (the parent-side handle).
 
@@ -877,7 +889,7 @@ class SandboxSession:
         (see :meth:`_reject_unsolicited`) — that is a lost worker and a dead-lettered message."""
         with self._lock:
             if self._closed:
-                raise SandboxError("sandbox session is closed")
+                raise SandboxSessionClosed("sandbox session is closed")
             proc = self._live_worker()
             assert proc.stdin is not None
             # A FRESH unpredictable id per dispatch, not a counter: the worker learns it only when it

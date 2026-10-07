@@ -5540,6 +5540,13 @@ async def test_list_audit_exclusion_runs_in_sql_before_limit_mssql(store) -> Non
     ]
     assert len(await store.list_audit(actor=who, exclude=ex, limit=2)) == 2
     assert len(await store.list_audit(actor=who, limit=10)) == 5
+    # Vault BACKLOG #2776: the keyset cursor and the count bind after TOP (?) and the exclusion.
+    ids = [r["id"] for r in await store.list_audit(actor=who, exclude=ex, limit=10)]
+    page = await store.list_audit(actor=who, exclude=ex, limit=10, before_id=ids[0])
+    assert [r["id"] for r in page] == ids[1:]
+    assert await store.count_audit(actor=who, exclude=ex, limit=10) == 3
+    assert await store.count_audit(actor=who, exclude=ex, limit=2) == 2
+    assert await store.count_audit(actor=who, exclude=ex, limit=10, before_id=ids[0]) == 2
 
 
 # --- BACKLOG #2097: can a pooled session carry SET NOCOUNT ON? --------------------------------------

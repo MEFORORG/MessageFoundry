@@ -6827,24 +6827,32 @@ class MessageStore:
         attachment therefore sits at ``refcount=0`` until increffed — reclaimable by the **next** startup
         sweep, never mid-run (the sweep is startup-only, like ``reset_stale_inflight``)."""
         self._require_streaming_attachments()
-        hasher = hashlib.sha256()
-        total = 0
-        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but the
-        # attachment_id is the sha256 content address, known only once the full plaintext is hashed. So
-        # buffer the verbatim slices, hash them, then seal each under its (ref, seq). `chunks` is a
-        # slicing of an already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory over
-        # the caller's own copy, and each AES-GCM seal still consumes exactly one chunk (one-chunk seal).
-        plaintext_chunks: list[str] = []
-        for chunk in chunks:
-            data = chunk.encode("utf-8")
-            hasher.update(data)
-            total += len(data)
-            plaintext_chunks.append(chunk)
-        ref = hasher.hexdigest()
-        sealed: list[str] = [
-            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
-            for seq, c in enumerate(plaintext_chunks)
-        ]
+
+        def _seal() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
+            # work in proportion to its size, and nothing else would run meanwhile.
+            hasher = hashlib.sha256()
+            total = 0
+            # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but
+            # the attachment_id is the sha256 content address, known only once the full plaintext is
+            # hashed. So buffer the verbatim slices, hash them, then seal each under its (ref, seq).
+            # `chunks` is a slicing of an already-materialized OBX-5.5 value, so this adds no
+            # order-of-magnitude memory over the caller's own copy, and each AES-GCM seal still
+            # consumes exactly one chunk (one-chunk seal).
+            plaintext_chunks: list[str] = []
+            for chunk in chunks:
+                data = chunk.encode("utf-8")
+                hasher.update(data)
+                total += len(data)
+                plaintext_chunks.append(chunk)
+            ref = hasher.hexdigest()
+            sealed: list[str] = [
+                self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+                for seq, c in enumerate(plaintext_chunks)
+            ]
+            return ref, total, sealed
+
+        ref, total, sealed = await asyncio.to_thread(_seal)
         now = time.time()
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
@@ -11011,17 +11019,17 @@ class MessageStore:
             return AppendedAuditRow(row_id, seq, row_hash)
         raise AssertionError("unreachable: the second attempt returns or raises")
 
-    async def list_audit(
-        self,
+    @staticmethod
+    def _audit_where(
         *,
-        limit: int = 50,
-        actor: str | None = None,
-        action: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        exclude: AuditExclusion | None = None,
-    ) -> list[aiosqlite.Row]:
-        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        exclude: AuditExclusion | None,
+        before_id: int | None,
+    ) -> tuple[str, list[object]]:
+        """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
         Filters are ANDed and every value is a bound ``?`` parameter — the only thing interpolated
         into the SQL text is the fixed column/operator template built from the argument NAMES, never a
@@ -11047,13 +11055,69 @@ class MessageStore:
                 return "?"
 
             clauses.extend(exclude.clauses(bind))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> list[aiosqlite.Row]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
+        Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
         params.append(limit)
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?", params
             )
             return list(await cur.fetchall())
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, without reading
+        them (vault BACKLOG #2776). Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
+        params.append(limit)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where} ORDER BY id DESC LIMIT ?)",
+                params,
+            )
+            row = await cur.fetchone()
+            return int(row[0]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
         """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault

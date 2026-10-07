@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -967,6 +968,146 @@ async def test_audit_csv_export_content_and_audit_event(engine: Engine) -> None:
     assert '"count": 1' in exports[0]["detail"]
 
 
+async def _export_with_read_spy(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, query: str, *, page: int
+) -> tuple[list[str], dict[str, Any], list[tuple[int, int]], list[int]]:
+    """Run ``GET /audit/export`` with the page size pinned to ``page``, every store read recorded
+    as ``(limit asked, rows returned)`` and every ``count_audit`` result recorded. Returns the CSV
+    data lines, the export's own ``audit.export`` detail, the reads and the counts."""
+    from messagefoundry.api import auth_routes
+
+    # raising=False keeps the control arm meaningful: on code without paging the reads, not a
+    # missing name, are what fails.
+    monkeypatch.setattr(auth_routes, "_AUDIT_EXPORT_PAGE", page, raising=False)
+    service = await _service(engine)
+    await _add(service, "auditor", Role.AUDITOR)
+    reads: list[tuple[int, int]] = []
+    counts: list[int] = []
+    real = engine.store.list_audit
+    real_count = getattr(engine.store, "count_audit", None)
+
+    async def spy(**kw: Any) -> Any:
+        rows = await real(**kw)
+        reads.append((kw["limit"], len(rows)))
+        return rows
+
+    async def count_spy(**kw: Any) -> int:
+        assert real_count is not None
+        n: int = await real_count(**kw)
+        counts.append(n)
+        return n
+
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "auditor")).json()["token"])
+        monkeypatch.setattr(engine.store, "list_audit", spy)
+        monkeypatch.setattr(engine.store, "count_audit", count_spy, raising=False)
+        resp = await c.get(f"/audit/export?format=csv&{query}", headers=h)
+        monkeypatch.setattr(engine.store, "list_audit", real)
+        assert resp.status_code == 200
+    lines = [ln for ln in resp.text.splitlines() if ln]
+    assert lines[0] == "ts,actor,action,channel_id,client,detail"
+    exports = await engine.store.list_audit(action="audit.export", limit=1)
+    return lines[1:], json.loads(exports[0]["detail"]), reads, counts
+
+
+async def test_audit_export_reads_the_trail_in_pages(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2776: the export holds one page of rows at a time, not the whole result. Seven
+    rows at a page of two must arrive whole and newest first over four reads, none larger than a
+    page, and the recorded count must be the rows sent. Before the fix this was ONE read of every
+    row, which the per-read bound below refuses."""
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    data, detail, reads, counts = await _export_with_read_spy(
+        engine, monkeypatch, "actor=alice", page=2
+    )
+    assert [float(ln.split(",")[0]) for ln in data] == [106.0 - i for i in range(7)]
+    assert all(asked <= 2 and got <= 2 for asked, got in reads), reads
+    assert len(reads) == 4, reads
+    assert detail["count"] == 7 and counts == [7]
+
+
+async def test_audit_export_stops_at_the_limit_and_the_count(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``limit`` still caps the paged export: seven matching rows and ``limit=5`` send the five
+    newest, read no row past them, and record ``count`` 5."""
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    data, detail, reads, counts = await _export_with_read_spy(
+        engine, monkeypatch, "actor=alice&limit=5", page=2
+    )
+    assert [float(ln.split(",")[0]) for ln in data] == [106.0, 105.0, 104.0, 103.0, 102.0]
+    assert sum(got for _asked, got in reads) == 5, reads
+    assert detail["count"] == 5 and detail["filter"]["limit"] == 5 and counts == [5]
+
+
+@pytest.mark.parametrize(
+    ("query", "sent", "read"),
+    [("actor=alice", 7, (10, 7)), ("actor=alice&limit=3", 3, (3, 3))],
+    ids=["short-first-page", "first-page-holds-the-limit"],
+)
+async def test_audit_export_whose_first_page_is_the_result_runs_no_count(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    sent: int,
+    read: tuple[int, int],
+) -> None:
+    """A first page that is short, or that already holds ``limit`` rows, is the whole result, so the
+    export records its length and runs no count query."""
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    data, detail, reads, counts = await _export_with_read_spy(engine, monkeypatch, query, page=10)
+    assert len(data) == sent and detail["count"] == sent
+    assert reads == [read] and counts == []
+
+
+async def test_audit_export_never_contains_its_own_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unfiltered, the trail grows while the export streams: its own ``audit.export`` row is written
+    after the first page is read. The later pages sit below the first page, so that row is never
+    sent, and the recorded count equals the rows sent. A guard on the cursor: the old single read
+    passes it too, and a cursor that started above the first page would fail it."""
+    for i in range(5):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    data, detail, _, _ = await _export_with_read_spy(engine, monkeypatch, "", page=2)
+    assert not any(",audit.export," in ln for ln in data), data
+    assert detail["count"] == len(data) >= 5
+
+
+async def test_audit_export_logs_a_stream_cut_short(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A later page is read after the 200 and the ``audit.export`` row, so a store failure there
+    can only end the body early. The engine log must say how many of the counted rows were sent."""
+    from messagefoundry.api import auth_routes
+
+    monkeypatch.setattr(auth_routes, "_AUDIT_EXPORT_PAGE", 2)
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    service = await _service(engine)
+    await _add(service, "auditor", Role.AUDITOR)
+    real = engine.store.list_audit
+
+    async def failing_second_page(**kw: Any) -> Any:
+        if kw.get("before_id") is not None:
+            raise RuntimeError("the store went away")
+        return await real(**kw)
+
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "auditor")).json()["token"])
+        monkeypatch.setattr(engine.store, "list_audit", failing_second_page)
+        with (
+            caplog.at_level(logging.WARNING, logger="messagefoundry.api.auth_routes"),
+            pytest.raises(RuntimeError),
+        ):
+            await c.get("/audit/export?format=csv&actor=alice", headers=h)
+    assert "audit export by auditor ended early: 2 of 7 rows sent" in caplog.text
+
+
 async def test_audit_export_denied_to_unauthorized_role(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "vw", Role.VIEWER)
@@ -1349,9 +1490,9 @@ async def test_connection_test_and_integrity_check_are_paced(engine: Engine) -> 
 
 #: BACKLOG #287 (ASVS 2.4.2): the three state-changing routes that stayed on plain require() after the
 #: #193 sweep. Each entry is (method, path, json body, the status an admitted request gets). None of
-#: them needs a live dependency: the preset id names no row, the log level is set to the value the
-#: root logger already holds (filled in at run time), and the test-email request finds no [alerts]
-#: mail transport configured, so it answers without dialling anything.
+#: them needs a live dependency: the preset id names no row, the log level is set to one the instance
+#: accepts, the current one where it can be (filled in at run time), and the test-email request
+#: finds no [alerts] mail transport configured, so it answers without dialling anything.
 _PACED_BY_287: tuple[tuple[str, str, dict[str, object] | None, int], ...] = (
     ("DELETE", "/search/presets/" + "a" * 32, None, 404),
     ("PATCH", "/logging/level", None, 200),
@@ -1398,9 +1539,14 @@ async def test_backlog_287_routes_are_paced(
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "adm")).json()["token"])
         if path == "/logging/level":
+            # A level this instance ACCEPTS: the client passes no [ai] posture, so it counts as
+            # production and DEBUG is refused (vault BACKLOG #2777). Re-PATCHing the current level
+            # would make this test depend on whatever level the root logger was left at.
             current = await c.get("/logging/level", headers=h)
             assert current.status_code == 200
-            body = {"level": current.json()["level"]}
+            level = current.json()["level"]
+            accepted = current.json()["levels"]
+            body = {"level": level if level in accepted else accepted[0]}
         for _ in range(2):
             admitted = await c.request(method, path, json=body, headers=h)
             assert admitted.status_code == admitted_status, admitted.text

@@ -343,7 +343,13 @@ from messagefoundry.config.wiring import (
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.logging_guard import active_guard as active_log_guard
-from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runtime_level
+from messagefoundry.logging_setup import (
+    LOG_LEVELS,
+    LogLevelRefused,
+    current_log_level,
+    level_refused_on_production,
+    set_runtime_level,
+)
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
@@ -6930,6 +6936,27 @@ def create_app(
 
     # --- runtime log verbosity + redacted log-tail viewer (BACKLOG #171, ADR 0130) ----
 
+    def _log_level_production(request: Request) -> bool:
+        """The production tier the level control keys on (vault BACKLOG #2777). A tier this app cannot
+        resolve counts as production, the strictest answer; ``serve`` always resolves it before the app
+        exists, from the same ``[ai]``/``[security]`` settings stashed here."""
+        ai = getattr(request.app.state, "ai", None) or AiSettings()
+        prod = ai.derived_posture()
+        return True if prod is None else prod
+
+    def _log_level_info(request: Request, level: str, *, production: bool) -> LogLevelInfo:
+        # ``levels`` is the set this instance ACCEPTS, so a client building a picker from it never
+        # offers a level the PATCH would refuse on this posture.
+        return LogLevelInfo(
+            level=level,
+            configured=getattr(request.app.state, "configured_log_level", None),
+            levels=[
+                name
+                for name in LOG_LEVELS
+                if not level_refused_on_production(name, production=production)
+            ],
+        )
+
     @app.get("/logging/level", response_model=LogLevelInfo)
     async def get_logging_level(
         request: Request,
@@ -6937,11 +6964,10 @@ def create_app(
     ) -> LogLevelInfo:
         """The current effective root log level, the startup ``[logging].level`` baseline a restart returns
         to, and the accepted level set — the read half of the runtime verbosity control (#171, ADR 0130).
-        **Not PHI** (level names only); gated by ``monitoring:diagnose`` (the diagnostic tier)."""
-        return LogLevelInfo(
-            level=current_log_level(),
-            configured=getattr(request.app.state, "configured_log_level", None),
-            levels=list(LOG_LEVELS),
+        **Not PHI** (level names only); gated by ``monitoring:diagnose`` (the diagnostic tier). On a
+        production instance the accepted set leaves out DEBUG (vault BACKLOG #2777)."""
+        return _log_level_info(
+            request, current_log_level(), production=_log_level_production(request)
         )
 
     @app.patch("/logging/level", response_model=LogLevelInfo)
@@ -6956,23 +6982,47 @@ def create_app(
         **ephemeral**: a process restart re-asserts ``[logging].level``, and a ``/config/reload`` does NOT
         reset it (``configure_logging`` does not re-run there), so it survives a reload and resets only on
         restart. Gated by ``monitoring:diagnose``; an invalid level is a 400. The change is recorded as a
-        ``logging_level_change`` audit row (old → new, actor) — level names only, no PHI."""
+        ``logging_level_change`` audit row (old → new, actor) — level names only, no PHI.
+
+        A production instance refuses DEBUG here exactly as ``serve`` refuses to start at it (vault
+        BACKLOG #2777): the same predicate, keyed on the same production tier. That refusal is a 403
+        naming the posture, leaves the level untouched, and is audited as
+        ``logging_level_change_denied``. The denial row is best-effort, like ``cluster_stepdown_denied``:
+        a store too sick to take it must not turn the refusal into a 500 that hides its reason."""
         previous = current_log_level()
+        production = _log_level_production(request)
         try:
-            applied = set_runtime_level(body.level)
+            applied = set_runtime_level(body.level, production=production)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        except LogLevelRefused as exc:
+            try:
+                await engine.store.record_audit(
+                    "logging_level_change_denied",
+                    actor=identity.username,
+                    detail=json.dumps(
+                        {
+                            "from": previous,
+                            "requested": body.level.upper(),
+                            "reason": "production_instance",
+                        }
+                    ),
+                    client=client_ip(request),
+                )
+            except Exception as audit_exc:
+                _log.warning(
+                    "refused a DEBUG log level on a production instance but could not record the "
+                    "logging_level_change_denied audit row: %s",
+                    safe_exc(audit_exc),
+                )
+            raise HTTPException(403, str(exc)) from exc
         await engine.store.record_audit(
             "logging_level_change",
             actor=identity.username,
             detail=json.dumps({"from": previous, "to": applied}),
             client=client_ip(request),
         )
-        return LogLevelInfo(
-            level=applied,
-            configured=getattr(request.app.state, "configured_log_level", None),
-            levels=list(LOG_LEVELS),
-        )
+        return _log_level_info(request, applied, production=production)
 
     @app.get("/logs/tail", response_model=LogTailPage)
     async def get_logs_tail(
@@ -7591,12 +7641,15 @@ def create_app(
                 close_code=1013,  # try again later
             )
             return
+        # Take the slot BEFORE the first await past the check (vault BACKLOG #2775). accept() waits for
+        # the handshake to finish, so counting after it let every handshake that reached the check
+        # before any accept() returned pass the cap. No await sits between the check and this line,
+        # and the `finally` below gives the slot back on every path, an accept() that raises included.
+        state.ws_count = getattr(state, "ws_count", 0) + 1
         auth: AuthService | None = getattr(state, "auth", None)
         # Server-rendered connections fragment for the browser dashboard, installed by the web console
         # in the serve_ui path. Absent → counts-only push (see the send loop below).
         ui_connections_render = getattr(state, "ui_connections_render", None)
-        await websocket.accept()
-        state.ws_count = getattr(state, "ws_count", 0) + 1
 
         async def _reauthorize() -> Identity | None:
             """Re-validate the open socket's session (revocation/expiry/disable/downgrade/password-
@@ -7618,6 +7671,7 @@ def create_app(
             return current
 
         try:
+            await websocket.accept()
             # Re-check BEFORE the first push: a token revoked between the handshake authorize and
             # accept() must not get even one frame (close the pre-first-send window — SEC-018).
             current = await _reauthorize()

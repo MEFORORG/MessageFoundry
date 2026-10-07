@@ -137,12 +137,18 @@ def test_cli_reports_import_failures_on_the_right_stream(
     else:
         # Inject this at the importer boundary: sibling width no longer causes recursion,
         # but the command must still report a stack failure from another import stage.
-        def fail_import(export_path: str | Path, out_dir: str | Path) -> ImportResult:
+        def fail_import(
+            export_path: str | Path, out_dir: str | Path, *, force: bool = False
+        ) -> ImportResult:
             raise RecursionError("synthetic recursion failure")
 
         monkeypatch.setattr("messagefoundry.corepoint_import.import_corepoint", fail_import)
 
     args = ["import", "corepoint", str(export), "--out", str(out)]
+    if failure == "write":
+        # Past the overwrite refusal, which would otherwise name the directory planted at the target
+        # first (vault BACKLOG #2786), so the write itself is what fails.
+        args.append("--force")
     if as_json:
         args.append("--json")
     error = _cli_error(args, capsys, as_json)

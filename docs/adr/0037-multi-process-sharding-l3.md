@@ -118,3 +118,39 @@ generalizes the per-shard store).
 > + a single delivery consumer per outbound lane (so "outbound + logic are shared" now means shared
 > *definitions*, not shared *consumers*). Restart backoff / crash-loop breaker and per-shard log
 > aggregation remain deferred.
+
+## Amendment (2026-10-06) -- restart backoff and a per-shard crash-loop breaker
+
+AC-4 above restarts a shard every time it exits, and the Consequences list restart backoff and a
+crash-loop breaker as deferred. Both are now built in `messagefoundry/pipeline/supervisor.py`, so
+AC-4 no longer holds without limit: a shard that keeps exiting soon after it starts stops being
+restarted. Without this, a start-up failure that neither the supervisor's config load nor its
+pre-flight reproduces (a store that cannot be reached, a port in use, a `serve` gate refusing)
+relaunched in a tight loop, each pass a full interpreter start and config load.
+
+- **A fast exit is one within 60 s of the start.** A shard whose child exits after running for less
+  than `stable_uptime` (default 60 s) counts as a fast exit. Under `restart`, a launch that raises
+  `OSError` counts as one too. The cause is not read, so a process that dies within the window for
+  a reason other than start-up counts the same way.
+- **The restart delay backs off.** Each fast exit in a row doubles the delay before the next launch,
+  starting at `restart_backoff_initial` (1 s) and capped at `restart_backoff_max` (60 s). A child
+  that ran for 60 s or more resets the count, so the next fast exit waits 1 s again. No relaunch is
+  immediate any more: the one after a stable exit also waits `restart_backoff_initial` (1 s).
+- **The breaker trips per shard.** After `crash_loop_limit` (10) fast exits in a row, that shard is
+  not restarted again. The supervisor logs it at ERROR, naming the shard and its exit history, and
+  the shard stays in `Supervisor.crash_looped` for the rest of that run. The supervisor has no store
+  and so no AlertSink; the ERROR line is its alert.
+- **The other shards keep running.** A tripped breaker ends only that shard's watcher, so one
+  shard's bad start-up is not a fleet outage. `supervise` returns 1 only when every shard has
+  tripped; a later shutdown with some shards tripped and some alive still returns 0, and logs at
+  ERROR which shards were down.
+- **Accepted cost.** The lanes a tripped shard owns have no consumer until the supervisor is
+  restarted, and their rows stay queued durably. Those lanes are at least its outbound lanes, since
+  under ADR 0073 each has one static owner, and the pass-through and `reingress_to` loopback
+  inbounds a sibling shard keeps producing into (vault BACKLOG #2755). Its own listeners are down, so
+  a sender to one of them gets no ACK until then. A sibling's non-owned-lane watchdog checks only
+  outbound lanes, so the inbound backlog raises no buildup or stall alert; the supervisor's ERROR
+  line is the signal.
+
+Per-shard structured-log aggregation and graceful in-flight drain on restart remain deferred. This
+implements vault BACKLOG #2773.

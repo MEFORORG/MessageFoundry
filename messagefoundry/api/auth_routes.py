@@ -16,7 +16,7 @@ import io
 import json
 import logging
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -159,6 +159,11 @@ def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by
 # names below now alias the canonical rule, byte-for-byte the one every other writer uses.
 _CSV_FORMULA_TRIGGERS = SPREADSHEET_FORMULA_TRIGGERS
 _csv_safe = spreadsheet_safe
+
+# Rows per store read while GET /audit/export streams (vault BACKLOG #2776). The route's `limit` goes
+# up to 1,000,000, and the engine process that serves it also runs the pipeline, so the export holds
+# one page at a time rather than the whole result.
+_AUDIT_EXPORT_PAGE = 1000
 
 
 def _session_info(session: SessionRecord, current_token_hash: str) -> SessionInfo:
@@ -1018,7 +1023,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         except TemporaryPasswordUnavailable as exc:
             # ADR 0197 Amendment A: the credential is generated now, so the reset's 503 applies here
-            # too -- a site setting no generated candidate clears, raised before any write.
+            # too -- a site setting no generated candidate clears, raised before any account row is
+            # written. The console answers 503 as well.
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         # Only after the create succeeded: a lost username race (409 above) granted nobody anything.
         if Role.ADMINISTRATOR.value in body.roles:
@@ -1239,16 +1245,20 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
             raise HTTPException(code, detail) from exc
         except TemporaryPasswordUnavailable as exc:
-            # Raised before any write, so the account is untouched; the grant the gate spent is
-            # given back, so a request that changed nothing costs no proof (ADR 0197 Amendment A,
-            # Manager decision 2026-09-29; the refund's docstring says what it can and cannot buy).
+            # Raised before the account is touched; only the refusal's audit row is written. The
+            # grant the gate spent is given back, so a request that changed nothing costs no proof
+            # (ADR 0197 Amendment A, Manager decision 2026-09-29; the refund's docstring says what
+            # it can and cannot buy).
             # It restores only the grant THIS request's gate spent, on either plane: the console
             # calls this handler in-process, in the same request, after its own gate.
             service.refund_action_step_up(STEP_UP_ACTION_ADMIN_RESET_PASSWORD)
             # A site setting, not a bad request, so a 503 like this module's other server-side
             # refusals. It is mapped rather than left to the generic handler, which says only
-            # "internal error": the message names the setting to fix, and the web console renders
-            # this detail on the user page (with its own 400, as it does for every refusal here).
+            # "internal error": the message names the setting to fix. The web console renders this
+            # detail on the user page and answers 503 too (`_refusal_status` in its admin routes).
+            # It re-raises a 404 and answers 400 for the other refusals. The service already wrote
+            # the `auth.credential_issue_refused` row, so neither surface audits it again (BACKLOG
+            # #2359).
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return PasswordResetResponse(temp_password=issued.password, expires_at=issued.expires_at)
 
@@ -1298,8 +1308,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         try:
             issued = await service.admin_reset_mfa(user_id, actor=identity.username)
         except TemporaryPasswordUnavailable as exc:
-            # As on the password reset: raised before any write, so the factors and sessions are
-            # untouched, and the spent grant is given back.
+            # As on the password reset: raised before the account is touched, so the factors and
+            # sessions are untouched, the spent grant is given back, and the console answers 503.
             service.refund_action_step_up(STEP_UP_ACTION_ADMIN_RESET_MFA)
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except ValueError as exc:
@@ -1524,12 +1534,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        before_id: int | None = None,
     ) -> Sequence[Any]:
         """THE ONE READ OF THE TRAIL FOR A CALLER. ``GET /audit``, the console's ``/ui/audit`` and
         ``GET /audit/export`` all come through here, so none of them can skip the owner-ruled lock-row
         exclusion of 2026-09-28 (BACKLOG #1131; :mod:`messagefoundry.auth.audit_visibility`). It is
         keyed on ``identity``, which is why this takes one: a caller without ``users:manage`` gets
         the trail minus the lock rows, applied in SQL before ``limit`` so a page is never short.
+        ``before_id`` is the export's keyset cursor (vault BACKLOG #2776).
 
         Every filter value is passed as a keyword to the store, which binds it as a SQL parameter
         across all three backends (BACKLOG #170) -- never string-interpolated into the query."""
@@ -1540,6 +1552,31 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             since=since,
             until=until,
             exclude=audit_exclusion_for(identity),
+            before_id=before_id,
+        )
+
+    async def _count_audit(
+        service: AuthService,
+        identity: Identity,
+        *,
+        limit: int,
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        before_id: int | None,
+    ) -> int:
+        """How many rows :func:`_read_audit` would return for the same caller and arguments, under
+        the same lock-row exclusion (BACKLOG #1131), counted in SQL rather than read. The export
+        records it before it streams (vault BACKLOG #2776)."""
+        return await service.store.count_audit(
+            limit=limit,
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=audit_exclusion_for(identity),
+            before_id=before_id,
         )
 
     async def _audit_list(
@@ -1593,8 +1630,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # defaults MUST be plain values — a route Query(...) sentinel must never reach the store bind
         # (BACKLOG #170 regression guard: 'type Query is not supported'). The UI shows the NEWEST
         # `limit` rows and nothing older, which is not the full trail and must not be described as one
-        # (BACKLOG #1743): this wrapper takes no offset because the store's list_audit has none, so
-        # there is no second page to reach and no total to compare against. The filters are on GET
+        # (BACKLOG #1743): this wrapper takes no cursor, so there is no second page to reach and no
+        # total to compare against. The store's keyset cursor (list_audit's before_id) and its
+        # count_audit serve the export (vault BACKLOG #2776); no pager uses them. The filters are on GET
         # /audit and the CSV is GET /audit/export, which is capped too (its own `limit`, no offset),
         # so it does not hold the whole trail either. AUDIT_READ is
         # enforced by the webconsole route's own require_ui dependency, so this wrapper carries no auth
@@ -1629,9 +1667,47 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         many rows).
 
         A caller without ``users:manage`` exports the trail without the lock rows, exactly as it reads
-        it (BACKLOG #1131), and ``count`` is the number of rows it received."""
-        rows = await _read_audit(
-            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
+        it (BACKLOG #1131), and ``count`` is the number of rows the export sends it.
+
+        The rows are read in pages of ``_AUDIT_EXPORT_PAGE``, newest first, each page keyed below the
+        last ``id`` of the one before (vault BACKLOG #2776), so the process holds one page and not the
+        whole result. The first page is read before the ``audit.export`` row is written, and every
+        later page sits below it, so the export never contains its own row. ``count`` is counted in
+        SQL over the same rows, from the first page's newest ``id`` down, and the stream stops at it.
+        A first page that is short, or that already holds ``limit`` rows, is the whole result, so it
+        is its own count and no count query runs.
+
+        The later pages are read after the 200 status and the ``audit.export`` row, so a body that
+        ends before ``count`` rows -- a store failure, a disconnect, a page that comes back short --
+        cannot change either. The engine log records how many of ``count`` rows were sent."""
+        page_size = min(limit, _AUDIT_EXPORT_PAGE)
+
+        async def _page(size: int, before_id: int | None) -> Sequence[Any]:
+            return await _read_audit(
+                service,
+                identity,
+                limit=size,
+                actor=actor,
+                action=action,
+                since=since,
+                until=until,
+                before_id=before_id,
+            )
+
+        first = await _page(page_size, None)
+        count = (
+            len(first)
+            if len(first) < page_size or page_size == limit
+            else await _count_audit(
+                service,
+                identity,
+                limit=limit,
+                actor=actor,
+                action=action,
+                since=since,
+                until=until,
+                before_id=int(first[0]["id"]) + 1,
+            )
         )
         # Record the export as its own audit event BEFORE streaming — the detail is metadata only (the
         # applied filter + row count), never a message body.
@@ -1641,7 +1717,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             detail=json.dumps(
                 {
                     "format": "csv",
-                    "count": len(rows),
+                    "count": count,
                     "filter": {
                         "actor": actor,
                         "action": action,
@@ -1654,28 +1730,50 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             client=client_ip(request),
         )
 
-        def _iter_csv() -> Iterator[str]:
+        async def _iter_csv() -> AsyncIterator[str]:
             buf = io.StringIO()
             writer = csv.writer(buf)
             writer.writerow(["ts", "actor", "action", "channel_id", "client", "detail"])
-            yield buf.getvalue()
-            for r in rows:
-                buf.seek(0)
-                buf.truncate(0)
-                # Neutralize spreadsheet formula injection (CWE-1236) in every string cell before it
-                # reaches the CSV a compliance officer may open in Excel/Sheets.
-                writer.writerow(
-                    _csv_safe(c)
-                    for c in (
-                        r["ts"],
-                        r["actor"],
-                        r["action"],
-                        r["channel_id"],
-                        r["client"],
-                        r["detail"],
-                    )
-                )
+            page, remaining = first, count
+            try:
                 yield buf.getvalue()
+                while page:
+                    # One chunk per page, not per row. Neutralize spreadsheet formula injection
+                    # (CWE-1236) in every string cell before it reaches the CSV a compliance officer
+                    # may open in Excel/Sheets.
+                    buf.seek(0)
+                    buf.truncate(0)
+                    writer.writerows(
+                        [
+                            _csv_safe(c)
+                            for c in (
+                                r["ts"],
+                                r["actor"],
+                                r["action"],
+                                r["channel_id"],
+                                r["client"],
+                                r["detail"],
+                            )
+                        ]
+                        for r in page[:remaining]
+                    )
+                    yield buf.getvalue()
+                    remaining -= len(page)
+                    # A short page is the end of the trail; a full one may have more below it.
+                    if remaining <= 0 or len(page) < page_size:
+                        return
+                    page = await _page(min(page_size, remaining), int(page[-1]["id"]))
+            finally:
+                # The 200 and the audit.export row are already out, so an early end -- an
+                # exception, a cancel, a closed generator, a short page -- can only be logged. The
+                # row count is metadata, never a body.
+                if remaining > 0:
+                    _log.warning(
+                        "audit export by %s ended early: %d of %d rows sent",
+                        identity.username,
+                        count - remaining,
+                        count,
+                    )
 
         return StreamingResponse(
             _iter_csv(),
