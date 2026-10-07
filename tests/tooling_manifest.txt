@@ -38,6 +38,7 @@ tests/test_asvs_verifier_vault_contract.py
 tests/test_bash_probe_path.py
 tests/test_bash_resolver.py
 tests/test_blanket_stage_guard.py
+tests/test_check_dependency_floors.py
 tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
 tests/test_ci_faulthandler_belts.py

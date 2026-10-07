@@ -1,0 +1,102 @@
+# Runs the route-walk and thread-pool guards against the OLDEST releases pyproject.toml allows
+# (vault BACKLOG #3055). The test legs in ci.yml install through constraints.lock, so none of them
+# shows whether the floors pyproject.toml declares still install and still pass.
+# The FastAPI floor is the case that filed this. It rests on names the route walk reads from
+# FastAPI, and only a run at the floor shows those names are there.
+#
+# ADVISORY. This job's context is not in `.github/required-contexts.txt`, which is the only thing
+# that gates a merge. It runs on a pull request only when a dependency declaration or one of the
+# guards it exists for changes, and weekly, because an upstream yank or a new release can break a
+# floor with no commit here.
+#
+# DELIBERATELY UNCONSTRAINED. `--constraint constraints.lock` is right on every other install in
+# this repository and wrong here: it pins each version to the lock, so the run would measure the lock
+# a second time. `--resolution lowest-direct` takes the lowest release each DIRECT dependency allows
+# (the engine's own and its [dev] extra) and the newest of everything else.
+#
+# THREE DECLARED FLOORS DO NOT INSTALL ON PYTHON 3.14 TODAY. Measured 2026-10-06 with uv 0.11.25,
+# `uv pip compile --resolution lowest-direct --python-version 3.14`, with and without
+# `--only-binary :all:`, and a real install of the result on Windows. The leg does not hide them.
+# The override file below raises the two that need it, and check_dependency_floors.py lists each
+# raised RUNTIME floor in `--raised`. So a runtime dependency above its floor for any other reason
+# reds the run, and so does a listed one that is back at its floor.
+#   - pydantic>=2.6 resolves to 2.9.0, whose pydantic-core 2.23.2 has no cp314 wheel. Its sdist is a
+#     Rust build, which failed locally. 2.12.0 (pydantic-core 2.41.1) is the lowest release uv finds
+#     a cp314 wheel for.
+#   - pyspnego>=0.10: 0.10.0 and 0.10.1 are yanked on PyPI, so the resolver takes 0.10.2. No override
+#     is needed; the floor check lists it as raised.
+#   - pyyaml>=6.0, in the [dev] extra and so not a runtime floor: the 6.0 sdist fails to build
+#     ("'build_ext' object has no attribute 'cython_sources'"). 6.0.3 is the lowest release uv finds
+#     a cp314 wheel for.
+# Raising those floors in pyproject.toml is a separate change. When one lands, drop its override and
+# its `--raised` entry here in the same pull request, or this leg goes red.
+name: dependency floors
+
+on:
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "packaging/messagefoundry-webconsole/pyproject.toml"
+      - "scripts/security/route_gates.py"
+      - "scripts/ci/check_dependency_floors.py"
+      - "tests/test_route_gates.py"
+      - "tests/test_thread_pool_fairness_baseline.py"
+      - "tests/test_check_dependency_floors.py"
+      - ".github/workflows/dependency-floors.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "23 6 * * 1"
+
+concurrency:
+  # Per-ref for pull-request events so a re-push supersedes its own run; a unique group for a
+  # scheduled or dispatched run so it is never superseded. Nothing here is required.
+  group: dependency-floors-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  floors:
+    name: dependency floors (advisory)
+    runs-on: ubuntu-latest
+    # The install is the slow part; the tests take seconds. Bounded so a hung build cannot hold a
+    # runner.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            packaging/messagefoundry-webconsole/pyproject.toml
+      - name: Install the engine at its declared floors
+        run: |
+          set -euo pipefail
+          # The two overrides are the floors that cannot install on Python 3.14; see the header.
+          printf '%s\n' 'pydantic==2.12.0' 'pyyaml==6.0.3' > "$RUNNER_TEMP/floor-overrides.txt"
+          uv pip install --system --resolution lowest-direct \
+            --override "$RUNNER_TEMP/floor-overrides.txt" \
+            -e ".[dev]" -e packaging/messagefoundry-webconsole
+      - name: Check every runtime dependency sits at its floor
+        run: |
+          set -euo pipefail
+          python scripts/ci/check_dependency_floors.py --raised pydantic --raised pyspnego
+      - name: Import the route walk and build the full surface
+        run: |
+          set -euo pipefail
+          python -c "from scripts.security.route_gates import full_surface_app, route_rows; print(len(route_rows(full_surface_app())), 'route rows')"
+      - name: Run the route-walk and thread-pool guards
+        run: |
+          set -euo pipefail
+          python -m pytest -p no:cacheprovider tests/test_route_gates.py tests/test_thread_pool_fairness_baseline.py tests/test_check_dependency_floors.py
