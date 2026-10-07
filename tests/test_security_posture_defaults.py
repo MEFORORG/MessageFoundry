@@ -1219,7 +1219,16 @@ def test_plain_ldap_with_the_opt_in_loads_under_warn_and_is_named(tmp_path: Path
     """The control arm: the same config, with only the dial moved, loads and is reported."""
     settings = _load_plain_ldap(tmp_path, "warn")
     assert settings.auth.plain_ldap_bind is True
-    assert "cleartext" in _risks(settings.security, settings.auth)["ad_allow_insecure_ldap"]
+    risk = _risks(settings.security, settings.auth)["ad_allow_insecure_ldap"]
+    assert "cleartext" in risk
+    # Directory password sign-in is retired, so the only user bind left is the step-up re-bind, and
+    # only a Kerberos session reaches it: an OIDC session steps up at the identity provider. The
+    # posture text said "every signing-in user's password"; it must name that step-up instead.
+    from tests._sign_in_claim import SIGN_IN_ANY_TENSE
+
+    assert not SIGN_IN_ANY_TENSE.search(risk), risk
+    assert "step up a Windows SSO (Kerberos) session" in risk, risk
+    assert "OIDC session steps up at the identity provider" in risk, risk
 
 
 def test_a_bare_host_with_no_scheme_is_a_plain_bind(tmp_path: Path) -> None:

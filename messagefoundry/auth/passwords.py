@@ -2,8 +2,13 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """argon2id password hashing (argon2-cffi) for *local* users.
 
-AD users never reach here — they authenticate by binding to the directory. The hash string embeds
-its own salt and cost parameters, so it is self-contained and safe to store in the ``users`` table.
+AD users never reach here. Directory password sign-in is retired, so they sign in with Windows SSO
+(Kerberos) or OIDC. A Kerberos session steps up with the user's password, which a re-bind to the
+directory checks (``AuthService._reauth_ad``), never a stored hash. An OIDC session steps up at the
+identity provider and sends no password to the engine.
+
+The hash string embeds its own salt and cost parameters, so it is self-contained and safe to store
+in the ``users`` table.
 """
 
 from __future__ import annotations

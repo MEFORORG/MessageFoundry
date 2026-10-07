@@ -7814,9 +7814,10 @@ def security_loosenings(
         out.append(
             (
                 "ad_allow_insecure_ldap",
-                "AD binds over plain ldap:// -- the service-account password and every signing-in "
-                "user's password cross the network in cleartext, and nothing authenticates the "
-                "domain controller",
+                "AD binds over plain ldap:// -- the service-account password, and the password a "
+                "directory user types to step up a Windows SSO (Kerberos) session, cross the network "
+                "in cleartext, and nothing authenticates the domain controller (an OIDC session steps "
+                "up at the identity provider and sends no password here)",
             )
         )
     # BACKLOG #288: the new-client-IP step-up defaults ON.
