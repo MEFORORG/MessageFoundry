@@ -17,10 +17,12 @@ import asyncio
 import io
 import json
 import logging
+import os
 import tarfile
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -116,32 +118,37 @@ async def test_a_backup_after_a_reload_from_another_root_carries_that_root(
         assert b"IB_STAGING_ADT" in member.read()
 
 
-@pytest.mark.parametrize(
-    "fault",
-    [
-        # A directory that cannot be listed. An unreadable FILE is skipped by the fold itself.
-        OSError(13, "Permission denied"),
-        # What the fold raises on a file name that is not UTF-8 (vault BACKLOG #2839).
-        UnicodeEncodeError("utf-8", "x\udc80", 1, 2, "surrogates not allowed"),
-    ],
-    ids=["unlistable-dir", "non-utf8-file-name"],
-)
+@pytest.mark.parametrize("fault", ["unlistable-dir", "non-utf8-file-name"])
 async def test_a_config_read_fault_costs_the_fingerprint_not_the_backup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    fault: Exception,
+    fault: str,
 ) -> None:
     cfg, _staging = _roots(tmp_path)
     db = tmp_path / "b.db"
     store = await MessageStore.open(db)
     threads: list[threading.Thread] = []
+    if fault == "unlistable-dir":
+        # Listing the dir is denied while stat still works. The fold lists through glob, which
+        # swallows this and would digest an empty bundle; the backup's own listing must not.
+        real_scandir = os.scandir
 
-    def failing(directory: object) -> str:
-        threads.append(threading.current_thread())
-        raise fault
+        def scandir(path: Any = ".") -> Any:
+            if Path(path) == cfg:
+                threads.append(threading.current_thread())
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_scandir(path)
 
-    monkeypatch.setattr(fp, "config_fingerprint", failing)
+        monkeypatch.setattr(os, "scandir", scandir)
+    else:
+
+        def failing(directory: object) -> str:
+            threads.append(threading.current_thread())
+            # What the fold raises on a file name that is not UTF-8 (vault BACKLOG #2839).
+            raise UnicodeEncodeError("utf-8", "x\udc80", 1, 2, "surrogates not allowed")
+
+        monkeypatch.setattr(fp, "config_fingerprint", failing)
     runner = BackupRunner(
         store,
         BackupSettings(enabled=True, destination=str(tmp_path / "out"), allow_unencrypted=True),
@@ -155,13 +162,14 @@ async def test_a_config_read_fault_costs_the_fingerprint_not_the_backup(
         await store.close()
     assert result is not None and result.config_fingerprint is None
     assert result.verify is not None and result.verify.status == "PASS"
-    # Taken once, and off the event loop.
-    assert len(threads) == 1 and threads[0] is not threading.main_thread()
+    # Taken off the event loop, first by the fingerprint.
+    assert threads and threads[0] is not threading.main_thread()
     warnings = [r.getMessage() for r in caplog.records if "config fingerprint failed" in r.message]
     assert len(warnings) == 1 and str(cfg) in warnings[0]
     with _archive_tar(result.archive_path) as tar:
         assert _manifest(tar)["config_fingerprint"] is None
-        assert "config/cfg.py" in tar.getnames(), "the config is still archived"
+        if fault == "non-utf8-file-name":
+            assert "config/cfg.py" in tar.getnames(), "the config is still archived"
 
 
 async def _backup_of(tmp_path: Path, cfg: Path) -> str | None:

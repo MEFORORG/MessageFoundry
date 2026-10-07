@@ -1165,17 +1165,18 @@ class BackupRunner:
 
         It catches what :meth:`Engine.fingerprint_bundle_blocking` catches, so a bundle a load
         tolerates cannot fail a backup (vault BACKLOG #3094); that method is the rule's source of
-        record. A directory that is not there is refused here too, because the digest of a missing
-        directory is the digest of an empty bundle and would read as real. Either way the archive
-        loses its fingerprint and the backup goes on. The warning names the directory and a
-        scrubbed reason, never config content."""
+        record. A directory that is not there or cannot be listed is refused here too: the fold
+        lists through ``glob``, which swallows that error, so it would digest an empty bundle and
+        the digest would read as real. Either way the archive loses its fingerprint and the backup
+        goes on. The warning names the directory and a scrubbed reason, never config content."""
         if config_dir is None:
             return None
         from messagefoundry.config.fingerprint import config_fingerprint
 
         try:
-            if not config_dir.is_dir():
-                raise FileNotFoundError(f"config directory not found: {config_dir}")
+            # Raises the real reason (gone, not a directory, access denied) where glob would not.
+            with os.scandir(config_dir):
+                pass
             return config_fingerprint(config_dir)
         except (OSError, ValueError) as exc:
             log.warning(
