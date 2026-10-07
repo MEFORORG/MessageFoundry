@@ -308,7 +308,9 @@ from typing import Any
 #: merged with vault BACKLOG #3062 (``AuthService.enabled`` removed), which moved the digest on its
 #: own; the value below covers both changes. ``CoreHandlers`` then gained the REQUIRED
 #: ``prior_resend``, the read-only repeat lookup the resend and edit-resend routes ask before they
-#: demand a proof; a console without it fails the ``UiDeps`` construction.
+#: demand a proof. The engine builds ``CoreHandlers``, so a console that calls it against an engine
+#: without it would raise AttributeError at request time; the pinned digest refuses the pair at
+#: mount first.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

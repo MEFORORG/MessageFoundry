@@ -80,6 +80,7 @@ __all__ = [
     "set_session_cookie",
     "spend_ui_action_step_up",
     "proof_spent_for",
+    "settle_ui_action_step_up",
 ]
 
 COOKIE_NAME = "mf_session"
@@ -1270,40 +1271,62 @@ def require_ui_step_up_action(
     return mark_route_gate(dependency)
 
 
+#: How long a spend record outlives the request that made it. Not a security window: a record
+#: outlives its request only when that request RAN, and by then the store has bound the key, so a
+#: same-key repeat can only be ADR 0090's duplicate. It just lets a quick repeat skip the prompt.
+_SPENT_FOR_KEY_TTL_SECONDS = 300.0
+#: Bound on the spend records held at once. Fail-safe: a dropped record makes its repeat ask again.
+_SPENT_FOR_KEY_MAX = 4096
+
+
 class _SpentForKey:
-    """Which requests a session has already spent an action-bound proof on (vault BACKLOG #2625),
-    each named by the caller from its idempotency key AND what the key acts on, so the same key
-    aimed elsewhere is not taken for a repeat. In memory and synchronous, so a second POST in flight beside the first finds the spend
-    before the first one's resend commits; ``resend_log`` cannot tell it that yet. Keyed by the
-    session's token hash, the action and the key; bounded and TTL'd like the continuations, and
-    a drop only means the repeat asks for a proof again."""
+    """Which requests a session spent an action-bound proof on (vault BACKLOG #2625), each named by
+    the caller from its idempotency key AND what the key acts on, so the same key aimed elsewhere
+    is no repeat. In memory and synchronous, so a second POST in flight beside the first finds the
+    spend before the first one's write commits.
+
+    A record is made when the proof is spent and kept only if the request then RAN
+    (:func:`settle_ui_action_step_up`); a request the handler refuses takes its record with it, so
+    the next submit asks for a proof again. Keyed by the session's token hash; bounded and TTL'd."""
 
     def __init__(self) -> None:
         self._entries: OrderedDict[tuple[str, str, str], float] = OrderedDict()
 
-    def put(self, token: str, action: str, key: str) -> None:
+    def put(self, token: str, action: str, name: str) -> None:
         now = time.monotonic()
-        entry = (hash_token(token), action, key)
+        entry = (hash_token(token), action, name)
         self._entries.pop(entry, None)
-        self._entries[entry] = now + REAUTH_CONTINUATION_TTL_SECONDS
+        self._entries[entry] = now + _SPENT_FOR_KEY_TTL_SECONDS
         while self._entries and next(iter(self._entries.values())) <= now:
             self._entries.popitem(last=False)
-        while len(self._entries) > _REAUTH_CONTINUATION_SESSIONS_MAX:
+        while len(self._entries) > _SPENT_FOR_KEY_MAX:
             self._entries.popitem(last=False)
 
-    def holds(self, token: str | None, action: str, key: str) -> bool:
+    def drop(self, token: str, action: str, name: str) -> None:
+        self._entries.pop((hash_token(token), action, name), None)
+
+    def holds(self, token: str | None, action: str, name: str) -> bool:
         if not token:
             return False
-        deadline = self._entries.get((hash_token(token), action, key))
+        deadline = self._entries.get((hash_token(token), action, name))
         return deadline is not None and deadline > time.monotonic()
 
 
 _SPENT_FOR_KEY = _SpentForKey()
 
 
-def proof_spent_for(request: Request, action: str, key: str) -> bool:
-    """Whether this session already spent its ``action`` proof on idempotency key ``key``."""
-    return _SPENT_FOR_KEY.holds(session_token(request), action, key)
+def proof_spent_for(request: Request, action: str, name: str) -> bool:
+    """Whether this session spent its ``action`` proof on the request named ``name``, and that
+    request is still running or ran."""
+    return _SPENT_FOR_KEY.holds(session_token(request), action, name)
+
+
+def settle_ui_action_step_up(request: Request, action: str, name: str, *, ran: bool) -> None:
+    """Close out a spend made with ``key=name``: keep its record when the request ran, so a quick
+    repeat rides on it, and drop it when the handler refused, so the next submit asks again."""
+    token = session_token(request)
+    if token and not ran:
+        _SPENT_FOR_KEY.drop(token, action, name)
 
 
 async def spend_ui_action_step_up(
@@ -1323,9 +1346,10 @@ async def spend_ui_action_step_up(
     if auth is None or not auth.action_step_up_required:
         return
     token = session_token(request)
-    # ``key`` ties the spend to one idempotency key: a second POST with the same key, in flight
-    # beside the first, rides on the proof the first spent rather than asking for another. The
-    # store makes that second one ADR 0090's duplicate, so it queues nothing.
+    # ``key`` names the request the proof is spent on. A second POST naming the same request,
+    # in flight beside the first or just after it, rides on that spend rather than asking for
+    # another; the store makes it ADR 0090's duplicate. The caller settles the spend once the
+    # handler resolves (settle_ui_action_step_up), so a refused request leaves no record.
     if key is not None and _SPENT_FOR_KEY.holds(token, action, key):
         return
     if not await _ui_action_step_up_ok(auth, token, action):

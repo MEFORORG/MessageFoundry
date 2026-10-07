@@ -470,6 +470,14 @@ async def test_a_target_that_cannot_take_a_delivery_is_reported_as_blocked(
         r = await _post_resend(c, mid, to="OB2")
         assert r.status_code == 400
         assert str(text(RESEND_BLOCKED_NOTICE)) in r.text
+        # Vault BACKLOG #2625: the refusal came after the proof was spent, and left no record of
+        # it, so the same URL again (a Back button, a stale tab) asks for a proof rather than
+        # running on the spent one once the outbound is up.
+        await engine.start()
+        again = await _post_resend(c, mid, to="OB2", mint=False)
+        assert again.status_code == 303 and again.headers["location"].startswith("/ui/reauth?")
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert rows == []
 
 
 def test_the_409_notice_makes_no_completeness_claim() -> None:

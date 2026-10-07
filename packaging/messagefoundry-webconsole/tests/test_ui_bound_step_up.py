@@ -152,6 +152,14 @@ async def test_the_editor_asks_before_it_opens_and_the_resubmit_spends_it(engine
         )
         assert sent.status_code == 400 and _reauth_next(sent) is None
         assert _reauth_next(await c.get(editor)) == editor
+        # The refused submit left no spend record, so resubmitting the re-rendered editor with
+        # the SAME key asks for a proof again rather than riding on the one it spent.
+        again = await c.post(
+            post,
+            data={"raw": "MSH|other", "idempotency_key": "k2", "mode": "reroute"},
+            headers=SAME_ORIGIN,
+        )
+        assert _reauth_next(again) == editor
 
 
 async def test_an_edit_resubmit_repeated_with_one_proof_lands_once(
