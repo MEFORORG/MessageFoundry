@@ -17,7 +17,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -182,8 +182,9 @@ async def test_ad_user_reauth_uses_a_live_rebind(engine: Engine) -> None:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "ad-pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            found = principal if (username == "jdoe" and password == "ad-pw") else None
+            return DirectoryBind(DirectoryAnswer.FOUND, found)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
@@ -462,8 +463,9 @@ async def test_ad_reauth_mints_action_grant_via_live_rebind(engine: Engine) -> N
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "ad-pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            found = principal if (username == "jdoe" and password == "ad-pw") else None
+            return DirectoryBind(DirectoryAnswer.FOUND, found)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None

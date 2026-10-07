@@ -9,11 +9,12 @@ neither discharges it, which is why a third one earns its runtime:
 * ``tests/test_security_notice_deliverability.py::test_the_LIFESPAN_refuses_and_not_merely_the_predicate``
   drives the real refusal, but through ``app.router.lifespan_context`` -- no uvicorn, no process.
 * ``tests/test_lifespan_startup_unwinds.py`` runs uvicorn in a subprocess and asserts the process
-  exits, but it PATCHES ``_assert_security_notice_is_deliverable`` with a raising stub. That is
-  deliberate and correct for its own subject (BACKLOG #1257 is about unwinding, and it must not
-  fail when the gate that happens to sit there changes) -- and it means the thing that raised was
-  never the gate. **Do not weaken or reuse it.** This file arranges the gate's real preconditions
-  instead and lets the shipped code do the refusing.
+  exits, but it raises from a patched call site, never from the gate. That is deliberate and correct
+  for its own subject (BACKLOG #1257 is about unwinding, and it must not fail when the gate that
+  happens to sit there changes). Since BACKLOG #2131 moved the gate before ``engine.start()``, that
+  test sets the gate's written waiver and raises from ``_initial_credential_warn_lead``. **Do not weaken
+  or reuse it.** This file arranges the gate's real preconditions instead and lets the shipped code
+  do the refusing.
 
 ADR 0167 records a second open question under *"What is NOT demonstrated"*: its exit-code arms were
 measured on a minimal repro that BACKLOG #1257's fix does not touch, so the REAL gate's exit code

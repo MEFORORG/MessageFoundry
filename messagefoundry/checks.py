@@ -58,6 +58,11 @@ has no ``reference`` tables) would pass this gate and then raise on every ``refe
 time, post-ACK, forever. It refuses that pairing here, keyed on the DECLARED backend, mirroring the
 engine's start-time refusal. Same fail-safe SKIPs and the same settings FAIL as ``build-check``.
 
+``oidc-revocation`` is required too (BACKLOG #2131): with federation on, it FAILS an off-box OIDC
+token or JWKS leg that checks no certificate revocation under an enforcing posture, the refusal
+``serve`` applies (ADR 0173 AC-4). It reads the decision ``verify``'s ``fed.idp_revocation`` row
+reads.
+
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
 config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable — at
@@ -109,6 +114,15 @@ if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings
 
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
+
+
+def _config_modules(base: Path) -> list[Path]:
+    """The config dir's ``*.py`` files, by the loader's own rule: a dot-named backup is never run, so
+    the static lints do not report on it either (vault BACKLOG #2781)."""
+    from messagefoundry.config.wiring import config_py_files
+
+    return config_py_files(base)
+
 
 # What ``_parse_config_module`` raises on a config module it cannot turn into a tree (BACKLOG #1858).
 # The advisory legs skip such a file, because ``validate`` runs first and names it: the loader's broad
@@ -231,10 +245,10 @@ def run_checks(
     connections, and there are none. The skip line they print says "config did not load", which is
     inexact for this one cause; threading the keyword further was left out of scope.
 
-    With no ``messagefoundry.toml``, the seven legs that read service settings, and the dry-run
+    With no ``messagefoundry.toml``, the legs that read service settings, and the dry-run
     preview's ``snapshot_on_send``, read them from the environment when ``MEFOR_AI_ENVIRONMENT``
-    names the instance (vault BACKLOG #2355). Each of the seven lines that ran says so; the dry-run
-    line does not. :func:`_settings_source` says why that variable is the trigger.
+    names the instance (vault BACKLOG #2355). Each of those legs' lines that ran says so; the
+    dry-run line does not. :func:`_settings_source` says why that variable is the trigger.
     """
     _toml, env_only = _settings_source(
         config_dir, service_config=service_config, suppress_search=suppress_service_toml_search
@@ -278,6 +292,16 @@ def run_checks(
         # Required, so the gate refuses what serve refuses.
         _with_source(
             _check_upstream_hop_ack(
+                config_dir,
+                service_config=service_config,
+                suppress_search=suppress_service_toml_search,
+            ),
+            env_only,
+        ),
+        # BACKLOG #2131 / ADR 0173 AC-4: serve refuses an off-box OIDC leg that checks no
+        # revocation under an enforcing posture. Required, so the gate refuses what serve refuses.
+        _with_source(
+            _check_oidc_revocation(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
@@ -505,7 +529,7 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
             "raise-fstring", ok=True, required=False, skipped=True, detail="not a config dir"
         )
     hits: list[str] = []
-    for path in sorted(base.glob("*.py")):
+    for path in _config_modules(base):
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -635,7 +659,7 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
             "accepts-candidate", ok=True, required=False, skipped=True, detail="not a config dir"
         )
     hits: list[str] = []
-    for path in sorted(base.glob("*.py")):
+    for path in _config_modules(base):
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -1541,12 +1565,12 @@ def _check_handler_security(
             "handler-security", ok=True, required=False, skipped=True, detail="not a config dir"
         )
     # sibling config modules (the dir's own *.py stems) are first-party for the unvetted-import rule.
-    local_modules = frozenset(p.stem for p in base.glob("*.py"))
+    local_modules = frozenset(p.stem for p in _config_modules(base))
     # unvetted-import needs a trustworthy shipped-dep set to tell operator-added from shipped; if the
     # metadata probe degraded to empty, skip the rule entirely rather than flag/block on a blind vet.
     shipped = _shipped_dep_import_roots()
     hits: list[str] = []
-    for path in sorted(base.glob("*.py")):
+    for path in _config_modules(base):
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -3292,6 +3316,66 @@ def _check_upstream_hop_ack(
             if source == "upstream"
             else f"no plaintext proxy-to-engine hop (TLS source of the API: {source})"
         ),
+    )
+
+
+def _check_oidc_revocation(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Report the OIDC revocation refusal ``serve`` applies, at commit/CI time (BACKLOG #2131,
+    ADR 0173 AC-4).
+
+    The decision is :func:`~messagefoundry.verify.federation.idp_revocation_result`, which reads
+    the engine's own guards (:func:`~messagefoundry.auth.service.idp_revocation_guards`) and maps
+    them to a status in the one place ``verify``'s ``fed.idp_revocation`` row does. That function
+    says why it reads no anchor, and :func:`~messagefoundry.verify.federation._revocation_row` how
+    the ``MEFOR_TLS_REVOCATION_ATTESTED`` read affects the status.
+
+    FAIL or ERROR fails this leg. MANUAL passes with the row's text, because the engine starts and
+    a person must confirm what crosses.
+
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`."""
+    from pydantic import ValidationError
+
+    from messagefoundry.verify.federation import idp_revocation_result
+    from messagefoundry.verify.model import FAILING
+
+    toml, env_only = _settings_source(
+        config_dir, service_config=service_config, suppress_search=suppress_search
+    )
+    if toml is None and not env_only:
+        return CheckResult(
+            "oidc-revocation",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
+        )
+    try:
+        settings = _load_check_settings(toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            "oidc-revocation",
+            ok=False,
+            required=True,
+            detail=f"settings did not load: {_settings_error(exc)}",
+        )
+    if not settings.auth.oidc_enabled:
+        return CheckResult(
+            "oidc-revocation",
+            ok=True,
+            required=True,
+            detail="[auth].oidc_enabled=false -- the engine builds no IdP hop to guard",
+        )
+    row = idp_revocation_result(settings)
+    return CheckResult(
+        "oidc-revocation",
+        ok=row.status not in FAILING,
+        required=True,
+        detail=f"{row.status.value}: {row.detail}",
     )
 
 

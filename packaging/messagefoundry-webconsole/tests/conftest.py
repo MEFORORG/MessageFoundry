@@ -111,6 +111,9 @@ _QUIESCE_TARGETS: tuple[str, ...] = (
     "asyncio",
     "aiosqlite",
     "messagefoundry",
+    # Not an emitter this suite has; listed so a run that collects the engine suite first, whose
+    # teardown quiesces it, gets it restored here too.
+    "tee.relay",
     "uvicorn",
 )
 
@@ -127,8 +130,13 @@ class _Baseline:
     __slots__ = ("level", "propagate")
 
     def __init__(self, logger: logging.Logger) -> None:
-        self.level: int = logger.level
-        self.propagate: bool = logger.propagate
+        # A quiesce the engine suite's copy of this guard left behind is read as the natural
+        # state; the engine conftest's _Baseline says why.
+        quiesced = logger.level == _ABOVE_CRITICAL or any(
+            _QuiesceNullHandler.tags(h) for h in logger.handlers
+        )
+        self.level: int = logging.NOTSET if quiesced else logger.level
+        self.propagate: bool = quiesced or logger.propagate
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -142,6 +150,12 @@ def _quiesce_baseline() -> Iterator[dict[str, _Baseline]]:
 class _QuiesceNullHandler(logging.NullHandler):
     """A sentinel terminal sink so a quiesced logger always has somewhere to land a record during
     teardown even if it does not propagate — tagged so setup removes exactly the ones we added."""
+
+    @staticmethod
+    def tags(handler: logging.Handler) -> bool:
+        """Whether ``handler`` is a sentinel added by either suite's copy of this guard. Matched by
+        class name, since the engine conftest defines its own class of this name."""
+        return type(handler).__name__ == _QuiesceNullHandler.__name__
 
 
 @pytest.fixture(autouse=True)
@@ -165,7 +179,7 @@ def _restore_baseline(baseline: dict[str, _Baseline]) -> None:
         logger = logging.getLogger(name)
         logger.propagate = snap.propagate
         logger.setLevel(snap.level)
-        for handler in [h for h in logger.handlers if isinstance(h, _QuiesceNullHandler)]:
+        for handler in [h for h in logger.handlers if _QuiesceNullHandler.tags(h)]:
             logger.removeHandler(handler)
 
 
@@ -175,7 +189,7 @@ def _quiesce_targets() -> None:
         logger = logging.getLogger(name)
         logger.propagate = False
         logger.setLevel(_ABOVE_CRITICAL)
-        if not any(isinstance(h, _QuiesceNullHandler) for h in logger.handlers):
+        if not any(_QuiesceNullHandler.tags(h) for h in logger.handlers):
             logger.addHandler(_QuiesceNullHandler())
 
 

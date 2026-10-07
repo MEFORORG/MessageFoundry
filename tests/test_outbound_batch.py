@@ -242,15 +242,16 @@ async def test_crash_midbatch_no_loss_no_reorder(store: Any) -> None:
     assert await _states(store, mids) == [QUEUED] * 3
 
     # Part B — atomic failure: a transient transport failure re-pends ALL three together (never a split
-    # batch); a re-delivery then frames them in the identical prefix order. Zero backoff so the re-pended
-    # rows are immediately re-claimable within the test.
+    # batch); a re-delivery then frames them in the identical prefix order. A tiny backoff, slept out
+    # below, so the re-pended rows are re-claimable within the test (a zero backoff is refused, vault
+    # BACKLOG #2761).
     runner = _runner(store)
-    zero_backoff = RetryPolicy(backoff_seconds=0.0, backoff_multiplier=1.0)
+    tiny_backoff = RetryPolicy(backoff_seconds=0.01, backoff_multiplier=1.0)
     _wire_batch(
         runner,
         _Recorder(fail=DeliveryError("partner unreachable")),
         BatchConfig(max_count=5, max_wait_ms=1),
-        retry=zero_backoff,
+        retry=tiny_backoff,
     )
     head = await store.claim_next_fifo(DEST)
     _outcome, retry_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
@@ -261,6 +262,9 @@ async def test_crash_midbatch_no_loss_no_reorder(store: Any) -> None:
     )  # all three back, none lost
     assert await _states(store, mids) == [QUEUED] * 3  # re-pended, not abandoned INFLIGHT
 
+    # Slept out rather than claimed with a future `now`: the batch body claims the coalesced members
+    # itself, at the real clock.
+    await asyncio.sleep(0.1)  # past the 0.01 s backoff, so all three are due again
     ok = _Recorder()
     runner._destinations[DEST] = ok
     head2 = await store.claim_next_fifo(DEST)

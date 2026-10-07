@@ -26,7 +26,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "In an untrusted workspace, MessageFoundry will not auto-run the workspace Python CLI (validate/graph/codeset/promote are disabled) until you trust the workspace."
+      "description": "In an untrusted workspace, MessageFoundry will not auto-run the workspace Python CLI (validate/graph/codeset/promote are disabled) and will not set up version control and its commit hook, which runs the workspace's own Python environment, until you trust the workspace."
     }
   },
   "contributes": {

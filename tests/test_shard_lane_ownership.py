@@ -12,7 +12,8 @@ gates on a 2-shard registry viewed from shard ``a``:
 * per_lane mode spawns delivery workers ONLY for owned lanes (the connector is still built);
 * the pooled OUTBOUND lane provider filters ``registry.outbound | _destinations`` by ownership —
   including a reload-dropped-but-still-built lane, which keeps draining IFF owned;
-* ``_wake_lane`` drops OUTBOUND wakes for non-owned lanes and RESPONSE wakes for foreign inbounds;
+* ``_wake_lane`` drops OUTBOUND wakes for non-owned lanes and INGRESS / ROUTED / RESPONSE wakes for
+  foreign inbounds (the pass-through half is pinned in test_shard_passthrough.py);
 * outbound CONTROLS (stop/start/restart) refuse a non-owned lane with ShardLaneOwnershipError
   (the API maps it to 409) while an owned lane still pauses/quiesces normally;
 * the sharded-only non-owned-lane watchdog pages queue_buildup on a lane the owner isn't draining,

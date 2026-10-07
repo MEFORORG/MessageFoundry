@@ -38,6 +38,7 @@ tests/test_asvs_verifier_vault_contract.py
 tests/test_bash_probe_path.py
 tests/test_bash_resolver.py
 tests/test_blanket_stage_guard.py
+tests/test_check_dependency_floors.py
 tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
 tests/test_ci_faulthandler_belts.py
@@ -51,6 +52,7 @@ tests/test_ci_refused_subjects.py
 tests/test_ci_retry_native_crash.py
 tests/test_ci_rig_legs_sign_in.py
 tests/test_ci_step_margin.py
+tests/test_ci_tool_and_image_pins.py
 tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_cla_action_advisory_gate.py
@@ -163,6 +165,7 @@ tests/test_security_composite_parity.py
 tests/test_security_posture.py
 tests/test_security_txt_expiry_reminder.py
 tests/test_selfheal_installed_parity.py
+tests/test_selfhosted_sql_runner_isolation.py
 tests/test_semgrep_install_retry.py
 tests/test_serverdb_ci_coverage.py
 tests/test_session_context_presence.py

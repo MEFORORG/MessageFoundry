@@ -39,6 +39,11 @@ from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.store import load_audit_chain
+from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
+from tests._replay_settle_contract import (
+    assert_replayed_ingress_row_is_received,
+    assert_replayed_routed_row_settles,
+)
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -803,6 +808,31 @@ async def test_cancel_queued(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
+async def test_cancel_queued_top_only_cancels_a_backing_off_head(store) -> None:
+    # vault BACKLOG #2754: a backed-off head is later-due than the row behind it; "purge top" must
+    # still cancel the FIFO head (seq order, as claim_next_fifo), not the earliest-due row.
+    m1 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0
+    )
+    m2 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p2")], now=101.0
+    )
+    head = await store.claim_next_fifo("OB1", now=102.0)
+    assert head is not None and head.message_id == m1
+    await store.mark_failed(
+        head.id, "boom", RetryPolicy(max_attempts=None, backoff_seconds=60.0), now=102.0
+    )
+    assert (await store.outbox_for(m1))[0]["next_attempt_at"] > (await store.outbox_for(m2))[0][
+        "next_attempt_at"
+    ]
+    assert await store.claim_next_fifo("OB1", now=103.0) is None  # the head blocks the lane
+    assert await store.cancel_queued(None, "OB1", top_only=True, now=103.0) == 1
+    assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
+    assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
+    nxt = await store.claim_next_fifo("OB1", now=103.0)
+    assert nxt is not None and nxt.message_id == m2
+
+
 async def test_dead_letter_missing_destinations(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("GONE", "p")], now=100.0
@@ -1492,6 +1522,17 @@ async def test_all_declined_finalizes_not_deployed(store) -> None:
     nd = [e["destination"] for e in await store.events_for(mid) if e["event"] == "not_deployed"]
     assert nd == ["OB_OFF"]
     assert await store.outbox_for(mid) == []  # AC-2: not one row in the outbound stage
+
+
+@pytest.mark.parametrize(("declined", "expected"), REPLAY_SETTLE_CASES)
+async def test_replayed_routed_row_that_sends_nothing_settles(store, declined, expected) -> None:
+    """Vault BACKLOG #2723 on Postgres; ``tests/_replay_settle_contract`` carries the property."""
+    await assert_replayed_routed_row_settles(store, declined, expected)
+
+
+async def test_replayed_ingress_row_is_received(store) -> None:
+    """Vault BACKLOG #2723 on Postgres: the RECEIVED arm of replay's status pick."""
+    await assert_replayed_ingress_row_is_received(store)
 
 
 async def test_declined_sibling_still_processed_event_retained(store) -> None:
@@ -5225,3 +5266,10 @@ async def test_list_audit_exclusion_runs_in_sql_before_limit_pg(store) -> None:
     ]
     assert len(await store.list_audit(actor=who, exclude=ex, limit=2)) == 2
     assert len(await store.list_audit(actor=who, limit=10)) == 5
+    # Vault BACKLOG #2776: the keyset cursor and the count bind after the exclusion's $N values.
+    ids = [r["id"] for r in await store.list_audit(actor=who, exclude=ex, limit=10)]
+    page = await store.list_audit(actor=who, exclude=ex, limit=10, before_id=ids[0])
+    assert [r["id"] for r in page] == ids[1:]
+    assert await store.count_audit(actor=who, exclude=ex, limit=10) == 3
+    assert await store.count_audit(actor=who, exclude=ex, limit=2) == 2
+    assert await store.count_audit(actor=who, exclude=ex, limit=10, before_id=ids[0]) == 2

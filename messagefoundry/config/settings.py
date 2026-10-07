@@ -1791,9 +1791,12 @@ class DeliverySettings(_Section):
     # remains a deliberate internal idiom for a permanent, no-retry failure (store `mark_failed`), and
     # constraining that instead would delete a used mechanism while claiming to add a guard.
     retry_max_attempts: int | None = Field(default=100, ge=1)
-    retry_backoff_seconds: float = 5.0
-    retry_backoff_multiplier: float = 2.0
-    retry_max_backoff_seconds: float = 300.0
+    # Vault BACKLOG #2761: the same bounds RetryPolicy carries, so a bad value fails here, at load,
+    # naming the [delivery] key, rather than later at retry_policy(). Positive finite base and cap, a
+    # finite multiplier of at least 1.
+    retry_backoff_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    retry_backoff_multiplier: float = Field(default=2.0, ge=1, allow_inf_nan=False)
+    retry_max_backoff_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
 
     # BACKLOG #1217 half 2. TOML has no null literal and an env var is always a string, so `None`
     # (retry-forever) was reachable from code-first Python only. The string spelling "forever"
@@ -4315,9 +4318,13 @@ _ALERT_EVENT_TYPES = frozenset(
         # [approvals].min_dwell_seconds floor. Keyed `approval:<id>`, which no connection can be named.
         "approval_too_early",
         # BACKLOG #315: a release by an approver account changed after the request, and an
-        # Administrator grant through the console API.
+        # Administrator grant through the console API or, since vault BACKLOG #2610, by a directory
+        # sign-in's role sync (granted_by `<directory>`).
         "approval_approver_provenance",
         "administrator_granted",
+        # vault BACKLOG #2255: the approval gate could not write one of its audit rows. Keyed
+        # `approval:<id>`, which no connection can be named.
+        "audit_write_failed",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # a pass left accounts unrevoked (the breaker tripped, or probes were referred, BACKLOG
         # #2538), and one principal's sessions were revoked.
@@ -6878,9 +6885,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       comes sooner than the floor and skip the check at 0 or less, so a floor below its default is
       looser and 0 is off. A higher floor is stricter, and is not named.
 
-    **Not covered, and stated so the gap is visible:** ``[approvals].min_dwell_seconds``, the
-    dual-control approval floor, is another time floor of the same kind. It lives in a section this
-    registry does not receive, and reporting it needs a new required parameter at every call site."""
+    ``[approvals].min_dwell_seconds``, the dual-control approval floor, is another time floor of the
+    same kind. It lives in its own section, so :func:`_approvals_loosenings` names it, read the same
+    way (BACKLOG #2489)."""
     out: list[tuple[str, str]] = []
 
     def _count(field: str, value: int, *, what: str, so: str, off: str | None) -> None:
@@ -7224,6 +7231,69 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     return out
 
 
+def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]:
+    """The ``[approvals]`` dual-control limits set LOOSER THAN THEIR SHIPPED DEFAULT, as
+    ``(switch, risk)`` entries for :func:`security_loosenings` (BACKLOG #2489; ASVS 2.3.5, 2.4.2).
+
+    It reads them as :func:`_auth_limit_loosenings` reads the ``[auth]`` limits: the shipped default
+    is the cutoff, a stricter value is never named, and a part of a control is named only while the
+    control is built. Dual control ships OFF, so nothing here is named until ``enabled`` is on with
+    at least one operation held. Switching it off again is the shipped posture, not a loosening.
+
+    The direction is read from ``ApprovalGate``. Its dwell check skips a ``min_dwell_seconds`` of 0
+    and refuses an approve younger than the floor, so a floor below the default is looser. Its
+    expiry stamps no deadline at an ``expiry_hours`` of 0 and refuses an approve past the deadline,
+    so a longer window is looser and 0 is off. The load refuses a negative value for either.
+
+    Values are quoted at 15 significant digits, so a value just past the default never prints as
+    the default itself.
+
+    **Not covered:** ``approve`` checks neither ``enabled`` nor ``operations``, and each request
+    keeps the deadline stamped when it was made. A request left pending when dual control is turned
+    off can still be released under the current dwell, and nothing here names that."""
+    out: list[tuple[str, str]] = []
+    if not (approvals.enabled and approvals.operations):
+        return out
+    fields = ApprovalsSettings.model_fields
+    dwell, dwell_default = approvals.min_dwell_seconds, fields["min_dwell_seconds"].default
+    if dwell <= 0:
+        out.append(
+            (
+                "min_dwell_seconds",
+                "a dual-control request may be released the moment it is made. A script holding "
+                "an approver's session can release a held action before anyone reads it",
+            )
+        )
+    elif dwell < dwell_default:
+        out.append(
+            (
+                "min_dwell_seconds",
+                f"a dual-control request may be released {dwell:.15g} s after it is made, sooner "
+                f"than the default of {dwell_default:g} s. That is less time than an approver needs "
+                "to read the held action",
+            )
+        )
+    expiry, expiry_default = approvals.expiry_hours, fields["expiry_hours"].default
+    if expiry <= 0:
+        out.append(
+            (
+                "expiry_hours",
+                "a dual-control request never expires. A held action stays releasable after what "
+                "it acts on has changed",
+            )
+        )
+    elif expiry > expiry_default:
+        out.append(
+            (
+                "expiry_hours",
+                f"a dual-control request stays releasable for {expiry:.15g} h, longer than the "
+                f"default of {expiry_default:g} h. A stale held action may be released after what it "
+                "acts on has changed",
+            )
+        )
+    return out
+
+
 #: The one sign-in that proves a second factor without an enrolled one, worded once for the MFA
 #: advisories here and the exposure texts in ``__main__._serve``. ``_check_mfa_gate`` checks the
 #: amr/acr claim, and the OIDC mint stamps the session verified, only while this setting is on.
@@ -7263,6 +7333,7 @@ def security_loosenings(
     attested_hops: Sequence[str],
     revocation_attested_hops: Sequence[str],
     api: ApiSettings,
+    approvals: ApprovalsSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
@@ -7279,8 +7350,9 @@ def security_loosenings(
     ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
     bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288), the ``[auth]``
     sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap and OIDC flow-cache
-    settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131), an
-    ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
+    settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
+    the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
+    (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
@@ -7325,7 +7397,8 @@ def security_loosenings(
     unreported here; ``docs/SECURITY-LOOSENING.md`` names them, under *The switches*.
 
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
-    every call site names it. It carries the BACKLOG #1179 acknowledgement.
+    every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
+    it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -7652,6 +7725,8 @@ def security_loosenings(
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
     out.extend(_auth_limit_loosenings(auth))
+    # BACKLOG #2489: the dual-control dwell floor and expiry ceiling, read the same way.
+    out.extend(_approvals_loosenings(approvals))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
     # the refused "*" does. The load still accepts them; naming them is the fix. Parsed STRICTLY, as
@@ -7927,11 +8002,18 @@ def settings_error_detail(exc: Exception) -> str:
     SINCE BACKLOG #296 THE SETTINGS MODELS STRIP THE INPUT THEMSELVES. Every ``_Section`` and
     :class:`ServiceSettings` re-raises each error with its input replaced by :data:`HIDDEN_INPUT`
     (``_InputHidingModel``), so ``str(exc)``, ``exc.errors()`` and ``exc.json()`` carry the
-    placeholder, never the refused mapping. That covers
-    the ``__main__.py`` arms that still print ``str(exc)`` (at least ``rotate-key`` and the store
-    commands behind ``_host_gated_store_settings``). At least ``serve``, ``supervise``,
-    ``audit-anchor`` and, since vault BACKLOG #3054, ``audit-verify`` render through this function,
-    by way of ``_load_service_settings``.
+    placeholder, never the refused mapping.
+
+    THE CLI ARMS THAT PRINT A WHOLE-FILE LOAD FAILURE ARE MEANT TO RENDER IT HERE TOO (vault
+    BACKLOG #2760), so neither layer rests on the other: a model added later outside
+    ``_InputHidingModel`` still prints no input through them. Most reach it through
+    ``__main__._load_service_settings``, including the post-write ``validate`` callback of
+    ``security set`` and ``alert add``/``remove``, whose reload is the whole file plus the
+    environment layer and not the JSON the operator typed. ``tests/test_cli_settings_error_render.py``
+    holds at least the arms it lists to this; a new arm belongs there. Some arms print ``str(exc)``
+    on purpose, at least the operator-input prechecks (``invalid [security] value``, ``invalid alert
+    rule``) and ``security show``'s read of the file's own ``[security]`` table: none of those
+    reads the environment.
 
     THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
     refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``

@@ -47,21 +47,26 @@ import uvicorn
 
 import messagefoundry.api.app as appmod
 from messagefoundry.api import create_managed_app
-from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.config.settings import AlertsSettings, AuthSettings, EgressSettings
 
 
-async def _boom(*args: object, **kwargs: object) -> None:
+def _boom(*args: object, **kwargs: object) -> None:
     raise RuntimeError("PROBE: deliberate failure in the post-engine startup span")
 
 
 # A real call site inside the span (after engine.start(), before the yield). Patching the
-# function rather than arranging its preconditions keeps this about unwinding.
-appmod._assert_security_notice_is_deliverable = _boom  # type: ignore[assignment]
+# function rather than arranging its preconditions keeps this about unwinding. It must be a call
+# whose raise reaches the lifespan: the lockable-account census sits after the start too, but its
+# own guard swallows a raise, so a probe there would never fail startup.
+appmod._initial_credential_warn_lead = _boom  # type: ignore[assignment]
 
 app = create_managed_app(
     db_path=Path(sys.argv[1]) / "probe.db",
     poll_interval=0.05,
     auth_settings=AuthSettings(),
+    # The notice gate was this probe until BACKLOG #2131 moved it before engine.start(). On this
+    # empty store it would now refuse first, before the span, so its written waiver is set.
+    alerts_settings=AlertsSettings(security_notifications_required=False),
     egress_settings=EgressSettings(),
 )
 

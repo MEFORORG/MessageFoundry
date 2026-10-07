@@ -222,6 +222,54 @@ engine). The DR profile is a **startup decision**, not a runtime toggle: the thr
 a reload re-evaluates the whole graph, so a connection never flips between bound and filtered mid-run with
 in-flight rows stranded.
 
+> **Amendment (vault BACKLOG #3067): `POST /dr/activate` applies the RUNNING graph, and disk drift is only
+> recorded.** The paragraph above calls the profile a startup decision, but `POST /dr/activate` and
+> `POST /dr/release` turn it on and off on a running engine. That half was broken: the runner took its
+> threshold only at construction, and the activation reloaded through the same runner, so a box built passive
+> parked nothing on activation. A runner built under the profile likewise kept parking feeds after a release.
+> The engine now hands the running runner the threshold before the activation reload, and clears it on release.
+> A reload still re-evaluates the whole graph, so the in-flight guarantee above holds. A below-threshold
+> outbound's lane is now also PARKED, the way a start-disabled one is, so its rows are held PENDING rather than
+> backing off via the retry policy as the bullet above says. That retry path charged each row a failed attempt,
+> so a finite `max_attempts` dead-lettered rows only for being parked. A release's drain leaves held rows out,
+> and the `dr.release` row records `drained` and `held_on_parked_outbounds`. A box built passive
+> still binds its whole graph, every tier, before activation. That contradicts this ADR's load-balancer fence,
+> which relies on a passive box binding no high-priority listener, and the gap is a recorded defect.
+>
+> **Decision 1: the activation re-applies the graph the engine is running, not a config dir.** It used to
+> reload the config dir from disk. That put live any bytes edited there since the last approved reload, with
+> no second person, and a dir that had gone with the failed site refused the activation after the takeover
+> hook had moved the VIP. The activation now runs the settings preflight, the registry preflight and the
+> runner's reload over the in-memory graph. The runner's reload still runs the build check, so the egress and
+> exposure gates still apply. The preflight that refused an activation whose config dir could not be listed
+> (vault BACKLOG #2840) is removed with it, since the activation no longer needs the dir.
+>
+> **Decision 2: disk drift is recorded and logged, and only the gated reload applies it.** After the
+> re-apply, the engine digests the running config dir off the event loop, bounded by
+> `[dr].takeover_timeout_seconds`. The `dr.activate` row records the activated graph's digest, and a
+> `disk_config` verdict of `matches`, `differs`, `unreadable` or `unknown` (the running graph has no digest to
+> compare). On `differs` it also records the disk digest, and the engine logs one WARNING naming both digests
+> and the dir. On `unreadable` it records why and goes on: the check runs after the graph is live, so it never
+> fails the activation. The re-apply runs the current graph once it holds the runner's reload lock, so an
+> operator reload that lands first is re-evaluated under the threshold rather than reverted.
+> `POST /config/reload`, under its own approval gate, is what applies the disk. This is not a `config_changed`
+> alert, whose contract is a start loading different bytes. The `dr_seed` marker records the running graph's
+> digest too, not a disk digest. The marker is written before the takeover hook, so an operator reload that
+> lands during the hook makes it differ from the `dr.activate` row, which records the graph actually applied.
+>
+> **Decision 3: while the profile parks an outbound, the doors that would change its run state refuse.**
+> Operator start, stop and restart answer `409` with the reason, and an alert rule's automatic restart and
+> the scheduler's resume log the refusal at INFO and do nothing. The engine first tried to defer such a start
+> until release, but each door then turned one kind of pause into another, and each was found on its own.
+> A stop dropped the engine's park, so the lane read `stopping` for good. An alert rule's restart turned an
+> operator's pause into an engine park, so the release brought that lane up. So the lane keeps the state the
+> profile left it in until the first reload or start after `POST /dr/release` re-evaluates it. A lane the
+> engine parked then comes up, and a lane an operator or the calendar paused first stays paused. An
+> `auto_start = false` lane takes its gate's answer, so one an operator had started before DR stays down.
+> A purge of a parked lane is allowed, since the lane is paused and nothing is in flight. For an INBOUND, an
+> operator start still overrides the profile, as `tests/test_connection_scheduler.py` pins. An alert
+> rule's restart of a parked inbound does nothing.
+
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 
 **Locked (owner posture, 2026-06-28): the DR store is COLD-seeded from #60's encrypted backups on activation —
@@ -456,6 +504,15 @@ and listeners are unbound, so there is **no dual-accept window** while the VIP m
 2. DR **drains its staged queue to completion** (all `outbound` rows delivered or dead-lettered) **before
    `POST /dr/release` returns**. *Within DR's single store* the at-least-once + idempotency invariants make this
    safe: any row re-run re-derives identical output, and idempotent outbounds tolerate a duplicate.
+   *Amendment (vault BACKLOG #2752, 2026-10-06):* the wait is bounded (60 s of wall-clock time,
+   `DR_RELEASE_DRAIN_TIMEOUT_SECONDS` in `pipeline/engine.py`), so a row that cannot drain does not
+   hold the release. The hand-back then completes with those rows still queued, and the `dr.release`
+   audit row and the response record `depth_left`, the count left, instead of claiming a drain. Rows held on
+   an outbound the profile parks cannot drain on this box, so the wait leaves them out: `depth_left` counts
+   them, `held_on_parked_outbounds` says how many they are, and `drained` is true once every other row has
+   drained (vault BACKLOG #3067). The
+   release, like the activation, runs on when the API's request deadline cuts its caller off
+   (`api/outlive.py`), and a release cancelled partway stays active and writes `dr_release_failed`.
 3. Primary resumes against the authoritative store. Because the owner-locked seed is **cold**, DR ran on a
    **separate restored copy** that has since diverged from the primary's recovered store. **Across this cold
    handoff the engine provides NO cross-store guarantee** — at-least-once/idempotency are within-a-store properties

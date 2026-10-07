@@ -611,7 +611,7 @@ async def test_source_leave_durable_ledger_read_is_the_dedup(
     src = _src(monkeypatch, client, after_read="leave")
     ledger = _FakeLedger()
     ledger.keys.add(
-        src._file_key("a.hl7", 3)
+        src._file_key("a.hl7", 3, None)
     )  # pre-seed durable (full remote path folded); cache empty
     src.processed_ledger = ledger
     assert len(src._processed_seen) == 0
@@ -630,9 +630,9 @@ async def test_source_leave_distinct_remote_paths_get_distinct_keys(
     c1 = _FakeClient(files={"/in/m.hl7": b"AAA"})
     c2 = _FakeClient(files={"/other/m.hl7": b"AAA"})  # same name+size, different base
     s1 = _src(monkeypatch, c1, after_read="leave", remote_dir="/in")
-    k1 = s1._file_key("m.hl7", 3)
+    k1 = s1._file_key("m.hl7", 3, None)
     s2 = _src(monkeypatch, c2, after_read="leave", remote_dir="/other")
-    k2 = s2._file_key("m.hl7", 3)
+    k2 = s2._file_key("m.hl7", 3, None)
     assert k1 != k2  # distinct remote paths → distinct hashed keys
 
 

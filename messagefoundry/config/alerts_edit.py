@@ -171,7 +171,12 @@ def _build_table(obj: dict[str, Any]) -> Any:
 
 def _write_validated(path: Path, new_text: str, original: str | None, validate: Validate) -> None:
     """Atomically write ``new_text``, validate the file loads, and roll back to ``original`` on
-    failure (delete it if it didn't exist before)."""
+    failure (delete it if it didn't exist before).
+
+    The callback's error is re-raised unchanged, so the callback owns its wording. A whole-file
+    ``load_settings`` failure must leave the callback already rendered, as the ``alert`` CLI's
+    callback renders it with ``settings_error_detail`` (vault BACKLOG #2760): its caller prints
+    the message, and this module stays outside the settings import graph."""
     _atomic_write(path, new_text)
     try:
         validate(path)

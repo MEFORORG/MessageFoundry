@@ -32,6 +32,7 @@ import functools
 import hashlib
 import re
 from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
 from importlib.resources import files
 from typing import TYPE_CHECKING
 
@@ -244,6 +245,18 @@ class PasswordPolicy:
         """Every term the context screen refuses: the shipped ``CONTEXT_WORDS`` plus the site's own.
         A union, so a site term can widen the list and never narrow it."""
         return CONTEXT_WORDS | self.extra_context_words
+
+    @property
+    def requires_character_class(self) -> bool:
+        """Whether any opt-in character-class rule is on. Read from every ``require_*`` field, so a
+        class rule added later under that prefix counts with no edit here (BACKLOG #2359). The
+        temporary-password generator reads it to decide whether a suffixed candidate can help; a
+        hand-written list of the four fields would leave a fifth rule out of that decision. So the
+        ``require_`` prefix is for character-class rules only: a field of another kind needs
+        another name."""
+        return any(
+            getattr(self, f.name) for f in dataclass_fields(self) if f.name.startswith("require_")
+        )
 
     @classmethod
     def from_settings(cls, settings: AuthSettings) -> PasswordPolicy:

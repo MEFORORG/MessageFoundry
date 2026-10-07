@@ -30,7 +30,7 @@ from _ui_clients import SAME_ORIGIN as _SAME
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.oidc import FederatedPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -52,8 +52,10 @@ _PRINCIPAL = AdPrincipal(
 class _FakeLdap:
     """The duck-typed directory the /ui SSO and OIDC suites use. No AD exists in any test infra."""
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return _PRINCIPAL if username == "jdoe" else None
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+        if username != "jdoe":
+            return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+        return DirectoryBind(DirectoryAnswer.FOUND, _PRINCIPAL)
 
     def resolve_principal(
         self, username: str, *, object_id: str | None = None

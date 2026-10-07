@@ -30,6 +30,8 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.store.crypto import MARKER_PREFIX, make_cipher
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
+from tests._replay_settle_contract import assert_replayed_routed_row_settles
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
 
@@ -1040,11 +1042,20 @@ async def test_replay_dead_routed_row_does_not_repend_delivered_sibling(
     # The delivered outbound row stays DONE (not re-pended → not re-delivered).
     ob = {r["destination_name"]: r["status"] for r in await store.outbox_for(mid)}
     assert ob == {"OB_A": OutboxStatus.DONE.value}
-    # Back in the route/transform path (a routed row pending again).
+    # Back in the transform path: a routed row is pending again, and the router already ran, so the
+    # message is ROUTED -- not RECEIVED, which only a re-pended INGRESS row earns (vault BACKLOG #2723).
     fetched = await store.get_message(mid)
     assert fetched is not None
-    assert fetched["status"] == MessageStatus.RECEIVED.value
+    assert fetched["status"] == MessageStatus.ROUTED.value
     assert await _claim_routed(store, "IB") is not None
+
+
+@pytest.mark.parametrize(("declined", "expected"), REPLAY_SETTLE_CASES)
+async def test_replayed_routed_row_that_sends_nothing_settles(
+    store: MessageStore, declined: tuple[str, ...], expected: MessageStatus
+) -> None:
+    """Vault BACKLOG #2723 on SQLite; ``tests/_replay_settle_contract`` carries the property."""
+    await assert_replayed_routed_row_settles(store, declined, expected)
 
 
 # --- outbox→queue migration --------------------------------------------------

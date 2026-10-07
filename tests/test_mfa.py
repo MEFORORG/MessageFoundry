@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from messagefoundry.api import auth_models, models
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, DirectoryProbe
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     MFA_DISABLED,
@@ -319,8 +319,10 @@ async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-                return principal if (username == "jdoe" and password == "pw") else None
+            def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+                if username != "jdoe":
+                    return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+                return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
             def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
@@ -487,7 +489,7 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout(
         assert user is not None and user.failed_attempts == threshold  # none lost, none past it
         refused = await service.login(ADMIN_USERNAME, password)
         assert not refused.ok and refused.error == "account locked"  # the RIGHT password is refused
-        assert sum(1 for e in notifier.events if e.event_type == ACCOUNT_LOCKED) == 1
+        assert len(await _lock_notices(service, notifier)) == 1
 
         # Clear the lock the way a lapsed window would, so arm 2 starts from an unlocked account.
         # This is the raw lockout-state write (ADR 0171's offline unlock), not the counting path.
@@ -536,6 +538,9 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout(
 
         # The per-account queue leaves no entry behind once every attempt has left it.
         assert service._credential_locks == {}, "the per-account lock entry must not leak"
+        # Arms 2 and 3 set locks too; finish their background notices before the store closes
+        # (BACKLOG #2216), so none runs on into a later test on the shared loop.
+        await service.drain_background()
     finally:
         await store.close()
 
@@ -1613,7 +1618,7 @@ async def test_AC11_parallel_combined_sign_ins_each_count_on_the_second_step(
         assert [o.error for o in outs].count("account locked") == burst - threshold
         assert user.second_step_locked_until is not None and user.second_step_lock_cycles == 1
         assert (user.failed_attempts, user.locked_until) == (0, None)
-        assert sum(1 for e in notifier.events if e.event_type == ACCOUNT_LOCKED) == 1
+        assert len(await _lock_notices(service, notifier)) == 1
     finally:
         await store.close()
 
@@ -2130,8 +2135,18 @@ async def _notice_harness(
     return store, service, notifier, clock, admin.user_id
 
 
-def _lock_notices(notifier: _FakeNotifier) -> list[SecurityEvent]:
+async def _lock_notices(service: AuthService, notifier: _FakeNotifier) -> list[SecurityEvent]:
+    """The ACCOUNT_LOCKED mails sent so far. A wired notifier's lock notice runs as a background task
+    (BACKLOG #2216), so this awaits the service's drain first rather than sleeping."""
+    await service.drain_background()
     return [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
+
+
+async def _refuse(service: AuthService, username: str) -> None:
+    """One refused sign-in, with its lock notice finished before the test moves the clock on, so
+    the notice's throttle reads the same instant the lock was set at (BACKLOG #2216)."""
+    assert not (await service.login(username, "wrong-passphrase")).ok
+    await service.drain_background()
 
 
 async def test_AC10_a_lock_every_15_minutes_for_25_hours_mails_exactly_twice(
@@ -2140,13 +2155,13 @@ async def test_AC10_a_lock_every_15_minutes_for_25_hours_mails_exactly_twice(
     store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
     try:
         for _ in range(100):  # 100 x 15 minutes = 25 hours
-            assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+            await _refuse(service, ADMIN_USERNAME)
             clock.now += 15 * 60 + 1
         user = await store.get_user(user_id)
         assert user is not None and user.lock_cycles == 100
         rows = await store.list_audit(actor=ADMIN_USERNAME, action="auth.account_locked", limit=500)
         assert len(rows) == 100, "the auth.account_locked row must still be written every cycle"
-        notices = _lock_notices(notifier)
+        notices = await _lock_notices(service, notifier)
         assert len(notices) == 2, f"expected two mails in 25 hours, got {len(notices)}"
         assert notices[0].detail["lock"] == "sign_in" and notices[0].detail["cycle"] == 1
         assert notices[1].detail["cycle"] > 90
@@ -2162,13 +2177,13 @@ async def test_AC10_an_unlock_then_a_new_lock_at_a_high_cycle_count_still_mails(
     store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
     try:
         for _ in range(40):
-            assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+            await _refuse(service, ADMIN_USERNAME)
             clock.now += 15 * 60 + 1
-        assert len(_lock_notices(notifier)) == 1
+        assert len(await _lock_notices(service, notifier)) == 1
         await store.clear_lockout(user_id)
         clock.now += 86_400 + 1
-        assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
-        notices = _lock_notices(notifier)
+        await _refuse(service, ADMIN_USERNAME)
+        notices = await _lock_notices(service, notifier)
         assert len(notices) == 2, "the first lock after a quiet day sent no mail"
         assert notices[-1].detail["cycle"] == 41
     finally:
@@ -2180,7 +2195,7 @@ async def test_AC10_the_two_lock_kinds_are_throttled_separately(
 ) -> None:
     store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
     try:
-        assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+        await _refuse(service, ADMIN_USERNAME)
         user = await store.get_user(user_id)
         assert user is not None
         # A second-step lock minutes later is a different lock kind, so it mails too.
@@ -2195,7 +2210,7 @@ async def test_AC10_the_two_lock_kinds_are_throttled_separately(
         )
         assert result.just_locked
         await service._record_lock(user, "second_step", result, client=None, factor="password")
-        kinds = [e.detail["lock"] for e in _lock_notices(notifier)]
+        kinds = [e.detail["lock"] for e in await _lock_notices(service, notifier)]
         assert kinds == ["sign_in", "second_step"]
     finally:
         await store.close()
@@ -2257,14 +2272,16 @@ async def test_an_addressless_lock_notice_does_not_hold_back_a_later_mailable_on
         bare = await store.get_user("u-noaddr")
         assert bare is not None and not bare.notify_email
         for _ in range(3):
-            assert not (await service.login("no-address", "wrong-passphrase")).ok
+            await _refuse(service, "no-address")
             clock.now += 15 * 60 + 1
         rows = await store.list_audit(actor="no-address", action="auth.lock_notice", limit=10)
         assert len(rows) == 1 and '"mailed": false' in str(rows[0]["detail"])
         await store.set_user_notify_email("u-noaddr", email="later@example.org")
-        before = len(_lock_notices(notifier))
-        assert not (await service.login("no-address", "wrong-passphrase")).ok
-        assert len(_lock_notices(notifier)) == before + 1, "the first mailable lock was held back"
+        before = len(await _lock_notices(service, notifier))
+        await _refuse(service, "no-address")
+        assert len(await _lock_notices(service, notifier)) == before + 1, (
+            "the first mailable lock was held back"
+        )
     finally:
         await store.close()
 
@@ -2297,7 +2314,7 @@ async def test_a_directory_second_step_lock_names_the_directory_sign_in(
             now=clock.now,
         )
         await service._record_lock(ad, "second_step", result, client=None, factor="first_step")
-        notice = _lock_notices(notifier)[-1]
+        notice = (await _lock_notices(service, notifier))[-1]
         assert notice.detail["factor_right"] == "directory"
         body = _build_body(notice)
         assert "directory sign-in succeeded" in body and "password reset" not in body

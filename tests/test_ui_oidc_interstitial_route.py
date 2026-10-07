@@ -107,6 +107,42 @@ def test_the_allowlist_escape_suppresses_the_interstitial() -> None:
     assert r.status_code != 200 or "leaving" not in r.text.lower()
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"organization_domains": ("hospital.example",)},
+        {"organization_domains": (), "external_link_allowlist": ("hospital.example",)},
+    ],
+    ids=["org-domain", "allowlist"],
+)
+def test_a_host_that_only_LOOKS_internal_still_gets_the_interstitial(
+    policy: dict[str, Any],
+) -> None:
+    """Vault BACKLOG #2790, end to end through the one caller of ``is_external``.
+
+    The route builds ``https://<host>/``, and a browser ends that authority at the backslash, so it
+    goes to ``evil.example``. ``urlsplit`` read the host as the part after the ``@``, which let
+    both the organization domains and the audited allowlist skip the warning for another host.
+    """
+    r = _client(oidc_authorization_host="evil.example\\@adfs.hospital.example", **policy).get(
+        "/ui/oidc/start"
+    )
+    assert r.status_code == 200
+    assert "leaving" in r.text.lower()
+    # The page names the host the browser goes to, not the configured string that looks internal.
+    assert "<code>evil.example</code>" in r.text
+
+
+def test_an_ipv6_idp_is_shown_and_judged_as_its_whole_address() -> None:
+    """The engine passes an IPv6 host unbracketed. Wrapped as-is, ``https://fd00::10/`` reads as
+    host ``fd00``, which is neither the address shown to the operator nor the one navigated to."""
+    r = _client(organization_domains=("hospital.example",), oidc_authorization_host="fd00::10").get(
+        "/ui/oidc/start"
+    )
+    assert r.status_code == 200
+    assert "<code>fd00::10</code>" in r.text
+
+
 def test_turning_the_interstitial_off_suppresses_it() -> None:
     r = _client(
         organization_domains=("hospital.example",),

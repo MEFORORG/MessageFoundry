@@ -47,18 +47,20 @@ import asyncio
 import functools
 import inspect
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import fastapi
 import pytest
 from argon2 import PasswordHasher
 from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
+from fastapi.dependencies import models as fastapi_models
 from fastapi.dependencies.models import Dependant
 from fastapi.responses import PlainTextResponse
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from starlette.applications import Starlette
-from starlette.routing import BaseRoute, Mount, Route
+from starlette.routing import Mount, Route
 
 from messagefoundry.api.app import _get_engine, _get_gate
 from messagefoundry.api.auth_routes import _service as api_service
@@ -199,11 +201,14 @@ def _fastapi_awaits(call: Callable[..., Any]) -> bool:
     async generator on the loop, and sends anything else, such as a plain ``def``, a sync generator
     or a class, through ``run_in_threadpool`` (``fastapi.dependencies.utils.solve_dependencies``).
 
-    The two helpers are private. They are imported here rather than at the top, so a FastAPI upgrade
-    that renames them fails these guards loudly and leaves the starvation tests above standing."""
-    from fastapi.dependencies.models import _is_async_gen_callable, _is_coroutine_callable
-
-    return _is_coroutine_callable(call) or _is_async_gen_callable(call)
+    The two helpers are private, and FastAPI has no public form of them: ``Dependant`` exposes no
+    such predicate. Copying their logic here would let the guard drift from the rule FastAPI runs. So
+    they are read at call time through ``route_gates.fastapi_symbol``, and a FastAPI that renames one
+    fails these guards with the installed version and the missing name, leaving the starvation tests
+    above standing (vault BACKLOG #3055)."""
+    is_coroutine = route_gates.fastapi_symbol(fastapi_models, "_is_coroutine_callable")
+    is_async_gen = route_gates.fastapi_symbol(fastapi_models, "_is_async_gen_callable")
+    return bool(is_coroutine(call) or is_async_gen(call))
 
 
 def _starlette_awaits(call: object) -> bool:
@@ -217,17 +222,19 @@ def _starlette_awaits(call: object) -> bool:
     )
 
 
-def _walk(routes: Sequence[BaseRoute], prefix: str = "", found: _Walk | None = None) -> _Walk:
-    """The calls a request to these routes hands to a worker thread, as far as the walk can see.
+def _walk(
+    owner: Starlette | APIRouter | Mount, prefix: str = "", found: _Walk | None = None
+) -> _Walk:
+    """The calls a request to ``owner``'s routes hands to a worker thread, as far as the walk can see.
 
     Routes come through ``route_gates._effective_routes``, the walk the gate inventory already uses.
     It opens every ``include_router`` and reads the include's own dependencies. A mount with routes
     is walked under its path. Any other route type lands in ``unread``, so it is named rather than
-    skipped. Routes outside ``routes`` are not visited, such as a ``frontend`` group FastAPI keeps in
-    a separate list.
+    skipped. A ``frontend`` group, which FastAPI keeps in a separate list, makes that call raise
+    rather than pass unvisited.
     """
     found = _Walk() if found is None else found
-    for route, effective in route_gates._effective_routes(routes):
+    for route, effective in route_gates._effective_routes(owner):
         path = prefix + (getattr(effective, "path", None) or "")
         found.paths.add(path)
         dependant = getattr(effective, "dependant", None)
@@ -242,7 +249,7 @@ def _walk(routes: Sequence[BaseRoute], prefix: str = "", found: _Walk | None = N
                 if node.call is not None and not _fastapi_awaits(node.call):
                     found.sync.setdefault(_name(node.call), set()).add(path)
         elif isinstance(effective, Mount) and effective.routes:
-            _walk(effective.routes, path, found)
+            _walk(effective, path, found)
         elif isinstance(effective, Route) and (
             inspect.isfunction(effective.endpoint) or inspect.ismethod(effective.endpoint)
         ):
@@ -259,7 +266,7 @@ def _walk_app(app: FastAPI) -> _Walk:
     """:func:`_walk` over the routes, plus two app-level places a sync call reaches the pool: an
     exception handler, which Starlette runs through ``run_in_threadpool``, and a dependency
     override, which FastAPI calls in place of the declared dependency."""
-    found = _walk(app.routes)
+    found = _walk(app)
     for handler in app.exception_handlers.values():
         if not _starlette_awaits(handler):
             found.sync.setdefault(_name(handler), set()).add("<exception handler>")
@@ -362,3 +369,18 @@ def test_the_guard_names_what_was_planted() -> None:
         _name(_planted_sync_handler): {"<exception handler>"},
     }
     assert _name(_planted_async_dependency) not in found.sync
+
+
+@pytest.mark.parametrize("helper", ["_is_coroutine_callable", "_is_async_gen_callable"])
+def test_a_renamed_fastapi_helper_fails_the_guard_by_name(
+    helper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard reads FastAPI's own private rule. A FastAPI that renames either helper must fail it
+    with the installed version and the missing name, never let it classify with a guess (vault
+    BACKLOG #3055)."""
+    assert _fastapi_awaits(_planted_async_dependency)  # the control, before the rename
+    monkeypatch.delattr(fastapi_models, helper)
+    with pytest.raises(route_gates.MissingFastAPISymbol) as caught:
+        _fastapi_awaits(_planted_async_dependency)
+    assert f"fastapi.dependencies.models.{helper}" in str(caught.value)
+    assert f"FastAPI {fastapi.__version__}" in str(caught.value)
