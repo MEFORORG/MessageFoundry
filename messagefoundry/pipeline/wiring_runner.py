@@ -7772,6 +7772,10 @@ class RegistryRunner:
             if result.wake_target is not None:  # ROUTED lane (disposition already committed sync)
                 self._wake_lane(Stage.ROUTED, result.wake_target)
             return _ItemOutcome.PROCESSED, None
+        # The inline fast-path's fused deliveries, set inside the content try below only once
+        # route_only and transform_one have both returned and every per-message gate held. The
+        # handoff that commits them runs AFTER the try (ADR 0057 G1 as amended 2026-10-07).
+        fused: list[tuple[str, str]] | None = None
         try:
             # Publish the live graph's run-scoped views (code sets / reference snapshots /
             # active environment) so a call-time code_set(...)/reference(...)/
@@ -7806,9 +7810,11 @@ class RegistryRunner:
                     item.payload,
                     run_context=router_rc,
                 )
-            # ADR 0057 inline Step-A fast-path (G1: this whole block is INSIDE the inner try,
-            # so a raise from transform_one OR handoff routes to the internal_error policy
-            # below — NOT the outer retry-forever except). Eligible iff the inbound opted in
+            # ADR 0057 inline Step-A fast-path. G1, as amended 2026-10-07: the inline transform_one
+            # runs INSIDE the inner try, so a Handler raise routes to the internal_error policy
+            # below. The fused store.handoff does NOT: it runs after the try, so a store fault
+            # propagates to the caller's fault arm and re-pends the row, as route_handoff does here
+            # and as the fused path's handoff_exc does (ADR 0071). Eligible iff the inbound opted in
             # AND the graph has no live lookup AND ack_after=ingest AND not LOOPBACK
             # (graph-level gates, cached in self._inline_ok) — plus the per-message gates here.
             if inline and len(names) == 1:
@@ -7876,26 +7882,7 @@ class RegistryRunner:
                     and not meta_preview
                     and not declined
                 ):
-                    # CF — the fused single commit: consume the ingress row, insert one
-                    # outbound row per delivery, set ROUTED. G5: no DB connection/txn is held
-                    # across the to_thread calls above — C2 committed + released before this
-                    # block, and handoff opens a fresh txn now. Idempotent against a crash
-                    # re-run (its DELETE-guard returns False as a no-op if the ingress row was
-                    # already consumed — INV-1, no duplicate outbound).
-                    await self.store.handoff(
-                        ingress_id=item.id,
-                        message_id=item.message_id,
-                        channel_id=name,
-                        deliveries=deliveries,
-                        disposition=MessageStatus.ROUTED,
-                    )
-                    # B12 (ADR 0061): fan-out — wake EACH distinct destination's delivery
-                    # lane for the fused outbound rows (not one whole-stage set). OFF: each
-                    # call sets the shared singleton (idempotent), net-identical to today.
-                    for _dest in {d for d, _ in deliveries}:
-                        self._wake_lane(Stage.OUTBOUND, _dest)
-                    # fused — bypass the split route_handoff path entirely
-                    return _ItemOutcome.PROCESSED, None
+                    fused = deliveries
                 # else: ineligible per-message → fall through to the split path verbatim.
         except SandboxSessionClosed:
             # Not a Router or Handler fault: the dispatch that raised did not run (see
@@ -7904,10 +7891,35 @@ class RegistryRunner:
             raise
         except Exception as exc:
             # Router code error (incl. an unknown handler name) OR — on the inline fast-path —
-            # a transform_one/handoff failure (G1). Post-ACK, so no NAK — the global
-            # internal_error policy decides (factored into _apply_router_internal_error, the
-            # single source of truth shared with the fused route branch; byte-identical).
+            # a transform_one failure (G1). Post-ACK, so no NAK — the global internal_error
+            # policy decides (factored into _apply_router_internal_error, the single source of
+            # truth shared with the fused route branch; byte-identical).
             return await self._apply_router_internal_error(name, item, exc)
+        # `inline and` is redundant with how `fused` is set; it keeps the fused commit visibly
+        # gated on the inline cache (tests/test_crit2_inline_doc_drift.py reads that link).
+        if inline and fused is not None:
+            # CF — the fused single commit: consume the ingress row, insert one outbound row per
+            # delivery, set ROUTED. INFRA, not content (ADR 0057 G1 as amended): a raise here
+            # propagates to the caller's fault arm, which re-pends the row (per-lane #1611, pooled
+            # T17 and its infra_fault_stop_after STOP), never the "router error" dead-letter. G5:
+            # no DB connection/txn is held across the to_thread calls above — C2 committed +
+            # released before them, and handoff opens a fresh txn now. Idempotent against a crash
+            # re-run (its DELETE-guard returns False as a no-op if the ingress row was already
+            # consumed — INV-1, no duplicate outbound).
+            await self.store.handoff(
+                ingress_id=item.id,
+                message_id=item.message_id,
+                channel_id=name,
+                deliveries=fused,
+                disposition=MessageStatus.ROUTED,
+            )
+            # B12 (ADR 0061): fan-out — wake EACH distinct destination's delivery lane for the
+            # fused outbound rows (not one whole-stage set). OFF: each call sets the shared
+            # singleton (idempotent), net-identical to today.
+            for _dest in {d for d, _ in fused}:
+                self._wake_lane(Stage.OUTBOUND, _dest)
+            # fused — bypass the split route_handoff path entirely
+            return _ItemOutcome.PROCESSED, None
         disposition = MessageStatus.ROUTED if names else MessageStatus.UNROUTED
         await self.store.route_handoff(
             ingress_id=item.id,
