@@ -53,6 +53,7 @@ from messagefoundry.uploads import (
     UploadNotFoundError,
     UploadQuotaError,
     UploadStore,
+    UploadUnreadableError,
 )
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
@@ -454,6 +455,31 @@ async def test_an_unsealable_upload_is_removed_by_delete(
     assert _files(root) == []
     with pytest.raises(UploadNotFoundError):
         await store.get_meta(fid)
+
+
+async def test_a_delete_told_the_sidecar_was_refused_still_classifies_it(tmp_path: Path) -> None:
+    """BACKLOG #2322: ``sidecar_refused`` skips the second decrypt, never the check. A sealed
+    sidecar over a missing body, and a plaintext one the cipher passes through, each still answer
+    423 with nothing removed. A missing sidecar still answers 404."""
+    root = tmp_path / "uploads"
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    sealed = await store.save(
+        data=_ADT.encode(), filename="s.hl7", uploader="op", uploader_id="u-op"
+    )
+    (root / f"{sealed.file_id}.blob").unlink()
+    with pytest.raises(UploadUnreadableError):
+        await store.delete(sealed.file_id, sidecar_refused=True)
+    assert f"{sealed.file_id}.meta" in _files(root)
+
+    fid = await _plaintext_upload(root)
+    (root / f"{fid}.blob").unlink()
+    passthrough = UploadStore(root, _keyed(generate_key(), allow_unmarked=True), max_bytes=1 << 20)
+    with pytest.raises(UploadUnreadableError):
+        await passthrough.delete(fid, sidecar_refused=True)
+    assert f"{fid}.meta" in _files(root)
+
+    with pytest.raises(UploadNotFoundError):
+        await store.delete("f" * 32, sidecar_refused=True)
 
 
 @_BREAKS

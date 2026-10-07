@@ -6509,10 +6509,13 @@ def create_app(
         An override holder goes on to ``UploadStore.delete`` when the sidecar is refused. That call
         removes the kind it classes as never sealable, and refuses the rest (BACKLOG #2322)."""
         us = _require_upload_store(request)
-        with suppress(_UploadSidecarRefused):
-            await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
+        refused = False
         try:
-            meta = await us.delete(file_id)
+            await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
+        except _UploadSidecarRefused:
+            refused = True
+        try:
+            meta = await us.delete(file_id, sidecar_refused=refused)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnreadableError:

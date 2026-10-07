@@ -231,7 +231,13 @@ class UploadUnreadableError(UploadError, CipherError):
     keyed store refuses until ``rotate-key`` seals it (owner ruling 2026-09-23). It can also be a file
     under a key that is no longer configured. It is a :class:`CipherError` too, so any caller that
     already catches the cipher's error still does. The API maps it to HTTP 423 without importing the
-    cipher module. The message is the cipher's own, which names only the surface and the fix."""
+    cipher module. The message is the cipher's own, which names only the surface and the fix, or
+    :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither."""
+
+
+#: The text of the refusal :meth:`UploadStore.delete` raises when its caller's read was refused
+#: and the upload is not the never-sealable kind. It names no file and no cipher detail.
+_REFUSED_NOT_UNSEALABLE = "the uploaded file's metadata is refused under the configured store key"
 
 
 class UploadNotFoundError(UploadError):
@@ -1271,25 +1277,44 @@ class UploadStore:
 
         return await asyncio.to_thread(_read)
 
-    async def delete(self, file_id: str) -> UploadedFileMeta:
+    async def delete(self, file_id: str, *, sidecar_refused: bool = False) -> UploadedFileMeta:
         """Delete an uploaded file (both sidecars). Returns the deleted metadata for the audit row.
         Path-traversal-guarded; raises :class:`UploadNotFoundError` if it does not exist.
 
         An upload ``rotate-key`` cannot seal is deleted too, although its sidecar is refused
         (BACKLOG #2322). The metadata returned then carries only its id, its body's size on disk and
         its sidecar's mtime (:meth:`_UnsealableUpload.as_meta`). Any other refused upload still
-        raises :class:`UploadUnreadableError`, and nothing is removed."""
+        raises :class:`UploadUnreadableError`, and nothing is removed.
+
+        ``sidecar_refused`` says the caller's own :meth:`get_meta` was just refused. The sidecar is
+        then not decrypted again, so one delete raises one cipher WARNING and one alert, not two.
+        Only the never-sealable kind is removed either way."""
 
         def _delete() -> UploadedFileMeta:
             blob_path, meta_path = self._paths(file_id)
-            try:
-                meta = self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
-            except FileNotFoundError as exc:
-                raise UploadNotFoundError(file_id) from exc
-            except CipherError as exc:
+            meta: UploadedFileMeta | None = None
+            refusal = _REFUSED_NOT_UNSEALABLE
+            if sidecar_refused:
+                # The store checks the caller's claim: only a cipher that refuses plaintext can
+                # hold the never-sealable kind, as in _scan_unsealable_sync.
+                cipher = self._cipher
+                if not isinstance(cipher, AesGcmCipher) or cipher.allow_unmarked:
+                    raise UploadUnreadableError(refusal)
+                try:
+                    meta_path.stat()
+                except FileNotFoundError as exc:
+                    raise UploadNotFoundError(file_id) from exc
+            else:
+                try:
+                    meta = self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
+                except FileNotFoundError as exc:
+                    raise UploadNotFoundError(file_id) from exc
+                except CipherError as exc:
+                    refusal = str(exc)
+            if meta is None:
                 held = self._unsealable_sync(file_id, meta_path)
                 if held is None:
-                    raise UploadUnreadableError(str(exc)) from exc
+                    raise UploadUnreadableError(refusal)
                 meta = held.as_meta()
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the
             # listing key, so once it is gone the file is invisible even if the blob lingers).

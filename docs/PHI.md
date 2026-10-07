@@ -515,8 +515,8 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    any body-less pair. An operator holding `files:access_any` can also delete it through
    `DELETE /uploads/{id}`, which writes the same blank-owner `upload.delete` row. Its owner cannot,
    and gets 404. At least these are still outside retention, and the API cannot delete them: a
-   blank or non-UTF-8 sidecar, and a plaintext sidecar over a body that is oversized or is not a
-   regular file.
+   blank or non-UTF-8 sidecar, and a plaintext sidecar over a body that is oversized and not text,
+   or is not a regular file.
    **Under `cipher_provider = "vault_transit"` a plaintext upload still reads back as plaintext.**
    `rotate-key` refuses to run in that mode: it needs a local active key, and the store's own
    rotation raises there (BACKLOG #1165). So no command could ever seal the upload, and refusing it

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -1014,8 +1015,6 @@ async def test_the_RUNNER_prune_audit_row_also_names_the_system(tmp_path: Path) 
     pytest.importorskip("psutil")
     from messagefoundry.api import create_managed_app
     from messagefoundry.store.base import open_store
-    from messagefoundry.store.crypto import generate_key
-    from messagefoundry.uploads import UploadStore
 
     uploads = tmp_path / "runner-uploads"
     settings = StoreSettings(
@@ -1155,14 +1154,18 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
 
 @_BREAKS
 async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
-    engine: Engine, tmp_path: Path, break_body: Callable[[Path], None]
+    engine: Engine,
+    tmp_path: Path,
+    break_body: Callable[[Path], None],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """BACKLOG #2322: on a keyed store, a plaintext sidecar over a missing or non-text body is
     refused on every read, and ``rotate-key`` never seals it.
 
     * The owner, who lacks FILES_ACCESS_ANY, still gets 404 and removes nothing.
     * An override holder deletes it: both files go, and one ``upload.delete`` row names its id
-      and no owner, because the engine cannot verify the plaintext one."""
+      and no owner, because the engine cannot verify the plaintext one. The sidecar is decrypted
+      once, so the delete raises one cipher WARNING, not two."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
@@ -1187,9 +1190,13 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
             "a caller without FILES_ACCESS_ANY removed part of the upload"
         )
 
-        r = await c.delete(f"/uploads/{fid}", headers=ha)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.store.crypto"):
+            r = await c.delete(f"/uploads/{fid}", headers=ha)
         assert r.status_code == 200, r.text
         assert r.json() == {"file_id": fid, "filename": "", "deleted": True}
+        refusals = [m for m in caplog.messages if m.startswith("refused an unmarked value")]
+        assert len(refusals) == 1, refusals
         assert not sidecar.exists() and not blob.exists(), "the delete left a file behind"
 
     rows = [a for a in await engine.store.list_audit() if a["action"] == "upload.delete"]
