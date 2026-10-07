@@ -496,11 +496,11 @@ _NO_STORE_ROUTE_PATHS = frozenset(
 )
 _log = logging.getLogger(__name__)
 
-#: The two monitoring rows whose ``reason`` is masked until a per-item reveal (BACKLOG #2443).
 #: The response header ``GET /events`` states its total in, so its body can stay a bare list
 #: (BACKLOG #2438). The paged list routes that return a model carry ``total`` in the body instead.
 TOTAL_COUNT_HEADER: Final = "X-Total-Count"
 
+#: The two monitoring rows whose ``reason`` is masked until a per-item reveal (BACKLOG #2443).
 _ReasonInfo = TypeVar("_ReasonInfo", ConnectionEventInfo, AlertInstanceInfo)
 
 
@@ -4130,6 +4130,7 @@ def create_app(
         limit: int,
         offset: int = 0,
         reveal: int | None = None,
+        count: bool = True,
     ) -> ConnectionEventList:
         """One page of the event log and the total it sits in (BACKLOG #2438): the one body of
         ``GET /events`` and of the console's ``/ui/events`` page, so both read the same rows under
@@ -4137,7 +4138,8 @@ def create_app(
         so a scoped caller is told how many events IT can page through and no more.
 
         Called in-process by the console, so every argument is a plain value. ``reveal`` and the
-        redaction of ``reason`` behave as :func:`list_connection_events` states."""
+        redaction of ``reason`` behave as :func:`list_connection_events` states. ``count=False``
+        skips the count for a caller that shows no total, and ``total`` is then the page length."""
         await _admit_reveal(request, identity, reveal)
         # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
         # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
@@ -4153,8 +4155,12 @@ def create_app(
             offset=offset,
             allowed_channels=scope,
         )
-        total = await engine.store.count_connection_events(
-            connection=connection, kinds=kind, since=since, allowed_channels=scope
+        total = (
+            await engine.store.count_connection_events(
+                connection=connection, kinds=kind, since=since, allowed_channels=scope
+            )
+            if count
+            else len(rows)
         )
         events = await _redact_reasons(
             [_conn_event_info(r) for r in rows],
@@ -4229,6 +4235,7 @@ def create_app(
             since=since,
             limit=limit,
             reveal=reveal,
+            count=False,
         )
         return page.events
 

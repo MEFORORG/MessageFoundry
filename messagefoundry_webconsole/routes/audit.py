@@ -8,7 +8,13 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from messagefoundry.api._ui_seam import UiDeps
-from messagefoundry.api.validation import ActionFilter, ActorFilter, EpochSeconds
+from messagefoundry.api.validation import (
+    AUDIT_EXPORT_DEFAULT_LIMIT,
+    AUDIT_EXPORT_MAX_LIMIT,
+    ActionFilter,
+    ActorFilter,
+    EpochSeconds,
+)
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
 
@@ -27,9 +33,6 @@ from .._service import _service
 _AUDIT_PAGE = 200
 _SECURITY_EVENTS_PAGE = 200
 
-#: The console export's default row cap, the same default ``GET /audit/export`` declares.
-_EXPORT_LIMIT = 10_000
-
 
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L1c: read-only audit trail + self-service security events."""
@@ -46,7 +49,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return HTMLResponse(
             pages.audit_log(
                 data,
-                export_limit=_EXPORT_LIMIT if identity.has(Permission.AUDIT_EXPORT) else None,
+                export_limit=AUDIT_EXPORT_DEFAULT_LIMIT
+                if identity.has(Permission.AUDIT_EXPORT)
+                else None,
             )
         )
 
@@ -62,7 +67,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui(Permission.AUDIT_EXPORT)),
-        limit: int = Query(_EXPORT_LIMIT, ge=1, le=1_000_000),
+        limit: int = Query(AUDIT_EXPORT_DEFAULT_LIMIT, ge=1, le=AUDIT_EXPORT_MAX_LIMIT),
         actor: ActorFilter | None = Query(None),
         action: ActionFilter | None = Query(None),
         since: EpochSeconds | None = Query(None),

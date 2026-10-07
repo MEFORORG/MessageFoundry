@@ -411,12 +411,10 @@ def events(
     # The filters ride the reveal link as query values, never as path segments, so urlencode
     # escapes them; a blank one is left off, as the filter form's own GET would send it. The page
     # position rides it too, or a reveal from page two would re-read page one and miss its event.
-    back = urlencode(
-        {
-            **{k: v for k, v in filters.items() if v},
-            **({"limit": data.limit, "offset": data.offset} if data.offset else {}),
-        }
-    )
+    query: dict[str, object] = {k: v for k, v in filters.items() if v}
+    if data.offset:
+        query.update(limit=data.limit, offset=data.offset)
+    back = urlencode(query)
     suffix = f"?{back}" if back else ""
     body = [
         [

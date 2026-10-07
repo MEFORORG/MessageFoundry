@@ -395,18 +395,3 @@ async def test_the_event_log_pager_and_its_reveals_carry_the_filters_and_positio
             "limit": "2",
             "offset": "2",
         }
-
-
-@pytest.mark.parametrize(("shown", "capped"), [(0, False), (199, False), (200, True), (201, True)])
-def test_window_note_states_the_cap_only_on_a_full_window(shown: int, capped: bool) -> None:
-    """The helper's ``total is None`` branch, at both sides of the window edge.
-
-    199 is the last short window and 200 the first full one, so a comparison off by one in either
-    direction fails one of those two. 201 is not a state a route produces; it is here because
-    without it an equality test (``shown == limit``) would pass every other case.
-    """
-    from messagefoundry_webconsole.pages import _common
-
-    text = str(_common._window_note(shown, 200, "entry(s)"))
-    assert ("capped at the newest 200." in text) is capped
-    assert f"{shown} entry(s) shown" in text

@@ -6466,7 +6466,10 @@ class SqlServerStore:
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
-        clause, params = self._connection_event_where(connection, kinds, since, allowed_channels)
+        # The same ``?`` WHERE text as SQLite, so the per-channel scope lives in one place.
+        clause, params = MessageStore._connection_event_where(
+            connection, kinds, since, allowed_channels
+        )
         # OFFSET/FETCH rather than TOP (?), because TOP cannot skip (BACKLOG #2438). Both binds
         # follow the WHERE values, in the order their placeholders appear.
         rows = await self._fetchall(
@@ -6502,40 +6505,14 @@ class SqlServerStore:
         allowed_channels: Sequence[str] | None,
     ) -> int:
         """The total :meth:`list_connection_events` pages through (BACKLOG #2438)."""
-        clause, params = self._connection_event_where(connection, kinds, since, allowed_channels)
+        # The same ``?`` WHERE text as SQLite, so the per-channel scope lives in one place.
+        clause, params = MessageStore._connection_event_where(
+            connection, kinds, since, allowed_channels
+        )
         row = await self._fetchone(
             f"SELECT COUNT(*) AS n FROM connection_event{clause}", tuple(params)
         )
         return int(row["n"]) if row is not None else 0
-
-    @staticmethod
-    def _connection_event_where(
-        connection: str | None,
-        kinds: Sequence[str] | None,
-        since: float | None,
-        allowed_channels: Sequence[str] | None,
-    ) -> tuple[str, list[Any]]:
-        """The ``WHERE`` text and its bound ``?`` values shared by :meth:`list_connection_events`
-        and :meth:`count_connection_events`, so a page and its total read the same set."""
-        where: list[str] = []
-        params: list[Any] = []
-        if connection is not None:
-            where.append("connection=?")
-            params.append(connection)
-        if kinds:
-            placeholders = ",".join("?" for _ in kinds)
-            where.append(f"kind IN ({placeholders})")
-            params.extend(kinds)
-        if since is not None:
-            where.append("ts>=?")
-            params.append(since)
-        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
-        # outbound row (which spans channels). Scope placeholders append after connection/kinds/since,
-        # in the order their placeholders appear in the WHERE text.
-        if allowed_channels is not None:
-            where.append("direction='inbound'")
-            _append_channel_scope(where, params, "connection", allowed_channels)
-        return (" WHERE " + " AND ".join(where)) if where else "", params
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
     # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<

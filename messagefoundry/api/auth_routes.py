@@ -86,6 +86,8 @@ from messagefoundry.api.security import (
     require_step_up_action,
 )
 from messagefoundry.api.validation import (
+    AUDIT_EXPORT_DEFAULT_LIMIT,
+    AUDIT_EXPORT_MAX_LIMIT,
     ActionFilter,
     ActorFilter,
     CustomRoleId,
@@ -1690,14 +1692,26 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # Plain-default core shared by the HTTP route below and the webconsole seam wrapper. The
         # total is counted under the same exclusion as the page, so a reader without users:manage
         # is told how many rows IT can page through, never how many the trail holds (BACKLOG #2438).
-        filters: dict[str, Any] = {
-            "actor": actor,
-            "action": action,
-            "since": since,
-            "until": until,
-        }
-        rows = await _read_audit(service, identity, limit=limit, offset=offset, **filters)
-        total = await _count_audit(service, identity, limit=None, before_id=None, **filters)
+        rows = await _read_audit(
+            service,
+            identity,
+            limit=limit,
+            offset=offset,
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+        )
+        total = await _count_audit(
+            service,
+            identity,
+            limit=None,
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            before_id=None,
+        )
         return AuditList(
             entries=[
                 AuditEntry(
@@ -1762,7 +1776,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require(Permission.AUDIT_EXPORT)),
         format: str = Query("csv", pattern="^csv$"),
-        limit: int = Query(10000, ge=1, le=1_000_000),
+        limit: int = Query(AUDIT_EXPORT_DEFAULT_LIMIT, ge=1, le=AUDIT_EXPORT_MAX_LIMIT),
         actor: ActorFilter | None = Query(None),
         action: ActionFilter | None = Query(None),
         since: EpochSeconds | None = Query(

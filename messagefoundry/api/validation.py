@@ -228,6 +228,12 @@ ControlIdFilter = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTER
 ActorFilter = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTERN, max_length=256)]
 ActionFilter = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTERN, max_length=128)]
 
+#: ``GET /audit/export``'s default and largest ``limit``. Named once so the console's
+#: ``/ui/audit/export``, which declares the same bounds and quotes the default, cannot drift from it
+#: (BACKLOG #2446).
+AUDIT_EXPORT_DEFAULT_LIMIT = 10_000
+AUDIT_EXPORT_MAX_LIMIT = 1_000_000
+
 #: An operator-chosen display label, such as a saved preset's name. Printable, bounded as it ships.
 DisplayLabel = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTERN, max_length=128)]
 
