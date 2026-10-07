@@ -259,7 +259,7 @@ engine binds. Three planes sit at different exposure levels:
 
 | Plane | What it is | Where it binds | Posture |
 |---|---|---|---|
-| **Management** | web console (`/ui`) / IDE → engine API | loopback by default (or a restricted management subnet) | auth + RBAC + full audit, **always on**: `serve` refuses to start with sign-in off on any bind, loopback included, and no setting turns it off (vault BACKLOG #2719); smallest surface — keep it off general-user VLANs |
+| **Management** | web console (`/ui`) / IDE → engine API | loopback by default (or a restricted management subnet) | auth + RBAC + full audit, **always on**: sign-in is required on any bind, loopback included, and no setting turns it off (vault BACKLOG #2719); smallest surface — keep it off general-user VLANs |
 | **Data** | inbound feeds you *receive* (MLLP, TCP/X12, DB-poll) | the **internal network interface** — feeds come from other systems on your LAN, not `127.0.0.1` | **TLS on the wire where the channel has it** (enable MLLP-over-TLS; **TCP/X12 have none** — segment them) + the `[egress]`/ingress allow-lists + your network segmentation. PHI must not cross the LAN in cleartext |
 | **Inbound web service** | a partner *calls into* MEFOR (`Http()` source) | its own connector-owned socket | built (ADR 0023) — per-connection TLS + opt-in mTLS + IP allow-list, and partner authentication by `intake_auth` (`api_key`, `bearer` or `mtls_subject`; there is no HTTP Basic mode). An off-loopback listener with no effective peer control is **refused** under the default `[security].enforcement = enforce`, and only warned under `warn`; see the caveat below |
 
@@ -762,8 +762,8 @@ a PHI instance with **no** allow-list populated, and `block_unlisted_outbound` n
 ## Bind-guard behavior (summary)
 
 - **API** ([`__main__.py`](../messagefoundry/__main__.py)): a non-loopback bind is refused unless
-  `[api].tls_cert_file` is configured, or `tls_terminated_upstream` + `trusted_proxies` are set. A
-  start with sign-in off is refused on every bind, and no flag covers it. The refusal is not a cleartext
+  `[api].tls_cert_file` is configured, or `tls_terminated_upstream` + `trusted_proxies` are set. Sign-in
+  is always on, on every bind, and no setting or flag turns it off. The bind refusal is not a cleartext
   one: without a certificate the engine would serve TLS on its self-signed placeholder, which no trust
   store vouches for. Override (dev only): `serve --allow-insecure-bind`, which serves
   off-loopback on that placeholder — **clamped inert on an enforcing PHI instance**, i.e. on the

@@ -33,7 +33,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.base import DeliveryError, DestinationConnector, NegativeAckError
-from tests._refusal_log_capture import TOKEN, assert_no_token
+from tests._refusal_log_capture import TOKEN, assert_no_token, until
 
 OUT = "file_out"
 LOGGER = "messagefoundry.pipeline.wiring_runner"
@@ -136,15 +136,13 @@ async def test_the_real_worker_logs_once_when_max_attempts_dead_letters_a_row(
     runner._destinations[OUT] = cast(DestinationConnector, dest)
     (inbox / "a.hl7").write_bytes(_adt(1).encode("utf-8"))
     try:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 5.0
-        while await store.count_dead(allowed_channels=None) != 1:
-            assert loop.time() < deadline, "the row never dead-lettered"
-            await asyncio.sleep(0.02)
+        # Wait on the line, not the DEAD row: the line follows the dead-letter, after a read.
+        await until(lambda: len(_exhausted_lines(caplog)) == 1, "the retry-cap line")
     finally:
         await runner.stop()
 
     assert dest.calls == 2
+    assert await store.count_dead(allowed_channels=None) == 1
     (msg,) = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert msg["status"] == MessageStatus.ERROR.value  # the dead-letter itself is unchanged
     (line,) = _exhausted_lines(caplog)

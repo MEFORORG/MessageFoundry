@@ -2708,6 +2708,9 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
     }
     assert sorted(trees) == [
         "messagefoundry/auth/service.py",
+        # BACKLOG #2325: the `check` advisory on a required acr reads it to word its note. It is an
+        # advisory and never gates, and the scan below still walks it for a refusal.
+        "messagefoundry/checks.py",
         "messagefoundry/config/settings.py",
         "messagefoundry/verify/federation.py",
     ], (
@@ -2730,7 +2733,40 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
     assert any(name.endswith("config/settings.py") for name, _ in refusing), (
         f"the settings check that refuses {claim} = true with nothing to match is gone"
     )
-    off_refusals = [f"{name}:{n.lineno}" for name, n in refusing if _tests_for_off(n.test)]
+
+    # BACKLOG #2325 added ONE load refusal that tests the claim for off: an `oidc_acr_values`
+    # request beside it, which nothing would check. Turning the gate off still loads, so the scope
+    # note stays true, and it names this combination. Only that exact shape is set aside, and it
+    # must still exist, so a second off-value refusal still reds here.
+    def _is_the_acr_combination(name: str, test: ast.AST) -> bool:
+        # Exactly `requested_acr and not self.<claim>`: an AND of the two, nothing else. An OR, or
+        # a third operand, would refuse more than the combination and must red below.
+        return (
+            name.endswith("config/settings.py")
+            and isinstance(test, ast.BoolOp)
+            and isinstance(test.op, ast.And)
+            and len(test.values) == 2
+            and isinstance(test.values[0], ast.Name)
+            and test.values[0].id == "requested_acr"
+            and isinstance(test.values[1], ast.UnaryOp)
+            and isinstance(test.values[1].op, ast.Not)
+            and _is_the_claim(test.values[1].operand)
+        )
+
+    combined = [n for name, n in refusing if _is_the_acr_combination(name, n.test)]
+    assert len(combined) == 1, (
+        "the BACKLOG #2325 refusal of an acr request while the claim gate is off moved or changed; "
+        "re-derive this set-aside and docs/SECURITY-LOOSENING.md's scope note."
+    )
+    assert "beside an `oidc_acr_values` request" in _doc("docs/SECURITY-LOOSENING.md"), (
+        "docs/SECURITY-LOOSENING.md's scope note no longer names the one combination load refuses "
+        "with the claim gate off (BACKLOG #2325)."
+    )
+    off_refusals = [
+        f"{name}:{n.lineno}"
+        for name, n in refusing
+        if _tests_for_off(n.test) and not _is_the_acr_combination(name, n.test)
+    ]
     assert not off_refusals, (
         f"{off_refusals} now raise when {claim} is off; restate docs/SECURITY-LOOSENING.md's "
         "scope note."

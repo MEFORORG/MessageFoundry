@@ -71,8 +71,10 @@ _ACCOUNTDISABLE = 0x2
 class AdPrincipal:
     """An authenticated AD user: identity attributes + the set of groups governing role mapping.
 
-    ``groups`` holds **lower-cased** identifiers — both each group's DN and its ``sAMAccountName`` —
-    so the admin can map roles by whichever form they configured in ``ad_group_role_map``.
+    ``groups`` holds each group's **distinguished name in canonical form** (lower-cased, escaped
+    one way: :func:`canonical_group_dn`), and nothing else. The group
+    maps take a full DN only (BACKLOG #2610): a short name is unique in no sense the engine can
+    check, so a same-named group in another unit would grant the mapped roles.
 
     ``directory_object_id`` is the account's **immutable** directory identity (BACKLOG #1471): the
     normalised ``objectGUID``, which is what the engine resolves a MessageFoundry user row by. It
@@ -475,6 +477,180 @@ def _multi(entry: Any, name: str) -> list[str]:
 def _cn_of(dn: str) -> str | None:
     head = dn.split(",", 1)[0]
     return head[3:] if head[:3].upper() == "CN=" else None
+
+
+#: The fewest RDNs a group map key may hold (BACKLOG #2610). One RDN, such as ``CN=Admins``, names a
+#: group in no particular unit, which is the short-name match this rule exists to remove.
+_GROUP_DN_MIN_RDNS = 2
+
+
+_ASCII_LETTERS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+_ASCII_DIGITS = frozenset("0123456789")
+_DESCR_REST = _ASCII_LETTERS | _ASCII_DIGITS | {"-"}
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_dn_attr_type(name: str) -> bool:
+    """Whether ``name`` is an attribute type: a name (RFC 4512 ``descr``) or a dotted OID.
+
+    A character loop rather than a regex, so the parser holds no quantified group a static ReDoS
+    scan must clear (BACKLOG #2610). ASCII only, as ``[0-9]`` was: ``str.isdigit`` would admit
+    other scripts' digits."""
+    if name[:1] in _ASCII_LETTERS:
+        return all(ch in _DESCR_REST for ch in name[1:])
+    return all(part and all(ch in _ASCII_DIGITS for ch in part) for part in name.split("."))
+
+
+#: Characters a canonical value escapes with a backslash wherever they appear (RFC 4514 section 2.4).
+_DN_ESCAPED = frozenset('\\"+,;<>')
+#: The one padding token: an unescaped space at either end of a value (RFC 4514 section 3). Only a
+#: space. A tab or line break is part of the value, so ``CN=Admins<TAB>`` names a different group.
+_DN_PAD = (b" ", False)
+
+
+def _hex_escaped(ch: str) -> str:
+    """``ch`` as ``\\xx`` escapes of its UTF-8 bytes, lower-case hex so ``str.lower()`` keeps it."""
+    return "".join(f"\\{b:02x}" for b in ch.encode("utf-8"))
+
+
+def _canonical_value(tokens: list[tuple[bytes, bool]]) -> str | None:
+    """One attribute value, case-folded and re-escaped, or ``None``.
+
+    ``tokens`` holds each character or hex pair as ``(bytes, escaped)``. An unescaped space at
+    either end is padding, so it is dropped. An unescaped ``#`` at the start would make the value a
+    BER hex string, which no group map needs, so it is refused.
+
+    **The output is printable ASCII, and only ASCII letters fold case.** Every other character is
+    written as ``\\xx`` escapes of its UTF-8 bytes, in lower-case hex. Python's Unicode case tables
+    fold some characters onto a different letter (the Kelvin sign onto ``k``) and pair scripts AD's
+    own table may keep apart, and a SQL Server column under a case- and width-insensitive collation
+    folds far more. An all-ASCII key with no upper-case letter means none of those can merge two
+    groups, and the store's ``strip().lower()`` is a no-op on it. **The cost fails closed:** a
+    non-ASCII letter matches only in the case it was written in, so ``CN=Ärzte`` and ``CN=ärzte``
+    name different keys. Copy a key from the directory's own spelling.
+
+    The plain space is the one exception to escaping, and only inside a value. At either end it is
+    written ``\\20``, so a key never starts or ends with white space."""
+    first, last = 0, len(tokens)
+    while first < last and tokens[first] == _DN_PAD:
+        first += 1
+    while last > first and tokens[last - 1] == _DN_PAD:
+        last -= 1
+    tokens = tokens[first:last]
+    if not tokens or tokens[0] == (b"#", False):
+        return None
+    try:
+        raw = b"".join(part for part, _escaped in tokens).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    out = []
+    for i, ch in enumerate(raw):
+        if ch in _DN_ESCAPED or (ch == "#" and i == 0):
+            out.append("\\" + ch)
+        elif ch == " ":
+            out.append("\\20" if i in (0, len(raw) - 1) else " ")
+        elif "!" <= ch <= "~":  # printable ASCII other than the space
+            out.append(ch.lower())
+        else:
+            out.append(_hex_escaped(ch))
+    return "".join(out)
+
+
+def canonical_group_dn(text: str) -> str | None:
+    """The one form a group DN is compared in (BACKLOG #2610), or ``None`` if ``text`` is no DN.
+
+    Each attribute becomes ``type=value``, ASCII letters lower-cased, with the value unescaped and
+    then escaped again one way (:func:`_canonical_value`). The parts of a multi-valued RDN (``+``) are
+    sorted, and RDNs are joined with ``,``. So however a value is escaped, one DN gives one
+    string: ``CN=C# Developers``, ``cn=C\\# developers`` and ``CN=C\\23 Developers`` all become
+    ``cn=c# developers``, and ``\\2C`` and ``\\,`` agree. It does not map an attribute's OID onto
+    its name, a non-ASCII letter onto its other case, or one Unicode normal form onto another;
+    those spellings stay apart and match nothing, which fails closed.
+
+    The parser is tolerant where Active Directory is. A ``#`` after a value's first character is
+    literal, which RFC 4514 allows and ldap3's ``parse_dn`` refuses, and AD writes it unescaped in
+    ``memberOf``. Spaces around a separator are padding. It refuses an unescaped ``"`` or ``;``,
+    an unescaped ``#`` that starts a value, an empty value, a value that is not UTF-8 once
+    unescaped, text that cannot be encoded as UTF-8, and anything with fewer than
+    :data:`_GROUP_DN_MIN_RDNS` RDNs.
+
+    The output is printable ASCII and never changes under ``str.lower()`` or ``str.strip()``, so
+    the store's own ``strip().lower()`` is a no-op on it. Linear apart from sorting a multi-valued RDN's parts, so
+    operator text cannot make it backtrack.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None  # a lone surrogate: no directory DN holds one
+    rdns: list[list[str]] = []
+    avas: list[str] = []
+    attr: str | None = None  # None while reading a type, the type once its "=" is read
+    start = 0  # where the current type began
+    tokens: list[tuple[bytes, bool]] = []
+
+    def close_ava() -> bool:
+        if attr is None:
+            return False
+        value = _canonical_value(tokens)
+        if value is None:
+            return False
+        avas.append(f"{attr}={value}")
+        return True
+
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if attr is None:
+            if ch in ",+":
+                return None  # a separator before any "="
+            if ch == "=":
+                name = text[start:i].strip()
+                if not _is_dn_attr_type(name):
+                    return None
+                attr, tokens = name.lower(), []
+            i += 1
+            continue
+        if ch == "\\":
+            pair = text[i + 1 : i + 3]
+            if len(pair) == 2 and pair[0] in _HEX and pair[1] in _HEX:
+                tokens.append((bytes.fromhex(pair), True))
+                i += 3
+            elif i + 1 < len(text):
+                tokens.append((text[i + 1].encode("utf-8"), True))
+                i += 2
+            else:
+                return None  # a trailing lone backslash
+            continue
+        if ch in ",+":
+            if not close_ava():
+                return None
+            if ch == ",":
+                rdns.append(sorted(avas))
+                avas = []
+            attr, start = None, i + 1
+        elif ch in '";':
+            return None  # a quoted value, or the old ";" separator: not a form AD writes
+        else:
+            tokens.append((ch.encode("utf-8"), False))
+        i += 1
+    if not close_ava():
+        return None
+    rdns.append(sorted(avas))
+    if len(rdns) < _GROUP_DN_MIN_RDNS:
+        return None
+    return ",".join("+".join(rdn) for rdn in rdns)
+
+
+def is_group_dn(value: str) -> bool:
+    """Whether ``value`` is a full distinguished name that a group map may key on (BACKLOG #2610).
+
+    Both group maps match a principal's ``groups``, which hold canonical DNs only
+    (:func:`canonical_group_dn`). A key in any other form would match nothing, or, as a short name
+    did before this item, match a same-named group in any unit. The map routes call
+    :func:`canonical_group_dn` themselves, because they store its result; this predicate is the
+    same test for a caller that only needs the yes or no.
+    """
+    return canonical_group_dn(value) is not None
 
 
 #: A referred host the refusal may name. Anything else is replaced, because the text comes from the
@@ -967,14 +1143,23 @@ class LdapAuthenticator:
         )
 
     def _resolve_groups(self, conn: Any, user_dn: str, member_of: list[str]) -> frozenset[str]:
+        """The user's groups as canonical DNs (:func:`canonical_group_dn`), the one form both group
+        maps key on.
+
+        BACKLOG #2610. This used to add each direct group's first CN and each nested group's
+        ``sAMAccountName`` too, so a map key written as a short name matched a same-named group in
+        any unit. Anyone able to create a group anywhere could then take the roles mapped to it.
+
+        Canonical rather than merely lower-cased, so a key matches however either side escapes a
+        value: AD writes ``CN=C# Developers`` in ``memberOf``, and an operator may write ``C\\#``. A
+        DN that has no canonical form is dropped, and the drop is counted in the log. No map key can
+        name it, since every key is stored canonical, so dropping it takes nothing a member could
+        have been granted.
+        """
         import ldap3
 
-        groups: set[str] = set()
-        for dn in member_of:  # direct membership from the user's memberOf attribute
-            groups.add(dn.lower())
-            cn = _cn_of(dn)
-            if cn:
-                groups.add(cn.lower())
+        # Direct membership from the user's memberOf attribute.
+        found = list(member_of)
         if self._s.ad_use_nested_groups and self._s.ad_group_search_base:
             _search(
                 conn,
@@ -982,14 +1167,20 @@ class LdapAuthenticator:
                 search_base=self._s.ad_group_search_base,
                 search_filter=f"(member:{_MATCHING_RULE_IN_CHAIN}:={_escape_filter(user_dn)})",
                 search_scope=ldap3.SUBTREE,
-                attributes=["distinguishedName", "sAMAccountName"],
+                attributes=["distinguishedName"],
             )
-            for e in conn.entries:
-                groups.add(str(e.entry_dn).lower())
-                sam = _attr(e, "sAMAccountName")
-                if sam:
-                    groups.add(sam.lower())
-        return frozenset(groups)
+            found.extend(str(e.entry_dn) for e in conn.entries)
+        canonical = [canonical_group_dn(dn) for dn in found]
+        dropped = canonical.count(None)
+        if dropped:
+            # A count only, at DEBUG: a group DN is directory text, and this runs on every sign-in
+            # and every reconcile probe.
+            logger.debug(
+                "AD group resolution dropped %d group DN(s) with no canonical form; no group map "
+                "key can name such a group, so it grants nothing (BACKLOG #2610)",
+                dropped,
+            )
+        return frozenset(c for c in canonical if c is not None)
 
     def authenticate(
         self, username: str, password: str, *, object_id: str | None = None
@@ -1222,6 +1413,37 @@ def _kerberos_acceptor(settings: AuthSettings) -> Any:
     return spnego.server(hostname=hostname, service=service)
 
 
+def _kerberos_context_complete(server: Any) -> bool:
+    """Whether one acceptor step finished the Kerberos context that checked the client's ticket.
+
+    ``server.complete`` answers this for the native SSPI acceptor, which is what Windows uses. On
+    any host without SSPI, Linux and macOS included, every sign-in goes through pyspnego's own
+    Negotiate wrapper instead: pyspnego 0.12's GSSAPI proxy offers ``kerberos`` only, never
+    ``negotiate``, so the default ``negotiate`` acceptor :func:`_kerberos_acceptor` asks for is
+    always the wrapper there. The wrapper can stay incomplete after a step whose inner Kerberos
+    context did finish. It waits for a ``mechListMIC`` (RFC 4178 section 4.2.2) when the client's
+    first mechanism differs from its own, as a Windows client's does, and this single-leg acceptor
+    never takes a second leg. So for that wrapper the inner context is read, and only a finished
+    KERBEROS context counts. It is a private attribute: if pyspnego moves it, this returns
+    ``False`` and the sign-in is refused.
+    """
+    if server.complete:
+        return True
+    try:
+        from spnego._negotiate import NegotiateProxy  # lazy, like every spnego import here
+
+        if not isinstance(server, NegotiateProxy):
+            return False
+        inner = server._context
+    except (ImportError, AttributeError, KeyError, StopIteration):
+        # The wrapper moved, or it chose no mechanism: nothing finished that can be read.
+        return False
+    return (
+        getattr(inner, "complete", False) is True
+        and getattr(inner, "negotiated_protocol", None) == "kerberos"
+    )
+
+
 def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     """Complete one SPNEGO server step and return the authenticated sAMAccountName, or ``None``.
 
@@ -1230,13 +1452,17 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     NTLM fallback, no mutual-auth response token, no multi-leg challenge handshake. The server must
     have a usable keytab/credential for ``kerberos_spn`` in its environment; the realm suffix
     (``user@REALM``) is stripped to yield the account name.
+
+    ``None`` unless :func:`_kerberos_context_complete` says the context finished (BACKLOG #2610
+    review point c), so no provider can hand back a principal from a half-done exchange. That is
+    defence in depth: no such provider is known.
     """
     import spnego
 
     try:
         server = _kerberos_acceptor(settings)
         server.step(token)
-        principal = server.client_principal
+        principal = server.client_principal if _kerberos_context_complete(server) else None
     except (spnego.exceptions.SpnegoError, ValueError, struct.error) as exc:
         # SpnegoError is the SSPI/GSSAPI (Windows/Linux-krb5) rejection; the pure-Python provider
         # instead raises a bare ValueError/struct.error while parsing an untrusted token. Both are

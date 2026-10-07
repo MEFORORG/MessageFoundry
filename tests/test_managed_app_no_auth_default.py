@@ -167,7 +167,8 @@ async def test_an_attached_service_cannot_be_opened(tmp_path: Path) -> None:
     So ``allow_no_auth=True`` opens an app only when no service is attached, and ``create_app``
     refuses the opt-in beside one. Before vault BACKLOG #2825 a service built from settings with
     ``enabled=False`` answered as disabled, and beside the opt-in the app served ``/stats`` to anyone
-    (200); the property was a plain attribute anyone could set."""
+    (200); the property was a plain attribute anyone could set. Vault BACKLOG #3062 removed the
+    property, so no guard reads one."""
     engine = await Engine.create(
         tmp_path / "attached.db",
         poll_interval=0.05,
@@ -175,9 +176,9 @@ async def test_an_attached_service_cannot_be_opened(tmp_path: Path) -> None:
     )
     try:
         service = await _service(engine, AuthSettings(require_mfa=False))
-        assert service.enabled is True
-        with pytest.raises(AttributeError):
-            setattr(service, "enabled", False)  # noqa: B010 -- the name is the subject
+        # Vault BACKLOG #3062: the class has no `enabled` switch, so a stand-in that sets one
+        # reporting false is read by nothing, and every check below still refuses.
+        setattr(service, "enabled", False)  # noqa: B010 -- the name is the subject
         with pytest.raises(ValueError, match="allow_no_auth"):
             create_app(engine, auth=service, allow_no_auth=True)
         async with _client(create_app(engine, auth=service)) as c:
