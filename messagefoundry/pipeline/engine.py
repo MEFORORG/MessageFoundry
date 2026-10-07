@@ -2544,7 +2544,8 @@ class Engine:
 
     # The operator mutations below take a REQUIRED ``audit``: the operator's audit row commits in the
     # mutation's own transaction, so a crash cannot keep the change and lose who made it (BACKLOG
-    # #2624). Required, so a new caller cannot reach the store's change without saying what it records.
+    # #2624). Required, so a caller of these wrappers must say what it records. Purge has no wrapper:
+    # the API calls ``store.cancel_queued`` directly, where ``audit`` is optional.
     async def replay(self, message_id: str, *, audit: OperatorAudit[int]) -> int:
         """Re-queue every delivery for a message and wake the delivery workers."""
         requeued = await self.store.replay(message_id, audit=audit)
@@ -2617,7 +2618,8 @@ class Engine:
         This is deliberately **not** :meth:`edit_resend_reroute`/``reingress``: that presupposes an
         origin ``messages`` row (for its channel + correlation), which an uploaded, never-ingested file
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
-        validation (registered/running) + RBAC + audit are the API's job, and so are the target inbound's
+        validation (registered/running) + RBAC are the API's job, and the API builds the
+        ``audit`` row that commits with the message (BACKLOG #2624), and so are the target inbound's
         ingress guards (BACKLOG #1911). Returns the new message id."""
         mid = await self.store.enqueue_ingress(
             channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata, audit=audit

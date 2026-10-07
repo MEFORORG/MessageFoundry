@@ -4134,21 +4134,23 @@ class AuditedWrite:
     is what lets a write with several ``return`` paths inside its transaction tee from every one.
     """
 
-    __slots__ = ("_pending", "now")
+    __slots__ = ("_audits", "_rows", "now")
 
     def __init__(self, now: float) -> None:
         self.now = now
-        self._pending: list[tuple[AuditAppend, AppendedAuditRow]] = []
+        self._audits: list[AuditAppend] = []
+        self._rows: list[AppendedAuditRow] = []
 
     def add(self, audits: Sequence[AuditAppend], rows: Sequence[AppendedAuditRow]) -> None:
         """Hold rows the transaction appended, one per audit, in order, until it commits."""
-        self._pending.extend(zip(audits, rows, strict=True))
+        self._audits.extend(audits)
+        self._rows.extend(rows)
 
     def flush(self) -> None:
         """Tee the held rows. Call it only once their transaction has committed."""
-        pending, self._pending = self._pending, []
-        for audit, row in pending:
-            audit.tee(ts=self.now, row=row)
+        audits, rows = self._audits, self._rows
+        self._audits, self._rows = [], []
+        tee_audits(audits, rows, ts=self.now)
 
     async def __aenter__(self) -> Self:
         return self

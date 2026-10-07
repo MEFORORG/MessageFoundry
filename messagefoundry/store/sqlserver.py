@@ -49,13 +49,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import (
-    AbstractAsyncContextManager,
-    AsyncExitStack,
-    asynccontextmanager,
-    contextmanager,
-    nullcontext,
-)
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from functools import partial
 from time import perf_counter
 from types import MappingProxyType
@@ -5323,11 +5317,10 @@ class SqlServerStore:
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
         refs = list(dict.fromkeys(attachment_refs or ()))
-        # BACKLOG #2624: an operator's inject passes an ``audit``; a live receipt passes none, so its
-        # gate is a no-op and it never queues behind this process's audit writes.
+        # BACKLOG #2624: an operator's inject passes an ``audit``; a live receipt passes none and
+        # takes no audit lock.
         async with (
             AuditedWrite(now) as written,
-            self._operator_audit_gate(audit),
             self._acquire() as conn,
             self._cursor(conn) as cur,
         ):
@@ -9875,7 +9868,6 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with (
             AuditedWrite(now) as written,
-            self._operator_audit_gate(audit),
             self._acquire() as conn,
             self._cursor(conn) as cur,
         ):
@@ -9978,7 +9970,6 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with (
             AuditedWrite(now) as written,
-            self._operator_audit_gate(audit),
             self._acquire() as conn,
             self._cursor(conn) as cur,
         ):
@@ -10205,7 +10196,6 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with (
             AuditedWrite(now) as written,
-            self._operator_audit_gate(audit),
             self._acquire() as conn,
             self._cursor(conn) as cur,
         ):
@@ -10366,7 +10356,6 @@ class SqlServerStore:
         # BACKLOG #2624: ``audit``'s row commits with the replay, zero included.
         async with (
             AuditedWrite(now) as written,
-            self._operator_audit_gate(audit),
             self._acquire() as conn,
             self._cursor(conn) as cur,
         ):
@@ -10417,7 +10406,6 @@ class SqlServerStore:
         # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
         async with (
             AuditedWrite(now) as written,
-            self._operator_audit_gate(audit),
             self._acquire() as conn,
             self._cursor(conn) as cur,
         ):
@@ -11380,8 +11368,7 @@ class SqlServerStore:
     async def _append_audits(
         self, cur: Any, audits: Sequence[AuditAppend], *, now: float
     ) -> list[AppendedAuditRow]:
-        """Append each of a write's ``audits``, in order, on ``cur`` inside its open transaction.
-        The caller holds ``_audit_lock``, as :meth:`_append_audit_row` requires."""
+        """Append each of a write's ``audits``, in order, on ``cur`` inside its open transaction."""
         return [
             await self._append_audit_row(
                 cur,
@@ -11395,19 +11382,18 @@ class SqlServerStore:
             for a in audits
         ]
 
-    def _operator_audit_gate(self, audit: object) -> AbstractAsyncContextManager[None]:
-        """The in-process audit gate an operator mutation holds when it may append (BACKLOG #2624).
-
-        Taken before the connection, the order :meth:`record_audit` uses. With no ``audit`` there is
-        nothing to append, so the mutation does not queue behind this process's audit writes."""
-        return self._audit_lock if audit is not None else nullcontext()
-
     async def _append_operator_audit[R](
         self, cur: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
     ) -> None:
         """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
-        that fails rolls the mutation back. The caller holds :meth:`_operator_audit_gate`, and its
-        first statement opened the transaction the applock needs. ``written`` tees after commit."""
+        that fails rolls the mutation back. The caller's first statement opened the transaction the
+        applock needs. ``written`` tees after commit.
+
+        It does NOT take the in-process ``_audit_lock``. That lock is only the cheap near gate
+        :meth:`record_audit` describes; ``_AUDIT_APPEND_LOCK`` is what serialises the chain, and it
+        is taken here, at the tail, after the mutation's own writes. Holding ``_audit_lock`` across a
+        whole mutation would queue every audit write in this process, sign-ins included, behind a
+        bulk replay or purge."""
         audits = operator_audits(audit, result)
         written.add(audits, await self._append_audits(cur, audits, now=written.now))
 
