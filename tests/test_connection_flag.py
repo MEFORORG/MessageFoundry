@@ -223,7 +223,9 @@ async def test_concurrent_flag_writes_both_land(engine: Engine, tmp_path: Path) 
     reg = load_config(tmp_path)  # the file still parses + loads cleanly
     assert reg.outbound["OB_TOML"].flagged is True  # neither update was lost
     assert reg.inbound["IB_TOML"].flagged is True
-    assert not list(tmp_path.glob("connections.toml.*.tmp"))  # no shared/leftover temp file
+    # No leftover edit candidate, in either the old temp-file shape or the private-directory one.
+    assert not list(tmp_path.glob("connections.toml.*.tmp"))
+    assert not list(tmp_path.glob(".connections.toml.*.edit"))
 
 
 def test_flagged_survives_toml_roundtrip(tmp_path: Path) -> None:

@@ -11,9 +11,10 @@ list / show / upsert / rename / remove those tables. The on-disk authored format
 The writer mirrors the loader's rules **exactly** so a file it produces always loads: the first
 column is the lookup key, at least one value column is required, no duplicate keys, and a stem that
 collides with an existing ``.toml`` is rejected (the same ambiguity the loader fails loud on). The
-final authority is the loader itself — after an atomic, owner-only write, the candidate file is
-re-loaded via :func:`~messagefoundry.config.code_sets.load_code_set`; any failure rolls the prior
-content back (or unlinks a brand-new file), so a bad edit never lands.
+final authority is the loader itself — the new table is written to an owner-only candidate beside the
+live file and loaded via :func:`~messagefoundry.config.code_sets.load_code_set` BEFORE it replaces the
+live file, so a bad edit never touches it, and the write holds a cross-process lock
+(:mod:`messagefoundry.config.atomic_edit`, vault BACKLOG #2782).
 
 The post-write check is injected as a ``validate`` callback (so the CLI passes the *real* loader and
 this module stays trivially testable), exactly as ``connections_edit`` does. The name-safety,
@@ -30,8 +31,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from messagefoundry.config import atomic_edit
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
+    POLICY_SIDECAR_SUFFIX,
     CodeSet,
     CodeSetError,
     UnmappedPolicy,
@@ -52,8 +55,9 @@ def _policy_detail(policy: UnmappedPolicy) -> dict[str, Any]:
     return {"kind": policy.kind.value, "default_value": policy.default_value}
 
 
-#: Run after a write to prove the file loads; the CLI passes the real loader. It receives the written
-#: ``.csv`` path and raises on any problem (which triggers a rollback).
+#: Run before a write to prove the file loads; the CLI passes the real loader. It receives the
+#: CANDIDATE ``.csv`` (the live file's name, in a private directory beside it, with the policy sidecar
+#: copied next to it) and raises on any problem, which leaves the live file untouched.
 Validate = Callable[[Path], None]
 
 
@@ -129,9 +133,10 @@ def upsert_code_set(
 
     Validates the name (safety), the structure (>=1 value column, unique non-empty headers, no
     duplicate keys; a blank-key row carrying data is rejected, a fully-blank row dropped), and the
-    stem (no colliding ``.toml``) **before** writing. Writes atomically with owner-only perms, then re-loads the file via ``validate`` as the
-    final authority; on any failure the prior content is restored (or a brand-new file unlinked).
-    Raises :class:`WiringError` on bad input or a file that wouldn't load.
+    stem (no colliding ``.toml``) **before** writing. Loads an owner-only candidate via ``validate`` as
+    the final authority and only then replaces the live file, so on any failure the live file is
+    untouched (and a brand-new one never created). Raises :class:`WiringError` on bad input or a file
+    that wouldn't load.
 
     ``create`` distinguishes a *create*-flavored save from an *edit* (#240). When ``create`` is True
     the save refuses if **any** supported file already exists for the stem (a ``.csv`` OR ``.toml``) —
@@ -142,21 +147,22 @@ def upsert_code_set(
     emitted = _validate_rows(name, headers, rows)
     codesets_dir = _codesets_dir(config_dir)
     _validate_name(codesets_dir, name)
-    if create and _existing_path_or_none(codesets_dir, name) is not None:
-        # A create must not silently overwrite an existing code set — refuse loud (mirrors the wizard/
-        # form collision refusal, PR #1081). An edit (create=False) overwrites the same-stem .csv.
-        raise WiringError(_create_collision_message(name, codesets_dir))
-    _reject_toml_collision(codesets_dir, name)
-
     path = codesets_dir / f"{name}.csv"
-    # Capture prior content as BYTES so a rollback restores the file byte-for-byte (CSV line
-    # terminators are \r\n; a text round-trip through universal-newline translation would not).
-    original = path.read_bytes() if path.is_file() else None
-    text = _build_csv_text(headers, emitted)
-    _write_validated(path, text, original, validate)
+    codesets_dir.mkdir(parents=True, exist_ok=True)
+    # The existence checks sit inside the lock with the write, so a concurrent create of the same stem
+    # cannot pass the check between them.
+    with atomic_edit.edit_lock(path, busy_error=WiringError):
+        if create and _existing_path_or_none(codesets_dir, name) is not None:
+            # A create must not silently overwrite an existing code set — refuse loud (mirrors the
+            # wizard/form collision refusal, PR #1081). An edit (create=False) overwrites the .csv.
+            raise WiringError(_create_collision_message(name, codesets_dir))
+        _reject_toml_collision(codesets_dir, name)
 
-    # The written file is now proven loadable; count its keys for the RESULT.
-    entries = len(_load_one(path))
+        text = _build_csv_text(headers, emitted)
+        _write_validated(path, text, validate)
+
+        # The written file is now proven loadable; count its keys for the RESULT.
+        entries = len(_load_one(path))
     return {"op": "upsert", "name": name, "format": "csv", "entries": entries}
 
 
@@ -561,37 +567,18 @@ def _build_csv_text(headers: list[str], rows: list[list[str]]) -> str:
     return buf.getvalue()
 
 
-def _write_validated(path: Path, new_text: str, original: bytes | None, validate: Validate) -> None:
-    """Atomically write ``new_text``, run ``validate`` (the real loader), roll back on failure.
+def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
+    """Load ``new_text`` as a candidate via ``validate`` (the real loader), then replace ``path``.
 
-    ``original`` is the prior file's exact bytes (``None`` for a brand-new file); a rollback restores
-    them byte-for-byte, or unlinks a file that didn't exist before."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(path, new_text.encode("utf-8"))
-    try:
-        validate(path)
-    except BaseException:
-        if original is None:
-            path.unlink(missing_ok=True)
-        else:
-            _atomic_write(path, original)
-        raise
-    _secure_file(path)
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    # Write bytes verbatim (no newline translation) so CSV \r\n terminators survive a write/rollback.
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
-
-
-def _secure_file(path: Path) -> None:
-    # Owner-only permissions (defence in depth; a code set can carry sensitive mappings). Reuse the
-    # store's primitive, identical to connections_edit.
-    from messagefoundry.store.store import _secure_file as _secure
-
-    _secure(path)
+    The candidate carries the live file's name, so the loader reads the same code-set name and format,
+    and the ``<name>.policy.toml`` sidecar is copied beside it, so the candidate loads exactly as the
+    live file would, policy included. Bytes go out verbatim, so CSV ``\r\n`` terminators survive."""
+    atomic_edit.replace_validated(
+        path,
+        new_text.encode("utf-8"),
+        validate,
+        companions=(path.with_name(path.stem + POLICY_SIDECAR_SUFFIX),),
+    )
 
 
 # --- #152 referent pre-flight composition ------------------------------------

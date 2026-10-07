@@ -469,9 +469,9 @@ system value, a facility code → a downstream mnemonic. Rather than a hand-main
     `.toml`; TOML sets are summarized and shown **read-only** in the grid — TOML-in-grid editing is a
     fast-follow).
   - `messagefoundry codeset show   --config DIR --name N` — the grid (headers + rows).
-  - `messagefoundry codeset upsert --config DIR --data '{…}'` — validate → write `codesets/N.csv`
-    atomically (temp + replace, owner-only perms) → **re-load the written file as the final check**;
-    a bad save rolls back, so the CLI never leaves an unloadable table.
+  - `messagefoundry codeset upsert --config DIR --data '{…}'` — validate → write an owner-only
+    candidate of `codesets/N.csv` → **load the candidate as the final check** → replace the live
+    file with it; a bad save never touches the live file, so the CLI never leaves an unloadable table.
   - `messagefoundry codeset rename --config DIR --name N --to M` / `… remove --config DIR --name N`.
 
   The CLI is **offline** (no engine start, no egress check — a code set is standalone data); it validates

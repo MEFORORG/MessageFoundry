@@ -524,8 +524,9 @@ class Engine:
         # Serializes ALL console→connections.toml writes (#131/#136 review): the read-modify-write of the
         # config file is not atomic on its own, so two concurrent config:deploy writers could lose an
         # update. A single engine-level lock guarding every such write (a future console→TOML writer must
-        # take it too) keeps them serial; the writer's unique-temp + os.replace (connections_edit) guards
-        # against a DIFFERENT process (the `connection` CLI) writing concurrently.
+        # take it too) keeps them serial. It is in-process only, so the write also holds
+        # `connections_edit.locked`, an OS file lock the `connection` CLI in another process takes too
+        # (vault BACKLOG #2782); that one is blocking and is only ever taken in a worker thread.
         self._toml_write_lock = asyncio.Lock()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
@@ -1995,6 +1996,14 @@ class Engine:
 
             connections_edit.upsert_connection(cfg_dir, match, validate=validate)
 
+        def _locked_write() -> None:
+            # The cross-process lock (vault BACKLOG #2782) spans the list as well as the upsert: the
+            # entry is read here and written back whole, so a `connection` CLI edit of the same entry
+            # landing between the two would otherwise be overwritten. Re-entrant, so the upsert's own
+            # acquisition of it nests.
+            with connections_edit.locked(cfg_dir):
+                _write()
+
         # Serialize the whole read-modify-write + live reflect under the engine-level TOML-write lock so
         # two concurrent config:deploy flag toggles can't interleave (lost update / racing temp files);
         # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
@@ -2011,7 +2020,7 @@ class Engine:
             # the runner's listening set is snapshotted here, on the loop. None = the offline test.
             live = self._registry_runner
             binds_listener = live.listener_bind_predicate() if live is not None else None
-            await asyncio.to_thread(_write)
+            await asyncio.to_thread(_locked_write)
 
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
             # Best-effort: the durable connections.toml is the source of truth, so a concurrent reload

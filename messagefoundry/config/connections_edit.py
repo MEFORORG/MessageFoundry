@@ -6,8 +6,11 @@
 The file is edited by hand **and** by the VS Code GUI, so a write must touch only the target
 connection and leave every other table's comments + formatting byte-stable — hence ``tomlkit``
 (style-preserving) rather than a plain serializer. Each mutation **validates the whole config dir**
-(load + the connector/egress build-check) BEFORE it persists, and writes atomically (temp + replace,
-owner-only perms); if validation fails the prior content is restored, so a bad edit never lands.
+(load + the connector/egress build-check) BEFORE it persists: the dir is loaded with a candidate
+``connections.toml`` in place of the live one, and only a candidate that loads replaces it (temp +
+replace, owner-only perms), so a bad edit never touches the live file. The read-modify-write holds a
+cross-process lock (:func:`locked`), so the ``connection`` CLI and the console cannot lose each other's
+edit (:mod:`messagefoundry.config.atomic_edit`, vault BACKLOG #2782).
 
 The validation is injected as a callback so this module stays free of service-settings/engine imports
 (and is trivially testable); the ``connection`` CLI builds the callback from ``load_config`` +
@@ -22,19 +25,20 @@ silently deleted by the next GUI/CLI save (the #234 data-loss bug this closes).
 
 from __future__ import annotations
 
-import os
-import tempfile
-from collections.abc import Callable
+import contextlib
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
 import tomlkit
 
+from messagefoundry.config import atomic_edit
 from messagefoundry.config.connections_file import (
     _INBOUND_KEYS,
     _OUTBOUND_KEYS,
     CONNECTIONS_FILE_NAME,
+    validating_candidate,
 )
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
@@ -128,6 +132,18 @@ assert "direction" not in _SCALAR_FIELDS + _SUB_TABLES
 Validate = Callable[[Path], None]
 
 
+@contextlib.contextmanager
+def locked(config_dir: str | Path) -> Iterator[None]:
+    """Hold the cross-process edit lock on ``config_dir``'s ``connections.toml`` for the ``with`` body.
+
+    :func:`upsert_connection` and :func:`remove_connection` take it themselves. A caller whose
+    read-modify-write starts earlier, as the engine's flag toggle does with :func:`list_connections`,
+    wraps the whole of it; the lock is re-entrant within one thread. Blocking: call it off the event
+    loop. A holder that does not let go within the timeout raises :class:`WiringError`."""
+    with atomic_edit.edit_lock(_path(config_dir), busy_error=WiringError):
+        yield
+
+
 def list_connections(config_dir: str | Path) -> list[dict[str, Any]]:
     """The data-authored connections in ``config_dir``'s ``connections.toml`` (``[]`` if none).
 
@@ -182,29 +198,30 @@ def upsert_connection(
     ``connections.toml`` untouched."""
     _validate_input(obj)
     path = _path(config_dir)
-    original = path.read_text(encoding="utf-8") if path.is_file() else None
-    doc = tomlkit.parse(original) if original is not None else tomlkit.document()
+    with locked(config_dir):
+        original = path.read_text(encoding="utf-8") if path.is_file() else None
+        doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
-    direction = obj["direction"]
-    aot = doc.get(direction)
-    if aot is None:
-        aot = tomlkit.aot()
-        doc[direction] = aot
-    new_table = _build_table(obj)
-    for index in range(len(aot)):
-        if aot[index].get("name") == obj["name"]:
-            # Update the EXISTING table object key-wise. Assigning ``aot[index] = new_table`` swaps
-            # the whole table out, and tomlkit discards the trivia around it: the edited table's own
-            # inline comments AND the leading comment block of the FOLLOWING entry (which tomlkit
-            # carries as trivia on the array body, not on the next table). A no-op save therefore
-            # deleted the documentation of a connection the user never touched. Mutating in place
-            # keeps every comment that is not attached to a value we actually change.
-            _apply_table(aot[index], new_table)
-            break
-    else:
-        aot.append(new_table)
+        direction = obj["direction"]
+        aot = doc.get(direction)
+        if aot is None:
+            aot = tomlkit.aot()
+            doc[direction] = aot
+        new_table = _build_table(obj)
+        for index in range(len(aot)):
+            if aot[index].get("name") == obj["name"]:
+                # Update the EXISTING table object key-wise. Assigning ``aot[index] = new_table``
+                # swaps the whole table out, and tomlkit discards the trivia around it: the edited
+                # table's own inline comments AND the leading comment block of the FOLLOWING entry
+                # (which tomlkit carries as trivia on the array body, not on the next table). A no-op
+                # save therefore deleted the documentation of a connection the user never touched.
+                # Mutating in place keeps every comment that is not attached to a value we change.
+                _apply_table(aot[index], new_table)
+                break
+        else:
+            aot.append(new_table)
 
-    _write_validated(path, tomlkit.dumps(doc), original, validate)
+        _write_validated(path, tomlkit.dumps(doc), validate)
     return {"op": "upsert", "direction": direction, "name": obj["name"]}
 
 
@@ -214,28 +231,28 @@ def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) 
     path = _path(config_dir)
     if not path.is_file():
         raise WiringError(f"no {CONNECTIONS_FILE_NAME} in {config_dir}")
-    original = path.read_text(encoding="utf-8")
-    doc = tomlkit.parse(original)
+    with locked(config_dir):
+        doc = tomlkit.parse(path.read_text(encoding="utf-8"))
 
-    removed = False
-    for direction in ("inbound", "outbound"):
-        aot = doc.get(direction)
-        if aot is None:
-            continue
-        for index in range(len(aot)):
-            if aot[index].get("name") == name:
-                del aot[index]
-                removed = True
+        removed = False
+        for direction in ("inbound", "outbound"):
+            aot = doc.get(direction)
+            if aot is None:
+                continue
+            for index in range(len(aot)):
+                if aot[index].get("name") == name:
+                    del aot[index]
+                    removed = True
+                    break
+            if removed:
                 break
-        if removed:
-            break
-    if not removed:
-        raise WiringError(
-            f"connection {name!r} is not in {CONNECTIONS_FILE_NAME} "
-            "(a code-authored connection can't be removed here)"
-        )
+        if not removed:
+            raise WiringError(
+                f"connection {name!r} is not in {CONNECTIONS_FILE_NAME} "
+                "(a code-authored connection can't be removed here)"
+            )
 
-    _write_validated(path, tomlkit.dumps(doc), original, validate)
+        _write_validated(path, tomlkit.dumps(doc), validate)
     return {"op": "remove", "name": name}
 
 
@@ -254,7 +271,7 @@ def _validate_input(obj: Any) -> None:
         raise WiringError("connection 'direction' must be 'inbound' or 'outbound'")
     if not isinstance(obj.get("name"), str) or not obj["name"]:
         raise WiringError("connection 'name' must be a non-empty string")
-    # The loader would refuse it after the write and roll back (BACKLOG #1107); refuse before writing.
+    # The loader would refuse the candidate (BACKLOG #1107); refuse before building one.
     if not is_connection_name(obj["name"]):
         raise WiringError(f"connection 'name' {obj['name']!r} must match {CONNECTION_NAME_PATTERN}")
     if not isinstance(obj.get("transport"), str) or not obj["transport"]:
@@ -358,42 +375,19 @@ def _toml_value(value: Any) -> Any:
     return value
 
 
-def _write_validated(path: Path, new_text: str, original: str | None, validate: Validate) -> None:
-    """Atomically write ``new_text``, validate the dir, and roll back to ``original`` on failure."""
-    _atomic_write(path, new_text)
-    try:
-        validate(path.parent)
-    except BaseException:
-        if original is None:
-            path.unlink(missing_ok=True)
-        else:
-            _atomic_write(path, original)
-        raise
-    _secure_file(path)
+def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
+    """Validate the dir with ``new_text`` as its ``connections.toml``, then replace the live file.
 
+    ``validate`` still receives the config DIR. While it runs, a ``load_config`` of that dir in this
+    thread reads the candidate in place of the live file
+    (:func:`~messagefoundry.config.connections_file.validating_candidate`), so the live file is
+    untouched until the candidate loads. Bytes go out verbatim, with no newline translation: Python's
+    default would rewrite every ``\n`` as ``\r\n`` on Windows and turn a one-key edit of an
+    LF-committed file into a whole-file diff."""
+    config_dir = path.parent
 
-def _atomic_write(path: Path, text: str) -> None:
-    # A UNIQUE per-write temp in the SAME directory (same filesystem → os.replace is atomic), so two
-    # concurrent writers — the console→TOML seam and the `connection` CLI in a separate process — never
-    # clobber a shared ``<name>.tmp``. ``mkstemp`` creates it owner-only from the instant it exists (no
-    # create-then-chmod window); the final file inherits those perms on replace, and _secure_file
-    # re-asserts them belt-and-braces. On any failure the temp is removed rather than left behind.
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
-    tmp = Path(tmp_name)
-    try:
-        # newline="" so the bytes tomlkit produced are written verbatim. Without it Python's default
-        # translation rewrites every "\n" as "\r\n" on Windows, so saving one connection reflowed an
-        # LF-committed connections.toml into CRLF and turned a one-key edit into a whole-file diff.
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    def check(candidate: Path) -> None:
+        with validating_candidate(config_dir, candidate):
+            validate(config_dir)
 
-
-def _secure_file(path: Path) -> None:
-    # Owner-only permissions (defence in depth). Reuse the store's primitive; tolerate its absence.
-    from messagefoundry.store.store import _secure_file as _secure
-
-    _secure(path)
+    atomic_edit.replace_validated(path, new_text.encode("utf-8"), check)
