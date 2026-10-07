@@ -16,6 +16,7 @@ per path, and a source scan that keeps a new site from rendering a caught one ra
 
 from __future__ import annotations
 
+import abc
 import ast
 import collections
 import collections.abc
@@ -820,6 +821,48 @@ def _cycle_through_namedtuple(err: UnicodeEncodeError) -> object:
     return point
 
 
+def _cycle_through_ordered_data(err: UnicodeEncodeError) -> object:
+    data: collections.OrderedDict[str, object] = collections.OrderedDict(e=err)
+    holder: collections.UserDict[str, object] = collections.UserDict()
+    holder.data = data
+    data["me"] = holder
+    return holder
+
+
+class _Abstract(abc.ABC):  # noqa: B024 - a class with a metaclass, used only as a factory
+    pass
+
+
+class _Prefixed(list[object]):
+    def __repr__(self) -> str:
+        return "P" + list.__repr__(self)
+
+
+def test_a_cycle_through_a_container_with_its_own_repr_prints_a_note_not_a_blowup() -> None:
+    # Printing such a container again at each back edge, as the stdlib may, grew as the fifth
+    # power of its width before the depth cutoff stopped it.
+    err = _encode_error()
+    wide = _Prefixed([err])
+    wide.extend([wide] * 20)
+    for arg in (wide, _cycle_through_namedtuple(err)):
+        record = _record("%s", (arg,))
+        prepare_log_record(record)
+        out = record.getMessage()
+        assert "caf" not in out and len(out) < 2000
+        assert "[a cycle back to a container that holds a codec error]" in out
+
+
+def test_a_mapping_value_changed_after_the_filter_is_scanned_when_it_is_formatted() -> None:
+    # A handler may format late. The lookup scans what it finds then, not what the filter saw.
+    inner: list[object] = [1]
+    record = _record("%(a)s", {"a": inner, "b": _encode_error()})
+    prepare_log_record(record)
+    inner.append(_encode_error())
+    out = record.getMessage()
+    _assert_encode_safe(out)
+    assert "caf" not in out
+
+
 class _Labelled(dict[str, object]):
     def __repr__(self) -> str:
         return f"_Labelled{dict.__repr__(self)}"
@@ -846,7 +889,8 @@ def _holders(err: UnicodeEncodeError) -> list[object]:
         _cycle_mapping(collections.OrderedDict, err),
         _cycle_mapping(lambda: collections.defaultdict(None), err),
         _ReversedDeque([1, err, 2]),
-        _cycle_through_namedtuple(err),
+        _cycle_through_ordered_data(err),
+        collections.defaultdict[str, object](_Abstract, k=err),
         collections.Counter({err: 1, "ok": 3}),
         _Labelled(e=err, n=1),
         [err, clean_loop],
@@ -872,7 +916,8 @@ _HOLDER_IDS = [
     "cyclic-ordereddict",
     "cyclic-defaultdict",
     "deque-printed-through-its-iter",
-    "cycle-through-a-namedtuple",
+    "userdict-cycle-through-ordered-data",
+    "defaultdict-with-an-abc-factory",
     "counter",
     "dict-subclass-with-its-own-repr",
     "list-beside-a-clean-cycle",
@@ -957,6 +1002,8 @@ def test_a_deque_whose_iteration_consumes_it_is_not_consumed_by_the_filter() -> 
 
 def test_a_namedtuple_given_as_the_args_formats_field_by_field() -> None:
     record = _record("%s %s", _POINT(_encode_error(), 2))
+    prepare_log_record(record)
+    assert type(record.args) is _POINT  # the same type, so a later handler can still read .y
     RedactionFilter().filter(record)
     out = record.getMessage()
     _assert_encode_safe(out)

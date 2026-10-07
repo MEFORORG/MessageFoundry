@@ -2321,21 +2321,18 @@ class _RenderedMapping(dict[Any, Any]):
     the rebuilt keys and values, so a later handler that reads ``.get()`` or ``.items()`` gets the
     safe text too. It writes nothing to the caller's mapping."""
 
-    __slots__ = ("_original", "_rebuild", "_repr", "_str")
+    __slots__ = ("_original", "_repr", "_str")
 
     def __init__(self, original: Any, rebuild: _Rebuild) -> None:
         rendered = rebuild.arg(original, 0)
         super().__init__(rebuild.pairs(original))
         self._original = original
-        self._rebuild = rebuild
         self._repr, self._str = repr(rendered), str(rendered)
 
     def __getitem__(self, key: Any) -> Any:
         value = self._original[key]  # the caller's own lookup, as "%(key)s" makes it with no filter
         try:
-            node = self._rebuild.scan.nodes.get(id(value))
-            if node is not None and node[0] is value:  # walked already: reuse that scan
-                return self._rebuild.arg(value, 1)
+            # Scanned afresh: it may have changed since the filter ran, and a handler may format late.
             return _safe_arg(value, 1)
         except Exception as exc:  # noqa: BLE001 -- fail closed, see prepare_log_record
             return _withheld(type(exc).__name__)
@@ -2354,9 +2351,10 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
     """The objects a render of ``arg`` prints, read from its storage through the builtin's own
     methods. A mapping's are its keys and values, flattened in order.
 
-    Each read is one ``list()`` over a C iterator, which another thread cannot interleave with, so it
-    fails only on a container changed mid-read in a free-threaded build. That propagates and the
-    scan fails closed. A ``UserDict``'s ``.data`` is the one read that can run the caller's code; an
+    Each read is one ``list()`` over a C iterator, so it is short, but it is not atomic: a garbage
+    collection inside it can run other code and switch threads. A container another thread changes
+    mid-read raises, that propagates, and the scan fails closed, so that argument prints as a
+    withheld note rather than as the object. A ``UserDict``'s ``.data`` is the one read that can run the caller's code; an
     error from it leaves the argument untouched, since its ``repr`` reads the same attribute and
     fails the same way, as it would with no filter.
 
@@ -2450,11 +2448,13 @@ _FACTORY_NOTE = "[a default factory, not rendered]"
 
 
 def _factory_repr(arg: Any) -> str:
-    """A `defaultdict`'s factory as its `repr` prints it, when that is a class or a function and so
-    names code, never data. Any other callable, as a `partial`, may print what it holds, and it is
-    not walked, so it is a fixed note."""
+    """A ``defaultdict``'s factory as its ``repr`` prints it, when that is a class or a function and
+    so names code, never data. Any other callable, as a ``partial`` or a bound method, may print
+    what it holds, and it is not walked, so it is a fixed note."""
     factory = _DEFAULT_FACTORY.__get__(arg)
-    if factory is None or type(factory) in (type, BuiltinFunctionType, FunctionType):
+    if factory is None or isinstance(factory, type):  # a class, whatever its metaclass
+        return repr(factory)
+    if type(factory) in (BuiltinFunctionType, FunctionType):
         return repr(factory)
     return _FACTORY_NOTE
 
@@ -2570,12 +2570,8 @@ class _Rebuild:
         if key not in self.scan.holds:
             return arg  # holds no error: untouched
         if key in self.active:
-            mark = self._back_edge(arg, kind)
-            if mark is not None:
-                self.back_edges += 1
-                return mark
-            # A repr of its own has no guard, so the stdlib prints it again here, and the builtin
-            # container inside it on the same cycle prints the mark. The depth cutoff bounds this.
+            self.back_edges += 1
+            return self._back_edge(arg, kind)
         if depth > _ARG_DEPTH:
             return _Rendered(_TOO_DEEP)
         cached = self.memo.get(key)
@@ -2594,25 +2590,31 @@ class _Rebuild:
             self.memo[key] = (depth, result)
         return result
 
-    def _back_edge(self, arg: Any, kind: type[Any]) -> _Rendered | None:
-        """What the builtin ``repr`` prints where a container meets itself again, or None for a
-        container whose own ``repr`` has no such guard."""
+    def _back_edge(self, arg: Any, kind: type[Any]) -> _Rendered:
+        """What the builtin ``repr`` prints where a container meets itself again. A container with
+        a ``repr`` of its own gets the fixed note: printing it again, as the stdlib may, can grow
+        as the fifth power of its width before the depth cutoff stops it."""
+        mark = self._builtin_mark(arg, kind)
+        return _Rendered(_CYCLE) if mark is None else _Rendered(mark)
+
+    def _builtin_mark(self, arg: Any, kind: type[Any]) -> str | None:
         own: Any = kind.__repr__
         if own is list.__repr__ or own is deque.__repr__:
-            return _Rendered("[...]")
+            return "[...]"
         if own is tuple.__repr__:
-            return _Rendered("(...)")
+            return "(...)"
         if own is dict.__repr__:
-            return _Rendered("{...}")
+            return "{...}"
         if own is defaultdict.__repr__:
-            return _Rendered(f"{kind.__name__}({_factory_repr(arg)}, {{...}})")
+            return f"{kind.__name__}({_factory_repr(arg)}, {{...}})"
         if own is OrderedDict.__repr__ or issubclass(kind, _ARG_VIEWS):
-            return _Rendered("...")
-        if issubclass(kind, UserDict):
-            # UserDict prints repr(self.data) at the same level, so it must stop here.
+            return "..."
+        if own is UserDict.__repr__:
+            # It prints repr(self.data), and the stdlib's guard there marks the data, by its type.
             children = self.scan.nodes[id(arg)][1]
-            data_is_dict = own is UserDict.__repr__ and children and type(children[0]) is dict
-            return _Rendered("{...}" if data_is_dict else _CYCLE)
+            data = children[0] if children else None
+            if issubclass(type(data), dict):
+                return self._builtin_mark(data, type(data))
         return None
 
     def _render(self, arg: Any, kind: type[Any], children: list[Any], depth: int) -> _Rendered:
@@ -2714,7 +2716,8 @@ def prepare_log_record(record: logging.LogRecord) -> None:
             except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
                 fresh.append(_withheld(type(exc).__name__))
         if any(new is not old for new, old in zip(fresh, items, strict=True)):
-            record.args = tuple(fresh)
+            # The same type, built through tuple's own constructor, so a namedtuple stays one.
+            record.args = tuple.__new__(type(args), fresh)
         return
     try:
         safe = _safe_mapping_args(args)
