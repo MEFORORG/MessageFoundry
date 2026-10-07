@@ -1015,8 +1015,13 @@ need separate engine processes.
 **Two more things the setting does not reach.** `messagefoundry check` and `messagefoundry dryrun`
 always run Routers/Handlers **in-process** and never consult `mode`. On the default that costs nothing,
 because `serve` runs them in-process too; once you set `mode="subprocess"` the preview stops matching
-the engine, so a Handler calling `db_lookup`/`fhir_lookup` passes the pre-deploy gate green and then
-fails closed at `serve`, and `wall_seconds` is unenforced in the preview. And
+the engine in at least two ways. `wall_seconds` is unenforced in the preview, so test a slow Handler
+under `serve`. And config code there sees the full environment, not the worker's allowlist that the
+*Environment variables* row above describes. A Handler calling `db_lookup`/`fhir_lookup` is not one
+of these. The dry run has no lookup runner, so the call raises there in every mode. Unless the
+Handler catches that error, the fixture records `ERROR`. The gate then fails unless its `.expect`
+file declares `ERROR`. Under `subprocess` that matches `serve`, which refuses the lookup; at
+`mode="off"` it does not, because `serve` runs the lookup there. And
 `[pipeline].fuse_thread_hops` is **hard-disabled** whenever `mode="subprocess"`: fusion runs
 Router/Handler code in-process on an executor hop, so honouring both would silently unsandbox the code
 you asked to isolate. The runner fails closed to the async sandboxed path and logs it. To get fusion you

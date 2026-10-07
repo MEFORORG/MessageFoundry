@@ -18,6 +18,7 @@ import pytest
 import messagefoundry.checks as checks
 from messagefoundry.__main__ import main
 from messagefoundry.checks import CheckReport, run_checks
+from messagefoundry.config.settings import load_settings
 from messagefoundry.logging_guard import GuardedStreamHandler, active_guard, set_active_guard
 from messagefoundry.logging_setup import configure_logging
 
@@ -643,6 +644,45 @@ def test_no_expect_keeps_default_semantics(tmp_path: Path) -> None:
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), None)
     dr = _run_dryrun(cfg, msgs)
     assert dr.ok and "expectation-checked" not in dr.detail
+
+
+_LOOKUP_CALLS = {
+    "db_lookup": "db_lookup('clarity', 'SELECT npi FROM p WHERE mrn = :mrn', {'mrn': 'M1'})",
+    "fhir_lookup": "fhir_lookup('epic', 'Patient/123')",
+}
+
+
+@pytest.mark.parametrize("bridge", sorted(_LOOKUP_CALLS))
+@pytest.mark.parametrize("sandbox_mode", ["off", "subprocess"])
+def test_a_lookup_handler_fails_the_gate_in_every_sandbox_mode(
+    tmp_path: Path, bridge: str, sandbox_mode: str
+) -> None:
+    # The dry run has no live lookup runner, so a Handler that reaches db_lookup/fhir_lookup ERRORs
+    # and, with no `.expect` sidecar, blocks the gate whatever `[sandbox].mode` says. The mode axis
+    # pins that the verdict does not depend on the mode; it would trip only if a lookup started to
+    # succeed in the preview. docs/CONFIGURATION.md, [sandbox].
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        f"from messagefoundry import inbound, outbound, router, handler, File, Send, {bridge}\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "outbound('OB_X', File(directory='out'))\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        "def h(m):\n"
+        f"    {_LOOKUP_CALLS[bridge]}\n"
+        "    return Send('OB_X', m)\n",
+        encoding="utf-8",
+    )
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(f'[sandbox]\nmode = "{sandbox_mode}"\n', encoding="utf-8")
+    # Control: the gate resolves THIS file and it carries the mode, so the arms really differ.
+    assert checks._resolve_service_toml(cfg, service_config=None, suppress_search=False) == toml
+    assert load_settings(config_path=toml, environ={}).sandbox.mode == sandbox_mode
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), None)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "1/1 run(s) failed" in dr.detail and bridge in dr.detail, dr.detail
 
 
 # --- posture check (#5): catch a custom env with no explicit posture at check time ----------------
