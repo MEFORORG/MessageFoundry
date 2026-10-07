@@ -211,7 +211,9 @@ async def test_a_skipped_plaintext_body_leaves_its_sidecar_untouched_and_unliste
     A keyed store refuses a plaintext sidecar, so the upload is not listed. Sealing that sidecar over
     a body the pass did not seal would list an upload whose body is unusable, and the missing-body arm
     is also the cheapest plant: one hand-written sidecar. So the sidecar comes out byte-for-byte as it
-    went in, and the pair counts as ONE skipped upload.
+    went in. It counts as ``unsealable``, not ``skipped``: neither half is under any key, and no
+    re-run changes that, so a skip would send the operator to re-run forever (PR 2102 repair). A
+    second pass leaves it alone and counts it the same way.
     """
     root = tmp_path / "uploads"
     fid = await _seed(_keyed_store(root, None))
@@ -219,8 +221,9 @@ async def test_a_skipped_plaintext_body_leaves_its_sidecar_untouched_and_unliste
     sidecar = (root / f"{fid}.meta").read_bytes()
 
     keyed = _keyed_store(root, generate_key())
-    assert await keyed.reseal_to_active() == ResealResult(resealed=0, skipped=1)
-    assert (root / f"{fid}.meta").read_bytes() == sidecar
+    for _ in range(2):
+        assert await keyed.reseal_to_active() == ResealResult(unsealable=1)
+        assert (root / f"{fid}.meta").read_bytes() == sidecar
     assert await keyed.list_files() == []
 
 

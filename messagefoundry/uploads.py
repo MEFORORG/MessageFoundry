@@ -95,6 +95,12 @@ _ORPHAN_MIN_AGE_SECONDS = 3600.0
 # logged and left running (UploadStore._leave_running).
 _LEDGER_CANCEL_WAIT_SECONDS = 5.0
 
+# How much of a refused plaintext sidecar the quota reads to find the uploader it bills (BACKLOG
+# #2322). A sidecar the engine wrote is a few hundred bytes. Past this the owner counts as unknown.
+_UNSEALABLE_OWNER_READ_LIMIT = 64 * 1024
+# The chunk size for checking that a body decodes as text. It bounds memory, not the work.
+_BODY_CHECK_CHUNK = 1 << 20
+
 # Every filename a write in THIS process is currently holding: an atomic write's temp from the moment
 # it is created until its ``os.replace`` lands, and a save's blob from its own write until its sidecar
 # lands. The orphan sweep skips these outright, so it never has to reason about timing for a race it
@@ -199,7 +205,9 @@ class UploadQuotaError(UploadError):
       that raised after it may have committed, a release that fails, and a reserve or release Task
       that ``asyncio.run``'s shutdown cancels. A call still running at the bound is left to
       finish, and only leaks if it then lands in one of those cases. The module logs each at
-      WARNING except a shutdown cancel of a call it was still waiting for.
+      WARNING, with at least two exceptions, both a RELEASE the shutdown cancels: one a save still
+      waits for, and the late release that pays back a reserve left running. A cancelled reserve
+      is logged whether or not a save was still waiting for it.
       **IT DOES NOT SELF-HEAL UNCONDITIONALLY, and an earlier version of this line said it did.**
       The release statement sets ``since = <now>`` **unconditionally** (its own comment: "Never
       conditional: refusing a release would strand the reservation it is paying back"), so every
@@ -261,6 +269,48 @@ class UploadedFileMeta:
     sha256: str
     uploaded_at: float
     message_count: int
+
+
+@dataclass(frozen=True)
+class _UnsealableUpload:
+    """An upload ``rotate-key`` cannot seal, kept inside retention and the quota (BACKLOG #2322).
+
+    It is a plaintext sidecar that a keyed store refuses, over a body that is missing or is not
+    text. ``rotate-key`` leaves that sidecar unsealed, because sealing it would list an upload with
+    no usable body and would seal a planted lone sidecar too. So it is refused on every read, for
+    good, and nothing here ever serves or lists it.
+
+    Nothing in the plaintext is trusted where trusting it could do harm. ``file_id`` comes from the
+    PATH, so a planted sidecar cannot name another upload. ``modified`` is the sidecar's mtime, which
+    is the expiry clock. ``size`` is the body's size on disk, never the sidecar's claim, so it cannot
+    be negative. ``uploader_id`` is read from the plaintext and used ONLY to bill the quota. A plant
+    can bill another uploader that way, which errs toward refusing an upload until the plant expires.
+    """
+
+    file_id: str
+    uploader_id: str
+    size: int
+    modified: float
+
+    def expired(self, cutoff: float, now: float) -> bool:
+        # An mtime more than a day ahead is not a clock the engine set: a plant dated into the future
+        # would otherwise never age out, and keep billing an uploader forever.
+        return self.modified < cutoff or self.modified > now + _SECONDS_PER_DAY
+
+    def as_meta(self) -> UploadedFileMeta:
+        """The metadata an ``upload.prune`` or ``upload.delete`` audit row reports. The owner fields
+        are blank: a permanent audit record must not name an owner the engine cannot verify."""
+        return UploadedFileMeta(
+            file_id=self.file_id,
+            filename="",
+            uploader="",
+            uploader_id="",
+            content_type="",
+            size=self.size,
+            sha256="",
+            uploaded_at=self.modified,
+            message_count=0,
+        )
 
 
 def sanitize_filename(name: str | None) -> str:
@@ -405,9 +455,10 @@ class ResealResult:
     """What one :meth:`UploadStore.reseal_to_active` pass did.
 
     ``skipped`` is load-bearing, not decoration: an operator reads it to decide whether it is safe to
-    drop the retired key. A file this pass could not read is a file still sealed under the OLD key,
-    and dropping that key makes it permanently unreadable — so a non-zero ``skipped`` means "run it
-    again before you retire anything".
+    drop the retired key. A file this pass could not read MAY still be sealed under the OLD key, and
+    dropping that key would make it permanently unreadable, so a non-zero ``skipped`` means "fix the
+    cause and run it again before you retire anything". **A body that is missing or is not text under
+    a SEALED sidecar still counts here, and no re-run clears it,** although no key could read it.
 
     The counts use different units. ``resealed`` counts VALUES: each body or sidecar it rewrites
     adds one. ``skipped`` counts UPLOADS: a pair adds at most one, whichever half failed (BACKLOG
@@ -415,6 +466,11 @@ class ResealResult:
 
     resealed: int = 0
     skipped: int = 0
+    #: How many UPLOADS this pass cannot seal and left as they were: a PLAINTEXT sidecar over a body
+    #: that is missing or is not text (BACKLOG #2322). Not counted in ``skipped``: neither half is
+    #: under any key, so retiring one loses nothing, and no re-run changes them. They stay refused on
+    #: every read. The retention prune removes them once they expire (:class:`_UnsealableUpload`).
+    unsealable: int = 0
     #: How many UPLOADS had a plaintext half that this pass sealed (BACKLOG #1169). It counts files,
     #: not values, so it matches the count ``serve`` logs at startup (:meth:`UploadStore.warn_if_unsealed`).
     #: A keyed store refuses those uploads until this pass seals them, so this is how many it turned
@@ -506,6 +562,9 @@ class UploadStore:
         # Ledger calls a cancelled save stopped waiting for (BACKLOG #2263), held until they finish:
         # the loop holds a Task only weakly. See _leave_running.
         self._stragglers: set[asyncio.Future[Any]] = set()
+        # Body name -> ((mtime_ns, size), decodes as text). Checking a body means reading it whole,
+        # and every save's quota scan asks, so a body that has not changed is not read twice.
+        self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
 
     @property
     def max_bytes(self) -> int:
@@ -644,7 +703,8 @@ class UploadStore:
         coercion and fails every save. Trusting it to keep retention working would trade a bounded
         residual for all of that. The residual is named in ``docs/PHI.md`` §3: a refused upload is
         outside retention and the quota until ``rotate-key`` seals it, and ``serve`` logs the count
-        at startup so the operator knows to run it.
+        at startup so the operator knows to run it. The one upload ``rotate-key`` can never seal is
+        brought back by :meth:`_scan_unsealable_sync` instead, without trusting its sidecar.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch
@@ -668,6 +728,97 @@ class UploadStore:
                     "uploaded-file sidecar %s: malformed metadata (%s)", fid, type(exc).__name__
                 )
         return out
+
+    def _scan_unsealable_sync(self, *, readable: set[str]) -> list[_UnsealableUpload]:
+        """Every upload ``rotate-key`` cannot seal that the listing scan refuses (BACKLOG #2322).
+
+        :meth:`_scan_metas_sync` drops each refused sidecar. Most wait for ``rotate-key``, but this
+        kind never stops being refused, so without this pass it would sit outside retention and the
+        quota forever, with a body that may hold message content. Only the quota and the prune read
+        this list. Nothing that lists or serves an upload does, so the strict read is not loosened.
+
+        Empty unless the cipher refuses plaintext. Under ``[store].allow_unmarked_ciphertext`` the
+        listing scan reads these sidecars itself, and counting them here too would bill them twice.
+        ``readable`` is the ids that scan just decrypted. Their sidecars are skipped unopened, since a
+        sealed sidecar's id is bound to it. Sync: the caller runs it off the event loop."""
+        cipher = self._cipher
+        if not isinstance(cipher, AesGcmCipher) or cipher.allow_unmarked:
+            return []
+        out: list[_UnsealableUpload] = []
+        bodies: set[str] = set()
+        for fid, sidecar in self._iter_sidecars():
+            if fid in readable:
+                continue
+            bodies.add(f"{fid}{_BLOB_SUFFIX}")
+            held = self._unsealable_sync(fid, sidecar)
+            if held is not None:
+                out.append(held)
+        # Forget the checks of uploads that are gone, so the cache cannot outgrow the directory. A
+        # copy, because a scan on another worker thread may be writing to it.
+        for name in self._body_checks.copy().keys() - bodies:
+            self._body_checks.pop(name, None)
+        return out
+
+    def _unsealable_sync(self, fid: str, sidecar: Path) -> _UnsealableUpload | None:
+        """``fid`` as an upload ``rotate-key`` cannot seal, or ``None`` when it is not one.
+
+        It is one when its sidecar is plaintext and its body is missing or is not text. The body
+        test is :meth:`_lost_body_size`, which the reseal also calls. Any other failure returns
+        ``None``: a body unreadable for another cause, such as a permission, is one a re-run of
+        ``rotate-key`` can seal once the cause is fixed, so it waits like any refused upload."""
+        try:
+            with sidecar.open(encoding="utf-8") as handle:
+                head = handle.read(len(MARKER_PREFIX))
+                if not head or head == MARKER_PREFIX:
+                    return None  # blank, or sealed: not plaintext
+                text = head + handle.read(_UNSEALABLE_OWNER_READ_LIMIT)
+                whole = not handle.read(1)
+            modified = sidecar.stat().st_mtime
+        except (OSError, UnicodeDecodeError):
+            return None  # the listing scan names this one
+        size = self._lost_body_size(sidecar.with_name(f"{fid}{_BLOB_SUFFIX}"))
+        if size is None:
+            return None
+        owner = ""
+        if whole:
+            # Only a string is taken, so nothing here can fail to coerce or carry a negative size.
+            with contextlib.suppress(ValueError, RecursionError):
+                d = json.loads(text)
+                if isinstance(d, dict) and isinstance(d.get("uploader_id"), str):
+                    owner = d["uploader_id"]
+        return _UnsealableUpload(file_id=fid, uploader_id=owner, size=size, modified=modified)
+
+    def _lost_body_size(self, blob: Path) -> int | None:
+        """The bytes on disk of a body no key can read, or ``None`` when the body is readable text.
+
+        ``0`` when it is missing, and its size when it does not decode as UTF-8. ``None`` also when
+        it cannot be read for another cause. A decoded body is not checked again until its mtime or
+        size changes (``_body_checks``)."""
+        try:
+            stat = blob.stat()
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            return None
+        key = (stat.st_mtime_ns, stat.st_size)
+        cached = self._body_checks.get(blob.name)
+        if cached is not None and cached[0] == key:
+            decodes = cached[1]
+        else:
+            try:
+                with blob.open(encoding="utf-8") as handle:
+                    while handle.read(_BODY_CHECK_CHUNK):
+                        pass
+            except FileNotFoundError:
+                return 0
+            except UnicodeDecodeError:
+                decodes = False
+            except OSError:
+                return None
+            else:
+                decodes = True
+            self._body_checks[blob.name] = (key, decodes)
+        return None if decodes else stat.st_size
 
     # --- public API (all disk/crypto/split work off the event loop) --------------------------------
 
@@ -1044,9 +1195,15 @@ class UploadStore:
 
     def _observed_sync(self, uploader_id: str) -> tuple[int, int]:
         """(file count, total bytes) already ON DISK for ``uploader_id`` — the fleet-visible half of
-        the budget. Sync: the caller runs it off the event loop."""
-        mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
-        return len(mine), sum(m.size for m in mine)
+        the budget. Sync: the caller runs it off the event loop.
+
+        An upload ``rotate-key`` cannot seal counts too, at its body's size on disk (BACKLOG #2322).
+        Its owner is unverified, so this errs toward refusing; :class:`_UnsealableUpload` says why."""
+        metas = self._scan_metas_sync()
+        sizes = [m.size for m in metas if m.uploader_id == uploader_id]
+        held = self._scan_unsealable_sync(readable={m.file_id for m in metas})
+        sizes += [h.size for h in held if h.uploader_id == uploader_id]
+        return len(sizes), sum(sizes)
 
     async def list_files(self) -> list[UploadedFileMeta]:
         """List all uploaded files (newest first). Undecryptable/foreign sidecars are skipped with a
@@ -1096,7 +1253,12 @@ class UploadStore:
 
     async def delete(self, file_id: str) -> UploadedFileMeta:
         """Delete an uploaded file (both sidecars). Returns the deleted metadata for the audit row.
-        Path-traversal-guarded; raises :class:`UploadNotFoundError` if it does not exist."""
+        Path-traversal-guarded; raises :class:`UploadNotFoundError` if it does not exist.
+
+        An upload ``rotate-key`` cannot seal is deleted too, although its sidecar is refused
+        (BACKLOG #2322). The metadata returned then carries only its id, its body's size on disk and
+        its sidecar's mtime (:meth:`_UnsealableUpload.as_meta`). Any other refused upload still
+        raises :class:`UploadUnreadableError`, and nothing is removed."""
 
         def _delete() -> UploadedFileMeta:
             blob_path, meta_path = self._paths(file_id)
@@ -1105,7 +1267,10 @@ class UploadStore:
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
             except CipherError as exc:
-                raise UploadUnreadableError(str(exc)) from exc
+                held = self._unsealable_sync(file_id, meta_path)
+                if held is None:
+                    raise UploadUnreadableError(str(exc)) from exc
+                meta = held.as_meta()
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the
             # listing key, so once it is gone the file is invisible even if the blob lingers).
             blob_path.unlink(missing_ok=True)
@@ -1151,12 +1316,17 @@ class UploadStore:
         detected from its first bytes and never read whole.
 
         **This pass LAUNDERS an unmarked value, and that is the ruled trade, not an oversight.** It
-        seals every plaintext file it finds, legacy or planted, into a genuine AAD-bound ciphertext,
+        seals every plaintext file it can, legacy or planted, into a genuine AAD-bound ciphertext,
         after which nothing distinguishes it from a file the engine wrote itself. Unlike the store,
         this surface has no "already sealed" evidence to tell the two apart: new sealed uploads land
         beside legacy plaintext ones for as long as the operator has not run ``rotate-key``. So the
         control is the refusal BEFORE this pass, with its alert and the startup count, plus
         ``sealed_plaintext`` in the result, which the operator can check against that count.
+
+        **It does not seal a plaintext sidecar over a body it did not seal (BACKLOG #2322).** Sealing
+        it would list an upload with no usable body, and would seal a planted lone sidecar too. Where
+        the body is missing or is not text, no re-run can change that, so the upload is counted in
+        ``unsealable`` rather than ``skipped``, and the retention prune removes it at expiry.
 
         Runs entirely off the event loop."""
         return await asyncio.to_thread(self._reseal_to_active_sync)
@@ -1170,7 +1340,7 @@ class UploadStore:
         if not root.is_dir():
             return ResealResult()
         active = cipher.active_marker_prefix
-        resealed = skipped = sealed_plaintext = 0
+        resealed = skipped = sealed_plaintext = unsealable = 0
         for fid, _sidecar in self._iter_sidecars():
             try:
                 blob_path, meta_path = self._paths(fid)
@@ -1200,7 +1370,8 @@ class UploadStore:
                     stored = path.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError) as exc:
                     # A half-deleted pair or an unreadable file. Counted and named, never silent:
-                    # this file is still under the OLD key and the operator must not retire it yet.
+                    # this file may still be under the OLD key and the operator must not retire it
+                    # yet.
                     pair_skipped = True
                     _log.warning("uploaded file %s (%s): skipped, unreadable: %s", fid, kind, exc)
                     continue
@@ -1211,7 +1382,21 @@ class UploadStore:
                     # upload whose body is unusable, and would seal a planted lone sidecar too. A
                     # sidecar under a retired key is listed already, so it is still re-sealed: left
                     # behind, it would drop out of reach of prune_expired once that key goes.
-                    _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
+                    if self._lost_body_size(blob_path) is not None:
+                        # The body is missing or is not text: the one test the prune and the quota
+                        # use too. No key reads either half and no re-run changes that, so it is not
+                        # a skip. It stays refused, and the prune removes it at expiry.
+                        pair_skipped = False
+                        unsealable += 1
+                        _log.warning(
+                            "uploaded file %s (meta): left unsealed for good, its body is missing "
+                            "or is not text; retention removes it when it expires",
+                            fid,
+                        )
+                    else:
+                        _log.warning(
+                            "uploaded file %s (meta): left unsealed, its body was not", fid
+                        )
                     continue
                 had_plaintext |= plaintext
                 aad = cell_aad("uploaded_file", kind, fid)
@@ -1227,15 +1412,21 @@ class UploadStore:
             # sealed plaintext half did not turn it "from refused into readable".
             skipped += pair_skipped
             sealed_plaintext += had_plaintext and not pair_skipped
-        if resealed or skipped:
+        if resealed or skipped or unsealable:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
-                "upload(s) (%d upload(s) skipped)",
+                "upload(s) (%d upload(s) skipped, %d that cannot be sealed)",
                 resealed,
                 sealed_plaintext,
                 skipped,
+                unsealable,
             )
-        return ResealResult(resealed=resealed, skipped=skipped, sealed_plaintext=sealed_plaintext)
+        return ResealResult(
+            resealed=resealed,
+            skipped=skipped,
+            sealed_plaintext=sealed_plaintext,
+            unsealable=unsealable,
+        )
 
     async def warn_if_unsealed(self) -> int:
         """Log, once at ``serve`` startup, how many uploads a keyed store holds as plaintext.
@@ -1247,14 +1438,21 @@ class UploadStore:
         operator needs. Returns the count. Returns 0 without logging where the refusal does not apply
         (see :attr:`_passes_unmarked`).
 
-        The cost is one directory walk and a read of at most a marker's length from each file. The
-        hourly retention scan already decrypts every sidecar, so this adds nothing of a new order. Runs
-        off the event loop."""
+        **An upload ``rotate-key`` cannot seal is counted apart, on a line of its own (BACKLOG
+        #2322).** Telling the operator to run a command that can never seal it would be false, so
+        that line says what does remove it. It is not in the returned count, which is the number
+        ``rotate-key`` should report as sealed.
+
+        The cost is one directory walk and a read of at most a marker's length from each file, plus,
+        for each upload with a PLAINTEXT sidecar, a read of its whole body, to tell the two kinds
+        apart. That body read is new work at startup, bounded by the plaintext uploads still waiting
+        for ``rotate-key``, and the first quota scan or prune after it does not repeat it
+        (``_body_checks``). Runs off the event loop."""
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):  # the same test as _passes_unmarked
             return 0
         try:
-            count = await asyncio.to_thread(self._count_unsealed_sync)
+            count, unsealable = await asyncio.to_thread(self._count_unsealed_sync)
         except OSError as exc:
             # The directory itself could not be walked. A startup notice must never stop serve; the
             # listing scan will hit and name the same fault.
@@ -1273,14 +1471,22 @@ class UploadStore:
                 count,
                 what,
             )
+        if unsealable:
+            _log.warning(
+                "uploaded-logs: %d uploaded file(s) have a plaintext sidecar over a body that is "
+                "missing or is not text. rotate-key cannot seal them. The retention prune removes "
+                "them once they expire (BACKLOG #2322)",
+                unsealable,
+            )
         return count
 
-    def _count_unsealed_sync(self) -> int:
-        """How many uploads have a non-blank half with no ``mfenc:`` marker. Reads only the first
-        ``len(MARKER_PREFIX)`` characters of each file. A file that cannot be read is not counted here;
-        the listing scan names it on its own."""
-        count = 0
-        for fid, _sidecar in self._iter_sidecars():
+    def _count_unsealed_sync(self) -> tuple[int, int]:
+        """How many uploads have a non-blank half with no ``mfenc:`` marker, as two counts: those
+        ``rotate-key`` can seal, and those it cannot (:meth:`_unsealable_sync`). Reads the first
+        ``len(MARKER_PREFIX)`` characters of each file, and a plaintext sidecar's body whole. A file
+        that cannot be read is not counted here; the listing scan names it on its own."""
+        count = unsealable = 0
+        for fid, sidecar in self._iter_sidecars():
             try:
                 paths = self._paths(fid)
             except UploadPathError:
@@ -1292,9 +1498,12 @@ class UploadStore:
                 except (OSError, UnicodeDecodeError):
                     continue
                 if head and head != MARKER_PREFIX:
-                    count += 1
+                    if self._unsealable_sync(fid, sidecar) is None:
+                        count += 1
+                    else:
+                        unsealable += 1
                     break  # count the upload once, whichever half is plaintext
-        return count
+        return count, unsealable
 
     async def prune_expired(
         self,
@@ -1310,8 +1519,10 @@ class UploadStore:
 
         Idempotent: a re-run finds the already-deleted pairs gone and returns an empty pass.
         Undecryptable/foreign sidecars are skipped (never pruned — a rotated-away key must not silently
-        destroy data). Runs off the event loop; the periodic runner + the opportunistic save-time sweep
-        both drive it.
+        destroy data). The one exception is an upload ``rotate-key`` can never seal (BACKLOG #2322):
+        it is pruned once its sidecar's mtime passes the cutoff, and is reported with blank owner
+        fields (:class:`_UnsealableUpload`). Runs off the event loop; the periodic runner + the
+        opportunistic save-time sweep both drive it.
 
         A pair is reported only when this pass removed its body, the PHI the audit row is about. A
         refused body unlink leaves the whole pair for the next pass; a refused sidecar unlink leaves
@@ -1331,9 +1542,15 @@ class UploadStore:
             pruned: list[UploadedFileMeta] = []
             # Checked before the scan too: the scan decrypts every sidecar, which is wasted on a stop.
             metas = [] if stop.is_set() else self._scan_metas_sync()
-            for meta in metas:
-                if meta.uploaded_at >= cutoff:
-                    continue
+            due = [meta for meta in metas if meta.uploaded_at < cutoff]
+            # An upload rotate-key cannot seal ages by its sidecar's mtime (BACKLOG #2322).
+            if not stop.is_set():
+                due += [
+                    held.as_meta()
+                    for held in self._scan_unsealable_sync(readable={m.file_id for m in metas})
+                    if held.expired(cutoff, at)
+                ]
+            for meta in due:
                 if stop.is_set():
                     break
                 # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).

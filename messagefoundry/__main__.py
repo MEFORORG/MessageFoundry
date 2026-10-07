@@ -7642,6 +7642,16 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "key. If serve logged a count of plaintext uploads at startup, check this number against "
             "it; an extra one may be a file that did not come through the engine."
         )
+    if uploads.unsealable:
+        # BACKLOG #2322: these are left as they were on purpose, and no re-run changes them. They hold
+        # nothing under the prior key, so they do not block retiring it, and saying "skipped" here
+        # sent the operator to re-run a command that can never seal them.
+        print(
+            f"note: {uploads.unsealable} uploaded file(s) have a plaintext sidecar over a body that "
+            "is missing or is not text, and were left unsealed. rotate-key cannot seal them, and "
+            "they hold nothing under the prior key. The retention prune removes them once they "
+            "expire."
+        )
     if uploads.skipped:
         # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
         # key now destroys it. This is the one outcome where "OK" alone would mislead.
