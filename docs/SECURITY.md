@@ -4052,20 +4052,19 @@ uses the same host gate as `admin-unlock`.
    So the account never has no factor, and the swap is never live unrecorded. A wrong code, a lost
    console or a refused audit row writes nothing, and the old entry keeps working. So does a
    removal or a new enrolment that lands while you type: the write checks the enrolment it read.
-   When it writes nothing after showing the key, it tells you to delete the new entry.
+   Follow what its message says about the new entry when it writes nothing.
 4. It shows the new recovery codes on the console once. The old entry and the old codes stop
-   working. Delete the old entry, the one named after the bare username, from the app.
+   working. Delete the old entry, the one you signed in with until now, from the app.
 
 The audit row is `auth.admin_totp_reset`, naming the OS user. After it, the command sends the
 account an `mfa_enabled` notice where a relay is configured. It keeps passkeys and says so when the
 account has one; remove one from the web console if its device may be compromised too. It does not
-clear a lockout; run `admin-unlock` for that. When the store reports an error during or after the
-write, the command re-reads the account. Where it finds the new seed, it says the seed WAS replaced,
-shows the new codes and exits 3. Where it cannot re-read, it exits 3 and says the outcome is
-unknown: keep both entries and try the new one first. A refusal exits 1 and has written nothing.
-Another account's authenticator is reset from
-the web console (Reset MFA), because a host-run replacement would leave the new seed with whoever
-ran it.
+clear a lockout; run `admin-unlock` for that. An error from the write is read back before the
+command reports it, because on a server store the error can follow the commit. Exit 3 means the
+seed was replaced, or may have been, and the message says which. The exit codes and what each
+message tells you to do are in ADR 0171 Amendment B, under "An error does not say whether the
+commit landed". Another account's authenticator is reset from the web console (Reset MFA),
+because a host-run replacement would leave the new seed with whoever ran it.
 
 > **Binding conditionality — controls 2 and 3 are one switch, not two.**
 > `[auth].login_rate_limit_enabled = false` constructs **neither** limiter: `_login_limiter` and

@@ -176,8 +176,8 @@ order:
    uses one to separate the issuer. The operator adds the seed to the authenticator app and types
    a code. Five wrong codes, or no terminal, refuse with nothing written. The command names the OS
    user for the audit row before the key is shown, so a shell that cannot name one is refused
-   before the operator enrols anything. Every refusal after the key was shown tells the operator
-   to delete the new entry, whose seed was never stored.
+   before the operator enrols anything. Each refusal the command words itself after the key was
+   shown tells the operator to delete the new entry, whose seed was never stored.
 3. It reopens the store, asks the same refusals again, refuses a row whose id changed, and makes
    **one transaction**, `replace_totp_enrolment`. That writes the new seed, new recovery-code hashes
    and the proving code's step, ends every session of the account, and appends the audit row. Its
@@ -283,15 +283,24 @@ says anything.
 | the re-read finds | the command says | exit |
 |---|---|---|
 | the old seed, and the error was a store refusal | nothing was written; the old entry still works; delete the new one | 1 |
+| the old seed, and the error was anything else | nothing; the error is re-raised to the CLI's floor | the floor's |
 | the new seed | the seed WAS replaced, then something failed; the new codes are shown | 3 |
 | nothing, because it failed too | the outcome is UNKNOWN; keep both entries and try the new one; the codes are shown | 3 |
 
-A failure after a confirmed commit, the store's close or a Ctrl-C included, takes the second row.
-After the commit only the store's close, the codes on the console and the notice are left. The
-codes are shown first, then the notice runs, best effort. **Exit 3 is new to this command and
-deliberate:** 1 is a refusal that wrote nothing and 2 is "could not start", and a script reading
-only the code must not take a replaced seed for either. The `--json` body carries `"replaced":
-true` and the report fields beside the error.
+The read-back runs for a Ctrl-C during the swap as well. A failure after a confirmed commit, in the
+store's close for example, takes the third row. After the commit only the store's close, the codes
+on the console and the notice are left. The codes are shown first, then the notice runs, best
+effort; a failure in the notice, a Ctrl-C included, is reported as a notice not sent. **Exit 3 is
+new to this command and deliberate:** 1 is a refusal that wrote nothing and 2 is "could not start",
+and a script reading only the code must not take a replaced seed for either. The `--json` body
+carries `"replaced"` and `recovery_codes_shown` beside the error. These hold at least for the paths
+the tests drive; a Ctrl-C that lands while the codes are being written to the console is not
+covered.
+
+A store failure before the swap, once the key has been shown, exits 2 with a message that tells
+the operator to delete the new entry. The store had opened once already, so the message names the
+error's class rather than "cannot open the store". The class only, here and in every message after
+the key is shown: a driver's text can quote a stored value (ASVS 16.5.4).
 
 ### A named store method, on all three backends
 
@@ -313,8 +322,8 @@ passes through a state the property above forbids. The shared TOTP store contrac
   enrolment only. A role removal, a disable or a newly enabled peer Administrator that lands in the
   moment between the second refusal check and the UPDATE is not caught; with the engine stopped
   nothing can make one.
-- The sole-Administrator check is a fourth copy of the enabled-Administrator predicate, beside the
-  three in `AuthService`, and it reads the roles one user at a time, as `is_last_enabled_admin`
-  does. One shared query for the predicate is unbuilt.
+- The sole-Administrator check is one more open-coded copy of the enabled-Administrator predicate,
+  beside at least those in `AuthService` and the ones ADR 0167 counts, and it reads the roles one
+  user at a time, as `is_last_enabled_admin` does. One shared query for the predicate is unbuilt.
 - A store key that cannot be resolved exits 2 here, as it does for `provision-admin`.
   `admin-unlock` does not route that error yet.
