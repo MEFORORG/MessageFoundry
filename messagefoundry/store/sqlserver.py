@@ -49,7 +49,13 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    contextmanager,
+    nullcontext,
+)
 from functools import partial
 from time import perf_counter
 from types import MappingProxyType
@@ -151,6 +157,7 @@ from messagefoundry.store.store import (
     AlertSummary,
     AppendedAuditRow,
     AuditAppend,
+    AuditedWrite,
     AuditVerdict,
     CapturedResponse,
     ChannelScopeSource,
@@ -171,6 +178,7 @@ from messagefoundry.store.store import (
     MessageSearchResult,
     MessageStatus,
     MessageStore,
+    OperatorAudit,
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
@@ -207,6 +215,7 @@ from messagefoundry.store.store import (
     lockout_escalates,
     next_lockout_state,
     not_deployed_detail,
+    operator_audits,
     owned_lane_scope,
     password_claim_set,
     require_notify_email,
@@ -5295,6 +5304,7 @@ class SqlServerStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
+        audit: OperatorAudit[str] | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the ingress stage (status RECEIVED + one
         ``stage='ingress'`` queue row holding the raw) in ONE transaction — the staged pipeline's
@@ -5313,7 +5323,14 @@ class SqlServerStore:
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
         refs = list(dict.fromkeys(attachment_refs or ()))
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # BACKLOG #2624: an operator's inject passes an ``audit``; a live receipt passes none, so its
+        # gate is a no-op and it never queues behind this process's audit writes.
+        async with (
+            AuditedWrite(now) as written,
+            self._operator_audit_gate(audit),
+            self._acquire() as conn,
+            self._cursor(conn) as cur,
+        ):
             try:
                 await cur.execute(
                     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
@@ -5376,6 +5393,8 @@ class SqlServerStore:
                         "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
                         (mid, ref),
                     )
+                if audit is not None:
+                    await self._append_operator_audit(cur, written, audit, mid)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -9835,7 +9854,13 @@ class SqlServerStore:
         )
         return len(orphans)
 
-    async def replay(self, message_id: str, now: float | None = None) -> int:
+    async def replay(
+        self,
+        message_id: str,
+        now: float | None = None,
+        *,
+        audit: OperatorAudit[int] | None = None,
+    ) -> int:
         """Re-queue a message's stuck/dead deliveries — or, if none are stuck, re-send the delivered
         ones. Two-mode (M-2): if any row is dead/pending, replay ONLY those (never re-fire a DONE
         sibling); else replay the done rows. messages.status -> RECEIVED if a pending ingress row
@@ -9845,9 +9870,15 @@ class SqlServerStore:
         #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
         idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
-        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580)."""
+        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
+        ``audit``'s row commits with the replay (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with (
+            AuditedWrite(now) as written,
+            self._operator_audit_gate(audit),
+            self._acquire() as conn,
+            self._cursor(conn) as cur,
+        ):
             try:
                 await cur.execute(
                     "SELECT COUNT(*) FROM queue WHERE message_id=? AND status IN (?, ?)",
@@ -9899,6 +9930,7 @@ class SqlServerStore:
                     await self._event(
                         cur, message_id, "replayed", None, f"{count} destination(s)", now
                     )
+                await self._append_operator_audit(cur, written, audit, int(count))
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -9914,6 +9946,7 @@ class SqlServerStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[ResendOutcome] | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
         Mirrors :meth:`MessageStore.resend_to`. When ``body_override`` is set this is the edit-and-resend
@@ -9940,9 +9973,15 @@ class SqlServerStore:
 
         Idempotency: a per-key ``sp_getapplock`` serializes same-key inserts, then the ``resend_log``
         ``INSERT … WHERE NOT EXISTS`` + ``rowcount`` is the atomic gate; the outbound row is created only
-        when it made a row (ADR 0090 §4)."""
+        when it made a row (ADR 0090 §4). ``audit``'s row commits with the resend, a duplicate included
+        (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with (
+            AuditedWrite(now) as written,
+            self._operator_audit_gate(audit),
+            self._acquire() as conn,
+            self._cursor(conn) as cur,
+        ):
             try:
                 # Serialize concurrent same-key resends so the NOT-EXISTS gate is race-free (must-fix #5).
                 await self._applock(cur, f"mefor:resend:{idempotency_key}")
@@ -9969,14 +10008,16 @@ class SqlServerStore:
                             f" {pr[0]!r} to {pr[1]!r}; it cannot be reused for message {message_id!r}"
                             f" to {to!r}"
                         )
-                    await self._commit(conn)
-                    return ResendOutcome(
+                    outcome = ResendOutcome(
                         status="duplicate",
                         message_id=message_id,
                         to_destination=pr[1] if pr else to,
                         from_destination=pr[2] if pr else (from_ or ""),
                         outbox_id=pr[3] if pr else None,
                     )
+                    await self._append_operator_audit(cur, written, audit, outcome)
+                    await self._commit(conn)
+                    return outcome
                 if body_override is not None:
                     # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                     # operator's EDITED body to `to` as a NEW, correlated CHILD delivery; the ORIGIN row
@@ -10131,14 +10172,16 @@ class SqlServerStore:
                     "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
                     (outbox_id, idempotency_key),
                 )
-                await self._commit(conn)
-                return ResendOutcome(
+                outcome = ResendOutcome(
                     status="resent",
                     message_id=message_id,
                     to_destination=to,
                     from_destination=str(src_dest),
                     outbox_id=outbox_id,
                 )
+                await self._append_operator_audit(cur, written, audit, outcome)
+                await self._commit(conn)
+                return outcome
             except Exception:
                 await conn.rollback()
                 raise
@@ -10150,15 +10193,22 @@ class SqlServerStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
+        audit: OperatorAudit[ReingressOutcome] | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
         fresh, correlated ``RECEIVED`` child message at the origin channel's ingress stage; the origin
         row is READ (channel + correlation metadata), never written. Idempotency: a per-key
         ``sp_getapplock`` serializes same-key inserts, then the ``resend_log`` ``INSERT … WHERE NOT
         EXISTS`` + ``rowcount`` gate (keyed to ``(origin, "@reingress:<channel>")``) admits exactly one;
-        the deterministic content-addressed child id is the partial-rollback defense."""
+        the deterministic content-addressed child id is the partial-rollback defense. ``audit``'s row
+        commits with the resubmit, a duplicate included (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with (
+            AuditedWrite(now) as written,
+            self._operator_audit_gate(audit),
+            self._acquire() as conn,
+            self._cursor(conn) as cur,
+        ):
             try:
                 await cur.execute(
                     "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=?",
@@ -10192,13 +10242,15 @@ class SqlServerStore:
                             f" resubmit ({pr[0]!r} -> {pr[1]!r}); it cannot be reused for message"
                             f" {origin_message_id!r}"
                         )
-                    await self._commit(conn)
-                    return ReingressOutcome(
+                    outcome = ReingressOutcome(
                         status="duplicate",
                         message_id=origin_message_id,
                         new_message_id=(pr[2] if pr else "") or "",
                         channel_id=channel_id,
                     )
+                    await self._append_operator_audit(cur, written, audit, outcome)
+                    await self._commit(conn)
+                    return outcome
                 raw_meta = self._dec(
                     metadata_ciphertext, aad=cell_aad("messages", "metadata", origin_message_id)
                 )
@@ -10271,13 +10323,15 @@ class SqlServerStore:
                     "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
                     (new_mid, idempotency_key),
                 )
-                await self._commit(conn)
-                return ReingressOutcome(
+                outcome = ReingressOutcome(
                     status="resubmitted",
                     message_id=origin_message_id,
                     new_message_id=new_mid,
                     channel_id=channel_id,
                 )
+                await self._append_operator_audit(cur, written, audit, outcome)
+                await self._commit(conn)
+                return outcome
             except Exception:
                 await conn.rollback()
                 raise
@@ -10288,6 +10342,7 @@ class SqlServerStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Re-queue dead-lettered outbound deliveries (optionally scoped), reverting each affected
         message from ``error`` to ``routed``. Mirrors :meth:`MessageStore.replay_dead`.
@@ -10308,13 +10363,20 @@ class SqlServerStore:
             where.append("destination_name=?")
             params.append(destination_name)
         clause = " AND ".join(where)
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # BACKLOG #2624: ``audit``'s row commits with the replay, zero included.
+        async with (
+            AuditedWrite(now) as written,
+            self._operator_audit_gate(audit),
+            self._acquire() as conn,
+            self._cursor(conn) as cur,
+        ):
             try:
                 await cur.execute(
                     f"SELECT DISTINCT message_id FROM queue WHERE {clause}", tuple(params)
                 )
                 message_ids = [r[0] for r in await cur.fetchall()]
                 if not message_ids:
+                    await self._append_operator_audit(cur, written, audit, 0)
                     await self._commit(conn)
                     return 0
                 await cur.execute(
@@ -10329,6 +10391,7 @@ class SqlServerStore:
                         (MessageStatus.ROUTED.value, message_id, MessageStatus.ERROR.value),
                     )
                     await self._event(cur, message_id, "replayed", None, "dead-letter replay", now)
+                await self._append_operator_audit(cur, written, audit, int(count))
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -10342,6 +10405,7 @@ class SqlServerStore:
         *,
         top_only: bool = False,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]
@@ -10350,7 +10414,13 @@ class SqlServerStore:
             where.insert(1, "channel_id=?")
             params.insert(1, channel_id)
         top = "TOP (1) " if top_only else ""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
+        async with (
+            AuditedWrite(now) as written,
+            self._operator_audit_gate(audit),
+            self._acquire() as conn,
+            self._cursor(conn) as cur,
+        ):
             try:
                 # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
                 # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
@@ -10364,6 +10434,7 @@ class SqlServerStore:
                 )
                 rows = [(r[0], r[1]) for r in await cur.fetchall()]
                 if not rows:
+                    await self._append_operator_audit(cur, written, audit, 0)
                     await self._commit(conn)
                     return 0
                 ids = [r[0] for r in rows]
@@ -10380,6 +10451,7 @@ class SqlServerStore:
                 await self._lock_finalize_batch(cur, mids)
                 for message_id in sorted(mids):
                     await self._maybe_finalize(cur, message_id, now)
+                await self._append_operator_audit(cur, written, audit, len(ids))
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -11296,18 +11368,7 @@ class SqlServerStore:
                 try:
                     async with self._cursor(conn) as cur:
                         await cur.execute(sql, params)
-                        appended = [
-                            await self._append_audit_row(
-                                cur,
-                                a.action,
-                                actor=a.actor,
-                                channel_id=None,
-                                detail=a.detail,
-                                client=a.client,
-                                now=now,
-                            )
-                            for a in audits
-                        ]
+                        appended = await self._append_audits(cur, audits, now=now)
                         await self._commit(conn)
                 except Exception:
                     # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
@@ -11315,6 +11376,40 @@ class SqlServerStore:
                     await self._rollback_or_discard(conn)
                     raise
         tee_audits(audits, appended, ts=now)
+
+    async def _append_audits(
+        self, cur: Any, audits: Sequence[AuditAppend], *, now: float
+    ) -> list[AppendedAuditRow]:
+        """Append each of a write's ``audits``, in order, on ``cur`` inside its open transaction.
+        The caller holds ``_audit_lock``, as :meth:`_append_audit_row` requires."""
+        return [
+            await self._append_audit_row(
+                cur,
+                a.action,
+                actor=a.actor,
+                channel_id=a.channel_id,
+                detail=a.detail,
+                client=a.client,
+                now=now,
+            )
+            for a in audits
+        ]
+
+    def _operator_audit_gate(self, audit: object) -> AbstractAsyncContextManager[None]:
+        """The in-process audit gate an operator mutation holds when it may append (BACKLOG #2624).
+
+        Taken before the connection, the order :meth:`record_audit` uses. With no ``audit`` there is
+        nothing to append, so the mutation does not queue behind this process's audit writes."""
+        return self._audit_lock if audit is not None else nullcontext()
+
+    async def _append_operator_audit[R](
+        self, cur: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+    ) -> None:
+        """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
+        that fails rolls the mutation back. The caller holds :meth:`_operator_audit_gate`, and its
+        first statement opened the transaction the applock needs. ``written`` tees after commit."""
+        audits = operator_audits(audit, result)
+        written.add(audits, await self._append_audits(cur, audits, now=written.now))
 
     async def create_user(
         self,
