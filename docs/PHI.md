@@ -1412,13 +1412,26 @@ different control, such as an allowlist scrubbing every non-allowlisted query va
 one should correct this section rather than work around those tests. That is why the engine still
 classifies the general log as a PHI read surface (below).
 
-**Prod-`DEBUG` refusal.** `serve` **refuses to start at `DEBUG` on a production instance** — derived
-from `--env prod` or **`[security].production_instance = true`** (exit code 2). DEBUG can surface full
-bodies / raw fields and real PHI flows there. Two qualifications: this is a **startup** gate only, and
-`PATCH /logging/level` (permission `monitoring:diagnose`) can raise the **live** level to `DEBUG` on a
-production instance with no posture check. That change is audited (`logging_level_change`, old→new +
-actor) and is ephemeral — a restart re-asserts `[logging].level`, though a `/config/reload` does not
-reset it.
+**Prod-`DEBUG` refusal.** A production instance — derived from `--env prod` or
+**`[security].production_instance = true`** — refuses `DEBUG` at **start-up and at run time**, with one
+predicate (`logging_setup.level_refused_on_production`). DEBUG can surface full bodies / raw fields into
+the general log and any off-box forwarder, so on a first deployment it would put PHI there. `serve`
+refuses to start at `DEBUG` (exit code 2), and `PATCH /logging/level` refuses to switch to it (403 naming
+the posture, level unchanged, audited as `logging_level_change_denied` with the actor), and
+`GET /logging/level` leaves `DEBUG` out of the levels it offers there. A run-time change the posture
+allows is audited as `logging_level_change` (old and new level, actor). A `/config/reload` does not
+re-level the log or change the posture, so it cannot bring `DEBUG` back. `DEBUG` exists only on an
+instance that is non-production from start-up: reproduce a problem on a separate non-production
+instance fed synthetic or de-identified messages (the `messagefoundry/anon/` framework), never a copy
+of the production feed, and do not relabel a production instance to get verbose logs. Either shortcut
+would put PHI in a log by another door.
+
+*Corrected 2026-10-06 (vault BACKLOG #2777).* This paragraph used to call the start-up gate the only
+one and describe the run-time switch to `DEBUG` on a production instance as a "qualification". That
+text cited no owner ruling, and it arrived in an unrelated squash (PR 1878). Adversarial review
+under the owner's driver rule found it was a defect, a non-PHI permission bypassing a PHI control, and
+the run-time path now applies the start-up rule. An audited break-glass with an expiry would be a
+separate, recorded loosening, and none exists.
 
 **Gate #1 acceptance (v0.1)** — each criterion with its proving test:
 - the global `RedactionFilter` is installed by `configure_logging` (`tests/test_logging.py`);
@@ -1428,6 +1441,8 @@ reset it.
   hits a Handler exception **and** a delivery failure leaves **no record at WARNING+** carrying those
   values (`tests/test_wiring_engine.py`);
 - `serve` refuses `DEBUG` in a `prod` environment (`tests/test_logging.py`).
+- `PATCH /logging/level` refuses `DEBUG` on a production instance, audits the refusal, and a
+  `/config/reload` does not bring it back (`tests/test_logging_surfaces.py`).
 
 **Structured logging + off-box forwarding `[BUILT, sec-offbox-log]`.** The general log can emit
 **structured JSON** (one object per line, `[logging].format = "json"`; `text` is the stdout default) and
