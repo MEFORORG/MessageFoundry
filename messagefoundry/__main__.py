@@ -8211,6 +8211,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
     except (NotImplementedError, StoreNotFoundError) as exc:  # #1780: no store there
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except _key_unresolved() as exc:
+        # BACKLOG #2109: in vault_transit mode the Transit key-type check runs here, inside
+        # open_store, not at resolve_active_key above. It is raised before any row is touched.
+        print(f"error: cannot open the store for rotation: {exc}", file=sys.stderr)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
     done = (
