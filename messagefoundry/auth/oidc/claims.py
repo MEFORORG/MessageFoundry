@@ -370,6 +370,17 @@ def _require_number(claims: Mapping[str, object], field_name: str, _reason: str)
     return number
 
 
+def _accepted_claim_values(configured: Sequence[str]) -> frozenset[str]:
+    """The configured values the MFA gate may match: strings that are not blank (BACKLOG #2325).
+
+    Settings load already strips both lists and drops blanks, so this guards the other constructors
+    (the offline verifier, tests, a future caller). A "" in either list would otherwise accept a token
+    whose acr is "" or whose amr holds "" as MFA. A bare string is one value, never its characters,
+    and a non-string item matches nothing rather than raising outside the ClaimsError path."""
+    items: Sequence[object] = (configured,) if isinstance(configured, str) else configured
+    return frozenset(v for v in items if isinstance(v, str) and v.strip())
+
+
 def _check_mfa_gate(
     claims: Mapping[str, object], policy: OidcClaimPolicy
 ) -> tuple[tuple[str, ...], str | None]:
@@ -382,8 +393,10 @@ def _check_mfa_gate(
     if not policy.require_mfa_claim:
         return amr, acr_str
 
-    amr_ok = bool(set(policy.mfa_amr_values) & set(amr)) if policy.mfa_amr_values else False
-    acr_ok = acr_str in set(policy.required_acr_values) if policy.required_acr_values else False
+    accepted_amr = _accepted_claim_values(policy.mfa_amr_values)
+    accepted_acr = _accepted_claim_values(policy.required_acr_values)
+    amr_ok = bool(accepted_amr & set(amr))
+    acr_ok = acr_str is not None and acr_str in accepted_acr
     if not (amr_ok or acr_ok):
         raise ClaimsError(
             "mfa_claim_missing",

@@ -128,7 +128,8 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > `[auth].ad_tls_verify` are gated by their own serve-time refusals and are **not** reported here.
 > `[auth].enabled` is no longer a config key: `serve` always requires sign-in and refuses the key at
 > load (vault BACKLOG #2719). `[auth].oidc_require_mfa_claim` is not reported either, and it has
-> no serve-time refusal of its own. Turned off, it mints every OIDC session with no factor met. While
+> no serve-time refusal of its own. Load refuses it off only beside an `oidc_acr_values` request,
+> which nothing would then check (BACKLOG #2325). Turned off, it mints every OIDC session with no factor met. While
 > `[security].require_mfa` is on, that session then owes an engine factor at the access gate.
 > `require_mfa` itself is reported: see its entry below.
 > That gap is enumerated in the floor test's exemption set, so it is a written decision rather than an

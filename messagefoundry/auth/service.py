@@ -4317,8 +4317,10 @@ class AuthService:
         # any token lacking a configured amr/acr, so a principal reaching this line provably carried
         # one and the grant is engine-verified. When the operator opted out, the engine verified
         # nothing, the session mints unverified, and mfa_satisfied refuses it (see :mfa_satisfied).
-        # A load-time validator guarantees the gate can never be on-but-unmatchable, so the flag
-        # alone is a sound predicate.
+        # The flag alone is a sound predicate because a blank value cannot satisfy the gate (BACKLOG
+        # #2325): settings load strips both lists and drops blank entries, then refuses the gate with
+        # neither list left non-empty, and _check_mfa_gate ignores a blank value from any other
+        # constructor. So a principal reaching this line carried a non-blank configured amr or acr.
         mfa_verified = self._settings.oidc_require_mfa_claim
         return await self._complete_ad_login(
             principal,

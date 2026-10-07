@@ -199,6 +199,15 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
         {},
         "nothing checks the acr",
     ),
+    "acr_requested_gate_off": (
+        _auth(
+            oidc_acr_values="urn:mfa",
+            oidc_required_acr_values=["urn:mfa"],
+            oidc_require_mfa_claim=False,
+        ),
+        {},
+        "the claim gate reads no acr while it is off",
+    ),
     "redirect_path": (_auth(oidc_redirect_path="/elsewhere"), {}, "oidc_redirect_path is fixed"),
     "strip_domain_unchecked": (
         _auth(oidc_username_strip_domain=True, ad_domain=_DROP),

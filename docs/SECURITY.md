@@ -3994,17 +3994,21 @@ non-blank value (`AuthSettings._require_oidc_fields` in `config/settings.py`). T
 matching `amr` **or** a matching `acr` (`_check_mfa_gate` in `auth/oidc/claims.py`). So a token whose
 `amr` matches `oidc_mfa_amr_values` (default `["mfa"]`) signs in MFA-verified whatever its `acr`. A
 deploying site that relies on `acr` alone would set `oidc_required_acr_values`, keep
-`oidc_require_mfa_claim` on, and empty `oidc_mfa_amr_values`. At least these requests load and are
-still not checked:
+`oidc_require_mfa_claim` on, and empty `oidc_mfa_amr_values`.
+
+Load also refuses a request while `oidc_require_mfa_claim` is off (BACKLOG #2325). The gate then
+reads no `acr` at all, so nothing would check the answer. A whitespace-only `oidc_acr_values` loads
+as no request, and the authorization request carries no `acr_values`. Both list settings,
+`oidc_mfa_amr_values` and `oidc_required_acr_values`, are stripped at load and lose blank entries,
+in the TOML list form as in the env string form. A list of blanks is then empty, so a gate left with
+nothing to match is refused. `_check_mfa_gate` also ignores a blank configured value, so an `acr` or
+`amr` of `""` never counts as MFA. At least this request loads and is still not checked:
 
 - A requested class that `oidc_required_acr_values` does not list. `messagefoundry check` notes it
   (`_check_oidc_auth_params` in `checks.py`).
-- Any request while `oidc_require_mfa_claim` is off. The `acr` that comes back is only recorded in the
-  sign-in's success audit row (`AuthService._authenticate_oidc`), and `check` does not flag this case.
-- A whitespace-only `oidc_acr_values`. Load counts it as blank, and the authorization request still
-  carries it.
 
-This paragraph was read against engine commit `df77028b45`. The key's row is in the `[auth]` table of
+This paragraph was read against engine commit `b2d2b908f0` with the BACKLOG #2325 change applied.
+The key's row is in the `[auth]` table of
 [CONFIGURATION.md](CONFIGURATION.md#auth--authentication--rbac).
 
 **What this fallback does not cover.** An `amr` or `acr` value that does arrive is the identity

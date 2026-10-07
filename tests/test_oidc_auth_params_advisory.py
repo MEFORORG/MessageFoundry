@@ -123,7 +123,8 @@ def test_a_missing_openid_scope_fires(tmp_path: Path) -> None:
 
 
 def test_requiring_an_acr_the_request_never_asks_for_fires(tmp_path: Path) -> None:
-    """The engine would refuse a login for an assurance level it never asked the provider to apply."""
+    """The engine names an assurance level it never asked the provider to apply. With the default
+    ``oidc_mfa_amr_values`` a token with no acr still signs in on its amr (BACKLOG #2325)."""
     detail = _detail(tmp_path, oidc_required_acr_values='["phr"]')
     assert "never asked for the assurance" in detail
 

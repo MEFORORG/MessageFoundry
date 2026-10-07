@@ -310,8 +310,11 @@ def build_authorization_url(
         "code_challenge_method": "S256",
         "max_age": "0" if step_up else str(max_age),
     }
-    if acr_values:
-        params["acr_values"] = acr_values
+    # BACKLOG #2325: a whitespace-only request names no class, so it is not sent. Settings load
+    # already turns one into None; this covers any other caller.
+    requested_acr = " ".join((acr_values or "").split())
+    if requested_acr:
+        params["acr_values"] = requested_acr
     if step_up:
         params["prompt"] = "login"
     elif prompt:
