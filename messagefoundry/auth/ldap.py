@@ -461,35 +461,54 @@ _DN_ATTR_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9-]*|[0-9]+(?:\.[0-9]+)*")
 _HEX = frozenset("0123456789abcdefABCDEF")
 #: Characters a canonical value escapes with a backslash wherever they appear (RFC 4514 section 2.4).
 _DN_ESCAPED = frozenset('\\"+,;<>')
-#: Unescaped white space at either end of a value: padding, not part of it.
-_DN_PADDING = frozenset({b" ", b"\t", b"\r", b"\n"})
+#: The one padding token: an unescaped space at either end of a value (RFC 4514 section 3). Only a
+#: space. A tab or line break is part of the value, so ``CN=Admins<TAB>`` names a different group.
+_DN_PAD = (b" ", False)
+
+
+def _hex_escaped(ch: str) -> str:
+    """``ch`` as ``\\xx`` escapes of its UTF-8 bytes, lower-case hex so ``str.lower()`` keeps it."""
+    return "".join(f"\\{b:02x}" for b in ch.encode("utf-8"))
 
 
 def _canonical_value(tokens: list[tuple[bytes, bool]]) -> str | None:
     """One attribute value, lower-cased and re-escaped, or ``None``.
 
-    ``tokens`` holds each character or hex pair as ``(bytes, escaped)``. Unescaped white space at
-    either end is padding, not value, so it is dropped (RFC 4514 section 3 for a space). An
-    unescaped ``#`` at the start would make the value a BER hex string, which no group map needs,
-    so it is refused."""
-    while tokens and not tokens[0][1] and tokens[0][0] in _DN_PADDING:
-        tokens = tokens[1:]
-    while tokens and not tokens[-1][1] and tokens[-1][0] in _DN_PADDING:
-        tokens = tokens[:-1]
+    ``tokens`` holds each character or hex pair as ``(bytes, escaped)``. An unescaped space at
+    either end is padding, so it is dropped. An unescaped ``#`` at the start would make the value a
+    BER hex string, which no group map needs, so it is refused.
+
+    **Lower-casing must merge only a letter with its own other case.** ``str.lower()`` also folds
+    some characters onto a different letter: the Kelvin sign onto ``k``, the ohm sign onto omega. A
+    directory may hold ``CN=Kiosk`` and ``CN=<KELVIN SIGN>iosk`` as two groups, so a value holding
+    such a character is refused. The test is that upper-casing the lower-cased character gives it
+    back. A refused member group can be named by no key, so it grants nothing.
+
+    The output hex-escapes every space-like or control character it keeps except an inner plain
+    space, and a space at either end. So it never starts or ends with white space, and the store's
+    own ``strip()`` cannot shorten it."""
+    first, last = 0, len(tokens)
+    while first < last and tokens[first] == _DN_PAD:
+        first += 1
+    while last > first and tokens[last - 1] == _DN_PAD:
+        last -= 1
+    tokens = tokens[first:last]
     if not tokens or tokens[0] == (b"#", False):
         return None
     try:
-        value = b"".join(raw for raw, _escaped in tokens).decode("utf-8").lower()
+        raw = b"".join(part for part, _escaped in tokens).decode("utf-8")
     except UnicodeDecodeError:
         return None
+    if any(ch.lower() != ch and ch.lower().upper() != ch for ch in raw):
+        return None
+    value = raw.lower()
     out = []
     for i, ch in enumerate(value):
-        if ch == "\x00":
-            out.append("\\00")
-        elif (
-            ch in _DN_ESCAPED or (ch == " " and i in (0, len(value) - 1)) or (ch == "#" and i == 0)
-        ):
+        edge = i in (0, len(value) - 1)
+        if ch in _DN_ESCAPED or (ch == "#" and i == 0):
             out.append("\\" + ch)
+        elif (ch == " " and edge) or (ch != " " and (ch.isspace() or not ch.isprintable())):
+            out.append(_hex_escaped(ch))
         else:
             out.append(ch)
     return "".join(out)
@@ -499,20 +518,28 @@ def canonical_group_dn(text: str) -> str | None:
     """The one form a group DN is compared in (BACKLOG #2610), or ``None`` if ``text`` is no DN.
 
     Each attribute becomes ``type=value``, both lower-cased, with the value unescaped and then
-    escaped again the RFC 4514 minimal way. The parts of a multi-valued RDN (``+``) are sorted, and
-    RDNs are joined with ``,``. So every spelling of one DN gives one string:
-    ``CN=C# Developers``, ``cn=C\\# developers`` and ``CN=C\\23 Developers`` all become
-    ``cn=c# developers``, and ``\\2C`` and ``\\,`` agree.
+    escaped again one way (:func:`_canonical_value`). The parts of a multi-valued RDN (``+``) are
+    sorted, and RDNs are joined with ``,``. So however a value is escaped, one DN gives one
+    string: ``CN=C# Developers``, ``cn=C\\# developers`` and ``CN=C\\23 Developers`` all become
+    ``cn=c# developers``, and ``\\2C`` and ``\\,`` agree. It does not map an attribute's OID onto
+    its name, or one Unicode normal form onto another; those spellings stay apart and match
+    nothing, which fails closed.
 
     The parser is tolerant where Active Directory is. A ``#`` after a value's first character is
     literal, which RFC 4514 allows and ldap3's ``parse_dn`` refuses, and AD writes it unescaped in
     ``memberOf``. Spaces around a separator are padding. It refuses an unescaped ``"`` or ``;``,
     an unescaped ``#`` that starts a value, an empty value, a value that is not UTF-8 once
-    unescaped, and anything with fewer than :data:`_GROUP_DN_MIN_RDNS` RDNs.
+    unescaped, a value whose case cannot be folded safely, text that cannot be encoded as UTF-8,
+    and anything with fewer than :data:`_GROUP_DN_MIN_RDNS` RDNs.
 
-    The output never changes under ``str.lower()``, so the store's own ``strip().lower()`` is a
-    no-op on it. One linear pass, so operator text cannot make it backtrack.
+    The output never changes under ``str.lower()`` or ``str.strip()``, so the store's own
+    ``strip().lower()`` is a no-op on it. Linear apart from sorting a multi-valued RDN's parts, so
+    operator text cannot make it backtrack.
     """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None  # a lone surrogate: no directory DN holds one
     rdns: list[list[str]] = []
     avas: list[str] = []
     attr: str | None = None  # None while reading a type, the type once its "=" is read
@@ -577,9 +604,9 @@ def is_group_dn(value: str) -> bool:
 
     Both group maps match a principal's ``groups``, which hold canonical DNs only
     (:func:`canonical_group_dn`). A key in any other form would match nothing, or, as a short name
-    did before this item, match a same-named group in any unit. So a map write refuses it, and
-    stores the canonical form of every key it takes. A key spelled differently from the directory,
-    such as ``\\2C`` where AD writes ``\\,`` or ``\\#`` where AD writes ``#``, still matches.
+    did before this item, match a same-named group in any unit. The map routes call
+    :func:`canonical_group_dn` themselves, because they store its result; this predicate is the
+    same test for a caller that only needs the yes or no.
     """
     return canonical_group_dn(value) is not None
 
@@ -1066,8 +1093,9 @@ class LdapAuthenticator:
 
         Canonical rather than merely lower-cased, so a key matches however either side escapes a
         value: AD writes ``CN=C# Developers`` in ``memberOf``, and an operator may write ``C\\#``. A
-        DN that has no canonical form is dropped. No map key can name it, since every key is stored
-        canonical, so dropping it takes nothing a member could have been granted.
+        DN that has no canonical form is dropped, and the drop is counted in the log. No map key can
+        name it, since every key is stored canonical, so dropping it takes nothing a member could
+        have been granted.
         """
         import ldap3
 
@@ -1083,7 +1111,16 @@ class LdapAuthenticator:
                 attributes=["distinguishedName"],
             )
             found.extend(str(e.entry_dn) for e in conn.entries)
-        return frozenset(c for c in map(canonical_group_dn, found) if c is not None)
+        canonical = [canonical_group_dn(dn) for dn in found]
+        dropped = canonical.count(None)
+        if dropped:
+            # A count only: a group DN is directory text, and the log is not the place for it.
+            logger.info(
+                "AD group resolution dropped %d group DN(s) with no canonical form; no group map "
+                "key can name such a group, so it grants nothing (BACKLOG #2610)",
+                dropped,
+            )
+        return frozenset(c for c in canonical if c is not None)
 
     def authenticate(
         self, username: str, password: str, *, object_id: str | None = None
@@ -1313,14 +1350,15 @@ def _kerberos_context_complete(server: Any) -> bool:
     """Whether one acceptor step finished the Kerberos context that checked the client's ticket.
 
     ``server.complete`` answers this for the native SSPI acceptor, which is what Windows uses. On
-    Linux every sign-in goes through pyspnego's own Negotiate wrapper instead: pyspnego 0.12's
-    GSSAPI proxy offers ``kerberos`` only, never ``negotiate``, so the default ``negotiate``
-    acceptor :func:`_kerberos_acceptor` asks for is always the wrapper there. The wrapper can stay
-    incomplete after a step whose inner Kerberos context did finish. It waits for a
-    ``mechListMIC`` (RFC 4178 section 4.2.2) when the client's first mechanism differs from its
-    own, as a Windows client's does, and this single-leg acceptor never takes a second leg. So for that wrapper the inner context is read, and
-    only a finished KERBEROS context counts. It is a private attribute: if pyspnego moves it, this
-    returns ``False`` and the sign-in is refused.
+    any host without SSPI, Linux and macOS included, every sign-in goes through pyspnego's own
+    Negotiate wrapper instead: pyspnego 0.12's GSSAPI proxy offers ``kerberos`` only, never
+    ``negotiate``, so the default ``negotiate`` acceptor :func:`_kerberos_acceptor` asks for is
+    always the wrapper there. The wrapper can stay incomplete after a step whose inner Kerberos
+    context did finish. It waits for a ``mechListMIC`` (RFC 4178 section 4.2.2) when the client's
+    first mechanism differs from its own, as a Windows client's does, and this single-leg acceptor
+    never takes a second leg. So for that wrapper the inner context is read, and only a finished
+    KERBEROS context counts. It is a private attribute: if pyspnego moves it, this returns
+    ``False`` and the sign-in is refused.
     """
     if server.complete:
         return True

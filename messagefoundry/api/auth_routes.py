@@ -371,9 +371,11 @@ def _canonical_group_dns(groups: list[str]) -> list[str]:
     what it returns, in the same order. A short name used to match a same-named group in any unit,
     so it is refused rather than stored. The canonical form is the one ``_resolve_groups`` gives a
     member's groups, so a key matches however it escapes a value (:func:`canonical_group_dn`). The
-    store still folds case and strips, which is a no-op on it. A blank key stays blank, and the
-    store drops it as it always has."""
-    canonical = [canonical_group_dn(g) if g.strip() else "" for g in groups]
+    store still strips and folds case, which changes nothing in that form. A blank key stays blank,
+    and the store drops it as it always has."""
+    # Outer white space is trimmed first: a pasted key often carries a line break, and the last
+    # RDN of a group DN is a domain component, which holds none.
+    canonical = [canonical_group_dn(g.strip()) if g.strip() else "" for g in groups]
     bad = sorted({g.strip() for g, c in zip(groups, canonical, strict=True) if c is None})
     if bad:
         named = ", ".join(bad[:_GROUPS_NAMED])

@@ -11,14 +11,16 @@
   `BACKLOG #2610`)
 - **Group map keys and a user's groups are compared in one canonical DN form.** Each side is
   parsed, lower-cased, unescaped and escaped again one way, with the parts of a multi-valued RDN
-  sorted. So `CN=C# Developers,...`, which Active Directory writes with the `#` unescaped,
-  `CN=C\# Developers,...` and `CN=C\23 Developers,...` all name the same group, and a space after a
-  comma is ignored. The maps store the canonical form, which is what `GET` now returns. (vault
-  `BACKLOG #2610`)
+  sorted. So however a value is escaped, one DN gives one key: `CN=C# Developers,...`, which
+  Active Directory writes with the `#` unescaped, `CN=C\# Developers,...` and
+  `CN=C\23 Developers,...` all name the same group, and a space after a comma is ignored. Groups
+  that differ stay apart: a tab or line break in a value is part of it, and a value whose case
+  cannot be folded without merging two letters, such as one holding the Kelvin sign, is refused.
+  The maps store the canonical form, which is what `GET` now returns. (vault `BACKLOG #2610`)
 - **A Windows SSO step names a client only when the Kerberos context that checked the ticket
-  finished.** On Windows that is the SSPI context's own `complete` flag. On Linux every sign-in
-  goes through pyspnego's own Negotiate wrapper, because pyspnego 0.12's GSSAPI proxy offers
-  Kerberos only and never Negotiate. That wrapper can stay incomplete after one step while the
+  finished.** On Windows that is the SSPI context's own `complete` flag. On any host without SSPI,
+  Linux and macOS included, every sign-in goes through pyspnego's own Negotiate wrapper, because
+  pyspnego 0.12's GSSAPI proxy offers Kerberos only and never Negotiate. That wrapper can stay incomplete after one step while the
   Kerberos context inside it finished, so there the inner context is read, and only a Kerberos one
   counts. This is defence in depth; no provider is known to name a client on an unfinished context.
   Kerberos realm handling is unchanged. (vault `BACKLOG #2610`)

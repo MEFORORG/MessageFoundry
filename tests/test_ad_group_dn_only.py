@@ -170,6 +170,9 @@ def test_a_full_dn_is_a_group_dn(value: str) -> None:
         "CN=MF-Admins,DC=example\\",  # a trailing lone backslash
         "CN=\\ff,DC=example",  # not UTF-8 once unescaped
         "C N=MF-Admins,DC=example",  # not an attribute type
+        "CN=\u212aiosk,DC=example",  # the Kelvin sign lower-cases onto a different letter
+        "CN=\\E2\\84\\AAiosk,DC=example",  # the same, hex-escaped
+        "CN=\ud800,DC=example",  # a lone surrogate cannot be encoded
         "example\\MF-Admins",
         "",
     ],
@@ -196,9 +199,14 @@ def test_anything_else_is_not_a_group_dn(value: str) -> None:
         ("CN=Ops+OU=Lab,DC=example", "cn=ops+ou=lab,dc=example"),
         ("ou=Lab+cn=Ops,DC=example", "cn=ops+ou=lab,dc=example"),
         # Escapes a canonical value must keep, and a multi-byte UTF-8 hex escape.
-        ("CN=\\#lead\\ ,DC=example", "cn=\\#lead\\ ,dc=example"),
+        # An escaped space at either end is hex-escaped, so the store's strip() cannot eat it.
+        ("CN=\\#lead\\ ,DC=example", "cn=\\#lead\\20,dc=example"),
+        ("CN=\\ lead,DC=example", "cn=\\20lead,dc=example"),
+        # A tab, a line break and a no-break space are part of the value, hex-escaped.
+        ("CN=a\tb\\0A,DC=example", "cn=a\\09b\\0a,dc=example"),
+        ("CN=a\u00a0,DC=example", "cn=a\\c2\\a0,dc=example"),
         ("CN=a\\+b\\<c\\>,DC=example", "cn=a\\+b\\<c\\>,dc=example"),
-        ("CN=Caf\\C3\\A9,DC=example", "cn=café,dc=example"),
+        ("CN=Caf\\C3\\A9,DC=example", "cn=caf\u00e9,dc=example"),
         ("CN=a\\00b,DC=example", "cn=a\\00b,dc=example"),
         # A dotted-OID attribute type. Three arcs, so it is not mistaken for an IP address.
         ("2.5.77=Ops,DC=example", "2.5.77=ops,dc=example"),
@@ -209,6 +217,47 @@ def test_each_spelling_has_one_canonical_form(spelling: str, canonical: str) -> 
     # Stable: canonicalising again changes nothing, and neither does the store's own fold.
     assert canonical_group_dn(canonical) == canonical
     assert canonical.strip().lower() == canonical
+
+
+@pytest.mark.parametrize(
+    ("one", "other"),
+    [
+        # An escaped "+" is part of a value; an unescaped one starts a second attribute.
+        ("CN=a\\+OU=b,DC=example", "CN=a+OU=b,DC=example"),
+        # An escaped space at either end is part of the value; an unescaped one is padding.
+        ("CN=\\ a,DC=example", "CN=a,DC=example"),
+        ("CN=a\\ ,DC=example", "CN=a,DC=example"),
+        # A tab, a line break or a no-break space at either end is never padding.
+        ("CN=MF-Admins\t,OU=Groups,DC=example", "CN=MF-Admins,OU=Groups,DC=example"),
+        ("CN=MF-Admins\\0A,OU=Groups,DC=example", "CN=MF-Admins,OU=Groups,DC=example"),
+        ("CN=MF-Admins,OU=Groups,DC=example\\c2\\a0", "CN=MF-Admins,OU=Groups,DC=example"),
+        # An escaped backslash followed by "00" is not a NUL.
+        ("CN=a\\5c00,DC=example", "CN=a\\00,DC=example"),
+        # A different unit is a different group, which is the point of #2610.
+        (LEGIT, ROGUE),
+    ],
+)
+def test_distinct_groups_keep_distinct_canonical_forms(one: str, other: str) -> None:
+    """Review of the canonical form: a merge of two spellings is only safe while two different
+    groups never merge. Each pair here names two groups, and each must canonicalise apart."""
+    a, b = canonical_group_dn(one), canonical_group_dn(other)
+    assert a is not None and b is not None
+    assert a != b
+    # The store strips and folds case on both sides; that must not merge them either.
+    assert a.strip().lower() != b.strip().lower()
+
+
+async def test_a_pasted_key_with_a_line_break_still_maps(engine: Engine) -> None:
+    """A route trims the key's outer white space before canonicalising it, so a key pasted with
+    a trailing line break stores the same key as the bare one."""
+    transport = await _admin_transport(engine)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        login = {"username": "boss", "password": PW, "provider": "local"}
+        h = {"Authorization": f"Bearer {(await c.post('/auth/login', json=login)).json()['token']}"}
+        body = {"entries": [{"ad_group": f"{LEGIT}\r\n", "role": Role.OPERATOR.value}]}
+        assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200
+        got = (await c.get("/ad-group-map", headers=h)).json()["entries"]
+        assert got == [{"ad_group": LEGIT.lower(), "role": Role.OPERATOR.value}]
 
 
 def test_resolve_groups_canonicalises_direct_and_nested_dns() -> None:

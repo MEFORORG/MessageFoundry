@@ -3022,9 +3022,13 @@ only. A user in multiple mapped groups gets the union of those roles.
 
 **Keys and a user's groups are compared in one canonical form.** The engine parses each DN, then
 lower-cases it, unescapes each value and escapes it again one way, and sorts the parts of a
-multi-valued RDN. The maps store that form. So a key matches however either side spells the DN:
+multi-valued RDN. The maps store that form. So a key matches however either side escapes a value:
 Active Directory writes `CN=C# Developers,OU=Groups,...` with the `#` unescaped, and
-`CN=C\# Developers` and `CN=C\23 Developers` name the same group.
+`CN=C\# Developers` and `CN=C\23 Developers` name the same group. Distinct groups stay apart. A
+tab or line break in a value is part of it, and a value whose case cannot be folded without
+merging two letters, such as one holding the Kelvin sign, is refused. An attribute written as a
+dotted OID instead of its name, such as `CN`, is not mapped onto that name, so such a key matches
+nothing.
 
 **A short name is refused because the engine cannot tell two same-named groups apart** (BACKLOG
 #2610). This section used to say a key could be the group's `sAMAccountName`, which is unique in a
