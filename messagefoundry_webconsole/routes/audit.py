@@ -45,10 +45,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(Permission.AUDIT_READ)),
         limit: int = Query(_AUDIT_PAGE, ge=1, le=1000),
         offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
-        before_id: int | None = Query(None, ge=1, le=PAGE_BIND_MAX),
+        as_of: EpochSeconds | None = Query(None),
     ) -> HTMLResponse:
         data = await admin.list_audit(
-            service=service, _=identity, limit=limit, offset=offset, before_id=before_id
+            service=service, _=identity, limit=limit, offset=offset, as_of=as_of
         )
         return HTMLResponse(
             pages.audit_log(
@@ -96,9 +96,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui()),
         limit: int = Query(_SECURITY_EVENTS_PAGE, ge=1, le=1000),
         offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
-        before_id: int | None = Query(None, ge=1, le=PAGE_BIND_MAX),
+        as_of: EpochSeconds | None = Query(None),
     ) -> HTMLResponse:
         data = await admin.my_security_events(
-            service=service, identity=identity, limit=limit, offset=offset, before_id=before_id
+            service=service, identity=identity, limit=limit, offset=offset, as_of=as_of
         )
         return HTMLResponse(pages.security_events(data))

@@ -1825,14 +1825,10 @@ class EngineClient:
     def delete_user(self, user_id: str) -> None:
         self._request("DELETE", f"/users/{_seg(user_id)}")
 
-    def audit(
-        self, *, limit: int = 100, offset: int = 0, before_id: int | None = None
-    ) -> AuditList:
-        """One page of the audit trail; ``total`` on the result places it, and its ``before_id``
+    def audit(self, *, limit: int = 100, offset: int = 0, as_of: float | None = None) -> AuditList:
+        """One page of the audit trail; ``total`` on the result places it, and its ``as_of``
         passed back with the next offset keeps the pages on one snapshot (BACKLOG #2438)."""
-        return _decode(
-            self._get("/audit", limit=limit, offset=offset, before_id=before_id), AuditList
-        )
+        return _decode(self._get("/audit", limit=limit, offset=offset, as_of=as_of), AuditList)
 
     def ad_group_map(self) -> AdGroupMap:
         return _decode(self._get("/ad-group-map"), AdGroupMap)

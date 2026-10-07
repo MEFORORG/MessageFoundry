@@ -117,44 +117,55 @@ async def test_get_audit_pages_do_not_repeat_the_grant_row_each_read_writes(
     engine: Engine,
 ) -> None:
     """Every ``GET /audit`` writes its own ``auth.permission_granted`` row before it reads, so an
-    unpinned offset walk repeats one row per page. Passing back ``before_id`` walks one snapshot:
-    the pages join to the first page's listing with nothing repeated, and the total holds still."""
+    unpinned offset walk repeats one row per page. Passing back ``as_of`` walks one snapshot:
+    the pages join to the first page's listing with nothing repeated, and the total holds still.
+    The pin is a timestamp: no audit row id reaches the caller, since the gap between two ids
+    would count the lock rows a reader without users:manage may not see (BACKLOG #1131)."""
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)
     await _seed_trail(engine)
     async with _client(engine, service) as c:
         root = _auth((await _login(c, "root")).json()["token"])
         first = (await c.get("/audit", params={"limit": 3}, headers=root)).json()
-        pin, total = first["before_id"], first["total"]
-        assert isinstance(pin, int) and total > 6
+        pin, total = first["as_of"], first["total"]
+        assert isinstance(pin, float) and total > 6
+        assert pin == max(e["ts"] for e in first["entries"])
+        assert "before_id" not in first and all("id" not in e for e in first["entries"])
         seen = [(e["ts"], e["action"], e["detail"]) for e in first["entries"]]
         offset = 3
         while offset < total:
             page = (
                 await c.get(
                     "/audit",
-                    params={"limit": 3, "offset": offset, "before_id": pin},
+                    params={"limit": 3, "offset": offset, "as_of": pin},
                     headers=root,
                 )
             ).json()
-            assert page["total"] == total and page["before_id"] == pin
+            assert page["total"] == total and page["as_of"] == pin
             seen += [(e["ts"], e["action"], e["detail"]) for e in page["entries"]]
             offset += 3
         assert len(seen) == total
         # The whole snapshot read at once is the same sequence the pages joined into.
-        once = (
-            await c.get("/audit", params={"limit": 1000, "before_id": pin}, headers=root)
-        ).json()
+        once = (await c.get("/audit", params={"limit": 1000, "as_of": pin}, headers=root)).json()
         assert seen == [(e["ts"], e["action"], e["detail"]) for e in once["entries"]]
 
 
-@pytest.mark.parametrize("path", ["/audit", "/me/security-events", "/events"])
-async def test_an_offset_past_a_64_bit_bind_is_refused_not_a_500(engine: Engine, path: str) -> None:
+@pytest.mark.parametrize(
+    ("path", "pins"),
+    [
+        ("/audit", ("offset",)),
+        ("/me/security-events", ("offset",)),
+        ("/events", ("offset", "before_id")),
+    ],
+)
+async def test_an_offset_past_the_bind_bound_is_refused_not_a_500(
+    engine: Engine, path: str, pins: tuple[str, ...]
+) -> None:
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "root")).json()["token"])
-        for name in ("offset", "before_id"):
+        for name in pins:
             too_big = await c.get(path, params={name: PAGE_BIND_MAX + 1}, headers=h)
             assert too_big.status_code == 422, (name, too_big.text)
         assert (await c.get(path, params={"offset": PAGE_BIND_MAX}, headers=h)).status_code == 200
@@ -168,19 +179,21 @@ async def test_get_me_security_events_pages_with_a_total(engine: Engine) -> None
         for i in range(3):
             await engine.store.record_audit("auth.test_seed", actor="alice", detail=f'{{"n":{i}}}')
         whole = (await c.get("/me/security-events", headers=h)).json()
-        total, pin = whole["total"], whole["before_id"]
-        assert total == len(whole["events"]) >= 3 and isinstance(pin, int)
+        total, pin = whole["total"], whole["as_of"]
+        assert total == len(whole["events"]) >= 3 and isinstance(pin, float)
         # A row the caller writes after the first page stays out of the pinned pages.
-        await engine.store.record_audit("auth.test_seed", actor="alice", detail='{"n":"late"}')
+        await engine.store.record_audit(
+            "auth.test_seed", actor="alice", detail='{"n":"late"}', now=pin + 1.0
+        )
         second = (
             await c.get(
                 "/me/security-events",
-                params={"limit": 1, "offset": 1, "before_id": pin},
+                params={"limit": 1, "offset": 1, "as_of": pin},
                 headers=h,
             )
         ).json()
         assert second["total"] == total and second["offset"] == 1 and second["limit"] == 1
-        assert second["before_id"] == pin
+        assert second["as_of"] == pin
         assert second["events"] == whole["events"][1:2]
 
 

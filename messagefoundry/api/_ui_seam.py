@@ -312,10 +312,12 @@ from typing import Any
 #: ``AdminHandlers`` gained the required ``export_audit``, which the new ``/ui/audit/export``
 #: streams from the console session. The digest moved because both grew.
 #:
-#: BACKLOG #2438, the review's repair: the three list models gained the required ``before_id``,
-#: the snapshot a page was read under, and ``list_audit``, ``my_security_events`` and
-#: ``connection_event_page`` take it as a keyword. Without it, the grant row each audit read
-#: writes made every page repeat a row. The digest moved because the DTO surface grew.
+#: BACKLOG #2438, the review's repair: each list model gained the snapshot a page was read under.
+#: ``AuditList`` and ``SecurityEventsList`` carry ``as_of``, a timestamp, which ``list_audit`` and
+#: ``my_security_events`` take as a keyword. ``ConnectionEventList`` carries ``before_id``, which
+#: ``connection_event_page`` takes. Without a pin, the grant row each audit read writes made every
+#: page repeat a row. The audit pins are timestamps because an audit row id would count the lock
+#: rows a reader may not see. The digest moved because the DTO surface grew.
 #:
 #: Vault BACKLOG #2460 / #2458: ``CoreHandlers`` gains a required ``resolve_action`` for the
 #: console's resolve of an interrupted release, with ``ApprovalResolveRequest`` and its ``outcome``
@@ -331,7 +333,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "f52c268c93850fb8"
+ENGINE_UI_SEAM: str = "1c42b766969ab80a"
 
 
 @dataclass(frozen=True, slots=True)

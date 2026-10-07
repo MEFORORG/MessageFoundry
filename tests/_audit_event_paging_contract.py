@@ -106,12 +106,16 @@ async def check_security_events_paging(store: Any, tag: str) -> None:
 
     # The snapshot pin: rows written after the first page stay out of the later pages and the
     # total, so a walk that started before them neither repeats a row nor moves its count.
-    pin = int(whole[0]["id"]) + 1
-    await store.record_audit("auth.login_success", actor=who, detail='{"n": "late"}')
-    assert await store.count_security_events_for_user(who, before_id=pin) == 5
+    # The pin is a ts and not an id (an audit id would count other accounts' rows), and the
+    # late row is written one second later so the clock's resolution cannot tie it to the pin.
+    pin = max(float(r["ts"]) for r in whole)
+    await store.record_audit("auth.login_success", actor=who, detail='{"n": "late"}', now=pin + 1.0)
+    assert await store.count_security_events_for_user(who, until=pin) == 5
     assert await store.count_security_events_for_user(who) == 6
-    pinned = await store.security_events_for_user(who, limit=2, offset=2, before_id=pin)
+    pinned = await store.security_events_for_user(who, limit=2, offset=2, until=pin)
     assert [r["detail"] for r in pinned] == [r["detail"] for r in whole[2:4]]
+    # The feed hands out no row id to pin on.
+    assert "id" not in dict(whole[0])
 
 
 def _event(connection: str, direction: str, kind: str, now: float) -> dict[str, Any]:

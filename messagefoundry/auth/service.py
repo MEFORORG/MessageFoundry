@@ -10443,31 +10443,23 @@ class AuthService:
         return self._store
 
     async def security_events_for(
-        self, username: str, *, limit: int = 100, offset: int = 0, before_id: int | None = None
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
     ) -> list[dict[str, Any]]:
         """The caller's own security-event history (audited ``auth.*`` actions, most-recent-first) for
         ``GET /me/security-events`` — normalized to plain dicts so the API doesn't see backend Row
         types. PHI-free (the audit ``detail`` carries metadata only). ``offset`` pages it,
-        ``before_id`` pins the pages to one snapshot, and :meth:`count_security_events_for` is its
-        total (BACKLOG #2438). Each dict carries the row ``id`` the pager pins on."""
+        ``until`` keeps rows at or before that ``ts`` so a pager reads one snapshot, and
+        :meth:`count_security_events_for` is its total (BACKLOG #2438)."""
         rows = await self._store.security_events_for_user(
-            username, limit=limit, offset=offset, before_id=before_id
+            username, limit=limit, offset=offset, until=until
         )
         return [
-            {
-                "id": int(r["id"]),
-                "ts": float(r["ts"]),
-                "action": str(r["action"]),
-                "detail": r["detail"],
-            }
-            for r in rows
+            {"ts": float(r["ts"]), "action": str(r["action"]), "detail": r["detail"]} for r in rows
         ]
 
-    async def count_security_events_for(
-        self, username: str, *, before_id: int | None = None
-    ) -> int:
+    async def count_security_events_for(self, username: str, *, until: float | None = None) -> int:
         """How many rows :meth:`security_events_for` pages through (BACKLOG #2438)."""
-        return await self._store.count_security_events_for_user(username, before_id=before_id)
+        return await self._store.count_security_events_for_user(username, until=until)
 
     async def _generate_issued_credential(
         self,

@@ -4258,7 +4258,9 @@ def create_app(
         Every page is pinned below ``before_id``. A caller that names none gets the newest event's
         ``id`` plus one, read in the same query as the total, and passes it back with the next
         offset. Without the pin, events arriving between clicks would shift every row down, and a
-        reveal would re-read a window its event had already left.
+        reveal would re-read a window its event had already left. The pin is an id because each
+        event row already carries its id; ``list_connection_events`` in ``store/base.py`` states
+        where, with more than one writer, it is close rather than exact.
 
         Called in-process by the console, so every argument is a plain value. ``reveal`` and the
         redaction of ``reason`` behave as :func:`list_connection_events` states."""

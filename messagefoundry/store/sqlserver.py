@@ -6527,9 +6527,9 @@ class SqlServerStore:
             connection, kinds, since, before_id, allowed_channels
         )
         row = await self._fetchone(
-            f"SELECT COUNT(*) AS n, MAX(id) AS top FROM connection_event{clause}", tuple(params)
+            f"SELECT COUNT(*) AS n, MAX(id) AS newest FROM connection_event{clause}", tuple(params)
         )
-        return (int(row["n"]), int(row["top"] or 0)) if row is not None else (0, 0)
+        return (int(row["n"]), int(row["newest"] or 0)) if row is not None else (0, 0)
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
     # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
@@ -11290,28 +11290,28 @@ class SqlServerStore:
         )
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100, offset: int = 0, before_id: int | None = None
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
     ) -> list[dict[str, Any]]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
         /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
         user only by email, when one can be sent. ``auth/notifications.py`` states the rule.
-        ``offset`` pages it, and ``before_id`` pins the pages to one snapshot (BACKLOG #2438).
+        ``offset`` pages it, and ``until`` pins the pages to one snapshot (BACKLOG #2438).
         FETCH refuses a zero row count, so a zero limit returns nothing here, as the ``TOP (0)`` it
         replaced did."""
         if limit < 1:
             return []
-        where, params = _security_events_where(username, before_id)
+        where, params = _security_events_where(username, until)
         return await self._fetchall(
-            f"SELECT id, ts, action, detail FROM audit_log{where} ORDER BY id DESC"
+            f"SELECT ts, action, detail FROM audit_log{where} ORDER BY id DESC"
             " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             (*params, max(offset, 0), limit),
         )
 
     async def count_security_events_for_user(
-        self, username: str, *, before_id: int | None = None
+        self, username: str, *, until: float | None = None
     ) -> int:
         """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
-        where, params = _security_events_where(username, before_id)
+        where, params = _security_events_where(username, until)
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM audit_log{where}", tuple(params))
         return int(row["n"]) if row is not None else 0
 

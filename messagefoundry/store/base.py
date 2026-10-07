@@ -1265,7 +1265,10 @@ class QueueStore(StoreLifecycle, Protocol):
         same filtered, scoped, ordered set (BACKLOG #2438); :meth:`connection_event_extent` is its
         total. ``before_id`` keeps only rows whose ``id`` is below it. The order is by ``ts``, but an
         ``id`` is assigned on insert, so pinning ``before_id`` holds a pager to one snapshot even
-        when a burst flush inserts an older ``ts`` among the rows already paged.
+        when a burst flush inserts an older ``ts`` among the rows already paged. On Postgres and SQL
+        Server with more than one writer the pin is close and not exact: an id is assigned at
+        insert but seen at commit, so a slower transaction can commit an id below the pin after
+        the first page counted.
 
         ``allowed_channels`` applies the same per-channel RBAC scope as :meth:`list_dead` /
         :meth:`list_messages`: ``None`` = all channels (no restriction); a set restricts the read to
@@ -1768,19 +1771,20 @@ class AuditStore(Protocol):
         ...
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100, offset: int = 0, before_id: int | None = None
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
     ) -> Sequence[Row]:
-        """``username``'s own ``auth.*`` rows (``id``, ``ts``, ``action``, ``detail``), newest first.
-        ``offset`` pages them, and ``before_id`` keeps only rows whose ``id`` is below it, so a pager
-        that passes its first page's newest ``id`` plus one reads one snapshot while new rows
-        arrive (BACKLOG #2438)."""
+        """``username``'s own ``auth.*`` rows (``ts``, ``action``, ``detail``), newest first.
+        ``offset`` pages them, and ``until`` keeps only rows whose ``ts`` is at most it, so a pager
+        that passes its first page's newest ``ts`` reads one snapshot while new rows arrive
+        (BACKLOG #2438). The pin is a ``ts`` and not an ``id`` because an ``audit_log`` id is
+        global: the gap between two of a user's ids would count every other account's rows."""
         ...
 
     async def count_security_events_for_user(
-        self, username: str, *, before_id: int | None = None
+        self, username: str, *, until: float | None = None
     ) -> int:
         """How many rows :meth:`security_events_for_user` pages through for ``username`` and the
-        same ``before_id``, with no ``limit`` or ``offset`` (BACKLOG #2438)."""
+        same ``until``, with no ``limit`` or ``offset`` (BACKLOG #2438)."""
         ...
 
     async def create_pending_approval(

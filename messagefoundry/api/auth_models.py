@@ -484,16 +484,17 @@ class AuditList(BaseModel):
     #2446). It is a fact about the CALLER, not about this page. It is True whether or not any such
     row falls in the filtered range, so it cannot tell a reader whether a lock happened.
 
-    ``before_id`` is the snapshot the page was read under: only rows whose ``id`` is below it. A
-    reader passes it back with the next ``offset``, so rows written after the first page, such as
-    the grant row ``GET /audit`` itself writes, neither repeat a row across pages nor move the
-    total. It is None only when the listing was empty and there was nothing to pin."""
+    ``as_of`` is the snapshot the page was read under: only rows whose ``ts`` is at or before it.
+    A reader passes it back with the next ``offset``, so rows written after the first page, such
+    as the grant row ``GET /audit`` itself writes, neither repeat a row across pages nor move the
+    total. It is a timestamp and never a row id, because an id would count the rows the caller may
+    not see (:mod:`messagefoundry.api.paging`). It is None only when the listing was empty."""
 
     entries: list[AuditEntry]
     total: int
     limit: int
     offset: int
-    before_id: int | None
+    as_of: float | None
     withheld: bool
 
 
@@ -528,10 +529,10 @@ class SecurityEventInfo(BaseModel):
 
 class SecurityEventsList(BaseModel):
     """One page of the caller's own security events (BACKLOG #2438), placed within ``total`` as
-    :class:`AuditList` places its page, and pinned to ``before_id`` as that page is."""
+    :class:`AuditList` places its page, and pinned to ``as_of`` as that page is."""
 
     events: list[SecurityEventInfo]
     total: int
     limit: int
     offset: int
-    before_id: int | None
+    as_of: float | None

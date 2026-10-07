@@ -424,9 +424,11 @@ class ConnectionEventList(BaseModel):
     event under the same filters and channel scope, so ``offset`` and ``limit`` place this page.
     ``GET /events`` returns it, and the console's ``/ui/events`` page reads it.
 
-    ``before_id`` is the snapshot the page was read under, as ``AuditList.before_id`` states: only
-    events whose ``id`` is below it. The log is ordered by ``ts``, but ``id`` grows on insert, so
-    the pin also holds when a burst flush lands an older ``ts`` among rows already paged."""
+    ``before_id`` is the snapshot the page was read under: only events whose ``id`` is below it.
+    A reader passes it back with the next ``offset``. The log is ordered by ``ts``, but ``id`` grows
+    on insert, so the pin also holds when a burst flush lands an older ``ts`` among rows already
+    paged. An id is safe to hand out here, unlike on the audit trail: every event row already
+    carries its own."""
 
     total: int
     limit: int

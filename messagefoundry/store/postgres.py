@@ -5193,9 +5193,9 @@ class PostgresStore:
             connection, kinds, since, before_id, allowed_channels
         )
         row = await self._fetchone(
-            f"SELECT COUNT(*) AS n, MAX(id) AS top FROM connection_event{clause}", *params
+            f"SELECT COUNT(*) AS n, MAX(id) AS newest FROM connection_event{clause}", *params
         )
-        return (int(row["n"]), int(row["top"] or 0)) if row is not None else (0, 0)
+        return (int(row["n"]), int(row["newest"] or 0)) if row is not None else (0, 0)
 
     @staticmethod
     def _connection_event_where(
@@ -7395,16 +7395,16 @@ class PostgresStore:
         return [dict(r) for r in rows]
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100, offset: int = 0, before_id: int | None = None
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
     ) -> Sequence[Row]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
         /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
         user only by email, when one can be sent. ``auth/notifications.py`` states the rule.
-        ``offset`` pages it, and ``before_id`` pins the pages to one snapshot (BACKLOG #2438)."""
-        where, params = _security_events_where_pg(username, before_id)
+        ``offset`` pages it, and ``until`` pins the pages to one snapshot (BACKLOG #2438)."""
+        where, params = _security_events_where_pg(username, until)
         n = len(params)
         return await self._fetchall(
-            f"SELECT id, ts, action, detail FROM audit_log{where} ORDER BY id DESC"
+            f"SELECT ts, action, detail FROM audit_log{where} ORDER BY id DESC"
             f" LIMIT ${n + 1} OFFSET ${n + 2}",
             *params,
             limit,
@@ -7412,10 +7412,10 @@ class PostgresStore:
         )
 
     async def count_security_events_for_user(
-        self, username: str, *, before_id: int | None = None
+        self, username: str, *, until: float | None = None
     ) -> int:
         """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
-        where, params = _security_events_where_pg(username, before_id)
+        where, params = _security_events_where_pg(username, until)
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM audit_log{where}", *params)
         return int(row["n"]) if row is not None else 0
 
@@ -9423,14 +9423,14 @@ def _pg_cutoff_case(
     return sql, params, idx + 1
 
 
-def _security_events_where_pg(username: str, before_id: int | None) -> tuple[str, list[Any]]:
+def _security_events_where_pg(username: str, until: float | None) -> tuple[str, list[Any]]:
     """The ``$N`` ``WHERE`` text and values for one user's security-event page and its total
     (BACKLOG #2438), shared so the two count one set. The SQLite builder states the rule."""
     params: list[Any] = [username]
     clause = " WHERE actor = $1 AND action LIKE 'auth.%'"
-    if before_id is not None:
-        params.append(before_id)
-        clause += " AND id < $2"
+    if until is not None:
+        params.append(until)
+        clause += " AND ts <= $2"
     return clause, params
 
 

@@ -4559,15 +4559,15 @@ def _connection_event_where(
     return (" WHERE " + " AND ".join(where)) if where else "", params
 
 
-def _security_events_where(username: str, before_id: int | None) -> tuple[str, list[Any]]:
+def _security_events_where(username: str, until: float | None) -> tuple[str, list[Any]]:
     """The ``?`` ``WHERE`` text and values for one user's security-event page and its total (BACKLOG
-    #2438): the ``auth.*`` actions recorded under their own name, below ``before_id`` when a pager
-    pins one. SQLite and SQL Server share it, so the page and its total count one set."""
+    #2438): the ``auth.*`` actions recorded under their own name, at or before ``until`` when a
+    pager pins one. SQLite and SQL Server share it, so the page and its total count one set."""
     params: list[Any] = [username]
     clause = " WHERE actor = ? AND action LIKE 'auth.%'"
-    if before_id is not None:
-        clause += " AND id < ?"
-        params.append(before_id)
+    if until is not None:
+        clause += " AND ts <= ?"
+        params.append(until)
     return clause, params
 
 
@@ -11455,26 +11455,26 @@ class MessageStore:
         return [dict(r) for r in rows]
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100, offset: int = 0, before_id: int | None = None
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
     ) -> list[aiosqlite.Row]:
         """A user's own security events (the audited ``auth.*`` actions), most-recent-first — the
         source for ``GET /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes (whose audit
         ``actor`` is the admin) are delivered out-of-band by email, not shown in this self view.
-        ``offset`` pages it, and ``before_id`` pins the pages to one snapshot (BACKLOG #2438)."""
-        where, params = _security_events_where(username, before_id)
+        ``offset`` pages it, and ``until`` pins the pages to one snapshot (BACKLOG #2438)."""
+        where, params = _security_events_where(username, until)
         async with self._read() as db:
             cur = await db.execute(
-                f"SELECT id, ts, action, detail FROM audit_log{where} ORDER BY id DESC"
+                f"SELECT ts, action, detail FROM audit_log{where} ORDER BY id DESC"
                 " LIMIT ? OFFSET ?",
                 (*params, limit, max(offset, 0)),
             )
             return list(await cur.fetchall())
 
     async def count_security_events_for_user(
-        self, username: str, *, before_id: int | None = None
+        self, username: str, *, until: float | None = None
     ) -> int:
         """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
-        where, params = _security_events_where(username, before_id)
+        where, params = _security_events_where(username, until)
         async with self._read() as db:
             cur = await db.execute(f"SELECT COUNT(*) FROM audit_log{where}", params)
             row = await cur.fetchone()

@@ -29,8 +29,9 @@ this line.**
   snapshot the first page was read under, so rows written between clicks do not shift the pages.
   The event log's pager and its reason reveals carry the page's filters, position and snapshot, so
   a reveal reads the window it was clicked on. Seam change: `AuditList`, `SecurityEventsList` and
-  the new `ConnectionEventList` carry `total`, `limit`, `offset` and `before_id`, and
-  `CoreHandlers` gains `connection_event_page`. (BACKLOG #2438)
+  the new `ConnectionEventList` carry `total`, `limit` and `offset`, plus their snapshot (`as_of`
+  on the first two, `before_id` on the third), and `CoreHandlers` gains `connection_event_page`.
+  (BACKLOG #2438)
 - **The audit page exports, and says when rows are withheld.** `/ui/audit` links to the new
   `/ui/audit/export` for a holder of `audit:export`. That route streams the engine's audit CSV from
   the console session, so an auditor who signs in only through OIDC, and so holds no bearer token,
