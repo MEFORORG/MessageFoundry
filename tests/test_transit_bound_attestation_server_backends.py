@@ -16,7 +16,6 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.store.store import AuditAppend
 from messagefoundry.store.transit_attestation import (
     TRANSIT_BOUND_ATTESTED_ACTION,
     TRANSIT_BOUND_WITHDRAWN_ACTION,
@@ -48,13 +47,9 @@ def test_the_table_is_in_the_schema_batch(module: str) -> None:
 
 async def attestation_roundtrip(store: Any) -> None:
     """Shared by the live SQL Server and Postgres suites, which own the clean-slate fixture."""
-
-    def withdrawn_row(_w: object) -> AuditAppend:
-        return AuditAppend(TRANSIT_BOUND_WITHDRAWN_ACTION, actor="cli:ci")
-
-    await store.withdraw_transit_bound_attestation(audit=withdrawn_row)  # a clean slate
+    await store.withdraw_transit_bound_attestation(actor="cli:ci")  # a clean slate
     assert await store.get_transit_bound_attestation() is None
-    assert await store.withdraw_transit_bound_attestation(audit=withdrawn_row) is None
+    assert await store.withdraw_transit_bound_attestation(actor="cli:ci") is None
 
     await store.record_transit_bound_attestation(key_name="first", reason="r1", actor="cli:ci")
     recorded = await store.record_transit_bound_attestation(
@@ -71,8 +66,10 @@ async def attestation_roundtrip(store: Any) -> None:
     }
     assert float(newest["ts"]) == recorded.attested_at
 
-    withdrawn = await store.withdraw_transit_bound_attestation(audit=withdrawn_row)
+    withdrawn = await store.withdraw_transit_bound_attestation(actor="cli:ci", reason="moved off")
     assert withdrawn is not None and withdrawn.key_name == "mefor-store"
     assert await store.get_transit_bound_attestation() is None
     [row] = await store.recent_audit_of([TRANSIT_BOUND_WITHDRAWN_ACTION], limit=1)
     assert row["actor"] == "cli:ci"
+    detail = json.loads(row["detail"])
+    assert detail["key_name"] == "mefor-store" and detail["reason"] == "moved off"

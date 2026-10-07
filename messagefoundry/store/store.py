@@ -38,8 +38,10 @@ import asyncio
 import functools
 import hashlib
 import hmac
+import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -2434,7 +2436,12 @@ def _audit_row_mac(
     row: Mapping[str, Any], prev: Any, key: bytes | None, mac: AuditMacFn | None
 ) -> str | None:
     """The hash ``row`` should carry, chained from ``prev``, or ``None`` when a chained column holds a
-    value of a type no engine build writes -- which the walk reports as a break rather than raising."""
+    value of a type no engine build writes -- which the walk reports as a break rather than raising.
+
+    A MAC provider is pinned to the Transit key version ``row``'s stored hash names
+    (:func:`_version_pinned_mac`), so a row sealed before a key rotation still verifies after it."""
+    if mac is not None:
+        mac = _version_pinned_mac(mac, row["row_hash"])
     try:
         return audit_row_hash(
             prev,
@@ -4129,15 +4136,24 @@ TRANSIT_ATTESTATION_COLUMNS: Final = "key_name, reason, actor, attested_at, audi
 
 def _transit_attestation_row(row: Any) -> TransitBoundAttestation:
     """A ``transit_bound_attestation`` row as the dataclass, on any backend's row mapping. The
-    audit columns are attacker-writable, so they are typed here rather than trusted."""
+    audit columns are attacker-writable, so they are typed here rather than trusted.
+
+    An ``attested_at`` that is not a finite number reads as ``nan`` with ``audit_gap`` set, never as
+    an exception: SQLite's REAL affinity stores text, and a raise here would stop a ``warn`` start,
+    fail the posture and block the withdraw that removes the row."""
     audit_hash = row["audit_hash"]
+    raw_at = row["attested_at"]
+    finite = (
+        isinstance(raw_at, (int, float)) and not isinstance(raw_at, bool) and math.isfinite(raw_at)
+    )
     return TransitBoundAttestation(
         key_name=str(row["key_name"]),
         reason=str(row["reason"]),
         actor=str(row["actor"]),
-        attested_at=float(row["attested_at"]),
+        attested_at=float(raw_at) if finite else float("nan"),
         audit_seq=_strict_int(row["audit_seq"]),
         audit_hash=audit_hash if isinstance(audit_hash, str) else None,
+        audit_gap=None if finite else "its attested_at is not a finite number",
     )
 
 
@@ -4151,6 +4167,57 @@ def transit_attested_audit(*, key_name: str, reason: str, actor: str) -> AuditAp
     )
 
 
+def transit_withdrawn_audit(
+    withdrawn: TransitBoundAttestation, *, actor: str, reason: str | None
+) -> AuditAppend:
+    """The audit row ``withdraw_transit_bound_attestation`` appends, on every backend (BACKLOG
+    #2337). The store builds it, as it does the attest row, so no caller can delete the attestation
+    with no ``store.transit_bound_withdrawn`` row, which is what makes a later DML replay of the old
+    row read as superseded."""
+    detail: dict[str, object] = {
+        "key_name": withdrawn.key_name,
+        "attested_by": withdrawn.actor,
+        # A non-finite time (a corrupt row) is recorded as null: json.dumps would write NaN, which is
+        # not JSON.
+        "attested_at": withdrawn.attested_at if math.isfinite(withdrawn.attested_at) else None,
+    }
+    if reason:
+        detail["reason"] = reason
+    return AuditAppend(TRANSIT_BOUND_WITHDRAWN_ACTION, actor=actor, detail=json.dumps(detail))
+
+
+#: Transit's HMAC string names the key version that made it: ``vault:v<N>:<base64>``.
+_TRANSIT_MAC_VERSION: Final = re.compile(r"vault:v([1-9][0-9]{0,9}):")
+
+
+def _version_pinned_mac(mac: AuditMacFn, stored: object) -> AuditMacFn:
+    """``mac`` pinned to the Transit key version ``stored`` was made under, or ``mac`` unchanged
+    when ``stored`` names no version.
+
+    Transit's ``generate_hmac`` uses the key's LATEST version unless told otherwise. So after the
+    operator rotates the key, as the attestation says they will, an unpinned recompute yields
+    ``vault:v2:...`` against a stored ``vault:v1:...`` and the attestation reads as forged. Pinning
+    keeps the check exact: the recompute still runs inside Transit under the stored version's key,
+    so a writer without Transit access still cannot forge a match. A provider whose signature takes
+    no ``key_version`` (a plain ``Callable[[bytes], str]``) is returned unpinned, as before."""
+    match = _TRANSIT_MAC_VERSION.match(stored) if isinstance(stored, str) else None
+    if match is None:
+        return mac
+    try:
+        pinnable = "key_version" in inspect.signature(mac).parameters
+    except (TypeError, ValueError):  # a builtin or C callable with no introspectable signature
+        pinnable = False
+    if not pinnable:
+        return mac
+    version = int(match.group(1))
+    versioned = cast("Callable[..., str]", mac)
+
+    def pinned(data: bytes) -> str:
+        return versioned(data, key_version=version)
+
+    return pinned
+
+
 #: One read for :func:`load_transit_bound_attestation`: ``(sql, params) -> row or None``. ``sql``
 #: carries ``?`` placeholders; the Postgres store rewrites them to ``$n`` before it runs.
 type TransitAttestationFetch = Callable[
@@ -4158,28 +4225,80 @@ type TransitAttestationFetch = Callable[
 ]
 
 
-async def load_transit_bound_attestation(
+@dataclass(frozen=True, slots=True)
+class TransitAttestationRead:
+    """What :func:`read_transit_bound_attestation_rows` gathered inside one read: the attestation,
+    and the one MAC still to check, which :func:`settle_transit_bound_attestation` computes after
+    the read is released (BACKLOG #2337).
+
+    ``mac_check`` is ``(audit row, previous row hash, key, MAC provider)``, or ``None`` when the
+    verdict is already settled (no row, or a gap found without a MAC)."""
+
+    attestation: TransitBoundAttestation | None
+    mac_check: tuple[Mapping[str, Any], object, bytes | None, AuditMacFn | None] | None = None
+
+
+async def read_transit_bound_attestation_rows(
     fetch: TransitAttestationFetch,
     *,
     mac_keys: Mapping[str, bytes],
     mac_fn: AuditMacFn | None,
-) -> TransitBoundAttestation | None:
-    """The recorded attestation, checked against the audit row it names -- the read all three
-    backends' ``get_transit_bound_attestation`` run (BACKLOG #2337).
+) -> TransitAttestationRead:
+    """The recorded attestation and the audit rows that must back it -- the read all three
+    backends' ``get_transit_bound_attestation`` run inside one snapshot (BACKLOG #2337).
 
-    ``None`` when no row is recorded. Otherwise the row, with ``audit_gap`` set to why its audit row
-    does not back it, or left ``None`` when it does. Every query is portable across SQLite, Postgres
-    and SQL Server, and every value is a bound parameter. The check reuses the chain's own pieces: the
-    row MAC (:func:`audit_row_hash`, under the key of the row's range, as :func:`verify_audit_rows`
-    picks it) and the constant-time compare. It walks no chain, so it costs one MAC, not one per row."""
+    Every query is portable across SQLite, Postgres and SQL Server, and every value is a bound
+    parameter. It makes no MAC call: a Transit MAC is a Vault round trip, and holding a read
+    snapshot or a pooled connection across it would pin the WAL or the pool while Vault is slow.
+    Pass the result to :func:`settle_transit_bound_attestation` once the read is released."""
     row = await fetch(
         f"SELECT {TRANSIT_ATTESTATION_COLUMNS} FROM transit_bound_attestation WHERE id = ?", (1,)
     )
     if row is None:
-        return None
+        return TransitAttestationRead(None)
     attestation = _transit_attestation_row(row)
-    gap = await _transit_attestation_audit_gap(attestation, fetch, mac_keys=mac_keys, mac_fn=mac_fn)
-    return attestation if gap is None else replace(attestation, audit_gap=gap)
+    if attestation.audit_gap is not None:  # the row itself is malformed
+        return TransitAttestationRead(attestation)
+    found = await _transit_attestation_audit_gap(
+        attestation, fetch, mac_keys=mac_keys, mac_fn=mac_fn
+    )
+    if isinstance(found, str):
+        return TransitAttestationRead(replace(attestation, audit_gap=found))
+    return TransitAttestationRead(attestation, found)
+
+
+async def settle_transit_bound_attestation(
+    read: TransitAttestationRead,
+) -> TransitBoundAttestation | None:
+    """``read``'s attestation, with ``audit_gap`` set when its audit row's MAC does not verify.
+
+    ``None`` when no row is recorded. The check reuses the chain's own pieces: the row MAC
+    (:func:`_audit_row_mac`, under the key of the row's range and the Transit key version its hash
+    names) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC provider
+    runs off the event loop, because it is a blocking Vault call. A Transit refusal of that call,
+    such as a key version a forged hash names that does not exist, reads as a gap, not an error, so
+    a row anyone with DML wrote cannot stop a ``warn`` start."""
+    attestation = read.attestation
+    if attestation is None or read.mac_check is None:
+        return attestation
+    audit, prev, key, mac = read.mac_check
+    seq = audit["seq"]
+    if mac is None:
+        expected = _audit_row_mac(audit, prev, key, None)
+    else:
+        try:
+            expected = await asyncio.to_thread(_audit_row_mac, audit, prev, key, mac)
+        except CipherError as exc:
+            return replace(
+                attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
+            )
+    if expected is None or not hmac.compare_digest(
+        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(expected)
+    ):
+        return replace(
+            attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"
+        )
+    return attestation
 
 
 async def _transit_attestation_audit_gap(
@@ -4188,8 +4307,9 @@ async def _transit_attestation_audit_gap(
     *,
     mac_keys: Mapping[str, bytes],
     mac_fn: AuditMacFn | None,
-) -> str | None:
-    """Why ``attestation``'s audit row does not back it, or ``None`` when it does."""
+) -> str | tuple[Mapping[str, Any], object, bytes | None, AuditMacFn | None]:
+    """Why ``attestation``'s audit row does not back it, or, when every check but the MAC passes,
+    the inputs of that MAC check: ``(audit row, previous row hash, key, MAC provider)``."""
     seq = attestation.audit_seq
     if seq is None or seq < 1 or attestation.audit_hash is None:
         return "it names no audit row"
@@ -4255,12 +4375,9 @@ async def _transit_attestation_audit_gap(
         secret = _audit_secret_for(key_id, mac_keys, mac_fn)
     if secret is None:
         return f"this process does not hold the audit key audit row {seq} is sealed under"
-    expected = _audit_row_mac(audit, prev, *secret)
-    if expected is None or not hmac.compare_digest(
-        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(expected)
-    ):
-        return f"audit row {seq}'s MAC does not verify under the audit key"
-    return None
+    # A plain dict, so the row outlives the cursor and the read that produced it.
+    columns = ("seq", *_AUDIT_CHAINED_COLUMNS, "row_hash")
+    return ({c: audit[c] for c in columns}, prev, secret[0], secret[1])
 
 
 def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
@@ -11667,8 +11784,9 @@ class MessageStore:
     # Non-secret. See messagefoundry.store.transit_attestation for the rulings it implements.
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
-        """The recorded attestation, checked against its audit row (:func:`load_transit_bound_attestation`),
-        or ``None``."""
+        """The recorded attestation, checked against its audit row, or ``None``. The rows are read
+        in one ``_read()`` snapshot (:func:`read_transit_bound_attestation_rows`); the MAC runs after
+        it is released (:func:`settle_transit_bound_attestation`)."""
         async with self._read() as db:
 
             async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
@@ -11676,9 +11794,10 @@ class MessageStore:
                 # sqlite3.Row reads by column name, the one Mapping operation the reader uses.
                 return cast("Mapping[str, Any] | None", await cur.fetchone())
 
-            return await load_transit_bound_attestation(
+            read = await read_transit_bound_attestation_rows(
                 fetch, mac_keys=self._audit_mac_keys, mac_fn=self._audit_mac_fn
             )
+        return await settle_transit_bound_attestation(read)
 
     async def record_transit_bound_attestation(
         self, *, key_name: str, reason: str, actor: str, now: float | None = None
@@ -11711,10 +11830,11 @@ class MessageStore:
         return recorded
 
     async def withdraw_transit_bound_attestation(
-        self, *, audit: OperatorAudit[TransitBoundAttestation], now: float | None = None
+        self, *, actor: str, reason: str | None = None, now: float | None = None
     ) -> TransitBoundAttestation | None:
-        """Delete the attestation and append the row ``audit`` builds from it, in ONE transaction.
-        ``None``, with nothing appended, when none was recorded."""
+        """Delete the attestation and append its ``store.transit_bound_withdrawn`` row
+        (:func:`transit_withdrawn_audit`), in ONE transaction. ``None``, with nothing appended, when
+        none was recorded."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
@@ -11727,7 +11847,7 @@ class MessageStore:
                 return None
             withdrawn = _transit_attestation_row(row)
             await self._db.execute("DELETE FROM transit_bound_attestation WHERE id = 1")
-            audits = operator_audits(audit, withdrawn)
+            audits = (transit_withdrawn_audit(withdrawn, actor=actor, reason=reason),)
             appended = await self._append_audits(audits, now=now)
             await self._commit()
         tee_audits(audits, appended, ts=now)

@@ -218,7 +218,6 @@ from messagefoundry.store.store import (
     check_password_generated,
     delivery_key,
     load_audit_chain,
-    load_transit_bound_attestation,
     lockout_arms,
     lockout_clear_set,
     lockout_escalates,
@@ -227,13 +226,16 @@ from messagefoundry.store.store import (
     operator_audits,
     owned_lane_scope,
     password_claim_set,
+    read_transit_bound_attestation_rows,
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
+    settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
     totp_enable_term,
     transit_attested_audit,
+    transit_withdrawn_audit,
     verify_audit_rows,
 )
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
@@ -7476,8 +7478,13 @@ class PostgresStore:
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
         """See the SQLite twin. The shared reader's ``?`` placeholders become ``$n`` here, and
-        its reads share one borrow, as the SQLite twin's share one ``_read()``."""
-        async with self._timed_acquire(record=False) as conn:
+        its reads share one borrow and one read-only REPEATABLE READ snapshot, as the SQLite twin's
+        share one ``_read()``. Without the snapshot, an attest committed between the row read and
+        the supersession read would make a valid attestation read as superseded."""
+        async with (
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
 
             async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
                 parts = sql.split("?")
@@ -7485,9 +7492,11 @@ class PostgresStore:
                 row: Mapping[str, Any] | None = await conn.fetchrow(numbered, *params)
                 return row
 
-            return await load_transit_bound_attestation(
+            read = await read_transit_bound_attestation_rows(
                 fetch, mac_keys=self._audit_mac_keys, mac_fn=self._audit_mac_fn
             )
+        # The Transit MAC runs after the snapshot and the borrow are released.
+        return await settle_transit_bound_attestation(read)
 
     async def record_transit_bound_attestation(
         self, *, key_name: str, reason: str, actor: str, now: float | None = None
@@ -7522,12 +7531,16 @@ class PostgresStore:
         )
 
     async def withdraw_transit_bound_attestation(
-        self, *, audit: OperatorAudit[TransitBoundAttestation], now: float | None = None
+        self, *, actor: str, reason: str | None = None, now: float | None = None
     ) -> TransitBoundAttestation | None:
         """See the SQLite twin. ``DELETE ... RETURNING`` reads and removes the row in one statement,
         and the audit row commits in the same transaction."""
         now = time.time() if now is None else now
         async with self._timed_acquire(record=False) as conn, conn.transaction():
+            # The audit lock FIRST, the order `record_transit_bound_attestation` takes them in (its
+            # append, then the row), so a concurrent attest and withdraw cannot deadlock. The
+            # append below re-takes it, which a transaction-scoped advisory lock allows.
+            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
             row = await conn.fetchrow(
                 "DELETE FROM transit_bound_attestation WHERE id = 1"
                 f" RETURNING {TRANSIT_ATTESTATION_COLUMNS}"
@@ -7535,7 +7548,7 @@ class PostgresStore:
             if row is None:
                 return None
             withdrawn = _transit_attestation_row(row)
-            audits = operator_audits(audit, withdrawn)
+            audits = (transit_withdrawn_audit(withdrawn, actor=actor, reason=reason),)
             appended = await self._append_audits(conn, audits, now=now)
         tee_audits(audits, appended, ts=now)
         return withdrawn

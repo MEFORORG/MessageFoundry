@@ -25,8 +25,15 @@ sequence number and chain hash of the audit row its write appended. Every read c
 it must be in the log, be the newest attest or withdraw row, say the same key name, reason, actor and
 time, carry the recorded hash, and verify under the audit key of its own range. A row that fails any of
 these reads as UNATTESTED, with the reason in ``audit_gap``. A forger would need the audit key, which on
-``vault_transit`` lives inside Transit. Deleting a later withdraw row to replay an older attestation
-breaks the chain, which ``audit-verify`` and the start-up chain walk report, and this check does not.
+``vault_transit`` lives inside Transit. The MAC is recomputed under the Transit key VERSION the audit
+row names, so the key rotation the operator attests to does not void the attestation.
+
+What this check does NOT catch: a writer who deletes a later withdraw row and re-inserts the old
+attestation row. If rows follow the deleted one, the chain breaks, and ``audit-verify`` reports it,
+as does the start-up walk when ``audit_verify_on_start`` is on. If the withdraw row was the newest
+row, the surviving chain still verifies; only an external anchor taken after the withdraw
+(``audit-verify --expected-anchor``, or ``[integrity].audit_anchor_file`` with the start-up walk
+on) catches the cut.
 
 The binding is to the key NAME only. A store pointed at another Vault, or another Transit mount, that
 holds a key with the same name keeps the attestation. That follows the 2026-10-07 ruling.
@@ -36,12 +43,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
-
-if TYPE_CHECKING:
-    from messagefoundry.store.store import OperatorAudit
 
 __all__ = [
     "TRANSIT_BOUND_ATTESTED_ACTION",
@@ -115,11 +119,11 @@ class TransitBoundAttestationStore(Protocol):
         ...
 
     async def withdraw_transit_bound_attestation(
-        self, *, audit: OperatorAudit[TransitBoundAttestation], now: float | None = None
+        self, *, actor: str, reason: str | None = None, now: float | None = None
     ) -> TransitBoundAttestation | None:
-        """Delete the recorded attestation and append the row ``audit`` builds from it, in one
-        transaction. Returns what was withdrawn, or ``None`` (and appends nothing) when there was
-        none."""
+        """Delete the recorded attestation and append its ``store.transit_bound_withdrawn`` audit
+        row, which the store builds itself, in one transaction. Returns what was withdrawn, or
+        ``None`` (and appends nothing) when there was none."""
         ...
 
 

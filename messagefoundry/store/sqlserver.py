@@ -206,7 +206,6 @@ from messagefoundry.store.store import (
     check_password_generated,
     delivery_key,
     load_audit_chain,
-    load_transit_bound_attestation,
     lockout_arms,
     lockout_clear_set,
     lockout_escalates,
@@ -215,13 +214,16 @@ from messagefoundry.store.store import (
     operator_audits,
     owned_lane_scope,
     password_claim_set,
+    read_transit_bound_attestation_rows,
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
+    settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
     totp_enable_term,
     transit_attested_audit,
+    transit_withdrawn_audit,
     verify_audit_rows,
 )
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
@@ -10948,14 +10950,17 @@ class SqlServerStore:
     # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
-        """See the SQLite twin."""
+        """See the SQLite twin. Each read here is its own pooled statement, not one snapshot, so an
+        attest committed between the row read and the supersession read reads, that once, as
+        superseded: the fail-closed direction, gone on the next read."""
 
         async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
             return await self._fetchone(sql, params)
 
-        return await load_transit_bound_attestation(
+        read = await read_transit_bound_attestation_rows(
             fetch, mac_keys=self._audit_mac_keys, mac_fn=self._audit_mac_fn
         )
+        return await settle_transit_bound_attestation(read)
 
     async def record_transit_bound_attestation(
         self, *, key_name: str, reason: str, actor: str, now: float | None = None
@@ -10969,6 +10974,11 @@ class SqlServerStore:
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
+                        # OPENS THE TRANSACTION, as in `record_audit`: the audit append takes
+                        # `sp_getapplock @LockOwner='Transaction'`, which needs one already open, and
+                        # under implicit transactions only a statement touching a table begins one.
+                        await cur.execute("SELECT TOP (1) seq FROM audit_log ORDER BY seq DESC")
+                        await cur.fetchall()  # drain, so the next execute on this cursor is clean
                         [appended] = await self._append_audits(cur, (audit,), now=now)
                         await cur.execute(
                             "MERGE transit_bound_attestation WITH (HOLDLOCK) AS t"
@@ -10999,7 +11009,7 @@ class SqlServerStore:
         )
 
     async def withdraw_transit_bound_attestation(
-        self, *, audit: OperatorAudit[TransitBoundAttestation], now: float | None = None
+        self, *, actor: str, reason: str | None = None, now: float | None = None
     ) -> TransitBoundAttestation | None:
         """See the SQLite twin. ``DELETE ... OUTPUT`` reads and removes the row in one statement,
         and the audit row commits in the same transaction. This leg is CI-only."""
@@ -11008,6 +11018,13 @@ class SqlServerStore:
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
+                        # The audit applock FIRST, the order the record leg takes them in (its
+                        # append, then the MERGE), so a concurrent attest and withdraw cannot
+                        # deadlock. The opener read starts the transaction the applock needs; the
+                        # append below re-takes the lock, which the same owner may do.
+                        await cur.execute("SELECT TOP (1) seq FROM audit_log ORDER BY seq DESC")
+                        await cur.fetchall()
+                        await self._applock(cur, _AUDIT_APPEND_LOCK)
                         names = TRANSIT_ATTESTATION_COLUMNS.split(", ")
                         await cur.execute(
                             "DELETE FROM transit_bound_attestation OUTPUT "
@@ -11019,7 +11036,7 @@ class SqlServerStore:
                             await conn.rollback()
                             return None
                         withdrawn = _transit_attestation_row(dict(zip(names, rows[0], strict=True)))
-                        audits = operator_audits(audit, withdrawn)
+                        audits = (transit_withdrawn_audit(withdrawn, actor=actor, reason=reason),)
                         appended = await self._append_audits(cur, audits, now=now)
                         await self._commit(conn)
                 except Exception:

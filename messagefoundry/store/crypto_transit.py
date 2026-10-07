@@ -189,7 +189,7 @@ class TransitCipher(_UnmarkedPolicy):
         """No in-heap audit keys. Transit versions its own audit key, so the engine sees one range."""
         return {}
 
-    def audit_hmac(self, data: bytes) -> str:
+    def audit_hmac(self, data: bytes, *, key_version: int | None = None) -> str:
         """Compute the audit-chain row MAC INSIDE Transit (``generate_hmac``) — no key ever enters heap.
 
         Returns Transit's own ``vault:v1:…`` HMAC string (deterministic for a given input+key+version, so
@@ -197,12 +197,21 @@ class TransitCipher(_UnmarkedPolicy):
         different input yields a different MAC → tamper/forgery is detected). ADR 0138 §To-resolve: this
         moves the audit chain from keyless SHA-256 to forgery-**resistant** without an in-heap key,
         closing the ASVS 16.4.2 residual for ``vault_transit`` mode. Fail-closed: any Transit error raises
-        :class:`CipherError` (type-only — the canonical row bytes are PHI-derived and never surfaced)."""
+        :class:`CipherError` (type-only — the canonical row bytes are PHI-derived and never surfaced).
+
+        ``key_version`` pins the Transit key version; ``None`` means Transit's latest. A check of a
+        stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
+        an older row read as forged."""
         inp = base64.b64encode(data).decode("ascii")
+        kwargs: dict[str, Any] = {
+            "name": self._audit_key,
+            "hash_input": inp,
+            "algorithm": _AUDIT_HASH_ALGO,
+        }
+        if key_version is not None:
+            kwargs["key_version"] = key_version
         try:
-            response: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key, hash_input=inp, algorithm=_AUDIT_HASH_ALGO
-            )
+            response: Any = self._client.secrets.transit.generate_hmac(**kwargs)
             mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
             raise CipherError(
