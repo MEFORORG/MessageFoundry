@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -1754,8 +1754,25 @@ class AuditStore(Protocol):
         requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None:
+        audit: AuditAppend | None = None,
+        on_repeat: Callable[[str], AuditAppend] | None = None,
+    ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+        Returns the id of the row that holds the request: ``approval_id``, or an open request's id
+        when ``on_repeat`` joins this one to it.
+
+        ``audit``, when given, is appended to the audit chain in the SAME transaction as the INSERT,
+        so the request and its ``approval.requested`` row commit or roll back together, then teed
+        off-box (vault BACKLOG #2255). Its timestamp is the store's own clock.
+
+        ``on_repeat``, when given, makes a repeat file nothing (vault BACKLOG #2445). If an OPEN
+        request matches -- the same ``operation``, the same ``params`` text, the same
+        ``requester_user_id``, still ``pending`` and unexpired at ``requested_at`` -- no row is
+        inserted, ``audit`` is not written, and ``on_repeat(<that request's id>)`` is appended
+        instead, in the same transaction; that id is returned. The oldest match wins. The check and
+        the insert are one serialized step on every backend, so two concurrent repeats file one
+        request between them. The match includes the requester because the requester of record is
+        whose authority the release re-checks; ``ApprovalGate.guard`` says more.
 
         ``requester_user_id`` is the **authorization key** and ``requester`` is the display label
         (BACKLOG #1540). :meth:`~messagefoundry.api.approvals.ApprovalGate.approve` is the source of
@@ -1773,7 +1790,12 @@ class AuditStore(Protocol):
 
     async def get_pending_approval(self, approval_id: str) -> Row | None: ...
 
-    async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]: ...
+    async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
+        """Open (``pending``, unexpired) requests, newest first. Each row projects at least ``id``,
+        ``operation``, ``params``, ``requester``, ``requester_user_id`` (BACKLOG #2460: the queue
+        marks the caller's own requests by it), ``requested_at``, ``status``, ``approver``,
+        ``decided_at`` and ``expires_at``."""
+        ...
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
         """Released requests whose operation was cut off mid-run (status ``interrupted``), OLDEST
@@ -1797,7 +1819,40 @@ class AuditStore(Protocol):
         approver: str | None,
         decided_at: float,
         from_status: str = "pending",
-    ) -> bool: ...
+        audit: AuditAppend | None = None,
+        claim_owner: str | None = None,
+    ) -> bool:
+        """Move a request from ``from_status`` to ``status`` in one guarded UPDATE. ``True`` iff
+        this call moved it, which is what guards a double decision.
+
+        ``audit``, when given, is appended to the audit chain in the SAME transaction, and only
+        when the row moved: a transition that matched no row writes no audit row. A failed append
+        rolls the transition back, so the gate never sees a moved row without its audit row, nor
+        the reverse (vault BACKLOG #2255). The row is teed off-box after the commit. Its timestamp
+        is the store's own clock, not ``decided_at``.
+
+        ``claim_owner``, when given, is written to the row's ``claim_owner`` column in the same
+        UPDATE; ``None`` leaves the column as it is (BACKLOG #1562). The approval gate passes it on
+        the claim (``pending`` to ``executing``): it names the engine process that will run the
+        operation, so that process can recognise its own claims after a restart
+        (``ApprovalGate.reconcile_after_restart``). Engine shards and cluster nodes share one store,
+        and the owner is what keeps one process from settling a sibling's live release."""
+        ...
+
+    async def list_executing_approvals(
+        self, *, claim_owner: str | None = None, limit: int = 1000
+    ) -> Sequence[Row]:
+        """Released requests still claimed as ``executing``, OLDEST claim first (BACKLOG #1562).
+
+        ``claim_owner``, when given, keeps only the rows that owner claimed and the rows with no
+        owner, filtered in SQL so other owners' rows cannot push them past ``limit``.
+
+        Projects ``id``, ``operation``, ``requester``, ``approver``, ``decided_at`` (when it was
+        claimed) and ``claim_owner``. Read at startup by ``ApprovalGate.reconcile_after_restart``,
+        which settles the rows this process owns and reports the rest. An ``executing`` row is
+        normally short-lived, so the cap is generous; oldest first so a row stuck longest is never
+        the one past it."""
+        ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...
 

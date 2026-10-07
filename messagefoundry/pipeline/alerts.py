@@ -372,9 +372,11 @@ class AlertSink(Protocol):
         ``config_reload:inline`` when it loses the ``config_reload_attempted`` row it writes before
         an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). ``action`` is
         the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT
-        carried: the ERROR log line written beside this alert holds it. It is raised whether the gate
-        then refused the request (an ``approval.release_attempted`` row it could not write answers
-        503) or went ahead (the operation had already run). It is not a connection-scoped event, so no
+        carried. The ERROR log line written beside this alert carries the row's detail on some paths
+        and only the exception on others; docs/SECURITY.md says which. It is raised whether the gate
+        then refused the request (a claim it could not write with its ``approval.release_attempted``
+        row answers 503) or went ahead (the operation had already run). It is not a connection-scoped
+        event, so no
         rule's ``control_action`` fires on it (BACKLOG #1898), and the colon keeps ``name`` outside
         the connection-name grammar. Repeated failures on one request fold into one instance, and
         every inline reload's into the one ``config_reload:inline`` instance until an operator
