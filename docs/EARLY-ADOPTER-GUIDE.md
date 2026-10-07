@@ -477,8 +477,10 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       was changed to name a key, from `4` the chain was rewritten as keyless. Re-run with the
       engine's settings and key before deciding. Do not clear a `5` with the keyless opt-out
       unless the engine runs under it. A job that moves from `0` to `4` or `5` changed, and the
-      database may have changed too: find out what changed the job, then re-run it. Treating any
-      of `2` to `5` as a pass leaves the real log unchecked. Add `--allow-empty` only
+      database may have changed too: find out what changed the job, then re-run it. `6` means a
+      store key or key-provider error stopped the walk part way, such as a Transit outage: re-run
+      once the provider answers, and treat a `6` that repeats as a possible tamper. Treating any
+      of `2` to `6` as a pass leaves the real log unchecked. Add `--allow-empty` only
       where an empty log is expected. Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md)
       "Tamper-evidence".
 - [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean

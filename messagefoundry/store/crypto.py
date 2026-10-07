@@ -1331,6 +1331,14 @@ class AesGcmCipher(_UnmarkedPolicy):
         )
 
 
+class MalformedKeyError(ValueError):
+    """A configured store key is not base64 of 32 bytes (vault BACKLOG #3054, item 8).
+
+    Its own class, so a caller can tell this from the other ``ValueError`` a store open raises, and
+    from nothing a database holds: only :func:`make_cipher` raises it, on a key the settings or the
+    key provider supplied. Its text names the setting, never the key."""
+
+
 def _decode_key(key_b64: str, name: str) -> bytearray:
     # Return a MUTABLE bytearray (not immutable bytes) so the cipher that receives it can lock + zeroize
     # the raw key material after AESGCM has copied it in (ASVS 13.3.3). base64.b64decode returns bytes;
@@ -1338,9 +1346,9 @@ def _decode_key(key_b64: str, name: str) -> bytearray:
     try:
         decoded = base64.b64decode(key_b64, validate=True)
     except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
-        raise ValueError(f"{name} must be valid base64") from exc
+        raise MalformedKeyError(f"{name} must be valid base64") from exc
     if len(decoded) != 32:
-        raise ValueError(
+        raise MalformedKeyError(
             f"{name} must decode to 32 bytes (got {len(decoded)}); generate one with `messagefoundry gen-key`"
         )
     return bytearray(decoded)

@@ -4534,21 +4534,35 @@ than the paragraph above. It does so only where the shell's settings allow the s
 keyless; exit 5 below covers the rest. A store that has a key and opens
 onto keyless rows fails the verify, and is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
-**A scheduled job reads the exit code and nothing else, so these six are kept distinct:**
+**A scheduled job reads the exit code and nothing else, so these seven are kept distinct:**
 
 | Exit | Meaning |
 |---|---|
 | `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
-| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. An error the command does not classify, such as a malformed key or a Transit outage part way through the walk, also exits 1 and prints no `FAIL` line, so by the code alone a job cannot tell it from a broken chain. |
-| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, and an empty log in a shell that holds no key and whose settings require one. |
+| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. An error the command does not classify still reaches the last-resort handler and exits 1 with no `FAIL` line. Since vault BACKLOG #3054 a malformed key exits 2 and a key error part way through the walk exits 6, so neither is one of them any more. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
 | `5` | The chain is keyless and walked clean as plain SHA-256. This shell holds no key, and its settings require one. So the chain was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move between 4 and 5 means. |
+| `6` | The store opened, and then a store key or key-provider error stopped the walk part way, such as a Transit outage. The chain was neither verified nor found broken. It prints a `NOT CHECKED` line naming the error's class, and never the error's text. This is not a pass. Before vault BACKLOG #3054 it exited 1 with no `FAIL` line. |
 
 For exit 2 the verifier refuses each case rather than creating or migrating the evidence it was asked
 to check, and it opens read-only so it cannot write to that file either way. It never spends `1` on
-any of them. A store key that cannot be resolved is refused while the store opens, before it reads
-a row.
+any of them. A store key that cannot be resolved, or that is not base64 of 32 bytes, is refused
+while the store opens, before it reads a row.
+
+**Treat 6 as unchecked, never as clean.** Re-run once the key provider answers. Under
+`cipher_provider = "vault_transit"` each row goes to Transit for its MAC, so a row's own content can
+make Transit refuse, for example one too large for a request. A writer can therefore turn a 1 into a
+6. So a 6 that repeats while the provider answers other requests is a sign the log may have been
+altered.
+
+At least these older cases also exit 2 and are not findings about the chain. An audit log emptied
+out of band, verified in a shell that holds no key and whose settings require one, exits 2: the
+store open refuses it, as the paragraph on that setup below says. A row holding text that is not
+valid UTF-8 exits 2 too, because the database driver refuses to read it, and the line says the
+store could not be opened. A writer can cause either, so a 2 from a job that ran clean before is
+worth the same look as a 1.
 
 Exits 4 and 5 are each decided by a flag the store's verify sets only in a process that holds no
 key, so nothing a database holds can turn a verify run with the key into either (vault BACKLOG
@@ -4582,7 +4596,10 @@ The warning is a sign, not a diagnosis: a clean keyless walk cannot tell a store
 from a keyed chain rewritten as keyless. Run the job with the settings and key the engine runs
 with: a keyless store then passes with exit 0 and no warning, and a keyed chain rewritten as
 keyless fails with exit 1. Do not clear the 5 by giving the job the keyless opt-out unless the
-engine runs under it too. A job that moves from 0 to 4 or 5 has at least one of these causes: it
+engine runs under it too: under the opt-out, in a shell with no key, a keyed chain rewritten whole
+as keyless exits 0 with no warning, because a keyless chain is what those settings expect. Only a
+run with the key shows that rewrite. With an expected anchor that matched, the warning drops the
+rewrite as a cause, since a rewrite changes the anchor's head. A job that moves from 0 to 4 or 5 has at least one of these causes: it
 lost the key it ran with, it lost the opt-out, or it moved from a build before #3054. Neither move
 comes from the database alone, but the database may have changed too. So find out what changed the
 job, then re-run it with the engine's settings and key. An empty log in this setup

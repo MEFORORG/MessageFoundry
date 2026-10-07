@@ -950,8 +950,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
         "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store', "
         "exit 4 'this shell holds no key while its settings require one, and the chain's first "
-        "row names a key', exit 5 'the same shell, and the chain is keyless'). It does not apply "
-        "in that shell: an empty log there exits 2 or 5",
+        "row names a key', exit 5 'the same shell, and the chain is keyless', exit 6 'a key or "
+        "key-provider error stopped the walk'). It does not apply in that shell: an empty log "
+        "there exits 2 or 5",
     )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
@@ -5732,6 +5733,10 @@ def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | in
     Shared by ``admin-unlock``, ``admin-set-notify-email`` and ``admin-reset-totp`` so the gate is
     stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it legitimately creates the
     store, so it cannot carry the M-31 guard below.
+
+    Both refusals exit 2, "could not start", as each command's ``StoreNotFoundError`` arm already
+    did for a server database with no store (vault BACKLOG #3110, item 4). They exited 1, the code
+    these commands give a refusal about the account.
     """
     from pathlib import Path
 
@@ -5743,18 +5748,20 @@ def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | in
     # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
-        return _emit_error(detail or "could not load the service settings", as_json=args.json)
+        _emit_error(detail or "could not load the service settings", as_json=args.json)
+        return 2
 
     # The same M-31 guard _audit_verify carries. Before #1780 a SQLite store was CREATED on open, so a
     # typo'd path yielded a fresh empty DB and a false "no such user". open_store now refuses an absent
     # file itself; this guard stays first because it says "you got the DATABASE wrong" in this
     # command's words, where the seam's refusal would surface as an unhandled StoreNotFoundError.
     if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
-        return _emit_error(
+        _emit_error(
             f"no store at {settings.store.path} — refusing to create one and report a false "
             f"'no such user' (check --db / [store].path)",
             as_json=args.json,
         )
+        return 2
     return settings
 
 
@@ -5792,9 +5799,13 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         return settings
 
     async def run() -> tuple[str, dict[str, Any]]:
-        store = await open_store(
-            settings.store,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        # A key that does not resolve is "could not start", exit 2, as audit-verify exits on it
+        # (vault BACKLOG #3054, item 11). Only the open is wrapped; see the helper.
+        store = await _open_store_or_refuse_the_key(
+            open_store(
+                settings.store,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
         try:
             user = await store.get_user_by_username(args.username)
@@ -5824,8 +5835,13 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
     try:
         outcome, report = run_guarded(run())
-    # #1916; #1780: a server database with no store (auto mode). Could not start.
-    except (KeylessAuditChainRefused, StoreNotFoundError, _UnauditableWrite) as exc:
+    # #1916; #1780: a server database with no store (auto mode); #3054: no key. Could not start.
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        _StoreKeyUnresolved,
+    ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -7115,10 +7131,15 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
         try:
             # BACKLOG #1916: this command appends an audit row, so on a fresh store with no key it
-            # would start a keyless chain. The shared verdict decides; a refusal exits 2 below.
-            store = await open_store(
-                settings.store,
-                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            # would start a keyless chain. The shared verdict decides; a refusal exits 2 below, as
+            # does a key that does not resolve (vault BACKLOG #3054, item 11).
+            store = await _open_store_or_refuse_the_key(
+                open_store(
+                    settings.store,
+                    keyless_chain_refusal=keyless_opt_out_refusal(
+                        settings.store, settings.security
+                    ),
+                )
             )
         except (StoreKeylessError, CipherError) as exc:
             # A keyed store with encrypted rows, opened from a shell without its key, refuses at
@@ -7172,7 +7193,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
     try:
         outcome, username, extra = run_guarded(run())
-    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780: could not start
+    # #1916, #1780, #3054 (no key): could not start
+    except (KeylessAuditChainRefused, StoreNotFoundError, _StoreKeyUnresolved) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -7752,6 +7774,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
         StoreNotFoundError,
         open_store,
     )
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.keyprovider import KeyProviderError
     from messagefoundry.store.store import AuditVerdict
 
     # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
@@ -7811,6 +7835,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
             # than pattern-matching "verified 0 " out of a human-readable message.
             count, _head = await store.audit_anchor()
             return verdict, count
+        except (CipherError, KeyProviderError) as exc:
+            # Raised by the walk, after the open: a Transit HMAC that failed for a row, or a key
+            # provider that failed part way. Its own tuple, not `_key_unresolved()`, whose classes
+            # are raised before a row is read. Exit 6 below, never 2: rows were already read.
+            raise _AuditWalkStopped(type(exc).__name__) from exc
         finally:
             await store.close()
 
@@ -7823,6 +7852,18 @@ def _audit_verify(args: argparse.Namespace) -> int:
     ) as exc:  # #1916; #1780: a server database with no store; #2725: no key. Could not start.
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except _AuditWalkStopped as exc:
+        # EXIT 6, NOT 1 (vault BACKLOG #3054, item 8). It reached the dispatch floor and exited 1 with
+        # no FAIL line, so a job reading the code took a provider outage for a broken chain. Not 2
+        # either: the store opened and rows were read. The walk has no verdict, so the line is NOT
+        # CHECKED, and it names the error's class only. Under Transit a row's content goes to the
+        # provider, so a row can cause this too, which is why 6 is never a pass.
+        print(
+            f"NOT CHECKED: the audit chain walk stopped part way on a store key or key-provider "
+            f"error ({exc}), so the chain was neither verified nor found broken. Re-run once the "
+            "key provider answers; if it answers and this repeats, treat the log as possibly altered"
+        )
+        return 6
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; this catch is what a server backend and any error raised after the open
@@ -7866,13 +7907,20 @@ def _audit_verify(args: argparse.Namespace) -> int:
         )
         # "No first row naming a key" rather than "its first row names no key": the open refuses an
         # empty log here (#1916, exit 2), but one emptied after the open has no first row (#3054).
+        # A MATCHED anchor rules the rewrite out since the anchor was taken: rewriting a keyed chain
+        # as plain SHA-256 changes every row hash, the head included (vault BACKLOG #3110, item 2).
+        rewrite = (
+            "The expected anchor matched, so the chain has not been rewritten since that anchor "
+            "was taken, and it was keyless then too."
+            if expected_anchor is not None
+            else "Or the chain was rewritten as keyless, which a keyless check cannot see."
+        )
         print(
             "WARNING: the audit chain is keyless (it has no first row naming a key, and it was "
             "checked as plain SHA-256), but this shell's settings require a store key. Causes "
-            "include at least: the store runs keyless under other settings, the key is missing "
-            "here, or the chain was rewritten as keyless, which a keyless check cannot see. Run "
-            "this check with the settings and key the engine runs with; if the engine holds a "
-            "key, that run decides it.",
+            "include at least: the store runs keyless under other settings, or the key is missing "
+            f"here. {rewrite} Run this check with the settings and key the engine runs with; if "
+            "the engine holds a key, that run decides it.",
             file=sys.stderr,
         )
         return 5
@@ -9382,11 +9430,13 @@ def _key_unresolved() -> tuple[type[Exception], ...]:
 
     Each is raised while the key is resolved, before the store reads a row, so nothing a database
     holds can cause one. Their texts name settings, environment variables and files, never a key.
+    A key that resolved but is not base64 of 32 bytes is one of them (vault BACKLOG #3054, item 8).
     Imported here, not at module level, so the CLI's import cost stays where it is."""
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
+    from messagefoundry.store.crypto import MalformedKeyError
     from messagefoundry.store.keyprovider import KeyProviderError
 
-    return (KeyProviderError, DpapiError, DpapiUnavailable)
+    return (KeyProviderError, DpapiError, DpapiUnavailable, MalformedKeyError)
 
 
 class _StoreKeyUnresolved(RuntimeError):
@@ -9398,14 +9448,22 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
     """Await a store open, turning a key that cannot be resolved into :class:`_StoreKeyUnresolved`.
 
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
-    code. Only the OPEN is wrapped: ``open_store`` resolves the key before the backend reads a row,
-    so nothing a database holds can turn a finding into "could not start". A malformed key raises
-    ``ValueError``, which is not caught, because the open raises ``ValueError`` for other reasons too.
+    code, and for ``admin-unlock`` and ``admin-set-notify-email`` (vault BACKLOG #3054, item 11).
+    Only the OPEN is wrapped: ``open_store`` resolves the key before the backend reads a row, so
+    nothing a database holds can turn a finding into "could not start". A malformed key is caught
+    by its own class, ``MalformedKeyError``, never as the bare ``ValueError`` the open raises for
+    other reasons too.
     """
     try:
         return await opening
     except _key_unresolved() as exc:
         raise _StoreKeyUnresolved(str(exc)) from exc
+
+
+class _AuditWalkStopped(RuntimeError):
+    """A key or key-provider error raised AFTER the store opened, while ``audit-verify`` walked the
+    chain (vault BACKLOG #3054, item 8). Its text is the error's class name only: under Transit the
+    error is raised for a row's MAC, and its own text is not this command's to print."""
 
 
 def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool) -> int:

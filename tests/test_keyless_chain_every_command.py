@@ -41,8 +41,9 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.base import open_store
-from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
+from messagefoundry.store.keyprovider import KeyProviderError
+from messagefoundry.store.store import AuditVerdict, MessageStore
 from tests.test_audit_keyless_chain_flagged import _AT_REST_ENV
 from tests.test_provision_first_administrator import _tty
 
@@ -474,6 +475,57 @@ def test_an_edit_inside_a_closed_key_range_exits_1_with_no_key(
     assert "does not match the range it closes" in capsys.readouterr().out
 
 
+def _walk_with_no_key(
+    rows: list[dict[str, object]], *, expected_prefix: tuple[int, str] | None = None
+) -> AuditVerdict:
+    """The one walk every backend runs, by a process that holds no key."""
+    from messagefoundry.store.store import verify_audit_rows
+
+    return verify_audit_rows(
+        rows, mac_keys={}, mac_fn=None, capable=False, expected_prefix=expected_prefix
+    )
+
+
+def test_a_cut_tail_against_an_expected_prefix_is_a_break_with_no_key() -> None:
+    """Vault BACKLOG #3054, item 4: the expected-prefix check, pinned where no key is held. The
+    engine's start check passes the anchor file as a prefix. A tail cut after that anchor needs no
+    key to see, so it is a break, never "not checked". Fails if the prefix check is removed, or if
+    the not-checked return moves above it. The control is the same anchor on the intact chain."""
+    from messagefoundry.store.store import AUDIT_PREFIX_BREAK_MARKER
+    from tests.test_audit_key_rotation import _A, _B, _rows_across_a_rotation
+
+    rows = _rows_across_a_rotation(_A, _B)
+    anchor = (len(rows), str(rows[-1]["row_hash"]))
+    intact = _walk_with_no_key(rows, expected_prefix=anchor)
+    assert not intact[0] and intact.key_unavailable, intact
+
+    cut = _walk_with_no_key(rows[:-1], expected_prefix=anchor)
+    ok, message = cut
+    assert not ok and not cut.key_unavailable, message
+    assert AUDIT_PREFIX_BREAK_MARKER in (message or ""), message
+
+
+def test_a_range_rows_link_is_checked_with_no_key() -> None:
+    """Vault BACKLOG #3054, item 4: the range link check, pinned where no key is held. A range row's
+    recorded link to the chain below it needs no key to compare, so a changed link is a break, never
+    "not checked". Only the link differs here: the range's fields and digest still match. Fails if
+    the link check is removed or held back to a process with a key. The controls are the same rows
+    with the key held, a break too, and the intact rows with no key, not checked."""
+    from tests.test_audit_key_rotation import _A, _B, _rows_across_a_rotation, _verify_rows
+
+    intact = _walk_with_no_key(_rows_across_a_rotation(_A, _B))
+    assert not intact[0] and intact.key_unavailable, intact
+
+    relinked = _rows_across_a_rotation(_A, _B, closes_edit={"prev_hash": "f" * 64})
+    ok, message = _verify_rows(relinked, (_A, _B))
+    assert not ok and "no longer match the link" in (message or ""), message
+
+    verdict = _walk_with_no_key(relinked)
+    ok, message = verdict
+    assert not ok and not verdict.key_unavailable, message
+    assert "no longer match the link" in (message or ""), message
+
+
 def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -510,7 +562,22 @@ def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
     assert out.startswith("FAIL: audit chain broken") and "run keyless" in out, out
 
 
-@pytest.mark.parametrize("command", ["audit-verify", "audit-anchor"])
+#: The commands that route a store key that does not resolve to exit 2. The admin pair joined in
+#: vault BACKLOG #3054, item 11; each exited 1 at the dispatch floor before.
+_KEY_REFUSING_COMMANDS = ["audit-verify", "audit-anchor", "admin-unlock", "admin-set-notify-email"]
+
+
+def _refusal_text(command: str, out: str, err: str) -> str:
+    """The refusal line: `audit-verify` has no --json and writes it to stderr; the rest, as `_argv`
+    runs them, write a JSON error to stdout."""
+    return err if command == "audit-verify" else str(json.loads(out)["error"])
+
+
+#: Not base64, so the key fails to decode. The text a refusal may print is the setting's name.
+_MALFORMED_KEY = "not-a-key-MALFORMEDKEYMARKER!"
+
+
+@pytest.mark.parametrize("command", _KEY_REFUSING_COMMANDS)
 def test_a_key_that_does_not_resolve_exits_2(
     command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -523,8 +590,32 @@ def test_a_key_that_does_not_resolve_exits_2(
     rc = main(_argv(command, db, shell))
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
-    text = json.loads(captured.out)["error"] if command == "audit-anchor" else captured.err
+    text = _refusal_text(command, captured.out, captured.err)
     assert "MEFOR_STORE_TRANSIT_KEY" in text, text
+
+
+@pytest.mark.parametrize("command", _KEY_REFUSING_COMMANDS)
+def test_a_malformed_key_exits_2_and_never_prints_it(
+    command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3054, item 8. A key that is not base64 of 32 bytes is refused while the store
+    opens, before a row is read, so it is "could not start", exit 2. It reached the dispatch floor
+    and exited 1 with no FAIL line, a broken chain's code. The line names the setting, never the key.
+    The control is the same store with its real key, which opens."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    assert main(["audit-verify", "--db", str(db)]) == 0  # the control
+    capsys.readouterr()
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", _MALFORMED_KEY)
+    rc = main(_argv(command, db, shell))
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    text = _refusal_text(command, captured.out, captured.err)
+    assert "MEFOR_STORE_ENCRYPTION_KEY must be valid base64" in text, text
+    assert "MALFORMEDKEYMARKER" not in captured.out + captured.err
 
 
 def test_the_verdict_keeps_its_flag_through_a_copy() -> None:
@@ -575,6 +666,7 @@ def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_5(
     assert "OK" not in captured.out, captured.out
     assert "WARNING: the audit chain is keyless" in captured.err, captured.err
     assert "require a store key" in captured.err, captured.err
+    assert "rewritten as keyless" in captured.err, captured.err  # the control for the anchored run
     assert "row-content-marker" not in captured.out + captured.err
 
     # A matching anchor does not change it: the walk was still not keyed, which is what the settings
@@ -582,7 +674,12 @@ def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_5(
     assert main(["audit-anchor", "--db", str(db)]) == 0
     anchor = capsys.readouterr().out.strip()
     assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 5
-    assert capsys.readouterr().out.startswith("NOT CHECKED: ")
+    captured = capsys.readouterr()
+    assert captured.out.startswith("NOT CHECKED: ")
+    # Vault BACKLOG #3110, item 2: a matched anchor rules out a rewrite since it was taken, so the
+    # WARNING says that and stops naming the rewrite as a cause. The bare run above still names it.
+    assert "rewritten as keyless" not in captured.err, captured.err
+    assert "The expected anchor matched" in captured.err, captured.err
 
 
 @pytest.mark.parametrize("allow_empty", [False, True])
@@ -642,27 +739,36 @@ def test_a_keyless_chain_under_the_opt_out_does_not_warn(
     assert "WARNING" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("error", [KeyProviderError, CipherError], ids=lambda e: e.__name__)
 def test_a_key_error_raised_after_the_open_is_not_reported_as_could_not_start(
-    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    error: type[Exception],
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Pins where the exit-2 key arm sits: around the OPEN only. Once rows are read, a key error is
     not "could not start", because a row's content might be what raised it. Here the verify itself
-    raises the key error. Catching key errors around the whole run would turn this into exit 2."""
-    from messagefoundry.store.keyprovider import KeyProviderError
+    raises the key error. Catching key errors around the whole run would turn this into exit 2.
 
+    Since vault BACKLOG #3054, item 8, it is exit 6 with a NOT CHECKED line, where it reached the
+    dispatch floor and exited 1 with no FAIL line. `CipherError` is what a Transit HMAC that fails
+    for a row raises. The line names the class and never the error's text, which names a key."""
     db = shell / "keyed.db"
     key = generate_key()
     _keyed_chain(db, key)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
 
     async def raising(self: MessageStore, **kwargs: object) -> object:
-        raise KeyProviderError("raised after the open")
+        raise error("Transit audit HMAC failed (key='TEXTMARKER'): ConnectError")
 
     monkeypatch.setattr(MessageStore, "verify_audit_chain", raising)
     rc = main(["audit-verify", "--db", str(db)])
-    capsys.readouterr()
-    assert rc != 2, "a key error after the open was reported as could-not-start"
-    assert rc != 0
+    captured = capsys.readouterr()
+    assert rc == 6, (captured.out, captured.err)
+    assert captured.out.startswith("NOT CHECKED: "), captured.out
+    assert f"({error.__name__})" in captured.out, captured.out
+    assert "FAIL" not in captured.out and "OK" not in captured.out, captured.out
+    assert "TEXTMARKER" not in captured.out + captured.err, (captured.out, captured.err)
 
 
 _FORGE_GENESIS = (
