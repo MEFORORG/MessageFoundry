@@ -104,8 +104,8 @@ _LEDGER_CANCEL_WAIT_SECONDS = 5.0
 _RESERVATION_HEARTBEAT_SECONDS = 100.0
 # How long a save keeps touching its row at most. A write that never finishes would otherwise pin
 # the row, and any leaked slot in it, for as long as the process lives. Past this the heartbeat
-# stops with a WARNING and the row goes stale as it did before #2648. A write is bounded by
-# ``max_upload_bytes`` (512 MiB at most), so an hour is far past any healthy save.
+# stops with a WARNING, and the row goes stale unless other activity keeps it fresh. A write is
+# bounded by ``max_upload_bytes`` (512 MiB at most), so an hour is far past any healthy save.
 _RESERVATION_HEARTBEAT_MAX_SECONDS = 3600.0
 
 # How much of a refused plaintext sidecar the quota reads to find the uploader it bills (BACKLOG
@@ -223,10 +223,11 @@ class UploadQuotaError(UploadError):
       is logged whether or not a save was still waiting for it.
       **IT DOES NOT SELF-HEAL UNCONDITIONALLY, and an earlier version of this line said it did.**
       Every release, every applied reserve and every live save's heartbeat sets the row's
-      ``since`` to now (BACKLOG #2648), and the row holds one clock for all of its slots. **So a
-      leaked slot self-heals only once that uploader is otherwise IDLE** for the whole window. An
-      uploader who keeps uploading, or one save that runs a long time, can hold a leaked slot
-      indefinitely, up to the heartbeat's own cap, ``_RESERVATION_HEARTBEAT_MAX_SECONDS``.
+      ``since`` to now, never backwards (BACKLOG #2648), and the row holds one clock for all of its
+      slots. **So a leaked slot self-heals only once that uploader is otherwise IDLE** for the whole
+      window, with no bound while activity continues. Any reserve, release or heartbeat for that
+      uploader, from any shard, keeps it alive. A host whose clock runs ahead holds it longer by the
+      skew.
     * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a row with no activity
       for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow one.
       Every applied reserve moves the row's clock, and a live save touches it every
@@ -234,14 +235,16 @@ class UploadQuotaError(UploadError):
       keeps its slot. A live slot is still reclaimed in at least these cases: its holder lands no
       touch for the whole window while it is alive (a suspended process or VM, an event loop
       starved for minutes, or a store this shard cannot reach while a sibling can); its save
-      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; or the hosts' wall clocks disagree by a
-      large part of the window, since ``since`` is stamped from the writer's ``time.time()`` and
-      compared against the reader's. A sibling then counts neither that file nor its slot, and the
-      holder's later release erases a sibling's slot, so the undercount lasts until the ledger next
-      drains to zero. That restores the N-1 bound above while it lasts, never worse than the
-      pre-#1112 behaviour. The window is accepted: closing it needs one ledger row per
-      reservation, stamped by the store's own clock, a store-contract change across three
-      backends.
+      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; or the holder's host clock lags a sibling's
+      by a large part of the window. ``since`` is stamped from the writer's ``time.time()`` and
+      compared against the reader's, and the stamp never moves backwards, so a lagging host can no
+      longer age a row a sibling keeps fresh, but a row only it touches still looks old to the
+      sibling. A sibling then counts neither that file nor its slot, and the holder's later release
+      erases a sibling's slot, so the undercount lasts until the ledger next drains to zero. That
+      restores the N-1 bound above while it lasts, never worse than the pre-#1112 behaviour. The
+      window is accepted. The skew case alone could be closed inside the existing statements, by
+      stamping and comparing with the database server's clock. The rest needs one ledger row per
+      reservation, a store-contract change across three backends.
 
     The ledger is checked and paid back around the write, not in the same transaction as it, because
     the body lives on the filesystem rather than in the store. The ordering above is what stands in
@@ -527,7 +530,12 @@ class UploadQuotaLedger(Protocol):
     Declared here as a structural protocol rather than importing ``store.base.Store``, so this module
     stays a leaf (see the module docstring). Every backend's ``Store`` satisfies it structurally —
     see :meth:`messagefoundry.store.base.Store.reserve_upload_quota` and
-    :meth:`~messagefoundry.store.base.Store.upload_quota_in_flight` for the full contract."""
+    :meth:`~messagefoundry.store.base.Store.upload_quota_in_flight` for the full contract.
+
+    **A release of zero files and zero bytes is a touch, and the heartbeat depends on it (BACKLOG
+    #2648).** It must take the release path and move the row's clock forward, changing no count.
+    An implementation that skipped a zero-delta release would silently leave every slow save
+    reclaimable."""
 
     async def reserve_upload_quota(
         self,
@@ -1143,17 +1151,17 @@ class UploadStore:
         async def _beat() -> None:
             deadline = time.monotonic() + _RESERVATION_HEARTBEAT_MAX_SECONDS
             while not stop.is_set():
-                if time.monotonic() >= deadline:
-                    _log.warning(
-                        "an upload by %s is still writing after %gs; its cross-shard reservation "
-                        "is no longer refreshed and will be reclaimed when it goes stale",
-                        uploader_id,
-                        _RESERVATION_HEARTBEAT_MAX_SECONDS,
-                    )
-                    return
                 try:
                     await asyncio.wait_for(stop.wait(), _RESERVATION_HEARTBEAT_SECONDS)
                 except TimeoutError:
+                    if time.monotonic() >= deadline:
+                        _log.warning(
+                            "an upload by %s is still writing after %gs; its cross-shard "
+                            "reservation is no longer refreshed and may be reclaimed",
+                            uploader_id,
+                            _RESERVATION_HEARTBEAT_MAX_SECONDS,
+                        )
+                        return
                     try:
                         await ledger.reserve_upload_quota(uploader_id, files=0, size_bytes=0)
                     except Exception:  # noqa: BLE001 — a missed touch must not fail the upload

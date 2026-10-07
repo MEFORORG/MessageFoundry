@@ -7316,7 +7316,7 @@ class PostgresStore:
                 "UPDATE upload_quota SET"
                 " inflight_files = GREATEST(0, inflight_files + $2),"
                 " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
-                " since = $4"
+                " since = GREATEST(since, $4)"  # never backwards (BACKLOG #2648)
                 " WHERE uploader_id = $1",
                 uploader_id,
                 int(files),
@@ -7336,7 +7336,8 @@ class PostgresStore:
             " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
             " inflight_bytes ="
             " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
-            " since = $4"  # every applied reserve refreshes it (BACKLOG #2648)
+            # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
+            " since = GREATEST(upload_quota.since, $4)"
             " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
             " ELSE upload_quota.inflight_files END) + $2 <= $6"
             " AND (CASE WHEN upload_quota.since <= $5 THEN 0"

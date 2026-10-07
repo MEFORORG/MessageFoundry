@@ -259,10 +259,13 @@ async def test_a_live_reserve_joining_an_old_row_is_not_reclaimed_with_it(
             )
 
         assert await _reserve(shard_ab)  # shard A, never released
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(2.0)
         assert await _reserve(shard_ab)  # shard B, mid-write
         # Shard C: A's slot is twice the window old, B's is well inside it.
-        assert await _reserve(shard_c, stale_after=0.3)
+        assert await _reserve(shard_c, stale_after=1.0)
         # B's reserve moved the clock, so nothing was reclaimed: A's leaked slot stays while the
         # row is active (it clears once the uploader is idle), and B's live slot is counted.
         assert await shard_c.upload_quota_in_flight(uploader_id) == (3, 30)
+        # Drain the row, so a server-backend run leaves nothing in flight behind it.
+        await shard_c.reserve_upload_quota(uploader_id, files=-3, size_bytes=-30)
+        assert await shard_c.upload_quota_in_flight(uploader_id) == (0, 0)

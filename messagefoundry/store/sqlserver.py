@@ -10887,13 +10887,14 @@ class SqlServerStore:
                 "UPDATE upload_quota SET"
                 " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
                 " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
-                " since = ?"
+                " since = CASE WHEN since > ? THEN since ELSE ? END"  # never backwards (#2648)
                 " WHERE uploader_id = ?",
                 (
                     int(files),
                     int(files),
                     int(size_bytes),
                     int(size_bytes),
+                    now,
                     now,
                     uploader_id,
                 ),
@@ -10921,7 +10922,8 @@ class SqlServerStore:
                     " t.inflight_bytes ="
                     " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
                     " + s.size_bytes,"
-                    " t.since = s.now_ts"  # every applied reserve refreshes it (BACKLOG #2648)
+                    # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
+                    " t.since = CASE WHEN t.since > s.now_ts THEN t.since ELSE s.now_ts END"
                     " WHEN NOT MATCHED THEN"
                     " INSERT (uploader_id, inflight_files, inflight_bytes, since)"
                     " VALUES (s.uploader_id, s.files, s.size_bytes, s.now_ts)"
