@@ -5,11 +5,12 @@ import { ServiceConnectionProvider } from '@theia/core/lib/browser/messaging/ser
 import URI from '@theia/core/lib/common/uri';
 import { ContainerModule, injectable } from '@theia/core/shared/inversify';
 import { STEPS_LENS_PATH, StepsLensService } from '../common/steps-protocol';
+import { isStepsUri } from './analyst-routes';
 import { StepsWidget, StepsWidgetOptions } from './steps-widget';
 
 /**
- * Opens a `.py` in the Steps widget. Priority 500 beats the text editor's default (100), so the
- * navigator's open goes here. Making that the ONLY route is spike S-2's question, not this one's.
+ * Opens a `.py` on disk in the Steps widget. Priority 500 beats the text editor's default (100), so
+ * the navigator's open goes here. The analyst build makes it the ONLY route (analyst-frontend-module).
  */
 @injectable()
 export class StepsOpenHandler extends WidgetOpenHandler<StepsWidget> {
@@ -17,7 +18,7 @@ export class StepsOpenHandler extends WidgetOpenHandler<StepsWidget> {
     readonly label = 'Steps';
 
     canHandle(uri: URI): number {
-        return uri.path.ext === '.py' ? 500 : 0;
+        return isStepsUri(uri) ? 500 : 0;
     }
 
     protected createWidgetOptions(uri: URI): StepsWidgetOptions {

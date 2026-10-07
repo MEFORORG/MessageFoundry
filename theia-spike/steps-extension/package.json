@@ -26,6 +26,9 @@
     {
       "frontend": "lib/theia-spike/steps-extension/src/browser/steps-frontend-module",
       "backend": "lib/theia-spike/steps-extension/src/node/steps-backend-module"
+    },
+    {
+      "frontend": "lib/theia-spike/steps-extension/src/browser/analyst-frontend-module"
     }
   ]
 }
