@@ -1331,30 +1331,44 @@ Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and
 - Developers, the `ide/` extension and the ADR 0208 developer build keep the default. The ADR 0208
   analyst build always sets the flag and offers no way to turn it off.
 
-**The structure rule, stated once here.** ADR 0208, its specification and AC-G5 point to it. A
-*generator-shaped* header is one AST-equal to what the lens emits from literal inputs. A
-*hand-written* header is any other. A *dynamic* row is a typed, send or route row the lens could not
-have written: one with a parameter that is not a literal or inert value (G.7), or whose full
-statement lacks the generator's skeleton (ADR 0208 spec FR-40 item 5a), such as
-`set_field(<code> or msg, ...)` or `anything.Send(...)`. Under the flag (Manager decision 2026-10-07,
-after review, which states the rule as an invariant rather than a property of the moved row):
+**The structure rule, stated once here.** ADR 0208, its specification and AC-G5 point to it.
 
-1. A move or delete never targets a `code` row, and never carries one inside a block (rule 5).
+- A *generator-shaped* header is one AST-equal to what the lens emits from literal inputs. A
+  *hand-written* header is any other.
+- A *dynamic* row is a typed, send or route row the lens could not have written: one with a
+  parameter that is not a literal or inert value (G.7), or whose full statement lacks the
+  generator's skeleton (ADR 0208 spec FR-40 item 5a), such as `set_field(<code> or msg, ...)` or
+  `anything.Send(...)`. A dynamic row is hand-written, so it is the developer's code, like a `code`
+  row (G.1).
+- A *binding* row is a Read Field row, or a lookup row with an `assign_to`.
+- A *suite path* is the chain of control headers above a row, each compared by content. An `elif`
+  or `else` suite's path also includes every earlier clause test in its chain, so adding or
+  removing an `elif` ahead of an `else` changes the path of everything under that `else`.
+
+Under the flag, these hold (Manager decision 2026-10-07, after review, which states the rule as an
+invariant rather than a property of the moved row):
+
+1. A move or delete never moves or deletes a `code` row, and never carries one inside a block
+   (rule 5).
 2. After a move or delete, every `code` row keeps its order relative to the other `code` rows, and
-   its suite path: the chain of control headers above it, compared by content.
+   its suite path.
 3. Every hand-written header keeps its order relative to `code` rows and other hand-written headers,
    and its suite path.
-4. A dynamic row keeps its order relative to `code` rows and hand-written headers, and its suite
-   path. It may be deleted.
-5. A deleted or moved block takes no hand-written Python with it. A delete of an `if` covers its
-   whole chain: every `elif` test must be generator-shaped too, and no `elif` or `else` body may
-   hold a `code` row.
+4. A dynamic row is never moved or deleted (Manager decision 2026-10-07, after review). It is the
+   developer's code, so the analyst build treats it as G.1 treats a `code` row.
+5. A deleted or moved block takes no hand-written Python with it: no `code` row, no dynamic row, and
+   no hand-written header. A delete of an `if` covers its whole chain: every `elif` test must be
+   generator-shaped too, and no `elif` or `else` body may hold a `code` row or a dynamic row.
+6. A block that holds a binding row is never moved or deleted. A top-level binding row is never
+   deleted while a later row reads its variable, and never moved below a row that reads it
+   (Manager decision 2026-10-07, after review). Either would leave that read unbound. The R1
+   branch's `_is_typed_stmt` already refuses the block case.
 
 A typed row that is not dynamic may move past a `code` row in the same suite: rule 2 holds, and the
 result is the same as inserting the typed row there, which the analyst build already allows. A `pass`
 statement does not count as a `code` row for this rule, so an analyst can delete a block whose body
-is still the generator's `pass` seed. Rules 3 and 4 are Manager decisions 2026-10-07, from spike S-4,
-which found that the repository check needs them (ADR 0208 spec FR-40).
+is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager decisions
+2026-10-07, from spike S-4, which found that the repository check needs them (ADR 0208 spec FR-40).
 
 This narrows, in typed-only mode only, at least: §2 Phase 3 and §5 of this ADR; ADR 0106; the
 *Delete* and *Move* verbs of [ADR 0103](0103-steps-view-row-context-menu.md)'s row menu; and the
@@ -1366,7 +1380,8 @@ landed.
 **This rule is the target, and the R1 tests are evidence only once they match it.** The R1 branch's
 `_refuse_untyped_structure`, read at `8df2bcf210`, checks the moved row, an up/down neighbour and a
 drop target's enclosing blocks. That is not the same rule: for example, it lets a dynamic row be
-dragged across a `code` row to a typed anchor, which rule 4 refuses. Where the two differ, the R1 code
+dragged across a `code` row to a typed anchor, which rule 4 refuses. It does match rule 6's block
+case. Where the two differ, the R1 code
 is what has to change.
 
 ### G.7 The R1 fix: values a typed edit may write
@@ -1387,25 +1402,30 @@ The R1 fix would change that, in every mode, at least as follows:
 describes it for a reader. **The list is not a gate.** No check, test or requirement may treat it as
 the definition of inert; a checker calls the lens's predicate (Manager decision 2026-10-07, after
 review). The list is a lower bound: the predicate admits at least these, with one exception that
-is a ceiling, the module-level name rule below. Nothing it admits calls anything, except a bounded
-`msg.field(...)` read and `FhirToken(...)`, named below.
+is a ceiling, the module-level name rule below. Nothing it admits calls anything, except at least a
+bounded `msg.field(...)` read, `FhirToken(...)` and `FhirRaw(<string literal>)`.
 
 - a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
 - `+` and `-` over numbers and admitted names; `*`, `/` and `//` over number literals only, with a
   non-zero divisor; never `%` or `**`;
 - a plain name other than `msg`, not a dunder, that cannot hold message content:
   - a For Each `range` loop index;
-  - a module-level name, only when its one binding is to a literal of an immutable type (a `str`,
-    number, `bool`, `None`, or a tuple of those) or to `code_set("<literal>")`, and nothing in the
-    module mutates it. *Mutates* covers at least a second binding (a `global` rebind included), a
-    `del`, an augmented assignment, an assignment or `del` through an attribute or subscript of it,
-    and a method call on it or on an attribute of it. A `CodeSet` is frozen in use but holds a plain
-    dict, so `X._data.update(...)` would change it without a binding (Manager decision 2026-10-07,
-    after review). A mutable container fails this however it is used: `SEEN = []` plus
-    `SEEN.append(msg["PID-3"])` rebinds nothing, yet `SEEN` then holds message content. **This is a
-    ceiling: the predicate SHALL NOT admit a module-level name outside it, whatever the R1 tests
-    say;**
-  - in value params only, any other such name, because a value param may carry message content;
+  - outside value params, a module-level name only when its one binding is to a literal of an
+    immutable type (a `str`, number, `bool`, `None`, or a tuple of those), and nothing in the module
+    mutates it. *Mutates* covers at least a second binding (a `global` rebind included), a `del`, an
+    augmented assignment, an assignment or `del` through an attribute or subscript of it, and a
+    method call on it or on an attribute of it. A mutable container fails this however it is used:
+    `SEEN = []` plus `SEEN.append(msg["PID-3"])` rebinds nothing, yet `SEEN` then holds message
+    content;
+  - a name bound to `code_set("<literal>")`, **only** as `code_lookup`'s `table` argument, and
+    refused everywhere else (Manager decision 2026-10-07, after review). `code_set` returns the
+    shared active `CodeSet`, whose storage is a plain dict, so any `code` row can write message
+    content into it without naming the bound variable: `code_set("lab")._data["k"] = msg["PID-3"]`.
+    No engine change is made for this;
+  - **these two bullets are a ceiling: outside value params, the predicate SHALL NOT admit a
+    module-level name beyond them, whatever the R1 tests say;**
+  - in value params, any non-dunder name other than `msg`, because a value param may carry message
+    content anyway;
 - a list, tuple, set or dict built only from inert values, with no splat;
 - in value params only, a bounded field read (`msg.field(...)` taking only `occurrence` and
   `repetition` keywords) or a `templated` f-string whose every read is one;
@@ -1418,9 +1438,9 @@ those tests differ, the tests win. `set_params` on action, lookup and diagnostic
 refuses a `dynamic` value (AC-M5).
 
 **The module-level name ceiling is not yet what the R1 branch does.** Read at `8df2bcf210`, its
-`_message_locals` admits any module-level binding no function rebinds, and a name bound nowhere, and
-its tests admit `SEEN`. The R1 code (PR 2155) is being changed to match the ceiling, and AC-G9 adds
-a refusal test for it.
+`_message_locals` admits any module-level binding no function rebinds, and a name bound nowhere, so
+its predicate would admit `SEEN` and a `code_set` name anywhere; no test covers either. The R1 code
+(PR 2155) is being changed to match the ceiling, and AC-G9 adds refusal tests for it.
 
 **A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
 `_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
@@ -1428,8 +1448,8 @@ accepts any `X.attr` callee by its last name. So `set_field(__import__("os").get
 "PID-5.1", "X")` and `anything.Send("OB", msg)` read back as ordinary typed rows whose `params` look
 unchanged. The Steps view then shows code that runs as a typed step. ADR 0208's repository check
 would close this for itself, once built, by comparing each typed row's full statement (spec FR-40
-item 5a); whether the lens
-should refuse to project such a row as typed is open work for the R1 fix.
+item 5a). Whether the lens should refuse to project such a row as typed is open work for the R1
+fix.
 
 That sentence of E.11 is not rewritten; the dated pointer appended to it sends the reader here. The
 change is being built separately and has not landed.
@@ -1461,5 +1481,6 @@ change is being built separately and has not landed.
 - [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`
   G.7 refuses, or a `set_params` on a route row whose base `handlers` is not a literal list, THEN
   `lens rewrite` SHALL refuse it, in every mode. R1 payloads 3 and 4 (G.5) are refusal tests, and
-  so is an `{"expr": "SEEN"}` value on a `checkpoint` label in a module that binds `SEEN = []` and
-  calls `SEEN.append(...)` (the G.7 ceiling).
+  so are these (the G.7 ceiling): an `{"expr": "SEEN"}` value on a `checkpoint` label in a module
+  that binds `SEEN = []` and calls `SEEN.append(...)`; and a name bound to `code_set("<literal>")`
+  used as a `checkpoint` label or in a `log_note` template.

@@ -166,13 +166,16 @@ ordinary review is what catches these (D-C):
   permit;
 - raise an error, or filter the message so nothing is delivered;
 - insert a typed step that changes data an unchanged `code` row below it later reads;
-- delete a lookup row, leaving its variable unbound for the rows after it. The lens already refuses
-  a delete or move of a Read Field row for this reason (the `read_field` gate in `rewrite_source`,
-  `messagefoundry/lens.py`), but that gate keys on `read_field` alone, so it does not cover a
-  lookup's `assign_to`. The R1 branch goes part of the way: under typed-only mode, its
-  `_is_typed_stmt` treats a Read Field or assigned lookup row nested in a moved or deleted block as
-  untyped, so that block is refused. A delete of a top-level lookup row is still allowed, so this
-  stays open.
+- delete a developer-written dynamic row. The analyst build refuses this (ADR 0076 Amendment G,
+  G.6 rule 4), but a change made with another tool passes the repository check (FR-40 item 3);
+- delete a lookup row, or move it below a row that reads its variable, leaving that read unbound.
+  The analyst build would refuse both (G.6 rule 6), but the repository check does not test for an
+  unbound read. Today the lens refuses a delete or move of a Read Field row for this reason (the
+  `read_field` gate in `rewrite_source`, `messagefoundry/lens.py`). That gate keys on `read_field`
+  alone, because it was written for Read Field rows (ADR 0089 row 4, BACKLOG #1505), so it does not
+  yet cover a lookup's `assign_to`. Under typed-only mode, the R1 branch's `_is_typed_stmt` already
+  refuses a moved or deleted block that holds a binding row. The top-level case of rule 6 is open
+  work for the R1 fix.
 
 **What already gates what runs, under both:** a change reaches a running engine only when someone with
 `config:deploy` reloads it, under the existing step-up and the site's `[approvals]` dual control. That
@@ -448,7 +451,8 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
 - Its Steps view is the same native extension as the analyst build's (ADR D3).
 - It applies **no per-user limits**, keeps every ADR 0076 guardrail, and offers the Python editor with
   an open language server, git, a terminal and the debugger. Pylance is licensed for Microsoft
-  products only, so the server is an open one such as basedpyright (spike S-1).
+  products only, so the server would be an open one such as basedpyright. Spike S-1 did not record
+  one; that leg is open.
 - It needs no engine session to edit or save.
 - It opens a Router or Handler in the Code view by default, with the Steps view one switch away, so
   ADR 0076's opt-in entry holds in it (AC-G3).
@@ -473,16 +477,15 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   3. Inside each def body, the ordered sequence of `code` rows is unchanged, each compared by content
      and by its enclosing suite path (the chain of control headers above it, compared by content),
      never by line number. So a hand-written line moved from under one condition to another fails.
-     From spike S-4:
-     - An `elif` or `else` suite's path includes every earlier clause test in its chain. So adding or
-       removing an `elif` ahead of an `else` that holds a `code` row is not Steps-only.
+     *Suite path*, *dynamic row* and *hand-written header* are defined once, in ADR 0076 Amendment G,
+     G.6. From spike S-4:
      - Changing a generated `if` test that encloses a hand-written line is not Steps-only, because
        the line's suite path changes. This is intended (Manager decision 2026-10-07, from spike S-4).
      - A `pass` statement is ignored on either side, so the `pass` seed of an If or For Each template
        or an Else If or Else clause (`_apply_insert_clause`) neither adds nor removes a row.
-     - Rules 3 and 4 of the structure rule in ADR 0076 Amendment G, G.6 hold between base and head:
-       hand-written headers and dynamic rows keep their order and suite path. A dynamic row may be
-       deleted.
+     - G.6 rule 3 holds between base and head. A dynamic row keeps its order relative to `code` rows
+       and hand-written headers, and its suite path, but may be deleted: the check passes that,
+       while the analyst build refuses it (G.6 rule 4, and section 5.2).
 
      The other sanctioned exception is the `sends = []` / `sends.append(...)` / `return sends`
      accumulator scaffold (ADR 0108), only when generator-shaped, with `return sends` only as the
@@ -490,14 +493,15 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   4. **Every control header** (`if`, `elif`, `for`, and the `raise` expression) is compared by content
      against base, like a `code` row, with its suite path. A changed or added header is Steps-only
      only when generator-shaped. A removed or moved header passes only when the base header was
-     itself generator-shaped. A hand-written header keeps its order and suite path (G.6 rule 3, from
-     spike S-4). `recognized` is not evidence: it is
+     itself generator-shaped. G.6 rule 3 also holds. `recognized` is not evidence: it is
      a deny-list (`_is_bounded`, `_emit_if` and `_is_message_iteration` in `messagefoundry/lens.py`,
      and the raise branch), so `if os.system("calc"):`, `for g in msg.groups(os.system("calc")):` and
      `raise ValueError(os.system("calc"))` read back as recognized today.
   5. Every typed parameter that is new or changed is a literal or an inert value under ADR 0076
-     Amendment G, G.7, as the lens's own predicate decides (from spike S-4: `insert_code_lookup`
-     writes a code-set name, and For Each writes `occurrence=i`, and neither is a literal). The four
+     Amendment G, G.7, as the lens's own predicate decides (from spike S-4: For Each writes
+     `occurrence=i`, which is not a literal). A name bound to `code_set("<literal>")` passes only as
+     `code_lookup`'s `table` argument, which `insert_code_lookup` writes, and fails anywhere else
+     (G.7; Manager decision 2026-10-07, after review). The four
      value params ADR 0076 E.11 rule 4 admits (`set_field.value`, `add_repetition.value`,
      `append_to_field.suffix`, `replace_literal.new`) may also be a template. A template anywhere else, such as a
      `db_lookup` statement or a `log_note` operand, is not Steps-only even though it reads back
@@ -543,7 +547,9 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   - from item 5a and G.7 (Manager decision 2026-10-07, after review): `trim_field(__import__("os").getcwd() or msg, "PID-5.1")`;
     `set_field(__import__("os").getcwd() or msg, "PID-5.1", "X")`; `anything.Send("OB", msg)`;
     an added `SEEN = []` at module level; and, with `SEEN = []` already at base, a new `checkpoint`
-    label or `log_note` template of `{"expr": "SEEN"}`.
+    label or `log_note` template of `{"expr": "SEEN"}`;
+  - a name bound to `code_set("<literal>")` used as a `checkpoint` label or in a `log_note` template
+    (G.7; Manager decision 2026-10-07, after review).
 
   It SHALL pass an ordinary Steps edit, an insert above a `code` row, and one of each sanctioned shape
   in items 2 and 3 (spike S-4).
@@ -675,8 +681,9 @@ route work.
 - `ide/src/stepsModel.ts` (about 3,500 lines) could become a shared view-model package. Spike S-1
   measured it: every line compiles outside VS Code except through one types-only chain,
   `stepsModel.ts` to `liveDebugModel` to `editorToolbar`'s `ElementKind` to `vscode`. The shared
-  package moves `ElementKind` into a module free of `vscode`. About 84.1% of the file by bytes is
-  reused in a full port (Manager decision 2026-10-07, from spike S-1).
+  package moves `ElementKind` into a module free of `vscode`. About 84.1% of the file's bundled
+  bytes is the share a full port links; that is not the share that carries over, since every line
+  compiles (Manager decision 2026-10-07, from spike S-1).
 - `ide/media/stepsWebview.js` reaches the host only through `acquireVsCodeApi()`. Spike S-1 rendered
   it unchanged in a sandboxed iframe with a shim that supplies that function. The page shell, toolbar
   and CSS live in `ide/src/stepsView.ts`, so they move to the shared package too.
@@ -782,9 +789,9 @@ In CI these would start as separate, **non-required** jobs (section 12). Spike S
 
 | Spike | Question | Pass condition |
 |---|---|---|
-| S-1 | Does a native Theia Steps extension render and edit `samples/config`, and how much of `ide/` does it reuse? | Parse, render, edit, undo and Test work in a pinned Theia build; hot-exit is verified or dropped from FR-26; the shared share of `stepsModel.ts` and the `acquireVsCodeApi` shim are measured; the typed-row versus `code`-row share over `samples/config` is recorded; the Theia version and language server are recorded; @theia/playwright runs at that version (section 16). **Met except the Test leg**: branch `claude/theia-spike-s1` at `cd97e6b1b4`, under `theia-spike/`, not merged, on Theia 1.76.0. Hot-exit was dropped (FR-26). Test is still open because it needs the D-B generator-spec engine change, which is not built |
+| S-1 | Does a native Theia Steps extension render and edit `samples/config`, and how much of `ide/` does it reuse? | Parse, render, edit, undo and Test work in a pinned Theia build; hot-exit is verified or dropped from FR-26; the shared share of `stepsModel.ts` and the `acquireVsCodeApi` shim are measured; the typed-row versus `code`-row share over `samples/config` is recorded; the Theia version and language server are recorded; @theia/playwright runs at that version (section 16). **Met except the Test and language-server legs**, measured on a browser target: branch `claude/theia-spike-s1` at `cd97e6b1b4`, under `theia-spike/`, not merged, on Theia 1.76.0. Hot-exit was dropped (FR-26). Test is open because it needs the D-B generator-spec engine change, which is not built. No language server was recorded. The Electron build is checked by spike S-3 (Manager decision 2026-10-07, after review) |
 | S-2 | Does the analyst build have no text-editor route for `.py`? | A scripted walk of every command, menu and *Open With* entry opens no `.py` in Monaco, and finds no pop-up notification (FR-17) |
-| S-3 | Does the analyst build install and run on a managed Windows image? | It installs and runs Test without administrator rights; installer size and memory use are recorded |
+| S-3 | Does the analyst build install and run on a managed Windows image? | It installs and runs Test without administrator rights, as the Electron build; installer size and memory use are recorded. It is also the first check of the Electron target, which spike S-1 did not run |
 | S-4 | The repository check as a CI step on a sample config repository | It meets FR-41, run from a base-ref workflow per section 5.4. **Classifier half met by the spike**: branch `claude/theia-spike-s4-steps-only` at `673faa7c60`, `scripts/theia_spike/steps_only.py` with 80 tests in `tests/test_theia_steps_only_spike.py`, not merged. The base-ref workflow half is untested |
 
 ---
@@ -922,8 +929,8 @@ was checked against `messagefoundry/lens.py` at `origin/main` and on the R1 bran
 | F1. Typed rows compared by `params` only | FR-40 item 5a, FR-41; the lens's own gap is open work, Amendment G, G.7 |
 | F2. A palette block's `pass` seed blocks its own delete | Amendment G, G.6 structure rule; FR-40 item 3 |
 | F3. Merge before commit | FR-34, section 6 step 7 |
-| F4. Deleting an `if` skips its `elif` and `else` | Amendment G, G.6 structure rule 4 |
-| F5. Refusal keyed on the moved row | Amendment G, G.6 structure rule 1, stated as an invariant |
+| F4. Deleting an `if` skips its `elif` and `else` | Amendment G, G.6 structure rule 5 |
+| F5. Refusal keyed on the moved row | Amendment G, G.6 structure rule 2, stated as an invariant |
 | F6. A mutable module-level name read as inert | Amendment G, G.7; FR-41 |
 | F7. AC-G7 against `_validated_raw_test` | Amendment G, AC-G7 |
 | F8. The inert list used as a gate | Amendment G, G.7; FR-40 item 5 |
@@ -933,9 +940,12 @@ was checked against `messagefoundry/lens.py` at `origin/main` and on the R1 bran
 | F12. ADR 0103 Delete and Move, ADR 0089 block-cut | Amendment G, G.6 |
 | F13. Stale-base test never resets | FR-39 |
 | F14. Block rule restated; stale index rows | Amendment G, G.6 states it once; G.1, AC-G5, FR-20, section 8.2, ADR AC-12 point there; `docs/adr/README.md` rows |
-| F15. Deleted-lookup residual | Section 5.2: kept open. The `read_field` gate covers Read Field rows only |
+| F15. Deleted-lookup residual | Amendment G, G.6 rule 6; section 5.2 keeps the top-level case open for the R1 fix |
 | Spike S-4 findings | FR-40 items 2 to 6, the false-failure and public-surface notes, FR-41, section 17 |
 | Spike S-1 findings | FR-26, sections 8.1, 8.2, 9, 10, 11.2, 12, 16 and 17; ADR D3, D9 and AC-10 |
+| Review of `af7f0a73e8`: a `code_set` name is shared mutable storage | Amendment G, G.7 (only as `code_lookup`'s `table`), AC-G9; FR-40 item 5, FR-41 |
+| Review of `af7f0a73e8`: binding rows and dynamic rows under G.6 | Amendment G, G.6 rules 4 to 6; section 5.2 |
+| Review of `af7f0a73e8`: other findings | S-1 and S-3 rows, section 7.7, section 11.2, ADR D3 and AC-14, FR-40 items 3 to 5, this table, README rows |
 
 ## Appendix C: what changed from the 2026-10-02 drafts
 

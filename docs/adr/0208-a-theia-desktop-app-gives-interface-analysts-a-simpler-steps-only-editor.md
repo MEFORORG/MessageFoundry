@@ -124,9 +124,10 @@ it, only when the site meets spec section 5.4.**
   removes *Open With* (AC-G1, spike S-2). The analyst build also needs `@theia/preferences`, with
   `@theia/userstorage`, or it hangs on a missing `PreferenceProvider` binding; that brings in
   `@theia/markers`, `@theia/outline-view` and `@theia/variable-resolver` (Manager decision 2026-10-07, from spike S-1). The port is the
-  main cost (spec section 11). Spike S-1 measured the reuse: `ide/media/stepsWebview.js` renders
-  unchanged through an `acquireVsCodeApi` shim, and about 84.1% of `ide/src/stepsModel.ts` by bytes
-  carries over.
+  main cost (spec section 11). Spike S-1 measured the reuse on a browser target:
+  `ide/media/stepsWebview.js` renders unchanged through an `acquireVsCodeApi` shim, and every line of
+  `ide/src/stepsModel.ts` compiles outside VS Code, with about 84.1% of its bundled bytes being the
+  share a full port links.
 - **D4 -- `code:steps` and a built-in Analyst role.** `code:steps` is added to the permission catalog
   and is **advisory**: the analyst build reads it, and no engine route checks it. `Coding` gains it.
   A new built-in Analyst role holds it and not `code:edit` (ruling 7). "`code:edit` implies
@@ -242,8 +243,8 @@ promote stays `POST /config/reload` with step-up and the site's dual control unc
   while any of those steps fails, including a conflict (AC-14) or a missing git or credential
   (AC-15).
   -> editor test *stale base* (path open)
-- **AC-14** -- IF a merge conflicts, THEN THE ANALYST BUILD SHALL push nothing and say "ask a
-  developer".
+- **AC-14** -- IF a merge conflicts, THEN THE ANALYST BUILD SHALL abort the merge, push nothing and
+  say "ask a developer".
   -> editor test *conflict* (path open)
 - **AC-15** -- IF git or its credential is missing, THEN THE ANALYST BUILD SHALL push nothing and say
   which is missing.
