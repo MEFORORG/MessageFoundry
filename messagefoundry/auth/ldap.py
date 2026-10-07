@@ -124,7 +124,8 @@ class DirectoryAnswer(Enum):
     #: reconciler can hold a wave of them (ADR 0195) instead of revoking it.
     UNDETERMINED = "undetermined"
     #: The search matched more than one entry, so none is provably the account asked about (vault
-    #: BACKLOG #2778). Refused on every sign-in path; the reconciler reads it as absent.
+    #: BACKLOG #2778). Refused on every sign-in path; the reconciler reads it as absent, and the
+    #: step-up re-bind audits it as ``not_in_directory`` and does not count it.
     AMBIGUOUS = "ambiguous"
 
 

@@ -1456,6 +1456,11 @@ _REBIND_REFUSALS: Final[Mapping[DirectoryAnswer | None, str]] = MappingProxyType
         DirectoryAnswer.NOT_FOUND: "not_in_directory",
         DirectoryAnswer.DISABLED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED],
         DirectoryAnswer.UNDETERMINED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.UNDETERMINED],
+        # Vault BACKLOG #2778. The id-keyed search shares `_search_user`, so a directory that
+        # answers two entries for one objectGUID is refused as AMBIGUOUS there too. No entry is
+        # provably the row's own, which is what `not_in_directory` already means, and the
+        # reconciler reads the same answer as ABSENT. Without this arm the lookup raised KeyError.
+        DirectoryAnswer.AMBIGUOUS: "not_in_directory",
     }
 )
 
@@ -1572,8 +1577,8 @@ class _DirectoryRebind:
     ``not_in_directory``, ``directory_disabled`` or ``directory_undetermined``, and, from a
     directory implementation that does not check the id itself, ``directory_object_id_missing`` or
     ``directory_identity_conflict`` (``None`` whether or not the bind succeeded).
-    ``not_in_directory`` means no entry for the row's id, or an entry that does not read the id
-    back. Since BACKLOG #2434 a disabled entry and an unreadable account state have their own
+    ``not_in_directory`` means no entry for the row's id, an entry that does not read the id
+    back, or more than one entry for it (vault BACKLOG #2778). Since BACKLOG #2434 a disabled entry and an unreadable account state have their own
     slugs, read from the bind's own lookup."""
 
     verdict: bool | None
@@ -8248,7 +8253,8 @@ class AuthService:
 
         **``authenticate`` says what its lookup found (BACKLOG #2434).** Its :class:`DirectoryBind`
         tells a refused bind on an enabled entry (``False``, counted) from an absent entry
-        (``not_in_directory``), a disabled one (``directory_disabled``) and an unreadable account
+        or an ambiguous one (``not_in_directory``, vault BACKLOG #2778), a disabled one
+        (``directory_disabled``) and an unreadable account
         state (``directory_undetermined``), none of them counted. Counting those would lock the
         engine row of a user whose every re-bind fails whatever they type, and the lock is then
         enforced at their Kerberos and OIDC sign-in. Before #2434 a second lookup after every

@@ -107,6 +107,18 @@ def test_the_reconciler_reads_an_ambiguous_answer_as_absent() -> None:
     assert _REFUSED_OUTCOMES[DirectoryAnswer.AMBIGUOUS] is reconcile.ProbeOutcome.ABSENT
 
 
+def test_every_refused_answer_has_a_reconcile_outcome_and_a_re_bind_reason() -> None:
+    """Both tables are indexed by whatever answer the lookup gave, so a member missing from either
+    is a KeyError on that path, not a refusal. AMBIGUOUS reaches the step-up re-bind too: its
+    id-keyed search shares ``_search_user`` with the name-keyed one."""
+    from messagefoundry.auth.service import _REBIND_REFUSALS, _REFUSED_OUTCOMES
+
+    refused = set(DirectoryAnswer) - {DirectoryAnswer.FOUND}
+    assert set(_REFUSED_OUTCOMES) == refused
+    assert set(_REBIND_REFUSALS) == refused | {None}
+    assert _REBIND_REFUSALS[DirectoryAnswer.AMBIGUOUS] == "not_in_directory"
+
+
 def test_one_entry_for_the_name_still_resolves() -> None:
     """Paired control: the same double with one entry is FOUND, so the refusal above is the count."""
     found = _authenticator()._lookup_by_name(_Conn([_X]), "victor")
@@ -155,9 +167,14 @@ def test_the_kerberos_lookup_resolves_no_principal(monkeypatch: pytest.MonkeyPat
 
 
 def test_the_password_is_never_bound_as_either_entry(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The password leg refuses too, and its only user bind is the timing equalizer's decoy DN."""
+    """The password leg refuses too, and its only user bind is the timing equalizer's decoy DN.
+
+    ``authenticate`` returns a :class:`DirectoryBind` since BACKLOG #2434: refused means no
+    principal, and the answer says the lookup was ambiguous rather than that a bind was judged."""
     binds: list[str] = []
     _install_directory(monkeypatch, binds)
-    assert _authenticator().authenticate("victor", "a-typed-password") is None
+    bound = _authenticator().authenticate("victor", "a-typed-password")
+    assert bound.principal is None
+    assert bound.answer is DirectoryAnswer.AMBIGUOUS
     assert "CN=X,DC=x" not in binds and "CN=V,DC=x" not in binds
     assert any("mf-nonexistent-timing-equalizer" in dn for dn in binds)
