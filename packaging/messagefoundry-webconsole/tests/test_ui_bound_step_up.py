@@ -13,10 +13,13 @@ after its own input checks. Upload resend also needs ``messages:edit``. The JSON
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 import httpx
+import pytest
 from _ui_clients import (
     ADT,
     PW,
@@ -210,6 +213,72 @@ async def test_an_edit_resubmit_repeated_with_one_proof_lands_once(
     rows = await engine.store.list_messages(limit=50, allowed_channels=None)
     children = [m for m in rows if m["id"] != mid]
     assert len(children) == 1
+
+
+async def test_an_edit_resubmit_cancelled_after_its_commit_keeps_its_repeat(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2625. A timeout or a client disconnect can cancel the resubmit after the store
+    committed the child. The request then never learns that it ran, and edit-resend has no
+    resend_log to fall back on, so dropping its spend record sent the retry to re-auth and a
+    fresh-key editor. A request that ends without a refusal keeps its record: the same-key retry
+    asks for no proof and lands on the child the first one made, and no second child exists."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+
+    (tmp_path / "in").mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "ch1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    mid = await seed_message(engine)
+    editor = f"/ui/messages/{mid}/edit"
+    post = f"/ui/messages/{mid}/edit-resend"
+    committed = asyncio.Event()
+    real_reroute = engine.edit_resend_reroute
+    calls = 0
+
+    async def cancelled_after_the_commit(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        outcome = await real_reroute(*args, **kwargs)
+        if calls == 1:
+            committed.set()
+            await asyncio.Event().wait()  # hangs until the request is cancelled
+        return outcome
+
+    monkeypatch.setattr(engine, "edit_resend_reroute", cancelled_after_the_commit)
+    form = {"raw": EDITED, "idempotency_key": "k1", "mode": "reroute"}
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        await mint_bound_proof(c, editor)  # the one proof
+        first = asyncio.create_task(c.post(post, data=form, headers=SAME_ORIGIN))
+        await committed.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        retry = await c.post(post, data=form, headers=SAME_ORIGIN)
+        assert _reauth_next(retry) is None
+        assert retry.status_code == 303 and retry.headers["location"] != f"/ui/messages/{mid}"
+        # Control: the first did spend the proof, so a NEW key still asks for one.
+        fresh = {**form, "idempotency_key": "k2"}
+        assert _reauth_next(await c.post(post, data=fresh, headers=SAME_ORIGIN)) == editor
+    assert calls == 2
+    rows = await engine.store.list_messages(limit=50, allowed_channels=None)
+    assert len(rows) == 2  # the origin and one child
+    children = [m for m in rows if m["id"] != mid]
+    assert [m["id"] for m in children] == [retry.headers["location"].rsplit("/", 1)[-1]]
 
 
 async def test_a_replay_still_opens_on_the_window(engine: Engine) -> None:

@@ -2090,12 +2090,17 @@ grant before it opens and the resubmit spends it after its own input checks, so 
 drops an edit the operator is about to type, and a refusal of the console's own input costs no proof.
 A refusal from the engine handler comes after the spend: the next submit asks again and re-opens the
 editor from the stored body, as an expired grant (300 s by default) does. The console resend checks
-its own input before it spends the proof too. On both, a same-key repeat of a request that already
-ran, or is still running, asks for no fresh proof: the session's spend of the proof on that same
-request marks it (a request the handler refused keeps no such mark, so its retry asks again), or,
-for a plain resend only, the key's `resend_log` row; the store answers it as ADR 0090's duplicate. A
-double-clicked resend lands on "already resent"; a repeated edit-resend lands on the child the
-first one made. One grant covers one request, and a bulk purge from the console is one request. The
+its own input before it spends the proof too. On both, a same-key repeat asks for no fresh proof
+when the session spent the proof on that same request and the handler did not refuse it, or, for a
+plain resend only, when the key has a `resend_log` row. A repeat that arrives while the first
+request is still running waits for it to finish, for 30 seconds at most, and past that asks
+for a proof of its own. If the handler refused the first, the repeat asks
+for a proof of its own, as the next submit does. A request that ends any other way keeps its mark,
+an error or a cancel by a timeout or a disconnect included, because the store may already have
+committed it. The store answers a repeat of a committed request as ADR 0090's duplicate. A repeat of
+one that never committed runs once, on the proof that request spent, so one proof still gives one
+delivery at most. A double-clicked resend lands on "already resent"; a repeated edit-resend lands
+on the child the first one made. One grant covers one request, and a bulk purge from the console is one request. The
 grant is keyed on the session and the action, not on a target. The rest of the step-up surface keeps
 the shared window on purpose: a bound proof is a typed password per action, and an operator replaying
 dead letters during an incident would type it per message. `[auth].require_action_step_up = false`

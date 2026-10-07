@@ -1133,14 +1133,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def _is_repeat(
         request: Request, action: str, *, key: str, to: str | None, from_log: bool
     ) -> bool:
-        """Whether this POST repeats a request that ran, or is running, under the same key (vault
-        BACKLOG #2625): the one request that may skip the proof, because the store can only answer
-        it as ADR 0090's duplicate. Kept per request (in the ASGI scope, keyed by these arguments),
-        so the gate and the route get the same answer.
+        """Whether this POST repeats a request under the same key that was not refused (vault
+        BACKLOG #2625): the one request that may skip the proof. Kept per request (in the ASGI
+        scope, keyed by these arguments), so the gate and the route get the same answer.
 
         The first sign is the proof this session spent on this very request, held in memory, so a
-        second POST in flight beside the first finds it before the first commits; a refused
-        request leaves none. The second, with ``from_log``, is the ``resend_log`` row a completed
+        second POST in flight beside the first finds it before the first commits. It waits for the
+        first to settle, and a refused first leaves no sign (``_auth._SpentForKey`` says what else
+        keeps one). The second, with ``from_log``, is the ``resend_log`` row a completed
         resend claimed, for a repeat after a restart. Only the plain resend reads it: a row records
         no actor and no action, and the resend handler renders no body and queues nothing on a
         duplicate. Nothing is asked under the org opt-out, where no proof is spent. The key and the
@@ -1154,7 +1154,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return bool(cache[cache_key])
         answer = False
         if _fits_key(key) and (to is None or is_connection_name(to)):
-            answer = proof_spent_for(request, action, _spent_name(request, key, to))
+            answer = await proof_spent_for(request, action, _spent_name(request, key, to))
             if not answer and from_log:
                 prior = await core.prior_resend(
                     engine=await deps.get_engine(request),
@@ -1268,25 +1268,28 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return _refused(RESEND_MALFORMED_NOTICE, status=400)
         # The engine handler's own action-bound gate does not run on a direct call, so the proof
         # the gate above only checked is spent here, immediately before the resend, and tied to
-        # this key. A same-key repeat (_is_repeat) spends nothing: the handler still runs it, for
-        # the channel-scope and target checks and a truthful outcome, and the store answers it as
-        # ADR 0090 §4's duplicate. A target that has since gone down answers 409 instead.
-        spent = _spent_name(request, body.idempotency_key, body.to)
-        spent_here = not await _resend_is_repeat(request)
-        if spent_here:
-            await spend_ui_action_step_up(
+        # this key. A same-key repeat (_is_repeat, or one found while spending) spends nothing:
+        # the handler still runs it, for the channel-scope and target checks and a truthful
+        # outcome, and the store answers a committed key as ADR 0090 §4's duplicate. A target
+        # that has since gone down answers 409 instead.
+        spend = (
+            None
+            if await _resend_is_repeat(request)
+            else await spend_ui_action_step_up(
                 request,
                 STEP_UP_ACTION_MESSAGE_RESEND,
                 reauth_next=_resend_confirm_next,
-                key=spent,
+                key=_spent_name(request, body.idempotency_key, body.to),
             )
-        ran = False
+        )
         try:
             result = await core.resend_message(
                 message_id, body=body, request=request, engine=engine, identity=identity
             )
-            ran = True
         except HTTPException as exc:
+            # A refusal drops the spend record, so a repeat waiting on it and the next submit
+            # both ask for a proof again.
+            settle_ui_action_step_up(spend, refused=True)
             # All three of 403/404/409 are handled rather than re-raised because an escaping
             # HTTPException renders as application/json inside the HTML console, with the caller's
             # own outbound name quoted in it. The log carries the STATUS only: the message id, the
@@ -1296,8 +1299,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 raise
             return _refused(notice, status=exc.status_code)
         finally:
-            if spent_here:
-                settle_ui_action_step_up(request, STEP_UP_ACTION_MESSAGE_RESEND, spent, ran=ran)
+            # Any other way out keeps the record, a cancel after the store committed included
+            # (_auth._SpentForKey says why). A no-op after the refusal above.
+            settle_ui_action_step_up(spend, refused=False)
         # `duplicate` means the key was already used and NOTHING was queued (ADR 0090 §4). Reporting
         # it as a send would be the same lie as answering a refusal with the success response.
         echo = {"to": result.to, "source": result.source} if result.source else {"to": result.to}
@@ -1440,33 +1444,35 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return await _reject("invalid input")
         # The engine handler's own action-bound gate does not run on a direct call, so the grant
         # the gate above only checked is spent here, immediately before the resubmit, and tied to
-        # this key. A same-key repeat (_is_repeat) spends nothing; the store answers it as a
-        # duplicate and the route lands where the first one did.
-        spent = _spent_name(request, body.idempotency_key, body.to)
-        spent_here = not await _resubmit_is_repeat(request)
-        if spent_here:
-            await spend_ui_action_step_up(
+        # this key. A same-key repeat (_is_repeat, or one found while spending) spends nothing;
+        # the store answers a committed key as a duplicate and the route lands where the first
+        # one did.
+        spend = (
+            None
+            if await _resubmit_is_repeat(request)
+            else await spend_ui_action_step_up(
                 request,
                 STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
                 reauth_next=_edit_page,
-                key=spent,
+                key=_spent_name(request, body.idempotency_key, body.to),
             )
-        ran = False
+        )
         try:
             result = await core.edit_resend_message(
                 message_id, body=body, engine=engine, identity=identity, request=request
             )
-            ran = True
         except HTTPException as exc:
+            # A refused resubmit drops its spend record BEFORE the two audited reads in _reject,
+            # so a repeat waiting on it is released at once, and the editor _reject re-renders
+            # with the same key asks for a proof again on the next submit.
+            settle_ui_action_step_up(spend, refused=True)
             # str(exc.detail) carries ids only (the endpoint never interpolates the body).
             return await _reject(str(exc.detail))
         finally:
-            # A refused resubmit drops its spend record, so the editor _reject re-renders with the
-            # same key asks for a proof again on the next submit.
-            if spent_here:
-                settle_ui_action_step_up(
-                    request, STEP_UP_ACTION_MESSAGE_EDIT_RESEND, spent, ran=ran
-                )
+            # Any other way out keeps the record, a cancel after the store committed included:
+            # edit-resend has no resend_log to fall back on, so dropping it here sent the retry
+            # to re-auth (_auth._SpentForKey). A no-op after the refusal above.
+            settle_ui_action_step_up(spend, refused=False)
         # Land on the NEW correlated child (re-route) so the operator sees the resubmit flow; the direct
         # path lands back on the origin (which now carries the new outbound row). The ORIGINAL is intact.
         target = result.new_message_id if (result.reroute and result.new_message_id) else message_id
