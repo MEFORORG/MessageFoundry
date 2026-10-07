@@ -514,6 +514,7 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
         await _add(service, "bob", Role.ADMINISTRATOR)
         a_held, release_a = asyncio.Event(), asyncio.Event()
         b_mid_swap, a_written = asyncio.Event(), asyncio.Event()
+        a_written_mid_swap = asyncio.Event()
         real_sync = engine._reconcile_reference_sync
         real_record = engine.store.record_audit
 
@@ -533,6 +534,7 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
             b_mid_swap.set()
             # Bounded: B holds the runner's reload lock here, and runs on past a client timeout.
             await asyncio.wait_for(a_written.wait(), timeout=30)
+            a_written_mid_swap.set()  # proves the ordering; a timeout above would skip this
             raise RuntimeError("an outbound would not start")
 
         async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
@@ -557,6 +559,7 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
             r_b = await asyncio.wait_for(reload_b, timeout=30)
         assert r_a.status_code == 200, r_a.text
         assert r_b.status_code == 500, r_b.text  # B failed after its swap and rolled back
+        assert a_written_mid_swap.is_set(), "A's row was not written while B's graph was live"
         assert engine.last_reload_dir == cfg_a.resolve(), "A's graph is the one running"
 
         (row,) = await engine.store.list_audit(action="config_reload")

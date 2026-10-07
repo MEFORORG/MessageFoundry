@@ -1449,8 +1449,8 @@ _CONFIG_BASELINE_WINDOW = 50
 #: and any flag toggle that process writes. A later start passes over such a row to the last checked
 #: one, so the change the unchecked start could not see is still reported. A start row that a reload
 #: superseded before it was written carries it too (vault BACKLOG #2838): its digest is no baseline.
-#: So does a reload row written after a later reload or a flag toggle moved the loaded fingerprint
-#: on (vault BACKLOG #2257). A reload row the engine has not moved past is never marked.
+#: So does an inline or released reload's row written after a later reload or a flag toggle moved
+#: the loaded fingerprint on (vault BACKLOG #2257), and a convergence reload's row with no digest.
 _BASELINE_UNCHECKED = "baseline_unchecked"
 
 #: What a start's ``config_loaded`` row records as ``comparison``.

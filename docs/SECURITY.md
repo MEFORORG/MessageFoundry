@@ -1765,9 +1765,11 @@ attempt row may have committed after all.
 BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
 the digest it took before the swap. The row is written after the swap, so a second reload or a
 connection flag toggle can move the engine on first. The row then still names its own config, but
-is marked `superseded` and `baseline_unchecked`, so the next start does not compare against it.
-The check runs just before the write, so a swap after it is not caught. A cluster convergence
-reload's row is still read from the engine's live state when it is written.
+is marked `superseded` and `baseline_unchecked`, so the next start passes over it and does not
+compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
+fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
+runs just before the write, so a change after it is not caught. A cluster convergence reload's
+row is still read from the engine's live state when it is written.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
