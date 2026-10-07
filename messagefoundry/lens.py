@@ -4273,7 +4273,9 @@ def _insert_value_policy(call: str, pname: str) -> str:
 
 def _is_field_call(node: ast.expr, *, scope: _Scope) -> bool:
     """Whether ``node`` is ``msg.field("LIT")`` with only ``occurrence=``/``repetition=`` keywords whose
-    values are integers or admitted names (a For-Each index: ``occurrence=i``).
+    values are 1 or more on every message (:func:`_is_index_value`: int arithmetic, a 1-based
+    For-Each index such as ``occurrence=i``, or that index plus a non-negative literal), or a
+    ``repetition=None``.
 
     Stricter than :func:`_is_bounded_message_read`, which also admits extra POSITIONAL constants:
     ``Message.field`` takes ``occurrence`` and ``repetition`` keyword-only, so ``msg.field("X", 2)``
@@ -4763,10 +4765,13 @@ def _reaches_globals(n: ast.AST, safe_getattr: set[int]) -> bool:
     import or alias (``import builtins as b``, ``from builtins import globals as g``); and a
     ``getattr`` used any way but a direct call with a non-dunder string literal name, so an alias
     (``ga = getattr``) counts too (Lander review of 71fe1207f4, finding 4). ``safe_getattr`` holds
-    the ``id`` of each ``getattr`` name node that IS such a direct call. A frame's ``f_globals``,
-    ``__getattribute__`` and ``operator.attrgetter`` count as attributes. A relative import from a
-    sibling module named ``builtins`` does not count. A bypass not listed here may remain: this is a
-    static check."""
+    the ``id`` of each ``getattr`` name node that IS such a direct call, and whose name is not in
+    :data:`_GLOBALS_ATTRS`. ``locals``, a frame's ``f_globals``, ``f_locals`` and ``f_builtins``,
+    ``__getattribute__`` and ``operator.attrgetter`` count too, and so does an absolute
+    ``from X import <name>`` of any of those names (``from sys import modules``). A relative import
+    from a sibling module named ``builtins`` does not count. This is a deny list, so a bypass not
+    listed here remains possible: a re-export under another name, ``inspect.getmodule``, a
+    self-import and the like are known to pass."""
     if isinstance(n, ast.Name):
         if n.id == "getattr":
             return id(n) not in safe_getattr
