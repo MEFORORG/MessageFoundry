@@ -5784,8 +5784,9 @@ def _host_gated_store_settings(
     fresh empty store would wrongly report for them.
 
     Both refusals exit 2, "could not start", as each command's ``StoreNotFoundError`` arm already
-    did for a server database with no store (vault BACKLOG #3110, item 4). They exited 1, the code
-    these commands give a refusal about the account.
+    did for a server database with no store (vault BACKLOG #3110, item 4). They exited 1 before,
+    which the admin commands give a refusal about the account and the transit-bound commands give a
+    refused write.
     """
     from pathlib import Path
 
@@ -6176,7 +6177,7 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
-        store_driver_errors,
+        store_open_errors,
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
     from messagefoundry.store.transit_attestation import (
@@ -6218,12 +6219,14 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     # A refused write raises one of these on every backend (BACKLOG #1983). The row and its audit
     # row share one transaction, so a refusal leaves neither. sqlite3.DatabaseError is here because
     # an open's own failure has already been re-raised as _StoreOpenFailed, so what reaches this
-    # clause is the write, such as "database is locked".
+    # clause is the write, such as "database is locked". store_open_errors() carries pyodbc's Error
+    # root and InterfaceError (a failed login, a missing driver, a deadlock victim) and OSError
+    # (vault BACKLOG #3054, item 10), and UnicodeError is a driver decoding a row's text.
     store_errors: tuple[type[Exception], ...] = (
         RuntimeError,
-        OSError,
         sqlite3.DatabaseError,
-        *store_driver_errors(),
+        UnicodeError,
+        *store_open_errors(),
     )
     # A key that cannot be resolved at open, or a cipher refusal (Transit unreachable) at either end.
     key_errors: tuple[type[Exception], ...] = (
@@ -6272,7 +6275,8 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
             )
             return ("attested", recorded, store.path)
         finally:
-            await store.close()
+            # A close that fails after the write committed must not report that write as refused.
+            await _close_store_quietly(store)
 
     try:
         outcome, row, path = run_guarded(run())
@@ -6285,11 +6289,16 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     except _StoreOpenFailed as exc:
         return _emit_store_open_error(exc.cause, settings.store.path, as_json=args.json)
     except _StoreConnectFailed as exc:
-        _emit_error(f"could not open the store: {exc.cause}", as_json=args.json)
+        _emit_error(
+            f"could not open the store at {_store_label(settings.store)}: "
+            f"{_store_error_text(exc.cause)}",
+            as_json=args.json,
+        )
         return 2
     except store_errors as exc:
         return _emit_error(
-            f"the store refused the write, so nothing was recorded ({exc}). If the engine is "
+            f"the store refused the write, so nothing was recorded ({_store_error_text(exc)}). "
+            "If the engine is "
             "running on a SQLite store, stop it and re-run",
             as_json=args.json,
         )
@@ -9815,6 +9824,27 @@ class _AuditWalkStopped(RuntimeError):
     to print."""
 
 
+def _store_error_text(exc: Exception) -> str:
+    """A store error as one line that quotes no row's content: the rendering
+    :func:`_emit_store_open_error` documents. ``store attest-transit-bound`` uses it too, for a
+    failed open or a refused write (BACKLOG #2337)."""
+    import re
+
+    from messagefoundry.redaction import safe_exc
+    from messagefoundry.store.base import driver_sqlstate
+
+    state = driver_sqlstate(exc)
+    if isinstance(exc, sqlite3.DatabaseError):
+        return re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
+    if state is not None:
+        # The native number, read by the anchored pattern the database connector uses; never text.
+        native = re.findall(r"\((\d{1,6})\)\s*\(SQL[A-Za-z]+\)", str(exc))
+        return f"{type(exc).__name__} [SQLSTATE {state}]" + (
+            f" native error {native[-1]}" if native else ""
+        )
+    return safe_exc(exc)
+
+
 def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
     """One line and exit 2 for a store that could not be opened (BACKLOG #1670).
 
@@ -9842,23 +9872,7 @@ def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
     error with no SQLSTATE goes through ``safe_exc``: at least asyncpg's refused connection, an
     OSError, and its client errors, whose text ``safe_exc`` redacts by pattern only.
     """
-    import re
-
-    from messagefoundry.redaction import safe_exc
-    from messagefoundry.store.base import driver_sqlstate
-
-    state = driver_sqlstate(exc)
-    if isinstance(exc, sqlite3.DatabaseError):
-        shown = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
-    elif state is not None:
-        # The native number, read by the anchored pattern the database connector uses; never text.
-        native = re.findall(r"\((\d{1,6})\)\s*\(SQL[A-Za-z]+\)", str(exc))
-        shown = f"{type(exc).__name__} [SQLSTATE {state}]" + (
-            f" native error {native[-1]}" if native else ""
-        )
-    else:
-        shown = safe_exc(exc)
-    message = f"cannot open the store at {path}: {shown}"
+    message = f"cannot open the store at {path}: {_store_error_text(exc)}"
     if as_json:
         print(json.dumps({"error": message}))
     else:

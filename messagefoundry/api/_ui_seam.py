@@ -309,6 +309,10 @@ from typing import Any
 #: that failed to import (BACKLOG #1907), before any digest check runs. The digest records the
 #: alias's values, not its name, so renaming it alone would not move the digest.
 #:
+#: BACKLOG #2337: ``SecurityPosture`` gains ``transit_bound_attestation``, a
+#: ``TransitBoundAttestationView``, the vault_transit AES-GCM bound attestation. The console renders
+#: no new field, but the DTO is on the discovered surface, so the digest moved because it grew.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

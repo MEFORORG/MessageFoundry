@@ -309,10 +309,17 @@ _DIRECTORY_ARMS = [
     ["admin-unlock", "--username", "a", "--json"],
     ["admin-set-notify-email", "--username", "a", "--email", "a@example.org", "--json"],
     ["admin-reset-totp", "--username", "a", "--json"],
+    # BACKLOG #2337: the transit-bound commands share the admin commands' host gate.
+    ["store", "attest-transit-bound", "--reason", "r", "--json"],
+    ["store", "withdraw-transit-bound", "--json"],
 ]
 
 
-@pytest.mark.parametrize("argv", _DIRECTORY_ARMS, ids=[argv[0] for argv in _DIRECTORY_ARMS])
+@pytest.mark.parametrize(
+    "argv",
+    _DIRECTORY_ARMS,
+    ids=[argv[1] if argv[0] == "store" else argv[0] for argv in _DIRECTORY_ARMS],
+)
 def test_a_directory_named_as_the_service_config_exits_2(
     argv: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

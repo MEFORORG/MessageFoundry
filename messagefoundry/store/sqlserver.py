@@ -10983,11 +10983,10 @@ class SqlServerStore:
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
-                        # OPENS THE TRANSACTION, as in `record_audit`: the audit append takes
-                        # `sp_getapplock @LockOwner='Transaction'`, which needs one already open, and
-                        # under implicit transactions only a statement touching a table begins one.
-                        await cur.execute("SELECT TOP (1) seq FROM audit_log ORDER BY seq DESC")
-                        await cur.fetchall()  # drain, so the next execute on this cursor is clean
+                        # OPENS THE TRANSACTION and takes the audit applock first, the order the
+                        # withdraw leg takes them in; the append below re-takes the lock, which the
+                        # same owner may do.
+                        await self._open_under_audit_applock(cur)
                         [appended] = await self._append_audits(cur, (audit,), now=now)
                         await cur.execute(
                             "MERGE transit_bound_attestation WITH (HOLDLOCK) AS t"
@@ -11029,11 +11028,8 @@ class SqlServerStore:
                     async with self._cursor(conn) as cur:
                         # The audit applock FIRST, the order the record leg takes them in (its
                         # append, then the MERGE), so a concurrent attest and withdraw cannot
-                        # deadlock. The opener read starts the transaction the applock needs; the
-                        # append below re-takes the lock, which the same owner may do.
-                        await cur.execute("SELECT TOP (1) seq FROM audit_log ORDER BY seq DESC")
-                        await cur.fetchall()
-                        await self._applock(cur, _AUDIT_APPEND_LOCK)
+                        # deadlock. The append below re-takes the lock, which the same owner may do.
+                        await self._open_under_audit_applock(cur)
                         names = TRANSIT_ATTESTATION_COLUMNS.split(", ")
                         await cur.execute(
                             "DELETE FROM transit_bound_attestation OUTPUT "

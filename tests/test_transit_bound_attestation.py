@@ -506,6 +506,27 @@ def test_cli_a_write_the_store_refuses_is_exit_1_not_a_failed_open(
     assert "cannot open" not in err
 
 
+def test_cli_a_close_that_fails_after_the_write_does_not_report_it_refused(
+    transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The attestation has committed when the close runs, so a failed close warns and the result
+    stands: exit 0, not "the store refused the write, so nothing was recorded"."""
+    real_close = MessageStore.close
+
+    async def failing_close(self: MessageStore) -> None:
+        await real_close(self)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(MessageStore, "close", failing_close)
+    rc = main(["store", "attest-transit-bound", "--reason", "r", "--db", str(transit_db)])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "refused the write" not in captured.err
+    assert "closing the store failed" in captured.err
+    monkeypatch.setattr(MessageStore, "close", real_close)
+    assert _read(transit_db) is not None
+
+
 def test_cli_a_file_that_is_not_a_database_is_exit_2(
     transit_db: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
