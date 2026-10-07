@@ -300,6 +300,15 @@ from typing import Any
 #: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
 #: signatures changed.
 #:
+#: Vault BACKLOG #2460 / #2458: ``CoreHandlers`` gains a required ``resolve_action`` for the
+#: console's resolve of an interrupted release, with ``ApprovalResolveRequest`` and its ``outcome``
+#: values. ``PendingApprovalInfo`` gains ``params``, ``caller_is_requester`` and ``gated``. The
+#: digest moved because the surface grew. An older console on this engine is refused at mount by the
+#: digest. A newer console on an older engine fails earlier, at import: its approvals modules import
+#: the alias ``ResolveOutcome`` from ``api.models``. The engine reports that as an installed console
+#: that failed to import (BACKLOG #1907), before any digest check runs. The digest records the
+#: alias's values, not its name, so renaming it alone would not move the digest.
+#:
 #: Vault BACKLOG #2625: ``AuthService`` gained ``holds_action_step_up``, which the console's
 #: message editor calls to ask for an action-bound proof without spending it, and the console imports
 #: five new step-up action constants, for the resend, edit-resend, upload-resend, purge and reload
@@ -311,13 +320,15 @@ from typing import Any
 #: demand a proof. The engine builds ``CoreHandlers``, so a console that calls it against an engine
 #: without it would raise AttributeError at request time; the pinned digest refuses the pair at
 #: mount first.
+#: Re-derived again on the tree merged with PR 2115 (vault BACKLOG #2460 / #2458, entry above),
+#: whose ``resolve_action`` and ``PendingApprovalInfo`` fields moved the digest independently.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "bd65aff6f5a79dc6"
+ENGINE_UI_SEAM: str = "4250552c8e399e60"
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,11 +425,12 @@ class CoreHandlers:
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
     # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on approve
     # and reject, so each /ui route asserts approvals:approve through require_ui, which paces a /ui
-    # write the same way. The resolve of an interrupted release is not on the seam: its JSON gate is
-    # require_step_up and the console renders those rows read-only.
+    # write the same way. The resolve of an interrupted release (BACKLOG #2460) has the JSON gate
+    # require_step_up, so its /ui route takes require_ui_step_up for the same fresh re-proof.
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]
+    resolve_action: Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)

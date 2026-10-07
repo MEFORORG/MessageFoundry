@@ -58,6 +58,8 @@ POST /ui/account/sessions/{session_id}/revoke	session_id	path	-	-
 POST /ui/account/webauthn/{credential_id_hash}/delete	credential_id_hash	path	-	-
 POST /ui/approvals/{approval_id}/approve	approval_id	path	-	-
 POST /ui/approvals/{approval_id}/reject	approval_id	path	-	-
+POST /ui/approvals/{approval_id}/resolve/{outcome}	approval_id	path	-	-
+POST /ui/approvals/{approval_id}/resolve/{outcome}	outcome	path	-	-
 POST /ui/connections/{name}/flag	name	path	connection	422
 POST /ui/connections/{name}/purge/{scope}	name	path	connection	422
 POST /ui/connections/{name}/purge/{scope}	scope	path	-	-

@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -170,19 +171,86 @@ async def test_reseal_raises_rather_than_dropping_a_file_it_cannot_open(tmp_path
     assert (await _keyed_store(root, key_a).read_bytes(fid)).decode() == _ADT
 
 
-async def test_an_unreadable_file_is_counted_as_skipped_not_as_success(tmp_path: Path) -> None:
-    """A half-deleted pair must not be reported as re-sealed.
+def _garble(path: Path) -> None:
+    path.write_bytes(b"\xff\xfe not utf-8")
+
+
+def _remove(path: Path) -> None:
+    path.unlink()
+
+
+@pytest.mark.parametrize("break_body", [_remove, _garble], ids=["missing", "undecodable"])
+async def test_a_skipped_body_under_rotation_still_reseals_its_sidecar(
+    tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    """A half-deleted or unreadable pair must not be reported as re-sealed.
 
     ``skipped`` is what tells the operator NOT to retire the prior key yet, so it has to be non-zero
-    here — counting the pass as clean is the failure that loses the file two commands later.
+    here; counting the pass as clean is the failure that loses the file two commands later.
+
+    The sidecar under the retired key IS re-sealed (BACKLOG #2322). It is listed already, so sealing
+    it lists nothing new, and left under the old key it would drop out of reach of ``prune_expired``
+    once that key goes. Only a PLAINTEXT sidecar is held back; see the next test.
     """
     root = tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     fid = await _seed(_keyed_store(root, key_a))
-    (root / f"{fid}.blob").unlink()  # sidecar without a body
+    break_body(root / f"{fid}.blob")
 
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
     assert result == ResealResult(resealed=1, skipped=1)
+    assert (await _keyed_store(root, key_b).get_meta(fid)).filename == "acme.hl7"
+
+
+@pytest.mark.parametrize("break_body", [_remove, _garble], ids=["missing", "undecodable"])
+async def test_a_skipped_plaintext_body_leaves_its_sidecar_untouched_and_unlisted(
+    tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    """BACKLOG #2322: the body-first order has to hold when the body FAILS, not only when it succeeds.
+
+    A keyed store refuses a plaintext sidecar, so the upload is not listed. Sealing that sidecar over
+    a body the pass did not seal would list an upload whose body is unusable, and the missing-body arm
+    is also the cheapest plant: one hand-written sidecar. So the sidecar comes out byte-for-byte as it
+    went in. It counts as ``unsealable``, not ``skipped``: neither half is under any key, and no
+    re-run changes that, so a skip would send the operator to re-run forever (PR 2102 repair). A
+    second pass leaves it alone and counts it the same way.
+    """
+    root = tmp_path / "uploads"
+    fid = await _seed(_keyed_store(root, None))
+    break_body(root / f"{fid}.blob")
+    sidecar = (root / f"{fid}.meta").read_bytes()
+
+    keyed = _keyed_store(root, generate_key())
+    for _ in range(2):
+        assert await keyed.reseal_to_active() == ResealResult(unsealable=1)
+        assert (root / f"{fid}.meta").read_bytes() == sidecar
+    assert await keyed.list_files() == []
+
+
+async def test_an_unreadable_sidecar_still_counts_its_pair_once(tmp_path: Path) -> None:
+    """The other half of the unit: a readable body is sealed, and the failed sidecar adds ONE skip.
+
+    The plaintext body it sealed does not count in ``sealed_plaintext``: that field counts uploads
+    turned from refused into readable, and this one is still unreadable.
+    """
+    root = tmp_path / "uploads"
+    fid = await _seed(_keyed_store(root, None))
+    _garble(root / f"{fid}.meta")
+
+    result = await _keyed_store(root, generate_key()).reseal_to_active()
+    assert result == ResealResult(resealed=1, skipped=1, sealed_plaintext=0)
+
+
+async def test_a_pair_with_both_halves_unreadable_counts_once(tmp_path: Path) -> None:
+    """``skipped`` counts uploads, so two failed halves of one pair still add one."""
+    root = tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    fid = await _seed(_keyed_store(root, key_a))
+    (root / f"{fid}.blob").unlink()
+    _garble(root / f"{fid}.meta")
+
+    result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
+    assert result == ResealResult(resealed=0, skipped=1)
 
 
 async def test_reseal_ignores_a_foreign_file_in_the_uploads_root(tmp_path: Path) -> None:

@@ -350,12 +350,17 @@ def sanitize_svg(body: bytes) -> bytes:
     well-formed, entity-free document with an ``svg`` root in the SVG namespace or in none."""
     if len(body) > _MAX_SVG_BYTES:
         raise SvgRejected(f"SVG is larger than {_MAX_SVG_BYTES} bytes")
+    # The parser's error can quote sender text (an entity name, a system id, an encoding label), so
+    # only its type name is kept and the refusal is raised after the except ends: no caller's log
+    # or traceback can reach the original through the chain (BACKLOG #2387, #1796).
+    root: Element | None = None
+    refused = "no root element"
     try:
         root = _xml_fromstring(body, forbid_dtd=False, forbid_entities=True, forbid_external=True)
     except (ParseError, DefusedXmlException, ValueError, LookupError) as exc:
-        raise SvgRejected(
-            f"SVG is not a well-formed, entity-free document: {type(exc).__name__}"
-        ) from exc
+        refused = type(exc).__name__
+    if root is None:
+        raise SvgRejected(f"SVG is not a well-formed, entity-free document: {refused}")
     ns, local = _split(root.tag)
     if local != "svg" or ns not in (SVG_NS, ""):
         raise SvgRejected("document root is not an SVG svg element")

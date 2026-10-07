@@ -24,6 +24,7 @@ that probe FAILS the open when it cannot verify RCSI, and this test is about wha
 
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from typing import Any
@@ -50,7 +51,7 @@ class _FakePool:
     async def wait_closed(self) -> None:
         self.wait_closed_called += 1
         if self._wait_closed_hangs:
-            raise RuntimeError("wait_closed wedged")
+            raise ConnectionResetError("wait_closed wedged")
 
 
 class _FakeExecutor:
@@ -148,12 +149,16 @@ async def test_open_closes_pool_and_shuts_down_executor_when_ensure_schema_raise
 
 
 async def test_open_still_shuts_down_the_executor_when_wait_closed_hangs(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """THE MUTATION THIS PINS: releasing the executor only AFTER ``await pool.wait_closed()`` returns,
     instead of in a ``finally`` wrapped around it. Red (pre-fix ordering): ``wait_closed()`` raising
     skips straight past the shutdown line, so ``fake_executor.shutdown_calls`` stays empty even though
-    the pool-close path ran."""
+    the pool-close path ran.
+
+    Since vault BACKLOG #3054 the cleanup's own failure is logged by class and the OPEN's error
+    propagates, so a failed cleanup never hides why the open failed (an audit chain read that
+    `audit-verify` must report, among others). It used to be the cleanup's error that escaped."""
     pool = _FakePool(wait_closed_hangs=True)
     _install_fake_aioodbc(monkeypatch, pool)
     monkeypatch.setattr(SqlServerStore, "_ensure_schema", _boom_ensure_schema)
@@ -163,8 +168,13 @@ async def test_open_still_shuts_down_the_executor_when_wait_closed_hangs(
         sqlserver_module, "_build_pool_executor", lambda settings, maxsize=None: fake_executor
     )
 
-    with pytest.raises(RuntimeError, match="wait_closed wedged"):
+    with (
+        caplog.at_level(logging.WARNING, logger=sqlserver_module.__name__),
+        pytest.raises(RuntimeError, match="schema boom"),
+    ):
         await SqlServerStore.open(_settings())
+    assert "closing the pool after a failed open also failed (ConnectionResetError)" in caplog.text
+    assert "wait_closed wedged" not in caplog.text  # by class only
 
     assert pool.closed == 1
     assert pool.wait_closed_called == 1

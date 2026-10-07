@@ -2776,6 +2776,23 @@ _AD_TIMEOUT_MAX_SECONDS = 3600.0
 _OIDC_ISSUER_MAX = 256
 
 
+def _normalise_claim_value_list(v: object) -> object:
+    """An OIDC list setting, stripped with blanks dropped (BACKLOG #2325). Every OIDC list reads its
+    env string through it; only the lists compared with a token claim read a TOML list through it.
+
+    An env string is comma-split first. A list or tuple keeps its order. A non-string item is left
+    as it is, for the field's own type check to refuse, and anything else passes through."""
+    if isinstance(v, str):
+        v = v.split(",")
+    if isinstance(v, list | tuple):
+        return [
+            item.strip() if isinstance(item, str) else item
+            for item in v
+            if not isinstance(item, str) or item.strip()
+        ]
+    return v
+
+
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
 
@@ -3165,7 +3182,8 @@ class AuthSettings(_Section):
     oidc_required_acr_values: list[str] = Field(default_factory=list)
     # Requested `acr_values` authorize param. A request only: the claim gate checks the returned
     # acr against oidc_required_acr_values (while oidc_require_mfa_claim is on), so setting this
-    # with no non-blank required value is refused at load (BACKLOG #2032).
+    # with no non-blank required value is refused at load (BACKLOG #2032), and so is setting it
+    # while oidc_require_mfa_claim is off (BACKLOG #2325). A whitespace-only value loads as None.
     oidc_acr_values: str | None = None
     oidc_prompt: str | None = None  # requested `prompt` authorize param
     oidc_jwks_ttl_seconds: int = 3600
@@ -3180,6 +3198,16 @@ class AuthSettings(_Section):
     # default reuses mfa_verify_min_elapsed_seconds' derivation (a new prompt and one submit, 1.43 s
     # by the keystroke-level model, less a margin). 0 turns it off; it must be shorter than the TTL.
     oidc_callback_min_elapsed_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    # BACKLOG #2388: the amr values that mark a re-authentication with no human step, such as
+    # integrated Windows sign-in or a client certificate. Such an IdP answers a step-up faster than
+    # the floor above on every try, so every step-up would be refused. A callback whose
+    # signature-verified amr names one of these values skips that floor, and only that one. Empty
+    # (the default) exempts nothing, and the step-up floor then refuses before the code exchange,
+    # as it always has. A non-empty list is a LOOSENING: it proves a device or a stored credential
+    # answered, not that a person acted. security_loosenings() names it while OIDC and the floor
+    # are both on. A value oidc_mfa_amr_values also accepts is refused at load while the claim
+    # gate is on: every token the gate admits by it would skip the floor, the floor off in effect.
+    oidc_callback_floor_exempt_amr: list[str] = Field(default_factory=list)
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
     # ASVS 6.8.4 / 7.6.1, BACKLOG #296 / #1150: the most time, in seconds, that may pass between the
@@ -3387,8 +3415,6 @@ class AuthSettings(_Section):
         "oidc_allowed_endpoints",
         "oidc_scopes",
         "oidc_signing_algorithms",
-        "oidc_mfa_amr_values",
-        "oidc_required_acr_values",
         "oidc_allowed_username_domains",
         mode="before",
     )
@@ -3396,9 +3422,34 @@ class AuthSettings(_Section):
     def _split_oidc_lists(cls, v: object) -> object:
         # Allow env-setting a list key as one comma-separated string (MEFOR_AUTH_OIDC_SCOPES=...);
         # without this the "zero env-plumbing" property holds only for scalars (precedent: egress).
-        if isinstance(v, str):
-            return [item.strip() for item in v.split(",") if item.strip()]
-        return v
+        # The string form only: these lists keep a TOML list as written (BACKLOG #2325 scoped the
+        # list-form cleanup to the claim-value lists below).
+        return _normalise_claim_value_list(v) if isinstance(v, str) else v
+
+    @field_validator(
+        "oidc_mfa_amr_values",
+        "oidc_required_acr_values",
+        "oidc_callback_floor_exempt_amr",  # BACKLOG #2388: a blank must never match a blank amr
+        mode="before",
+    )
+    @classmethod
+    def _split_oidc_claim_value_lists(cls, v: object) -> object:
+        # The env string form, as _split_oidc_lists reads it, and BACKLOG #2325: the TOML list form
+        # is normalised the same way, stripped and with blanks dropped. Before this a `[""]` was
+        # truthy, so it passed the MFA-family guard, and the claim gate then accepted a token whose
+        # acr was "" as MFA. A `[" phr"]` passed the guard and could never match. Scoped to the
+        # lists compared with a token claim; a non-string item is left for the type check to refuse.
+        return _normalise_claim_value_list(v)
+
+    @field_validator("oidc_acr_values")
+    @classmethod
+    def _normalise_oidc_acr_values(cls, v: str | None) -> str | None:
+        # BACKLOG #2325: the request is space-separated (OIDC Core, the authentication request). A whitespace-only
+        # value names no class, so it becomes None and the authorization request carries no
+        # acr_values at all, rather than the raw blanks it used to send.
+        if v is None:
+            return None
+        return " ".join(v.split()) or None
 
     @field_validator("ad_tls_ca_cert_pin", "oidc_tls_ca_cert_pin")
     @classmethod
@@ -3804,6 +3855,19 @@ class AuthSettings(_Section):
                 "oidc_require_mfa_claim=true needs at least one of oidc_mfa_amr_values / "
                 "oidc_required_acr_values (an MFA gate that can never match is refused)"
             )
+        # BACKLOG #2388: an exempt amr names a sign-in with NO human step, and an MFA amr names one
+        # with a human factor. A value on both lists would exempt every token the gate admits by
+        # it, which is the floor turned off while the loosening entry says it is narrower than
+        # that. Refused rather than quietly dropped. The text quotes no configured value.
+        if self.oidc_require_mfa_claim and (
+            set(self.oidc_callback_floor_exempt_amr) & set(self.oidc_mfa_amr_values)
+        ):
+            raise ValueError(
+                "oidc_callback_floor_exempt_amr names a value oidc_mfa_amr_values accepts as MFA, "
+                "so every sign-in the claim gate admits by that value would skip "
+                "oidc_callback_min_elapsed_seconds. List only the amr values that mark a sign-in "
+                "with no human step"
+            )
 
         # BACKLOG #2032: `oidc_acr_values` is only a REQUEST. It rides the authorization URL, and
         # the claim gate checks the returned `acr` against `oidc_required_acr_values` alone (and
@@ -3813,7 +3877,19 @@ class AuthSettings(_Section):
         # as the accepted set would silently turn a request into a requirement. An explicit
         # required list makes the operator state what they accept.
         requested_acr = (self.oidc_acr_values or "").split()
-        if requested_acr and not any(v.strip() for v in self.oidc_required_acr_values):
+        # BACKLOG #2325: a request with the claim gate OFF. _check_mfa_gate then returns before it
+        # reads acr at all, so nothing checks the answer, however oidc_required_acr_values is set.
+        # Checked FIRST, so the #2032 advice below never sends an operator with the gate off to set
+        # a required list that this check would then refuse. The text quotes no configured value.
+        if requested_acr and not self.oidc_require_mfa_claim:
+            raise ValueError(
+                "oidc_acr_values requests an acr from the identity provider while "
+                "oidc_require_mfa_claim is false, and the claim gate reads no acr while it is off, "
+                "so nothing checks the acr the identity provider returns. Turn "
+                "oidc_require_mfa_claim on, or remove oidc_acr_values"
+            )
+        # Load strips oidc_required_acr_values and drops blanks (BACKLOG #2325), so empty is "none".
+        if requested_acr and not self.oidc_required_acr_values:
             raise ValueError(
                 f"oidc_acr_values requests {requested_acr} from the identity provider, but "
                 "oidc_required_acr_values names no acr value, so nothing checks the acr the "
@@ -7038,6 +7114,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       ``mfa_verify_min_elapsed_seconds``, ``oidc_callback_min_elapsed_seconds``) refuse an action that
       comes sooner than the floor and skip the check at 0 or less, so a floor below its default is
       looser and 0 is off. A higher floor is stricter, and is not named.
+    * ``oidc_callback_floor_exempt_amr`` (BACKLOG #2388) skips the federated floor for a matching
+      ``amr``, so any value listed is looser, named while that floor is on.
 
     ``[approvals].min_dwell_seconds``, the dual-control approval floor, is another time floor of the
     same kind. It lives in its own section, so :func:`_approvals_loosenings` names it, read the same
@@ -7351,6 +7429,19 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 "so a scripted flow may complete at machine speed"
             ),
         )
+        # BACKLOG #2388: the amr exemption from that floor. Named only while the floor is on, as a
+        # part of a limiter is named only while the limiter is built. The text quotes no value.
+        exempt = auth.oidc_callback_floor_exempt_amr
+        if any(v.strip() for v in exempt) and (auth.oidc_callback_min_elapsed_seconds > 0):
+            out.append(
+                (
+                    "oidc_callback_floor_exempt_amr",
+                    "a federated callback whose verified amr names one of these values skips the "
+                    "least time between its start and its callback, so such a sign-in or step-up "
+                    "may complete at machine speed. The amr proves a device or a stored credential "
+                    "answered the identity provider, not that a person acted",
+                )
+            )
 
     # --- concurrent sessions (ASVS 7.1.2). 0 or less means unlimited, so a negative cap is off too.
     sessions = auth.max_sessions_per_user

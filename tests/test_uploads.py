@@ -9,13 +9,16 @@ import dataclasses
 import logging
 import threading
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Literal
 
 import pydantic
 import pytest
 
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
+from messagefoundry.store.store import MessageStore
 from messagefoundry.uploads import (
     PruneResult,
     UploadContentError,
@@ -720,6 +723,404 @@ async def test_a_forced_shutdown_cancelling_every_task_still_waits_for_the_write
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(save, 10)
     assert ledger.metas_at_release == [1]
+
+
+def _hold_after_the_sidecar_lands(
+    mp: pytest.MonkeyPatch,
+) -> tuple[threading.Event, threading.Event]:
+    """Patch the module's atomic write so the write thread pauses just AFTER the sidecar lands.
+    Returns ``(landed, finish)``: ``landed`` is set once the pair is on disk, and the thread
+    returns only once ``finish`` is set."""
+    from messagefoundry import uploads as uploads_mod
+
+    landed, finish = threading.Event(), threading.Event()
+    real = uploads_mod._atomic_write_text
+
+    def _write_then_hold(root: Path, path: Path, text: str) -> None:
+        real(root, path, text)
+        if path.suffix == ".meta":
+            landed.set()
+            finish.wait(10)
+
+    mp.setattr(uploads_mod, "_atomic_write_text", _write_then_hold)
+    return landed, finish
+
+
+async def _cancel_once_landed(store: UploadStore, mp: pytest.MonkeyPatch) -> None:
+    """Start a save, cancel it just AFTER its sidecar lands, and assert the cancellation propagates."""
+    landed, finish = _hold_after_the_sidecar_lands(mp)
+    save = asyncio.create_task(
+        store.save(data=_ADT.encode(), filename="x.hl7", uploader="op", uploader_id="u-op")
+    )
+    try:
+        assert await asyncio.to_thread(landed.wait, 10), "the sidecar never landed"
+        # The control: the pair IS on disk when the cancellation is sent.
+        assert len(list(store._root.glob("*.meta"))) == 1
+        save.cancel()
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(save, 10)
+
+
+async def test_a_save_cancelled_after_its_file_lands_leaves_no_file(tmp_path: Path) -> None:
+    """BACKLOG #2262. The API writes ``upload.create`` only once ``save`` returns, so a cancellation
+    reaching ``save`` after the pair landed left a stored upload with no creation row while the
+    request answered an error. The pair is removed before the cancellation propagates. Red before
+    the fix: one ``.blob`` and one ``.meta`` stayed, and ``list_files`` returned the upload."""
+    store = _store(tmp_path, key=True)
+    with pytest.MonkeyPatch.context() as mp:
+        await _cancel_once_landed(store, mp)
+    assert list((tmp_path / "uploads").iterdir()) == []
+    assert await store.list_files() == []
+
+
+async def test_an_anyio_scope_cancel_still_removes_the_landed_file(tmp_path: Path) -> None:
+    """BACKLOG #2262 under the cancellation production delivers. The request deadline reaches the
+    route through anyio task groups (``BaseHTTPMiddleware``), which cancel again at every await. A
+    plain ``to_thread`` cleanup cancelled before a worker picked it up never ran; measured in review
+    at 25 runs of 200. The cleanup now waits through repeat cancellations, as the write does."""
+    import functools
+
+    import anyio
+
+    store = _store(tmp_path, key=True)
+    with pytest.MonkeyPatch.context() as mp:
+        landed, finish = _hold_after_the_sidecar_lands(mp)
+        save = functools.partial(
+            store.save, data=_ADT.encode(), filename="x.hl7", uploader="op", uploader_id="u-op"
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(save)
+            try:
+                assert await asyncio.to_thread(landed.wait, 10), "the sidecar never landed"
+                tg.cancel_scope.cancel()
+            finally:
+                finish.set()
+    assert list((tmp_path / "uploads").iterdir()) == []
+
+
+async def test_a_cancel_in_the_reservation_release_still_removes_the_landed_file(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #2262, the later window: the write returned, then the cancellation landed in the
+    cross-shard release await. That raised out of ``save`` with the file on disk just the same.
+    BACKLOG #2263: the release itself now finishes before the cancellation propagates."""
+    root = tmp_path / "uploads"
+    releasing, finish = asyncio.Event(), asyncio.Event()
+
+    class _SlowReleaseLedger(_RecordingLedger):
+        async def reserve_upload_quota(
+            self,
+            uploader_id: str,
+            *,
+            files: int,
+            size_bytes: int,
+            max_files: int = 0,
+            max_total_bytes: int = 0,
+        ) -> bool:
+            if files < 0:
+                releasing.set()
+                await finish.wait()
+            return await super().reserve_upload_quota(
+                uploader_id, files=files, size_bytes=size_bytes
+            )
+
+    ledger = _SlowReleaseLedger(root)
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
+    save = asyncio.create_task(
+        store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    )
+    await asyncio.wait_for(releasing.wait(), 10)
+    assert len(list(root.glob("*.meta"))) == 1  # the control: the write had returned
+    save.cancel()
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(save, 10)
+    assert list(root.iterdir()) == []
+    assert ledger.metas_at_release == [1], "the cancelled release never paid the slot back"
+
+
+@pytest.fixture
+async def ledger_db(tmp_path: Path) -> AsyncIterator[MessageStore]:
+    """A real SQLite store, for tests that read the upload-quota ledger back."""
+    db = await MessageStore.open(tmp_path / "engine.db")
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
+class _GatedLedger:
+    """The real SQLite ledger with one pause: just AFTER a reserve commits (``hold="reserve"``), or
+    just BEFORE a release starts (``hold="release"``). ``at_gate`` is set on arrival and the call
+    goes on once ``gate`` is set. A cancellation delivered at the reserve pause is the shape of one
+    that lands in the store's commit await while its thread commits anyway."""
+
+    def __init__(self, store: MessageStore, *, hold: Literal["reserve", "release"]) -> None:
+        self.store = store
+        self.hold = hold
+        self.at_gate, self.gate = asyncio.Event(), asyncio.Event()
+
+    async def _pause(self) -> None:
+        self.at_gate.set()
+        await self.gate.wait()
+
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        *,
+        files: int,
+        size_bytes: int,
+        max_files: int = 0,
+        max_total_bytes: int = 0,
+    ) -> bool:
+        if files < 0 and self.hold == "release":
+            await self._pause()
+        applied = await self.store.reserve_upload_quota(
+            uploader_id,
+            files=files,
+            size_bytes=size_bytes,
+            max_files=max_files,
+            max_total_bytes=max_total_bytes,
+        )
+        if files > 0 and self.hold == "reserve":
+            await self._pause()
+        return applied
+
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        return await self.store.upload_quota_in_flight(uploader_id)
+
+
+async def test_a_reserve_cancelled_after_its_commit_pays_the_slot_back(
+    tmp_path: Path, ledger_db: MessageStore
+) -> None:
+    """BACKLOG #2263. A cancellation that reached ``save`` after the reserve had committed, but
+    before the store call returned, skipped the release, because ``reserved`` was never assigned.
+    The slot then narrowed the uploader's budget, and its refusal blamed a shard that is not there.
+    Red before the fix: the ledger still read ``(1, 2)`` in flight."""
+    root = tmp_path / "uploads"
+    ledger = _GatedLedger(ledger_db, hold="reserve")
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
+    save = asyncio.create_task(
+        store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    )
+    await asyncio.wait_for(ledger.at_gate.wait(), 10)
+    assert await ledger_db.upload_quota_in_flight("u-op") == (1, 2)  # the control: it committed
+    save.cancel()
+    ledger.gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(save, 10)
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+    assert not root.exists() or list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("hold", ["reserve", "release"])
+async def test_an_anyio_scope_cancel_at_either_ledger_call_pays_the_slot_back(
+    tmp_path: Path, ledger_db: MessageStore, hold: Literal["reserve", "release"]
+) -> None:
+    """BACKLOG #2263 under the cancellation production delivers: an anyio scope cancels again at
+    every await, the release's own included. ``reserve``: the cancel lands just after the reserve
+    commits. ``release``: it lands while the release itself is in flight."""
+    import functools
+
+    import anyio
+
+    root = tmp_path / "uploads"
+    ledger = _GatedLedger(ledger_db, hold=hold)
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
+    save = functools.partial(
+        store.save, data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op"
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(save)
+        try:
+            await asyncio.wait_for(ledger.at_gate.wait(), 10)
+            assert await ledger_db.upload_quota_in_flight("u-op") == (1, 2)  # the control
+            tg.cancel_scope.cancel()
+        finally:
+            ledger.gate.set()
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+    assert not root.exists() or list(root.iterdir()) == []
+
+
+async def test_a_deadline_mid_write_still_pays_the_reservation_back(
+    tmp_path: Path, ledger_db: MessageStore
+) -> None:
+    """BACKLOG #2263, the release half. A request deadline arrives through an anyio scope while
+    the write runs. The write waits it out, and then the release in ``save``'s ``finally`` was
+    cancelled again at its first await and never committed. Red before the fix: ``(1, len)`` stayed
+    in flight on the ledger, while #2262's cleanup removed the file."""
+    import functools
+
+    import anyio
+
+    root = tmp_path / "uploads"
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=1024, store=ledger_db)
+    with pytest.MonkeyPatch.context() as mp:
+        landed, finish = _hold_after_the_sidecar_lands(mp)
+        save = functools.partial(
+            store.save, data=_ADT.encode(), filename="x.hl7", uploader="op", uploader_id="u-op"
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(save)
+            try:
+                assert await asyncio.to_thread(landed.wait, 10), "the sidecar never landed"
+                tg.cancel_scope.cancel()
+            finally:
+                finish.set()
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("hold", ["reserve", "release"])
+async def test_a_ledger_call_stuck_past_the_bound_lets_the_cancellation_through(
+    tmp_path: Path,
+    ledger_db: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    hold: Literal["reserve", "release"],
+) -> None:
+    """BACKLOG #2263's wait is bounded. A store that never answers must not hold ``_quota_lock``
+    and the request's cancellation forever: past the bound the call is left running, a WARNING
+    names it, and the cancellation propagates. A landed file is still removed (#2262). Once the
+    call does finish, the slot is paid back: a late reserve by a fresh release."""
+    from messagefoundry import uploads as uploads_mod
+
+    root = tmp_path / "uploads"
+    ledger = _GatedLedger(ledger_db, hold=hold)
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
+    with (
+        pytest.MonkeyPatch.context() as mp,
+        caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"),
+    ):
+        mp.setattr(uploads_mod, "_LEDGER_CANCEL_WAIT_SECONDS", 0.2)
+        save = asyncio.create_task(
+            store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+        )
+        await asyncio.wait_for(ledger.at_gate.wait(), 10)
+        save.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(save, 10)
+            assert not store._quota_lock.locked()
+            assert f"upload {hold} for u-op did not finish" in caplog.text, caplog.text
+            assert not root.exists() or list(root.iterdir()) == []
+        finally:
+            ledger.gate.set()  # let the abandoned call finish before the store closes
+            await _drain_stragglers(store)
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+
+
+async def _drain_stragglers(store: UploadStore) -> None:
+    """Wait for every ledger call a cancelled save left running, a late release included."""
+    for _ in range(100):
+        if not store._stragglers:
+            return
+        await asyncio.wait(set(store._stragglers), timeout=10)
+    raise AssertionError("ledger calls were still running")
+
+
+async def test_a_cancel_absorbed_by_the_write_still_bounds_the_release(
+    tmp_path: Path, ledger_db: MessageStore
+) -> None:
+    """A plain asyncio cancel is used up by the write's wait, so the release in ``save``'s
+    ``finally`` starts with no cancellation pending. It is bounded all the same, because the task
+    is still cancelling. Found in review: without that, the release waited forever."""
+    from messagefoundry import uploads as uploads_mod
+
+    root = tmp_path / "uploads"
+    ledger = _GatedLedger(ledger_db, hold="release")
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=1024, store=ledger)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(uploads_mod, "_LEDGER_CANCEL_WAIT_SECONDS", 0.2)
+        landed, finish = _hold_after_the_sidecar_lands(mp)
+        save = asyncio.create_task(
+            store.save(data=_ADT.encode(), filename="x.hl7", uploader="op", uploader_id="u-op")
+        )
+        try:
+            assert await asyncio.to_thread(landed.wait, 10), "the sidecar never landed"
+            save.cancel()
+        finally:
+            finish.set()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(save, 10)
+            assert not store._quota_lock.locked()
+            assert list(root.iterdir()) == []
+        finally:
+            ledger.gate.set()
+            await _drain_stragglers(store)
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+
+
+async def test_a_reserve_that_fails_while_cancelled_is_logged_and_not_blindly_released(
+    tmp_path: Path, ledger_db: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reserve whose outcome is unknown is not paid back: a release here could subtract a
+    sibling shard's live slot and let an upload past the cap. It is logged instead. The ledger
+    keeping ``(1, 2)`` is the control that no release ran."""
+
+    class _CommitThenFail(_GatedLedger):
+        async def reserve_upload_quota(
+            self,
+            uploader_id: str,
+            *,
+            files: int,
+            size_bytes: int,
+            max_files: int = 0,
+            max_total_bytes: int = 0,
+        ) -> bool:
+            await super().reserve_upload_quota(
+                uploader_id,
+                files=files,
+                size_bytes=size_bytes,
+                max_files=max_files,
+                max_total_bytes=max_total_bytes,
+            )
+            raise ConnectionError("lost after the commit")
+
+    root = tmp_path / "uploads"
+    ledger = _CommitThenFail(ledger_db, hold="reserve")
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
+    save = asyncio.create_task(
+        store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    )
+    await asyncio.wait_for(ledger.at_gate.wait(), 10)
+    save.cancel()
+    ledger.gate.set()
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await asyncio.wait_for(save, 10)
+    assert "reserve for u-op failed while the upload was being cancelled" in caplog.text
+    # Logged once, by this module. An asyncio.shield wait also handed it to the loop's handler.
+    assert "shielded future" not in caplog.text, caplog.text
+    assert await ledger_db.upload_quota_in_flight("u-op") == (1, 2)
+
+
+async def test_a_refused_removal_keeps_the_pair_and_logs_the_audit_gap(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A body the filesystem will not unlink keeps its sidecar too, so the upload stays listed and
+    billed rather than hidden, and the missing ``upload.create`` row is named at ERROR."""
+    store = _store(tmp_path, key=True)
+    root = tmp_path / "uploads"
+    real_unlink = Path.unlink
+
+    def _refuse_the_body(self: Path, missing_ok: bool = False) -> None:
+        if self.suffix == ".blob":
+            raise PermissionError(13, "in use")
+        real_unlink(self, missing_ok=missing_ok)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Path, "unlink", _refuse_the_body)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+            await _cancel_once_landed(store, mp)
+    assert len(list(root.glob("*.blob"))) == 1
+    assert len(list(root.glob("*.meta"))) == 1
+    assert "no upload.create audit row" in caplog.text, caplog.text
+    assert "x.hl7" not in caplog.text  # the filename can carry PHI
 
 
 async def test_run_once_after_start_and_stop_still_prunes(tmp_path: Path) -> None:

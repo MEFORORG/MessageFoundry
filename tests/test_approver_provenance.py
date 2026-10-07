@@ -416,10 +416,10 @@ async def test_mapping_a_directory_group_to_administrator_raises_the_grant_alert
         headers = await _token(c, "admin1")
         body = {
             "entries": [
-                {"ad_group": "CN=Ops", "role": Role.OPERATOR.value},
-                {"ad_group": "CN=Admins", "role": Role.ADMINISTRATOR.value},
+                {"ad_group": "CN=Ops,DC=x", "role": Role.OPERATOR.value},
+                {"ad_group": "CN=Admins,DC=x", "role": Role.ADMINISTRATOR.value},
                 # The store folds case, so this is the same group: it must not page twice.
-                {"ad_group": "cn=admins ", "role": Role.ADMINISTRATOR.value},
+                {"ad_group": "cn=admins,dc=x ", "role": Role.ADMINISTRATOR.value},
             ]
         }
         r = await c.put("/ad-group-map", headers=headers, json=body)
@@ -430,11 +430,11 @@ async def test_mapping_a_directory_group_to_administrator_raises_the_grant_alert
     assert sink.events == [
         (
             "administrator_granted",
-            "ad-group:cn=admins",
+            "ad-group:cn=admins,dc=x",
             {"via": "ad_group_map", "granted_by": "admin1"},
         )
     ]
-    assert not is_connection_name("ad-group:cn=admins")
+    assert not is_connection_name("ad-group:cn=admins,dc=x")
 
 
 async def test_a_failed_executor_is_still_flagged(engine: Engine) -> None:
