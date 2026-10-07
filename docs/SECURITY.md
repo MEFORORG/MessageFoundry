@@ -1671,7 +1671,9 @@ the same permission set on the same method reds CI until it is listed here.
 > scope the directory does not own is unaffected. **An AD account's stored scope with a null
 > source counts as `ad` here (BACKLOG #2252):** it predates the source column, the sync withdraws
 > it like a directory scope, and the GET still reports it as null. The 409 detail names the
-> conflict, never the scope. The web console sends `expected_source` when the administrator ticks "Make this scope
+> conflict, never the scope. Each 409 writes one `user.channel_scope_change_refused` audit row
+> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271). A store
+> that refuses that row leaves an ERROR log line instead, and the 409 stands. The web console sends `expected_source` when the administrator ticks "Make this scope
 > manual", and shows a race as a refused save with the edits kept.
 >
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
@@ -4389,7 +4391,7 @@ user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.l
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
-`user.channel_scope_changed` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
+`user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. PHI access (viewing a raw message or displaying patient summaries) is recorded
 with the viewer. Read the trail via `GET /audit` (`audit:read`). **Credentials, tokens, and PHI bodies
 are never logged** (only ids/counts land in `detail`).
