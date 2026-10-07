@@ -71,13 +71,13 @@ import logging
 import pkgutil
 import re
 import traceback
-from collections import OrderedDict, UserDict, deque
-from collections.abc import Callable, Sequence
+from collections import OrderedDict, UserDict, defaultdict, deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
 from types import TracebackType
-from typing import Any
+from typing import Any, cast
 
 __all__ = [
     "clamp_untrusted",
@@ -2226,12 +2226,17 @@ def codec_safe_str(exc: BaseException) -> str:
     return safe_exc(exc) if isinstance(exc, UnicodeError) else str(exc)
 
 
-#: The containers a log argument is walked through, and how deep. A ``UnicodeError`` inside one
-#: renders through ``repr``, which prints ``.object``, the whole input. The record's arguments are
-#: level 1, so an error inside five nested containers of the caller's own is found. A container
-#: deeper than that, or met again round a cycle, is not scanned, so it is replaced by a fixed note:
-#: it may hold an error. Subclasses count (an ``OrderedDict``, a ``defaultdict``, a namedtuple, a
-#: ``deque``), and so do a dict's views, a ``UserDict``'s data and an exception's ``.args``.
+#: The containers a log argument is walked through. A ``UnicodeError`` inside one renders through
+#: ``repr``, which prints ``.object``, the whole input. Subclasses count (an ``OrderedDict``, a
+#: ``defaultdict``, a namedtuple, a ``deque``), and so do a dict's views, a ``UserDict``'s data and
+#: an exception's ``.args``.
+#:
+#: MINIMAL TOUCH (round 5 of vault BACKLOG #3185). An argument that holds no ``UnicodeError`` reaches
+#: the formatter as the same object, untouched, so it prints exactly as it would with no filter: a
+#: recursive list keeps its ``[...]``, a deep container its depth, a subclass its own ``__repr__``.
+#: So the walk is two passes. :class:`_Scan` only READS, at any depth and round any cycle, and finds
+#: which containers can reach an error. :class:`_Rebuild` then rebuilds only those, from the scan's
+#: snapshot, and prints every other element as the container would have printed it.
 #:
 #: IT READS A CONTAINER THROUGH THE BUILTIN'S OWN METHODS (``dict.items(arg)``), and tests the real
 #: type, never ``isinstance``, which a proxy can fake. A log call must never raise because of its
@@ -2239,8 +2244,8 @@ def codec_safe_str(exc: BaseException) -> str:
 #: interpolates and can raise, and the engine's ``CodeSet`` would be walked whole on every record.
 #: Those, a ``ChainMap``, a ``MappingProxyType``, a ``SimpleNamespace``, a dataclass and every other
 #: object are left as they are. The caller's code still runs in at least three places: a
-#: ``UserDict``'s ``.data``, ``repr()`` of a wrapping exception's other arguments, and the hash and
-#: equality of keys when a mapping is rebuilt. :func:`prepare_log_record` catches what they raise.
+#: ``UserDict``'s ``.data``, the ``repr()`` of an element beside an error, and a namedtuple's or list
+#: subclass's own ``__repr__``. :func:`prepare_log_record` catches what they raise.
 _ARG_SEQUENCES: tuple[type[Any], ...] = (tuple, list, set, frozenset, deque)
 _ARG_VIEWS: tuple[type[Any], ...] = (type({}.keys()), type({}.values()), type({}.items()))
 _ARG_MAPPINGS: tuple[type[Any], ...] = (dict, UserDict)
@@ -2250,26 +2255,29 @@ _ARG_WALKED: tuple[type[Any], ...] = (
     *_ARG_SEQUENCES,
     *_ARG_VIEWS,
 )
+#: How many levels of an error's path are rebuilt. The record's arguments are level 1, so an error
+#: inside five nested containers of the caller's own prints as :func:`safe_exc` text. A container
+#: deeper than that on the path to an error prints as a fixed note; one with no error is untouched.
 _ARG_DEPTH = 5
 #: The argument types nearly every record carries, answered without a subclass check.
 _ARG_SCALARS = frozenset({str, int, float, bool, bytes, type(None)})
-_TOO_DEEP = "[nested too deep to scan for a codec error]"
-_CYCLE = "[a cycle, not scanned for a codec error]"
-#: Marks a container the walk is inside, so meeting it again is a cycle.
+_TOO_DEEP = "[holds a codec error, nested too deep to render]"
+_CYCLE = "[a cycle back to a container that holds a codec error]"
+#: Marks a container the rebuild is inside, so meeting it again is a cycle.
 _IN_PROGRESS: Any = object()
 #: The builtin descriptors, so a subclass that overrides one cannot run its own code here.
 _EXC_ARGS: Any = BaseException.__dict__["args"]
 _GROUP_MEMBERS: Any = BaseExceptionGroup.__dict__["exceptions"]
-_GROUP_MESSAGE: Any = BaseExceptionGroup.__dict__["message"]
 _DEQUE_MAXLEN: Any = deque.__dict__["maxlen"]
+_DEFAULT_FACTORY: Any = defaultdict.__dict__["default_factory"]
 
 
 class _SafeText(str):
-    """Text standing in for what a log argument held, a ``UnicodeError`` among it.
+    """Text standing in for a ``UnicodeError`` in a log argument.
 
     It hashes and compares by identity, as the error it replaces did, so two errors that render the
-    same text stay two dict keys or two set members. It equals nothing else, a ``str`` of the same
-    text included, so the hash and equality agree."""
+    same text stay two. It equals nothing else, a ``str`` of the same text included, so the hash and
+    equality agree."""
 
     __slots__ = ()
 
@@ -2282,127 +2290,264 @@ class _SafeText(str):
     __hash__ = object.__hash__
 
 
-class _Rebuilt(dict[Any, Any]):
-    """A mapping argument rebuilt with its errors replaced, so the walk writes nothing to the
-    caller's own mapping.
+class _Rendered:
+    """What a container or exception holding a ``UnicodeError`` prints, worked out by the rebuild.
 
-    A key it lacks is looked up in the original, as ``"%(name)s"`` against the original would have
-    been, so a ``defaultdict``'s default or a ``Counter``'s zero still renders. That lookup is the
-    original's own code, exactly as without this filter: a ``defaultdict`` stores its default there.
-    What it returns is walked before it is rendered."""
+    ``repr()`` and ``str()`` return that text, so the formatter's ``%r`` and ``%s``, and the
+    ``repr()`` of an enclosing container, all print it. It hashes by identity, and nothing hashes it
+    here: the rebuild prints a dict or a set from its elements, never by building a new one."""
+
+    __slots__ = ("_repr", "_str")
+
+    def __init__(self, text: str, text_str: str | None = None) -> None:
+        self._repr = text
+        self._str = text if text_str is None else text_str
+
+    def __repr__(self) -> str:
+        return self._repr
+
+    def __str__(self) -> str:
+        return self._str
+
+
+class _RenderedMapping(_Rendered):
+    """The record's single mapping argument, when it holds a ``UnicodeError``.
+
+    ``"%(name)s"`` asks the caller's own mapping, through its own ``__getitem__``, exactly as it would
+    with no filter. So a subclass that masks a key still masks it, and a ``defaultdict``'s default
+    still renders. Only what that lookup returns is walked, and it is replaced only if it holds an
+    error. ``"%s"`` of the whole mapping prints the rebuilt text."""
 
     __slots__ = ("_original",)
 
-    def __init__(self, pairs: list[tuple[Any, Any]], original: Any) -> None:
-        super().__init__(pairs)
+    def __init__(self, original: Any, rendered: _Rendered) -> None:
+        super().__init__(rendered._repr, rendered._str)
         self._original = original
 
-    def __missing__(self, key: Any) -> Any:
-        value = self._original[key]
+    def __getitem__(self, key: Any) -> Any:
+        value = self._original[key]  # the caller's own lookup, as "%(key)s" makes it with no filter
         try:
-            return _safe_arg(value, 1, {})
+            return _safe_arg(value, 1)
         except Exception as exc:  # noqa: BLE001 -- fail closed, see prepare_log_record
-            return _withheld(exc)
+            return _withheld(type(exc).__name__)
 
 
-def _safe_items(
-    items: Sequence[Any], depth: int, seen: dict[int, tuple[Any, Any]]
-) -> list[Any] | None:
-    """``items`` with each error replaced, or None when nothing was. Copies only on a change."""
-    fresh: list[Any] | None = None
-    for i, item in enumerate(items):
-        new = _safe_arg(item, depth, seen)
-        if fresh is not None:
-            fresh.append(new)
-        elif new is not item:
-            fresh = [*items[:i], new]
-    return fresh
-
-
-def _safe_mapping(arg: Any, kind: type[Any], depth: int, seen: dict[int, tuple[Any, Any]]) -> Any:
-    data = arg.data if issubclass(kind, UserDict) else arg
-    data_kind = type(data)
-    if not issubclass(data_kind, dict):
-        return arg
-    # An OrderedDict keeps its own order apart from the dict's storage.
-    items = OrderedDict.items if issubclass(data_kind, OrderedDict) else dict.items
-    flat = [part for pair in items(data) for part in pair]  # key, value, key, value, ...
-    fresh = _safe_items(flat, depth, seen)
-    if fresh is None:
-        return arg
-    pairs = list(zip(fresh[0::2], fresh[1::2], strict=True))
-    return dict(pairs) if kind is dict else _Rebuilt(pairs, arg)
-
-
-def _walk(arg: Any, kind: type[Any], depth: int, seen: dict[int, tuple[Any, Any]]) -> Any:
+def _children(arg: Any, kind: type[Any]) -> list[Any]:
+    """The objects ``arg`` holds that a render of it could print, read through the builtins' own
+    methods. A mapping's are its keys and values, flattened in order."""
     if issubclass(kind, BaseExceptionGroup):
-        # Its str() and repr() print its members, and a subclass may print them its own way, so a
-        # group holding an error is rendered from its message and member count alone.
-        members = _GROUP_MEMBERS.__get__(arg)
         # Both: a subclass may print its .args, and the caller's list in .args can differ from them.
-        held = _safe_items(members, depth + 1, seen) is not None
-        if not held and _safe_items(_EXC_ARGS.__get__(arg), depth + 1, seen) is None:
-            return arg
-        message = safe_text(_GROUP_MESSAGE.__get__(arg))
-        return _SafeText(f"{kind.__name__}: {message} ({len(members)} sub-exceptions)")
+        return [*_GROUP_MEMBERS.__get__(arg), *_EXC_ARGS.__get__(arg)]
     if issubclass(kind, BaseException):
-        # str() and repr() print .args, so a wrapping exception prints its error's text.
-        fresh = _safe_items(_EXC_ARGS.__get__(arg), depth + 1, seen)
-        if fresh is None:
-            return arg
-        return _SafeText(f"{kind.__name__}({', '.join(map(repr, fresh))})")
-    if issubclass(kind, _ARG_MAPPINGS):
-        return _safe_mapping(arg, kind, depth + 1, seen)
+        return list(_EXC_ARGS.__get__(arg))  # str() and repr() print .args
+    if issubclass(kind, UserDict):
+        return [arg.data]
+    if issubclass(kind, dict):
+        # An OrderedDict keeps its own order apart from the dict's storage.
+        items = OrderedDict.items if issubclass(kind, OrderedDict) else dict.items
+        return [part for pair in items(arg) for part in pair]
     if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
-        fresh = _safe_items(list(arg), depth + 1, seen)
-        return arg if fresh is None else tuple(fresh)  # hashable, as the view was
+        return list(arg)
     for base in _ARG_SEQUENCES:
         if issubclass(kind, base):
-            # A snapshot, except of a tuple: a list changed mid-walk must not reach the copy unscanned.
-            items = arg if kind is tuple else list(base.__iter__(arg))
-            fresh = _safe_items(items, depth + 1, seen)
-            if fresh is None:
-                return arg
-            if base is deque:
-                return deque(fresh, _DEQUE_MAXLEN.__get__(arg))
-            # The plain builtin, not the subclass: a namedtuple's constructor does not take a list.
-            return base(fresh)
-    return arg
+            return list(base.__iter__(arg))
+    return []
 
 
-def _safe_arg(arg: Any, depth: int, seen: dict[int, tuple[Any, Any]]) -> Any:
+class _Scan:
+    """Which containers reachable from one log argument hold a ``UnicodeError``. It only reads.
+
+    It walks at any depth, without recursion, and visits each container once, so a cycle or a shared
+    container costs nothing extra. Each container's elements are kept as read, so the rebuild works
+    from the same objects (a dict view's items are new tuples on every read). A container that
+    cannot be read counts as holding an error: it might."""
+
+    __slots__ = ("holds", "nodes")
+
+    def __init__(self, root: Any) -> None:
+        # id -> (the object, its elements or None when unreadable, why it was unreadable). Holding
+        # the object keeps its id from being reused while the walk runs.
+        nodes: dict[int, tuple[Any, list[Any] | None, str]] = {}
+        seeds: list[int] = []
+        pending = [root]
+        while pending:
+            arg = pending.pop()
+            kind = type(arg)
+            key = id(arg)
+            if kind in _ARG_SCALARS or key in nodes:
+                continue
+            if issubclass(kind, UnicodeError):
+                nodes[key] = (arg, [], "")
+                seeds.append(key)
+                continue
+            if not issubclass(kind, _ARG_WALKED):
+                continue
+            try:
+                children = _children(arg, kind)
+            except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
+                nodes[key] = (arg, None, type(exc).__name__)
+                seeds.append(key)
+                continue
+            nodes[key] = (arg, children, "")
+            pending.extend(child for child in children if type(child) not in _ARG_SCALARS)
+        self.nodes = nodes
+        self.holds: set[int] = set()
+        if not seeds:
+            return
+        parents: dict[int, list[int]] = {}
+        for key, (_arg, held, _why) in nodes.items():
+            for child in held or ():
+                if id(child) in nodes:
+                    parents.setdefault(id(child), []).append(key)
+        self.holds.update(seeds)
+        while seeds:
+            for parent in parents.get(seeds.pop(), ()):
+                if parent not in self.holds:
+                    self.holds.add(parent)
+                    seeds.append(parent)
+
+
+def _joined(items: list[Any]) -> str:
+    return ", ".join(map(repr, items))
+
+
+def _builtin_render(arg: Any, kind: type[Any], fresh: list[Any]) -> str | None:
+    """What the builtin ``repr`` of ``kind`` prints for these elements, or None when ``kind``
+    prints itself its own way. Written out, so a dict or a set is printed in the original's order
+    and nothing is hashed."""
+    own_str: Any = kind.__str__
+    if own_str is not object.__str__:
+        return None
+    own: Any = kind.__repr__
+    if issubclass(kind, dict):
+        body = (
+            "{"
+            + ", ".join(f"{k!r}: {v!r}" for k, v in zip(fresh[0::2], fresh[1::2], strict=True))
+            + "}"
+        )
+        if own is dict.__repr__:
+            return body
+        if own is OrderedDict.__repr__:
+            return f"{kind.__name__}({body})"
+        if own is defaultdict.__repr__:
+            return f"{kind.__name__}({_DEFAULT_FACTORY.__get__(arg)!r}, {body})"
+        return None
+    if issubclass(kind, _ARG_VIEWS):  # these types cannot be subclassed
+        return f"{kind.__name__}([{_joined(fresh)}])"
+    if own is list.__repr__:
+        return f"[{_joined(fresh)}]"
+    if own is tuple.__repr__:
+        return f"({_joined(fresh)}{',' if len(fresh) == 1 else ''})"
+    if own is set.__repr__ or own is frozenset.__repr__:
+        body = "{" + _joined(fresh) + "}"
+        return body if kind is set else f"{kind.__name__}({body})"
+    if own is deque.__repr__:
+        maxlen = _DEQUE_MAXLEN.__get__(arg)
+        return (
+            f"{kind.__name__}([{_joined(fresh)}]{'' if maxlen is None else f', maxlen={maxlen}'})"
+        )
+    return None
+
+
+def _own_render(kind: type[Any], fresh: list[Any]) -> _Rendered | None:
+    """A tuple or list subclass that prints itself its own way, as a namedtuple does, printed by
+    its own methods over a bare copy holding the rebuilt elements. None for any other kind, or when
+    those methods need what the bare copy lacks."""
+    copy: Any
+    try:
+        if issubclass(kind, tuple):
+            copy = tuple.__new__(kind, fresh)
+        elif issubclass(kind, list):
+            copy = list.__new__(kind)
+            list.__init__(copy, fresh)
+        else:
+            return None
+        return _Rendered(repr(copy), str(copy))
+    except Exception:  # noqa: BLE001 -- the caller prints the fixed note instead
+        return None
+
+
+def _holder_note(kind: type[Any]) -> _Rendered:
+    """An exception, or a container that prints itself its own way, holding a ``UnicodeError``.
+
+    Never its other arguments: an exception class may keep them out of its message, and printing
+    them from ``repr`` would bypass that (the Lander's hold on round 4 of vault BACKLOG #3185)."""
+    return _Rendered(f"[{kind.__name__} holding a codec error, not rendered]")
+
+
+class _Rebuild:
+    """The rebuild of the paths a :class:`_Scan` found, from its snapshot. Anything off a path is
+    returned as the same object. ``memo`` holds each rebuilt container by ``id``, so a shared one is
+    printed once, and a container met again while it is being printed is a cycle."""
+
+    __slots__ = ("memo", "scan")
+
+    def __init__(self, scan: _Scan) -> None:
+        self.scan = scan
+        self.memo: dict[int, Any] = {}
+
+    def arg(self, arg: Any, depth: int) -> Any:
+        kind = type(arg)
+        if kind in _ARG_SCALARS:
+            return arg
+        # Before the depth cutoff: an error AT the last level is replaced, only a container there is not.
+        if issubclass(kind, UnicodeError):
+            return _SafeText(safe_exc(arg))
+        key = id(arg)
+        if key not in self.scan.holds:
+            return arg  # holds no error: untouched
+        if depth > _ARG_DEPTH:
+            return _Rendered(_TOO_DEEP)
+        done = self.memo.get(key)
+        if done is _IN_PROGRESS:
+            return _Rendered(_CYCLE)  # the back edge would print the raw original: fail closed
+        if done is not None:
+            return done
+        _, children, failure = self.scan.nodes[key]
+        if children is None:
+            return _withheld(failure)
+        self.memo[key] = _IN_PROGRESS
+        result = self._render(arg, kind, children, depth)
+        self.memo[key] = result
+        return result
+
+    def _render(self, arg: Any, kind: type[Any], children: list[Any], depth: int) -> _Rendered:
+        if issubclass(kind, BaseException):
+            return _holder_note(kind)
+        if issubclass(kind, UserDict):
+            own: Any = kind.__repr__
+            own_str: Any = kind.__str__
+            if own is not UserDict.__repr__ or own_str is not object.__str__:
+                return _holder_note(kind)
+            # UserDict prints repr(self.data); the data is its own storage, so the same level.
+            return _Rendered(repr(self.arg(children[0], depth)))
+        fresh = [self.arg(child, depth + 1) for child in children]
+        text = _builtin_render(arg, kind, fresh)
+        if text is not None:
+            return _Rendered(text)
+        return _own_render(kind, fresh) or _holder_note(kind)
+
+
+def _safe_arg(arg: Any, depth: int) -> Any:
     """``arg`` with each ``UnicodeError`` in it replaced by :func:`safe_exc` text, or ``arg`` itself
-    when nothing was replaced, so a record with nothing to replace keeps its own objects.
+    when it holds none, so a record with nothing to replace keeps its own objects.
 
-    One walker finds and rebuilds, so the two cannot disagree about how deep to look (round 2 of
-    vault BACKLOG #3185 split them, and the copy that checked depth first missed an error at the last
-    level). ``seen`` holds each container's result by ``id``, so a structure that shares a container
-    walks it once, and a cycle stops at its first repeat. The caller's code it runs may raise;
-    :func:`prepare_log_record` catches that."""
+    The caller's code it runs may raise; :func:`prepare_log_record` catches that."""
     kind = type(arg)
     if kind in _ARG_SCALARS:
         return arg
-    # Before the depth cutoff: an error AT the last level is replaced, only a container there is not.
     if issubclass(kind, UnicodeError):
         return _SafeText(safe_exc(arg))
     if not issubclass(kind, _ARG_WALKED):
         return arg
-    if depth > _ARG_DEPTH:
-        return _SafeText(_TOO_DEEP)  # unscanned, so fail closed
-    # Each entry keeps its container alive, so an id cannot be reused by another object mid-walk.
-    done = seen.get(id(arg))
-    if done is not None:
-        if done[1] is _IN_PROGRESS:
-            return _SafeText(_CYCLE)  # the back edge would print the raw original: fail closed
-        return done[1]
-    seen[id(arg)] = (arg, _IN_PROGRESS)
-    result = _walk(arg, kind, depth, seen)
-    seen[id(arg)] = (arg, result)
-    return result
+    scan = _Scan(arg)
+    if not scan.holds:
+        return arg
+    return _Rebuild(scan).arg(arg, depth)
 
 
-def _withheld(exc: Exception) -> _SafeText:
-    return _SafeText(f"[withheld: {type(exc).__name__} while scanning it for a codec error]")
+def _withheld(failure: str) -> _Rendered:
+    return _Rendered(f"[withheld: {failure} while scanning it for a codec error]")
 
 
 def prepare_log_record(record: logging.LogRecord) -> None:
@@ -2416,8 +2561,9 @@ def prepare_log_record(record: logging.LogRecord) -> None:
     It then replaces each ``UnicodeError`` in the record's ``msg`` and ``args`` with
     :func:`safe_exc`'s text, inside builtin containers too. ``log.warning("unreadable: %s", exc)``
     renders ``str(exc)``, which names the character or byte the codec failed on, and ``%r`` or a
-    container renders ``repr(exc)``, which prints ``.object``, the whole input. Args with nothing to
-    replace are left as the same object.
+    container renders ``repr(exc)``, which prints ``.object``, the whole input. An argument that
+    holds no error is left as the same object. A container on the path to one prints as it would,
+    the error aside; an exception on that path prints its class and a fixed note.
 
     IT NEVER RAISES. ``Handler.handle`` does not catch a filter's exception, so one raised here would
     reach the caller's log call. An argument that cannot be walked, or a traceback that cannot be
@@ -2430,30 +2576,32 @@ def prepare_log_record(record: logging.LogRecord) -> None:
         except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
             record.exc_text = f"[traceback withheld: {type(exc).__name__} while rendering it]"
     record.exc_info = None
-    seen: dict[int, tuple[Any, Any]] = {}
     try:
-        record.msg = _safe_arg(record.msg, 1, seen)
+        record.msg = _safe_arg(record.msg, 1)
     except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
         # The args went with the message they were for, or the formatter's % would raise.
-        record.msg, record.args = _withheld(exc), ()
+        record.msg, record.args = _withheld(type(exc).__name__), ()
         return
     args = record.args
     if type(args) is tuple:
         fresh: list[Any] = []
         for arg in args:  # one at a time, so one bad argument withholds only itself
             try:
-                fresh.append(_safe_arg(arg, 1, seen))
+                fresh.append(_safe_arg(arg, 1))
             except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
-                fresh.append(_withheld(exc))
+                fresh.append(_withheld(type(exc).__name__))
         if any(new is not old for new, old in zip(fresh, args, strict=True)):
             record.args = tuple(fresh)
         return
     try:  # the stdlib's single-mapping form: its values are the arguments, at level 1
-        record.args = _safe_arg(args, 0, seen)
+        rendered = _safe_arg(args, 0)
+        if isinstance(rendered, _Rendered):
+            # Not a Mapping: getMessage() only applies %, and "%(key)s" needs only __getitem__.
+            record.args = cast(Any, _RenderedMapping(args, rendered))
     except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
         # With no args the formatter applies no %, so the template prints as it was written.
         template = record.msg if type(record.msg) is str else "[log message withheld]"
-        record.msg = f"{template} {_withheld(exc)}"
+        record.msg = f"{template} {_withheld(type(exc).__name__)}"
         record.args = ()
 
 

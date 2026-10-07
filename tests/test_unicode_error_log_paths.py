@@ -29,7 +29,7 @@ import traceback
 import types
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -369,8 +369,8 @@ def test_two_unicode_error_keys_that_render_alike_stay_two_keys() -> None:
         "t", logging.WARNING, __file__, 1, "%s %s", ({first: 1, second: 2}, {first, second}), None
     )
     prepare_log_record(record)
-    keyed, members = cast(tuple[dict[str, int], set[str]], record.args)
-    assert sorted(keyed.values()) == [1, 2] and len(members) == 2
+    safe = repr(redaction.safe_exc(first))
+    assert record.getMessage() == f"{{{safe}: 1, {safe}: 2}} {{{safe}, {safe}}}"
     _assert_encode_safe(record.getMessage())
 
 
@@ -406,7 +406,8 @@ class _Unreprable:
 
 def test_an_argument_that_cannot_be_rendered_is_withheld_alone_never_raised() -> None:
     logger, stream = _capture()
-    logger.warning("%s / %s", RuntimeError(_encode_error(), _Unreprable()), "kept")
+    # The list prints its other elements as it would, and one of them cannot be printed.
+    logger.warning("%s / %s", [_encode_error(), _Unreprable()], "kept")
     out = stream.getvalue()
     assert "[withheld: ValueError while scanning it for a codec error] / kept" in out
     for spelling in _CHAR_SPELLINGS:
@@ -484,7 +485,7 @@ def test_the_walk_fails_closed_past_five_levels_and_keeps_a_deques_bound() -> No
     )
     prepare_log_record(record)
     out = record.getMessage()
-    assert "[nested too deep to scan for a codec error]" in out
+    assert "[holds a codec error, nested too deep to render]" in out
     assert "maxlen=3" in out
 
 
@@ -514,7 +515,7 @@ def test_a_mapping_key_answered_by_the_original_is_walked_too() -> None:
 
 def test_a_withheld_message_takes_its_arguments_with_it() -> None:
     logger, stream = _capture()
-    logger.warning(RuntimeError(_encode_error(), _Unreprable()), 1)
+    logger.warning([_encode_error(), _Unreprable()], 1)
     assert "[withheld: ValueError while scanning it for a codec error]" in stream.getvalue()
 
 
@@ -539,7 +540,7 @@ class _ArgsGroup(ExceptionGroup[Exception]):
         return repr(self.args)
 
 
-def test_a_group_subclass_printing_its_members_renders_from_its_message() -> None:
+def test_a_group_subclass_printing_its_members_renders_as_its_class_and_a_note() -> None:
     members: list[Exception] = [ValueError("x")]
     by_args = _ArgsGroup("batch", members)
     members.append(_encode_error())  # in .args, the caller's own list, and not in .exceptions
@@ -548,8 +549,8 @@ def test_a_group_subclass_printing_its_members_renders_from_its_message() -> Non
     logger.warning("%s", _LoudGroup("batch", [_encode_error()]))
     logger.warning("%s", by_args)
     out = stream.getvalue()
-    assert "_LoudGroup: batch (1 sub-exceptions)" in out
-    assert "_ArgsGroup: batch (1 sub-exceptions)" in out
+    assert "[_LoudGroup holding a codec error, not rendered]" in out
+    assert "[_ArgsGroup holding a codec error, not rendered]" in out
     assert "caf" not in out
 
 
@@ -660,6 +661,186 @@ def test_the_redaction_filter_alone_rewrites_the_argument() -> None:
     RedactionFilter().filter(record)
     ControlCharScrubFilter().filter(record)
     _assert_encode_safe(record.getMessage())
+
+
+# --- minimal touch: only the path to an error changes (round 5 of #3185) -----------------------------
+
+
+def _record(msg: str, args: Any) -> logging.LogRecord:
+    return logging.LogRecord("t", logging.WARNING, __file__, 1, msg, args, None)
+
+
+def _chain_filter(chain: str) -> logging.Filter:
+    return RedactionFilter() if chain == "engine" else TrayLogScrubFilter()
+
+
+class _Hides(Exception):
+    """Keeps its arguments out of its message, as a Handler's own error class may."""
+
+    def __str__(self) -> str:
+        return "parse failed"
+
+
+@pytest.mark.parametrize("placeholder", ["%s", "%r"])
+@pytest.mark.parametrize("chain", ["engine", "tray"])
+def test_an_exception_holding_a_unicode_error_prints_its_class_never_its_other_args(
+    chain: str, placeholder: str
+) -> None:
+    # Round 4 rebuilt it from repr() of its .args, so text its own __str__ kept out reached the log.
+    arg = _Hides("RAWSEG|PID|1||DOE^JANE", _encode_error())
+    assert _record("before %s after %d", (arg, 7)).getMessage() == "before parse failed after 7"
+    record = _record(f"before {placeholder} after %d", (arg, 7))
+    _chain_filter(chain).filter(record)
+    expected = "before [_Hides holding a codec error, not rendered] after 7"
+    assert record.getMessage() == expected
+
+
+class _Masked(dict[str, object]):
+    """Masks one key in its own lookup, as a credential-holding mapping may."""
+
+    def __getitem__(self, key: str) -> object:
+        return "***" if key == "password" else dict.__getitem__(self, key)
+
+
+@pytest.mark.parametrize("chain", ["engine", "tray"])
+def test_a_mapping_subclass_holding_a_unicode_error_still_answers_through_its_own_lookup(
+    chain: str,
+) -> None:
+    # Round 4 rebuilt it from the raw dict storage, so the masked value printed in the clear.
+    err = _encode_error()
+    arg = _Masked(password="hunter2-RAW", e=err)
+    record = _record("%(password)s %(e)s", arg)
+    _chain_filter(chain).filter(record)
+    assert record.getMessage() == f"*** {redaction.safe_exc(err)}"
+
+
+def _recursive_list() -> list[object]:
+    loop: list[object] = [1, "two"]
+    loop.append(loop)
+    return loop
+
+
+def _recursive_dict() -> dict[str, object]:
+    loop: dict[str, object] = {"a": 1}
+    loop["self"] = loop
+    return loop
+
+
+def _clean_groups(levels: int) -> Exception:
+    group: Exception = ValueError("clean")
+    for n in range(levels):
+        group = ExceptionGroup(f"level {n}", [group])
+    return group
+
+
+_POINT = collections.namedtuple("_POINT", "x y")
+
+#: Arguments holding no UnicodeError. Each must reach the formatter as the same object.
+_CLEAN_ARGS = [
+    _recursive_list(),
+    _recursive_dict(),
+    _nested("leaf", 9),
+    _nested({"k": ("v", 1)}, 12),
+    {"a": _nested([1, 2], 8)},
+    _clean_groups(4),
+    _POINT(1, [2]),
+    collections.deque([_nested(3, 7)], maxlen=4),
+    collections.OrderedDict(a=_recursive_list()),
+]
+_CLEAN_IDS = [
+    "recursive-list",
+    "recursive-dict",
+    "nine-deep",
+    "twelve-deep-dict",
+    "deep-dict-value",
+    "clean-group-4",
+    "namedtuple",
+    "deque",
+    "ordereddict",
+]
+
+
+@pytest.mark.parametrize("arg", _CLEAN_ARGS, ids=_CLEAN_IDS)
+@pytest.mark.parametrize("chain", ["engine", "tray"])
+def test_an_argument_holding_no_unicode_error_prints_exactly_as_with_no_filter(
+    arg: object, chain: str
+) -> None:
+    # Round 4 rewrote an error-free recursive list as a cycle note, and anything past five levels
+    # as the too-deep note.
+    for placeholder in ("%s", "%r"):
+        unfiltered = _record(f"got {placeholder} end", (arg,)).getMessage()
+        bare = _record(f"got {placeholder} end", (arg,))
+        args = bare.args  # LogRecord unwraps a lone mapping into the args itself
+        prepare_log_record(bare)
+        assert bare.args is args  # the same object, untouched
+        record = _record(f"got {placeholder} end", (arg,))
+        _chain_filter(chain).filter(record)
+        assert record.getMessage() == unfiltered
+
+
+def test_a_single_mapping_holding_no_unicode_error_is_the_same_object() -> None:
+    arg = {"deep": _nested("x", 9), "loop": _recursive_list()}
+    record = _record("%(deep)s %(loop)r", arg)
+    prepare_log_record(record)
+    assert record.args is arg
+
+
+class _Set(set[object]):
+    pass
+
+
+def _holders(err: UnicodeEncodeError) -> list[object]:
+    clean_loop = _recursive_list()
+    return [
+        [err, clean_loop],
+        (err,),
+        {"e": err, "deep": _nested(1, 8)},
+        collections.OrderedDict(z=err, a=1),
+        collections.defaultdict[str, object](list, e=err),
+        collections.deque([err, "x"], maxlen=5),
+        {err, "a", "b", "c"},
+        frozenset({err, 7}),
+        _Set({err, 9}),
+        _POINT(err, [1, clean_loop]),
+        collections.UserDict(e=err, n=1),
+        {"e": err}.items(),
+        collections.OrderedDict(e=err).values(),
+        [[{"k": (err, 1)}, _nested(0, 7)]],
+    ]
+
+
+_HOLDER_IDS = [
+    "list-beside-a-clean-cycle",
+    "tuple",
+    "dict-beside-a-deep-list",
+    "ordereddict",
+    "defaultdict",
+    "deque",
+    "set",
+    "frozenset",
+    "set-subclass",
+    "namedtuple",
+    "userdict",
+    "dict-items",
+    "odict-values",
+    "nested",
+]
+
+
+@pytest.mark.parametrize("index", range(len(_HOLDER_IDS)), ids=_HOLDER_IDS)
+def test_a_container_holding_a_unicode_error_prints_as_it_would_but_for_the_error(
+    index: int,
+) -> None:
+    # Each rebuilt level prints its other elements as the container itself would: its own type
+    # name, its order, a clean cycle's [...] and a deep sibling's depth.
+    err = _encode_error()
+    arg = _holders(err)[index]
+    expected = repr(arg).replace(repr(err), repr(redaction.safe_exc(err)))
+    assert expected != repr(arg)  # control: the error is in the raw rendering
+    for placeholder in ("%s", "%r"):
+        record = _record(f"{placeholder}", (arg,))
+        prepare_log_record(record)
+        assert record.getMessage() == expected
 
 
 # --- path 3: an error rendered into another error's message -----------------------------------------
