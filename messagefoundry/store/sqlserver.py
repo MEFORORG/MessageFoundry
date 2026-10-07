@@ -210,6 +210,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    tee_audits,
     totp_enable_term,
     verify_audit_rows,
 )
@@ -11266,6 +11267,43 @@ class SqlServerStore:
                 raise
         return int(count) > 0
 
+    async def _execute_with_audits(
+        self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float
+    ) -> None:
+        """Run one account write with its ``audits`` in the same transaction (BACKLOG #2100, #2221).
+
+        With none it is a plain :meth:`_execute`. Otherwise a failed append rolls the write back.
+        The write opens the transaction, which the applock inside the append needs. Same lock order
+        as `record_audit`: the in-process gate, then the connection. The in-process gate is held
+        across the write; BACKLOG #2222 records that wider scope."""
+        if not audits:
+            await self._execute(sql, params)
+            return
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(sql, params)
+                        appended = [
+                            await self._append_audit_row(
+                                cur,
+                                a.action,
+                                actor=a.actor,
+                                channel_id=None,
+                                detail=a.detail,
+                                client=a.client,
+                                now=now,
+                            )
+                            for a in audits
+                        ]
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits(audits, appended, ts=now)
+
     async def create_user(
         self,
         *,
@@ -11281,7 +11319,7 @@ class SqlServerStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -11307,33 +11345,7 @@ class SqlServerStore:
             directory_object_id,
             1 if password_generated else 0,
         )
-        if audit is None:
-            await self._execute(sql, params)
-            return
-        # BACKLOG #2100. The audit row joins the INSERT's transaction, so a failed append rolls the
-        # account back. The INSERT opens that transaction, which the applock inside the append
-        # needs. Same lock order as `record_audit`: the in-process gate, then the connection.
-        async with self._audit_lock:  # noqa: SIM117
-            async with self._acquire() as conn:
-                try:
-                    async with self._cursor(conn) as cur:
-                        await cur.execute(sql, params)
-                        appended = await self._append_audit_row(
-                            cur,
-                            audit.action,
-                            actor=audit.actor,
-                            channel_id=None,
-                            detail=audit.detail,
-                            client=audit.client,
-                            now=now,
-                        )
-                        await self._commit(conn)
-                except Exception:
-                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
-                    # detached close of the raw connection cannot race the cursor's own close.
-                    await self._rollback_or_discard(conn)
-                    raise
-        audit.tee(ts=now, row=appended)
+        await self._execute_with_audits(sql, params, audits, now=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=?", (user_id,))
@@ -11671,15 +11683,19 @@ class SqlServerStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits`` commit with the UPDATE (BACKLOG
+        #2221)."""
         now = time.time() if now is None else now
-        await self._execute(
+        await self._execute_with_audits(
             "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
             (display_name, email, now, user_id),
+            audits,
+            now=now,
         )
 
     async def set_user_notify_email(

@@ -4000,10 +4000,10 @@ def seed_notify_email(email: str | None) -> str | None:
 class AuditAppend:
     """One audit row a write appends in its OWN transaction, on all three backends (BACKLOG #2100).
 
-    For a record that must not outlive, or be outlived by, the row it describes. ``create_user``
-    takes one for a directory birth whose ``mail`` was not adopted. Written as a second call, a
-    crash between the two kept the account and lost the record of why it has no address. The row
-    joins the hash chain :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
+    For a record that must not outlive, or be outlived by, the row it describes. Written as a
+    second call, a crash between the two kept the change and lost its record. ``create_user`` and
+    ``update_user_profile`` take them (BACKLOG #2221). Each joins the hash chain
+    :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
     """
 
     action: str
@@ -4024,6 +4024,17 @@ class AuditAppend:
             seq=row.seq,
             row_hash=row.row_hash,
         )
+
+
+def tee_audits(
+    audits: Sequence[AuditAppend], rows: Sequence[AppendedAuditRow], *, ts: float
+) -> None:
+    """Tee each committed row of a write's ``audits`` off-box, after its commit (BACKLOG #2221).
+
+    Shared by all three backends. ``rows`` is what the appends returned, one per audit, in order.
+    """
+    for audit, row in zip(audits, rows, strict=True):
+        audit.tee(ts=ts, row=row)
 
 
 def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
@@ -10987,6 +10998,17 @@ class MessageStore:
             return AppendedAuditRow(row_id, seq, row_hash)
         raise AssertionError("unreachable: the second attempt returns or raises")
 
+    async def _append_audits(
+        self, audits: Sequence[AuditAppend], *, now: float
+    ) -> list[AppendedAuditRow]:
+        """Append each of a write's ``audits``, in order, inside its writer transaction (#2100)."""
+        return [
+            await self._append_audit_row(
+                a.action, actor=a.actor, channel_id=None, detail=a.detail, client=a.client, now=now
+            )
+            for a in audits
+        ]
+
     @staticmethod
     def _audit_where(
         *,
@@ -11475,7 +11497,7 @@ class MessageStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -11502,19 +11524,10 @@ class MessageStore:
                     1 if password_generated else 0,
                 ),
             )
-            if audit is not None:
-                # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
-                appended = await self._append_audit_row(
-                    audit.action,
-                    actor=audit.actor,
-                    channel_id=None,
-                    detail=audit.detail,
-                    client=audit.client,
-                    now=now,
-                )
+            # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
-        if audit is not None:
-            audit.tee(ts=now, row=appended)
+        tee_audits(audits, appended, ts=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         async with self._read() as db:
@@ -11662,18 +11675,22 @@ class MessageStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits`` commit with the UPDATE (BACKLOG
+        #2221)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
                 (display_name, email, now, user_id),
             )
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
+        tee_audits(audits, appended, ts=now)
 
     async def set_user_notify_email(
         self, user_id: str, *, email: str, now: float | None = None

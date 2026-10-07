@@ -224,6 +224,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    tee_audits,
     totp_enable_term,
     verify_audit_rows,
 )
@@ -7129,6 +7130,33 @@ class PostgresStore:
         )
         return AppendedAuditRow(int(new_id or 0), seq, row_hash)
 
+    async def _execute_with_audits(
+        self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float
+    ) -> None:
+        """Run one account write with its ``audits`` in the same transaction (BACKLOG #2100, #2221).
+
+        With none it is a plain :meth:`_execute`. Otherwise a failed append rolls the write back.
+        `record=False` as `_execute` passes: a sign-in is not a pipeline borrow. The write holds its
+        row while it waits for the audit advisory lock; BACKLOG #2222 records that wider scope."""
+        if not audits:
+            await self._execute(sql, *params)
+            return
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.execute(sql, *params)
+            appended = [
+                await self._append_audit_row(
+                    conn,
+                    a.action,
+                    actor=a.actor,
+                    channel_id=None,
+                    detail=a.detail,
+                    client=a.client,
+                    now=now,
+                )
+                for a in audits
+            ]
+        tee_audits(audits, appended, ts=now)
+
     @staticmethod
     def _audit_where(
         *,
@@ -7519,7 +7547,7 @@ class PostgresStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -7544,23 +7572,7 @@ class PostgresStore:
             directory_object_id,
             password_generated,
         )
-        if audit is None:
-            await self._execute(sql, *params)
-            return
-        # BACKLOG #2100. The audit row joins the INSERT's transaction, so a failed append rolls the
-        # account back. `record=False` as `_execute` passes: a sign-in is not a pipeline borrow.
-        async with self._timed_acquire(record=False) as conn, conn.transaction():
-            await conn.execute(sql, *params)
-            appended = await self._append_audit_row(
-                conn,
-                audit.action,
-                actor=audit.actor,
-                channel_id=None,
-                detail=audit.detail,
-                client=audit.client,
-                now=now,
-            )
-        audit.tee(ts=now, row=appended)
+        await self._execute_with_audits(sql, params, audits, now=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=$1", user_id)
@@ -7790,18 +7802,19 @@ class PostgresStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits`` commit with the UPDATE (BACKLOG
+        #2221)."""
         now = time.time() if now is None else now
-        await self._execute(
+        await self._execute_with_audits(
             "UPDATE users SET display_name=$1, email=$2, updated_at=$3 WHERE id=$4",
-            display_name,
-            email,
-            now,
-            user_id,
+            (display_name, email, now, user_id),
+            audits,
+            now=now,
         )
 
     async def set_user_notify_email(

@@ -5233,21 +5233,30 @@ class AuthService:
             # unreachable -- only the silent path is closed.
             display_name = principal.display_name or existing.display_name
             email = principal.email or existing.email
-            await self._store.update_user_profile(user_id, display_name=display_name, email=email)
-            if email != existing.email:
-                # BACKLOG #1139, ASVS 6.3.7. The directory owns the attribute, but repointing it
-                # decides where every later security notice on this account is delivered -- so it is
-                # an update to the account's authentication details, and it gets the same two records
-                # the local sibling ``update_user`` emits: an audit row and an out-of-band notice.
-                #
-                # This method sits on the SHARED directory completion path, so this covers the
-                # simple-bind, Kerberos and federated legs alike, not AD alone.
-                await self._audit(
-                    "auth.ad_profile_email_changed",
-                    actor=principal.username,
-                    detail=_json({"user_id": user_id, "source": "directory"}),
-                    client=client,
+            # BACKLOG #1139, ASVS 6.3.7. The directory owns the attribute, but repointing it decides
+            # where every later security notice on this account is delivered -- so it is an update
+            # to the account's authentication details, and it gets the same two records the local
+            # sibling ``update_user`` emits: an audit row and an out-of-band notice.
+            #
+            # This method sits on the SHARED directory completion path, so this covers the
+            # simple-bind, Kerberos and federated legs alike, not AD alone.
+            #
+            # The row commits in the UPDATE's transaction (BACKLOG #2221; ``AuditAppend`` says why).
+            email_changed = email != existing.email
+            repoint: list[AuditAppend] = []
+            if email_changed:
+                repoint.append(
+                    AuditAppend(
+                        "auth.ad_profile_email_changed",
+                        actor=principal.username,
+                        detail=_json({"user_id": user_id, "source": "directory"}),
+                        client=client,
+                    )
                 )
+            await self._store.update_user_profile(
+                user_id, display_name=display_name, email=email, audits=repoint
+            )
+            if email_changed:
                 # ADDRESSED TO THE ENGINE-OWNED ``notify_email`` FIRST (BACKLOG #1139, ADR 0182).
                 # This read used to start at ``existing.email``, the profile mirror, which is the one
                 # column a directory repoint is free to move -- so the notice about a repoint could
@@ -5319,6 +5328,7 @@ class AuthService:
         client: str | None,
         actor: str | None = None,
         typed_notify_email: str | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> str:
         """Insert the mirror row for a directory principal the store does not hold, and return its id.
 
@@ -5330,6 +5340,9 @@ class AuthService:
         ``typed_notify_email`` is the administrator's checked address for a row whose ``mail`` is
         not adopted (#2021 only). It is bound in the same INSERT, so no crash leaves that row with
         no address. The profile mirror still gets the directory's ``mail``.
+
+        ``audits`` are the caller's own rows for this birth. They commit in the INSERT's
+        transaction, after any not-adopted row (BACKLOG #2221).
         """
         user_id = uuid4().hex
         # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
@@ -5343,18 +5356,18 @@ class AuthService:
         adopt = _adopts_directory_mail(principal)
         # The address stays out of the audit row and the log. It is directory-supplied and may be a
         # lookalike of someone's real one. The row is written IN THE INSERT'S TRANSACTION (BACKLOG
-        # #2100): as a second write, a crash between the two kept the account and lost the record.
-        refusal = (
-            None
-            if adopt
-            else AuditAppend(
-                "auth.ad_notify_email_not_adopted",
-                # The sign-in's own holder, or the administrator whose create this is (#2021).
-                actor=actor or principal.username,
-                detail=_json({"user_id": user_id, "source": "directory"}),
-                client=client,
+        # #2100).
+        rows: list[AuditAppend] = []
+        if not adopt:
+            rows.append(
+                AuditAppend(
+                    "auth.ad_notify_email_not_adopted",
+                    # The sign-in's own holder, or the administrator whose create this is (#2021).
+                    actor=actor or principal.username,
+                    detail=_json({"user_id": user_id, "source": "directory"}),
+                    client=client,
+                )
             )
-        )
         await self._store.create_user(
             user_id=user_id,
             username=principal.username,
@@ -5367,7 +5380,7 @@ class AuthService:
             directory_object_id=principal.directory_object_id,
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
-            audit=refusal,
+            audits=[*rows, *audits],
             password_generated=False,
         )
         if not adopt:
@@ -5468,18 +5481,8 @@ class AuthService:
                     " give one as notify_email, such as name@example.org"
                 )
             typed = address = _require_single_mailbox(notify_email)
-        try:
-            user_id = await self._create_directory_row(
-                principal, client=client, actor=actor, typed_notify_email=typed
-            )
-        except Exception as exc:
-            if not _is_integrity_refusal(exc):
-                raise
-            # Re-read rather than assume the name index fired, as create_local_user does.
-            if await self._store.get_user_by_username(principal.username) is None:
-                raise
-            raise UsernameTaken(USERNAME_TAKEN) from exc
-        await self._audit(
+        # Committed with the INSERT, not after it (BACKLOG #2221).
+        created = AuditAppend(
             "user.created",
             actor=actor,
             detail=_json(
@@ -5492,6 +5495,17 @@ class AuthService:
             ),
             client=client,
         )
+        try:
+            user_id = await self._create_directory_row(
+                principal, client=client, actor=actor, typed_notify_email=typed, audits=(created,)
+            )
+        except Exception as exc:
+            if not _is_integrity_refusal(exc):
+                raise
+            # Re-read rather than assume the name index fired, as create_local_user does.
+            if await self._store.get_user_by_username(principal.username) is None:
+                raise
+            raise UsernameTaken(USERNAME_TAKEN) from exc
         await self._notify_security(
             ACCOUNT_CREATED, username=principal.username, email=address, detail={"roles": []}
         )
