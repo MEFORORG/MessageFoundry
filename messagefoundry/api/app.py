@@ -349,6 +349,7 @@ from messagefoundry.config.wiring import (
     revocation_attested_hops,
     unverified_generic_db_hops,
 )
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.logging_guard import active_guard as active_log_guard
@@ -1356,13 +1357,16 @@ async def _record_reload_audit(
         )
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
     except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
+        # The actor and the detail carry caller input (a username, a requested path), so each is
+        # scrubbed at the call site: see _audit_refused_reload for why the handler filter is not
+        # enough. ``json.dumps`` already escapes control characters, so the detail stays intact.
         _log.exception(
             "config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
             "loaded at start" if action == "config_loaded" else "reload swapped the graph",
             action,
             _RELOAD_AUDIT_STEP,
-            actor,
-            detail,
+            scrub_log_argument(actor),
+            None if detail is None else scrub_log_argument(detail),
         )
         return [*failed_steps, _RELOAD_AUDIT_STEP]
     return list(failed_steps)
@@ -1429,11 +1433,17 @@ async def _audit_refused_reload(
     try:
         await engine.store.record_audit(action, actor=actor, detail=row, client=client)
     except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
+        # The row names the caller's requested directory and the actor is a username, so a CR or
+        # LF in either could forge a log line on a handler with no ControlCharScrubFilter. The
+        # call-site scrub also lets CodeQL's py/log-injection query see the neutraliser, which it
+        # cannot see in a handler filter. The escapes are printable and reversible, and the row is
+        # JSON whose control characters ``json.dumps`` already escaped, so it is unchanged and an
+        # operator can still rebuild the lost row from this line.
         _log.exception(
             "a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
             action,
-            actor,
-            row,
+            scrub_log_argument(actor),
+            scrub_log_argument(row),
         )
     return status, answer
 
@@ -1471,8 +1481,8 @@ async def _audit_reload_attempt(
         _log.exception(
             "config reload: the audit log refused the config_reload_attempted row, so the reload "
             "did not run. Lost row: actor=%s detail=%s",
-            actor,
-            detail,
+            scrub_log_argument(actor),  # caller input: see _audit_refused_reload
+            scrub_log_argument(detail),
         )
         try:
             alert_sink.audit_write_failed(

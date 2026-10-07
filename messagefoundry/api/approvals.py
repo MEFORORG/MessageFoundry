@@ -56,6 +56,7 @@ from uuid import uuid4
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.settings import ApprovalsSettings
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.base import Store
@@ -505,10 +506,12 @@ class ApprovalGate:
                 "approval %s: the write carrying its %s audit row failed. The request is still "
                 "held under this id if this was a repeat. It is also held, with that row, if the "
                 "COMMIT landed before the error. Lost detail: actor=%s operation=%s",
-                lost_id,
+                scrub_log_argument(lost_id),
                 action,
-                requester,
-                operation,
+                # Caller input, scrubbed at the call site so a CR or LF cannot forge a log line on
+                # a handler with no ControlCharScrubFilter (CodeQL py/log-injection).
+                scrub_log_argument(requester),
+                scrub_log_argument(operation),
             )
             self._alert_lost_audit(lost_id, action)
             raise
@@ -1106,10 +1109,12 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - every store backend raises its own type
             log.exception(
                 "approval %s: %s, but its %s audit row failed. Lost detail: %s",
-                approval_id,
+                # The id can come from a request path and the detail names caller values, so both
+                # are scrubbed here as the lost-row logs in api/app.py are (CodeQL py/log-injection).
+                scrub_log_argument(approval_id),
                 context,
                 action,
-                detail,
+                scrub_log_argument(detail),
             )
             self._alert_lost_audit(approval_id, action)
 

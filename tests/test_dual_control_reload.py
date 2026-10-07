@@ -779,6 +779,40 @@ async def test_a_refused_release_whose_audit_row_fails_still_answers_422(
     )
 
 
+async def test_a_lost_refusal_row_cannot_forge_a_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CodeQL py/log-injection on PR 2115: the lost-row ERROR carries the caller's requested
+    directory and the actor, so a CR or LF in either must not start a new log line. caplog's
+    handler has no ControlCharScrubFilter, so this reads the call site's own scrub. The row must
+    still be recoverable: its JSON parses back to the detail that was lost."""
+    from types import SimpleNamespace
+    from typing import cast
+
+    from messagefoundry.api.app import _audit_refused_reload
+
+    async def _refuse(action: str, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    fake = cast(Engine, SimpleNamespace(store=SimpleNamespace(record_audit=_refuse)))
+    requested = "/cfg\r\nFORGED config reload succeeded"
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+        status, _answer = await _audit_refused_reload(
+            fake,
+            FileNotFoundError(requested),
+            actor="alice\nFORGED actor=root",
+            requested=requested,
+            dry_run=False,
+        )
+    assert status == 404
+    [lost] = [r for r in caplog.records if "Lost row" in r.getMessage()]
+    message = lost.getMessage()
+    assert "\r" not in message and "\n" not in message
+    assert "actor=alice\\nFORGED actor=root " in message
+    row = message.split(" detail=", 1)[1]
+    assert json.loads(row) == {"requested": requested, "dry_run": False, "reason": "not_found"}
+
+
 async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(
     engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
