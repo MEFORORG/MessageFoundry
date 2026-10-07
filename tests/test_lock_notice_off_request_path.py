@@ -17,8 +17,9 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -95,21 +96,54 @@ async def _seed_other_accounts_notices(store: MessageStore, count: int) -> None:
     await db.commit()
 
 
+@dataclass
+class _Reads:
+    """What the patched throttle read saw: how many reads ran, and the most in flight at once."""
+
+    count: int = 0
+    running: int = 0
+    peak: int = 0
+
+
+def _patch_throttle_read(
+    monkeypatch: pytest.MonkeyPatch,
+    store: MessageStore,
+    *,
+    before: Callable[[], Awaitable[object]] | None = None,
+    after: Callable[[], Awaitable[object]] | None = None,
+) -> _Reads:
+    """Run ``before`` ahead of each throttle read, and ``after`` once it has read and before it
+    answers, counting the reads in flight across both. Other ``list_audit`` calls pass through.
+    The test's own later ``auth.lock_notice`` reads are counted too, so read the counts first."""
+    real = store.list_audit
+    reads = _Reads()
+
+    async def held(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("action") != _LOCK_NOTICE:
+            return await real(*args, **kwargs)
+        reads.count += 1
+        reads.running += 1
+        reads.peak = max(reads.peak, reads.running)
+        try:
+            if before is not None:
+                await before()
+            rows = await real(*args, **kwargs)
+            if after is not None:
+                await after()
+            return rows
+        finally:
+            reads.running -= 1
+
+    monkeypatch.setattr(store, "list_audit", held)
+    return reads
+
+
 def _slow_throttle_read(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore, delay: float
-) -> list[float]:
-    """Make the throttle's read take at least ``delay``. Returns the list each read appends to."""
-    real = store.list_audit
-    reads: list[float] = []
-
-    async def slow(*args: Any, **kwargs: Any) -> Any:
-        if kwargs.get("action") == _LOCK_NOTICE:
-            reads.append(time.monotonic())
-            await asyncio.sleep(delay)
-        return await real(*args, **kwargs)
-
-    monkeypatch.setattr(store, "list_audit", slow)
-    return reads
+) -> _Reads:
+    """Make the throttle's read take at least ``delay``. For the timing tests, where the slow read
+    IS the condition under test; the race tests stage their overlaps with gates instead."""
+    return _patch_throttle_read(monkeypatch, store, before=lambda: asyncio.sleep(delay))
 
 
 def _record_deadlines(monkeypatch: pytest.MonkeyPatch) -> list[float]:
@@ -171,7 +205,7 @@ async def test_the_lock_setting_refusal_stays_in_its_slot_with_a_large_audit_log
             f"the lock-setting refusal answered {refused_by:.3f}s in, past its first slot"
         )
         # The throttle did run, slowly, after the answer's deadline was fixed.
-        assert len(reads) == 1, reads
+        assert reads.count == 1, reads
         assert len(notifier.locks()) == 1, "the notice never went out"
         rows = await _lock_notice_rows(store, user.username)
         assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": True}]
@@ -223,22 +257,94 @@ def _parallel_reads(service: AuthService) -> None:
     service._lock_notice_read_slots = asyncio.Semaphore(2)
 
 
+#: How long a :class:`_Gate` waits for its last arrival. The tests below stage their overlaps with
+#: gates rather than with sleeps. A healthy interleave opens a gate within milliseconds, so a wait
+#: this long means a regression, broken staging, or a runner stalled for seconds. The test then
+#: fails on the gate's record, before its mail counts.
+_GATE_SECONDS = 10.0
+
+
+class _Gate:
+    """Opens once ``needed`` tasks have arrived. Each :meth:`wait` records if it opened in time.
+
+    A timeout is recorded rather than raised: inside a patched throttle read an exception would be
+    swallowed by the read's fail-open handler, which mails, and could turn a staging failure into a
+    pass. Each test asserts :attr:`waits` itself, first. Not ``asyncio.Barrier``: the queue tests
+    count an arrival in one task and wait in another."""
+
+    def __init__(self, needed: int) -> None:
+        self._needed = needed
+        self._arrived = 0
+        self._open = asyncio.Event()
+        self.waits: list[bool] = []
+
+    def arrive(self) -> None:
+        self._arrived += 1
+        if self._arrived >= self._needed:
+            self._open.set()
+
+    async def wait(self) -> None:
+        try:
+            await asyncio.wait_for(self._open.wait(), _GATE_SECONDS)
+        except TimeoutError:
+            self.waits.append(False)
+        else:
+            self.waits.append(True)
+
+    async def meet(self) -> None:
+        """Arrive, then wait for the others."""
+        self.arrive()
+        await self.wait()
+
+
+def _gate_on_the_notice_queue(
+    monkeypatch: pytest.MonkeyPatch, service: AuthService, needed: int
+) -> _Gate:
+    """A gate that opens once ``needed`` lock notices have reached the per-account, per-kind queue.
+
+    Counted where ``_send_lock_notice`` enters ``_hold_keyed_lock`` on ``_lock_notice_locks``, which
+    takes the lock with no await in between, so a notice counted here is holding the queue or
+    waiting on it. The race control already replaces the same helper."""
+    gate = _Gate(needed)
+    real_hold = service_module._hold_keyed_lock
+
+    @asynccontextmanager
+    async def arriving(table: Any, key: str) -> AsyncIterator[None]:
+        if table is service._lock_notice_locks:
+            gate.arrive()
+        async with real_hold(table, key):
+            yield
+
+    monkeypatch.setattr(service_module, "_hold_keyed_lock", arriving)
+    return gate
+
+
 async def test_two_same_kind_locks_at_once_send_one_mail_and_write_one_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Off the request path, two sign-in locks on one account can land together, for example one
     set by a re-proof while a sign-in sets it too. Each task would read the throttle before the
-    other wrote its row. The per-account, per-kind queue makes the second read the first's row."""
+    other wrote its row. The per-account, per-kind queue makes the second read the first's row.
+
+    "Together" is staged, not timed: the first notice's read waits until the second notice has
+    reached the queue, so the second is waiting there while the first reads. A sleep used to stand
+    in for that, and on a loaded runner the second lock could arrive after the first had finished,
+    which passed here without testing the race."""
     store, service, notifier, user = await _harness()
     try:
-        reads = _slow_throttle_read(monkeypatch, store, 0.05)
+        queued = _gate_on_the_notice_queue(monkeypatch, service, 2)
+        _patch_throttle_read(monkeypatch, store, before=queued.wait)
         _parallel_reads(service)
         await asyncio.gather(
             service._record_lock(user, "sign_in", _lock(1), client=None),
             service._record_lock(user, "sign_in", _lock(2), client=None),
         )
         await service.drain_background()
-        assert len(reads) == 2, "both locks must reach the throttle for this to test the race"
+        assert queued.waits == [True, True], (
+            "the second lock's notice never reached the per-account queue while the first read, so "
+            f"this did not test the race: {queued.waits}. [False, False] means neither notice "
+            "entered the queue through _hold_keyed_lock on _lock_notice_locks."
+        )
         assert len(notifier.locks()) == 1, [e.detail for e in notifier.locks()]
         assert len(await _lock_notice_rows(store, user.username)) == 1
         locked = await store.list_audit(actor=user.username, action="auth.account_locked")
@@ -250,10 +356,17 @@ async def test_two_same_kind_locks_at_once_send_one_mail_and_write_one_row(
 
 async def test_the_race_is_real_without_the_queue(monkeypatch: pytest.MonkeyPatch) -> None:
     """The control for the race test: the same two locks with the per-account queue taken away mail
-    twice. So the single mail above is the queue's doing."""
+    twice. So the single mail above is the queue's doing.
+
+    The race is staged, not timed: each read's answer is held until both reads have finished, so
+    neither notice can write its row before the other has looked. A 0.05 s sleep used to stand in
+    for that, and on a loaded runner the second notice could start after the first had read, mailed
+    and written its row, so it was throttled and this mailed once (merge-queue intermittent, test
+    from PR 2092)."""
     store, service, notifier, user = await _harness()
     try:
-        _slow_throttle_read(monkeypatch, store, 0.05)
+        both_read = _Gate(2)
+        _patch_throttle_read(monkeypatch, store, after=both_read.meet)
         _parallel_reads(service)
 
         @asynccontextmanager
@@ -266,6 +379,10 @@ async def test_the_race_is_real_without_the_queue(monkeypatch: pytest.MonkeyPatc
             service._record_lock(user, "sign_in", _lock(2), client=None),
         )
         await service.drain_background()
+        assert both_read.waits == [True, True], (
+            f"the two throttle reads never overlapped, so the race was not staged: "
+            f"{both_read.waits}"
+        )
         assert len(notifier.locks()) == 2
         assert len(await _lock_notice_rows(store, user.username)) == 2
     finally:
@@ -277,7 +394,12 @@ async def test_one_throttle_read_runs_at_a_time_across_accounts(
 ) -> None:
     """Each throttle read walks every recent ``auth.lock_notice`` row, so locks on many accounts at
     once would fill the store's read pool that sign-ins wait on. The service runs one at a time.
-    Every account still gets its mail."""
+    Every account still gets its mail.
+
+    Each read waits until every account's notice has reached the throttle, so all five are waiting
+    for the read slot while the first reads, and a wider limit would let the others in beside it. A
+    sleep used to stand in for that, and on a loaded runner the notices could start too far apart
+    to overlap."""
     store, service, notifier, user = await _harness()
     try:
         users = [user]
@@ -293,28 +415,26 @@ async def test_one_throttle_read_runs_at_a_time_across_accounts(
             other = await store.get_user(f"u-{n}")
             assert other is not None
             users.append(other)
-        real = store.list_audit
-        running = 0
-        peak = 0
+        all_due = _Gate(len(users))
+        real_held_back = service._lock_notice_held_back
 
-        async def counted(*args: Any, **kwargs: Any) -> Any:
-            nonlocal running, peak
-            if kwargs.get("action") != _LOCK_NOTICE:
-                return await real(*args, **kwargs)
-            running += 1
-            peak = max(peak, running)
-            try:
-                await asyncio.sleep(0.02)
-                return await real(*args, **kwargs)
-            finally:
-                running -= 1
+        async def arriving(who: UserRecord, lock: str) -> bool:
+            # Counted just before the read slots are taken, with no await in between.
+            all_due.arrive()
+            return await real_held_back(who, lock)
 
-        monkeypatch.setattr(store, "list_audit", counted)
+        monkeypatch.setattr(service, "_lock_notice_held_back", arriving)
+        reads = _patch_throttle_read(monkeypatch, store, before=all_due.wait)
         await asyncio.gather(
             *(service._record_lock(u, "sign_in", _lock(1), client=None) for u in users)
         )
         await service.drain_background()
-        assert peak == 1, f"{peak} throttle reads ran at once"
+        assert all_due.waits == [True] * len(users), (
+            "the notices never all reached the throttle at once, so this did not test the limit: "
+            f"{all_due.waits}. All False means no notice reached _lock_notice_held_back while the "
+            "first read waited."
+        )
+        assert reads.peak == 1, f"{reads.peak} throttle reads ran at once"
         assert sorted(e.username for e in notifier.locks()) == sorted(u.username for u in users)
     finally:
         await store.close()
@@ -326,33 +446,28 @@ async def test_two_kinds_at_once_are_not_queued_behind_each_other(
     """The queue is per lock kind: a sign-in lock and a second-step lock landing together are two
     notices, as the time throttle has always counted them, and neither waits for the other. With
     two reads allowed at once, both kinds' reads are in flight together; a queue keyed on the
-    account alone would run them one after the other."""
+    account alone would run them one after the other.
+
+    Each read waits at a gate until both kinds' reads have reached it, rather than sleeping and
+    hoping the other arrives in time: on a loaded runner a sleep could end before the other kind's
+    read began. Anything that serializes the two reads keeps the gate shut until it times out.
+    The in-flight count is also the control for the test above: it shows the counter whose
+    ``peak == 1`` that test reads can see two reads at once."""
     store, service, notifier, user = await _harness()
     try:
         _parallel_reads(service)
-        real = store.list_audit
-        running = 0
-        peak = 0
-
-        async def counted(*args: Any, **kwargs: Any) -> Any:
-            nonlocal running, peak
-            if kwargs.get("action") != _LOCK_NOTICE:
-                return await real(*args, **kwargs)
-            running += 1
-            peak = max(peak, running)
-            try:
-                await asyncio.sleep(0.05)
-                return await real(*args, **kwargs)
-            finally:
-                running -= 1
-
-        monkeypatch.setattr(store, "list_audit", counted)
+        both_in_flight = _Gate(2)
+        reads = _patch_throttle_read(monkeypatch, store, before=both_in_flight.meet)
         await asyncio.gather(
             service._record_lock(user, "sign_in", _lock(1), client=None),
             service._record_lock(user, "second_step", _lock(1), client=None, factor="password"),
         )
         await service.drain_background()
-        assert peak == 2, "the two kinds' notices queued behind each other"
+        assert both_in_flight.waits == [True, True], (
+            "the two kinds' reads never ran at once: a queue keyed on the account alone, or one "
+            f"read slot, serializes them: {both_in_flight.waits}"
+        )
+        assert reads.peak == 2, "the in-flight counter did not see two reads at once"
         assert sorted(e.detail["lock"] for e in notifier.locks()) == ["second_step", "sign_in"]
     finally:
         await store.close()
@@ -389,14 +504,7 @@ async def test_a_notice_cancelled_at_shutdown_logs_a_line_that_names_nothing(
     store, service, notifier, user = await _harness()
     try:
         never = asyncio.Event()
-        real = store.list_audit
-
-        async def stuck(*args: Any, **kwargs: Any) -> Any:
-            if kwargs.get("action") == _LOCK_NOTICE:
-                await never.wait()
-            return await real(*args, **kwargs)
-
-        monkeypatch.setattr(store, "list_audit", stuck)
+        _patch_throttle_read(monkeypatch, store, before=never.wait)
         caplog.clear()
         with caplog.at_level(logging.INFO):
             await service._record_lock(user, "sign_in", _lock(1), client="10.0.0.9")
@@ -586,27 +694,17 @@ async def _rows_after_shutdown(db: Path, action: str) -> list[Any]:
 
 
 async def _lock_in_lifespan(
-    app: Any, monkeypatch: pytest.MonkeyPatch, *, gate: asyncio.Event | None = None
+    app: Any, monkeypatch: pytest.MonkeyPatch, gate: asyncio.Event
 ) -> AuthService:
-    """Inside a running lifespan: lock an account with a slow throttle read, so its notice is still
-    pending when the lifespan exits. With ``gate``, the read waits for it instead of a delay."""
+    """Inside a running lifespan: lock an account with its throttle read held at ``gate``, so its
+    notice is still pending when the lifespan exits however slow the runner is."""
     auth: AuthService = app.state.auth
     store = app.state.engine.store
     admin = await create_admin(auth)
     await store.set_user_notify_email(admin.user_id, email="owner@example.org")
     user = await store.get_user(admin.user_id)
     assert user is not None
-    if gate is None:
-        _slow_throttle_read(monkeypatch, store, 0.2)
-    else:
-        real = store.list_audit
-
-        async def held(*args: Any, **kwargs: Any) -> Any:
-            if kwargs.get("action") == _LOCK_NOTICE:
-                await gate.wait()
-            return await real(*args, **kwargs)
-
-        monkeypatch.setattr(store, "list_audit", held)
+    _patch_throttle_read(monkeypatch, store, before=gate.wait)
     await auth._record_lock(user, "sign_in", _lock(1), client=None)
     assert auth._background_tasks, "the notice did not run as a background task"
     return auth
@@ -615,13 +713,35 @@ async def _lock_in_lifespan(
 async def test_the_lifespan_drains_a_pending_notice_before_the_store_closes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The notice is held until the shutdown drain is called, and released only there, so a
+    lifespan that never drains would leave it pending past the store's close. A 0.2 s slow read
+    used to stand in for that, and on a loaded runner the notice could finish before shutdown,
+    which passed here without testing the drain."""
     monkeypatch.setattr(
         "messagefoundry.pipeline.security_notify.send_plain_email", lambda **_: None
     )
     db = tmp_path / "drain.db"
     app = _managed_app(db)
+    gate = asyncio.Event()
+    pending_at_drain: list[bool] = []
     async with app.router.lifespan_context(app):
-        await _lock_in_lifespan(app, monkeypatch)
+        auth = await _lock_in_lifespan(app, monkeypatch, gate)
+        real_drain = auth.drain_background
+
+        async def release_then_drain(*, timeout: float | None = None, close: bool = False) -> None:
+            if close:  # the shutdown drain, not the test's own join below
+                pending_at_drain.append(bool(auth._background_tasks))
+                gate.set()
+            await real_drain(timeout=timeout, close=close)
+
+        monkeypatch.setattr(auth, "drain_background", release_then_drain)
+    # Had the lifespan skipped the drain, the held notice would still be waiting: finish it here so
+    # it does not outlive the test. With the drain, there is nothing left to wait for.
+    gate.set()
+    await auth.drain_background()
+    assert pending_at_drain == [True], (
+        f"the shutdown drain did not run, or the notice was not pending at it: {pending_at_drain}"
+    )
     rows = await _rows_after_shutdown(db, _LOCK_NOTICE)
     assert len(rows) == 1, f"the pending notice's row was lost at shutdown: {rows}"
 
@@ -637,7 +757,7 @@ async def test_the_lifespan_control_loses_the_row_without_the_drain(
     app = _managed_app(db)
     gate = asyncio.Event()
     async with app.router.lifespan_context(app):
-        auth = await _lock_in_lifespan(app, monkeypatch, gate=gate)
+        auth = await _lock_in_lifespan(app, monkeypatch, gate)
 
         async def skipped() -> None:
             return None
