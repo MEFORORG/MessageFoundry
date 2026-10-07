@@ -27,27 +27,28 @@ FACILITY_MNEMONICS = code_set("facility_mnemonics")
 
 @handler("steps_oru_handler")
 def steps_oru_handler(msg):
-    # A result with no patient identifier cannot be filed: fail it to the error path.
+    # The EMR files on the first PID-3 identifier. A result without one goes to the error path.
     if msg.field("PID-3.1") is None:
         raise ValueError("PID-3 patient identifier is missing")
-    # A cancelled order (OBR-25 = X) carries no result to deliver: filter it.
-    if msg.field("OBR-25") == "X":
+    # A training message (MSH-11 = T, HL7 table 0103) is not delivered: filter it.
+    if msg.field("MSH-11") == "T":
         return []
     # Field mapping: address the message to the receiving system.
     set_field(msg, "MSH-5", "EMR")
     set_field(msg, "MSH-6", "MAINHOSP")
-    code_lookup(msg, "MSH-4", FACILITY_MNEMONICS)
+    code_lookup(msg, "MSH-4.1", FACILITY_MNEMONICS)
     trim_field(msg, "PID-5.1")
     convert_case(msg, "PID-5.1", "upper")
-    copy_field(msg, "OBR-7", "OBR-22")
-    format_date(msg, "OBR-22", "%Y%m%d%H%M")
+    # The EMR also reads the identifier from PID-2, and takes the birth date without a time.
+    copy_field(msg, "PID-3.1", "PID-2.1")
+    format_date(msg, "PID-7", "%Y%m%d")
     # A patient with no administrative sex is sent as unknown (HL7 table 0001).
     if msg.field("PID-8") is None:
         set_field(msg, "PID-8", "U")
-    # Each OBX with no result status (OBX-11) is sent as final (HL7 table 0085).
+    # Each OBX with no producer (OBX-15) is stamped with the performing lab.
     for i in range(1, msg.count_segments("OBX") + 1):
-        if msg.field("OBX-11", occurrence=i) is None:
-            msg.set("OBX-11", "F", occurrence=i)
+        if msg.field("OBX-15", occurrence=i) is None:
+            msg.set("OBX-15", "MAINLAB", occurrence=i)
     # Log each patient identifier repetition. log_note redacts every value by default.
     for ident in msg.repetitions("PID-3"):
         log_note("PID-3 repetition {}", ident)

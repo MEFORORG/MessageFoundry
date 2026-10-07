@@ -24,13 +24,14 @@ SAMPLES = Path(__file__).resolve().parents[1] / "samples" / "config"
 ROUTER = SAMPLES / "IB_STEPS_ORU_router.py"
 HANDLER = SAMPLES / "IB_STEPS_ORU_handler.py"
 
-# Synthetic: invented names and identifiers. OBX 1 has no result status (OBX-11), OBX 2 has one.
+# Synthetic: invented names and identifiers. MSH-4 is a full HD, so the lookup must key on MSH-4.1.
+# OBX 1 has no producer (OBX-15) and OBX 2 has one.
 ORU_R01 = (
-    "MSH|^~\\&|LAB|ACME|C|D|20260101120000||ORU^R01|STEPS1|P|2.5.1\r"
-    "PID|1||100^^^H^MR~200^^^H^PI||  zztest^synthetic\r"
+    "MSH|^~\\&|LAB|ACME^LABNS^L|C|D|20260101120000||ORU^R01|STEPS1|P|2.5.1\r"
+    "PID|1||100^^^H^MR~200^^^H^PI||  zztest^synthetic||19800101120000\r"
     "OBR|1|||CBC|||20260101113000\r"
-    "OBX|1|NM|WBC||7.1|10*3/uL\r"
-    "OBX|2|NM|HGB||13.9|g/dL|||||C\r"
+    "OBX|1|NM|WBC||7.1|10*3/uL|||||F\r"
+    "OBX|2|NM|HGB||13.9|g/dL|||||F||||OTHERLAB\r"
 )
 
 
@@ -94,10 +95,20 @@ def test_every_editable_row_rewrites_byte_identically(module: Path) -> None:
     original = module.read_bytes().decode("utf-8")
     editable = [r for r in _rows(module) if r["kind"] in {"action", "lookup", "send", "route"}]
     assert editable
+    resent = 0
     for row in editable:
         edit = {"line_start": row["line_start"], "line_end": row["line_end"], "op": "set_params"}
         out = rewrite_module(module, {**edit, "params": {}}, contract=CONTRACT_V2)
         assert out == original, f"no-op rewrite of {row} changed the file"
+        # An empty edit returns early, so also re-send each literal param at its current value: that
+        # runs the splice itself.
+        current = {k: row["params"][k] for k in row.get("literal_params", [])}
+        if current:
+            out = rewrite_module(module, {**edit, "params": current}, contract=CONTRACT_V2)
+            assert out == original, f"re-sending {current} on {row} changed the file"
+            resent += 1
+    if module == HANDLER:
+        assert resent >= 8
 
 
 def test_an_analyst_edit_changes_one_row() -> None:
@@ -129,23 +140,22 @@ def test_feed_transforms_a_synthetic_result() -> None:
         "OB_STEPS_ORU_EMR",
         "OB_STEPS_ORU_ARCHIVE",
     ]
-    assert msg.field("MSH-4") == "ACMEHOSP"  # code_lookup through facility_mnemonics
+    assert msg.field("MSH-4") == "ACMEHOSP^LABNS^L"  # code_lookup on MSH-4.1 only
     assert msg.field("MSH-5") == "EMR"
     assert msg.field("PID-5.1") == "ZZTEST"  # trimmed, then upper-cased
     assert msg.field("PID-8") == "U"  # the If branch filled the empty field
-    assert msg.field("OBR-22") == "202601011130"  # copied from OBR-7, then cut to minutes
-    assert msg.field("OBX-11", occurrence=1) == "F"  # For Each filled the empty status
-    assert msg.field("OBX-11", occurrence=2) == "C"  # and left the set one alone
+    assert msg.field("PID-2.1") == "100"  # copied from the first PID-3 identifier
+    assert msg.field("PID-7") == "19800101"  # the birth date without its time
+    assert msg.field("OBX-15", occurrence=1) == "MAINLAB"  # For Each filled the empty producer
+    assert msg.field("OBX-15", occurrence=2) == "OTHERLAB"  # and left the set one alone
 
 
 def test_handler_filters_and_raises() -> None:
     reg = load_config(SAMPLES)
     run = reg.handlers["steps_oru_handler"]
-    cancelled = Message.parse(
-        ORU_R01.replace("OBR|1|||CBC|||20260101113000", "OBR|1|||CBC" + "|" * 21 + "X")
-    )
-    assert cancelled.field("OBR-25") == "X"
-    assert run(cancelled) == []
+    training = Message.parse(ORU_R01.replace("|P|2.5.1", "|T|2.5.1"))
+    assert training.field("MSH-11") == "T"
+    assert run(training) == []
     no_id = Message.parse(ORU_R01.replace("100^^^H^MR~200^^^H^PI", ""))
     with pytest.raises(ValueError, match="PID-3"):
         run(no_id)
@@ -181,4 +191,4 @@ def test_check_passes_and_dryrun_delivers_twice(
     r = results[0]
     assert r["message_type"] == "ORU^R01"
     assert [d["to"] for d in r["deliveries"]] == ["OB_STEPS_ORU_EMR", "OB_STEPS_ORU_ARCHIVE"]
-    assert all("|ACMEHOSP|EMR|MAINHOSP|" in d["payload"] for d in r["deliveries"])
+    assert all("|ACMEHOSP^LABNS^L|EMR|MAINHOSP|" in d["payload"] for d in r["deliveries"])

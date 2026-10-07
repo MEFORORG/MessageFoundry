@@ -37,8 +37,7 @@ demo_oru_host = "127.0.0.1"
 demo_oru_port = 2641
 
 # Downstream EMR (OB_STEPS_ORU_EMR) and results archive (OB_STEPS_ORU_ARCHIVE) for the typed-Steps
-# example in samples/config/IB_STEPS_ORU_*.py):
-# local test receivers in DEV.
+# example in samples/config/IB_STEPS_ORU_*.py: local test receivers in DEV.
 steps_oru_host = "127.0.0.1"
 steps_oru_port = 2651
 steps_archive_host = "127.0.0.1"

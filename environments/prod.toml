@@ -37,8 +37,7 @@ demo_oru_host = "results-prod.example.org"
 demo_oru_port = 6666
 
 # Downstream EMR (OB_STEPS_ORU_EMR) and results archive (OB_STEPS_ORU_ARCHIVE) for the typed-Steps
-# example in samples/config/IB_STEPS_ORU_*.py —
-# placeholder hosts).
+# example in samples/config/IB_STEPS_ORU_*.py: placeholder hosts.
 steps_oru_host = "emr-prod.example.org"
 steps_oru_port = 6667
 steps_archive_host = "archive-prod.example.org"
