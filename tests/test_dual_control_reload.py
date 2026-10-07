@@ -30,6 +30,7 @@ from fastapi import HTTPException
 
 from messagefoundry.api import create_app
 from messagefoundry.api.app import (
+    _REFUSAL_LOG_LIMIT,
     _audit_refused_reload,
     _audit_reload_attempt,
     _compare_start_config,
@@ -879,13 +880,19 @@ def _refusal_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     ]
 
 
+@pytest.mark.parametrize(
+    "long_dir",
+    [
+        "/opt/messagefoundry/" + "/".join(f"site-{i:02d}-feeds" for i in range(25)),
+        "/opt/" + "a" * 4091,  # the longest config_dir FilesystemPath accepts, one token
+    ],
+)
 async def test_a_missing_dir_refusal_logs_the_whole_long_path(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, long_dir: str
 ) -> None:
-    """Lander hold on PR 2115. The refusal WARNING is the only place the real reload error is
-    written, and ``safe_exc``'s default 200-character cut dropped the directory from a long config
-    path. The whole path must reach the line, past where the old cut fell."""
-    long_dir = "/opt/messagefoundry/" + "/".join(f"site-{i:02d}-feeds" for i in range(25))
+    """Lander hold on PR 2115. The refusal WARNING carries the real reload error, and
+    ``safe_exc``'s default 200-character cut dropped the directory from a long config path. The
+    whole path must reach the line, past where the old cut fell, up to the longest the API takes."""
     assert len(long_dir) > 300
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         status, answer = await _audit_refused_reload(
@@ -947,7 +954,7 @@ async def test_a_refusal_warning_is_still_bounded(caplog: pytest.LogCaptureFixtu
     [warning] = _refusal_warnings(caplog)
     assert "word-00300" in warning  # well past the old 200-character cut
     assert "word-01999" not in warning
-    assert len(warning) < 4096 + 200
+    assert len(warning) < _REFUSAL_LOG_LIMIT + 200
 
 
 async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(

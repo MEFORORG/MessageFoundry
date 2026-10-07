@@ -997,7 +997,7 @@ def _build_approval_gate(
                 #
                 # The row names the requester either way and differs from an inline one only by its
                 # NULL client, so this line names the release too. Type name only, never the text:
-                # _audit_refused_reload logs the redacted text once, in its own WARNING.
+                # for a 404 or 422 refusal, _audit_refused_reload logs the redacted text itself.
                 _log.warning("released config reload refused: %s", type(exc).__name__)
                 _status, answer = await _audit_refused_reload(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False
@@ -1411,12 +1411,15 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
 )
 
 #: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for its 404 and 422 refusal
-#: WARNINGs, which are the only place the real reload error is written. ``safe_exc``'s default
+#: WARNINGs, which carry the real reload error that the answer withholds. ``safe_exc``'s default
 #: 200-character cut dropped the directory from a long config path and the fix from a long
-#: WiringError. 4096 characters holds a realistic path and a multi-line WiringError, and still bounds
-#: the line: how much redaction-missed text it can carry, what every handler's filters re-scan on the
-#: event loop, and its fit in one syslog datagram. ``safe_exc`` still redacts before the cut.
-_REFUSAL_LOG_LIMIT: Final = 4096
+#: WiringError. 8192 is twice the 4096 that ``FilesystemPath`` allows a ``config_dir``, so any
+#: directory the API accepts fits with its message, and a multi-line WiringError fits too. It still
+#: bounds how much redaction-missed text one line carries and what each handler's filters re-scan on
+#: the event loop. ``safe_exc`` redacts before the cut. The bound is on the text BEFORE
+#: ``scrub_log_argument`` escapes it, so a run of control characters can still grow the line several
+#: times over. The cut keeps the head, so an error longer than this still loses its tail.
+_REFUSAL_LOG_LIMIT: Final = 8192
 
 
 async def _audit_refused_reload(
