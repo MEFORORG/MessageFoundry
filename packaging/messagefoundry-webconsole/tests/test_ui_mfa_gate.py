@@ -18,7 +18,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from _ui_clients import SAME_ORIGIN, create_local_user_chosen
+from _ui_clients import SAME_ORIGIN, create_local_user_chosen, held_totp_code
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
@@ -142,12 +142,59 @@ async def _enroll_totp(service: AuthService, username: str = "op") -> str:
     enrollment = await service.begin_mfa_enrollment(identity)
     # `.ok`, not the result object: confirm_mfa_enrollment returns an Elevation (ASVS 7.2.4), and a
     # frozen dataclass is ALWAYS truthy — a bare assert on it would pass on a failed enrolment.
-    assert (
-        await service.confirm_mfa_enrollment(
-            identity, totp.totp(enrollment.secret), token=outcome.token
-        )
-    ).ok
+    # The code is checked on the clock it was made on (held_totp_code), or a step boundary between
+    # the two refuses it; test_the_enrolment_helper_survives_a_step_boundary pins that.
+    with held_totp_code(enrollment.secret) as code:
+        confirmed = await service.confirm_mfa_enrollment(identity, code, token=outcome.token)
+    assert confirmed.ok
     return enrollment.secret
+
+
+class _MovableClock:
+    """A ``time`` stand-in for ``totp`` whose instant a test moves by hand."""
+
+    def __init__(self, instant: float) -> None:
+        self.instant = instant
+
+    def time(self) -> float:
+        return self.instant
+
+
+async def test_the_enrolment_helper_survives_a_step_boundary(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``_enroll_totp`` makes its code on one read of the ``totp`` clock and lets the
+    confirm read it again.
+
+    Merge-queue intermittent, 2026-10-07 (run 37562580245, windows-2022): the helper's confirm
+    returned a wrong-proof Elevation and its ``auth.mfa_failed`` row (``phase=enroll``) was written
+    at 1791340620.000, a whole multiple of the 30 s period, 2 ms after ``auth.mfa_enroll_started``.
+    At the default ``totp_skew_steps=0`` a code from the step before is refused, which is the
+    product's correct answer. Here the clock turns the step while the confirm is in flight, the
+    same race made certain instead of rare.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    boundary = 1_000_020.0
+    assert boundary % totp.DEFAULT_PERIOD == 0
+    clock = _MovableClock(boundary - 0.001)
+    monkeypatch.setattr(totp, "time", clock)
+    real_confirm = service.confirm_mfa_enrollment
+
+    async def confirm_after_the_boundary(*args: object, **kwargs: object) -> Elevation:
+        clock.instant = boundary  # the step turns between making the code and checking it
+        return await real_confirm(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "confirm_mfa_enrollment", confirm_after_the_boundary)
+    # The control: the product does refuse a code from the step before the one it checks in, so the
+    # move above is a real boundary and the pass below is the helper's doing.
+    skew = service._settings.totp_skew_steps
+    assert skew == 0, "at a wider skew the step before is accepted and this tests nothing"
+    secret = totp.generate_secret()
+    stale = totp.totp(secret, now=boundary - 0.001)
+    assert totp.verify_totp_step(secret, stale, window=skew, now=boundary) is None
+    await _enroll_totp(service)
+    assert clock.instant == boundary, "the confirm did not run through the boundary-moving wrapper"
 
 
 # --- confinement ------------------------------------------------------------

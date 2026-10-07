@@ -16,11 +16,16 @@ a test that measures input validation and one that measures an RBAC denial.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.auth import totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
@@ -156,3 +161,23 @@ def issue_continuation(client: httpx.AsyncClient, next_path: str) -> None:
     token = client.cookies.get("mf_session")
     assert token, "issue_continuation needs a signed-in client"
     _ISSUED_CONTINUATIONS.issue(token, next_path)
+
+
+@contextmanager
+def held_totp_code(secret: str) -> Iterator[str]:
+    """A live TOTP code for ``secret``, with the ``totp`` clock held at the instant it was made.
+
+    For a test that hands a code it generated straight to the service, such as an enrolment
+    confirm. The service checks it against ``totp``'s own clock, under the default skew of 0 steps,
+    so a 30 s step boundary that falls between generating the code and checking it refuses a
+    correct code. That is right for the product and wrong for a fixture. Merge-queue run
+    37562580245 (2026-10-07) shows it: ``auth.mfa_enroll_started`` at 1791340619.998,
+    ``auth.mfa_failed`` with ``phase=enroll`` at 1791340620.000, and 1791340620 is a multiple of 30.
+
+    The clock is held only inside the ``with`` block, and only on the ``totp`` module, so every
+    other clock stays real. A clock the caller has already pinned is read and held as it is, and
+    restored afterwards."""
+    instant = totp.wall_clock()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(totp, "time", SimpleNamespace(time=lambda: instant))
+        yield totp.totp(secret, now=instant)
