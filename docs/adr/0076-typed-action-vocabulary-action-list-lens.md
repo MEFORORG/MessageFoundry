@@ -1241,9 +1241,10 @@ too: at least D.6 (*"No relaxation of the §5 guardrails"*, which names degrade-
 the analyst build.
 
 **The analyst build also narrows one thing.** Today a whole `if`/`for` block can be deleted or moved
-from its header row, nested `code` rows included. In the analyst build a delete or move of a block
-that contains a `code` row, or whose test is unrecognized, is refused (AC-G5), because it would
-remove or reorder hand-written Python.
+from its header row, nested `code` rows included. In the analyst build a delete or move of a lone
+`code` row, or of a block whose body holds a `code` row or whose header is not generator-shaped (G.6),
+is refused (AC-G5), because it would remove or reorder hand-written Python. The lens would refuse the
+same under typed-only mode (G.6).
 
 **The `ide/` extension and the developer build of ADR 0208 keep all three guardrails unchanged.** The
 developer build applies no per-user limits (ADR 0208, Manager decision D-A); a user without
@@ -1291,55 +1292,86 @@ accepted, it is the record that the parked path was taken.
 
 ### G.5 A precondition this amendment does not meet
 
-Review finding R1 showed `lens rewrite` accepting arbitrary Python through `paste_block`, a raw `if`
-test and `{"expr": ...}` values. Two changes to `messagefoundry/lens.py` answer it: the R1 fix and
-the typed-only mode of G.6. **Both are being built separately, on their own branch, and neither has
-landed.** Until they do, a typed-row edit can carry code, and the analyst build's limit does not hold
-even inside the editor. ADR 0208 makes both a condition of shipping the analyst build.
+Review finding R1 showed `lens rewrite` accepting arbitrary Python. Two changes to
+`messagefoundry/lens.py` answer it: the typed-only mode of G.6 and the R1 fix of G.7. **Both are
+being built separately, on their own branch, and neither has landed.** Until they do, a typed-row
+edit can carry code, and the analyst build's limit does not hold even inside the editor. ADR 0208
+makes both a condition of shipping the analyst build.
+
+**This amendment is the one statement of both.** ADR 0208 and its specification point here rather
+than restating them.
+
+The four R1 payloads, as the review recorded them:
+
+1. a `paste_block` that splices `subprocess.run(["calc"])` (G.6);
+2. a `template` If whose raw `test` is `__import__('os').system('calc') == 0` (G.6);
+3. an `insert_row` whose value is `{"expr": "__import__('os').system('calc')"}` (G.7);
+4. a `set_params` on a send row whose `to` is an `{"expr": ...}` (G.7).
 
 ### G.6 A typed-only mode closes two escape hatches (owner ruling 2026-10-07)
 
-Two hatches write code that runs, and accepted ADRs license both:
+Two hatches write code that runs, and accepted text licenses both:
 
 - **`paste_block`**, the op behind keyboard paste. ADR 0103 names keyboard paste as a verb, and the
   provenance comment above `_SUPPORTED_OPS` in `messagefoundry/lens.py` places the op under §2
   Phase 3 v2. No ADR text names `paste_block` itself.
-- **A one-line raw `test`**: a `test` key on an `op: template` If edit, or on an `insert_clause` Else
-  If edit. ADR 0106 section 3, Group 3, names it the *"power-user `test:{expr}` escape hatch"*.
+- **A one-line raw `test`**: a `test` key on an `op: template` edit whose template is `if`, or on an
+  `insert_clause` edit whose clause is `elif`. ADR 0106 section 3, Group 3, names it the
+  *"power-user `test:{expr}` escape hatch"*.
 
 **The templates themselves are not refused.** An `op: template` edit (If, For Each, Filter, Raise,
 Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and is routed through
-`_apply_paste_block`
-internally. So the refusal must sit on the `paste_block` *op* and on the `test` *key*, not inside
-`_apply_paste_block`, or typed templates would be refused too.
+`_apply_paste_block` internally. So the refusal sits on the `paste_block` *op* and on the `test`
+*key*, not inside `_apply_paste_block`, or typed templates would be refused too.
 
 **The owner ruled on 2026-10-07 that both close under a typed-only mode, and are otherwise kept.**
 
-- `lens rewrite` would gain a flag, working name `--typed-only`. Under it, a `paste_block` edit, and a
-  `template` or `insert_clause` edit carrying a `test` key, would be refused with the generic
-  `refused` code, and nothing written.
-- **The flag is off by default.** Developers, the `ide/` extension and the ADR 0208 developer build
-  keep both hatches.
-- **The ADR 0208 analyst build always sets it** and offers no way to turn it off.
+- `lens rewrite` would gain a flag, working name `--typed-only`, off by default. Under it, the two
+  hatches above would be refused with the generic `refused` code, and nothing written.
+- **Also under the flag** (Manager decision 2026-10-07, after adversarial review, part of the R1
+  fix): a move or delete of a lone `code` row, and a move or delete of a block whose body holds a
+  `code` row or whose header is not generator-shaped (AST-equal to what the lens emits from literal
+  inputs), would be refused.
+- Developers, the `ide/` extension and the ADR 0208 developer build keep the default. The ADR 0208
+  analyst build always sets the flag and offers no way to turn it off.
 
 In typed-only mode only, this narrows §2 Phase 3 and §5 of this ADR and ADR 0106. Neither text is
-changed; this amendment is the record. The flag is being built with the R1 fix and has not landed.
+changed; this amendment is the record. None of it has landed.
 
-### G.7 Structural inserts and send destinations stop accepting a value that is not inert
+### G.7 The R1 fix: values a typed edit may write
 
 Amendment E's 2026-09-29 note (E.11, rule 3) records that structural inserts (`insert_row` and the
 insert templates) *"still splice an `{"expr": ...}` verbatim"*, and that the note does not cover them.
-The R1 fix would change that, in every mode:
+The R1 fix would change that, in every mode, at least as follows:
 
-- a structural insert would refuse an `{"expr": ...}` that is not inert;
-- a send row's `set_params` destination would refuse one too;
-- `assign_to` would be restricted: not `msg`, not a keyword, not a dunder name, and not a name
-  already bound or used in the def.
+- An `{"expr": ...}` on an `insert_row` (including its occurrence keywords), on `insert_code_lookup`
+  (including the code-lookup default), or on a send row's `set_params` destination would be refused
+  unless it is **inert**.
+- `assign_to` would refuse `msg`, builtins, reserved names, dunder names, and any name the handler
+  or module already binds or reads.
+- `set_params` on a `route` row whose base `handlers` is not a literal list would be refused
+  (Manager decision 2026-10-07, after adversarial review).
 
-Here *inert* means a literal or an admitted `templated` value (Amendment E); the R1 fix settles the
-exact set, and its tests are the record. `set_params` on action, lookup and diagnostic rows already
-refuses a `dynamic` value (AC-M5). That sentence of E.11 is not rewritten; the dated pointer appended
-to it sends the reader here. The change is being built separately and has not landed.
+**The inert rule, stated once here.** At least these are inert, and nothing admitted calls
+anything:
+
+- a literal, or a sign on a number;
+- `+ - / //` over numbers and admitted names, and `* %` over numbers only; never `**`;
+- a non-dunder plain name other than `msg` that cannot hold message content: a module-level binding
+  no function rebinds, or a For Each `range` loop index (in value params, any other non-dunder name
+  except `msg` too);
+- a list, tuple, set or dict built only from inert values, with no splat;
+- in value params only, a bounded field read (`msg.field(...)` taking only `occurrence` and
+  `repetition` keywords) or a `templated` f-string whose every read is one;
+- for lookup `params`, a dict with literal keys and literal or read values, and in a FHIR lookup,
+  `FhirToken(literal, read)`.
+
+**The source of record is the R1 fix's tests** (`tests/test_lens_no_code_injection.py` on the R1
+branch, not yet merged). Where this list and those tests differ, the tests win. `set_params` on
+action, lookup and diagnostic rows already refuses a `dynamic` value (AC-M5).
+
+That sentence of E.11 is not rewritten; the dated pointer appended to it sends the reader here. The
+change is being built separately and has not landed.
 
 ### Acceptance Criteria (Amendment G -- proposed, not ratified)
 
@@ -1352,16 +1384,16 @@ to it sends the reader here. The change is being built separately and has not la
   SYSTEM SHALL keep *Reopen With: Python*, the text-editor fallback and opt-in entry unchanged.
 - [ ] **AC-G4** -- THE analyst build SHALL write a `.py` only through `lens rewrite` output applied
   to the editor's document, and SHALL store no Steps model.
-- [ ] **AC-G5** -- IF a delete or move in the ADR 0208 analyst build targets a control block that
-  contains a `code` row or has an unrecognized test, THEN THE SYSTEM SHALL refuse it.
-- [ ] **AC-G6** -- WHILE `lens rewrite` runs in typed-only mode, IF an edit is a `paste_block`, or a
-  `template` or `insert_clause` edit with a `test` key, THEN THE SYSTEM SHALL refuse it with the
-  generic `refused` code and write nothing. The R1 Builder's tests verify this; they land separately.
+- [ ] **AC-G5** -- IF a delete or move in the ADR 0208 analyst build targets a lone `code` row, or a
+  control block whose body holds a `code` row or whose header is not generator-shaped, THEN THE
+  SYSTEM SHALL refuse it.
+- [ ] **AC-G6** -- WHILE `lens rewrite` runs in typed-only mode, IF an edit is a `paste_block`, an If
+  `template` or Else If `insert_clause` edit with a `test` key, or a move or delete G.6 lists, THEN
+  THE SYSTEM SHALL refuse it with the generic `refused` code and write nothing. R1 payloads 1 and 2
+  (G.5) are refusal tests. The R1 fix's tests verify this; they land separately.
 - [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL accept `paste_block`
   and a raw `test`, and SHALL accept every typed `template` edit in either mode.
 - [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite` call.
-- [ ] **AC-G9** -- IF a structural insert, or a send row's `set_params` destination, carries an
-  `{"expr": ...}` that is not inert, or an `assign_to` breaks the G.7 rule, THEN `lens rewrite` SHALL
-  refuse it, in every mode. The R1 payloads it covers are an `insert_row` with an `{"expr": ...}`
-  value calling `os.system`, and a send row's `to` set to an `{"expr": ...}`; the other two, a
-  `paste_block` and a template If's raw `test`, are AC-G6's.
+- [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`
+  G.7 refuses, or a `set_params` on a route row whose base `handlers` is not a literal list, THEN
+  `lens rewrite` SHALL refuse it, in every mode. R1 payloads 3 and 4 (G.5) are refusal tests.

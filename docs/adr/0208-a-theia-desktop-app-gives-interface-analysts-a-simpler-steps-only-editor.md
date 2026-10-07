@@ -133,26 +133,29 @@ it, only when the site meets spec section 5.4.**
 - **D5 -- The role check is the primary control, in the analyst build, and it is a guardrail.** The
   analyst build signs in through the engine and finishes every session gate (MFA, password change,
   factor enrolment, notification address) before it stores a token or reads permissions. On start-up
-  and before each save it proves the session on a route that none of the gates exempts (review R2),
-  never on a timer (review R3). It stops an analyst changing Python through the analyst build. It does
+  and before each save it proves the session on a route that none of the gates exempts and that is
+  not an `mfa_gate=False` route (review R2), never on a timer (review R3). It signs the user out when
+  the token is refused or a gate is open; an unreachable engine shows a banner instead. It stops an
+  analyst changing
+  Python through the analyst build. It does
   not stop a change made with another tool. The developer build needs no engine session (D-A).
-- **D6 -- R1 is a precondition, answered by two changes landing separately.** The R1 fix would make
-  a structural insert, and a send row's `set_params` destination, refuse an `{"expr": ...}` that is
-  not inert, and would restrict `assign_to`. `set_params` on action, lookup and diagnostic rows
-  already refuses a `dynamic` value (ADR 0076 Amendment E, AC-M5). Typed-only mode (ruling 5) would
-  refuse `paste_block`, and a `test` key on a `template` If or on an `insert_clause`. It is off by
-  default, so the developer build and `ide/` keep both hatches. The analyst build passes it on every
-  `lens rewrite` call and offers no way to turn it off. The analyst build does not ship until both
-  changes land with the four R1 payloads as refusal tests. Amendment G, G.6 and G.7, records the
-  narrowing.
+- **D6 -- R1 is a precondition, answered by changes landing separately.** The R1 fix and typed-only
+  mode (ruling 5) are stated once, in ADR 0076 Amendment G: G.6 for typed-only mode, G.7 for the
+  R1 fix and its *inert* rule, and G.5 for the R1 payloads. They are being built separately and
+  have not landed.
+  Typed-only mode is off by default, so the developer build and `ide/` keep both hatches. The analyst
+  build passes it on every `lens rewrite` call and offers no way to turn it off. The analyst build
+  does not ship until both land with the R1 payloads as refusal tests.
 - **D7 -- The repository check is optional, and the project ships it.** It decides whether a change is
   Steps-only, comparing every `code` row and every control header against base by content, allowing
   only the lens's sanctioned generated shapes, and treating any change outside the def bodies or to
   another file as not Steps-only (spec FR-40). A Steps-only change passes; any other passes only when
   a `code:edit` reviewer has approved the head commit, which the check reads itself (ruling 6, D-C).
-  It holds against a deliberate change only when it runs from a definition the change cannot edit,
-  with CODEOWNERS over the CI directory and the engine pin and the required status bound to that
-  workflow (spec 5.4). The same classifier ships as an optional pre-commit hook, which is a
+  It holds against a deliberate change only when its definition, its engine version and its re-run
+  on approval all come from the base branch (the GitHub mechanism for the re-run is settled at build,
+  spec 5.4), it reads the change's files as data only, and code-owner
+  review covers the CI directory and the engine pin (spec 5.4). The same classifier ships as an
+  optional pre-commit hook, which is a
   convenience and not a control.
 - **D8 -- The analyst build drops three ADR 0076 guardrails.** No *Reopen With: Python*, no
   text-editor fallback on a parse failure, and the Steps view is the only way to open a Router or
@@ -162,8 +165,8 @@ it, only when the site meets spec section 5.4.**
 - **D10 -- Analyst Test uses a generated message and never `--show-phi`.** Test takes a message type
   and seed, saves the buffer, and runs `dryrun` or a thin wrapper that generates the message
   in-process. Values are shown unredacted only for that generated input (D-B). For a message type
-  with no generator, Test shows structure only. There is no Test Bench and no route to open or paste
-  a sample (review R13).
+  with no generator, Test is unavailable, and the analyst build says why. There is no Test Bench and
+  no route to open or paste a sample (review R13).
 - **D11 -- The source lives beside `ide/`.** The editor's source, a shared view-model package and the
   Theia application form one workspace in this repository, so the lens row contract and the editor
   version together (review R14).
@@ -189,23 +192,20 @@ promote stays `POST /config/reload` with step-up and the site's dual control unc
   on Steps-level editing; OTHERWISE it SHALL show a read-only Steps view. It SHALL never offer more
   than the Steps level.
   -> editor test *level selection* (path open)
-- **AC-3** -- WHILE `lens rewrite` runs in typed-only mode, IF an edit is a `paste_block`, or a
-  `template` or `insert_clause` edit with a `test` key, THEN it SHALL refuse the edit with the generic
-  `refused` code and write nothing. In any mode, IF a structural insert or a send row's `set_params`
-  destination carries an `{"expr": ...}` that is not inert, THEN it SHALL refuse it. The four R1
-  payloads are refusal tests: a `paste_block` splicing `subprocess.run(["calc"])`; a template If with
-  a raw `test` calling `os.system`; an `insert_row` with an `{"expr": ...}` value calling
-  `os.system`; and a send row's `to` set to an `{"expr": ...}`.
+- **AC-3** -- THE lens SHALL meet ADR 0076 Amendment G's AC-G6 and AC-G9, which state the typed-only
+  refusals, the R1 fix's refusals and the R1 payloads.
   -> the lens refusal tests the R1 fix adds (being built separately; path set when it lands)
 - **AC-3a** -- THE ANALYST BUILD SHALL pass typed-only mode on every `lens rewrite` call.
   -> editor test *typed-only argv* (path open)
 - **AC-4** -- THE ANALYST BUILD SHALL offer no route that opens a `.py` file in a text editor, and
   WHEN a file fails `lens parse` it SHALL show the read-only banner instead.
   -> editor test *no text route* and spike S-2 (path open)
-- **AC-5** -- IF the probe route fails because a session gate is open (MFA pending, password change
-  required, factor enrolment required, or notification address required), including for a token
+- **AC-5** -- IF the probe route refuses the token as invalid, expired or revoked, or because a
+  session gate is open (MFA pending, password change required, factor enrolment required, or
+  notification address required), including for a token
   stored by an earlier run, THEN THE ANALYST BUILD SHALL treat the user as signed out and name the
-  gate.
+  gate. IF the engine cannot be reached, THEN it SHALL show the read-only banner and SHALL NOT sign
+  the user out.
   -> editor test *gated session* (path open)
 - **AC-6** -- THE ANALYST BUILD SHALL pass the row-contract version on every `lens` call, and IF the
   engine command rejects it, THEN it SHALL show the refusal and SHALL NOT retry.
@@ -225,11 +225,13 @@ promote stays `POST /config/reload` with step-up and the site's dual control unc
 - **AC-11** -- WHEN the lens refuses an edit, THE ANALYST BUILD SHALL show the refusal on the step it
   concerns, in the Steps panel.
   -> editor test *refusal on the step* (path open)
-- **AC-12** -- IF a delete or move in the analyst build targets a control block that contains a
-  `code` row or has an unrecognized test, THEN it SHALL refuse it.
+- **AC-12** -- IF a delete or move in the analyst build targets a lone `code` row, or a control block
+  whose body holds a `code` row or whose header is not generator-shaped (ADR 0076 Amendment G, G.6),
+  THEN it SHALL refuse it.
   -> editor test *block with code is fixed* (path open)
-- **AC-13** -- IF the review branch's base is stale, THEN THE ANALYST BUILD SHALL push nothing and say
-  so.
+- **AC-13** -- WHEN the default branch has moved past the review branch's base, THE ANALYST BUILD
+  SHALL update the review branch from it before pushing, and SHALL push nothing only if that update
+  conflicts (AC-14).
   -> editor test *stale base* (path open)
 - **AC-14** -- IF a merge conflicts, THEN THE ANALYST BUILD SHALL push nothing and say "ask a
   developer".
@@ -241,8 +243,10 @@ promote stays `POST /config/reload` with step-up and the site's dual control unc
   actions SHALL find no pop-up notification. A route row SHALL list its handler names (`Unrouted` for
   an unrouted return), and each header SHALL read "Handler: name" or "Router: name".
   -> editor test *no toast* and *row labels* (path open)
-- **AC-17** -- No message the analyst build shows SHALL contain "code view", "View as Code", a
-  traceback or a Python identifier outside the "details" toggle.
+- **AC-17** -- No message the analyst build shows SHALL contain "code view", "View as Code", Python
+  source, a traceback, or a function or variable name from the code other than a component name,
+  outside the "details" toggle.
+  Component names (handler, router, connection, code set) are allowed.
   -> editor test *plain messages* (path open)
 - **AC-18** -- WHEN a field is dropped on a path parameter, THE ANALYST BUILD SHALL issue a
   `set_params` edit byte-identical to typing that path; WHEN dropped elsewhere, it SHALL write
@@ -317,6 +321,7 @@ cannot ship.
 
 - [ ] The R1 fix and typed-only mode land in `messagefoundry/lens.py`, with the four payloads as
       refusal tests (D6).
-- [ ] Spikes S-1 to S-4 in the specification, section 16, all pass.
+- [ ] Spikes S-1 to S-4 in the specification, section 17, all pass. Spec section 16 is the test
+      strategy.
 - [ ] ADR 0076 Amendment G accepted by the owner.
 - [ ] The start-up probe route, an implementation detail settled at build (spec section 15).

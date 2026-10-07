@@ -74,7 +74,7 @@ build is a view over that file. It is not a second authoring format.
 - **D-B. Analyst Test takes a generator spec, never a file.** The analyst picks a message type and a
   seed. A small engine change lets `dryrun`, or a thin wrapper, generate that message in-process and
   show its values unredacted, for that generated input only. The editor never passes `--show-phi`.
-  For a message type with no generator, Test shows structure only.
+  For a message type with no generator, Test is unavailable.
 - **D-C. Review.** The repository check passes and fails exactly as ruling 6 says, and reads the
   `code:edit` approval itself. The documents recommend the site's ordinary review, by any reviewer,
   on every pull request, as guidance and not as a requirement of the check.
@@ -104,7 +104,7 @@ The engine stays the identity and role authority. The editor holds no user datab
 | `code:edit` | Declared in `messagefoundry/auth/permissions.py`; no endpoint enforces it | Names who may approve a non-Steps-only change (FR-43). The developer build does not read it (D-A) |
 | `config:validate` | Declared; no endpoint enforces it (`docs/SECURITY.md`, permission table) | Not used by the analyst build, which runs `messagefoundry check` locally at submit (FR-34) |
 | `config:deploy` | Enforced on `POST /config/reload` | Promote. Unchanged. The analyst build offers no promote |
-| `ai:assist` | Reported by `GET /ai/policy`; the IDE honours it | Unused in this phase. Both builds leave AI out |
+| `ai:assist` | Enforced on `POST /ai/chat`, and reported by `GET /ai/policy` | Unused in this phase. Both builds leave AI out |
 
 - **`code:steps` is advisory.** Only the analyst build reads it. It gates nothing on the engine, and
   the `docs/SECURITY.md` permission table would have to say so in its row.
@@ -158,55 +158,55 @@ server-side broker, which this phase does not build.
 | **Depends on** | The R1 fix and typed-only mode (section 5.3); the permission catalog; a fully signed-in session (FR-6) | The section 5.4 preconditions; a git-host group mapped to engine `code:edit` holders, kept by hand |
 | **Kind of control** | A guardrail for analysts who use the analyst build as intended | A boundary against a deliberate or tool-assisted change, if section 5.4 holds; otherwise it stops an accidental change, not a deliberate one |
 
-**What a Steps-only change can still do.** It passes the repository check, so the site's ordinary
-review is what catches these (D-C):
+**What a Steps-only change can still do**, at least. It passes the repository check, so the site's
+ordinary review is what catches these (D-C):
 
 - redirect a send to any existing outbound connection;
 - issue a lookup with literal arguments against any database or FHIR server the egress allow-lists
   permit;
 - raise an error, or filter the message so nothing is delivered;
-- insert a typed step that changes data an unchanged `code` row below it later reads.
+- insert a typed step that changes data an unchanged `code` row below it later reads;
+- delete a lookup row, leaving its variable unbound for the rows after it.
 
 **What already gates what runs, under both:** a change reaches a running engine only when someone with
 `config:deploy` reloads it, under the existing step-up and the site's `[approvals]` dual control. That
 controls who deploys. It does not check whether a Steps-level author changed Python.
 
-### 5.3 R1 is a precondition, answered by two changes that have not landed
+### 5.3 R1 is a precondition, answered by changes that have not landed
 
 The review found that `lens rewrite` accepts edits that write arbitrary Python (review finding R1).
-Its four payloads were:
+The answer is the R1 fix and typed-only mode in `messagefoundry/lens.py`. They are being built
+separately, on their own branch, and **have not landed**. ADR 0076 Amendment G states them once:
+G.6 for typed-only mode, G.7 for the R1 fix and its *inert* rule, and G.5 for the R1 payloads. This
+spec does not restate them.
 
-1. a `paste_block` that splices `subprocess.run(["calc"])`;
-2. a `template` If with a raw `test` of `__import__('os').system('calc') == 0`;
-3. an `insert_row` whose value is `{"expr": "__import__('os').system('calc')"}`;
-4. a `set_params` on a send row whose `to` is an `{"expr": ...}`.
-
-Two changes to `messagefoundry/lens.py` would answer them. Both are being built separately, on their
-own branch, and **neither has landed**:
-
-- **The R1 fix** (payloads 3 and 4). A structural insert, and a send row's `set_params` destination,
-  would refuse an `{"expr": ...}` that is not inert. It would also restrict `assign_to`: not `msg`, not
-  a keyword, not a dunder name, and not a name already bound or used in the def. `set_params` on
-  action, lookup and diagnostic rows already refuses a `dynamic` value (ADR 0076 Amendment E,
-  AC-M5).
-- **Typed-only mode** (payloads 1 and 2; owner ruling 5). Under the flag, `paste_block`, and a `test`
-  key on a `template` If or on an `insert_clause`, would be refused with the generic `refused` code.
-  Templates themselves stay allowed. Amendment G, G.6, names the ops precisely.
-
-Until both land, the role check would not hold even inside the analyst build. The analyst build must
-not ship before both land with the four payloads as refusal tests (ADR AC-3), and before it passes
+Until they land, the role check would not hold even inside the analyst build. The analyst build must
+not ship before they land with the payloads as refusal tests (ADR AC-3), and before it passes
 typed-only mode on every `lens rewrite` call (FR-25).
 
 ### 5.4 Preconditions for the repository check to hold against a deliberate change
 
-The check can only be as strong as the place it runs. The site would need all of these:
+The check can only be as strong as the place it runs. **The general rule:** the check's definition,
+its engine version and the decision to re-run it must all come from the base branch, never from the
+change under review, and it must treat the change's files as data only. The site would need all of
+these:
 
-1. **The check runs from a definition the change cannot edit**: a workflow on the base ref, or a
-   central required workflow or ruleset. Never from the head commit's own CI file.
-2. **CODEOWNERS** names the `code:edit` group for the CI directory and for the engine version pin.
-3. **The required status is bound to that workflow**, so a same-named status from another job does
-   not satisfy it.
-4. Branch protection on the default branch with the review settings of FR-43.
+1. **The check runs from a definition the change cannot edit.** On GitHub that means a ruleset's
+   required workflow; it is also the only way to bind a required status to one workflow file, so a
+   same-named status from another job cannot satisfy it.
+2. **The head's files are read as data only.** The check never installs, imports or runs code from
+   the change. The `messagefoundry` version it runs is pinned **from the base branch** (FR-44). On
+   GitHub, a `pull_request_target` workflow would be one way; it must never install or import the
+   head's code.
+3. **It re-runs when an approval arrives, through a mechanism whose definition comes from the base
+   branch.** On GitHub, a `pull_request_review` workflow on its own runs the head's copy, so it is not
+   that. Which GitHub mechanism does it (for example a `workflow_run` workflow, which runs from the
+   default branch's definition, re-running the required check through the API) is settled at build
+   and verified by spike S-4. A ruleset required workflow may need an organization ruleset and a paid
+   plan; that is checked at build too.
+4. **Code owners.** CODEOWNERS names the `code:edit` group for the CI directory and the engine
+   version pin, and branch protection requires review from code owners.
+5. Branch protection on the default branch with the review settings of FR-43.
 
 Without these, the repository check would stop an accidental change but not a deliberate one.
 
@@ -275,10 +275,13 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   Sign-in through OIDC is out of scope for this phase; an OIDC-only site cannot use the analyst build.
 - **FR-6.** `GET /auth/me` alone does not prove a session is past these gates: it is exempt from them
   and returns every permission with no pending flag (review R2). WHEN the analyst build starts with a
-  stored token, it SHALL first call a route that is on none of the exempt lists and that every editor
-  user may call. The route is chosen at build; if none fits, the engine needs one (section 15).
-  IF that probe fails, THEN THE ANALYST BUILD SHALL treat the user as signed out and show which gate
-  is open, as in FR-5.
+  stored token, it SHALL first call a route that is on none of the exempt lists, is not one of the
+  `mfa_gate=False` routes (`messagefoundry/api/security.py` exempts those without listing them: TOTP
+  enrolment and confirm, and session termination), and that every editor user may call. The route is
+  chosen at build; if none fits, the engine needs one (section 15). IF the probe is refused because
+  the token is invalid, expired or revoked, or because a gate is open, THEN THE ANALYST BUILD SHALL
+  treat the user as signed out, naming the gate where one is open, as in FR-5. IF the engine cannot
+  be reached, it SHALL NOT sign the user out; it SHALL show the FR-13 banner.
 - **FR-7.** WHILE no session is signed in, THE ANALYST BUILD SHALL show the Steps view read-only.
 - **FR-8.** THE ANALYST BUILD SHALL re-check the session before each save **through the same probe
   route as FR-6**, and SHALL NOT poll on a timer. A save is real user activity, so moving the engine's
@@ -314,20 +317,29 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
 - **FR-17. Messages in the panel.** Every message the analyst build shows SHALL appear in the Steps
   panel, never as a pop-up notification (gap 3). Each refusal code SHALL have its own message: what
   was not changed, the plain reason, "ask a developer" where it applies, and the engine's detail
-  behind "details". No message SHALL contain "code view", "View as Code", a traceback or a Python
-  identifier.
+  behind "details". Messages MAY name components: handler, router, connection and code-set names.
+  No message SHALL contain "code view", "View as Code", Python source, a traceback, or a function or
+  variable name from the code other than a component name, outside the "details" toggle.
 
 ### 7.3 Steps-level operations
 
 - **FR-18.** THE ANALYST BUILD SHALL offer only these operations: set a typed parameter, insert a
   typed row from the palette (including the If, Else If, Else, For Each, Filter, Raise, Send and, in a
   Router, Route templates, without a raw `test`), delete, move, and edit a note. It SHALL NOT offer
-  `paste_block`,
-  a raw control `test`, or an `{"expr": ...}` value. Copy, cut and paste are absent, because typed-only
-  mode refuses `paste_block`.
+  `paste_block`, a raw control `test`, or a free-text expression. Copy, cut and paste are absent,
+  because typed-only mode refuses `paste_block`.
+- **FR-18a.** Today's `ide/` palette sends an `{"expr": ...}` value for Substring, Pad, Arithmetic,
+  Split, DB Lookup and FHIR Lookup (`ide/src/stepsModel.ts`, the prompts marked `expr`, and the `{}`
+  params seeds). THE ANALYST BUILD SHALL offer these steps with typed inputs instead of free text: a
+  number field for an index, width or operand; a list of field paths for Split; and a key/value table
+  for lookup params, with literal keys and literal or field-read values. Each input is serialised to an
+  `{"expr": ...}` that the R1 fix's *inert* rule admits (ADR 0076 Amendment G, G.7). A value the rule
+  refuses gets an FR-17 message, and nothing is written.
 - **FR-19.** `code` rows and control headers stay read-only.
-- **FR-20.** IF a delete or move targets an `if`/`for` block that contains a `code` row or has an
-  unrecognized test, THEN THE ANALYST BUILD SHALL refuse it. Today `ide/` deletes or moves a whole
+- **FR-20.** IF a delete or move targets a lone `code` row, or an `if`/`for` block whose body holds a
+  `code` row or whose header is not generator-shaped (AST-equal to what the lens emits from literal
+  inputs), THEN THE ANALYST BUILD SHALL refuse it. The lens would refuse the same under typed-only
+  mode, as part of the R1 fix (Amendment G, G.6). Today `ide/` deletes or moves a whole
   block from its header row, nested `code` rows included (`isRowDeletable` and `isRowMovable` in
   `ide/src/stepsModel.ts`) (Amendment G, AC-G5).
 - **FR-21. Drag a field.** The drag source SHALL be the sample panel or the schema tree. A drop onto
@@ -371,15 +383,16 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   SHALL NOT pass `--show-phi` (ADR AC-7). The generator-spec input is an engine change (section 14).
 - **FR-32.** THE ANALYST BUILD SHALL show the result in the Steps panel: the message before and after
   the selected step, with changed values marked. It SHALL open no other panel (gap 4).
-- **FR-33.** WHERE the chosen message type has no generator, Test SHALL show structure only (which
-  steps ran, and which sends and routes were chosen) and SHALL say plainly that no values are shown.
+- **FR-33.** WHERE a message type has no generator, Test SHALL be unavailable for it, and the analyst
+  build SHALL say why: Test runs only on a generated message, and none exists for that type.
   `messagefoundry/generators/` covers a fixed set of types; any other type falls here.
 - Test errors SHALL read as a plain summary, with the details behind a toggle (section 9).
 
 ### 7.6 Submit for review
 
-- **FR-34.** WHEN the analyst selects *Submit for review*, THE ANALYST BUILD SHALL first run
-  `messagefoundry check` and show any failure in plain words, and SHALL NOT push while it fails.
+- **FR-34.** WHEN the analyst selects *Submit for review*, THE ANALYST BUILD SHALL first update the
+  review branch from the default branch if the base is stale (FR-39), then run `messagefoundry check`
+  on that tree and show any failure in plain words, and SHALL NOT push while it fails.
 - **FR-35.** THE ANALYST BUILD SHALL commit, by explicit pathspec, only the Router and Handler modules
   edited through the Steps view in this session. IF anything else is staged, THEN it SHALL refuse.
   It SHALL never stage an untracked file.
@@ -393,9 +406,13 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
 - **FR-38.** THE SUBMIT PANEL SHALL show the change as steps (added, changed, removed), with the
   Python diff folded below for the reviewer, the Test results, and the pull request's review status.
   A revision SHALL be pushed to the same branch.
-- **FR-39.** IF git is missing, the credential is missing, the base is stale, or a merge conflicts,
-  THEN THE ANALYST BUILD SHALL push nothing and say so in plain words; a conflict reads "ask a
-  developer". The commit author is the user's engine identity, and the git email is set by the site.
+- **FR-39.** The base is **stale** when the default branch on the git host has moved past the commit
+  the review branch was cut from. WHEN the base is stale at submit, THE ANALYST BUILD SHALL update the
+  review branch from the current default branch by a merge before it pushes, so the pushed review
+  branch never needs a force-push. IF that update conflicts, THEN it SHALL push nothing and say
+  "ask a developer". IF git or
+  its credential is missing, THEN it SHALL push nothing and say which. The commit author is the
+  user's engine identity, and the git email is set by the site.
   Git authorship is free text, so it is a record, not proof (review R22).
 
 ### 7.7 The developer build (D-A)
@@ -420,7 +437,8 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
      `connections.toml`, a code set or an environment file is not Steps-only.
   2. Outside the `@handler` and `@router` def bodies, the module's bytes are unchanged, except for the
      lens's sanctioned generated shapes: an added `from messagefoundry import <name>` line, or an added
-     `NAME = code_set("<literal>")` line (ADR 0106 section 5 items (H) and (I), and section 6). Each
+     `NAME = code_set("<literal>")` line with the blank line `insert_code_lookup` puts before it (ADR
+     0106 section 5 items (H) and (I), and section 6). Each
      passes only when AST-equal to what the lens generator emits from literal inputs. `lens parse`
      partitions def bodies only (ADR 0076 section 3's coverage invariant, and A.5 *"No module
      scope"*), so the rest is compared as bytes.
@@ -432,32 +450,45 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
      sends` accumulator scaffold (ADR
      0108), each only when AST-equal to the generator's output from literal inputs.
   4. **Every control header** (`if`, `elif`, `for`, and the `raise` expression) is compared by content
-     against base, like a `code` row. A changed or added header is Steps-only only when AST-equal to
-     what the lens generator emits from literal inputs. `recognized` is not evidence: it is a
+     against base, like a `code` row, with its suite path. A changed or added header is Steps-only
+     only when AST-equal to what the lens generator emits from literal inputs. A removed or moved
+     header passes only when the base header was itself generator-shaped. `recognized` is not
+     evidence: it is a
      deny-list (`_is_bounded`, `_emit_if` and `_is_message_iteration` in `messagefoundry/lens.py`, and
      the raise branch), so `if os.system("calc"):`, `for g in msg.groups(os.system("calc")):` and
      `raise ValueError(os.system("calc"))` read back as recognized today.
-  5. Every typed parameter that is new or changed is a literal or a template, and every new or
-     changed `assign_to` meets the G.7 rule of ADR 0076 Amendment G (not `msg`, not a keyword, not a
-     dunder name, not a name already bound or used in the def). A developer-written dynamic parameter
-     the change leaves alone does not fail it.
-  6. Every `send` and `route` row either matches base by content or is fully literal: one literal
-     destination per `Send`, the message argument a plain name, no `SetState` expression, and a
-     route's `handlers` non-empty or `unrouted`. The lens projects a `Send` with a computed argument,
-     or a dynamic route, with no typed parameters (`_send_outbounds` and `_route_row` in `lens.py`).
-- **FR-41.** The check SHALL classify these as not Steps-only: the four R1 payloads; a hand-edited
+  5. Every typed parameter that is new or changed is a literal, except that the four value params ADR
+     0076 E.11 rule 4 admits (`set_field.value`, `add_repetition.value`, `append_to_field.suffix`,
+     `replace_literal.new`) may also be a template. A template anywhere else, such as a `db_lookup`
+     statement or a `log_note` operand, is not Steps-only even though it reads back `templated`. A
+     lookup's `params` dict also passes when it meets G.7's lookup-params rule (ADR 0076 Amendment
+     G), so an analyst lookup that reads the message is still Steps-only.
+     Every new or changed `assign_to` meets the rule of ADR 0076 Amendment G, G.7. A
+     developer-written dynamic parameter the change leaves alone does not fail it.
+  6. Every `send` and `route` row either matches base by content, or is new or was literal at base
+     and is fully literal at head: one literal destination per `Send`, the message argument a plain
+     name, no `SetState` expression, and a route's `handlers` non-empty or `unrouted`. A row that was
+     dynamic at base and is literal at head is not Steps-only; the R1 fix would also make the lens
+     refuse `set_params` on such a route row (G.7). The lens projects a `Send` with a computed
+     argument, or a dynamic route, with no typed parameters (`_send_outbounds` and `_route_row` in
+     `lens.py`).
+- **FR-41.** The check SHALL classify these as not Steps-only: the R1 payloads (ADR 0076 Amendment
+  G, G.5); a hand-edited
   `code` row; a `code` row moved under a different condition; a typed row whose `assign_to` rebinds
-  `msg`; the three recognized-header shapes of item 4; a changed import; a new helper file. It
+  `msg`; the three recognized-header shapes of item 4; a removed hand-written header; a template in a
+  `db_lookup` statement; a dynamic route made literal; a changed import; a new helper file. It
   SHALL pass an ordinary Steps edit, an insert above a `code` row, and one of each sanctioned shape in
   items 2 and 3 (spike S-4).
 - **FR-42.** THE CHECK SHALL pass a Steps-only change. It SHALL pass any other change only when a
   member of the `code:edit` reviewer group has approved **the head commit**; the check reads that
   approval itself through the git host's API (owner ruling 6, D-C).
-- **FR-43.** THE PROJECT SHALL document the setup: the section 5.4 preconditions; branch protection
-  with dismiss-stale-approvals and require-approval-of-the-latest-push; and a review-event trigger,
-  so the check runs again when an approval arrives. The `code:edit` reviewer group is kept in step
-  with engine roles by the site, by hand.
-- **FR-44.** The check SHALL run the same pinned `messagefoundry` version as the analyst build.
+- **FR-43.** THE PROJECT SHALL document the setup: the section 5.4 preconditions, and branch
+  protection that requires review from code owners, dismisses stale approvals and requires approval
+  of the latest push. The `code:edit` reviewer group is kept in step with engine roles by the site,
+  by hand.
+- **FR-44.** The check SHALL run the `messagefoundry` version pinned on the base branch, and SHALL
+  refuse to run below the minimum version (FR-28). The analyst build should bundle that same version;
+  the two can differ while an installer lags.
 - **FR-45.** The config-repository template of ADR 0017 SHALL carry the check as a commented-out
   workflow, so turning it on is one edit plus the section 5.4 settings.
 - **FR-46.** THE PROJECT SHALL also ship the same classifier as an optional pre-commit hook. It is a
@@ -508,8 +539,9 @@ is mostly `code` rows gives an analyst little to edit.
 - **Backend services.** Spawning Python and git, the credential store, and engine HTTPS calls run in
   Theia's Node backend, exposed to the frontend as JSON-RPC interfaces. The frontend never runs a
   process or holds the token.
-- **Python resolution.** In order: an administrator setting, then the bundled runtime, then `PATH`.
-  It never runs an interpreter the repository supplies, the rule `ide/src/cli.ts` calls SEC-004.
+- **Python resolution.** An administrator setting, then the bundled runtime. Nothing else: no `PATH`
+  fallback. It never runs an interpreter the repository supplies, the rule `ide/src/cli.ts` calls
+  SEC-004. It refuses to run an engine below the build's minimum version (FR-28).
 - **Workspace trust.** The analyst build trusts only the repository it cloned at setup, with no
   prompt. It opens no other folder.
 - **Installer.** It bundles the Python runtime and the pinned engine. The analyst never sees a
@@ -636,11 +668,32 @@ route work.
 
 Everything else is decided in section 2.
 
-## 16. Spikes required before the ADR is accepted
+## 16. Test strategy
+
+Manager decision 2026-10-07. Nothing here exists yet; this is how the editor would be tested, layer
+by layer.
+
+| Layer | Tool | What it would cover |
+|---|---|---|
+| 1. Shared view model | mocha in Node, as `ide/`'s `test:unit` | Row rendering and edit building, including the block refusal (FR-20, ADR AC-12). `ide/src/test/suite/steps-mirror.test.ts` would gain the Theia editor as a third consumer, checked against the same fixtures |
+| 2. Lens contract | pytest (exists), plus golden editor payloads recorded from the editor | A lens change that breaks the editor would fail in Python CI. Amendment G's AC-G6 and AC-G9 (ADR AC-3) live here |
+| 3. Backend services | mocha against each service in Theia's inversify container, with fake processes and a fake engine | Process spawn, git, engine HTTPS, certificate trust, the probe and sign-in: FR-1 to FR-11, FR-25 to FR-29, FR-34 to FR-39; ADR AC-3a (typed-only argv), AC-5, AC-6, AC-7 (no `--show-phi`), AC-8 (no default-branch push), AC-13 to AC-15 |
+| 4. End-to-end UI | `@theia/playwright`, the Theia project's own end-to-end package, with page objects against the browser build; Playwright's Electron launch for the desktop build, on a Windows runner | The section 6 analyst flow; spike S-2's no-text-route walk (ADR AC-4); no pop-up (ADR AC-16); plain messages (AC-17); drag equals typing (AC-18); the keyboard-only walk (AC-19); FR-12 to FR-24, FR-30 to FR-33 |
+| 5. Accessibility | `@axe-core/playwright`, inside the end-to-end run | ADR AC-19's accessibility check |
+| 6. Real engine | `messagefoundry serve` with `samples/config` on localhost in CI, users seeded from fixtures | ADR AC-1 (also a pytest) and AC-2 (level selection); sign-in and the session gates against a real engine, trusting its self-signed certificate the way the installer would (FR-2) |
+
+The repository check (FR-40 to FR-46, ADR AC-9) would be tested in Python, with spike S-4's sample
+config repository as its fixture. Build composition (ADR AC-10) would be a test over the analyst
+build's resolved package list.
+
+In CI these would start as separate, **non-required** jobs (section 12). Spike S-1 would confirm that
+`@theia/playwright` works at the pinned Theia version.
+
+## 17. Spikes required before the ADR is accepted
 
 | Spike | Question | Pass condition |
 |---|---|---|
-| S-1 | Does a native Theia Steps extension render and edit `samples/config`, and how much of `ide/` does it reuse? | Parse, render, edit, undo and Test work in a pinned Theia build; hot-exit is verified or dropped from FR-26; the shared share of `stepsModel.ts` and the `acquireVsCodeApi` shim are measured; the typed-row versus `code`-row share over `samples/config` is recorded; the Theia version and language server are recorded |
+| S-1 | Does a native Theia Steps extension render and edit `samples/config`, and how much of `ide/` does it reuse? | Parse, render, edit, undo and Test work in a pinned Theia build; hot-exit is verified or dropped from FR-26; the shared share of `stepsModel.ts` and the `acquireVsCodeApi` shim are measured; the typed-row versus `code`-row share over `samples/config` is recorded; the Theia version and language server are recorded; @theia/playwright runs at that version (section 16) |
 | S-2 | Does the analyst build have no text-editor route for `.py`? | A scripted walk of every command, menu and *Open With* entry opens no `.py` in Monaco, and finds no pop-up notification (FR-17) |
 | S-3 | Does the analyst build install and run on a managed Windows image? | It installs and runs Test without administrator rights; installer size and memory use are recorded |
 | S-4 | The repository check as a CI step on a sample config repository | It meets FR-41, run from a base-ref workflow per section 5.4 |
@@ -677,9 +730,9 @@ means the finding applies only to a hosted design and is carried to the later AD
 | R20 | minor | Addressed | Section 11.3, FR-14, spike S-2 |
 | R21 | minor | Addressed | Section 10 |
 | R22 | minor | Addressed | FR-39 |
-| R23 | minor | Addressed: option 5 re-weighed in the ADR | ADR options |
+| R23 | minor | Addressed: the web-console option, now option 6, re-weighed in the ADR | ADR options |
 | R24 | minor | Addressed by owner ruling 4 | Section 7.7 |
-| R25 | minor | Not applicable: no hosting cost threshold on the desktop | |
+| R25 | minor | Not applicable: no hosting cost threshold on the desktop. Hosted ADR | |
 | R26 | minor | Addressed | FR-29 |
 | R27 | note | Addressed | FR-22 |
 | R28 | note | Addressed: one out-of-scope list | Section 14 |
@@ -692,7 +745,7 @@ means the finding applies only to a hosted design and is carried to the later AD
 
 **Counts:** 22 addressed (R3 for the desktop only; R8 and R24 by owner ruling), 1 answered by design
 but not landed (R1), 1 partly applicable (R12), 10 not applicable to the desktop phase. The hosted
-ADR inherits R3, R4, R5, R7, R12, R15, R16, R17, R19 and R30.
+ADR inherits R3, R4, R5, R7, R12, R15, R16, R17, R19, R25 and R30.
 
 Three raw findings were refuted in verification and need no action: dual control on reload is
 conditional; a licensing claim, settled by owner ruling 8; and an operating-cost objection the drafts
@@ -744,6 +797,29 @@ they have no row.
 | C10 | Section 8.2, practice 2 |
 | C12 | Section 13, platform |
 | D-A, D-B, D-C | Section 2, and throughout |
+
+### Review round 3 (2026-10-07)
+
+An independent review of `e845ed2589`, which also read the R1 branch at `be2b886db1`, found these.
+Each was checked against the tree and that branch.
+
+| Finding | Where it landed |
+|---|---|
+| 1. Inert rule restated and narrower than the branch | Amendment G, G.7 states it once with "at least" and names the R1 tests as the source of record; G.5 holds the payloads; ADR D6, AC-3 and spec 5.3 point there |
+| 2. Templates outside E.11 rule 4's params | FR-40 item 5 |
+| 3. Where the check runs | Section 5.4 (general rule first, GitHub specifics marked), FR-43, FR-44 |
+| 4. A dynamic send or route made literal | FR-40 item 6, FR-41; the lens refusal in G.7 |
+| 5. Block protection keyed on "unrecognized test"; removed or moved headers | FR-20, FR-40 item 4, ADR AC-12, AC-G5, G.6 |
+| 6. Palette steps that send `{"expr"}` today | FR-18, FR-18a |
+| 7. `PATH` fallback; minimum engine version | Section 9 |
+| 8. `mfa_gate=False` routes; sign-out only for an open gate | FR-6, ADR D5 and AC-5 |
+| 9. Stale base undefined | FR-39, ADR AC-13 |
+| 10. Test for a type with no generator | FR-33, ADR D10 |
+| 11. Component names in messages | FR-17, ADR AC-17 |
+| 12. "Can still do" list | Section 5.2 |
+| 13. Appendix A | R23 and R25 rows, counts |
+| 14. Blank line; `ai:assist` on `POST /ai/chat` | FR-40 item 2, section 4 |
+| Test strategy (Manager decision) | Section 16 |
 
 ## Appendix C: what changed from the 2026-10-02 drafts
 
