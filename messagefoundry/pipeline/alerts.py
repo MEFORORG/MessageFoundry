@@ -365,12 +365,14 @@ class AlertSink(Protocol):
         incident responder reads, and a store that refuses its writes was otherwise visible only in
         the engine log, which nobody pages on.
 
-        ``name`` keys the subject the lost row was about. The approval gate is the only emitter, and
-        uses ``approval:<approval id>``, the key :meth:`approval_too_early` uses. ``action`` is the
-        audit action of the lost row, such as ``approval.approved``. The row's detail is NOT carried:
-        the ERROR log line written beside this alert holds it. It is raised whether the gate then
-        refused the request (an ``approval.release_attempted`` row it could not write answers 503)
-        or went ahead (the operation had already run). It is not a connection-scoped event, so no
+        ``name`` keys the subject the lost row was about. The approval gate uses ``approval:<approval
+        id>``, the key :meth:`approval_too_early` uses. ``POST /config/reload`` uses
+        ``config_reload:inline`` when it loses the ``config_reload_attempted`` row it writes before
+        an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). ``action`` is
+        the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT
+        carried: the ERROR log line written beside this alert holds it. It is raised whether the gate
+        then refused the request (an ``approval.release_attempted`` row it could not write answers
+        503) or went ahead (the operation had already run). It is not a connection-scoped event, so no
         rule's ``control_action`` fires on it (BACKLOG #1898), and the colon keeps ``name`` outside
         the connection-name grammar. Repeated failures on one request fold into one instance, and
         nothing resolves it, so an operator resolves it. Carries the key and the action name only:

@@ -209,6 +209,7 @@ from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
+    alert_sink_for,
     answers_before_body,
     authorize_ws,
     authorizes_in_body,
@@ -1312,6 +1313,55 @@ async def _audit_refused_reload(
             row,
         )
     return status, answer
+
+
+#: The ``audit_write_failed`` alert's key for an inline reload's lost attempt row (vault BACKLOG
+#: #2254). The colon keeps it outside the connection-name grammar, as the gate's ``approval:<id>`` does.
+_INLINE_RELOAD_ALERT_NAME = "config_reload:inline"
+
+
+async def _audit_reload_attempt(
+    engine: Engine,
+    *,
+    actor: str,
+    requested: str | None,
+    client: str | None,
+    alert_sink: AlertSink,
+) -> None:
+    """Write an ungated reload's ``config_reload_attempted`` row before anything swaps, and refuse
+    the reload with 503 when the audit log will not take it (vault BACKLOG #2254).
+
+    The ``config_reload`` row comes after the swap, when a failed write can only be reported
+    (:func:`_record_reload_audit`). Without this row, an audit log that refused writes would let a
+    new config go live with no record of who deployed it. A released reload needs no such row: the
+    gate writes ``approval.release_attempted`` before the release runs, and this is that row's
+    shape for the inline route.
+
+    It says ATTEMPTED because the outcome comes later. A reload the engine then refuses writes its
+    refusal row after this one, and a cancelled one writes ``config_reload_interrupted``."""
+    detail = json.dumps({"requested": requested, "dry_run": False})
+    try:
+        await engine.store.record_audit(
+            "config_reload_attempted", actor=actor, detail=detail, client=client
+        )
+    except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+        _log.exception(
+            "config reload: the audit log refused the config_reload_attempted row, so the reload "
+            "did not run. Lost row: actor=%s detail=%s",
+            actor,
+            detail,
+        )
+        try:
+            alert_sink.audit_write_failed(
+                _INLINE_RELOAD_ALERT_NAME, action="config_reload_attempted"
+            )
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+            _log.exception("config reload: the audit_write_failed alert failed to emit")
+        raise HTTPException(
+            503,
+            "the audit log could not record this reload, so it did not run; retry once the audit "
+            "log accepts writes",
+        ) from exc
 
 
 #: The audit actions that record which config bytes a process ran from: a start, an applied reload,
@@ -4604,6 +4654,8 @@ def create_app(
         ``[approvals].enabled``, a NON-dry-run reload is **held** (202) for a *distinct* second approver
         — the requester can never release their own — rather than swapping the live graph inline. A
         dry_run is never held (it swaps nothing). Deny-by-default: ungated deployments reload inline.
+        An inline reload writes ``config_reload_attempted`` before it swaps anything, and answers 503
+        without reloading when the audit log refuses that row (vault BACKLOG #2254).
 
         Error responses are intentionally generic (the detail is logged server-side, not returned)
         so a config:deploy holder can't probe the filesystem via reload error text."""
@@ -4654,6 +4706,14 @@ def create_app(
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
             else:
+                # vault BACKLOG #2254: only an ungated reload gets here, with no approval row first.
+                await _audit_reload_attempt(
+                    engine,
+                    actor=user.username,
+                    requested=req.config_dir,
+                    client=client_ip(request),
+                    alert_sink=alert_sink_for(request.app.state),
+                )
                 outcome = await _reload_or_record_interruption(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
                 )

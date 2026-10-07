@@ -1750,6 +1750,14 @@ has already swapped when that row is written. So a failed write is logged at ERR
 still answers success. It reports `degraded: true` with `audit` among its `failures`. A released
 reload carries that into its `approval.approved` row.
 
+**An ungated reload proves the audit log works before it swaps (vault BACKLOG #2254).** A reload
+that dual control does not hold has no `approval.release_attempted` row before it. So
+`POST /config/reload` writes its own `config_reload_attempted` row first, naming the requester and
+the requested directory. If the audit log refuses that row, the route answers **503**, nothing
+loads or swaps, and an `audit_write_failed` alert keyed `config_reload:inline` is raised. A dry run
+writes no such row, because it swaps nothing. Like the gate's row, it says *attempted*: a reload
+the engine then refuses or that is cancelled has its own row after it.
+
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is `approval.too_early` and `approval.stale_requester`. A claim, a rejection or

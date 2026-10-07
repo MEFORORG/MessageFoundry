@@ -105,13 +105,15 @@ def _client(
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
-def _fail_config_reload_audit(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> None:
-    """Make only the config_reload audit write fail, so every other row (the login, the request)
+def _fail_config_reload_audit(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, failing: str = "config_reload"
+) -> None:
+    """Make only the ``failing`` audit write fail, so every other row (the login, the request)
     still lands."""
     real = engine.store.record_audit
 
     async def _record(action: str, **kwargs: Any) -> None:
-        if action == "config_reload":
+        if action == failing:
             raise sqlite3.OperationalError("disk I/O error")
         await real(action, **kwargs)
 
@@ -315,6 +317,87 @@ async def test_config_reload_inline_when_not_gated(engine: Engine) -> None:
         assert r.status_code == 200, r.text  # executed inline, not held
         assert r.json()["inbound"] == 1
     assert "config_reload" in [a["action"] for a in await engine.store.list_audit(limit=50)]
+
+
+# --- vault BACKLOG #2254: an ungated reload proves the audit log works before it swaps ----
+
+
+async def test_an_inline_reload_the_audit_log_refuses_does_not_deploy(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Pre-fix nothing was written before the swap, so an audit log that refused writes still let
+    the new config go live, and the only trace was the degraded `audit` step on the answer."""
+    service = await _service(engine)
+    await _add(service, "deployer", Role.ADMINISTRATOR)
+    before = engine.registry_runner
+    reloads: list[object] = []
+    real_reload = engine.reload_detail
+
+    async def _counting(*args: Any, **kwargs: Any) -> Any:
+        reloads.append(args)
+        return await real_reload(*args, **kwargs)
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "deployer")
+        monkeypatch.setattr(engine, "reload_detail", _counting)
+        _fail_config_reload_audit(monkeypatch, engine, "config_reload_attempted")
+        with caplog.at_level(logging.WARNING):
+            r = await c.post("/config/reload", json={}, headers=headers)
+    assert r.status_code == 503, r.text
+    assert "did not run" in r.json()["detail"]
+    assert reloads == [], "the engine was never asked to load or swap"
+    assert engine.registry_runner is before
+    assert engine.last_reload_dir is None
+    assert await engine.store.list_audit(action="config_reload") == []
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("refused the config_reload_attempted row" in m for m in messages)
+    assert any(
+        "audit_write_failed" in m and "config_reload_attempted" in m and "config_reload:inline" in m
+        for m in messages
+    ), "the default LoggingAlertSink raised the alert"
+
+
+async def test_an_inline_reload_writes_its_attempt_row_before_the_swap(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = await _service(engine)
+    await _add(service, "deployer", Role.ADMINISTRATOR)
+    seen: list[tuple[str, object]] = []
+    real_record = engine.store.record_audit
+
+    async def _spy(action: str, **kwargs: Any) -> None:
+        # What the engine is running at the moment each row is written: last_reload_dir moves only
+        # once an applied reload has swapped the graph.
+        seen.append((action, engine.last_reload_dir))
+        await real_record(action, **kwargs)
+
+    async with _client(engine, service, NOT_GATED) as c:
+        headers = await _token(c, "deployer")
+        monkeypatch.setattr(engine.store, "record_audit", _spy)
+        r = await c.post("/config/reload", json={}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert dict(seen)["config_reload_attempted"] is None, "written before the swap"
+    assert dict(seen)["config_reload"] is not None
+    (row,) = await engine.store.list_audit(action="config_reload_attempted")
+    assert row["actor"] == "deployer"
+    assert json.loads(row["detail"]) == {"requested": None, "dry_run": False}
+
+
+async def test_a_dry_run_and_a_released_reload_write_no_attempt_row(engine: Engine) -> None:
+    """A dry run swaps nothing. A released reload already has the gate's approval.release_attempted
+    row before it, so a second pre-swap row would only repeat it."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, GATED) as c:
+        op = await _token(c, "op")
+        dry = await c.post("/config/reload", json={"dry_run": True}, headers=op)
+        assert dry.status_code == 200, dry.text
+        approval_id = (await c.post("/config/reload", json={}, headers=op)).json()["approval_id"]
+        ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "approver"))
+        assert ok.status_code == 200, ok.text
+    assert await engine.store.list_audit(action="config_reload_attempted") == []
+    assert len(await engine.store.list_audit(action="approval.release_attempted")) == 1
 
 
 # --- a dry-run is never held (it swaps nothing) -------------------------------
