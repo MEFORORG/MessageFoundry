@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI, Query
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from messagefoundry.api._ui_seam import UiDeps
+from messagefoundry.api.validation import ActionFilter, ActorFilter, EpochSeconds
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
 
@@ -26,6 +27,9 @@ from .._service import _service
 _AUDIT_PAGE = 200
 _SECURITY_EVENTS_PAGE = 200
 
+#: The console export's default row cap, the same default ``GET /audit/export`` declares.
+_EXPORT_LIMIT = 10_000
+
 
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L1c: read-only audit trail + self-service security events."""
@@ -39,7 +43,43 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         offset: int = Query(0, ge=0),
     ) -> HTMLResponse:
         data = await admin.list_audit(service=service, _=identity, limit=limit, offset=offset)
-        return HTMLResponse(pages.audit_log(data))
+        return HTMLResponse(
+            pages.audit_log(
+                data,
+                export_limit=_EXPORT_LIMIT if identity.has(Permission.AUDIT_EXPORT) else None,
+            )
+        )
+
+    # The audit CSV from the console session (BACKLOG #2446). GET /audit/export reads only a bearer
+    # header, and an account that signs in only through OIDC gets a cookie session and never a
+    # bearer, so without this route such an auditor had no export at all. It calls the engine's own
+    # handler, so the CSV, its lock-row exclusion, its audit.export row and its X-Audit-Withheld
+    # header are that route's. The filters are declared with the same types GET /audit/export uses,
+    # because an in-process call skips the handler's own validation. Every argument is passed
+    # explicitly, for the reason _audit_ui_list gives about Query sentinels.
+    @app.get("/ui/audit/export")
+    async def ui_audit_export(
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_ui(Permission.AUDIT_EXPORT)),
+        limit: int = Query(_EXPORT_LIMIT, ge=1, le=1_000_000),
+        actor: ActorFilter | None = Query(None),
+        action: ActionFilter | None = Query(None),
+        since: EpochSeconds | None = Query(None),
+        until: EpochSeconds | None = Query(None),
+    ) -> StreamingResponse:
+        response: StreamingResponse = await admin.export_audit(
+            request=request,
+            service=service,
+            identity=identity,
+            format="csv",
+            limit=limit,
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+        )
+        return response
 
     @app.get("/ui/security-events", response_class=HTMLResponse)
     async def ui_security_events(

@@ -308,12 +308,16 @@ from typing import Any
 #: connection detail page is unchanged. The digest moved because the DTO surface and
 #: ``CoreHandlers`` grew; a skewed pair fails the handshake.
 #:
+#: BACKLOG #2446: ``AuditList`` gained the required ``withheld``, which the audit page states, and
+#: ``AdminHandlers`` gained the required ``export_audit``, which the new ``/ui/audit/export``
+#: streams from the console session. The digest moved because both grew.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "bb7a98f205a24b50"
+ENGINE_UI_SEAM: str = "938fb5a9d0e3045a"
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,6 +456,10 @@ class AdminHandlers:
     enroll_mfa: Callable[..., Awaitable[Any]]
     disable_my_mfa: Callable[..., Awaitable[Any]]
     list_audit: Callable[..., Awaitable[Any]]
+    # GET /audit/export (BACKLOG #2446): the console's /ui/audit/export streams it from the cookie
+    # session, so an auditor who signs in only through OIDC, and so holds no bearer, can export.
+    # Its JSON gate is require(AUDIT_EXPORT), and the /ui route asserts the same permission.
+    export_audit: Callable[..., Awaitable[Any]]
     my_security_events: Callable[..., Awaitable[Any]]
     # Sync DTO projections (kept engine-side so the console never imports store.UserRecord — the
     # ``user`` arg stays opaque/Any across the seam).

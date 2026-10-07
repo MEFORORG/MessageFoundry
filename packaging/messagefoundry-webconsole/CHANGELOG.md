@@ -29,6 +29,14 @@ this line.**
   reason reveals carry the page's filters and position. Seam change: `AuditList` and
   `SecurityEventsList` carry `total`, `limit` and `offset`, and `CoreHandlers` gains
   `connection_event_page`. (BACKLOG #2438)
+- **The audit page exports, and says when rows are withheld.** `/ui/audit` links to the new
+  `/ui/audit/export` for a holder of `audit:export`. That route streams the engine's audit CSV from
+  the console session, so an auditor who signs in only through OIDC, and so holds no bearer token,
+  can export. For a reader without `users:manage` the page says account-lock entries are left out
+  of its list, count and export, and never which. `/ui/security-events` says that a change an
+  administrator made to the account is not listed there, and that it is emailed when it can be.
+  Seam change: `AuditList` carries `withheld`, and `AdminHandlers` gains `export_audit`.
+  (BACKLOG #2446)
 
 ### Fixed
 

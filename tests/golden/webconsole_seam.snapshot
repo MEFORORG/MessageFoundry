@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-bb7a98f205a24b50
+938fb5a9d0e3045a
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -104,6 +104,7 @@ change_password
 enroll_mfa
 disable_my_mfa
 list_audit
+export_audit
 my_security_events
 user_summary
 current_user
@@ -202,7 +203,7 @@ messagefoundry.api.auth_models.AdGroupMapEntry: ad_group, role
 messagefoundry.api.auth_models.AdGroupScopeEntry: ad_group, channel
 messagefoundry.api.auth_models.AdGroupScopeMap: entries
 messagefoundry.api.auth_models.AuditEntry: action, actor, channel_id, client, detail, ts
-messagefoundry.api.auth_models.AuditList: entries, limit, offset, total
+messagefoundry.api.auth_models.AuditList: entries, limit, offset, total, withheld
 messagefoundry.api.auth_models.ChannelScope: channels, expected_source
 messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, user_id, username
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions

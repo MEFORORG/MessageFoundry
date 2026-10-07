@@ -477,12 +477,18 @@ class AuditEntry(BaseModel):
 
 class AuditList(BaseModel):
     """One page of the audit trail (BACKLOG #2438). ``total`` counts every row the caller may read
-    under the same filters, so ``offset`` and ``limit`` place this page within it."""
+    under the same filters, so ``offset`` and ``limit`` place this page within it.
+
+    ``withheld`` is True when the caller's permissions leave a class of rows out of this listing
+    and its total: the lock rows a reader without ``users:manage`` does not see (BACKLOG #1131,
+    #2446). It is a fact about the CALLER, not about this page. It is True whether or not any such
+    row falls in the filtered range, so it cannot tell a reader whether a lock happened."""
 
     entries: list[AuditEntry]
     total: int
     limit: int
     offset: int
+    withheld: bool
 
 
 class SimpleMessage(BaseModel):

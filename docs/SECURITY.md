@@ -1379,14 +1379,14 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **123 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **124 routes + one `/ui/static` mount** (federation off,
 the default — the three `/ui/oidc/*` routes, `GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback`,
 and the IdP step-up start `POST /ui/reauth/oidc` are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 110 of the 120 carry a gate; the 10 that do not are the
+**Route → permission map (`/ui` plane).** 111 of the 121 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -1425,6 +1425,7 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/approvals/{approval_id}/approve` | `approvals:approve` | `require_ui` — paces the write like `require_paced`; the requester can never approve their own request |
 | `POST` | `/ui/approvals/{approval_id}/reject` | `approvals:approve` | `require_ui` |
 | `GET` | `/ui/audit` | `audit:read` | `require_ui` |
+| `GET` | `/ui/audit/export` | `audit:export` | `require_ui` |
 | `GET` | `/ui/cluster` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/cluster/force-stepdown` | `cluster:control` | `require_ui_step_up` |
 | `GET` | `/ui/cluster/force-stepdown-confirm` | `cluster:control`**+**`monitoring:read` | `require_ui_step_up` |
@@ -4506,6 +4507,18 @@ never comes back short. The account holder's own `/me/security-events` feed is n
 selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.
+
+**Such a reader is told rows were withheld, and never which (BACKLOG #2446).** `GET /audit` returns
+`withheld: true`, the console's `/ui/audit` says lock entries are left out of its list, count and
+export, and `GET /audit/export` sends `X-Audit-Withheld: true` and records `withheld` in its
+`audit.export` row. Each is decided by the reader's permission alone. It shows whether or not a
+hidden row falls in the range read, so it cannot tell the reader that a lock happened.
+
+**The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
+/audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC
+gets a console cookie and never a bearer. `GET /ui/audit/export` streams the same handler from the
+console session under the same `audit:export` permission, so its CSV, exclusion, `audit.export` row
+and header are that route's.
 
 **The general log no longer names lock events.** `GET /logs/tail` serves the application log to
 `logs:view`, which the built-in Operator holds without `users:manage`, so the ruling reaches it too:

@@ -346,8 +346,8 @@ async def test_the_audit_and_security_event_pages_page_against_a_total(engine: E
             assert _window(second.text, noun) == (4, 6, total), path
             assert ">Previous<" in second.text, path
         audit = await c.get("/ui/audit")
-        assert "not this console session" in audit.text
-        assert "set its until parameter (epoch seconds) to an earlier time" in audit.text
+        assert 'href="/ui/audit/export"' in audit.text
+        assert "add an until parameter (epoch seconds)" in audit.text
 
 
 async def test_the_event_log_pager_and_its_reveals_carry_the_filters_and_position(

@@ -101,7 +101,11 @@ from messagefoundry.auth import (
     Permission,
     Role,
 )
-from messagefoundry.auth.audit_visibility import audit_exclusion_for
+from messagefoundry.auth.audit_visibility import (
+    AUDIT_WITHHELD_HEADER,
+    audit_exclusion_for,
+    withholds_rows_from,
+)
 from messagefoundry.auth.ldap import LdapError, canonical_group_dn
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
@@ -1709,6 +1713,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             total=total,
             limit=limit,
             offset=offset,
+            # BACKLOG #2446: said by permission, never by whether a hidden row is in range.
+            withheld=withholds_rows_from(identity),
         )
 
     @app.get("/audit", response_model=AuditList)
@@ -1777,7 +1783,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         many rows).
 
         A caller without ``users:manage`` exports the trail without the lock rows, exactly as it reads
-        it (BACKLOG #1131), and ``count`` is the number of rows the export sends it.
+        it (BACKLOG #1131), and ``count`` is the number of rows the export sends it. The
+        ``X-Audit-Withheld`` header and the ``audit.export`` row's ``withheld`` say whether that
+        exclusion applied, by permission and never by the rows (BACKLOG #2446), so a filtered CSV
+        does not read as the whole trail.
 
         The rows are read in pages of ``_AUDIT_EXPORT_PAGE``, newest first, each page keyed below the
         last ``id`` of the one before (vault BACKLOG #2776), so the process holds one page and not the
@@ -1819,6 +1828,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 before_id=int(first[0]["id"]) + 1,
             )
         )
+        withheld = withholds_rows_from(identity)
         # Record the export as its own audit event BEFORE streaming — the detail is metadata only (the
         # applied filter + row count), never a message body.
         await service.store.record_audit(
@@ -1828,6 +1838,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 {
                     "format": "csv",
                     "count": count,
+                    "withheld": withheld,
                     "filter": {
                         "actor": actor,
                         "action": action,
@@ -1888,7 +1899,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         return StreamingResponse(
             _iter_csv(),
             media_type="text/csv",
-            headers={"Content-Disposition": 'attachment; filename="audit-export.csv"'},
+            headers={
+                "Content-Disposition": 'attachment; filename="audit-export.csv"',
+                AUDIT_WITHHELD_HEADER: "true" if withheld else "false",
+            },
         )
 
     # The /ui admin/account/audit pages moved to messagefoundry_webconsole (Option B, ADR 0065). Return
@@ -1920,6 +1934,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         enroll_mfa=enroll_mfa,
         disable_my_mfa=disable_my_mfa,
         list_audit=_audit_ui_list,
+        export_audit=export_audit,
         my_security_events=my_security_events,
         user_summary=_user_summary,
         federated_identity_view=_federated_identity_view,
