@@ -509,6 +509,14 @@ def _judge_crl(
                     f"Restore a readable {what} before restarting: the engine refuses to "
                     "start on one it cannot read",
                 )
+            elif bundle_only and file_facts is not None and file_facts.expired:
+                # Vault BACKLOG #2319: nothing judges a CA file's CRL at start, so a restart would
+                # load this expired CRL and refuse every peer under its issuer now.
+                why, remedy = (
+                    "whose CA file now holds an expired CRL",
+                    "Replace the CRL in the CA file with a current one before restarting: a "
+                    "restart would load the expired one",
+                )
             elif bundle_only and (file_facts is not None or not crl_pem_blocks(pem)):
                 # Vault BACKLOG #2319: the reload pass never applies a CA file, so no wait helps.
                 # A CA file whose CRL was moved out still starts, so a restart is safe then too.
@@ -532,7 +540,8 @@ def _judge_crl(
             elif fingerprint is not None and (refused := held.refusal(cert.path, fingerprint)):
                 # BACKLOG #299: the reload pass tried the file on the running hop and refused it.
                 why = "that differs from the file, which the engine refused to apply to it"
-                remedy = f"Reason: {refused.reason}. {refused.remedy}"
+                # The remedy leads: the alert instance keeps only the start of it (#2319).
+                remedy = f"{refused.remedy}. Reason: {refused.reason}"
             else:
                 # No refusal recorded: the reload pass (pipeline/crl_reload.py) has not judged
                 # these bytes yet, and will within its interval.

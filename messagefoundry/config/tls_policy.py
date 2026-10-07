@@ -472,15 +472,20 @@ def record_ca_bundle_crls(ctx: ssl.SSLContext, ca_file: str | None, *, setting: 
             return  # the usual CA file: certificates only
         facts = read_soonest_crl_facts(pem, now=time.time())
         record_crl_load(ctx, ca_file, pem, facts, setting=setting, ca_bundle=True)
-    except Exception as exc:
-        # Any failure, not only a ValueError: this records for the monitor, and a hop that built
-        # before this existed must not stop building because of it.
+    except ValueError as exc:
         logger.warning(
-            "the CA file %s carries a CRL block the expiry monitor cannot judge (%s: %s), so no "
+            "the CA file %s carries a CRL block the expiry monitor cannot judge (%s), so no "
             "alert will cover it. Move the CRL to the hop's CRL setting, which judges it at start",
             where,
-            type(exc).__name__,
             exc,
+        )
+    except Exception:
+        # Not a verdict on the file: a defect here. This only records for the monitor, and a hop
+        # that built before this existed must not stop building because of it.
+        logger.error(
+            "could not record the CRL in the CA file %s for the expiry monitor",
+            where,
+            exc_info=True,
         )
 
 

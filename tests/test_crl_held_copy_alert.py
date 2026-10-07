@@ -227,10 +227,14 @@ def test_the_notifier_payload_marks_a_held_copy_and_names_the_shared_rows() -> N
     assert event["connection"] == "tls.crl_file (CRL)"
     assert event["held_copy"] is True
     assert event["shared_with"] == ["logging.forward_tls_crl_file"]
-    # The remedy leads: the alert instance's reason keeps only about the first 200 characters.
-    assert event["detail"].startswith("Restart the engine. Held by: [tls].crl_file.")
+    # The marker, then the remedy: the alert instance's reason keeps about the first 200 characters.
+    assert event["detail"].startswith(f"{HELD_COPY_NOTE} Restart the engine. Held by:")
     assert "also serves logging.forward_tls_crl_file" in event["detail"]
-    assert event["detail"].endswith(HELD_COPY_NOTE)
+
+
+def test_a_shared_file_with_no_held_copy_mentions_no_held_copy() -> None:
+    note = crl_expiry_detail(held_copy=False, detail="", shared_with=("tls.crl_file",))
+    assert note == "The same file also serves tls.crl_file."
 
 
 def test_control_a_plain_crl_alert_payload_is_unchanged() -> None:
@@ -462,6 +466,27 @@ def test_a_crl_moved_out_of_the_ca_file_asks_for_a_restart(ca: _Ca, tmp_path: Pa
     held_copy, detail, _ = sink.crl_notes[mine[0]]
     assert held_copy is True
     assert detail.startswith("Restart the engine to apply the CA file")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_an_expired_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # Nothing judges a CA file's CRL at start, so "restart" here would load the expired CRL and
+    # refuse every peer under its issuer at once. The remedy must say to replace it first.
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca.pem + ca.crl(days=5.5, number=1))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+    hop = _hop(bundle, crl)
+    bundle.write_bytes(ca.pem + ca.crl(days=-0.01, number=3))  # lapsed about 14 minutes ago
+
+    sink, mine = _bundle_scan(bundle)
+
+    assert len(mine) == 1
+    held_copy, detail, _ = sink.crl_notes[mine[0]]
+    assert held_copy is False  # the file's expired CRL is the sooner date
+    assert detail.startswith("Replace the CRL in the CA file with a current one before restarting")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
