@@ -203,8 +203,10 @@ def _is_contained_name(name: object) -> bool:
     return not (len(name) >= 2 and name[0].isascii() and name[0].isalpha() and name[1] == ":")
 
 
-def _redact(host: str, path: str) -> str:
-    """``host:path`` only — never credentials, for a log line."""
+def _where(host: str, path: str) -> str:
+    """``host:path`` for a log line or an error. Pass only configured values: the connection's
+    ``host`` and ``remote_dir``. It redacts nothing, so a file name, from the message or the partner,
+    goes through ``safe_name`` instead (vault BACKLOG #3044; this was ``_redact``)."""
     return f"{host}:{path}"
 
 
@@ -2015,7 +2017,7 @@ class RemoteFileDestination(DestinationConnector):
             await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         except _RemoteError as exc:
             raise DestinationStartupError(
-                f"REMOTEFILE destination directory {_redact(self._host, self._remote_dir)} failed "
+                f"REMOTEFILE destination directory {_where(self._host, self._remote_dir)} failed "
                 f"startup validation: {exc}"
             ) from exc
 
@@ -2044,7 +2046,7 @@ class RemoteFileDestination(DestinationConnector):
             logger.warning(
                 "REMOTEFILE destination CREATED missing directory %s — this delivery is landing in a "
                 "directory the engine just made; verify the configured remote_dir is the intended one",
-                _redact(self._host, self._remote_dir),
+                _where(self._host, self._remote_dir),
             )
 
     def _list_or_retry(self, lister: Callable[[str], _T], why: str) -> _T:
@@ -2064,7 +2066,7 @@ class RemoteFileDestination(DestinationConnector):
             if exc.connection_fault:
                 raise
             raise _RemoteError(
-                f"REMOTEFILE upload directory {_redact(self._host, self._remote_dir)} {why}: {exc}",
+                f"REMOTEFILE upload directory {_where(self._host, self._remote_dir)} {why}: {exc}",
                 permanent=False,
             ) from exc
 
@@ -2073,14 +2075,12 @@ class RemoteFileDestination(DestinationConnector):
         # server. The remote path limit is the partner's and is not known here, so there is no
         # directory budget; a server refusal is classified by its own reply.
         name = render_filename(self._filename_template, payload, fallback=_FALLBACK_NAME)
-        # The shared helper, not a bare .encode(): a UnicodeEncodeError names a character of the
-        # message and carries the WHOLE payload on `.object`. The helper raises a permanent,
-        # content-free NegativeAckError with the chain severed (#1920), before any I/O. It is not a
-        # _RemoteError, so send() lets it through unchanged and the row dead-letters.
+        # Before any I/O. The refusal is not a _RemoteError, so send() lets it through and the row
+        # dead-letters, under either internal_error policy. The label carries no file name.
         data = encode_wire_body(
             payload,
             self._encoding,
-            transport=f"REMOTEFILE upload to {_redact(self._host, self._remote_dir)}",
+            transport=f"REMOTEFILE upload to {_where(self._host, self._remote_dir)}",
         )
         self._prepare_remote_dir()
         # With overwrite off, list for free names BEFORE anything is written (the #1936 rule).
@@ -2123,7 +2123,7 @@ class RemoteFileDestination(DestinationConnector):
         published = self._client.publish(tmp, candidates)
         if published is None:
             raise _RemoteError(
-                f"REMOTEFILE upload to {_redact(self._host, self._remote_dir)} found all "
+                f"REMOTEFILE upload to {_where(self._host, self._remote_dir)} found all "
                 f"{len(candidates)} names it tried taken after the listing, and overwrite is off, "
                 "so it published nothing; the retry lists again",
                 permanent=False,
@@ -2312,7 +2312,7 @@ class RemoteFileSource(SourceConnector):
             await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         except _RemoteError as exc:
             raise SourceStartupError(
-                f"REMOTEFILE source directory {_redact(self._host, self._remote_dir)} failed startup "
+                f"REMOTEFILE source directory {_where(self._host, self._remote_dir)} failed startup "
                 f"validation: {exc}"
             ) from exc
 
@@ -2331,7 +2331,7 @@ class RemoteFileSource(SourceConnector):
                 # reports running. Log and retry next interval (mirrors the File / DATABASE sources).
                 logger.exception(
                     "REMOTEFILE source poll failed for %s; retrying next interval",
-                    _redact(self._host, self._remote_dir),
+                    _where(self._host, self._remote_dir),
                 )
             try:  # noqa: SIM105
                 await asyncio.wait_for(self._stop.wait(), self._poll_seconds)
@@ -2350,14 +2350,14 @@ class RemoteFileSource(SourceConnector):
                 self._skipping = False
                 logger.debug(
                     "REMOTEFILE source resuming polling of %s (now leader)",
-                    _redact(self._host, self._remote_dir),
+                    _where(self._host, self._remote_dir),
                 )
             return True
         if not self._skipping:
             self._skipping = True
             logger.debug(
                 "REMOTEFILE source skipping polling of %s (not leader; another node ingests it)",
-                _redact(self._host, self._remote_dir),
+                _where(self._host, self._remote_dir),
             )
         return False
 
@@ -2398,7 +2398,7 @@ class RemoteFileSource(SourceConnector):
                 logger.warning(
                     "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
                     "(not a single safe name); left in place, not retrieved",
-                    _redact(self._host, self._remote_dir),
+                    _where(self._host, self._remote_dir),
                 )
                 continue
             if not fnmatch.fnmatch(name, self._pattern):
@@ -2457,7 +2457,7 @@ class RemoteFileSource(SourceConnector):
                 logger.warning(
                     "REMOTEFILE %s: %s changed while it was retrieved (%s bytes before, %d read, %s "
                     "after); not emitted, left in place for the next poll",
-                    _redact(self._host, self._remote_dir),
+                    _where(self._host, self._remote_dir),
                     safe_name(name),
                     exc.before,
                     exc.read,
@@ -2605,7 +2605,7 @@ class RemoteFileSource(SourceConnector):
         logger.info(
             "REMOTEFILE source %s reached poll_max_files (%s) this poll; %d listing entr(ies) left for "
             "the next poll (deferred, not dropped)",
-            _redact(self._host, self._remote_dir),
+            _where(self._host, self._remote_dir),
             self._poll_max_files,
             remaining,
         )
@@ -2644,7 +2644,7 @@ class RemoteFileSource(SourceConnector):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "REMOTEFILE %s: %s not yet settled (listed at %d bytes); %s",
-                _redact(self._host, self._remote_dir),
+                _where(self._host, self._remote_dir),
                 safe_name(name),
                 size,
                 "waiting for the next poll to agree"
@@ -2734,7 +2734,7 @@ class RemoteFileSource(SourceConnector):
             "REMOTEFILE %s: %s skipped as already ingested (leave mode); the server listed no "
             "modification time%s for it, so a new version under the same name%s is not told apart "
             "from the one already read",
-            _redact(self._host, self._remote_dir),
+            _where(self._host, self._remote_dir),
             safe_name(name),
             " and a size of 0" if size == 0 else "",
             "" if size == 0 else " and size",
@@ -2802,7 +2802,7 @@ class RemoteFileSource(SourceConnector):
                 "REMOTEFILE %s: %s changed after it was read (%d bytes read, %d now); the message "
                 "emitted from it may be incomplete, so the file is left in place for the next poll to "
                 "read whole",
-                _redact(self._host, self._remote_dir),
+                _where(self._host, self._remote_dir),
                 safe_name(name),
                 read_size,
                 now,

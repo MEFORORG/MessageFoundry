@@ -606,15 +606,20 @@ def encode_wire_body(payload: str, encoding: str, *, transport: str) -> bytes:
     **Permanent** because it is: the same bytes will never encode on a retry, so it dead-letters
     rather than looping the lane forever. (``direct.py`` once mapped this to a *transient* error, so
     an un-encodable body retried there instead of dead-lettering; it calls this helper now, BACKLOG
-    #1919/#1920.)"""
+    #1919/#1920.)
+
+    The charset and the position come **first**, and ``transport`` last: the delivery worker stores
+    the error through ``safe_exc``, which cuts the text at 200 characters. A label carrying a long
+    host and directory, as RemoteFile's does, would otherwise push the two actionable facts off the
+    end (vault BACKLOG #3044)."""
     try:
         return payload.encode(encoding)
     except UnicodeEncodeError as exc:
         # Keep the INDEX and nothing else; `exc` dies with the handler, taking `.object` with it.
         offending_position = exc.start
     raise NegativeAckError(
-        f"{transport}: payload is not encodable as {encoding!r} "
-        f"(first offending character at position {offending_position})",
+        f"payload is not encodable as {encoding!r} "
+        f"(first offending character at position {offending_position}) for {transport}",
         code="encoding",
         permanent=True,
     )
