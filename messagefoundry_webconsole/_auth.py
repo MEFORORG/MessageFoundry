@@ -421,7 +421,7 @@ def require_ui(
 
     async def dependency(request: Request) -> Identity:
         auth = get_auth(request)
-        if auth is None or not auth.enabled:
+        if auth is None:
             # The browser UI always needs a real session — no allow_no_auth shortcut here.
             raise _login_redirect()
         token = session_token(request)
@@ -1123,7 +1123,7 @@ def require_ui_step_up(
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
         auth = get_auth(request)
-        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+        if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
@@ -1161,7 +1161,7 @@ def require_ui_reauth_only(
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + permission (+ must-change gate)
         auth = get_auth(request)
-        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+        if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
@@ -1211,7 +1211,7 @@ def require_ui_step_up_action(
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
         auth = get_auth(request)
-        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+        if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
@@ -1268,7 +1268,7 @@ def require_ui_reauth_only_action(
         # cookie auth + permission (+ must-change gate) + the pending refusal above
         identity = await base(request)
         auth = get_auth(request)
-        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+        if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
@@ -1308,7 +1308,7 @@ async def authorize_ui_ws(
     if not token:
         return None, None
     auth = getattr(websocket.app.state, "auth", None)
-    if auth is None or not auth.enabled:
+    if auth is None:
         return None, None
     # activity=False (ASVS 14.3.1): app.js now re-opens this socket on a TIMER after a drop, and a
     # timer is not user activity. The page load that opened the first socket already counted.

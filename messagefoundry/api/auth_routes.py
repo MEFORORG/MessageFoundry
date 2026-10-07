@@ -213,7 +213,7 @@ async def _service(request: Request) -> AuthService:
     # Marked for the same reason as that provider: it sits ahead of the gate on every route
     # here, so the check that runs before the body is read asks it first (vault BACKLOG #2739).
     auth = get_auth(request)
-    if auth is None or not auth.enabled:
+    if auth is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not enabled")
     return auth
 

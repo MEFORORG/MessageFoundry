@@ -782,7 +782,7 @@ async def _session_caller(
     gets. ``activity`` is :meth:`AuthService.identity_for_token`'s: False validates the session
     the same way and leaves its idle clock alone."""
     auth = get_auth(request)
-    if auth is None or not auth.enabled:
+    if auth is None:
         if _allow_no_auth(request.app.state):
             return None, _SYSTEM_IDENTITY
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not configured")
@@ -951,9 +951,9 @@ async def refuse_from_new_address(request: Request) -> None:
     Costs one session read per request while ``[auth].admin_new_ip_step_up`` is on, and one more
     on a refusal, to pick its wording. The gate has
     already read the session through :func:`require`, but the identity it returns does not carry
-    the anchor address. A no-op with auth off or absent."""
+    the anchor address. A no-op with no auth service."""
     auth = get_auth(request)
-    if auth is None or not auth.enabled:
+    if auth is None:
         return
     token = bearer_token(request)
     if await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path):
@@ -979,7 +979,7 @@ def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Ide
     async def dependency(request: Request) -> Identity:
         identity = await base(request)
         auth = get_auth(request)
-        if auth is not None and auth.enabled:
+        if auth is not None:
             await refuse_from_new_address(request)
             _enforce_admin_write_pacing(request, auth, identity)
         return identity
@@ -1092,7 +1092,7 @@ async def resolve_client_cert_identity(request: Request) -> Identity | None:
     if not cert_map:
         return None  # feature off (empty map) — byte-identical to no cert-identity
     auth = get_auth(request)
-    if auth is None or not auth.enabled:
+    if auth is None:
         return None
     peer_cert = peer_cert_from_request(request)
     # Only the names listed under the cert's OWN issuer are consulted (BACKLOG #2237): the same
@@ -1314,7 +1314,7 @@ def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[I
     async def dependency(request: Request) -> Identity:
         identity = await base(request)
         auth = get_auth(request)
-        if auth is not None and auth.enabled:
+        if auth is not None:
             token = bearer_token(request)
             # BACKLOG #193 (ASVS 2.4.2): per-actor anti-automation pacing on the state-changing admin
             # surface (NON-GET only), shared with require_paced so both gates draw one per-actor bucket.
@@ -1356,7 +1356,7 @@ def require_reauth_only(*permissions: Permission) -> Callable[[Request], Awaitab
     async def dependency(request: Request) -> Identity:
         identity = await base(request)
         auth = get_auth(request)
-        if auth is not None and auth.enabled:
+        if auth is not None:
             token = bearer_token(request)
             # Same new-client-IP contextual-risk layer as require_step_up (WP-L3-13); the MFA gate is
             # intentionally skipped here (enrollment would otherwise deadlock — see the docstring).
@@ -1404,7 +1404,7 @@ def require_step_up_action(
     async def dependency(request: Request) -> Identity:
         identity = await base(request)
         auth = get_auth(request)
-        if auth is not None and auth.enabled:
+        if auth is not None:
             token = bearer_token(request)
             # BACKLOG #1148 (ASVS 2.4.2): charge the SAME per-actor anti-automation bucket
             # require_step_up charges, in the SAME position — first, so a throttled write is refused
@@ -1457,7 +1457,7 @@ def require_reauth_only_action(
     async def dependency(request: Request) -> Identity:
         identity = await base(request)
         auth = get_auth(request)
-        if auth is not None and auth.enabled:
+        if auth is not None:
             token = bearer_token(request)
             new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
             # After the new-IP signal, so a refused request still records it, and before the grant
@@ -1490,7 +1490,7 @@ async def optional_identity(request: Request) -> Identity | None:
     downgrade an already-public answer, never protect anything. Both consumers (``GET /health``,
     ``GET /ai/policy``) are non-PHI."""
     auth = get_auth(request)
-    if auth is None or not auth.enabled:
+    if auth is None:
         return _SYSTEM_IDENTITY if _allow_no_auth(request.app.state) else None
     return await auth.identity_for_token(bearer_token(request))
 
@@ -1538,7 +1538,7 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     if not _ws_origin_allowed(websocket):
         return None  # cross-site / disallowed browser Origin — reject before accept()
     auth: AuthService | None = getattr(websocket.app.state, "auth", None)
-    if auth is None or not auth.enabled:
+    if auth is None:
         return _SYSTEM_IDENTITY if _allow_no_auth(websocket.app.state) else None
     identity = await auth.identity_for_token(ws_token(websocket))
     if identity is None:
