@@ -5778,15 +5778,14 @@ def _host_gated_store_settings(
     """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
     Shared by ``admin-unlock``, ``admin-set-notify-email`` and ``admin-reset-totp`` so the gate is
-    stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it legitimately creates the
-    store, so it cannot carry the M-31 guard below. ``store attest-transit-bound`` and
-    ``withdraw-transit-bound`` use it too (BACKLOG #2337), and pass ``false_finding``, the result a
-    fresh empty store would wrongly report for them.
+    stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin``
+    does not use it: it legitimately creates the store, so it cannot carry the M-31 guard below.
+    ``store attest-transit-bound`` and ``withdraw-transit-bound`` use it too (BACKLOG #2337). Each
+    passes ``false_finding``, the result a fresh empty store would wrongly report for it.
 
     Both refusals exit 2, "could not start", as each command's ``StoreNotFoundError`` arm already
-    did for a server database with no store (vault BACKLOG #3110, item 4). They exited 1 before,
-    which the admin commands give a refusal about the account and the transit-bound commands give a
-    refused write.
+    did for a server database with no store (vault BACKLOG #3110, item 4). The admin commands exited
+    1 before that, the code they give a refusal about the account.
     """
     from pathlib import Path
 
@@ -6136,22 +6135,21 @@ def _store(args: argparse.Namespace) -> int:
     return _store_transit_bound(args)
 
 
-class _StoreOpenFailed(Exception):  # noqa: N818 -- a carrier, caught one frame up
-    """A SQLite error raised while OPENING the store, so ``_store_transit_bound`` can tell it from
-    the same class raised by its write (BACKLOG #2337)."""
-
-    def __init__(self, cause: sqlite3.DatabaseError) -> None:
-        super().__init__(str(cause))
-        self.cause = cause
-
-
 class _StoreConnectFailed(Exception):  # noqa: N818 -- a carrier, caught one frame up
-    """Any other store error raised while OPENING the store, such as a server backend that cannot
-    be reached, so ``_store_transit_bound`` reports exit 2 rather than a refused write."""
+    """A store error raised while OPENING the store, such as a path that is not a database or a
+    server backend that cannot be reached, so ``_store_transit_bound`` reports exit 2 rather than a
+    refused write. The same classes raised by the write are a refused write, except the defects
+    ``_store_transit_bound`` names (BACKLOG #2337)."""
 
     def __init__(self, cause: Exception) -> None:
         super().__init__(str(cause))
         self.cause = cause
+
+
+class _StoreDefect(Exception):  # noqa: N818 -- carries a defect to the dispatch floor
+    """A store error the transit-bound write raised that names a defect in the code, not a refusal
+    (BACKLOG #2337). Its text is the error's class and SQLSTATE as :func:`_store_error_text` renders
+    them, so the dispatch floor reports the defect without the server's text."""
 
 
 def _store_transit_bound(args: argparse.Namespace) -> int:
@@ -6177,6 +6175,7 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
+        store_driver_errors,
         store_open_errors,
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
@@ -6215,18 +6214,30 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
     actor = f"cli:{getpass.getuser()}"
+    # What a failure left in place, for the refusal lines below.
+    unchanged = (
+        "nothing was recorded"
+        if attesting
+        else "nothing was withdrawn, and any attestation on record still stands"
+    )
 
-    # A refused write raises one of these on every backend (BACKLOG #1983). The row and its audit
-    # row share one transaction, so a refusal leaves neither. sqlite3.DatabaseError is here because
-    # an open's own failure has already been re-raised as _StoreOpenFailed, so what reaches this
-    # clause is the write, such as "database is locked". store_open_errors() carries pyodbc's Error
-    # root and InterfaceError (a failed login, a missing driver, a deadlock victim) and OSError
-    # (vault BACKLOG #3054, item 10), and UnicodeError is a driver decoding a row's text.
-    store_errors: tuple[type[Exception], ...] = (
+    # What an OPEN that cannot reach or use its database raises, on any backend, at least: the
+    # engine's own refusals (RuntimeError, such as SchemaNotProvisionedError), the drivers' errors
+    # (SQLite's among them, for a path that is not a database, #1670), pyodbc's Error root and
+    # InterfaceError (a missing driver, a failed login), OSError (vault BACKLOG #3054, item 10), and
+    # UnicodeError, a driver decoding a row's text.
+    store_errors: tuple[type[Exception], ...] = (RuntimeError, UnicodeError, *store_open_errors())
+    # The same classes raised by the WRITE are a refused write (BACKLOG #1983): the row and its
+    # audit row share one transaction, so a refusal leaves neither. Two carve-outs reach the
+    # dispatch floor as defects instead, at least: pyodbc's bare Error root, which
+    # store_driver_errors() leaves out, unless its SQLSTATE names a transient condition such as a
+    # deadlock victim (40001), so a bind-count mismatch (07002) is a defect; and SQLite's
+    # ProgrammingError and InterfaceError, its own bind-count and misuse errors.
+    refused_writes: tuple[type[Exception], ...] = (
         RuntimeError,
-        sqlite3.DatabaseError,
         UnicodeError,
-        *store_open_errors(),
+        OSError,
+        *store_driver_errors(),
     )
     # A key that cannot be resolved at open, or a cipher refusal (Transit unreachable) at either end.
     key_errors: tuple[type[Exception], ...] = (
@@ -6248,13 +6259,11 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
                 settings.store,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
-        except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-            raise _StoreOpenFailed(exc) from exc
         except open_refusals:
             raise  # each has its own message and exit code below
         except store_errors as exc:
-            # A server backend that cannot be reached or refuses the login fails here, and that is
-            # "could not open the store" (exit 2), not a refused write.
+            # A path that is not a database (#1670), or a server backend that cannot be reached or
+            # refuses the login, fails here: "cannot open the store" (exit 2), not a refused write.
             raise _StoreConnectFailed(exc) from exc
         try:
             if not isinstance(store, TransitBoundAttestationStore):
@@ -6284,23 +6293,38 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
         _emit_error(str(exc), as_json=args.json)
         return 2
     except key_errors as exc:
-        _emit_error(f"nothing was recorded: {exc}", as_json=args.json)
+        _emit_error(f"{unchanged}: {exc}", as_json=args.json)
         return 2
-    except _StoreOpenFailed as exc:
-        return _emit_store_open_error(exc.cause, settings.store.path, as_json=args.json)
     except _StoreConnectFailed as exc:
-        _emit_error(
-            f"could not open the store at {_store_label(settings.store)}: "
-            f"{_store_error_text(exc.cause)}",
+        return _emit_store_open_error(
+            exc.cause,
+            _store_label(settings.store),
             as_json=args.json,
+            text=_transit_store_error_text(exc.cause),
         )
-        return 2
     except store_errors as exc:
+        if isinstance(exc, (sqlite3.ProgrammingError, sqlite3.InterfaceError)) or (
+            not isinstance(exc, refused_writes) and not _is_transient_driver_error(exc)
+        ):
+            # A defect, not a refusal: the dispatch floor reports it, by class and SQLSTATE only.
+            raise _StoreDefect(_store_error_text(exc)) from exc
+        text = _transit_store_error_text(exc)
+        if _write_outcome_unknown(exc):
+            # The link failed, possibly after the server applied the COMMIT, so nothing here can
+            # say whether the write took effect. Re-running either command is safe.
+            return _emit_error(
+                f"the connection to the store failed during the write, so whether it took effect "
+                f"is unknown ({text}). Re-run the command",
+                as_json=args.json,
+            )
+        # Only a lock is fixed by stopping a SQLite engine, so only a lock gets that hint.
+        hint = (
+            ". If the engine is running on this SQLite store, stop it and re-run"
+            if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+            else ""
+        )
         return _emit_error(
-            f"the store refused the write, so nothing was recorded ({_store_error_text(exc)}). "
-            "If the engine is "
-            "running on a SQLite store, stop it and re-run",
-            as_json=args.json,
+            f"the store refused the write, so {unchanged} ({text}){hint}", as_json=args.json
         )
     if outcome == "unsupported":
         return _emit_error("this store backend cannot hold the attestation", as_json=args.json)
@@ -9793,8 +9817,9 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
 
 
 async def _close_store_quietly(store: Store) -> None:
-    """Close ``store`` after ``audit-verify`` or ``audit-anchor`` has its result. A close that fails
-    prints a warning naming its class, and never replaces that result (vault BACKLOG #3054)."""
+    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``store attest-transit-bound`` or
+    ``store withdraw-transit-bound`` has its result. A close that fails prints a warning naming its
+    class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()
     except Exception as exc:
@@ -9826,8 +9851,9 @@ class _AuditWalkStopped(RuntimeError):
 
 def _store_error_text(exc: Exception) -> str:
     """A store error as one line that quotes no row's content: the rendering
-    :func:`_emit_store_open_error` documents. ``store attest-transit-bound`` uses it too, for a
-    failed open or a refused write (BACKLOG #2337)."""
+    :func:`_emit_store_open_error` documents. The two transit-bound commands use it too, for a
+    driver error at the open or at the write (BACKLOG #2337); an engine refusal goes to
+    :func:`_engine_refusal_text` instead."""
     import re
 
     from messagefoundry.redaction import safe_exc
@@ -9845,7 +9871,87 @@ def _store_error_text(exc: Exception) -> str:
     return safe_exc(exc)
 
 
-def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
+def _is_engine_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` is a refusal the engine wrote itself (BACKLOG #2337): a ``RuntimeError``
+    subclass the engine defines, such as ``SchemaNotProvisionedError``, or a plain ``RuntimeError``
+    raised from engine code, as the store's refusal sites raise it. A plain one raised by a library,
+    or a subclass from elsewhere such as ``NotImplementedError``, is not one. A refusal's text names
+    its fix, so it is printed whole."""
+    if not isinstance(exc, RuntimeError):
+        return False
+    if type(exc) is not RuntimeError:
+        return type(exc).__module__.split(".")[0] == "messagefoundry"
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    module = tb.tb_frame.f_globals.get("__name__", "")
+    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
+
+
+def _engine_refusal_text(exc: BaseException) -> str:
+    """An engine refusal's whole text, with any error it quotes from its cause chain rendered by
+    :func:`_store_error_text` in place of that error's own text (BACKLOG #2337).
+
+    A refusal such as the SQL Server open's READ_COMMITTED_SNAPSHOT check embeds the driver error
+    it was raised from, and a server's text can quote a stored value. The chain is followed through
+    ``__cause__``, or ``__context__`` where no cause was set. Each link that is not itself an engine
+    refusal has its ``repr``, its ``str`` and each of its string arguments replaced wherever the
+    refusal quotes them. Every occurrence is replaced: a short cause text that also appears in the
+    refusal's own prose costs that prose, which is the cheaper failure. A quotation in any other
+    shape is not caught; the refusal sites themselves are unchanged."""
+    text = str(exc)
+    renderings: list[str] = []
+    link = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    seen: set[int] = set()
+    while isinstance(link, Exception) and id(link) not in seen:
+        seen.add(id(link))
+        if not _is_engine_refusal(link):
+            # Longest first, so a repr is replaced before the str inside it; a placeholder keeps a
+            # rendering from being matched again by a later, shorter quotation.
+            quotations = {repr(link), str(link), *(a for a in link.args if isinstance(a, str))}
+            for quoted in sorted((q for q in quotations if len(q) > 5), key=len, reverse=True):
+                if quoted in text:
+                    text = text.replace(quoted, f"\x00{len(renderings)}\x00")
+                    renderings.append(_store_error_text(link))
+        link = link.__cause__ or (None if link.__suppress_context__ else link.__context__)
+    for n, rendered in enumerate(renderings):
+        text = text.replace(f"\x00{n}\x00", rendered)
+    return text
+
+
+def _transit_store_error_text(exc: Exception) -> str:
+    """How the transit-bound commands render a store error at the open or the write (BACKLOG
+    #2337): an engine refusal whole, through :func:`_engine_refusal_text`, so its remedy survives;
+    anything else as :func:`_store_error_text` renders it."""
+    return _engine_refusal_text(exc) if _is_engine_refusal(exc) else _store_error_text(exc)
+
+
+def _is_transient_driver_error(exc: BaseException) -> bool:
+    """Whether a server driver's error carries a SQLSTATE the database connector counts as
+    transient, such as a deadlock victim (40001) (BACKLOG #2337)."""
+    from messagefoundry.store.base import driver_sqlstate
+    from messagefoundry.transports.database import _is_transient
+
+    state = driver_sqlstate(exc)
+    return state is not None and _is_transient(state)
+
+
+def _write_outcome_unknown(exc: BaseException) -> bool:
+    """Whether a failed write may still have committed: a lost connection (OSError, or SQLSTATE
+    class 08), or 40003, "statement completion unknown" (BACKLOG #2337)."""
+    from messagefoundry.store.base import driver_sqlstate
+
+    if isinstance(exc, OSError):
+        return True
+    state = driver_sqlstate(exc)
+    return state is not None and (state.startswith("08") or state == "40003")
+
+
+def _emit_store_open_error(
+    exc: Exception, path: str, *, as_json: bool, text: str | None = None
+) -> int:
     """One line and exit 2 for a store that could not be opened (BACKLOG #1670).
 
     EXIT 2 AND NOT 1, DELIBERATELY. These subcommands already spend 1 on a negative *finding* --
@@ -9871,8 +9977,11 @@ def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
     is (...)", and ``safe_exc``'s pattern redaction keeps that (measured in BACKLOG #1661). An
     error with no SQLSTATE goes through ``safe_exc``: at least asyncpg's refused connection, an
     OSError, and its client errors, whose text ``safe_exc`` redacts by pattern only.
+
+    ``text``, when given, replaces that rendering, for a caller that has already rendered the error
+    its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337).
     """
-    message = f"cannot open the store at {path}: {_store_error_text(exc)}"
+    message = f"cannot open the store at {path}: {_store_error_text(exc) if text is None else text}"
     if as_json:
         print(json.dumps({"error": message}))
     else:

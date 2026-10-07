@@ -504,6 +504,7 @@ def test_cli_a_write_the_store_refuses_is_exit_1_not_a_failed_open(
     assert rc == 1, err
     assert "refused the write" in err and "database is locked" in err
     assert "cannot open" not in err
+    assert "stop it and re-run" in err  # a SQLite lock is the one case the hint is for
 
 
 def test_cli_a_close_that_fails_after_the_write_does_not_report_it_refused(
@@ -525,6 +526,17 @@ def test_cli_a_close_that_fails_after_the_write_does_not_report_it_refused(
     assert "closing the store failed" in captured.err
     monkeypatch.setattr(MessageStore, "close", real_close)
     assert _read(transit_db) is not None
+
+    # The withdraw twin: its write has committed too, so the row is gone and the exit is 0.
+    monkeypatch.setattr(MessageStore, "close", failing_close)
+    rc = main(["store", "withdraw-transit-bound", "--db", str(transit_db)])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "withdrew" in captured.out, captured.out
+    assert "refused the write" not in captured.err
+    assert "closing the store failed" in captured.err
+    monkeypatch.setattr(MessageStore, "close", real_close)
+    assert _read(transit_db) is None
 
 
 def test_cli_a_file_that_is_not_a_database_is_exit_2(
@@ -550,7 +562,279 @@ def test_cli_a_store_that_cannot_be_reached_is_exit_2(
     rc = main(["store", "withdraw-transit-bound", "--db", str(transit_db)])
     err = capsys.readouterr().err
     assert rc == 2, err
-    assert "could not open the store" in err and "refused the write" not in err
+    assert "cannot open the store" in err and "refused the write" not in err
+
+
+# The two commands, each with what it needs to reach the store's write.
+_TRANSIT_ARMS = {
+    "attest": (
+        ["store", "attest-transit-bound", "--reason", "r"],
+        "record_transit_bound_attestation",
+    ),
+    "withdraw": (["store", "withdraw-transit-bound"], "withdraw_transit_bound_attestation"),
+}
+# A server's text can quote a stored value. Each error below carries this marker in its text, and
+# no line the commands print may carry it.
+_ROW_TEXT = "ROWMARKER"
+
+
+def _stand_in_server_drivers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stand-ins from the audit-verify tests, with pyodbc's root stand-in also read as a server
+    driver's error, as the real ``pyodbc.Error`` is. pyodbc is not installed on every leg."""
+    from messagefoundry.store import base as store_base
+    from tests.test_keyless_chain_every_command import (
+        _PyodbcError,
+        _ServerDriverError,
+        _stand_in_drivers,
+    )
+
+    _stand_in_drivers(monkeypatch)
+    real = store_base._is_server_driver_error
+    monkeypatch.setattr(
+        store_base,
+        "_is_server_driver_error",
+        lambda exc: isinstance(exc, (_ServerDriverError, _PyodbcError)) or real(exc),
+    )
+
+
+def _open_error(kind: str) -> Exception:
+    """Built per test, so no instance carries one test's traceback into the next."""
+    from tests.test_keyless_chain_every_command import _InterfaceError, _ServerDriverError
+
+    if kind == "login":
+        return _InterfaceError(
+            "28000", f"[28000] Login failed for user '{_ROW_TEXT}' (18456) (SQLDriverConnect)"
+        )
+    return _ServerDriverError("42P01", f'relation "{_ROW_TEXT}" does not exist')
+
+
+@pytest.mark.parametrize("arm", list(_TRANSIT_ARMS))
+@pytest.mark.parametrize("kind", ["login", "relation"])
+def test_cli_a_server_driver_error_at_the_open_is_exit_2_and_its_text_is_not_printed(
+    arm: str,
+    kind: str,
+    transit_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed login (pyodbc's InterfaceError) or a missing relation at the open is "could not
+    start", exit 2, in the line the audit commands print, with the error's class and SQLSTATE and
+    never the server's text."""
+    import messagefoundry.store.base as store_base
+
+    _stand_in_server_drivers(monkeypatch)
+    error = _open_error(kind)
+
+    async def refusing(*_a: object, **_k: object) -> object:
+        raise error
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    argv, _ = _TRANSIT_ARMS[arm]
+    rc = main([*argv, "--db", str(transit_db)])
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert f"cannot open the store at {transit_db}: " in captured.err, captured.err
+    assert f"SQLSTATE {error.args[0]}" in captured.err, captured.err
+    assert _ROW_TEXT not in captured.out + captured.err
+    assert "refused the write" not in captured.err
+
+
+@pytest.mark.parametrize("arm", list(_TRANSIT_ARMS))
+def test_cli_a_deadlock_at_the_write_is_a_refused_write_and_its_text_is_not_printed(
+    arm: str, transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """pyodbc raises its bare Error root for a deadlock victim (40001). The server rolled the
+    transaction back, so it is a refused write, exit 1, rendered as its class, SQLSTATE and native
+    number. The stop-the-engine hint is for a SQLite lock only."""
+    from tests.test_keyless_chain_every_command import _PyodbcError
+
+    _stand_in_server_drivers(monkeypatch)
+    argv, method = _TRANSIT_ARMS[arm]
+
+    async def refusing(*_a: object, **_k: object) -> object:
+        raise _PyodbcError("40001", f"[40001] deadlock on {_ROW_TEXT} (1205) (SQLExecDirectW)")
+
+    monkeypatch.setattr(MessageStore, method, refusing)
+    rc = main([*argv, "--db", str(transit_db)])
+    captured = capsys.readouterr()
+    assert rc == 1, captured.err
+    assert "refused the write" in captured.err, captured.err
+    assert "SQLSTATE 40001] native error 1205" in captured.err, captured.err
+    assert _ROW_TEXT not in captured.out + captured.err
+    assert "stop it and re-run" not in captured.err
+    if arm == "withdraw":
+        assert "nothing was withdrawn, and any attestation on record still stands" in captured.err
+
+
+@pytest.mark.parametrize("arm", list(_TRANSIT_ARMS))
+def test_cli_a_link_lost_at_the_write_reports_an_unknown_outcome(
+    arm: str, transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lost link (SQLSTATE 08S01, a DatabaseError subclass in pyodbc) may land after the server
+    applied the COMMIT, so the line claims neither outcome. Exit 1, and the driver's text hidden."""
+    from tests.test_keyless_chain_every_command import _ServerDriverError
+
+    _stand_in_server_drivers(monkeypatch)
+    argv, method = _TRANSIT_ARMS[arm]
+
+    async def refusing(*_a: object, **_k: object) -> object:
+        raise _ServerDriverError(
+            "08S01", f"[08S01] link failure reading {_ROW_TEXT} (10054) (SQLExecDirectW)"
+        )
+
+    monkeypatch.setattr(MessageStore, method, refusing)
+    rc = main([*argv, "--db", str(transit_db)])
+    captured = capsys.readouterr()
+    assert rc == 1, captured.err
+    assert "whether it took effect is unknown" in captured.err, captured.err
+    assert "SQLSTATE 08S01] native error 10054" in captured.err, captured.err
+    assert "nothing was" not in captured.err
+    assert _ROW_TEXT not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("arm", list(_TRANSIT_ARMS))
+def test_cli_pyodbcs_bare_error_root_at_the_write_is_a_defect_not_a_refused_write(
+    arm: str,
+    transit_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """pyodbc raises its bare ``Error`` root for a SQLSTATE it does not map, such as 07002, a bind
+    count that does not match the statement: a defect in the code. The write arm counts the root as
+    a refusal only with a transient SQLSTATE, so the dispatch floor reports this one."""
+    from tests.test_keyless_chain_every_command import _PyodbcError
+
+    _stand_in_server_drivers(monkeypatch)
+    argv, method = _TRANSIT_ARMS[arm]
+
+    async def defect(*_a: object, **_k: object) -> object:
+        raise _PyodbcError("07002", f"[07002] COUNT field incorrect near {_ROW_TEXT}")
+
+    monkeypatch.setattr(MessageStore, method, defect)
+    rc = main([*argv, "--db", str(transit_db), "--json"])
+    captured = capsys.readouterr()
+    assert rc == 1, captured.err
+    assert "refused the write" not in captured.out + captured.err
+    # The dispatch floor's line names the defect by class and SQLSTATE, never the server's text.
+    assert "_StoreDefect: _PyodbcError [SQLSTATE 07002]" in captured.out, captured.out
+    assert _ROW_TEXT not in captured.out + captured.err + caplog.text
+
+
+def test_cli_a_sqlite_bind_count_error_at_the_write_is_a_defect(
+    transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SQLite's own bind-count error is a ProgrammingError, a DatabaseError subclass, but a defect
+    in the code all the same: the dispatch floor reports it, not "refused the write"."""
+
+    async def defect(*_a: object, **_k: object) -> object:
+        raise sqlite3.ProgrammingError("Incorrect number of bindings supplied")
+
+    monkeypatch.setattr(MessageStore, "record_transit_bound_attestation", defect)
+    rc = main(["store", "attest-transit-bound", "--reason", "r", "--db", str(transit_db)])
+    captured = capsys.readouterr()
+    assert rc == 1, captured.err
+    assert "refused the write" not in captured.out + captured.err
+
+
+def test_cli_a_schema_not_provisioned_refusal_prints_its_remedy_in_full(
+    transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An engine refusal at the open is printed whole: ``SchemaNotProvisionedError`` is longer
+    than ``safe_exc``'s cap, and its remedy, the provision-schema command, comes late in it. This
+    build moves the schema hash, so it is the expected first run of either command on a server
+    store."""
+    import messagefoundry.store.base as store_base
+    from messagefoundry.config.settings import StoreBackend
+
+    refusal = store_base.SchemaNotProvisionedError(StoreBackend.SQLSERVER, "mefor", "a" * 64)
+    assert len(str(refusal)) > 200  # the control: safe_exc would have cut it
+
+    async def refusing(*_a: object, **_k: object) -> object:
+        raise refusal
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["store", "attest-transit-bound", "--reason", "r", "--db", str(transit_db)])
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert f"cannot open the store at {transit_db}: {refusal}" in err, err
+    assert f"run `{store_base.PROVISION_SCHEMA_COMMAND}`" in err
+
+
+async def _real_rcsi_refusal(monkeypatch: pytest.MonkeyPatch, driver: Exception) -> RuntimeError:
+    """The refusal ``SqlServerStore._ensure_database_options`` itself raises when the RCSI ALTER
+    fails with ``driver`` and no peer turned RCSI on, over an ``aioodbc`` stand-in, so the test
+    reads the production message rather than a copy of its format string."""
+    import sys
+    import types
+
+    import messagefoundry.store.sqlserver as sqlserver_module
+    from messagefoundry.config.settings import SchemaManagement, StoreBackend
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    class Cursor:
+        async def execute(self, sql: str, *_params: object) -> None:
+            if sql.startswith("ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT"):
+                raise driver
+
+        async def fetchone(self) -> tuple[int, int]:
+            return (0, 0)  # RCSI off, on every read
+
+    class Conn:
+        async def cursor(self) -> Cursor:
+            return Cursor()
+
+        async def close(self) -> None:
+            return None
+
+    async def connect(**_kwargs: object) -> Conn:
+        return Conn()
+
+    module = types.ModuleType("aioodbc")
+    module.connect = connect  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "aioodbc", module)
+    monkeypatch.setattr(sqlserver_module, "_RCSI_REREAD_DELAY_S", 0.0)
+    settings = StoreSettings(
+        backend=StoreBackend.SQLSERVER,
+        server="localhost",
+        database="mefor",
+        username="sa",
+        schema_management=SchemaManagement.AUTO,
+    )
+    with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF") as info:
+        await SqlServerStore._ensure_database_options(settings)
+    return info.value
+
+
+def test_cli_an_engine_refusal_quoting_a_driver_error_prints_the_remedy_not_the_driver_text(
+    transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The SQL Server open's READ_COMMITTED_SNAPSHOT refusal quotes the driver error it was raised
+    from. Its remedy prints; the quoted driver text is replaced by the error's class, SQLSTATE and
+    native number."""
+    import asyncio
+
+    import messagefoundry.store.base as store_base
+    from messagefoundry.store.sqlserver import _rcsi_remedy
+    from tests.test_keyless_chain_every_command import _ServerDriverError
+
+    _stand_in_server_drivers(monkeypatch)
+    driver = _ServerDriverError(
+        "42000", f"[42000] permission denied on {_ROW_TEXT} (5011) (SQLExecDirectW)"
+    )
+    refusal = asyncio.run(_real_rcsi_refusal(monkeypatch, driver))
+    assert _ROW_TEXT in str(refusal)  # the control: the refusal does quote the driver's text
+
+    async def refusing(*_a: object, **_k: object) -> object:
+        raise refusal
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["store", "withdraw-transit-bound", "--db", str(transit_db)])
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert _rcsi_remedy("mefor") in err, err
+    assert "(_ServerDriverError [SQLSTATE 42000] native error 5011)" in err, err
+    assert _ROW_TEXT not in err
 
 
 def test_cli_record_refuses_a_store_not_on_vault_transit(
@@ -560,6 +844,42 @@ def test_cli_record_refuses_a_store_not_on_vault_transit(
     rc = main(["store", "attest-transit-bound", "--reason", "r", "--db", str(transit_db)])
     assert rc == 1
     assert "vault_transit" in capsys.readouterr().err
+
+
+def test_cli_a_runtime_error_the_engine_did_not_write_is_rendered_safely(
+    transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Only the engine's own refusals print whole. A RuntimeError subclass from elsewhere, such as
+    ``NotImplementedError``, and a plain RuntimeError raised outside engine code (here, by this
+    test, standing in for a library) go through ``safe_exc``, which bounds its length."""
+    import messagefoundry.store.base as store_base
+
+    for error in (NotImplementedError("x" * 400), RuntimeError("x" * 400)):
+
+        async def refusing(*_a: object, _error: Exception = error, **_k: object) -> object:
+            raise _error
+
+        monkeypatch.setattr(store_base, "open_store", refusing)
+        rc = main(["store", "withdraw-transit-bound", "--db", str(transit_db)])
+        err = capsys.readouterr().err
+        assert rc == 2, err
+        assert type(error).__name__ in err and "x" * 400 not in err, err
+
+
+def test_a_refusal_quoting_its_cause_by_repr_renders_the_cause_once() -> None:
+    """A refusal that quotes its cause with ``!r`` gets one rendering, not a rendering nested in
+    another, and the remedy after it survives."""
+    from messagefoundry.__main__ import _engine_refusal_text
+
+    try:
+        try:
+            raise OSError("reset by peer")
+        except OSError as exc:
+            raise RuntimeError(f"could not connect: {exc!r}; ask a DBA") from exc
+    except RuntimeError as refusal:
+        text = _engine_refusal_text(refusal)
+    assert text.count("reset by peer") == 1, text
+    assert text.endswith("; ask a DBA"), text
 
 
 # --- GET /security/posture -----------------------------------------------------------------------

@@ -327,7 +327,8 @@ def test_a_directory_named_as_the_service_config_exits_2(
     existence check and raises an ``OSError`` at the open, which ``_load_service_settings`` catches
     (#2760). These commands then exit 2, could not start, with one rendered line. ``rotate-key``
     exited 1 at the dispatch floor before #2760, and the admin commands' shared host gate exited 1,
-    the code they give a refusal about the account."""
+    the code they give a refusal about the account. ``store attest-transit-bound`` and
+    ``withdraw-transit-bound`` share that gate (BACKLOG #2337), so they are two arms here too."""
     code = main([*argv, "--service-config", str(tmp_path), "--db", str(tmp_path / "x.db")])
     captured = capsys.readouterr()
     assert code == 2, (captured.out, captured.err)
