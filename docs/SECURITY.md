@@ -1802,6 +1802,25 @@ The store makes the check and the insert one serialized step on all three backen
 requester always gets a request of their own: the release re-checks the requester's authority, so
 one person's ask must not ride on another person's standing.
 
+**A repeat of an open purge or reload needs no new step-up proof on the JSON plane (vault BACKLOG
+#2625).** `POST /connections/{name}/purge` and `POST /config/reload` take a single-use proof bound to
+their action, listed under [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753).
+Each route looks for the caller's open request first. If it finds one, it answers the same **202**
+and writes the same `approval.request_repeated` row, and spends no proof. Every other request spends
+the proof before it is held or run, so a first request, or a different one, still needs it. The
+rest of the route's gate applies to a repeat as well, at least the permission, pacing, the second
+factor, the new-address check and the factor-binding refusal. At least these limits apply:
+
+- the lookup and its audit row are two steps. A request approved, rejected or expired between them
+  is still named in the **202**. Nothing new is held or run because of it;
+- the lookup reads the newest 1000 open requests. A repeat of an older one needs a proof, and the
+  store's rule above then joins it;
+- the console's purge and reload ask for a proof on every request. A repeat there goes to re-auth,
+  and joins only when the operator submits it again;
+- a repeat that races the first request's commit may spend a proof and then join;
+- with `[auth].require_action_step_up = false` the two routes read the session window in place of a
+  proof, and a repeat skips that window check in the same way.
+
 **A held request cannot be released once dual control stops applying to it.** If an operator turns
 `[approvals].enabled` off, or removes the operation from `[approvals].operations`, a request held
 before the change is refused at release with **409** and an `approval.no_longer_gated` row against
@@ -2223,6 +2242,10 @@ grant is keyed on the session and the action, not on a target. The rest of the s
 the shared window on purpose: a bound proof is a typed password per action, and an operator replaying
 dead letters during an incident would type it per message. `[auth].require_action_step_up = false`
 puts these routes back on the window, as it does every action-bound route.
+
+Under dual control, a JSON purge or reload that repeats the caller's own open request answers with
+that request's id and spends no proof. [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+states when, and its limits.
 
 Upload resend also needs `messages:edit` beside `files:browse` (vault BACKLOG #2625). It injects a
 message, and `files:browse` is a read. `edit-resend` with a reroute was already the same power under

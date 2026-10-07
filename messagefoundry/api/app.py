@@ -237,6 +237,7 @@ from messagefoundry.api.security import (
     require_service_cert,
     require_step_up,
     require_step_up_action,
+    spend_step_up_action,
     ws_token,
 )
 from messagefoundry.api.svg_sanitize import SvgRejected, may_be_svg, sanitize_if_svg
@@ -826,6 +827,27 @@ def _purge_in_scope(identity: Identity) -> bool:
     """Whether ``identity`` may purge an outbound. A purge spans every inbound feeding it, so only an
     unscoped caller may. Read by the route and by the approval gate, like :func:`_replay_in_scope`."""
     return identity.allowed_channels is None
+
+
+def _purge_hold_params(name: str, scope: str) -> dict[str, Any]:
+    """What a held purge captures. The route's guard and its proof-free rejoin both read it, and a
+    repeat is recognised only when the two are identical (vault BACKLOG #2625 with #2445)."""
+    return {"name": name, "scope": scope}
+
+
+def _reload_hold_params(config_dir: str | None, requester: str) -> dict[str, Any]:
+    """What a held reload captures; shared by the guard and the rejoin as for a purge."""
+    return {"config_dir": config_dir, "requester": requester}
+
+
+def _held_reply(response: Response, approval_id: str, operation: str) -> PendingApprovalResponse:
+    """The 202 a dual-control hold answers, for a new request and for a rejoined repeat alike."""
+    response.status_code = 202
+    return PendingApprovalResponse(
+        approval_id=approval_id,
+        operation=operation,
+        detail="held for a second approver (dual-control)",
+    )
 
 
 def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
@@ -3981,11 +4003,50 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         scope: str = Query("all", pattern="^(top|all)$"),
         identity: Identity = Depends(
-            require_step_up_action(STEP_UP_ACTION_CONNECTION_PURGE, Permission.MESSAGES_PURGE)
+            require_step_up_action(
+                STEP_UP_ACTION_CONNECTION_PURGE, Permission.MESSAGES_PURGE, proof_in_route=True
+            )
         ),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> PurgeResult | PendingApprovalResponse:
-        """Soft-cancel queued deliveries to an outbound connection (across all inbounds)."""
+        """Soft-cancel queued deliveries to an outbound connection (across all inbounds).
+
+        A repeat of the caller's own open dual-control hold answers its 202 again with no new
+        step-up proof (vault BACKLOG #2625 with #2445). Any other request spends the proof bound to
+        ``connection_purge`` before it is held or run."""
+        if gate is not None and _purge_in_scope(identity):
+            held = await gate.rejoin(
+                "connection_purge",
+                _purge_hold_params(name, scope),
+                requester=identity.username,
+                requester_user_id=identity.user_id,
+                client=client_ip(request),
+            )
+            if held is not None:
+                return _held_reply(response, held, "connection_purge")
+        await spend_step_up_action(request, STEP_UP_ACTION_CONNECTION_PURGE)
+        return await _purge_connection_core(
+            name,
+            response,
+            engine=engine,
+            scope=scope,
+            identity=identity,
+            gate=gate,
+            request=request,
+        )
+
+    async def _purge_connection_core(
+        name: str,
+        response: Response,
+        *,
+        engine: Engine,
+        scope: str,
+        identity: Identity,
+        gate: ApprovalGate | None,
+        request: Request,
+    ) -> PurgeResult | PendingApprovalResponse:
+        """The purge past its step-up. The console calls this through the seam, behind its own
+        action-bound gate, which has already spent the proof."""
         # Purge targets an outbound and spans every inbound feeding it, so it can't be confined to a
         # per-(inbound-)channel scope — a channel-scoped user may not purge a shared outbound.
         if not _purge_in_scope(identity):
@@ -4018,18 +4079,13 @@ def create_app(
         ):  # dual-control: hold for a second approver when [approvals] gates purge
             pending = await gate.guard(
                 "connection_purge",
-                {"name": name, "scope": scope},
+                _purge_hold_params(name, scope),
                 requester=identity.username,
                 requester_user_id=identity.user_id,
                 client=client_ip(request),
             )
             if pending is not None:
-                response.status_code = 202
-                return PendingApprovalResponse(
-                    approval_id=pending,
-                    operation="connection_purge",
-                    detail="held for a second approver (dual-control)",
-                )
+                return _held_reply(response, pending, "connection_purge")
         client = client_ip(request)
         # BACKLOG #1641: written UNCONDITIONALLY, cancelled=0 included. Deliberately NOT the
         # `if requeued:` shape of the dead_letter_replay sibling: replay guards on "PHI was actually
@@ -4716,12 +4772,7 @@ def create_app(
                 client=client_ip(request),
             )
             if pending is not None:
-                response.status_code = 202
-                return PendingApprovalResponse(
-                    approval_id=pending,
-                    operation="dead_letter_replay",
-                    detail="held for a second approver (dual-control)",
-                )
+                return _held_reply(response, pending, "dead_letter_replay")
         requeued = await engine.replay_dead(
             channel_id=req.channel_id,
             destination_name=req.destination_name,
@@ -4835,7 +4886,9 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         user: Identity = Depends(
-            require_step_up_action(STEP_UP_ACTION_CONFIG_RELOAD, Permission.CONFIG_DEPLOY)
+            require_step_up_action(
+                STEP_UP_ACTION_CONFIG_RELOAD, Permission.CONFIG_DEPLOY, proof_in_route=True
+            )
         ),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ReloadResult | PendingApprovalResponse:
@@ -4855,27 +4908,53 @@ def create_app(
         An inline reload writes ``config_reload_attempted`` before it swaps anything, and answers 503
         without reloading when the audit log refuses that row (vault BACKLOG #2254).
 
+        A repeat of the caller's own open hold answers its 202 again with no new step-up proof
+        (vault BACKLOG #2625 with #2445). Any other request, a ``dry_run`` included, spends the
+        proof bound to ``config_reload`` first.
+
         Error responses are intentionally generic (the detail is logged server-side, not returned)
         so a config:deploy holder can't probe the filesystem via reload error text."""
+        if gate is not None and not req.dry_run:
+            held = await gate.rejoin(
+                "config_reload",
+                _reload_hold_params(req.config_dir, user.username),
+                requester=user.username,
+                requester_user_id=user.user_id,
+                client=client_ip(request),
+            )
+            if held is not None:
+                return _held_reply(response, held, "config_reload")
+        await spend_step_up_action(request, STEP_UP_ACTION_CONFIG_RELOAD)
+        return await _reload_config_core(
+            req, response, engine=engine, user=user, gate=gate, request=request
+        )
+
+    async def _reload_config_core(
+        req: ReloadRequest,
+        response: Response,
+        *,
+        engine: Engine,
+        user: Identity,
+        gate: ApprovalGate | None,
+        request: Request,
+    ) -> ReloadResult | PendingApprovalResponse:
+        """:func:`reload_config` past its step-up. The console calls this through the seam, behind
+        its own action-bound gate, which has already spent the proof."""
         # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run
         # is a read-only pre-flight (no swap), so it is never held. The guard runs AFTER the caller's
-        # own step-up + config:deploy check (above) — the second approver is an additional control, not
-        # a replacement. On hold, 202 + the pending id; the captured config_dir is replayed on release.
+        # own step-up + config:deploy check (in reload_config, or the console's own gate) — the second
+        # approver is an additional control, not a replacement. On hold, 202 + the pending id; the
+        # captured config_dir is replayed on release.
         if gate is not None and not req.dry_run:
             pending = await gate.guard(
                 "config_reload",
-                {"config_dir": req.config_dir, "requester": user.username},
+                _reload_hold_params(req.config_dir, user.username),
                 requester=user.username,
                 requester_user_id=user.user_id,
                 client=client_ip(request),
             )
             if pending is not None:
-                response.status_code = 202
-                return PendingApprovalResponse(
-                    approval_id=pending,
-                    operation="config_reload",
-                    detail="held for a second approver (dual-control)",
-                )
+                return _held_reply(response, pending, "config_reload")
         # #285 (ASVS 6.7.1): the engine re-verifies the settings trust anchors first on every real
         # reload, so a swapped or newly exposed anchor refuses the deploy (422, audited as
         # reason="trust_anchor" below). It moved there from this route in BACKLOG #2034, so a held,
@@ -8247,9 +8326,11 @@ def create_app(
                 dr_activate=dr_activate,
                 dr_release=dr_release,
                 dual_role_control=_dual_role_control,
-                purge_connection=purge_connection,
+                # The cores past the JSON route's step-up: each /ui route in front of one spends the
+                # same action-bound proof itself (vault BACKLOG #2625).
+                purge_connection=_purge_connection_core,
                 config_provenance=config_provenance,
-                reload_config=reload_config,
+                reload_config=_reload_config_core,
                 search_messages=search_messages,
                 audit_channel_denied=_audit_channel_denied,
                 upload_file=upload_file,

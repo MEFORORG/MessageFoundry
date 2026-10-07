@@ -189,7 +189,9 @@ def test_the_engine_answers_a_hold_with_the_status_the_client_discriminates_on()
     answers the question the client asks -- what does the engine actually set -- rather than
     re-asserting 202 against itself.
 
-    The route list is the positive control: a scan that found nothing would otherwise be
+    Every hold answers through ``_held_reply`` (vault BACKLOG #2625 gave purge and reload a second
+    answer, a repeat rejoined before its step-up), so the scan finds that one site. The operations
+    passed to it are the positive control: a scan that found nothing would otherwise be
     indistinguishable from an engine that never holds anything."""
     from messagefoundry.api import app as app_module
 
@@ -197,9 +199,14 @@ def test_the_engine_answers_a_hold_with_the_status_the_client_discriminates_on()
     holds = re.findall(
         r"response\.status_code = (\d+)\s*\r?\n\s*return PendingApprovalResponse\(", source
     )
-    assert len(holds) == len(_GATED_ROUTES), (
-        f"expected one hold site per gated route ({len(_GATED_ROUTES)}), found {len(holds)}: "
-        "either a gated route was added/removed, or the scan stopped matching the code"
+    assert len(holds) == 1, (
+        f"expected the one hold site in _held_reply, found {len(holds)}: either a route builds its "
+        "own 202 again, or the scan stopped matching the code"
+    )
+    held_ops = set(re.findall(r'return _held_reply\(response, \w+, "(\w+)"\)', source))
+    assert held_ops == {"connection_purge", "dead_letter_replay", "config_reload"}, (
+        f"the operations answered through _held_reply are {sorted(held_ops)}; one per gated route "
+        f"({len(_GATED_ROUTES)}) is expected"
     )
     assert set(holds) == {str(_HTTP_PENDING_APPROVAL)}, (
         f"the engine holds with {sorted(set(holds))} but the client discriminates on "
