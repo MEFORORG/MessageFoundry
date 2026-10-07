@@ -4875,9 +4875,17 @@ row: it must exist, be the newest attest or withdraw row, name the same key, rea
 carry the recorded hash, and verify under the audit key of its range. On `vault_transit` that key is
 inside Transit, so a writer with database rights and no Transit access cannot seal a new one. A row
 that fails any check counts as no attestation, and the start log and the posture say which check
-failed. A writer who deletes a later withdraw row, to replay an older attestation, breaks the
-audit chain. `messagefoundry audit-verify` and the start-up chain walk report that; this check does
-not.
+failed. The check recomputes the MAC under the Transit key version the audit row names, so
+rotating the key, which is what the operator attests to, keeps the attestation. The audit chain
+walk pins the version the same way, so a rotation does not read as a chain break either.
+
+**What this check does not catch: a replay after a deleted withdraw row.** A writer can delete the
+withdraw row and re-insert the old attestation row. This check does not see that. If other audit
+rows follow the deleted one, the chain breaks, and `messagefoundry audit-verify` reports it. So does
+the start-up walk, when `[integrity].audit_verify_on_start` is on. If the withdraw row was the
+newest row, the rest of the chain still verifies. Only an external anchor taken after the withdraw
+catches that cut: `audit-verify --expected-anchor`, or `[integrity].audit_anchor_file`, which the
+engine reads only when `audit_verify_on_start` is on.
 
 **What it does not do.** The engine still counts nothing on this path, so passing 2^32 on one key
 version would still be silent. The record says that someone named took responsibility for the

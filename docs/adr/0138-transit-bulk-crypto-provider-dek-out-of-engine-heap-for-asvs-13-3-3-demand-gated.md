@@ -226,9 +226,14 @@ checks that audit row: it exists, it is the newest attest or withdraw row, it na
 reason, actor and time, it carries the recorded hash, and its MAC verifies under the audit key of
 its own range. It reuses the chain's row MAC and constant-time compare and walks no chain, so it
 costs one MAC per read. A row that fails counts as no attestation. Without this, anyone with DML on
-the store could insert a row the gate would trust, with no audit trace. Deleting a later withdraw
-row to replay an older attestation breaks the chain instead, which `audit-verify` and the start-up
-walk report.
+the store could insert a row the gate would trust, with no audit trace. The MAC is recomputed
+under the Transit key version the audit row names, so rotating the key keeps the attestation, as
+ruling 3 says. The store builds the withdraw audit row itself, as it does the attest row.
+
+**What the binding does not catch.** Deleting a later withdraw row and re-inserting the old row
+passes this check. If rows follow the deleted one, the chain breaks and `audit-verify` reports it,
+as does the start-up walk when `[integrity].audit_verify_on_start` is on. If the withdraw row was
+the newest row, only an external anchor taken after it catches the cut.
 
 **The binding is to the key name only**, as ruling 3 says. A store pointed at another Vault, or
 another Transit mount, that holds a key with the same name keeps the attestation.
