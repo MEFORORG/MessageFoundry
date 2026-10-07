@@ -797,6 +797,8 @@ _CLI_OPENERS = {
     "_audit_verify.run",
     "_audit_anchor.run",
     "_backup.run",
+    # BACKLOG #2337: record or withdraw the vault_transit bound attestation, with its audit row
+    "_store_transit_bound.run",
 }
 _CLI_DEFAULT = {"_rotate_key.run"}
 

@@ -196,6 +196,7 @@ from messagefoundry.store.store import (
     _qmark_cutoff_case,
     _session_cap_groups,
     _session_live_params,
+    _transit_attestation_row,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -220,6 +221,7 @@ from messagefoundry.store.store import (
     totp_enable_term,
     verify_audit_rows,
 )
+from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
 
 log = logging.getLogger(__name__)
@@ -1860,6 +1862,15 @@ _SCHEMA: list[str] = [
         id INT NOT NULL PRIMARY KEY CHECK (id = 1),
         salt VARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
         created_at FLOAT NOT NULL)""",
+    # The vault_transit AES-GCM bound attestation (BACKLOG #2337) -- see the SQLite `_SCHEMA`. One row
+    # at most, written only by `store attest-transit-bound` with its audit row in the same
+    # transaction. BIN2 on key_name, because Transit key names compare case-sensitively, byte for
+    # byte; actor matches audit_log.actor's width. Non-secret.
+    """IF OBJECT_ID('transit_bound_attestation','U') IS NULL CREATE TABLE transit_bound_attestation (
+        id INT NOT NULL PRIMARY KEY CHECK (id = 1),
+        key_name NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        reason NVARCHAR(1000) NOT NULL, actor NVARCHAR(256) NOT NULL,
+        attested_at FLOAT NOT NULL)""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
     # for the in-flight-only rationale. One of the two backends a real sharded deployment runs
     # (`require_unified_store` makes a server DB mandatory past one shard). No PHI (an account id and
@@ -10928,6 +10939,84 @@ class SqlServerStore:
         if row is None:  # the MERGE above ran, so only a concurrent delete reaches here
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
+
+    # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
+
+    async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
+        """See the SQLite twin."""
+        row = await self._fetchone(
+            "SELECT key_name, reason, actor, attested_at FROM transit_bound_attestation WHERE id = 1"
+        )
+        return None if row is None else _transit_attestation_row(row)
+
+    async def record_transit_bound_attestation(
+        self, *, key_name: str, reason: str, audit: AuditAppend, now: float | None = None
+    ) -> TransitBoundAttestation:
+        """See the SQLite twin. The MERGE and the audit row share one transaction, under the same
+        lock order as ``record_audit``: the in-process gate, then the connection. This leg is
+        CI-only."""
+        now = time.time() if now is None else now
+        recorded = TransitBoundAttestation(
+            key_name=key_name, reason=reason, actor=audit.actor or "", attested_at=now
+        )
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(
+                            "MERGE transit_bound_attestation WITH (HOLDLOCK) AS t"
+                            " USING (SELECT 1 AS id, ? AS key_name, ? AS reason, ? AS actor,"
+                            " ? AS attested_at) AS s ON t.id = s.id"
+                            " WHEN MATCHED THEN UPDATE SET key_name = s.key_name,"
+                            " reason = s.reason, actor = s.actor, attested_at = s.attested_at"
+                            " WHEN NOT MATCHED THEN INSERT (id, key_name, reason, actor,"
+                            " attested_at) VALUES (s.id, s.key_name, s.reason, s.actor,"
+                            " s.attested_at);",
+                            (key_name, reason, recorded.actor, now),
+                        )
+                        appended = await self._append_audits(cur, (audit,), now=now)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits((audit,), appended, ts=now)
+        return recorded
+
+    async def withdraw_transit_bound_attestation(
+        self, *, audit: OperatorAudit[TransitBoundAttestation], now: float | None = None
+    ) -> TransitBoundAttestation | None:
+        """See the SQLite twin. ``DELETE ... OUTPUT`` reads and removes the row in one statement,
+        and the audit row commits in the same transaction. This leg is CI-only."""
+        now = time.time() if now is None else now
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(
+                            "DELETE FROM transit_bound_attestation OUTPUT deleted.key_name,"
+                            " deleted.reason, deleted.actor, deleted.attested_at WHERE id = 1"
+                        )
+                        rows = await cur.fetchall()  # drain, so the next execute is clean
+                        if not rows:
+                            await conn.rollback()
+                            return None
+                        key_name, reason, actor, attested_at = rows[0]
+                        withdrawn = TransitBoundAttestation(
+                            key_name=str(key_name),
+                            reason=str(reason),
+                            actor=str(actor),
+                            attested_at=float(attested_at),
+                        )
+                        audits = operator_audits(audit, withdrawn)
+                        appended = await self._append_audits(cur, audits, now=now)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits(audits, appended, ts=now)
+        return withdrawn
 
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a

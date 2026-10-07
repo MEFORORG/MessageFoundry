@@ -142,6 +142,7 @@ from messagefoundry.store.sealed_cache import (
     new_state_cache,
     sealed_reference_set,
 )
+from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.store.typed_fields import encode_typed_fields
 
 log = logging.getLogger(__name__)
@@ -4118,6 +4119,16 @@ row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock
 not read chain state."""
 
 
+def _transit_attestation_row(row: Any) -> TransitBoundAttestation:
+    """A ``transit_bound_attestation`` row as the dataclass, on any backend's row mapping."""
+    return TransitBoundAttestation(
+        key_name=str(row["key_name"]),
+        reason=str(row["reason"]),
+        actor=str(row["actor"]),
+        attested_at=float(row["attested_at"]),
+    )
+
+
 def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
     """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624)."""
     if audit is None:
@@ -4845,6 +4856,19 @@ CREATE TABLE IF NOT EXISTS store_salt (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     salt        TEXT NOT NULL,
     created_at  REAL NOT NULL
+);
+
+-- The vault_transit AES-GCM bound attestation (BACKLOG #2337, owner rulings 2026-10-07). One row at
+-- most: the Transit data-key NAME an operator attested, their reason, who (a `cli:<osuser>` actor) and
+-- when. Only `messagefoundry store attest-transit-bound` writes it, and its audit row commits in the
+-- same transaction; `store withdraw-transit-bound` deletes it the same way. `serve` on vault_transit
+-- refuses under enforce unless it names the configured key. Non-secret.
+CREATE TABLE IF NOT EXISTS transit_bound_attestation (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    key_name    TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    attested_at REAL NOT NULL
 );
 
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per uploader holding
@@ -11501,6 +11525,63 @@ class MessageStore:
         if row is None:  # the insert above ran under the writer lock, so this is unreachable
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
+
+    # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
+    # Non-secret. See messagefoundry.store.transit_attestation for the rulings it implements.
+
+    async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
+        """The recorded attestation, or ``None``."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT key_name, reason, actor, attested_at FROM transit_bound_attestation"
+                " WHERE id = 1"
+            )
+            row = await cur.fetchone()
+        return None if row is None else _transit_attestation_row(row)
+
+    async def record_transit_bound_attestation(
+        self, *, key_name: str, reason: str, audit: AuditAppend, now: float | None = None
+    ) -> TransitBoundAttestation:
+        """Replace the attestation with ``key_name`` and append ``audit``, in ONE transaction, so the
+        row never exists without the record of who wrote it (the #2624 pattern)."""
+        now = time.time() if now is None else now
+        recorded = TransitBoundAttestation(
+            key_name=key_name, reason=reason, actor=audit.actor or "", attested_at=now
+        )
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute(
+                "INSERT INTO transit_bound_attestation (id, key_name, reason, actor, attested_at)"
+                " VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET key_name=excluded.key_name,"
+                " reason=excluded.reason, actor=excluded.actor, attested_at=excluded.attested_at",
+                (key_name, reason, recorded.actor, now),
+            )
+            appended = await self._append_audits((audit,), now=now)
+            await self._commit()
+        tee_audits((audit,), appended, ts=now)
+        return recorded
+
+    async def withdraw_transit_bound_attestation(
+        self, *, audit: OperatorAudit[TransitBoundAttestation], now: float | None = None
+    ) -> TransitBoundAttestation | None:
+        """Delete the attestation and append the row ``audit`` builds from it, in ONE transaction.
+        ``None``, with nothing appended, when none was recorded."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "SELECT key_name, reason, actor, attested_at FROM transit_bound_attestation"
+                " WHERE id = 1"
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await self._commit()  # ends the empty transaction
+                return None
+            withdrawn = _transit_attestation_row(row)
+            await self._db.execute("DELETE FROM transit_bound_attestation WHERE id = 1")
+            audits = operator_audits(audit, withdrawn)
+            appended = await self._append_audits(audits, now=now)
+            await self._commit()
+        tee_audits(audits, appended, ts=now)
+        return withdrawn
 
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""

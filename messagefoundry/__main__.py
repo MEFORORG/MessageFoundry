@@ -1029,6 +1029,48 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     provision_schema.add_argument("--json", action="store_true", help="emit JSON")
 
+    # BACKLOG #2337 (owner rulings 2026-10-07): on vault_transit the engine counts no AES-GCM
+    # invocations, so serve needs a recorded, audited attestation naming the Transit data key. Only
+    # these two commands write it; there is no API endpoint and no permission for it.
+    attest_transit = store_sub.add_parser(
+        "attest-transit-bound",
+        help="record, with an audit row, that the vault_transit data key's rotation policy keeps "
+        "each key version under 2**32 encryptions. serve on vault_transit refuses to start under "
+        "[security].enforcement=enforce without it",
+        description="Record who attests, and when, that the Transit data key the store is "
+        "configured with (MEFOR_STORE_TRANSIT_KEY) is rotated before any one key version seals "
+        "2**32 values. The engine counts no AES-GCM invocations on vault_transit, so this record "
+        "stands in for the count. It binds to the key NAME: rotating versions inside that key "
+        "keeps it, and pointing the store at another key voids it. It replaces any earlier "
+        "attestation. The row and its audit row commit in one transaction, with the OS user as "
+        "the actor. serve reads it at its next start.",
+    )
+    attest_transit.add_argument(
+        "--reason",
+        required=True,
+        help="why the bound holds, for example the Transit key's rotation policy (recorded in the "
+        "store and in the audit row)",
+    )
+    withdraw_transit = store_sub.add_parser(
+        "withdraw-transit-bound",
+        help="remove the vault_transit bound attestation, with an audit row; serve then refuses "
+        "under [security].enforcement=enforce until it is recorded again",
+        description="Delete the recorded vault_transit AES-GCM bound attestation. The delete and "
+        "its audit row commit in one transaction, with the OS user as the actor. With nothing "
+        "recorded it changes nothing and writes no audit row.",
+    )
+    withdraw_transit.add_argument(
+        "--reason", default=None, help="why it is withdrawn (optional; recorded in the audit row)"
+    )
+    for transit_cmd in (attest_transit, withdraw_transit):
+        transit_cmd.add_argument(
+            "--service-config",
+            default=None,
+            help="service settings TOML (default: ./messagefoundry.toml if present)",
+        )
+        transit_cmd.add_argument("--db", default=None, help="store path (overrides [store].path)")
+        transit_cmd.add_argument("--json", action="store_true", help="emit JSON")
+
     # BACKLOG #305 part E2 (ASVS 13.2.2): the read-only per-hop privilege read-out. It probes the store
     # principal with the startup preflight's own probe, each Vault token with a self-lookup and a
     # capabilities read, and the AD bind account with Who am I and a read of its own groups; it
@@ -6063,8 +6105,171 @@ def _read_new_password(prompt: str) -> str:
 
 
 def _store(args: argparse.Namespace) -> int:
-    """`store` command group (BACKLOG #305) — only `provision-schema` today."""
-    return _store_provision_schema(args)
+    """`store` command group: `provision-schema` (BACKLOG #305), and the vault_transit bound
+    attestation's `attest-transit-bound` and `withdraw-transit-bound` (BACKLOG #2337)."""
+    if args.store_command == "provision-schema":
+        return _store_provision_schema(args)
+    return _store_transit_bound(args)
+
+
+def _store_transit_bound(args: argparse.Namespace) -> int:
+    """Record or withdraw the vault_transit AES-GCM bound attestation (BACKLOG #2337).
+
+    Owner rulings 2026-10-07: the engine records who attested and when, in an audited store row
+    that only this CLI writes, with the ``cli:<osuser>`` actor ``admin-unlock`` uses. The row binds
+    to the Transit data-key name, read from the opened store's live cipher rather than typed, so the
+    attestation names the key ``serve`` will check. Runs on ``admin-unlock``'s host gate.
+
+    Exit codes: 0 done (including a withdraw with nothing recorded); 1 refused (a blank reason, a
+    cipher that is not vault_transit, or a write the store refused, which then wrote nothing); 2
+    could not open the store."""
+    import datetime
+    import getpass
+
+    from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+        store_driver_errors,
+    )
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.store import AuditAppend
+    from messagefoundry.store.transit_attestation import (
+        TRANSIT_BOUND_ATTESTED_ACTION,
+        TRANSIT_BOUND_REASON_MAX,
+        TRANSIT_BOUND_WITHDRAWN_ACTION,
+        TransitBoundAttestation,
+        TransitBoundAttestationStore,
+    )
+
+    attesting = args.store_command == "attest-transit-bound"
+    reason = (args.reason or "").strip()
+    if attesting and not reason:
+        return _emit_error("--reason must not be blank", as_json=args.json)
+    if len(reason) > TRANSIT_BOUND_REASON_MAX:
+        return _emit_error(
+            f"--reason is longer than {TRANSIT_BOUND_REASON_MAX} characters", as_json=args.json
+        )
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
+    # Only a vault_transit store has a bound to attest. A withdraw runs on any cipher, so a store
+    # moved off vault_transit can still drop the row it left behind.
+    if attesting and settings.store.cipher_provider != "vault_transit":
+        return _emit_error(
+            f"[store].cipher_provider is {settings.store.cipher_provider!r}: the engine counts the "
+            "AES-GCM bound itself there, so there is nothing to attest. This command applies to "
+            "'vault_transit' only",
+            as_json=args.json,
+        )
+    actor = f"cli:{getpass.getuser()}"
+
+    def withdrawn_row(withdrawn: TransitBoundAttestation) -> AuditAppend:
+        detail: dict[str, object] = {
+            "key_name": withdrawn.key_name,
+            "attested_by": withdrawn.actor,
+            "attested_at": withdrawn.attested_at,
+        }
+        if reason:
+            detail["reason"] = reason
+        return AuditAppend(TRANSIT_BOUND_WITHDRAWN_ACTION, actor=actor, detail=json.dumps(detail))
+
+    async def run() -> tuple[str, TransitBoundAttestation | None, str]:
+        """``(outcome, the row recorded or withdrawn, the store path)``."""
+        store = await open_store(
+            settings.store,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
+        try:
+            if not isinstance(store, TransitBoundAttestationStore):
+                return ("unsupported", None, store.path)
+            _refuse_an_unauditable_write(store)
+            if not attesting:
+                withdrawn = await store.withdraw_transit_bound_attestation(audit=withdrawn_row)
+                return ("withdrawn" if withdrawn else "none", withdrawn, store.path)
+            key_name = store.cipher_info().transit_key_name
+            if key_name is None:  # cipher_provider said vault_transit; the open built another
+                return ("no-transit-key", None, store.path)
+            detail = json.dumps({"key_name": key_name, "reason": reason})
+            recorded = await store.record_transit_bound_attestation(
+                key_name=key_name,
+                reason=reason,
+                audit=AuditAppend(TRANSIT_BOUND_ATTESTED_ACTION, actor=actor, detail=detail),
+            )
+            return ("attested", recorded, store.path)
+        finally:
+            await store.close()
+
+    # A refused write raises one of these on every backend (BACKLOG #1983). The row and its audit
+    # row share one transaction, so a refusal leaves neither.
+    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
+    # A key that cannot be resolved at open, or a cipher refusal (Transit unreachable) at either end.
+    key_errors: tuple[type[Exception], ...] = (
+        *_key_unresolved(),
+        StoreKeylessError,
+        CipherError,
+    )
+    try:
+        outcome, row, path = run_guarded(run())
+    except (KeylessAuditChainRefused, StoreNotFoundError, _UnauditableWrite) as exc:
+        _emit_error(str(exc), as_json=args.json)
+        return 2
+    except key_errors as exc:
+        _emit_error(f"nothing was recorded: {exc}", as_json=args.json)
+        return 2
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    except store_errors as exc:
+        return _emit_error(
+            f"the store refused the write, so nothing was recorded ({exc}). If the engine is "
+            "running on a SQLite store, stop it and re-run",
+            as_json=args.json,
+        )
+    if outcome == "unsupported":
+        return _emit_error("this store backend cannot hold the attestation", as_json=args.json)
+    if outcome == "no-transit-key":
+        return _emit_error(
+            "the store opened without a Transit data key, so there is no key to attest",
+            as_json=args.json,
+        )
+    if args.json:
+        _print_json(
+            {
+                "ok": True,
+                "action": outcome,
+                "store": path,
+                "attestation": None
+                if row is None
+                else {
+                    "key_name": row.key_name,
+                    "reason": row.reason,
+                    "actor": row.actor,
+                    "attested_at": row.attested_at,
+                },
+            },
+            compact=True,
+        )
+        return 0
+    if row is None:
+        _safe_print(
+            f"OK: no vault_transit bound attestation is recorded in {path}; nothing changed"
+        )
+        return 0
+    when = datetime.datetime.fromtimestamp(row.attested_at, tz=datetime.UTC).isoformat()
+    if outcome == "attested":
+        _safe_print(
+            f"OK: recorded the AES-GCM bound attestation for Transit data key {row.key_name!r} "
+            f"as {row.actor} at {when} in {path}. serve reads it at its next start"
+        )
+    else:
+        _safe_print(
+            f"OK: withdrew the attestation for Transit data key {row.key_name!r} (recorded by "
+            f"{row.actor} at {when}) from {path}. Under [security].enforcement=enforce, serve now "
+            "refuses to start on vault_transit until one is recorded again"
+        )
+    return 0
 
 
 def _store_provision_schema(args: argparse.Namespace) -> int:

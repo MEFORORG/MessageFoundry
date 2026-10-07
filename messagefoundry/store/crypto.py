@@ -1380,6 +1380,9 @@ class CipherInfo:
 
     encrypts: bool
     active_key_id: str | None
+    # The Transit data-key NAME on a `vault_transit` store, else None (BACKLOG #2337). A name, not key
+    # material: the start gate and the posture compare it with the recorded attestation.
+    transit_key_name: str | None = None
 
 
 def cipher_info(cipher: Cipher) -> CipherInfo:
@@ -1389,4 +1392,8 @@ def cipher_info(cipher: Cipher) -> CipherInfo:
     # active_key_id is a property only on the real keyring cipher (AesGcmCipher); the identity cipher has
     # no key, so report None. getattr keeps this duck-typed against the Cipher protocol.
     active_key_id = getattr(cipher, "active_key_id", None) if cipher.encrypts else None
-    return CipherInfo(encrypts=cipher.encrypts, active_key_id=active_key_id)
+    return CipherInfo(
+        encrypts=cipher.encrypts,
+        active_key_id=active_key_id,
+        transit_key_name=getattr(cipher, "transit_key_name", None),
+    )

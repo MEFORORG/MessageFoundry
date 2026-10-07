@@ -192,6 +192,7 @@ from messagefoundry.api.models import (
     StatsResponse,
     StorePrivilegeView,
     SystemStatus,
+    TransitBoundAttestationView,
     UpdateInfo,
     UploadDeleteResult,
     UploadedFileInfo,
@@ -403,6 +404,10 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import AuditAppend, OperatorAudit, ReingressOutcome, ResendOutcome
+from messagefoundry.store.transit_attestation import (
+    TransitBoundAttestationStore,
+    transit_bound_gap,
+)
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -2947,6 +2952,29 @@ def create_app(
         )
         return AiChatResponse(reply=reply, model=ai.model, data_scope=enforced_scope)
 
+    async def _transit_bound_view(
+        store: object, key_name: str | None
+    ) -> TransitBoundAttestationView | None:
+        """The vault_transit bound attestation as the start gate reads it (BACKLOG #2337). ``None``
+        off vault_transit. A store without the slice reads as unattested, as the gate reads it."""
+        if key_name is None:
+            return None
+        recorded = (
+            await store.get_transit_bound_attestation()
+            if isinstance(store, TransitBoundAttestationStore)
+            else None
+        )
+        if recorded is None:
+            return TransitBoundAttestationView(key_name=key_name, attested=False)
+        return TransitBoundAttestationView(
+            key_name=key_name,
+            attested=transit_bound_gap(key_name, recorded) is None,
+            attested_key_name=recorded.key_name,
+            attested_by=recorded.actor,
+            attested_at=recorded.attested_at,
+            reason=recorded.reason,
+        )
+
     @app.get("/security/posture", response_model=SecurityPosture)
     async def security_posture(
         request: Request,
@@ -3121,6 +3149,9 @@ def create_app(
             client_denied_last=getattr(request.app.state, "client_denied_last", None),
             client_address_monoculture=bool(
                 getattr(request.app.state, "client_address_monoculture", False)
+            ),
+            transit_bound_attestation=await _transit_bound_view(
+                engine.store, info.transit_key_name
             ),
         )
 

@@ -113,6 +113,12 @@ class TransitCipher(_UnmarkedPolicy):
         # on any key type) so the chain is keyed-in-Transit by default; a dedicated key domain-separates.
         self._audit_key = audit_key or key_name
 
+    @property
+    def transit_key_name(self) -> str:
+        """The Transit data key's NAME, never key material. ``serve`` checks that a recorded
+        attestation names it (BACKLOG #2337), because the engine counts no AES-GCM invocations here."""
+        return self._key
+
     def _associated_data(self, aad: bytes | None) -> str | None:
         # Transit's associated_data is base64; None → omit it (symmetric with a None-aad encrypt).
         return base64.b64encode(aad).decode("ascii") if aad is not None else None

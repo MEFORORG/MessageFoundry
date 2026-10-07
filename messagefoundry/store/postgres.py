@@ -208,6 +208,7 @@ from messagefoundry.store.store import (
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     _session_cap_groups,
+    _transit_attestation_row,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -232,6 +233,7 @@ from messagefoundry.store.store import (
     totp_enable_term,
     verify_audit_rows,
 )
+from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
 
 log = logging.getLogger(__name__)
@@ -639,6 +641,16 @@ _SCHEMA: list[str] = [
         id          INTEGER PRIMARY KEY CHECK (id = 1),
         salt        TEXT NOT NULL,
         created_at  DOUBLE PRECISION NOT NULL
+    )""",
+    # The vault_transit AES-GCM bound attestation (BACKLOG #2337) -- see the SQLite `_SCHEMA`. One row
+    # at most, written only by `store attest-transit-bound` with its audit row in the same
+    # transaction. Non-secret.
+    """CREATE TABLE IF NOT EXISTS transit_bound_attestation (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        key_name    TEXT NOT NULL,
+        reason      TEXT NOT NULL,
+        actor       TEXT NOT NULL,
+        attested_at DOUBLE PRECISION NOT NULL
     )""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
     # for the in-flight-only rationale. This is the backend a real sharded deployment runs:
@@ -7454,6 +7466,58 @@ class PostgresStore:
         if row is None:  # the insert above ran, so only a concurrent delete reaches here
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
+
+    # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
+
+    async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
+        """See the SQLite twin."""
+        row = await self._fetchone(
+            "SELECT key_name, reason, actor, attested_at FROM transit_bound_attestation WHERE id = 1"
+        )
+        return None if row is None else _transit_attestation_row(row)
+
+    async def record_transit_bound_attestation(
+        self, *, key_name: str, reason: str, audit: AuditAppend, now: float | None = None
+    ) -> TransitBoundAttestation:
+        """See the SQLite twin. The upsert and the audit row share one transaction."""
+        now = time.time() if now is None else now
+        recorded = TransitBoundAttestation(
+            key_name=key_name, reason=reason, actor=audit.actor or "", attested_at=now
+        )
+        # `record=False` as `create_user` passes: a CLI write is not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.execute(
+                "INSERT INTO transit_bound_attestation (id, key_name, reason, actor, attested_at)"
+                " VALUES (1, $1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET"
+                " key_name = EXCLUDED.key_name, reason = EXCLUDED.reason,"
+                " actor = EXCLUDED.actor, attested_at = EXCLUDED.attested_at",
+                key_name,
+                reason,
+                recorded.actor,
+                now,
+            )
+            appended = await self._append_audits(conn, (audit,), now=now)
+        tee_audits((audit,), appended, ts=now)
+        return recorded
+
+    async def withdraw_transit_bound_attestation(
+        self, *, audit: OperatorAudit[TransitBoundAttestation], now: float | None = None
+    ) -> TransitBoundAttestation | None:
+        """See the SQLite twin. ``DELETE ... RETURNING`` reads and removes the row in one statement,
+        and the audit row commits in the same transaction."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "DELETE FROM transit_bound_attestation WHERE id = 1"
+                " RETURNING key_name, reason, actor, attested_at"
+            )
+            if row is None:
+                return None
+            withdrawn = _transit_attestation_row(row)
+            audits = operator_audits(audit, withdrawn)
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
+        return withdrawn
 
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a

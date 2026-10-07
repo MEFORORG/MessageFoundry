@@ -5706,3 +5706,11 @@ async def test_backlog_2097_nocount_persistence_probe() -> None:
     assert spid == spid_p == spid_c, "the arms read different sessions, so they compare nothing"
     assert plain == 512, "the positive control did not see NOCOUNT: the instrument is dead"
     assert restored == 0
+
+
+async def test_transit_bound_attestation_roundtrip_ss(store) -> None:
+    """BACKLOG #2337: record, replace and withdraw the vault_transit bound attestation, each with its
+    audit row in the same transaction."""
+    from tests.test_transit_bound_attestation_server_backends import attestation_roundtrip
+
+    await attestation_roundtrip(store)

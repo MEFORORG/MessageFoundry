@@ -5340,3 +5340,11 @@ async def test_list_audit_exclusion_runs_in_sql_before_limit_pg(store) -> None:
     assert await store.count_audit(actor=who, exclude=ex, limit=10) == 3
     assert await store.count_audit(actor=who, exclude=ex, limit=2) == 2
     assert await store.count_audit(actor=who, exclude=ex, limit=10, before_id=ids[0]) == 2
+
+
+async def test_transit_bound_attestation_roundtrip_pg(store) -> None:
+    """BACKLOG #2337: record, replace and withdraw the vault_transit bound attestation, each with its
+    audit row in the same transaction."""
+    from tests.test_transit_bound_attestation_server_backends import attestation_roundtrip
+
+    await attestation_roundtrip(store)
