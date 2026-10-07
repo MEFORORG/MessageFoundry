@@ -1345,15 +1345,17 @@ class EngineClient:
         connection: str | None = None,
         kind: str | None = None,
         limit: int = 200,
+        offset: int = 0,
         reveal: int | None = None,
     ) -> list[ConnectionEventInfo]:
         """The Corepoint-style connection/transport event log (#46), newest first. It needs only
         ``monitoring:read``, but it is not PHI-free: ``reason`` is scrubbed free text that
         ``docs/PHI.md`` section 2 gives a protection level. So ``reason`` is null without
         ``messages:view_summary`` and a fixed mask with it, and ``reveal`` names ONE event whose
-        reason comes back whole, an audited PHI read (BACKLOG #2443)."""
+        reason comes back whole, an audited PHI read (BACKLOG #2443). ``offset`` pages it; the
+        route states the total in its ``X-Total-Count`` header (BACKLOG #2438)."""
         response = self._get(
-            "/events", connection=connection, kind=kind, limit=limit, reveal=reveal
+            "/events", connection=connection, kind=kind, limit=limit, offset=offset, reveal=reveal
         )
         return [ConnectionEventInfo.model_validate(e) for e in response.json()]
 
@@ -1815,8 +1817,9 @@ class EngineClient:
     def delete_user(self, user_id: str) -> None:
         self._request("DELETE", f"/users/{_seg(user_id)}")
 
-    def audit(self, *, limit: int = 100) -> AuditList:
-        return _decode(self._get("/audit", limit=limit), AuditList)
+    def audit(self, *, limit: int = 100, offset: int = 0) -> AuditList:
+        """One page of the audit trail; ``total`` on the result places it (BACKLOG #2438)."""
+        return _decode(self._get("/audit", limit=limit, offset=offset), AuditList)
 
     def ad_group_map(self) -> AdGroupMap:
         return _decode(self._get("/ad-group-map"), AdGroupMap)

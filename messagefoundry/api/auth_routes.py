@@ -17,7 +17,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
@@ -845,14 +845,21 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
         limit: int = Query(100, ge=1, le=1000),
+        # Annotated, not ``= Query(0)``: the web console calls this handler in-process, and a call
+        # that leaves it out must get the int, never a Query sentinel bound into the SQL.
+        offset: Annotated[int, Query(ge=0)] = 0,
     ) -> SecurityEventsList:
         """The caller's own security-event history (WP-L3-05, ASVS 6.3.5/6.3.7): the audited ``auth.*``
         actions on their account (sign-ins, lockouts, password changes), most-recent-first; which
         events that includes is stated once, in ``auth/notifications.py``. The out-of-band email push
         complements this for events the user should learn of without logging in (and for
-        admin-initiated changes, whose audit actor is the admin)."""
-        rows = await service.security_events_for(identity.username, limit=limit)
-        return SecurityEventsList(events=[SecurityEventInfo(**r) for r in rows])
+        admin-initiated changes, whose audit actor is the admin). ``offset`` and ``total`` page it
+        (BACKLOG #2438)."""
+        rows = await service.security_events_for(identity.username, limit=limit, offset=offset)
+        total = await service.count_security_events_for(identity.username)
+        return SecurityEventsList(
+            events=[SecurityEventInfo(**r) for r in rows], total=total, limit=limit, offset=offset
+        )
 
     @app.delete("/me/sessions/{session_id}", response_model=SimpleMessage)
     async def revoke_my_session(
@@ -1617,13 +1624,15 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         since: float | None = None,
         until: float | None = None,
         before_id: int | None = None,
+        offset: int = 0,
     ) -> Sequence[Any]:
         """THE ONE READ OF THE TRAIL FOR A CALLER. ``GET /audit``, the console's ``/ui/audit`` and
         ``GET /audit/export`` all come through here, so none of them can skip the owner-ruled lock-row
         exclusion of 2026-09-28 (BACKLOG #1131; :mod:`messagefoundry.auth.audit_visibility`). It is
         keyed on ``identity``, which is why this takes one: a caller without ``users:manage`` gets
-        the trail minus the lock rows, applied in SQL before ``limit`` so a page is never short.
-        ``before_id`` is the export's keyset cursor (vault BACKLOG #2776).
+        the trail minus the lock rows, applied in SQL before ``limit`` and ``offset`` so a page is
+        never short and no page skips or repeats a row. ``before_id`` is the export's keyset cursor
+        (vault BACKLOG #2776); ``offset`` is the numbered pager's (BACKLOG #2438).
 
         Every filter value is passed as a keyword to the store, which binds it as a SQL parameter
         across all three backends (BACKLOG #170) -- never string-interpolated into the query."""
@@ -1635,13 +1644,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             until=until,
             exclude=audit_exclusion_for(identity),
             before_id=before_id,
+            offset=offset,
         )
 
     async def _count_audit(
         service: AuthService,
         identity: Identity,
         *,
-        limit: int,
+        limit: int | None,
         actor: str | None,
         action: str | None,
         since: float | None,
@@ -1650,7 +1660,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> int:
         """How many rows :func:`_read_audit` would return for the same caller and arguments, under
         the same lock-row exclusion (BACKLOG #1131), counted in SQL rather than read. The export
-        records it before it streams (vault BACKLOG #2776)."""
+        records it before it streams (vault BACKLOG #2776). ``limit=None`` is the uncapped total a
+        pager states (BACKLOG #2438)."""
         return await service.store.count_audit(
             limit=limit,
             actor=actor,
@@ -1666,15 +1677,23 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity,
         *,
         limit: int = 100,
+        offset: int = 0,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
     ) -> AuditList:
-        # Plain-default core shared by the HTTP route below and the webconsole seam wrapper.
-        rows = await _read_audit(
-            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
-        )
+        # Plain-default core shared by the HTTP route below and the webconsole seam wrapper. The
+        # total is counted under the same exclusion as the page, so a reader without users:manage
+        # is told how many rows IT can page through, never how many the trail holds (BACKLOG #2438).
+        filters: dict[str, Any] = {
+            "actor": actor,
+            "action": action,
+            "since": since,
+            "until": until,
+        }
+        rows = await _read_audit(service, identity, limit=limit, offset=offset, **filters)
+        total = await _count_audit(service, identity, limit=None, before_id=None, **filters)
         return AuditList(
             entries=[
                 AuditEntry(
@@ -1686,7 +1705,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     detail=r["detail"],
                 )
                 for r in rows
-            ]
+            ],
+            total=total,
+            limit=limit,
+            offset=offset,
         )
 
     @app.get("/audit", response_model=AuditList)
@@ -1694,6 +1716,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require(Permission.AUDIT_READ)),
         limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
         actor: ActorFilter | None = Query(None),
         action: ActionFilter | None = Query(None),
         since: EpochSeconds | None = Query(
@@ -1704,23 +1727,28 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ),
     ) -> AuditList:
         return await _audit_list(
-            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
+            service,
+            identity,
+            limit=limit,
+            offset=offset,
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
         )
 
-    async def _audit_ui_list(*, service: AuthService, _: Identity, limit: int = 100) -> AuditList:
+    async def _audit_ui_list(
+        *, service: AuthService, _: Identity, limit: int = 100, offset: int = 0
+    ) -> AuditList:
         # The webconsole /ui/audit page invokes this seam callable DIRECTLY (not through FastAPI), so its
         # defaults MUST be plain values — a route Query(...) sentinel must never reach the store bind
-        # (BACKLOG #170 regression guard: 'type Query is not supported'). The UI shows the NEWEST
-        # `limit` rows and nothing older, which is not the full trail and must not be described as one
-        # (BACKLOG #1743): this wrapper takes no cursor, so there is no second page to reach and no
-        # total to compare against. The store's keyset cursor (list_audit's before_id) and its
-        # count_audit serve the export (vault BACKLOG #2776); no pager uses them. The filters are on GET
-        # /audit and the CSV is GET /audit/export, which is capped too (its own `limit`, no offset),
-        # so it does not hold the whole trail either. AUDIT_READ is
-        # enforced by the webconsole route's own require_ui dependency, so this wrapper carries no auth
-        # dependency of its own. The identity it is handed is the page's caller, and it decides which
-        # rows that caller may read (BACKLOG #1131).
-        return await _audit_list(service, _, limit=limit)
+        # (BACKLOG #170 regression guard: 'type Query is not supported'). It pages the trail newest
+        # first by ``offset`` and returns the total the page states (BACKLOG #2438). The filters are
+        # on GET /audit and the CSV is GET /audit/export. AUDIT_READ is enforced by the webconsole
+        # route's own require_ui dependency, so this wrapper carries no auth dependency of its own.
+        # The identity it is handed is the page's caller, and it decides which rows that caller may
+        # read (BACKLOG #1131).
+        return await _audit_list(service, _, limit=limit, offset=offset)
 
     @app.get("/audit/export")
     async def export_audit(

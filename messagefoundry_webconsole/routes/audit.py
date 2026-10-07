@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 from messagefoundry.api._ui_seam import UiDeps
@@ -17,17 +17,14 @@ from .._auth import (
 )
 from .._service import _service
 
-#: How many rows each page asks for. NEITHER PAGES: the store's ``list_audit`` and its
-#: security-event sibling take a limit and no offset, so this number IS the page and there is no
-#: second one to reach (BACKLOG #1743). Each is handed to its own page builder as well as to its own
-#: query, so the sentence the operator reads states the bound that actually ran.
+#: How many rows each page shows by default. Both pages are paged by ``offset`` against a total
+#: (BACKLOG #2438), so this is a page size and not a cap on what the operator can reach.
 #:
 #: TWO CONSTANTS, NOT ONE, though they hold the same number today: these are unrelated listings --
 #: the whole estate's audit trail, and one user's own account history -- and a single name would
-#: make raising the trail's window for an investigation silently raise every user's self-service
-#: page with it.
-_AUDIT_WINDOW = 200
-_SECURITY_EVENTS_WINDOW = 200
+#: make resizing one silently resize the other.
+_AUDIT_PAGE = 200
+_SECURITY_EVENTS_PAGE = 200
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -38,16 +35,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_audit(
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui(Permission.AUDIT_READ)),
+        limit: int = Query(_AUDIT_PAGE, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
     ) -> HTMLResponse:
-        data = await admin.list_audit(service=service, _=identity, limit=_AUDIT_WINDOW)
-        return HTMLResponse(pages.audit_log(data, limit=_AUDIT_WINDOW))
+        data = await admin.list_audit(service=service, _=identity, limit=limit, offset=offset)
+        return HTMLResponse(pages.audit_log(data))
 
     @app.get("/ui/security-events", response_class=HTMLResponse)
     async def ui_security_events(
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui()),
+        limit: int = Query(_SECURITY_EVENTS_PAGE, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
     ) -> HTMLResponse:
         data = await admin.my_security_events(
-            service=service, identity=identity, limit=_SECURITY_EVENTS_WINDOW
+            service=service, identity=identity, limit=limit, offset=offset
         )
-        return HTMLResponse(pages.security_events(data, limit=_SECURITY_EVENTS_WINDOW))
+        return HTMLResponse(pages.security_events(data))

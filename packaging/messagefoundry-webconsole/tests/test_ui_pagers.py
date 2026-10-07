@@ -313,78 +313,88 @@ async def test_the_dead_letter_pager_pages_and_carries_both_filters(engine: Engi
         assert "OB_OTHER" not in last.text, "the pager widened the query it was replaying"
 
 
-async def test_the_capped_pages_say_they_are_windows_rather_than_the_record(engine: Engine) -> None:
-    """BACKLOG #1743 item 3: neither capped page may read as the whole log.
+def _window(html: str, noun: str) -> tuple[int, int, int]:
+    """The pager's ``first-last of total`` line, read out of the page."""
+    found = re.search(rf"(\d+)-(\d+) of (\d+) {re.escape(noun)}", html)
+    assert found is not None, f"no window-of-total line for {noun}"
+    first, last, total = (int(g) for g in found.groups())
+    return first, last, total
 
-    Neither can page -- ``list_audit`` and the security-event listing take a limit and no offset,
-    and there is no count to put in a window-of-total line -- so the correction is the claim, not a
-    control: a reader who takes either page for the complete record reads an absence on screen as
-    an absence in the record. BOTH pages are asserted because they are disclosed by one helper,
-    and covering only the first would leave the second free to drift.
 
-    The bound itself is in the assertion: "capped at the newest N" is the sentence that separates a
-    log holding N entries from a log holding a hundred times N, and a bare count states neither.
+async def test_the_audit_and_security_event_pages_page_against_a_total(engine: Engine) -> None:
+    """BACKLOG #2438: both pages used to show only the newest window, with no way to an older row.
 
-    SEEDED PAST THE WINDOW. The cap sentence now shows only on a FULL window (residual (c)), and a
-    fresh engine holds a handful of sign-in rows, so an unseeded run would measure the short branch
-    and call it the capped one. The seed overruns the larger of the two route windows, read from
-    the route module so raising one window does not read as a regression here. The seeded actions
-    are ``auth.*`` rows by ``op``, which is the only shape the security-event page reads.
-    """
-    from messagefoundry_webconsole.routes.audit import _AUDIT_WINDOW, _SECURITY_EVENTS_WINDOW
-
+    Each now states which rows of how many it shows, and its Next link reaches the next page. The
+    total is read off the first page rather than assumed, because signing in writes rows of its
+    own; the seed only guarantees there are more rows than one small page holds."""
     service = await _service(engine)
-    for i in range(max(_AUDIT_WINDOW, _SECURITY_EVENTS_WINDOW) + 5):
+    for i in range(7):
         await service.store.record_audit("auth.test_seed", actor="op", detail=f'{{"n": {i}}}')
     async with _client(engine, service) as c:
         await _login(c)
-        for path, noun, window in (
-            ("/ui/audit", "entry(s)", _AUDIT_WINDOW),
-            ("/ui/security-events", "event(s)", _SECURITY_EVENTS_WINDOW),
-        ):
-            r = await c.get(path)
-            assert r.status_code == 200, r.text
-            assert "only the most recent" in r.text, path
-            assert f"{window} {noun} shown, capped at the newest {window}." in r.text, path
-
-
-async def test_a_short_listing_is_not_called_capped_and_the_export_is_not_the_record(
-    engine: Engine,
-) -> None:
-    """BACKLOG #1743 residual (c): the two claims the capped pages must not make.
-
-    A listing shorter than its window reached the end of what its query could read, so "capped at
-    the newest 200" there calls a complete listing partial. Both pages filter in SQL before the
-    limit (``_read_audit`` and ``security_events_for_user``), so a short page is never a trimmed
-    one. The unseeded engine is the arm: it holds a few sign-in rows, far under either window.
-    The header's "only the most recent" sentence must be absent for the same reason.
-
-    The audit page also used to call the export "the complete record". ``GET /audit/export`` has
-    its own ``limit`` and no offset, so it is newest-first and capped as well. The replacement is
-    pinned on the three facts an operator acts on: it is capped, the console session does not
-    reach it, and ``until`` is the parameter that moves it to older rows.
-    """
-    from messagefoundry_webconsole.routes.audit import _AUDIT_WINDOW, _SECURITY_EVENTS_WINDOW
-
-    service = await _service(engine)
-    async with _client(engine, service) as c:
-        await _login(c)
-        for path, noun, window in (
-            ("/ui/audit", "entry(s)", _AUDIT_WINDOW),
-            ("/ui/security-events", "event(s)", _SECURITY_EVENTS_WINDOW),
-        ):
-            r = await c.get(path)
-            assert r.status_code == 200, r.text
-            assert "capped at the newest" not in r.text, path
-            assert "only the most recent" not in r.text, path
-            note = re.search(rf"(\d+) {re.escape(noun)} shown\.", r.text)
-            assert note is not None, path
-            assert int(note.group(1)) < window, path
+        for path, noun in (("/ui/audit", "entry(s)"), ("/ui/security-events", "event(s)")):
+            first = await c.get(path, params={"limit": 3})
+            assert first.status_code == 200, first.text
+            start, end, total = _window(first.text, noun)
+            assert (start, end) == (1, 3) and total >= 7, path
+            assert ">Next<" in first.text and ">Previous<" not in first.text, path
+            href = _next_href(first.text)
+            assert href.startswith(f"{path}?"), path
+            assert _query(href) == {"limit": "3", "offset": "3"}, path
+            second = await c.get(href)
+            assert second.status_code == 200, second.text
+            assert _window(second.text, noun) == (4, 6, total), path
+            assert ">Previous<" in second.text, path
         audit = await c.get("/ui/audit")
-        assert "complete record" not in audit.text
-        assert "The audit export does not hold the whole trail either." in audit.text
         assert "not this console session" in audit.text
         assert "set its until parameter (epoch seconds) to an earlier time" in audit.text
+
+
+async def test_the_event_log_pager_and_its_reveals_carry_the_filters_and_position(
+    engine: Engine,
+) -> None:
+    """BACKLOG #2438: the event log pages, and its links keep both filters. Events the filter
+    excludes are seeded too, so a link that dropped a filter would surface them. A reveal link on
+    page two carries the position, or the reveal would re-read page one and miss its event."""
+    service = await _service(engine)
+
+    async def ev(connection: str, kind: str, now: float, reason: str | None = None) -> None:
+        await engine.store.record_connection_event(
+            connection=connection,
+            transport="mllp",
+            direction="inbound",
+            kind=kind,
+            peer_host=None,
+            reason=reason,
+            now=now,
+        )
+
+    for i in range(3):
+        await ev("IB_A", "closed", 100.0 + i, reason="eof")
+    await ev("IB_A", "established", 110.0)
+    await ev("IB_B", "closed", 120.0, reason="eof")
+
+    async with _client(engine, service) as c:
+        await _login(c)
+        first = await c.get(
+            "/ui/events", params={"connection": "IB_A", "kind": "closed", "limit": 2}
+        )
+        assert first.status_code == 200, first.text
+        assert "1-2 of 3 event(s)" in first.text
+        href = _next_href(first.text)
+        assert _query(href) == {"connection": "IB_A", "kind": "closed", "limit": "2", "offset": "2"}
+        last = await c.get(href)
+        assert last.status_code == 200, last.text
+        assert "3-3 of 3 event(s)" in last.text
+        assert "IB_B" not in last.text and "established" not in last.text.split("</select>")[1]
+        reveal = re.search(r'href="(/ui/events/\d+/reason\?[^"]*)"', last.text)
+        assert reveal is not None, "no reveal link on page two"
+        assert _query(reveal.group(1).replace("&amp;", "&")) == {
+            "connection": "IB_A",
+            "kind": "closed",
+            "limit": "2",
+            "offset": "2",
+        }
 
 
 @pytest.mark.parametrize(("shown", "capped"), [(0, False), (199, False), (200, True), (201, True)])

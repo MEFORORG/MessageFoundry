@@ -419,6 +419,18 @@ class ConnectionEventInfo(PhiGatedModel):
     reason: str | None = None
 
 
+class ConnectionEventList(BaseModel):
+    """One page of the event log and the total it sits in (BACKLOG #2438). ``total`` counts every
+    event under the same filters and channel scope, so ``offset`` and ``limit`` place this page.
+    The console's ``/ui/events`` page reads it; ``GET /events`` returns ``events`` as a bare list
+    and states ``total`` in a header."""
+
+    total: int
+    limit: int
+    offset: int
+    events: list[ConnectionEventInfo]
+
+
 class AlertInstanceInfo(PhiGatedModel):
     """One resolvable operator-alert instance (ADR 0044, #56): the alert type, connection label,
     severity, lifecycle status (open/acknowledged/resolved), the first/last-seen window + occurrence

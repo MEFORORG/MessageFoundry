@@ -300,12 +300,20 @@ from typing import Any
 #: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
 #: signatures changed.
 #:
+#: BACKLOG #2438: the audit, security-event and event-log pages page by ``offset`` against a
+#: total. ``AuditList`` and ``SecurityEventsList`` gained the required ``total``, ``limit`` and
+#: ``offset``; ``CoreHandlers`` gained the required ``connection_event_page``, which returns the new
+#: ``ConnectionEventList``; ``list_audit`` and ``my_security_events`` take the keyword ``offset``.
+#: ``list_connection_events`` is now an unpaged wrapper with the same parameters, so the
+#: connection detail page is unchanged. The digest moved because the DTO surface and
+#: ``CoreHandlers`` grew; a skewed pair fails the handshake.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1f0ffb907379e761"
+ENGINE_UI_SEAM: str = "bb7a98f205a24b50"
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +409,10 @@ class CoreHandlers:
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]
+    # The paged event log (BACKLOG #2438): one page and its total, as a ConnectionEventList, under
+    # GET /events' gates. ``list_connection_events`` above stays the unpaged bare-list read the
+    # connection detail page uses.
+    connection_event_page: Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)

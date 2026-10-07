@@ -2467,7 +2467,7 @@ def test_alerts_builder_escapes_hostile() -> None:
 
 
 def test_events_builder_escapes_hostile() -> None:
-    from messagefoundry.api.models import ConnectionEventInfo
+    from messagefoundry.api.models import ConnectionEventInfo, ConnectionEventList
     from messagefoundry_webconsole.pages import events
 
     rows = [
@@ -2482,7 +2482,7 @@ def test_events_builder_escapes_hostile() -> None:
             reason="<b>boom</b>",
         )
     ]
-    html = str(events(rows))
+    html = str(events(ConnectionEventList(total=1, limit=100, offset=0, events=rows)))
     assert "<b>boom</b>" not in html
     assert "&lt;b&gt;boom&lt;/b&gt;" in html
     assert "&lt;script&gt;" in html  # hostile peer_host escaped
@@ -7039,9 +7039,11 @@ async def test_replay_all_dead_letters_registered_and_gated(engine: Engine) -> N
 
 
 def test_events_filter_renders_kind_dropdown() -> None:
+    from messagefoundry.api.models import ConnectionEventList
     from messagefoundry_webconsole.pages import events
 
-    html = str(events([], connection="", kind="peer_reset"))
+    empty = ConnectionEventList(total=0, limit=100, offset=0, events=[])
+    html = str(events(empty, connection="", kind="peer_reset"))
     assert 'name="kind"' in html
     assert "All kinds" in html
     # Every canonical kind is an option, and the selected one is marked.

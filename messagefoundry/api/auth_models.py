@@ -476,7 +476,13 @@ class AuditEntry(BaseModel):
 
 
 class AuditList(BaseModel):
+    """One page of the audit trail (BACKLOG #2438). ``total`` counts every row the caller may read
+    under the same filters, so ``offset`` and ``limit`` place this page within it."""
+
     entries: list[AuditEntry]
+    total: int
+    limit: int
+    offset: int
 
 
 class SimpleMessage(BaseModel):
@@ -509,4 +515,10 @@ class SecurityEventInfo(BaseModel):
 
 
 class SecurityEventsList(BaseModel):
+    """One page of the caller's own security events (BACKLOG #2438), placed within ``total`` as
+    :class:`AuditList` places its page."""
+
     events: list[SecurityEventInfo]
+    total: int
+    limit: int
+    offset: int

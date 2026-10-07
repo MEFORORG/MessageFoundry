@@ -21,7 +21,7 @@ from messagefoundry.api.models import (
     AlertsConfig,
     ClusterNodeList,
     ClusterStatus,
-    ConnectionEventInfo,
+    ConnectionEventList,
     DrStatus,
     GraphResponse,
     IntegrityResult,
@@ -33,7 +33,7 @@ from messagefoundry.api.models import (
 )
 
 from .._html import Markup, el, page, register_nav, rows_table
-from ._common import _failed_inbound_reason, _reveal_cell, _window_note
+from ._common import _failed_inbound_reason, _pager, _reveal_cell, _window_note
 
 __all__ = [
     "alerts",
@@ -385,29 +385,38 @@ def _event_filter(connection: str, kind: str = "") -> Markup:
 
 
 def events(
-    rows: list[ConnectionEventInfo],
+    data: ConnectionEventList,
     *,
     connection: str = "",
     kind: str = "",
     error: str = "",
     revealed: int | None = None,
 ) -> Markup:
-    """The connection/transport event log (Corepoint-style, #46), newest first. The Reason column is
-    scrubbed free text that ``docs/PHI.md`` section 2 gives a protection level, so the page is not
-    PHI-free. It arrives masked, and ``revealed`` is the one event whose reason this request asked
-    for whole (BACKLOG #2443). Each other masked reason links to its own reveal, carrying the two
-    filters so the operator lands back on this list. The kind and the rest of each row stay visible
-    to every ``monitoring:read`` holder.
+    """The connection/transport event log (Corepoint-style, #46), newest first, paged by ``offset``
+    against ``data.total`` (BACKLOG #2438). The Reason column is scrubbed free text that
+    ``docs/PHI.md`` section 2 gives a protection level, so the page is not PHI-free. It arrives
+    masked, and ``revealed`` is the one event whose reason this request asked for whole (BACKLOG
+    #2443). Each other masked reason links to its own reveal, carrying the two filters and the page
+    position so the operator lands back on this page of this list. The kind and the rest of each row
+    stay visible to every ``monitoring:read`` holder.
 
     ``error`` renders a refusal banner above the table, the shape ``pages.messages`` uses: the filter
     form comes back carrying what the operator typed and the route answers 400 rather than querying
     under a filter the JSON twin would refuse (BACKLOG #1740). It also suppresses the "No events."
-    line, which would otherwise read as the result of a filter that was never applied.
+    line and the pager, which would otherwise read as the result of a filter that was never applied.
     """
     headers = ["When", "Connection", "Transport", "Dir", "Kind", "Peer", "Reason"]
+    rows = data.events
+    filters = {"connection": connection, "kind": kind}
     # The filters ride the reveal link as query values, never as path segments, so urlencode
-    # escapes them; a blank one is left off, as the filter form's own GET would send it.
-    back = urlencode({k: v for k, v in (("connection", connection), ("kind", kind)) if v})
+    # escapes them; a blank one is left off, as the filter form's own GET would send it. The page
+    # position rides it too, or a reveal from page two would re-read page one and miss its event.
+    back = urlencode(
+        {
+            **{k: v for k, v in filters.items() if v},
+            **({"limit": data.limit, "offset": data.offset} if data.offset else {}),
+        }
+    )
     suffix = f"?{back}" if back else ""
     body = [
         [
@@ -430,6 +439,15 @@ def events(
         else [
             el("p", "No events.", class_="muted") if not rows else Markup(""),
             rows_table(headers, body),
+            _pager(
+                path="/ui/events",
+                total=data.total,
+                limit=data.limit,
+                offset=data.offset,
+                shown=len(rows),
+                noun="event(s)",
+                filters=filters,
+            ),
         ]
     )
     return page(

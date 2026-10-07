@@ -10729,35 +10729,18 @@ class MessageStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
+        offset: int = 0,
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(
             1, min(limit, 1000)
         )  # server-side clamp (a flooded log can't drive an unbounded read)
-        where: list[str] = []
-        params: list[Any] = []
-        if connection is not None:
-            where.append("connection=?")
-            params.append(connection)
-        if kinds:
-            placeholders = ",".join("?" for _ in kinds)
-            where.append(f"kind IN ({placeholders})")
-            params.extend(kinds)
-        if since is not None:
-            where.append("ts>=?")
-            params.append(since)
-        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
-        # outbound row (which spans channels) — mirrors the connection_metadata/purge boundary that
-        # hides shared-outbound topology. None leaves the read unrestricted.
-        if allowed_channels is not None:
-            where.append("direction='inbound'")
-            _append_channel_scope(where, params, "connection", allowed_channels)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
-        params.append(limit)
+        clause, params = self._connection_event_where(connection, kinds, since, allowed_channels)
+        params += [limit, max(offset, 0)]
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
-                f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ?",
+                f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
                 params,
             )
             return [
@@ -10779,6 +10762,50 @@ class MessageStore:
                 )
                 for r in await cur.fetchall()
             ]
+
+    async def count_connection_events(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        allowed_channels: Sequence[str] | None,
+    ) -> int:
+        """The total :meth:`list_connection_events` pages through (BACKLOG #2438)."""
+        clause, params = self._connection_event_where(connection, kinds, since, allowed_channels)
+        async with self._read() as db:
+            cur = await db.execute(f"SELECT COUNT(*) FROM connection_event{clause}", params)
+            row = await cur.fetchone()
+        return int(row[0]) if row is not None else 0
+
+    @staticmethod
+    def _connection_event_where(
+        connection: str | None,
+        kinds: Sequence[str] | None,
+        since: float | None,
+        allowed_channels: Sequence[str] | None,
+    ) -> tuple[str, list[Any]]:
+        """The ``WHERE`` text and its bound values shared by :meth:`list_connection_events` and
+        :meth:`count_connection_events`, so a page and its total read the same set."""
+        where: list[str] = []
+        params: list[Any] = []
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            where.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        if since is not None:
+            where.append("ts>=?")
+            params.append(since)
+        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
+        # outbound row (which spans channels) — mirrors the connection_metadata/purge boundary that
+        # hides shared-outbound topology. None leaves the read unrestricted.
+        if allowed_channels is not None:
+            where.append("direction='inbound'")
+            _append_channel_scope(where, params, "connection", allowed_channels)
+        return (" WHERE " + " AND ".join(where)) if where else "", params
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
     # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
@@ -11255,10 +11282,12 @@ class MessageStore:
         until: float | None = None,
         exclude: AuditExclusion | None = None,
         before_id: int | None = None,
+        offset: int = 0,
     ) -> list[aiosqlite.Row]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
-        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
-        Every value is a bound parameter; see :meth:`_audit_where`."""
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776),
+        or past ``offset`` rows of the filtered set (BACKLOG #2438). Every value is a bound
+        parameter; see :meth:`_audit_where`."""
         where, params = self._audit_where(
             actor=actor,
             action=action,
@@ -11267,17 +11296,17 @@ class MessageStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
+        params += [limit, max(offset, 0)]
         async with self._read() as db:
             cur = await db.execute(
-                f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?", params
+                f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?", params
             )
             return list(await cur.fetchall())
 
     async def count_audit(
         self,
         *,
-        limit: int,
+        limit: int | None = None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
@@ -11295,12 +11324,13 @@ class MessageStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
+        if limit is None:
+            sql = f"SELECT COUNT(*) FROM audit_log{where}"
+        else:
+            sql = f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where} ORDER BY id DESC LIMIT ?)"
+            params.append(limit)
         async with self._read() as db:
-            cur = await db.execute(
-                f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where} ORDER BY id DESC LIMIT ?)",
-                params,
-            )
+            cur = await db.execute(sql, params)
             row = await cur.fetchone()
             return int(row[0]) if row is not None else 0
 
@@ -11332,18 +11362,29 @@ class MessageStore:
         return [dict(r) for r in rows]
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100
+        self, username: str, *, limit: int = 100, offset: int = 0
     ) -> list[aiosqlite.Row]:
         """A user's own security events (the audited ``auth.*`` actions), most-recent-first — the
         source for ``GET /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes (whose audit
-        ``actor`` is the admin) are delivered out-of-band by email, not shown in this self view."""
+        ``actor`` is the admin) are delivered out-of-band by email, not shown in this self view.
+        ``offset`` pages it (BACKLOG #2438)."""
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT ts, action, detail FROM audit_log "
-                "WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC LIMIT ?",
-                (username, limit),
+                "WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC LIMIT ? OFFSET ?",
+                (username, limit, max(offset, 0)),
             )
             return list(await cur.fetchall())
+
+    async def count_security_events_for_user(self, username: str) -> int:
+        """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE actor = ? AND action LIKE 'auth.%'",
+                (username,),
+            )
+            row = await cur.fetchone()
+        return int(row[0]) if row is not None else 0
 
     # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
 
