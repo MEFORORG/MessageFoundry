@@ -744,3 +744,19 @@ def test_a_route_registered_directly_and_through_an_include_reports_both_paths()
     app.include_router(sub, prefix="/inc")
     rows = _rows_by_key(app)
     assert ("GET", "/plain") in rows and ("GET", "/inc/plain") in rows, sorted(rows)
+
+
+def test_a_shared_route_object_still_fails_by_name_when_the_rebuilt_route_is_renamed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registered directly once, the shared object is served as it is once. Its include context
+    must still find the rebuilt copy, so a rename fails by name rather than reporting /plain twice."""
+    shared = Route("/plain", _plain)
+    sub = APIRouter()
+    sub.routes.append(shared)
+    app = FastAPI(openapi_url=None)
+    app.router.routes.append(shared)
+    app.include_router(sub, prefix="/inc")
+    _route_context_hiding(monkeypatch, "starlette_route")
+    with pytest.raises(route_gates.MissingFastAPISymbol, match="starlette_route"):
+        route_gates.route_rows(app)

@@ -14,7 +14,7 @@
 # a second time. `--resolution lowest-direct` takes the lowest release each DIRECT dependency allows
 # (the engine's own and its [dev] extra) and the newest of everything else.
 #
-# THREE DECLARED FLOORS DO NOT INSTALL ON PYTHON 3.14 TODAY. Measured 2026-10-06 with uv 0.11.25,
+# AT LEAST FOUR DECLARED FLOORS DO NOT INSTALL ON PYTHON 3.14 TODAY. Measured 2026-10-06 with uv 0.11.25,
 # `uv pip compile --resolution lowest-direct --python-version 3.14`, with and without
 # `--only-binary :all:`, and a real install of the result on Windows. The leg does not hide them.
 # The override file below raises the two that need it, and check_dependency_floors.py lists each
@@ -28,6 +28,10 @@
 #   - pyyaml>=6.0, in the [dev] extra and so not a runtime floor: the 6.0 sdist fails to build
 #     ("'build_ext' object has no attribute 'cython_sources'"). 6.0.3 is the lowest release uv finds
 #     a cp314 wheel for.
+#   - pytest-asyncio>=0.26, also [dev]: 0.26.0 requires pytest<9 and the [dev] floor is pytest>=9.0.3,
+#     so the resolver takes 1.3.0. No override is needed. Found by code review, not by this leg.
+# The floor check reads only runtime dependencies, so a [dev] floor that does not hold is not
+# reported by this leg. Those two were found by hand.
 # Raising those floors in pyproject.toml is a separate change. When one lands, drop its override and
 # its `--raised` entry here in the same pull request. A stale runtime entry reds this leg; the pyyaml
 # override does NOT, because the floor check reads only runtime dependencies, so drop it by hand.

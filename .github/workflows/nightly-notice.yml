@@ -254,8 +254,9 @@ jobs:
               ;;
             "dependency floors")
               DETAIL="Here that covers the weekly install at the lowest releases \`pyproject.toml\`
-          allows, and the route-walk and thread-pool guards run against them. Nothing here changed in
-          the repository if no pull request touched a dependency, so read the failing step first.
+          allows, and the route-walk and thread-pool guards run against them. The cause can be merged
+          code, because the pull-request leg is advisory and path-filtered, or an upstream release or
+          yank. Read the failing step first.
 
           - The install failed: a declared floor no longer installs on Python 3.14, for example a
             yanked release. Raise that floor in \`pyproject.toml\`.

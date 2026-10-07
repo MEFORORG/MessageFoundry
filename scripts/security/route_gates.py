@@ -68,6 +68,7 @@ import inspect
 import linecache
 import re
 import types
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -98,7 +99,8 @@ class MissingFastAPISymbol(RuntimeError):
 
     Not an ``ImportError``: it is raised mostly at walk time, and a caller that skips on a missing
     optional import must not read a renamed FastAPI internal as "not installed". The one read at
-    import time is re-raised as an ``ImportError`` below."""
+    import time is re-raised as an ``ImportError`` below, because the module cannot load there; a
+    caller that skips on ``ImportError`` skips every guard on such a release."""
 
 
 def fastapi_symbol(owner: object, name: str) -> Any:
@@ -508,7 +510,9 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
     gate comes from the route's own dependencies."""
     _refuse_low_priority_routes(owner)
     routes: Sequence[BaseRoute] = owner.routes
-    registered = {id(route) for route in routes}
+    # A count, not a set: a route object registered here AND through an include is served as it is
+    # only once, so its second context must still find the rebuilt copy or fail by name.
+    direct = Counter(id(route) for route in routes)
     for context in iter_route_contexts(routes):
         original: BaseRoute = context.original_route
         if isinstance(original, APIRoute):
@@ -520,7 +524,7 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
         # both ways still reports its prefixed path through the include.
         served = getattr(context, "starlette_route", None)
         if not isinstance(served, BaseRoute):
-            if id(original) not in registered:
+            if direct[id(original)] == 0:
                 # Reached through an include, so the copy must exist. FastAPI does not promise the
                 # field, and the unprefixed original is the wrong path to report.
                 served = fastapi_symbol(context, "starlette_route")
@@ -528,10 +532,11 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
                     f"FastAPI {fastapi.__version__} serves an included {type(original).__name__} "
                     f"with no rebuilt route ({served!r}), so the walk cannot read its path"
                 )
+            direct[id(original)] -= 1
             served = original
-        if isinstance(served, Mount):
-            # Refused here and not only when a walk descends, because a walk descends only into a
-            # mount with routes, and a mount holding nothing but a frontend group has none.
+        if isinstance(served, Mount) and not served.routes:
+            # A walk descends only into a mount with routes, which refuses there; a mount holding
+            # nothing but a frontend group has none, so it is refused here.
             _refuse_low_priority_routes(served)
         yield original, served
 

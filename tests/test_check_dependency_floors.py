@@ -32,6 +32,9 @@ def test_floors_are_read_from_the_lower_bound_and_skip_what_does_not_apply(tmp_p
             "compatible~=2.3",
             "pinned==1.4",
             "wildcard==1.4.*",
+            "excluded>=1.0,!=1.0",
+            "twice>=1.0",
+            "twice>=2.0; python_version >= '3.10'",
             "nofloor",
             "elsewhere>=1.0; sys_platform == 'never'",
         )
@@ -42,6 +45,8 @@ def test_floors_are_read_from_the_lower_bound_and_skip_what_does_not_apply(tmp_p
         "compatible": Version("2.3"),
         "pinned": Version("1.4"),
         "wildcard": None,
+        "excluded": None,
+        "twice": Version("2.0"),
         "nofloor": None,
     }
 
