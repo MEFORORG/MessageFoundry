@@ -41,8 +41,31 @@ verification, merged into R1 to R34) returned "rework before acceptance". The ow
 4. Developers keep the full IDE layout in the Theia build, with a Steps / Split / Code switch. They
    may also stay on VS Code and `ide/`.
 
-This ADR rewrites the drafts on those rulings. The specification carries the detail and a disposition
-for every review finding.
+Later on 2026-10-07 the owner ruled on four more points:
+
+5. **Typed-only mode.** `paste_block` and a one-line raw `test` stay available by default, as ADR 0076
+   section 5 and ADR 0106 license them. A flag on `lens rewrite` (working name `--typed-only`)
+   refuses both
+   with the generic `refused` code. The analyst build always sets it.
+6. **The repository check's reading.** A Steps-only change passes. Any other change passes only with
+   approval from a `code:edit` reviewer.
+7. **Analyst is a built-in role**: Steps editing, no `code:edit`.
+8. **Licence.** The Theia analyst editor extension and its desktop builds are AGPL-3.0-or-later,
+   the same as the repository.
+
+A Manager took three more decisions under the owner's delegation, the same day:
+
+- **Pre-commit hook.** The repository check also ships as an optional pre-commit hook running the
+  same classifier. It is a convenience, not a control: a local hook is bypassable. The CI check is
+  the control.
+- **Drag-a-field.** It is inside the BACKLOG #26 carve-out only as entry of a path parameter on a
+  step, producing the same typed `lens rewrite` edit as typing it. A drag that creates a
+  field-to-field mapping, or a step from a mapping gesture, stays declined.
+- **Source location.** The editor's source lives in this repository, beside `ide/`, so the lens row
+  contract and the editor version together (review R14).
+
+This ADR rewrites the drafts on those rulings and decisions. The specification carries the detail
+and a disposition for every review finding.
 
 ### What already exists
 
@@ -50,8 +73,9 @@ for every review finding.
   Every edit is a row-scoped splice computed by `lens rewrite`.
 - **`lens rewrite` does not yet limit an edit to typed rows.** The review probed it and found that
   `paste_block`, a raw `if` test and `{"expr": ...}` values all write arbitrary Python (finding R1).
-  The drafts' claim that a typed-row edit cannot inject Python is false today. A fix is being built
-  separately; this ADR does not claim it is done.
+  The drafts' claim that a typed-row edit cannot inject Python is false today. The answer is the R1
+  fix plus the typed-only mode of ruling 5, both being built separately on their own branch. Neither
+  has landed, and this ADR does not claim either is done.
 - **The roles half-exist.** `Role.CODING` holds `code:edit`, which no endpoint enforces. No permission
   describes the Steps level.
 - **Promote ships no files.** For a remote engine, the reload reads the engine's own `--config`
@@ -77,7 +101,8 @@ repository check.** Spec section 5 sets this out and says when a site should tur
 **Ship a Theia desktop app in two builds. The analyst build shows a native Steps extension and little
 else. The developer build is a full IDE with a Steps / Split / Code switch. The editor reads the
 user's engine permissions and offers only the editing they allow. A site may add a repository check
-that holds the Steps limit whatever tool made the change.**
+that holds the Steps limit whatever tool made the change, where the site's branch protection
+requires it.**
 
 - **D1 -- Purpose.** The analyst build exists to be simpler than VS Code for an analyst. Enforcement
   is described honestly in D5 and is not the reason to build it.
@@ -90,20 +115,27 @@ that holds the Steps limit whatever tool made the change.**
   therefore ports the Steps view to a native Theia extension. That port is the main cost of this
   decision (spec section 9). The developer build may run either.
 - **D4 -- New permission `code:steps`.** It is added to the permission catalog. `Coding` gains it.
-  `code:edit` means the Code level and implies the Steps level. An *Analyst* role is a custom role
-  under ADR 0045 until the owner decides otherwise. It is the only engine API change. The other engine
-  changes are the separately built R1 fix (D6) and the repository-check command (D7); spec section 11
-  lists them.
+  `code:edit` means the Code level and implies the Steps level. A new built-in *Analyst* role holds
+  `code:steps` and not `code:edit` (owner ruling 7). The permission and the role are the engine's
+  only API changes. The other engine changes are the separately built R1 fix and typed-only mode (D6)
+  and the repository-check command (D7); spec section 11 lists them.
 - **D5 -- The role check is the primary control, and it is a guardrail.** The editor signs in
   through the engine, finishes MFA and any required password change before it stores a token or reads
-  permissions, and on start-up proves a stored token on a route that is not MFA-exempt (review R2).
+  permissions, and on start-up proves a stored token on a route that is on neither the MFA nor the
+  must-change exempt
+  list (review R2).
   It re-reads them before each save rather than on a timer (review R3), and turns on only the editing
   they allow. It stops an analyst changing Python through the editor. It does not stop a
   change made with another tool. In the analyst build it also refuses a delete or move of a control
   block that holds a `code` row or an unrecognized test, which `ide/` allows today (Amendment G).
-- **D6 -- R1 is a precondition.** The analyst build does not ship until the lens refuses
-  `paste_block`, a raw control test and any `{expr}` value at the Steps level, with the four R1
-  payloads as refusal tests. The analyst build also offers none of those operations itself.
+- **D6 -- R1 is a precondition, answered by two changes landing separately.** The R1 fix makes a
+  structural insert refuse a value that is not inert; `set_params` already refuses a `dynamic`
+  value (ADR 0076 Amendment E, AC-M5). Typed-only mode
+  (ruling 5) refuses `paste_block` and a raw control `test`. It is off by default, so developers and
+  `ide/` keep both hatches. The analyst build, and the developer build for a user without
+  `code:edit`, pass it on every `lens rewrite` call and offer no way to turn it off. The analyst build
+  also offers none of those operations in its UI. It does not ship until both changes land with the
+  four R1 payloads as refusal tests. ADR 0076 Amendment G, G.6 and G.7, records the narrowing.
 - **D7 -- The repository check is optional, and the project ships it.** A CI step decides whether a
   change is Steps-only: only existing Router or Handler modules changed; no byte changed outside the
   def bodies, which `lens parse` does not partition; the ordered hand-written source in each body
@@ -112,7 +144,9 @@ that holds the Steps limit whatever tool made the change.**
   base or is fully literal, since the lens projects a computed `Send` argument or a dynamic route with
   no typed parameters. A Steps-only change passes. Any other change passes only
   with an approval from a review group whose members hold `code:edit`, behind the site's branch
-  protection. That reading of ruling 3 is this ADR's, not a ruling (spec FR-27a). The
+  protection (owner ruling 6). The same classifier also ships as an optional pre-commit hook. The hook
+  is a convenience and not a control, because a local hook is bypassable; the CI check is the
+  control (Manager decision). The
   config-repository template (ADR 0017) carries the step commented out. Spec section 5.4 says when to
   turn it on.
 - **D8 -- The analyst build drops three ADR 0076 guardrails, for that build only.** No *Reopen With:
@@ -123,6 +157,11 @@ that holds the Steps limit whatever tool made the change.**
   hot-exit keep working. There is no server-side broker in this phase.
 - **D10 -- Analyst Test never reveals PHI.** The analyst build runs Test against synthetic samples
   without `--show-phi` and shows results in place. It has no Test Bench (review R13).
+- **D11 -- The source lives beside `ide/`.** The editor's source is a tree in this repository next to
+  `ide/`, so the lens row contract and the editor version together (Manager decision; review R14).
+- **D12 -- Drag-a-field is path entry only.** A drag fills one path parameter on a step and produces
+  the same typed `lens rewrite` edit as typing it. A field-to-field mapping, or a step created from a
+  mapping gesture, stays declined under BACKLOG #26 (Manager decision; ADR 0076 Amendment G, G.3).
 
 **What this must not break:** the `.py` stays the only artifact and the only execution path, with no
 stored Steps model; routers and transforms stay pure; the web console stays the sole operator console
@@ -131,20 +170,22 @@ on); promote stays `POST /config/reload` with step-up and the site's dual contro
 
 ## Acceptance Criteria
 
-> Proposed tests. None exists yet. The editor's own tests get a path when its source location is
-> decided (the source-location item under To resolve), so those lines name the test and leave the
-> path open.
+> Proposed tests. None exists yet. The editor's source lives beside `ide/` (D11), and its test paths
+> are set when that tree is created, so those lines name the test and leave the path open.
 
-- **AC-1** -- THE SYSTEM SHALL expose `code:steps` in the permission catalog, grant it to `Coding`,
-  and allow it in a custom role.
+- **AC-1** -- THE SYSTEM SHALL expose `code:steps` in the permission catalog, grant it to `Coding`
+  and to a new built-in `Analyst` role that does not hold `code:edit`, and allow it in a custom role.
   -> `tests/test_custom_roles.py::test_code_steps_permission_catalog_and_roles`
 - **AC-2** -- WHEN the signed-in user holds `code:edit`, THE EDITOR SHALL offer the Code level; WHEN
   the user holds `code:steps` without `code:edit`, the Steps level; OTHERWISE a read-only Steps view.
   -> editor test *level selection* (path open)
-- **AC-3** -- IF a Steps-level edit is a `paste_block`, a raw control test, or carries an `{expr}`
-  value anywhere, THEN `lens rewrite` SHALL refuse it and write
-  nothing.
+- **AC-3** -- WHILE `lens rewrite` runs in typed-only mode, IF an edit is a `paste_block` or carries a
+  raw control test, THEN it SHALL refuse the edit with the generic `refused` code and write nothing;
+  and IF a structural insert carries a value that is not inert, in any mode, THEN it SHALL refuse it.
   -> the lens refusal tests the R1 fix adds (being built separately; path set when it lands)
+- **AC-3a** -- THE ANALYST BUILD, and the developer build for a user without `code:edit`, SHALL pass
+  typed-only mode on every `lens rewrite` call.
+  -> editor test *typed-only argv* (path open)
 - **AC-4** -- THE ANALYST BUILD SHALL offer no route that opens a `.py` file in a text editor, and
   WHEN a file fails `lens parse` it SHALL show a read-only notice instead.
   -> editor test *no text route* and spike S-2 (path open)
@@ -217,26 +258,22 @@ on); promote stays `POST /config/reload` with step-up and the site's dual contro
 ## Consequences
 
 **Positive** -- Analysts get an editor with one job. Nothing new runs on a server. Each token stays on
-its user's machine. The only engine API change is one permission. A site that needs a hard boundary
+its user's machine. The only engine API changes are one permission and one built-in role. A site
+that needs a hard boundary
 can turn one on without the hosted design.
 
 **Negative / risks** -- The Steps view must be ported to a native Theia extension and then kept in
 step with `ide/` (spec section 9). Without the repository check, the Steps limit holds only for
 analysts who use the editor as intended. The required-review half depends on a git-host group kept in
-step with engine roles by hand. Licensing between EPL-2.0 Theia and AGPL-3.0 MessageFoundry needs
-review. Until R1 is fixed, the analyst build cannot ship.
+step with engine roles by hand. Until the R1 fix and typed-only mode land, the analyst build cannot
+ship.
 
 **Out of scope** -- Listed once, in spec section 11.
 
 ## To resolve on acceptance
 
-- [ ] R1 fixed in `messagefoundry/lens.py`, with the four payloads as refusal tests (D6).
+- [ ] The R1 fix and typed-only mode land in `messagefoundry/lens.py`, with the four payloads as
+      refusal tests (D6).
 - [ ] Spikes S-1 to S-4 in the specification, section 13, all pass.
 - [ ] ADR 0076 Amendment G accepted by the owner.
-- [ ] Where the editor's source lives: a tree in this repository, or its own repository.
-- [ ] *Analyst* as a built-in role, or a custom-role recipe.
-- [ ] Licence for the native extension and the builds (owner legal review).
-- [ ] Owner confirms the repository check's reading of ruling 3 (spec FR-27a, question 7).
-- [ ] The start-up route for proving a stored token (spec question 6); an engine route if none fits.
-- [ ] Owner confirms that drag-a-field-onto-a-step is parameter entry inside the BACKLOG #26
-      carve-out (spec section 12, question 4).
+- [ ] The FR-2 start-up route, an implementation detail settled at build (spec section 12).

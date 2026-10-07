@@ -31,9 +31,9 @@ correct, and section 5 keeps it. But the reason to build this is the simpler int
 The `.py` file stays the only artifact and the only execution path (ADR 0076 section 2). The analyst
 layout is a view over that file. It is not a second authoring format.
 
-## 2. Owner rulings this spec is built on
+## 2. Rulings and decisions this spec is built on
 
-Given by the owner on 2026-10-07.
+Owner rulings, given on 2026-10-07.
 
 1. **Purpose.** Theia exists to give low-code analysts a simpler interface than VS Code.
    Enforcement is not the motivation.
@@ -45,6 +45,27 @@ Given by the owner on 2026-10-07.
    required review comes from a `code:edit` holder.
 4. **Developers keep the full IDE.** The Theia developer build has a Steps / Split / Code switch.
    Developers may also stay on VS Code and `ide/`.
+5. **Typed-only mode.** `paste_block` and a one-line raw `test` can still write code that runs, as
+   ADR 0076 section 5 and ADR 0106 license. A flag on `lens rewrite` (working name `--typed-only`)
+   refuses both
+   with the generic `refused` code. It is off by default, so developers and today's IDE keep both.
+   The analyst build always sets it.
+6. **The repository check's reading.** A Steps-only change passes. Any other change passes only with
+   approval from a `code:edit` reviewer (FR-27a).
+7. **Analyst is a built-in role**: Steps editing, no `code:edit` (section 4).
+8. **Licence.** The Theia analyst editor extension and its desktop builds are AGPL-3.0-or-later,
+   the same as the repository. (section 10)
+
+Manager decisions under the owner's delegation, 2026-10-07.
+
+- **Pre-commit hook.** The repository check also ships as an optional pre-commit hook running the
+  same classifier. It is a convenience, not a control: a local hook is bypassable. The CI check is
+  the control (FR-30a).
+- **Drag-a-field.** It is inside the BACKLOG #26 carve-out only as entry of a path parameter on a
+  step, producing the same typed `lens rewrite` edit as typing it. A drag that creates a
+  field-to-field mapping, or a step from a mapping gesture, stays declined (section 7.2, practice 5).
+- **Source location.** The editor's source lives in this repository, beside `ide/`, so the lens row
+  contract and the editor version together (review R14; section 9.3).
 
 ## 3. Terms
 
@@ -66,16 +87,16 @@ The engine stays the identity and role authority. The editor holds no user datab
 
 | Permission | Status today | Meaning under this spec |
 |---|---|---|
-| `code:steps` | **New** (the only engine API change in this phase; section 11 lists the others) | Edit typed rows through the Steps view. Grants the Steps level. |
+| `code:steps` | **New** (with the built-in *Analyst* role, the only engine API changes in this phase; section 11 lists the others) | Edit typed rows through the Steps view. Grants the Steps level. |
 | `code:edit` | Declared in `messagefoundry/auth/permissions.py`; no endpoint enforces it | Grants the Code level. Implies everything `code:steps` allows. |
 | `config:validate` | Declared; no endpoint enforces it (`docs/SECURITY.md`, permission table) | Shows Validate in the editor. The gate is advisory: the editor runs validate locally. |
 | `config:deploy` | Enforced on `POST /config/reload` | Promote. Unchanged. The analyst build offers no promote. |
 | `ai:assist` | Reported by `GET /ai/policy`; the IDE honours it | Unused in this phase. Both builds leave AI out. |
 
 - The built-in `Coding` role gains `code:steps` beside the `code:edit` it has.
-- An analyst gets the Steps level through a custom role (ADR 0045). An example *Analyst* role is
-  `monitoring:read` + `code:steps` + `config:validate`. Whether *Analyst* becomes a built-in role is
-  open question 1.
+- A new built-in *Analyst* role holds `code:steps` and does not hold `code:edit` (owner ruling 7).
+  Its other permissions are set at build; `monitoring:read` and `config:validate` are the likely
+  pair. A site can still build a narrower custom role under ADR 0045.
 - **Level selection.** `code:edit` gives the Code level. `code:steps` without `code:edit` gives the
   Steps level. Neither, or no sign-in, gives a read-only Steps view.
 
@@ -110,25 +131,35 @@ hosted read-only mount plus server-side broker, which the desktop phase does not
 | **Where it runs** | In the analyst's editor | In the config repository's CI and branch protection |
 | **Stops** | An analyst changing Python **through the editor**: by accident, by using an editor feature, or by an edit the lens would otherwise accept | A change that is not Steps-only (FR-27) reaching the protected branch without a `code:edit` holder's approval, **whatever tool made it** |
 | **Does not stop** | An analyst who edits the `.py` file with any other tool and commits it | A change a `code:edit` holder approves. A push straight to a branch that branch protection leaves open. A Steps-only change that is wrong but well-formed: that is the review's job |
-| **Depends on** | R1 fixed (section 5.3); the engine's permission catalog; the session being fully signed in (FR-2) | The site's git host enforcing branch protection and required review; a mapping from engine `code:edit` holders to a git-host reviewer group, kept by hand |
+| **Depends on** | The R1 fix and typed-only mode (section 5.3); the engine's permission catalog; the session being fully signed in (FR-2) | The site's git host enforcing branch protection and required review; a mapping from engine `code:edit` holders to a git-host reviewer group, kept by hand |
 | **Kind of control** | A guardrail for analysts who use the editor as intended | A boundary that holds against a deliberate or tool-assisted change |
 
 What already gates what **runs**, under both: a change reaches a running engine only when someone with
 `config:deploy` reloads it, under the existing step-up and the site's `[approvals]` dual control. That
 controls who deploys. It does not check whether a Steps-level author changed Python.
 
-### 5.3 R1 is a precondition, not a solved problem
+### 5.3 R1 is a precondition, answered by two changes that have not landed
 
 The review found that `lens rewrite` accepts edits that write arbitrary Python: `paste_block`, a raw
-`if` test, and `{"expr": ...}` values on an inserted row or a send row's `to` (review finding R1). A
-fix to `messagefoundry/lens.py` is being built separately. Until it lands, the role check would not
-hold even inside the editor, because a typed-row edit could carry code.
+`if` test, and `{"expr": ...}` values on an inserted row or a send row's `to` (review finding R1).
+Two changes to `messagefoundry/lens.py` answer it. Both are being built separately, on their own
+branch, and **neither has landed**:
 
-The analyst build must therefore not ship before:
+- **The R1 fix.** A structural insert refuses a value that is not inert, in every mode. `set_params`
+  already refuses a `dynamic` value (ADR 0076 Amendment E, AC-M5). (ADR 0076's Amendment E note,
+  E.11, still says structural inserts splice an
+  `{expr}` verbatim; Amendment G, G.7, records the change.)
+- **Typed-only mode** (owner ruling 5). Under a `lens rewrite` flag, working name `--typed-only`, a
+  `paste_block` edit and a raw control `test` are refused with the generic `refused` code. The flag
+  is off by default, so developers and the `ide/` extension keep both, as ADR 0076 section 5 and
+  ADR 0106 license them. Amendment G, G.6, records the narrowing.
 
-- the lens offers a Steps-level operation set that refuses `paste_block`, a raw test, and any `{expr}`
-  value (FR-9); and
-- the four R1 payloads are refusal tests in the engine suite (AC in the ADR).
+Until both land, the role check would not hold even inside the editor, because a typed-row edit could
+carry code. The analyst build must therefore not ship before:
+
+- both changes land, with the four R1 payloads as refusal tests in the engine suite (ADR AC-3); and
+- the analyst build passes typed-only mode on every `lens rewrite` call (FR-12a), and offers none of
+  the refused operations in its UI (FR-9).
 
 ### 5.4 When a site should turn on the repository check
 
@@ -161,7 +192,7 @@ Written in EARS form, like the ADR's acceptance criteria.
   and `_MUST_CHANGE_EXEMPT_PATHS`). So the editor stores a token only once FR-1 is complete. WHEN it
   starts with a stored token, it SHALL first call a route that is on neither exempt list and that
   every editor user may call; the route is chosen at build, and if none fits, the engine needs one
-  (open question 6). IF the session has proven only the password, THEN THE EDITOR SHALL treat the
+  (section 12, item 1). IF the session has proven only the password, THEN THE EDITOR SHALL treat the
   user as signed out.
 - **FR-3.** WHILE no session is signed in, THE EDITOR SHALL show the Steps view read-only.
 - **FR-4.** THE EDITOR SHALL re-read the user's permissions before each save and SHALL NOT poll them
@@ -201,6 +232,9 @@ Written in EARS form, like the ADR's acceptance criteria.
   `lens rewrite` call, and SHALL refuse with a visible message when the engine command rejects that
   version. It SHALL NOT silently retry at the default contract, because contract 1 does not project
   `@router` defs (review R14; `ide/src/cli.ts` retries today).
+- **FR-12a.** THE ANALYST BUILD, and the developer build for a user without `code:edit`, SHALL pass
+  typed-only mode on every `lens rewrite` call, and SHALL offer no way to turn it off (owner ruling 5;
+  ADR AC-3a).
 - **FR-13.** THE EDITOR SHALL run the `lens` command from the pinned `messagefoundry` install. `lens`
   is toolkit-tier by ADR 0201 but is still registered on the `messagefoundry` command
   (`messagefoundry/__main__.py`), not on `messagefoundry-toolkit` (review R26).
@@ -243,7 +277,8 @@ Written in EARS form, like the ADR's acceptance criteria.
   with the analyst build's limits, including no route to a text editor for `.py` (Amendment G,
   AC-G1, AC-G2 and AC-G5).
 - **FR-26.** For a `code:edit` holder, the developer build keeps every ADR 0076 guardrail,
-  including *Reopen With: Python* and the text-editor fallback. It provides the Python editor with an open language server, git, a
+  including *Reopen With: Python* and the text-editor fallback. It provides the Python editor with
+  an open language server, git, a
   terminal and the debugger. Pylance is licensed for Microsoft products only, so the choice is an open
   server such as basedpyright (spike S-1).
 
@@ -260,7 +295,8 @@ Written in EARS form, like the ADR's acceptance criteria.
      text, and the `test_src` of every control row the lens marks unrecognized (`lens.py` emits an
      unbounded `if` or `for` that way, not as a `code` row), compared by content and nesting, never by
      line number. A change from one recognized test to another passes: a recognized test stays inside
-     the bounded grammar of ADR 0076 section 4, so it carries no arbitrary code. Only the analyst build's
+     the bounded grammar of ADR 0076 section 4, so it carries no arbitrary code. Only the analyst
+     build's
      UI keeps tests read-only (FR-9). An insert above a `code` row therefore passes, and a moved,
      added, removed or edited `code` row fails.
   4. Every typed parameter that is new or changed between base and head is a literal or a template.
@@ -272,9 +308,9 @@ Written in EARS form, like the ADR's acceptance criteria.
      `_route_row` in `messagefoundry/lens.py`), so items 3 and 4 alone would miss it.
   The command's name and home are settled at build (ADR 0201 decides the tier).
 - **FR-27a.** Owner ruling 3 says the check *"fails if a `code` row changed"*. Read literally, it
-  would fail every developer change too. This spec reads it as: the check passes a Steps-only change,
-  and passes any other change only when a member of the `code:edit` reviewer group (FR-29) has
-  approved the head commit. The reading is the author's, not a ruling (open question 7).
+  would fail every developer change too. Owner ruling 6 settles the reading: the check passes a
+  Steps-only change, and passes any other change only when a member of the `code:edit` reviewer group
+  (FR-29) has approved the head commit.
 - **FR-28.** The check SHALL classify each of the four R1 payloads as not Steps-only, and SHALL pass an
   ordinary Steps edit, including an insert above a `code` row (spike S-4).
 - **FR-29.** THE PROJECT SHALL document the required-review half: branch protection on the default
@@ -282,6 +318,9 @@ Written in EARS form, like the ADR's acceptance criteria.
   The project cannot keep that group in step with engine roles; the site does it by hand.
 - **FR-30.** The config-repository template of ADR 0017 SHALL carry the check as a commented-out CI
   step, so turning it on is one edit.
+- **FR-30a.** THE PROJECT SHALL also ship the same classifier as an optional pre-commit hook. The hook
+  is a convenience that warns early. It is not a control: it runs on the author's machine, and a
+  local hook can be skipped. The CI check is the control (Manager decision).
 
 ### 6.8 AI
 
@@ -318,7 +357,7 @@ previews, Logic Apps, Blockly). Each row says whether this phase adopts it.
 | 2 | Code the visual editor cannot show becomes a locked block | MakeCode grey blocks, DTL code action, Mirth JavaScript steps | **Adopted as today:** a read-only `code` row. Today a code row cannot be moved, and this phase keeps that |
 | 3 | A comment above a step becomes its description | Power Query | **Not adopted.** ADR 0076 A.5 forbids attaching a comment to the following statement; that needs its own amendment and is gated on BACKLOG #1758 |
 | 4 | Show the sample message after the selected step | Power Query, n8n, DTL test tool | **Adopted** (FR-16) |
-| 5 | Drag a field from a message tree onto a step | Mirth | **Adopted as parameter entry only:** the drag fills a typed parameter, as the existing field picker does. It creates no mapping artifact and no canvas (Amendment G, G.3) |
+| 5 | Drag a field from a message tree onto a step | Mirth | **Adopted as path entry only** (Manager decision, section 2): the drag fills one path parameter on a step and produces the same typed `lens rewrite` edit as typing it. A field-to-field mapping, or a step created from a mapping gesture, stays declined (Amendment G, G.3) |
 | 6 | Show what a change does before it goes in | Power Query Online script-change review | **Adopted** (FR-20) |
 | 7 | Code and visual side by side, with linked selection | SwiftUI previews | **Adopted in the developer build** (FR-23) |
 | 8 | The visual view never quietly rewrites code it does not understand | Logic Apps and Power Query are known for this failure | **Already a rule:** ADR 0076 section 5's row-scoped splice and its byte-stability test |
@@ -378,6 +417,13 @@ cost of this design:
 - Sign-in moves from the extension's own flow to the editor's (FR-1, FR-6). Promote is not offered in
   the analyst build.
 - The chat participant is left out; it needs `vscode.chat` and `vscode.lm`.
+- Every `lens rewrite` call passes typed-only mode (FR-12a).
+
+### 9.3 Where the source lives
+
+The editor's source is a tree in this repository, beside `ide/` (Manager decision, section 2). The
+lens row contract and the editor then change in one pull request and version together, which is the
+cheapest answer to review R14. The shared view-model package of 9.1 sits beside both.
 
 ## 10. Non-functional requirements
 
@@ -391,10 +437,8 @@ cost of this design:
 - **Network.** The editor talks to the engine API over TLS with certificate verification, and to the
   site's git host. Nothing else.
 - **Accessibility.** Keyboard use and screen-reader labels on every analyst action (practice 9).
-- **Licensing.** Theia is `EPL-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0`; MessageFoundry is
-  AGPL-3.0 plus a commercial licence. The licence for the native extension and the builds needs the
-  owner's legal review (open question 4). Two facts for that review: `CLA.md` grants a relicensing
-  right, and `ide/` has no `LICENSE` file although its `package.json` says `SEE LICENSE IN LICENSE`.
+- **Licence.** The native extension and the desktop builds are AGPL-3.0-or-later, the same as the
+  repository (owner ruling 8).
 
 ## 11. Out of scope for this phase
 
@@ -405,24 +449,20 @@ cost of this design:
 - Promote from the analyst build.
 - AI in either build.
 - Theia Cloud.
-- Any engine change beyond three: the `code:steps` permission, the separately built R1 fix to
-  `messagefoundry/lens.py`, and the repository-check command (FR-27). A route for FR-2's start-up
-  probe would be a fourth, only if no existing route fits (open question 6).
+- Any engine change beyond these: the `code:steps` permission and the built-in *Analyst* role; the
+  separately built R1 fix and typed-only mode in `messagefoundry/lens.py`; and the repository-check
+  command and its pre-commit hook (FR-27, FR-30a). A route for FR-2's start-up probe would be one
+  more, only if no existing route fits (section 12, item 1).
 
-## 12. Open questions for the owner
+## 12. Open questions
 
-1. Should *Analyst* be a built-in role, or a documented custom-role recipe?
-2. Where does the editor's source live: a tree in this repository, or its own repository?
-3. Which licence do the native extension and the builds carry? Needs legal review.
-4. Is drag-a-field-onto-a-step (practice 5) inside the BACKLOG #26 carve-out? This spec reads it as
-   parameter entry, like the existing field picker, so inside. The reading is the author's, not a
-   ruling.
-5. Should the repository check also ship as a pre-commit hook for sites that want an earlier
-   warning? A hook runs on the analyst's machine, so it is advice, not a control.
-6. Which route does the editor call at start-up to prove a stored token is fully signed in (FR-2)?
-   If no existing route is both non-exempt and open to every editor user, the engine needs one.
-7. Does the repository check read ruling 3 as FR-27a does: pass a Steps-only change, and pass any
-   other change only with a `code:edit` reviewer's approval?
+1. **Implementation detail, settled at build.** Which route does the editor call at start-up to prove
+   a stored token is fully signed in (FR-2)? If no existing route is both non-exempt and open to every
+   editor user, the engine needs one.
+
+Section 2 records the questions already decided. Owner rulings 6, 7 and 8 settle the repository
+check's reading, the built-in *Analyst* role and the licence. Manager decisions settle the
+pre-commit hook, drag-a-field and the source location.
 
 ## 13. Spikes required before the ADR is accepted
 
@@ -443,7 +483,7 @@ means the finding applies only to a hosted design and is carried to the later AD
 
 | Finding | Severity | Disposition | Where |
 |---|---|---|---|
-| R1 | blocker | **Open, being fixed separately.** A precondition for the analyst build | Section 5.3, FR-9, ADR D6 and AC-3 |
+| R1 | blocker | **Answered by design, not landed.** The R1 fix plus typed-only mode (owner ruling 5), both being built separately. A precondition for the analyst build | Section 5.3, FR-9, FR-12a, ADR D6, AC-3 and AC-3a, Amendment G (G.6, G.7) |
 | R2 | major | Addressed | FR-1, FR-2, ADR AC-5 |
 | R3 | major | Addressed for desktop: no timer poll. Hosted ADR keeps the engine-change question | FR-4 |
 | R4 | major | Not applicable to desktop: no central token store; each token stays on its owner's machine. Hosted ADR | FR-6, section 11 |
@@ -452,11 +492,11 @@ means the finding applies only to a hosted design and is carried to the later AD
 | R7 | major | Not applicable to desktop: edits go through the document model, no broker. Hosted ADR | FR-11 |
 | R8 | major | Addressed by owner ruling 3: the repository check is an option, with guidance on when to turn it on | Section 5.4, ADR options |
 | R9 | major | Addressed: ADR 0076 Amendment G, with the BACKLOG #26 note and the corrected amendment citation | Amendment G, FR-7, FR-8 |
-| R10 | minor | Addressed: every engine change is listed (`code:steps`, the R1 fix, the check command, and a start-up route only if none fits); the reload-commit requirement is dropped | Section 11, ADR D4 |
+| R10 | minor | Addressed: every engine change is listed in section 11; the reload-commit requirement is dropped | Section 11, ADR D4 |
 | R11 | minor | Addressed: `config:validate` marked declared, not enforced | Section 4 |
 | R12 | minor | Partly applicable: dry-run runs config code on the analyst's machine, as it does in `ide/` today. On a desktop the user can run code anyway. Hosted ADR | Section 8 note |
 | R13 | minor | Addressed | FR-15, ADR AC-7 |
-| R14 | minor | Addressed | FR-12, ADR AC-6 |
+| R14 | minor | Addressed | FR-12, section 9.3, ADR AC-6 and D11 |
 | R15 | minor | Not applicable to desktop: no broker receives a client path. Hosted ADR | |
 | R16 | minor | Not applicable to desktop: one writer, the document model. Hosted ADR | |
 | R17 | minor | Not applicable to desktop: each editor signs in from its own address. Hosted ADR | |
@@ -478,13 +518,14 @@ means the finding applies only to a hosted design and is carried to the later AD
 | R33 | note | Addressed | Section 10, spike S-1 |
 | R34 | note | Not applicable: concerned the review's own inputs | |
 
-**Counts:** 22 addressed (R3 for the desktop only; R8 and R24 by owner ruling), 1 partly applicable
-(R12), 10 not applicable to the desktop phase, 1 open (R1). The hosted ADR inherits R3, R4, R5, R7,
+**Counts:** 22 addressed (R3 for the desktop only; R8 and R24 by owner ruling), 1 answered by design
+but not landed (R1), 1 partly applicable (R12), 10 not applicable to the desktop phase. The hosted
+ADR inherits R3, R4, R5, R7,
 R12, R15, R16, R17, R19 and R30.
 
 Three raw findings were refuted in verification and need no action: dual control on reload is
-conditional (the drafts said "unchanged", which is true); a licensing claim left to the owner's legal
-review (its two facts are recorded in section 10); and an operating-cost objection the drafts
+conditional (the drafts said "unchanged", which is true); a licensing claim, since settled by owner
+ruling 8; and an operating-cost objection the drafts
 already named.
 
 ## Appendix B: what changed from the 2026-10-02 drafts
@@ -496,6 +537,6 @@ already named.
 | Read-only mount plus server-side broker as the control | Role check in the editor (primary) plus an optional repository check, with section 5 saying what each does | Owner ruling 3; SDS-3.7 |
 | Hosted Code build with a shell | Developer build on the desktop, or VS Code and `ide/` | Owner ruling 4; review R24 |
 | Steps view as the `ide/` plugin or a native extension | Native extension in the analyst build | Review R6 |
-| Claimed a typed-row edit cannot inject Python | States R1 as an open precondition | Review R1 |
+| Claimed a typed-row edit cannot inject Python | States R1 as a precondition, answered by the R1 fix and typed-only mode, neither landed | Review R1; owner ruling 5 |
 | Cited ADR 0076 Amendments A to E | Amendments A, C, D, E and F apply; B was declined | Review R9 |
 | "Studio" working name | Dropped | The product is two builds of one editor; no name is needed yet |
