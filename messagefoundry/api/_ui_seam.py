@@ -305,7 +305,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1f0ffb907379e761"
+ENGINE_UI_SEAM: str = "5b9f1b110d9357fc"
 
 
 @dataclass(frozen=True, slots=True)

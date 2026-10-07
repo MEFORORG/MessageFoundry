@@ -146,6 +146,7 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    TRANSIT_ATTESTATION_COLUMNS,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -205,6 +206,7 @@ from messagefoundry.store.store import (
     check_password_generated,
     delivery_key,
     load_audit_chain,
+    load_transit_bound_attestation,
     lockout_arms,
     lockout_clear_set,
     lockout_escalates,
@@ -219,6 +221,7 @@ from messagefoundry.store.store import (
     should_record_event,
     tee_audits,
     totp_enable_term,
+    transit_attested_audit,
     verify_audit_rows,
 )
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
@@ -1865,12 +1868,14 @@ _SCHEMA: list[str] = [
     # The vault_transit AES-GCM bound attestation (BACKLOG #2337) -- see the SQLite `_SCHEMA`. One row
     # at most, written only by `store attest-transit-bound` with its audit row in the same
     # transaction. BIN2 on key_name, because Transit key names compare case-sensitively, byte for
-    # byte; actor matches audit_log.actor's width. Non-secret.
+    # byte; actor matches audit_log.actor's width, and audit_hash audit_log.row_hash's. The widths
+    # count UTF-16 code units, which is what the CLI bounds (TRANSIT_BOUND_*_MAX). Non-secret.
     """IF OBJECT_ID('transit_bound_attestation','U') IS NULL CREATE TABLE transit_bound_attestation (
         id INT NOT NULL PRIMARY KEY CHECK (id = 1),
         key_name NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
         reason NVARCHAR(1000) NOT NULL, actor NVARCHAR(256) NOT NULL,
-        attested_at FLOAT NOT NULL)""",
+        attested_at FLOAT NOT NULL, audit_seq BIGINT NOT NULL,
+        audit_hash NVARCHAR(64) NOT NULL)""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
     # for the in-flight-only rationale. One of the two backends a real sharded deployment runs
     # (`require_unified_store` makes a server DB mandatory past one shard). No PHI (an account id and
@@ -10944,44 +10949,54 @@ class SqlServerStore:
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
         """See the SQLite twin."""
-        row = await self._fetchone(
-            "SELECT key_name, reason, actor, attested_at FROM transit_bound_attestation WHERE id = 1"
+
+        async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+            return await self._fetchone(sql, params)
+
+        return await load_transit_bound_attestation(
+            fetch, mac_keys=self._audit_mac_keys, mac_fn=self._audit_mac_fn
         )
-        return None if row is None else _transit_attestation_row(row)
 
     async def record_transit_bound_attestation(
-        self, *, key_name: str, reason: str, audit: AuditAppend, now: float | None = None
+        self, *, key_name: str, reason: str, actor: str, now: float | None = None
     ) -> TransitBoundAttestation:
-        """See the SQLite twin. The MERGE and the audit row share one transaction, under the same
-        lock order as ``record_audit``: the in-process gate, then the connection. This leg is
-        CI-only."""
+        """See the SQLite twin. The audit row and the MERGE naming it share one transaction, under
+        the same lock order as ``record_audit``: the in-process gate, then the connection. This leg
+        is CI-only."""
         now = time.time() if now is None else now
-        recorded = TransitBoundAttestation(
-            key_name=key_name, reason=reason, actor=audit.actor or "", attested_at=now
-        )
+        audit = transit_attested_audit(key_name=key_name, reason=reason, actor=actor)
         async with self._audit_lock:  # noqa: SIM117
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
+                        [appended] = await self._append_audits(cur, (audit,), now=now)
                         await cur.execute(
                             "MERGE transit_bound_attestation WITH (HOLDLOCK) AS t"
                             " USING (SELECT 1 AS id, ? AS key_name, ? AS reason, ? AS actor,"
-                            " ? AS attested_at) AS s ON t.id = s.id"
+                            " ? AS attested_at, ? AS audit_seq, ? AS audit_hash) AS s"
+                            " ON t.id = s.id"
                             " WHEN MATCHED THEN UPDATE SET key_name = s.key_name,"
-                            " reason = s.reason, actor = s.actor, attested_at = s.attested_at"
+                            " reason = s.reason, actor = s.actor, attested_at = s.attested_at,"
+                            " audit_seq = s.audit_seq, audit_hash = s.audit_hash"
                             " WHEN NOT MATCHED THEN INSERT (id, key_name, reason, actor,"
-                            " attested_at) VALUES (s.id, s.key_name, s.reason, s.actor,"
-                            " s.attested_at);",
-                            (key_name, reason, recorded.actor, now),
+                            " attested_at, audit_seq, audit_hash) VALUES (s.id, s.key_name,"
+                            " s.reason, s.actor, s.attested_at, s.audit_seq, s.audit_hash);",
+                            (key_name, reason, actor, now, appended.seq, appended.row_hash),
                         )
-                        appended = await self._append_audits(cur, (audit,), now=now)
                         await self._commit(conn)
                 except Exception:
                     # BACKLOG #1940: see _rollback_or_discard.
                     await self._rollback_or_discard(conn)
                     raise
-        tee_audits((audit,), appended, ts=now)
-        return recorded
+        tee_audits((audit,), (appended,), ts=now)
+        return TransitBoundAttestation(
+            key_name=key_name,
+            reason=reason,
+            actor=actor,
+            attested_at=now,
+            audit_seq=appended.seq,
+            audit_hash=appended.row_hash,
+        )
 
     async def withdraw_transit_bound_attestation(
         self, *, audit: OperatorAudit[TransitBoundAttestation], now: float | None = None
@@ -10993,21 +11008,17 @@ class SqlServerStore:
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
+                        names = TRANSIT_ATTESTATION_COLUMNS.split(", ")
                         await cur.execute(
-                            "DELETE FROM transit_bound_attestation OUTPUT deleted.key_name,"
-                            " deleted.reason, deleted.actor, deleted.attested_at WHERE id = 1"
+                            "DELETE FROM transit_bound_attestation OUTPUT "
+                            + ", ".join(f"deleted.{name}" for name in names)
+                            + " WHERE id = 1"
                         )
                         rows = await cur.fetchall()  # drain, so the next execute is clean
                         if not rows:
                             await conn.rollback()
                             return None
-                        key_name, reason, actor, attested_at = rows[0]
-                        withdrawn = TransitBoundAttestation(
-                            key_name=str(key_name),
-                            reason=str(reason),
-                            actor=str(actor),
-                            attested_at=float(attested_at),
-                        )
+                        withdrawn = _transit_attestation_row(dict(zip(names, rows[0], strict=True)))
                         audits = operator_audits(audit, withdrawn)
                         appended = await self._append_audits(cur, audits, now=now)
                         await self._commit(conn)

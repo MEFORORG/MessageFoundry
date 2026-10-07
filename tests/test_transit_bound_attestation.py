@@ -72,7 +72,7 @@ async def _attest(store: MessageStore, key_name: str = _KEY_NAME) -> TransitBoun
     return await store.record_transit_bound_attestation(
         key_name=key_name,
         reason="Transit auto-rotates this key every 30 days",
-        audit=AuditAppend(TRANSIT_BOUND_ATTESTED_ACTION, actor="cli:tester"),
+        actor="cli:tester",
     )
 
 
@@ -140,6 +140,116 @@ async def test_a_non_transit_store_is_not_gated(tmp_path: Path) -> None:
     await _start(keyless, SecurityEnforcement.ENFORCE)  # no raise: the engine counts the bound
 
 
+# --- the row is bound to its audit row (DML alone forges nothing) --------------------------------
+
+
+def _dml(db: Path, sql: str, params: tuple[object, ...] = ()) -> None:
+    """Write the store file directly, as someone with DML on the table and no audit key would."""
+    con = sqlite3.connect(db)
+    try:
+        con.execute(sql, params)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _attestation_row(db: Path) -> tuple[object, ...]:
+    con = sqlite3.connect(db)
+    try:
+        row = con.execute(
+            "SELECT key_name, reason, actor, attested_at, audit_seq, audit_hash"
+            " FROM transit_bound_attestation WHERE id = 1"
+        ).fetchone()
+    finally:
+        con.close()
+    assert row is not None
+    return tuple(row)
+
+
+_INSERT = (
+    "INSERT OR REPLACE INTO transit_bound_attestation"
+    " (id, key_name, reason, actor, attested_at, audit_seq, audit_hash)"
+    " VALUES (1, ?, ?, ?, ?, ?, ?)"
+)
+
+
+async def _refused_with(db: Path, needle: str) -> None:
+    store = await _transit_store(db)
+    got = await store.get_transit_bound_attestation()
+    assert got is not None and got.audit_gap is not None and needle in got.audit_gap, got
+    with pytest.raises(TransitBoundUnattestedError, match="not backed by its audit row"):
+        await _start(store, SecurityEnforcement.ENFORCE)
+
+
+async def test_a_row_inserted_by_dml_with_no_audit_row_does_not_count(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    await store.close()
+    db = tmp_path / "transit.db"
+    _dml(db, _INSERT, (_KEY_NAME, "forged", "cli:tester", time.time(), 9999, "0" * 64))
+    await _refused_with(db, "not in the audit log")
+
+
+async def test_a_dml_edit_of_the_key_name_does_not_count(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    await _attest(store, key_name="mefor-store-old")
+    await store.close()
+    db = tmp_path / "transit.db"
+    _dml(db, "UPDATE transit_bound_attestation SET key_name = ? WHERE id = 1", (_KEY_NAME,))
+    await _refused_with(db, "different key, reason, actor or time")
+
+
+async def test_a_row_replayed_after_a_withdraw_does_not_count(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    await _attest(store)
+    db = tmp_path / "transit.db"
+    saved = _attestation_row(db)
+    assert await _withdraw(store) is not None
+    await store.close()
+    _dml(db, _INSERT, saved)  # the old row, byte for byte, pointing at its real audit row
+    await _refused_with(db, "supersedes")
+
+
+async def test_a_forged_audit_row_does_not_verify(store: MessageStore, tmp_path: Path) -> None:
+    """A writer who also appends an audit row cannot seal it: the MAC is computed in Transit."""
+    await _attest(store, key_name="mefor-store-old")
+    await store.close()
+    db = tmp_path / "transit.db"
+    con = sqlite3.connect(db)
+    try:
+        seq, prev = con.execute("SELECT seq, row_hash FROM audit_log ORDER BY seq DESC").fetchone()
+        ts = time.time()
+        detail = json.dumps({"key_name": _KEY_NAME, "reason": "forged"})
+        con.execute(
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES (?, ?, ?, ?, NULL, ?, NULL, ?)",
+            (seq + 1, ts, "cli:tester", TRANSIT_BOUND_ATTESTED_ACTION, detail, "f" * 64),
+        )
+        con.execute(
+            _INSERT.replace("INSERT OR REPLACE", "REPLACE"),
+            (_KEY_NAME, "forged", "cli:tester", ts, seq + 1, "f" * 64),
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert prev  # the chain had a head to forge after
+    await _refused_with(db, "MAC does not verify")
+
+
+async def test_warn_names_the_audit_gap(
+    store: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    await store.close()
+    db = tmp_path / "transit.db"
+    _dml(db, _INSERT, (_KEY_NAME, "forged", "cli:tester", time.time(), 9999, "0" * 64))
+    again = await _transit_store(db)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.transit_attestation"):
+        await _start(again, SecurityEnforcement.WARN)
+    assert any("not backed by its audit row" in r.getMessage() for r in caplog.records)
+
+
 # --- the store rows ------------------------------------------------------------------------------
 
 
@@ -157,12 +267,17 @@ def _audit_rows(db: Path, action: str) -> list[sqlite3.Row]:
 async def test_record_replaces_and_withdraw_of_nothing_writes_no_audit_row(
     store: MessageStore, tmp_path: Path
 ) -> None:
+    commits = store.committed_txns
     assert await _withdraw(store) is None
+    assert store.committed_txns == commits  # rolled back, not an empty commit
     assert _audit_rows(tmp_path / "transit.db", TRANSIT_BOUND_WITHDRAWN_ACTION) == []
     await _attest(store, key_name="first")
-    await _attest(store, key_name=_KEY_NAME)
+    recorded = await _attest(store, key_name=_KEY_NAME)
     current = await store.get_transit_bound_attestation()
-    assert current is not None and current.key_name == _KEY_NAME and current.actor == "cli:tester"
+    assert current == recorded and current.audit_gap is None
+    assert current.key_name == _KEY_NAME and current.actor == "cli:tester"
+    [_, newest] = _audit_rows(tmp_path / "transit.db", TRANSIT_BOUND_ATTESTED_ACTION)
+    assert json.loads(newest["detail"])["key_name"] == _KEY_NAME
 
 
 async def test_a_refused_audit_append_records_no_attestation(
@@ -251,6 +366,45 @@ def test_cli_record_refuses_a_blank_reason(
     assert _read(transit_db) is None
 
 
+def test_cli_reason_is_bounded_in_utf16_code_units(
+    transit_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """600 characters outside the Basic Multilingual Plane are 1200 UTF-16 code units, which SQL
+    Server's NVARCHAR(1000) cannot hold, although a code-point count would pass them."""
+    reason = "\U0001f512" * 600
+    rc = main(["store", "attest-transit-bound", "--reason", reason, "--db", str(transit_db)])
+    assert rc == 1
+    assert "UTF-16" in capsys.readouterr().err
+    assert _read(transit_db) is None
+
+
+def test_cli_a_write_the_store_refuses_is_exit_1_not_a_failed_open(
+    transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A SQLite error from the WRITE, such as a locked file, is a refused write (exit 1), not
+    "cannot open the store" (exit 2), although both are sqlite3.DatabaseError."""
+
+    async def locked(*_a: object, **_k: object) -> object:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(MessageStore, "record_transit_bound_attestation", locked)
+    rc = main(["store", "attest-transit-bound", "--reason", "r", "--db", str(transit_db)])
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert "refused the write" in err and "database is locked" in err
+    assert "cannot open" not in err
+
+
+def test_cli_a_file_that_is_not_a_database_is_exit_2(
+    transit_db: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    junk = tmp_path / "junk.db"
+    junk.write_bytes(b"this is not a SQLite database, just some bytes" * 100)
+    rc = main(["store", "withdraw-transit-bound", "--db", str(junk)])
+    assert rc == 2
+    assert "cannot open the store" in capsys.readouterr().err
+
+
 def test_cli_record_refuses_a_store_not_on_vault_transit(
     transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -310,6 +464,7 @@ async def test_posture_reports_the_attestation(store: MessageStore) -> None:
     assert unattested["transit_bound_attestation"] == {
         "key_name": _KEY_NAME,
         "attested": False,
+        "gap": f"no attestation is recorded for the Transit data key {_KEY_NAME!r}",
         "attested_key_name": None,
         "attested_by": None,
         "attested_at": None,
@@ -318,7 +473,8 @@ async def test_posture_reports_the_attestation(store: MessageStore) -> None:
     recorded = await _attest(store)
     view = (await _posture(store))["transit_bound_attestation"]
     assert isinstance(view, dict)
-    assert view["attested"] is True and view["attested_by"] == "cli:tester"
+    assert view["attested"] is True and view["gap"] is None
+    assert view["attested_by"] == "cli:tester"
     assert view["attested_at"] == recorded.attested_at
 
 

@@ -405,7 +405,7 @@ from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import AuditAppend, OperatorAudit, ReingressOutcome, ResendOutcome
 from messagefoundry.store.transit_attestation import (
-    TransitBoundAttestationStore,
+    read_transit_bound_attestation,
     transit_bound_gap,
 )
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
@@ -2955,24 +2955,20 @@ def create_app(
     async def _transit_bound_view(
         store: object, key_name: str | None
     ) -> TransitBoundAttestationView | None:
-        """The vault_transit bound attestation as the start gate reads it (BACKLOG #2337). ``None``
-        off vault_transit. A store without the slice reads as unattested, as the gate reads it."""
+        """The vault_transit bound attestation as the start gate reads it (BACKLOG #2337), through
+        the same reader and the same verdict. ``None`` off vault_transit."""
         if key_name is None:
             return None
-        recorded = (
-            await store.get_transit_bound_attestation()
-            if isinstance(store, TransitBoundAttestationStore)
-            else None
-        )
-        if recorded is None:
-            return TransitBoundAttestationView(key_name=key_name, attested=False)
+        recorded = await read_transit_bound_attestation(store)
+        gap = transit_bound_gap(key_name, recorded)
         return TransitBoundAttestationView(
             key_name=key_name,
-            attested=transit_bound_gap(key_name, recorded) is None,
-            attested_key_name=recorded.key_name,
-            attested_by=recorded.actor,
-            attested_at=recorded.attested_at,
-            reason=recorded.reason,
+            attested=gap is None,
+            gap=gap,
+            attested_key_name=recorded.key_name if recorded else None,
+            attested_by=recorded.actor if recorded else None,
+            attested_at=recorded.attested_at if recorded else None,
+            reason=recorded.reason if recorded else None,
         )
 
     @app.get("/security/posture", response_model=SecurityPosture)

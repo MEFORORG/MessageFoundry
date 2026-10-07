@@ -60,7 +60,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -142,7 +142,11 @@ from messagefoundry.store.sealed_cache import (
     new_state_cache,
     sealed_reference_set,
 )
-from messagefoundry.store.transit_attestation import TransitBoundAttestation
+from messagefoundry.store.transit_attestation import (
+    TRANSIT_BOUND_ATTESTED_ACTION,
+    TRANSIT_BOUND_WITHDRAWN_ACTION,
+    TransitBoundAttestation,
+)
 from messagefoundry.store.typed_fields import encode_typed_fields
 
 log = logging.getLogger(__name__)
@@ -4119,14 +4123,144 @@ row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock
 not read chain state."""
 
 
+#: The columns every backend reads a ``transit_bound_attestation`` row by (BACKLOG #2337).
+TRANSIT_ATTESTATION_COLUMNS: Final = "key_name, reason, actor, attested_at, audit_seq, audit_hash"
+
+
 def _transit_attestation_row(row: Any) -> TransitBoundAttestation:
-    """A ``transit_bound_attestation`` row as the dataclass, on any backend's row mapping."""
+    """A ``transit_bound_attestation`` row as the dataclass, on any backend's row mapping. The
+    audit columns are attacker-writable, so they are typed here rather than trusted."""
+    audit_hash = row["audit_hash"]
     return TransitBoundAttestation(
         key_name=str(row["key_name"]),
         reason=str(row["reason"]),
         actor=str(row["actor"]),
         attested_at=float(row["attested_at"]),
+        audit_seq=_strict_int(row["audit_seq"]),
+        audit_hash=audit_hash if isinstance(audit_hash, str) else None,
     )
+
+
+def transit_attested_audit(*, key_name: str, reason: str, actor: str) -> AuditAppend:
+    """The audit row ``record_transit_bound_attestation`` appends, on every backend (BACKLOG #2337).
+    The store builds it, never the caller, so the read-side check knows what the detail must say."""
+    return AuditAppend(
+        TRANSIT_BOUND_ATTESTED_ACTION,
+        actor=actor,
+        detail=json.dumps({"key_name": key_name, "reason": reason}),
+    )
+
+
+#: One read for :func:`load_transit_bound_attestation`: ``(sql, params) -> row or None``. ``sql``
+#: carries ``?`` placeholders; the Postgres store rewrites them to ``$n`` before it runs.
+type TransitAttestationFetch = Callable[
+    [str, tuple[object, ...]], Awaitable[Mapping[str, Any] | None]
+]
+
+
+async def load_transit_bound_attestation(
+    fetch: TransitAttestationFetch,
+    *,
+    mac_keys: Mapping[str, bytes],
+    mac_fn: AuditMacFn | None,
+) -> TransitBoundAttestation | None:
+    """The recorded attestation, checked against the audit row it names -- the read all three
+    backends' ``get_transit_bound_attestation`` run (BACKLOG #2337).
+
+    ``None`` when no row is recorded. Otherwise the row, with ``audit_gap`` set to why its audit row
+    does not back it, or left ``None`` when it does. Every query is portable across SQLite, Postgres
+    and SQL Server, and every value is a bound parameter. The check reuses the chain's own pieces: the
+    row MAC (:func:`audit_row_hash`, under the key of the row's range, as :func:`verify_audit_rows`
+    picks it) and the constant-time compare. It walks no chain, so it costs one MAC, not one per row."""
+    row = await fetch(
+        f"SELECT {TRANSIT_ATTESTATION_COLUMNS} FROM transit_bound_attestation WHERE id = ?", (1,)
+    )
+    if row is None:
+        return None
+    attestation = _transit_attestation_row(row)
+    gap = await _transit_attestation_audit_gap(attestation, fetch, mac_keys=mac_keys, mac_fn=mac_fn)
+    return attestation if gap is None else replace(attestation, audit_gap=gap)
+
+
+async def _transit_attestation_audit_gap(
+    attestation: TransitBoundAttestation,
+    fetch: TransitAttestationFetch,
+    *,
+    mac_keys: Mapping[str, bytes],
+    mac_fn: AuditMacFn | None,
+) -> str | None:
+    """Why ``attestation``'s audit row does not back it, or ``None`` when it does."""
+    seq = attestation.audit_seq
+    if seq is None or seq < 1 or attestation.audit_hash is None:
+        return "it names no audit row"
+    audit = await fetch(
+        "SELECT seq, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
+        " WHERE seq = ?",
+        (seq,),
+    )
+    if audit is None:
+        return f"its audit row, sequence number {seq}, is not in the audit log"
+    if audit["action"] != TRANSIT_BOUND_ATTESTED_ACTION:
+        return f"audit row {seq} is not an attestation"
+    # The newest attest-or-withdraw row must be this one, so a row replayed after a withdraw, or
+    # after a later attestation, does not count.
+    newest = await fetch(
+        "SELECT MAX(seq) AS newest FROM audit_log WHERE action IN (?, ?)",
+        (TRANSIT_BOUND_ATTESTED_ACTION, TRANSIT_BOUND_WITHDRAWN_ACTION),
+    )
+    if newest is None or _strict_int(newest["newest"]) != seq:
+        return f"a later attest or withdraw audit row supersedes audit row {seq}"
+    try:
+        detail = json.loads(audit["detail"] or "")
+    except (ValueError, TypeError, RecursionError):
+        detail = None
+    ts = audit["ts"]
+    if not (
+        isinstance(detail, dict)
+        and detail.get("key_name") == attestation.key_name
+        and detail.get("reason") == attestation.reason
+        and audit["actor"] == attestation.actor
+        and isinstance(ts, (int, float))
+        and float(ts) == attestation.attested_at
+    ):
+        return f"audit row {seq} names a different key, reason, actor or time"
+    if not hmac.compare_digest(
+        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(attestation.audit_hash)
+    ):
+        return f"audit row {seq} carries a different hash than the attestation recorded"
+    prev: object = ""
+    if seq > 1:
+        before = await fetch("SELECT row_hash FROM audit_log WHERE seq = ?", (seq - 1,))
+        if before is None:
+            return f"audit row {seq - 1}, which audit row {seq} chains from, is missing"
+        prev = before["row_hash"]
+    # The key of the row's own range: the newest genesis or range row at or below it.
+    opening = await fetch(
+        "SELECT seq, action, detail FROM audit_log WHERE seq ="
+        " (SELECT MAX(seq) FROM audit_log WHERE action = ? AND seq <= ?)",
+        (AUDIT_KEY_EPOCH_ACTION, seq),
+    )
+    key_id: str | None = None
+    if opening is not None and _strict_int(opening["seq"]) == 1:
+        key_id = _audit_genesis_key(opening)
+    elif opening is not None and opening["action"] == AUDIT_KEY_EPOCH_ACTION:
+        parsed = parse_audit_epoch(opening["detail"])
+        key_id = parsed[0] if parsed is not None else None
+    secret: tuple[bytes | None, AuditMacFn | None] | None
+    if key_id is None:
+        # A keyless chain walks as plain SHA-256, and only a process holding no key walks it so,
+        # the rule verify_audit_rows applies. A keyed process reads a keyless row as a break.
+        secret = (None, None) if not mac_keys and mac_fn is None else None
+    else:
+        secret = _audit_secret_for(key_id, mac_keys, mac_fn)
+    if secret is None:
+        return f"this process does not hold the audit key audit row {seq} is sealed under"
+    expected = _audit_row_mac(audit, prev, *secret)
+    if expected is None or not hmac.compare_digest(
+        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(expected)
+    ):
+        return f"audit row {seq}'s MAC does not verify under the audit key"
+    return None
 
 
 def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
@@ -4861,14 +4995,17 @@ CREATE TABLE IF NOT EXISTS store_salt (
 -- The vault_transit AES-GCM bound attestation (BACKLOG #2337, owner rulings 2026-10-07). One row at
 -- most: the Transit data-key NAME an operator attested, their reason, who (a `cli:<osuser>` actor) and
 -- when. Only `messagefoundry store attest-transit-bound` writes it, and its audit row commits in the
--- same transaction; `store withdraw-transit-bound` deletes it the same way. `serve` on vault_transit
--- refuses under enforce unless it names the configured key. Non-secret.
+-- same transaction; `store withdraw-transit-bound` deletes it the same way. `audit_seq` and
+-- `audit_hash` name that audit row, and every read checks it, so a row written by DML alone counts as
+-- none. `serve` on vault_transit refuses under enforce unless it names the configured key. Non-secret.
 CREATE TABLE IF NOT EXISTS transit_bound_attestation (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     key_name    TEXT NOT NULL,
     reason      TEXT NOT NULL,
     actor       TEXT NOT NULL,
-    attested_at REAL NOT NULL
+    attested_at REAL NOT NULL,
+    audit_seq   INTEGER NOT NULL,
+    audit_hash  TEXT NOT NULL
 );
 
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per uploader holding
@@ -11530,34 +11667,47 @@ class MessageStore:
     # Non-secret. See messagefoundry.store.transit_attestation for the rulings it implements.
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
-        """The recorded attestation, or ``None``."""
+        """The recorded attestation, checked against its audit row (:func:`load_transit_bound_attestation`),
+        or ``None``."""
         async with self._read() as db:
-            cur = await db.execute(
-                "SELECT key_name, reason, actor, attested_at FROM transit_bound_attestation"
-                " WHERE id = 1"
+
+            async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+                cur = await db.execute(sql, params)
+                # sqlite3.Row reads by column name, the one Mapping operation the reader uses.
+                return cast("Mapping[str, Any] | None", await cur.fetchone())
+
+            return await load_transit_bound_attestation(
+                fetch, mac_keys=self._audit_mac_keys, mac_fn=self._audit_mac_fn
             )
-            row = await cur.fetchone()
-        return None if row is None else _transit_attestation_row(row)
 
     async def record_transit_bound_attestation(
-        self, *, key_name: str, reason: str, audit: AuditAppend, now: float | None = None
+        self, *, key_name: str, reason: str, actor: str, now: float | None = None
     ) -> TransitBoundAttestation:
-        """Replace the attestation with ``key_name`` and append ``audit``, in ONE transaction, so the
-        row never exists without the record of who wrote it (the #2624 pattern)."""
+        """Append the attestation's audit row, then replace the attestation with ``key_name`` and that
+        row's sequence number and hash, in ONE transaction, so the row never exists without the record
+        of who wrote it (the #2624 pattern) and names it."""
         now = time.time() if now is None else now
-        recorded = TransitBoundAttestation(
-            key_name=key_name, reason=reason, actor=audit.actor or "", attested_at=now
-        )
+        audit = transit_attested_audit(key_name=key_name, reason=reason, actor=actor)
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute(
-                "INSERT INTO transit_bound_attestation (id, key_name, reason, actor, attested_at)"
-                " VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET key_name=excluded.key_name,"
-                " reason=excluded.reason, actor=excluded.actor, attested_at=excluded.attested_at",
-                (key_name, reason, recorded.actor, now),
+            [appended] = await self._append_audits((audit,), now=now)
+            recorded = TransitBoundAttestation(
+                key_name=key_name,
+                reason=reason,
+                actor=actor,
+                attested_at=now,
+                audit_seq=appended.seq,
+                audit_hash=appended.row_hash,
             )
-            appended = await self._append_audits((audit,), now=now)
+            await self._db.execute(
+                "INSERT INTO transit_bound_attestation (id, key_name, reason, actor, attested_at,"
+                " audit_seq, audit_hash) VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET"
+                " key_name=excluded.key_name, reason=excluded.reason, actor=excluded.actor,"
+                " attested_at=excluded.attested_at, audit_seq=excluded.audit_seq,"
+                " audit_hash=excluded.audit_hash",
+                (key_name, reason, actor, now, appended.seq, appended.row_hash),
+            )
             await self._commit()
-        tee_audits((audit,), appended, ts=now)
+        tee_audits((audit,), (appended,), ts=now)
         return recorded
 
     async def withdraw_transit_bound_attestation(
@@ -11568,12 +11718,12 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
-                "SELECT key_name, reason, actor, attested_at FROM transit_bound_attestation"
-                " WHERE id = 1"
+                f"SELECT {TRANSIT_ATTESTATION_COLUMNS} FROM transit_bound_attestation WHERE id = 1"
             )
             row = await cur.fetchone()
             if row is None:
-                await self._commit()  # ends the empty transaction
+                # Nothing written, so nothing to commit: _writer_txn leaves the unwind to us.
+                await self._db.rollback()
                 return None
             withdrawn = _transit_attestation_row(row)
             await self._db.execute("DELETE FROM transit_bound_attestation WHERE id = 1")

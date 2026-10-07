@@ -11,6 +11,7 @@ withdraw removes it with its own audit row. Non-secret throughout: key names, a 
 from __future__ import annotations
 
 import importlib
+import json
 from typing import Any
 
 import pytest
@@ -55,21 +56,20 @@ async def attestation_roundtrip(store: Any) -> None:
     assert await store.get_transit_bound_attestation() is None
     assert await store.withdraw_transit_bound_attestation(audit=withdrawn_row) is None
 
-    await store.record_transit_bound_attestation(
-        key_name="first",
-        reason="r1",
-        audit=AuditAppend(TRANSIT_BOUND_ATTESTED_ACTION, actor="cli:ci", detail='{"n":1}'),
-    )
+    await store.record_transit_bound_attestation(key_name="first", reason="r1", actor="cli:ci")
     recorded = await store.record_transit_bound_attestation(
-        key_name="mefor-store",
-        reason="rotates every 30 days",
-        audit=AuditAppend(TRANSIT_BOUND_ATTESTED_ACTION, actor="cli:ci", detail='{"n":2}'),
+        key_name="mefor-store", reason="rotates every 30 days", actor="cli:ci"
     )
+    # Read back through the audit-row check: gap None means the audit row backs it on this backend.
     got = await store.get_transit_bound_attestation()
-    assert got == recorded and got.key_name == "mefor-store" and got.actor == "cli:ci"
+    assert got == recorded and got.audit_gap is None and got.actor == "cli:ci"
     [newest] = await store.recent_audit_of([TRANSIT_BOUND_ATTESTED_ACTION], limit=1)
-    assert newest["actor"] == "cli:ci" and newest["detail"] == '{"n":2}'
-    assert abs(float(newest["ts"]) - recorded.attested_at) < 1e-3
+    assert newest["actor"] == "cli:ci"
+    assert json.loads(newest["detail"]) == {
+        "key_name": "mefor-store",
+        "reason": "rotates every 30 days",
+    }
+    assert float(newest["ts"]) == recorded.attested_at
 
     withdrawn = await store.withdraw_transit_bound_attestation(audit=withdrawn_row)
     assert withdrawn is not None and withdrawn.key_name == "mefor-store"

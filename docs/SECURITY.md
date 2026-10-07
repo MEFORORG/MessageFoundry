@@ -4860,11 +4860,24 @@ rotation, and when.
    `store.transit_bound_withdrawn` audit row in the same transaction. The next start under enforce
    refuses until a new attestation is recorded.
 
-The record binds to the key **name**. Rotating versions inside one key keeps it, because that
-rotation is what the operator attested. Pointing the store at another key voids it. Only the CLI
-writes the row: there is no API endpoint and no permission for it, and no settings key stands in for
-it. `GET /security/posture` reports it in `transit_bound_attestation`. `messagefoundry check` does
-not, because it reads configuration and never opens the store.
+The record binds to the key **name**, and to nothing else. Rotating versions inside one key
+keeps it, because that rotation is what the operator attested. Pointing the store at another key
+name voids it. Pointing it at **another Vault, or another Transit mount, that holds a key with the
+same name keeps it**, under the owner ruling of 2026-10-07. Whoever moves the store there must
+withdraw and re-attest by hand if that key's rotation policy differs. Only the CLI writes the row:
+there is no API endpoint and no permission for it, and no settings key stands in for it.
+`GET /security/posture` reports it in `transit_bound_attestation`, with `gap` saying why it does not
+count. `messagefoundry check` does not, because it reads configuration and never opens the store.
+
+**The row is bound to its audit row, so DML on the table alone forges nothing.** The row stores the
+sequence number and chain hash of the audit row its write appended. Every read checks that audit
+row: it must exist, be the newest attest or withdraw row, name the same key, reason, actor and time,
+carry the recorded hash, and verify under the audit key of its range. On `vault_transit` that key is
+inside Transit, so a writer with database rights and no Transit access cannot seal a new one. A row
+that fails any check counts as no attestation, and the start log and the posture say which check
+failed. A writer who deletes a later withdraw row, to replay an older attestation, breaks the
+audit chain. `messagefoundry audit-verify` and the start-up chain walk report that; this check does
+not.
 
 **What it does not do.** The engine still counts nothing on this path, so passing 2^32 on one key
 version would still be silent. The record says that someone named took responsibility for the

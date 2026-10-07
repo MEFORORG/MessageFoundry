@@ -1005,8 +1005,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     # of any build whose schema moved.
     store_cmd = sub.add_parser(
         "store",
-        help="server-DB store administration: provision-schema runs the schema DDL as a "
-        "provisioning principal, so the engine's runtime login needs no DDL rights (BACKLOG #305)",
+        help="store administration: provision-schema runs a server database's schema DDL as a "
+        "provisioning principal, so the engine's runtime login needs no DDL rights (BACKLOG #305); "
+        "attest-transit-bound and withdraw-transit-bound record the vault_transit AES-GCM bound "
+        "attestation on any backend (BACKLOG #2337)",
     )
     store_sub = store_cmd.add_subparsers(dest="store_command", required=True)
     provision_schema = store_sub.add_parser(
@@ -1041,7 +1043,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "configured with (MEFOR_STORE_TRANSIT_KEY) is rotated before any one key version seals "
         "2**32 values. The engine counts no AES-GCM invocations on vault_transit, so this record "
         "stands in for the count. It binds to the key NAME: rotating versions inside that key "
-        "keeps it, and pointing the store at another key voids it. It replaces any earlier "
+        "keeps it, and pointing the store at another key name voids it. It binds to the name "
+        "only, so a store pointed at another Vault or Transit mount holding a key of the same "
+        "name keeps it. It replaces any earlier "
         "attestation. The row and its audit row commit in one transaction, with the OS user as "
         "the actor. serve reads it at its next start.",
     )
@@ -5768,12 +5772,16 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         return 2
 
 
-def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | int:
+def _host_gated_store_settings(
+    args: argparse.Namespace, *, false_finding: str = "'no such user'"
+) -> ServiceSettings | int:
     """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
     Shared by ``admin-unlock``, ``admin-set-notify-email`` and ``admin-reset-totp`` so the gate is
     stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it legitimately creates the
-    store, so it cannot carry the M-31 guard below.
+    store, so it cannot carry the M-31 guard below. ``store attest-transit-bound`` and
+    ``withdraw-transit-bound`` use it too (BACKLOG #2337), and pass ``false_finding``, the result a
+    fresh empty store would wrongly report for them.
     """
     from pathlib import Path
 
@@ -5794,7 +5802,7 @@ def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | in
     if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
         return _emit_error(
             f"no store at {settings.store.path} — refusing to create one and report a false "
-            f"'no such user' (check --db / [store].path)",
+            f"{false_finding} (check --db / [store].path)",
             as_json=args.json,
         )
     return settings
@@ -6112,6 +6120,15 @@ def _store(args: argparse.Namespace) -> int:
     return _store_transit_bound(args)
 
 
+class _StoreOpenFailed(Exception):  # noqa: N818 -- a carrier, caught one frame up
+    """A SQLite error raised while OPENING the store, so ``_store_transit_bound`` can tell it from
+    the same class raised by its write (BACKLOG #2337)."""
+
+    def __init__(self, cause: sqlite3.DatabaseError) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 def _store_transit_bound(args: argparse.Namespace) -> int:
     """Record or withdraw the vault_transit AES-GCM bound attestation (BACKLOG #2337).
 
@@ -6120,9 +6137,11 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     to the Transit data-key name, read from the opened store's live cipher rather than typed, so the
     attestation names the key ``serve`` will check. Runs on ``admin-unlock``'s host gate.
 
-    Exit codes: 0 done (including a withdraw with nothing recorded); 1 refused (a blank reason, a
-    cipher that is not vault_transit, or a write the store refused, which then wrote nothing); 2
-    could not open the store."""
+    Exit codes: 0 done (including a withdraw with nothing recorded); 1 refused (a blank or
+    too-long reason, a key name too long to record, a cipher that is not vault_transit, or a write
+    the store refused, which then wrote nothing); 2 could not open the store. A SQLite error raised
+    while OPENING is exit 2; the same class raised by the write, such as "database is locked" while
+    the engine holds the file, is a refused write and exit 1."""
     import datetime
     import getpass
 
@@ -6137,22 +6156,29 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
     from messagefoundry.store.store import AuditAppend
     from messagefoundry.store.transit_attestation import (
-        TRANSIT_BOUND_ATTESTED_ACTION,
+        TRANSIT_BOUND_KEY_NAME_MAX,
         TRANSIT_BOUND_REASON_MAX,
         TRANSIT_BOUND_WITHDRAWN_ACTION,
         TransitBoundAttestation,
         TransitBoundAttestationStore,
+        utf16_units,
     )
 
     attesting = args.store_command == "attest-transit-bound"
     reason = (args.reason or "").strip()
     if attesting and not reason:
         return _emit_error("--reason must not be blank", as_json=args.json)
-    if len(reason) > TRANSIT_BOUND_REASON_MAX:
+    # UTF-16 code units, as SQL Server's NVARCHAR(1000) counts them, so a reason that passes here
+    # fits every backend's column.
+    if utf16_units(reason) > TRANSIT_BOUND_REASON_MAX:
         return _emit_error(
-            f"--reason is longer than {TRANSIT_BOUND_REASON_MAX} characters", as_json=args.json
+            f"--reason is longer than {TRANSIT_BOUND_REASON_MAX} UTF-16 code units",
+            as_json=args.json,
         )
-    settings = _host_gated_store_settings(args)
+    false_finding = (
+        "'OK: recorded' into a store serve never reads" if attesting else "'nothing recorded'"
+    )
+    settings = _host_gated_store_settings(args, false_finding=false_finding)
     if isinstance(settings, int):
         return settings
     # Only a vault_transit store has a bound to attest. A withdraw runs on any cipher, so a store
@@ -6178,10 +6204,13 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
 
     async def run() -> tuple[str, TransitBoundAttestation | None, str]:
         """``(outcome, the row recorded or withdrawn, the store path)``."""
-        store = await open_store(
-            settings.store,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-        )
+        try:
+            store = await open_store(
+                settings.store,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+            raise _StoreOpenFailed(exc) from exc
         try:
             if not isinstance(store, TransitBoundAttestationStore):
                 return ("unsupported", None, store.path)
@@ -6192,19 +6221,25 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
             key_name = store.cipher_info().transit_key_name
             if key_name is None:  # cipher_provider said vault_transit; the open built another
                 return ("no-transit-key", None, store.path)
-            detail = json.dumps({"key_name": key_name, "reason": reason})
+            if utf16_units(key_name) > TRANSIT_BOUND_KEY_NAME_MAX:
+                return ("key-name-too-long", None, store.path)
             recorded = await store.record_transit_bound_attestation(
-                key_name=key_name,
-                reason=reason,
-                audit=AuditAppend(TRANSIT_BOUND_ATTESTED_ACTION, actor=actor, detail=detail),
+                key_name=key_name, reason=reason, actor=actor
             )
             return ("attested", recorded, store.path)
         finally:
             await store.close()
 
     # A refused write raises one of these on every backend (BACKLOG #1983). The row and its audit
-    # row share one transaction, so a refusal leaves neither.
-    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
+    # row share one transaction, so a refusal leaves neither. sqlite3.DatabaseError is here because
+    # an open's own failure has already been re-raised as _StoreOpenFailed, so what reaches this
+    # clause is the write, such as "database is locked".
+    store_errors: tuple[type[Exception], ...] = (
+        RuntimeError,
+        OSError,
+        sqlite3.DatabaseError,
+        *store_driver_errors(),
+    )
     # A key that cannot be resolved at open, or a cipher refusal (Transit unreachable) at either end.
     key_errors: tuple[type[Exception], ...] = (
         *_key_unresolved(),
@@ -6219,8 +6254,8 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     except key_errors as exc:
         _emit_error(f"nothing was recorded: {exc}", as_json=args.json)
         return 2
-    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    except _StoreOpenFailed as exc:
+        return _emit_store_open_error(exc.cause, settings.store.path, as_json=args.json)
     except store_errors as exc:
         return _emit_error(
             f"the store refused the write, so nothing was recorded ({exc}). If the engine is "
@@ -6232,6 +6267,12 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     if outcome == "no-transit-key":
         return _emit_error(
             "the store opened without a Transit data key, so there is no key to attest",
+            as_json=args.json,
+        )
+    if outcome == "key-name-too-long":
+        return _emit_error(
+            f"the Transit data key name is longer than {TRANSIT_BOUND_KEY_NAME_MAX} UTF-16 code "
+            "units, which the attestation's key_name column cannot hold, so nothing was recorded",
             as_json=args.json,
         )
     if args.json:

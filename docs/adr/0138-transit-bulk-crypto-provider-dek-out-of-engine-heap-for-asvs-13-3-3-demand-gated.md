@@ -219,6 +219,20 @@ the live cipher's key, it raises `TransitBoundUnattestedError` under `[security]
 enforce` and logs a warning under `warn`. `GET /security/posture` reports the row in
 `transit_bound_attestation`.
 
+**The row is bound to its audit row.** A Manager decision in the same batch, within ruling 2's
+"audited row", and not a further owner ruling. The row also stores the sequence number and chain
+hash of the audit row its write appended. Every read, by the start gate and by the posture alike,
+checks that audit row: it exists, it is the newest attest or withdraw row, it names the same key,
+reason, actor and time, it carries the recorded hash, and its MAC verifies under the audit key of
+its own range. It reuses the chain's row MAC and constant-time compare and walks no chain, so it
+costs one MAC per read. A row that fails counts as no attestation. Without this, anyone with DML on
+the store could insert a row the gate would trust, with no audit trace. Deleting a later withdraw
+row to replay an older attestation breaks the chain instead, which `audit-verify` and the start-up
+walk report.
+
+**The binding is to the key name only**, as ruling 3 says. A store pointed at another Vault, or
+another Transit mount, that holds a key with the same name keeps the attestation.
+
 **What it does not change.** The engine still counts no Transit encrypts. The 2026-09-28
 weaknesses 1 and 2 above stand: passing 2^32 on one key version is silent, and a burst can outrun
 a schedule. Weakness 3 narrows only to this: the engine now knows that a named operator vouched
