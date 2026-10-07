@@ -795,6 +795,24 @@ async def _alert_control_action(engine: Engine, action: str, target: str) -> Non
             )
 
 
+async def _record_upload_prune(store: Store, meta: UploadedFileMeta) -> None:
+    """Write the ``upload.prune`` row for one pruned upload. The retention runner and the
+    save-time sweep both call this, so their rows cannot drift apart.
+
+    BACKLOG #1224: a prune is automated and owner-blind, so the row is attributed to the system
+    principal (matching pipeline/retention.py's ``retention_purge``), never to the pruned file's
+    uploader, and carries no ``client``. The owner is DATA in ``detail``. Both the display name and
+    the IMMUTABLE ``uploader_id`` are recorded: the file is gone, and a username is reassignable
+    (BACKLOG #1225), so a row read later could otherwise name a different person than it meant."""
+    await store.record_audit(
+        "upload.prune",
+        actor="system",
+        detail=json.dumps(
+            {"file_id": meta.file_id, "uploader": meta.uploader, "uploader_id": meta.uploader_id}
+        ),
+    )
+
+
 def _dead_letter_replay_audit(
     *,
     actor: str | None,
@@ -6294,6 +6312,7 @@ def create_app(
             ),
             client=client_ip(request),
         )
+
         # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
         # error must never fail the upload the operator just made — it is logged and retried by the
         # periodic task. Each pruned file is audited (file_id + uploader, never content).
@@ -6308,26 +6327,17 @@ def create_app(
         # ROW, and once the actor is the system principal no address is in scope (ADR 0150 decision 4
         # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
         # `detail.uploader`, which is where it belongs.
+        #
+        # BACKLOG #2261: the request deadline can cancel this handler mid-sweep. prune_on_save then
+        # stops the sweep at its next file and still writes a row for each file it removed.
+        prune_store = engine.store
+
+        async def _audit_prune(pruned: UploadedFileMeta) -> None:
+            await _record_upload_prune(prune_store, pruned)
+
         try:
-            for pruned in (await us.prune_expired()).pruned:
-                await engine.store.record_audit(
-                    "upload.prune",
-                    actor="system",
-                    detail=json.dumps(
-                        {
-                            "file_id": pruned.file_id,
-                            "uploader": pruned.uploader,
-                            # The IMMUTABLE owner key beside the display name. A prune row is a
-                            # permanent record of a deletion whose subject cannot be recovered
-                            # afterwards -- the file is gone -- and a username is reassignable
-                            # (BACKLOG #1225), so a row read later could name a different person
-                            # than it meant. UploadedFileMeta carries both deliberately
-                            # (uploads.py:116); this records both.
-                            "uploader_id": pruned.uploader_id,
-                        }
-                    ),
-                )
-        except OSError:
+            await us.prune_on_save(_audit_prune)
+        except Exception:  # noqa: BLE001 — the upload already succeeded; a prune error must not fail it
             _log.warning("opportunistic uploaded-logs retention prune failed", exc_info=True)
         return _upload_info(meta)
 
@@ -9494,23 +9504,8 @@ def create_managed_app(
                 await _upload_store.warn_if_unsealed()
 
                 async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
-                    # BACKLOG #1224: the retention runner has no operator and no request behind it, so
-                    # the row is attributed to the system principal (matching pipeline/retention.py's
-                    # `retention_purge`) rather than to the pruned file's uploader. The uploader is
-                    # carried as DATA in `detail`, where a reader can still see whose file went. Both
-                    # this site and the request-path sweep had to change together: fixing one would have
-                    # left the same false attribution reachable by the other path.
-                    await store.record_audit(
-                        "upload.prune",
-                        actor="system",
-                        detail=json.dumps(
-                            {
-                                "file_id": meta.file_id,
-                                "uploader": meta.uploader,
-                                "uploader_id": meta.uploader_id,
-                            }
-                        ),
-                    )
+                    # The same row as the request-path sweep's (_record_upload_prune, BACKLOG #1224).
+                    await _record_upload_prune(store, meta)
 
                 upload_retention_runner = UploadRetentionRunner(
                     _upload_store, audit=_audit_upload_prune
