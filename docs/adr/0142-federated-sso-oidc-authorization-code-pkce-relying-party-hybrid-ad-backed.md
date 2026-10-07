@@ -520,15 +520,17 @@ B.1 left the verification of what comes back to the build. These are its criteri
   stated it, rotation SHALL carry it, and a step-up that passes every check SHALL replace it with
   its own in the statement that stamps `reauth_at`. An `oidc` session holding none SHALL be refused
   with `step_up_idp_auth_time_missing`, whose text SHALL NOT tell the operator to try again,
-  because a retry on the same session cannot pass. *Amended 2026-10-06:* this criterion's residual
+  because a retry on the same session cannot pass. The `step_up_idp_auth_time_not_later` text SHALL
+  offer a retry before a new sign-in, because a later IdP answer can pass it. *Amended 2026-10-06:* this criterion's residual
   read "an IdP that ignores `max_age=0` still passes when its
   last sign-in for the user is within that skew of the request", with storing the sign-in's IdP
   `auth_time` named as the fix and not built. It would now pass only when the user signed in at the
   IdP again after the stored value, inside that skew.
 - **AC-16 (identity)** — IF the verified `(iss, sub)` is not byte-for-byte the pair bound to the
   session's account, THEN THE SYSTEM SHALL refuse with `step_up_subject_mismatch` and leave the session
-  as it was. This test SHALL run before both AC-15 freshness tests, so an answer that fails it and
-  either of them is refused as `step_up_subject_mismatch` (BACKLOG #2143). IF the directory no
+  as it was. This test SHALL run after the claims ladder and the session and account checks, and
+  before both AC-15 freshness tests. So an answer that passes those earlier checks, and fails this
+  test and a freshness test, is refused as `step_up_subject_mismatch` (BACKLOG #2143). IF the directory no
   longer returns the account by its immutable id, THEN THE SYSTEM SHALL refuse with
   `not_in_directory`, and a row with no immutable id SHALL be refused with
   `directory_object_id_missing` rather than looked up by name. IF a role stored on the account is

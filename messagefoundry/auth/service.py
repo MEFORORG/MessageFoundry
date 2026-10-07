@@ -629,9 +629,9 @@ STEP_UP_NOT_FRESH = "step_up_not_fresh"
 STEP_UP_SUBJECT_MISMATCH = "step_up_subject_mismatch"
 #: The IdP-clock freshness test's two refusals (BACKLOG #2143), kept apart from the engine-clock
 #: :data:`STEP_UP_NOT_FRESH`. MISSING never clears on a retry against the same session, which holds
-#: no IdP ``auth_time`` to compare. NOT_LATER clears once the IdP answers with a later one: a retry
-#: after a step-up in the same second on an IdP that reports whole seconds, or once a stepped-back
-#: IdP clock catches up. It does not clear while the IdP keeps answering from an earlier sign-in.
+#: no IdP ``auth_time`` to compare. NOT_LATER clears once the IdP answers with a later one, for
+#: example after a stepped-back IdP clock passes the held value. It does not clear while the IdP
+#: keeps answering from an earlier sign-in, or while a slower IdP node answers.
 STEP_UP_IDP_AUTH_TIME_MISSING = "step_up_idp_auth_time_missing"
 STEP_UP_IDP_AUTH_TIME_NOT_LATER = "step_up_idp_auth_time_not_later"
 FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
@@ -662,9 +662,9 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         ),
         STEP_UP_IDP_AUTH_TIME_NOT_LATER: (
             "The identity provider's answer is no newer than this session's last confirmation, so"
-            " it could not confirm it's you. Wait a moment, then try again. If it repeats, sign out,"
-            " then sign in again. If it still repeats, the provider is ignoring max_age=0 and"
-            " prompt=login."
+            " it could not confirm it's you. Try again. If it repeats, sign out, then sign in again."
+            " If it still repeats, the provider may be ignoring max_age=0 and prompt=login, or its"
+            " clocks may disagree."
         ),
         "session_gone": "Your session ended. Sign in again.",
         "state_unknown": "The confirmation expired. Try again.",
@@ -4293,14 +4293,15 @@ class AuthService:
         """Redeem a step-up flow and, when the IdP proof holds, elevate the staged session.
 
         Checks, in order, each failing CLOSED with nothing elevated: the flow exists and ``state``
-        matches; it is a step-up flow; the code exchange and the whole claims ladder pass (the nonce,
-        the pinned issuer, ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA
-        claim when that gate is on); the session is still live by every test
-        :meth:`identity_for_token` applies, and still an OIDC session; the account is enabled and
-        still a directory account; the token's verified ``(issuer, sub)`` is byte-for-byte the pair
-        bound to the account; ``auth_time`` is fresh by our clock (see the inline note), and later
-        than the IdP ``auth_time`` the session holds; the directory still has the account; and every role stored on the account is among the roles its current
-        groups map to (BACKLOG #2154). Then it elevates through :meth:`_elevated_hash`, so
+        matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG
+        #2301); the code exchange and the whole claims ladder pass (the nonce, the pinned issuer,
+        ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA claim when that gate
+        is on); the session is still live by every test :meth:`identity_for_token` applies, and
+        still an OIDC session; the account is enabled and still a directory account; the token's
+        verified ``(issuer, sub)`` is byte-for-byte the pair bound to the account; ``auth_time`` is
+        fresh by our clock (see the inline note); the session holds an IdP ``auth_time``, and the
+        new one is later; the directory still has the account; and every role stored on the
+        account is among the roles its current groups map to (BACKLOG #2154). Then it elevates through :meth:`_elevated_hash`, so
         rotation, the MFA carry and the single-use grant follow the password leg's rules exactly.
 
         Refusals are audited under the staged session's account wherever the flow names one, so they

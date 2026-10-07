@@ -574,9 +574,9 @@ async def test_an_oidc_session_with_no_stored_auth_time_is_refused(
 def test_the_idp_clock_refusals_have_their_own_reasons_and_say_sign_in_again() -> None:
     """BACKLOG #2143. RED when: the IdP-clock refusals fold back into ``step_up_not_fresh``, or the
     missing-value text offers a retry. A retry on a session holding no IdP ``auth_time`` cannot
-    pass, so that text sends the operator to sign in again and nowhere else. The not-later text may
-    offer a retry, which a later IdP answer can pass, but must also name the new sign-in. The
-    engine-clock refusal keeps its own text."""
+    pass, so that text sends the operator to sign in again and nowhere else. The not-later text
+    offers a retry first, which a later IdP answer can pass, then the new sign-in (ADR 0142 AC-15).
+    The engine-clock refusal keeps its own text."""
     from messagefoundry.auth.service import _STEP_UP_ERRORS
 
     assert STEP_UP_NOT_FRESH == "step_up_not_fresh"
@@ -584,10 +584,12 @@ def test_the_idp_clock_refusals_have_their_own_reasons_and_say_sign_in_again() -
     assert STEP_UP_IDP_AUTH_TIME_NOT_LATER == "step_up_idp_auth_time_not_later"
     missing = _STEP_UP_ERRORS[STEP_UP_IDP_AUTH_TIME_MISSING].lower()
     assert "sign in again" in missing, missing
-    for retry_word in ("try", "retry", "again later", "in a moment"):
+    for retry_word in ("try", "again later", "in a moment"):
         assert retry_word not in missing, (retry_word, missing)
     not_later = _STEP_UP_ERRORS[STEP_UP_IDP_AUTH_TIME_NOT_LATER].lower()
-    assert "sign in again" in not_later and "max_age=0" in not_later, not_later
+    assert "try again" in not_later and "sign in again" in not_later, not_later
+    assert not_later.index("try again") < not_later.index("sign in again"), not_later
+    assert "max_age=0" in not_later, not_later
     assert "Try again" in _STEP_UP_ERRORS[STEP_UP_NOT_FRESH]
 
 
@@ -700,26 +702,30 @@ async def test_another_persons_older_idp_answer_is_a_subject_mismatch_not_stale(
 ) -> None:
     """BACKLOG #2143. RED when: either freshness test runs before the subject check again.
 
-    Another person's IdP session answers with an ``auth_time`` that one freshness test refuses on
-    its own. ``engine-clock-stale`` is older than the staged moment less the skew, which only the
-    engine-clock test catches first. ``idp-clock-not-later`` is inside the skew but equal to the
-    value this session holds, which only the IdP-clock test catches. The subject test refuses both.
+    Another person's IdP session answers with an ``auth_time`` that exactly one freshness test
+    refuses. ``engine-clock-stale`` is older than the staged moment less the skew, but later than
+    the older sign-in this arm holds, so only the engine-clock test refuses it.
+    ``idp-clock-not-later`` is inside the skew but equal to the value this session holds, so only
+    the IdP-clock test refuses it. The subject test refuses both.
     The audit row must say subject mismatch, which is the signal that another person's IdP session
     answered; a freshness reason would hide it. Both answers pass the claims ladder."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)
-        token = await _oidc_session(service, monkeypatch, rsa_key)
+        skew = service._settings.oidc_clock_skew_seconds
+        signed_in = {"engine-clock-stale": time.time() - 10 * skew, "idp-clock-not-later": None}
+        over = {} if signed_in[which] is None else {"auth_time": signed_in[which]}
+        token = await _oidc_session(service, monkeypatch, rsa_key, **over)
         held = await _held_auth_time(store, token)
         assert held is not None
         flow_id, _url = await _begin(service, token)
-        skew = service._settings.oidc_clock_skew_seconds
         floor = _staged(service, flow_id).issued_at - skew
         if which == "engine-clock-stale":
             answered_at = floor - skew - 1
+            assert held < answered_at < floor, "only the engine-clock test should refuse this arm"
         else:
             answered_at = held
-            assert answered_at >= floor, "the engine-clock test would refuse this arm first"
+            assert answered_at >= floor, "only the IdP-clock test should refuse this arm"
 
         out = await _return_from_idp(
             service,
