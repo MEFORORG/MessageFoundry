@@ -980,3 +980,74 @@ def test_r4_finding_8_repetition_may_be_none() -> None:
         params={"path": "OBX-3", "value": "x", "repetition": None},
     )
     assert "repetition=None" in rewrite_source(_ARITH, edit)
+
+
+# --- review of head bd5843dbd4 ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "loops",
+    [
+        # One loop is 1-based, the other binding the same name is not.
+        '    for i in range(1, 3):\n        pass\n    for i in range(0, msg.count_segments("OBX")):\n',
+        # A negative step reaches 0.
+        "    for i in range(3, -1, -1):\n",
+    ],
+    ids=["any-loop", "negative-step"],
+)
+def test_r5_findings_1_2_every_loop_binding_an_index_is_1_based(loops: str) -> None:
+    src = f'@handler("H")\ndef h(msg):\n{loops}        pass\n    return Send("OB", msg)\n'
+    line = len(src.splitlines()) - 1
+    edit = _edit(
+        "insert_row",
+        line,
+        position="before",
+        action="set_field",
+        params={"path": "OBX-3", "value": "x", "occurrence": {"expr": "i"}},
+    )
+    with pytest.raises(LensRewriteError, match="not a whole number"):
+        rewrite_source(src, edit)
+
+
+def test_r5_finding_3_a_guarded_raise_does_not_move_into_another_same_header_guard() -> None:
+    src = """\
+@handler("H")
+def h(msg):
+    if msg.field("PID-3"):
+        msg.set("B", "2")
+        raise ValueError("bad")
+    msg.set("PID-3", "X")
+    if msg.field("PID-3"):
+        msg.set("C", "3")
+    return Send("OB", msg)
+"""
+    edit = _edit("move_row", 5, to_line_start=8, to_position="after")
+    assert rewrite_source(src, edit) != src
+    _refused(src, edit, typed_only=True)
+
+
+@pytest.mark.parametrize(
+    "write", ['builtins.globals()["OB_DEST"] = 1', 'builtins.exec("OB_DEST = 1")']
+)
+def test_r5_finding_4_a_builtins_attribute_voids_inert_names(write: str) -> None:
+    src = (
+        'import builtins\n\nOB_DEST = "OB_X"\n\n\n'
+        f"def poke():  # type: ignore[no-untyped-def]\n    {write}\n\n\n"
+        '@handler("H")\ndef h(msg):\n    return Send("OB", msg)\n'
+    )
+    edit = _edit("set_params", 12, params={"to": {"expr": "OB_DEST"}})
+    _refused(src, edit, match=REFUSED)
+
+
+def test_r5_finding_5_a_comprehension_target_is_not_a_handler_read() -> None:
+    src = """\
+@handler("H")
+def h(msg):
+    msg.set("Z", "z")
+    for seg in msg.segments("OBX"):
+        pass
+    ids = [seg for seg in msg.segments("PID")]
+    return Send("OB", msg)
+"""
+    edit = _edit("move_row", 6, to_line_start=3, to_position="before")
+    assert rewrite_source(src, edit).index("ids = ") < rewrite_source(src, edit).index("for seg")

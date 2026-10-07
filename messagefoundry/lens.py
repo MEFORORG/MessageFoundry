@@ -2672,14 +2672,21 @@ def _linear_items(func: ast.FunctionDef | ast.AsyncFunctionDef, ctx: _TypedCtx) 
     """Every statement of ``func`` in source order, as :class:`_Item` s."""
     items: list[_Item] = []
 
+    seen: Counter[str] = Counter()
+
     def visit(stmts: list[ast.stmt], path: tuple[str, ...]) -> None:
         for stmt in stmts:
             key = _stmt_key(stmt)
+            seen[key] += 1
+            # Which block with this header: a raise may not move into another guard with the same
+            # test (review of head bd5843dbd4, finding 3). Moving a whole same-header block past
+            # another renumbers them, so that move is refused too; the safe direction.
+            nth = seen[key]
             at = len(items)
             terminal = isinstance(stmt, ast.Return | ast.Raise)
             items.append(_Item(stmt, key, path, not _is_typed_unit(stmt, ctx), at + 1, terminal))
             for label, suite, _ in _suites(stmt):
-                visit(suite, (*path, f"{key}|{label}"))
+                visit(suite, (*path, f"{key}#{nth}|{label}"))
             items[at] = items[at]._replace(end=len(items))
 
     visit(func.body, ())
@@ -2801,12 +2808,22 @@ def _read_sites(node: ast.AST, local: set[str], defined: set[str]) -> list[tuple
     where = _stmt_key(node) if isinstance(node, ast.stmt) else ast.dump(node)
     nth: Counter[str] = Counter()
     out: list[tuple[str, str, int]] = []
-    for n in ast.walk(node):
-        if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)):
-            continue
-        nth[n.id] += 1
-        if n.id in local and n.id not in defined:
-            out.append((where, n.id, nth[n.id]))
+    pending: list[tuple[ast.AST, frozenset[str]]] = [(node, frozenset())]
+    while pending:
+        n, own = pending.pop(0)
+        if isinstance(n, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
+            # The comprehension binds its targets in a scope of its own (review of head
+            # bd5843dbd4, finding 5): ``[seg for seg in ...]`` reads no handler ``seg``.
+            own = own | {
+                t.id for g in n.generators for t in ast.walk(g.target) if isinstance(t, ast.Name)
+            }
+        elif isinstance(n, ast.Lambda):
+            own = own | {a.arg for a in ast.walk(n.args) if isinstance(a, ast.arg)}
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            nth[n.id] += 1
+            if n.id in local and n.id not in defined and n.id not in own:
+                out.append((where, n.id, nth[n.id]))
+        pending.extend((child, own) for child in ast.iter_child_nodes(n))
     return out
 
 
@@ -4577,18 +4594,15 @@ def _message_scope(
     ]
     loop_indexes = {x for x in set(range_targets) if bound.count(x) == range_targets.count(x)}
     # ``occurrence=i`` is 1 or more only when every loop binding ``i`` starts at 1 or more.
-    one_based = {
+    # Every loop binding the name must qualify: ``range(k, n)`` or ``range(k, n, step)`` with literal
+    # ``k >= 1`` and literal ``step >= 1`` (review of head bd5843dbd4, findings 1 and 2).
+    zero_based = {
         n.target.id
         for n in ast.walk(func)
         if isinstance(n, ast.For | ast.AsyncFor)
         and isinstance(n.target, ast.Name)
-        and isinstance(n.iter, ast.Call)
-        and len(n.iter.args) >= 2
-        and isinstance(n.iter.args[0], ast.Constant)
-        and type(n.iter.args[0].value) is int
-        and n.iter.args[0].value >= 1
+        and not _is_one_based_range(n.iter)
     }
-    zero_based = {t for t in range_targets if t not in one_based}
     module_names, star = _module_bound_names(tree)
     if star or "range" in bound or "range" in module_names:
         loop_indexes = set()
@@ -4609,6 +4623,24 @@ def _message_scope(
         frozenset(loop_indexes - zero_based),
         _module_shadows(tree),
         frozenset(set(bound) - loop_indexes - globals_ - {"msg"}),
+    )
+
+
+def _is_one_based_range(node: ast.expr) -> bool:
+    """Whether ``node`` is ``range(k, n)`` or ``range(k, n, step)`` with int literals ``k >= 1`` and
+    ``step >= 1``, so every index it yields is 1 or more."""
+
+    def at_least_one(n: ast.expr) -> bool:
+        return isinstance(n, ast.Constant) and type(n.value) is int and n.value >= 1
+
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "range"
+        and not node.keywords
+        and len(node.args) in (2, 3)
+        and at_least_one(node.args[0])
+        and (len(node.args) == 2 or at_least_one(node.args[2]))
     )
 
 
@@ -4714,7 +4746,15 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
     mutated: set[str] = set()
     for n in ast.walk(tree):
         if (isinstance(n, ast.Name) and n.id in _GLOBALS_WRITERS) or (
-            isinstance(n, ast.Attribute) and n.attr in _GLOBALS_ATTRS
+            isinstance(n, ast.Attribute)
+            and (
+                n.attr in _GLOBALS_ATTRS
+                or (
+                    n.attr in _GLOBALS_WRITERS
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id == "builtins"
+                )
+            )
         ):
             return {}  # ``h.__globals__[...]``, ``sys.modules[...]`` and the like
         if isinstance(n, ast.ImportFrom) and any(al.name == "*" for al in n.names):
