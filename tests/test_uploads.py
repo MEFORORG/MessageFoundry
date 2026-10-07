@@ -472,6 +472,7 @@ async def test_stopping_the_runner_mid_sweep_audits_every_file_it_deleted(tmp_pa
         await asyncio.sleep(0)  # stop() raises its flags before its first await
     finally:
         release.set()
+        await runner.stop()  # a no-op once `stopping` has run; stops the loop if an assert failed
     await asyncio.wait_for(stopping, 10)
 
     remaining = {m.file_id for m in await store.list_files()}
@@ -513,26 +514,72 @@ async def test_a_refused_unlink_keeps_the_rest_of_the_sweep_auditable(tmp_path: 
     assert [m.file_id for m in await store.list_files()] == [stuck]
 
 
+async def _stop_stuck_runner(
+    store: UploadStore,
+    paused: threading.Event,
+    release: threading.Event,
+    caplog: pytest.LogCaptureFixture,
+) -> logging.LogRecord:
+    """Start a runner over ``store``, wait for its sweep to park on ``paused``, stop it with a
+    0.05 s bound, release the sweep, and return the one record ``stop()`` logged about it."""
+    runner = UploadRetentionRunner(
+        store,
+        audit=_audited_to([]),
+        clock=lambda: time.time() + 31 * 86_400,
+        stop_timeout_seconds=0.05,
+    )
+    runner.start()
+    try:
+        assert await asyncio.to_thread(paused.wait, 10), "the sweep never reached its park point"
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+            await asyncio.wait_for(runner.stop(), 10)
+    finally:
+        release.set()
+        await runner.stop()  # a no-op once stop() has run; stops the loop if an assert failed
+    [record] = [r for r in caplog.records if "retention sweep" in r.getMessage()]
+    return record
+
+
 async def test_a_sweep_stuck_past_the_stop_bound_is_cancelled_and_logged(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #2065, the bound. A sweep stuck inside one filesystem call cannot be stopped, so
     ``stop()`` waits only ``stop_timeout_seconds`` and then names the audit gap at ERROR rather than
-    holding shutdown open forever or returning in silence."""
+    holding shutdown open forever or returning in silence. The sweep is parked on its SECOND pair,
+    past that pair's abort check, so two pairs go with no audit row and the ERROR counts both."""
     store = _quota_store(tmp_path, retention_days=30)
-    await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
-    paused, release = _pause_sweep_at_pair(store, 1)
-    runner = UploadRetentionRunner(
-        store, clock=lambda: time.time() + 31 * 86_400, stop_timeout_seconds=0.05
-    )
-    runner.start()
-    try:
-        assert await asyncio.to_thread(paused.wait, 10), "the sweep never started deleting"
-        with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
-            await asyncio.wait_for(runner.stop(), 10)
-    finally:
-        release.set()
-    assert "did not finish within 0.05s of shutdown" in caplog.text, caplog.text
+    for i in range(2):
+        await store.save(
+            data=f"aging {i}\n".encode(), filename=f"f{i}.txt", uploader="op", uploader_id="u-op"
+        )
+    record = await _stop_stuck_runner(store, *_pause_sweep_at_pair(store, 2), caplog)
+    assert record.levelno == logging.ERROR, record.getMessage()
+    assert "did not finish within 0.05s of shutdown" in record.getMessage()
+    assert "started deleting 2 file(s) it had not audited" in record.getMessage()
+
+
+async def test_a_stuck_sweep_that_deleted_nothing_logs_no_audit_gap(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2264 item 1. ``stop()`` logged its possible-audit-gap ERROR even when the sweep had
+    deleted nothing. Parked in its sidecar scan, the sweep has deleted nothing, and once released
+    it sees the abort and deletes nothing more, so no row is lost: a WARNING, not an ERROR."""
+    store = _quota_store(tmp_path, retention_days=30)
+    meta = await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    paused, release = threading.Event(), threading.Event()
+    real_scan = store._scan_metas_sync
+
+    def _stuck_scan() -> list[UploadedFileMeta]:
+        paused.set()
+        release.wait(timeout=10)
+        return real_scan()
+
+    monkeypatch.setattr(store, "_scan_metas_sync", _stuck_scan)
+    record = await _stop_stuck_runner(store, paused, release, caplog)
+    assert record.levelno == logging.WARNING, record.getMessage()
+    assert "no upload.prune row is lost" in record.getMessage()
+    # The abort was set before the release, so the thread leaves the pair whole.
+    assert [m.file_id for m in await store.list_files()] == [meta.file_id]
 
 
 async def test_a_refused_body_unlink_is_not_reported_and_the_pair_stays_whole(
@@ -623,11 +670,12 @@ async def test_a_cancelled_shutdown_does_not_escape_stop(
 
         teardown = asyncio.create_task(_teardown())
         await asyncio.sleep(0.05)
-        with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
             teardown.cancel()
             assert await asyncio.wait_for(teardown, 10) == "teardown continued"
     finally:
         release.set()
+        await runner.stop()  # a no-op once stop() has run; stops the loop if an assert failed
     assert "shutdown itself was cancelled" in caplog.text, caplog.text
 
 

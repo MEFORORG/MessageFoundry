@@ -496,7 +496,8 @@ class UploadStore:
         # concurrent uploads each read a stale count and double-book the budget. Serialising the whole
         # build-and-write (not just the check) is what makes it atomic — releasing between them is the
         # race. The throughput cost is acceptable here and nowhere near the data plane: this is the
-        # operator diagnostic-upload surface, and each pass is bounded by max_bytes.
+        # operator diagnostic-upload surface. Each pass is one sidecar scan plus a write bounded by
+        # max_bytes.
         #
         # This lock is an asyncio.Lock, so it is per-event-loop and therefore PER-PROCESS. Engine
         # sharding is the built, shipped, default scaling axis and nothing partitions uploads_dir per
@@ -1318,6 +1319,7 @@ class UploadStore:
         now: float | None = None,
         retention_days: int | None = None,
         abort: threading.Event | None = None,
+        on_delete: Callable[[], None] | None = None,
     ) -> PruneResult:
         """Age-based retention sweep (ASVS 5.2.4): delete every (blob, meta) pair whose ``uploaded_at`` is
         older than ``retention_days`` (default: the configured ``retention_days``), then sweep the write
@@ -1336,7 +1338,12 @@ class UploadStore:
         ``abort`` stops the pass early without losing track of what it already deleted (BACKLOG #2065;
         :meth:`UploadRetentionRunner.stop` says why cancelling is not enough). The pass checks it before
         the scan and before each pair, then skips the orphan sweep and returns the pairs it did delete.
-        A pair is never half-deleted by an abort."""
+        A pair is never half-deleted by an abort.
+
+        ``on_delete`` is called in the pass's thread for each aged pair, right after the ``abort``
+        check and before the pair's unlinks. It lets a caller tell a pass that has deleted nothing
+        from one that may have, before the pass returns. It counts attempts, so a pair whose unlink
+        is refused counts too."""
         days = self._retention_days if retention_days is None else max(1, int(retention_days))
         at = time.time() if now is None else now
         cutoff = at - days * _SECONDS_PER_DAY
@@ -1352,6 +1359,10 @@ class UploadStore:
                     continue
                 if stop.is_set():
                     break
+                # Counted before the path guard, so nothing runs between the abort check and the
+                # count. A pair the guard then refuses is over-counted, which errs toward the ERROR.
+                if on_delete is not None:
+                    on_delete()
                 # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
                 try:
                     blob_path, meta_path = self._paths(meta.file_id)
@@ -1411,12 +1422,15 @@ class UploadStore:
         *,
         now: float | None = None,
         abort: threading.Event | None = None,
+        on_delete: Callable[[], None] | None = None,
+        on_audited: Callable[[], None] | None = None,
     ) -> PruneResult:
         """One :meth:`prune_expired` pass, then one ``audit`` call per pruned file.
 
         The shared body of the retention runner and the save-time sweep. A failed audit call is
-        logged and the rest still run, so one bad row never costs the others."""
-        result = await self.prune_expired(now=now, abort=abort)
+        logged and the rest still run, so one bad row never costs the others. ``on_delete`` is
+        :meth:`prune_expired`'s, and ``on_audited`` is called after each audit call, failed or not."""
+        result = await self.prune_expired(now=now, abort=abort, on_delete=on_delete)
         if audit is not None:
             for meta in result.pruned:
                 try:
@@ -1428,6 +1442,8 @@ class UploadStore:
                         "uploaded-logs prune audit failed for %s; it has no upload.prune audit row",
                         meta.file_id,
                     )
+                if on_audited is not None:
+                    on_audited()
         return result
 
     async def prune_on_save(
@@ -1548,10 +1564,35 @@ _DEFAULT_PRUNE_INTERVAL_SECONDS = 3600.0
 
 # How long ``UploadRetentionRunner.stop`` waits for a sweep already in flight to finish and write its
 # audit rows. The sweep stops at its next file once asked, so this bounds a hung filesystem call, a
-# sidecar scan already under way, and the audit writes for what the sweep had deleted. It sits well
-# under NSSM's 15 s graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1),
-# because the runner stops FIRST in the API lifespan's teardown and engine.stop() still has to run.
+# sidecar scan already under way, and the audit writes for what the sweep had deleted. The runner
+# stops FIRST in the API lifespan's teardown, and engine.stop() still has to run after it.
+#
+# It shares NSSM's 15 s graceful-stop window (AppStopMethodConsole in
+# scripts/service/install-service.ps1) with uvicorn's connection drain, which runs BEFORE the
+# lifespan teardown. ``serve`` passes uvicorn no ``timeout_graceful_shutdown``, so that drain has no
+# bound: a request still open at Ctrl+C can use up the window before this wait starts. A shorter
+# bound here would not fix that, and would cost audit rows on a slow disk, so 5 s stands. The fix is
+# to bound the drain where ``serve`` calls ``uvicorn.run``.
 _DEFAULT_STOP_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass
+class _SweepTally:
+    """How far one runner sweep got, read by :meth:`UploadRetentionRunner.stop` when it times out.
+
+    ``deleting`` counts pairs the sweep's thread started deleting, and ``audited`` counts audit
+    calls that returned or raised. A raised call is counted because
+    :meth:`UploadStore.prune_and_audit` already logs it per file. Each sweep gets its own, so a thread a timed-out stop left running
+    never writes into the next sweep's counts. One writer per field, so no lock."""
+
+    deleting: int = 0
+    audited: int = 0
+
+    def started_delete(self) -> None:
+        self.deleting += 1
+
+    def finished_audit(self) -> None:
+        self.audited += 1
 
 
 class UploadRetentionRunner:
@@ -1580,6 +1621,7 @@ class UploadRetentionRunner:
         # The sweep's worker thread reads this one; an asyncio.Event is not thread-safe.
         self._abort = threading.Event()
         self._task: asyncio.Task[None] | None = None
+        self._tally = _SweepTally()  # the sweep in flight, or the last one
 
     def start(self) -> None:
         """Spawn the supervised prune loop (idempotent)."""
@@ -1607,8 +1649,9 @@ class UploadRetentionRunner:
 
         A sweep can outlast that bound: one stuck filesystem call, the sidecar scan or orphan sweep
         already under way, or the audit writes for a long list of deletions. The task is then
-        cancelled and the loss is logged as an ERROR. The loss covers every file the sweep deleted
-        and had not yet audited, not only what it deletes afterwards.
+        cancelled. When the sweep had started deleting a file it had not yet audited, that loss is
+        logged as an ERROR. It covers every such file, not only one whose unlink is still running.
+        A sweep that had no such file loses no row, so it is logged as a WARNING instead.
 
         This never raises into the caller's teardown. If the caller is itself cancelled while
         waiting, the sweep is cancelled the same way and this returns, as it did before #2065, so the
@@ -1630,11 +1673,17 @@ class UploadRetentionRunner:
             why = f"did not finish within {self._stop_timeout:g}s of shutdown"
         except asyncio.CancelledError:
             why = "was still running when shutdown itself was cancelled"
-        _log.error(
-            "uploaded-logs retention sweep %s; cancelling it. A file it deleted and had not yet "
-            "audited, or deletes after this point, has no upload.prune audit row",
-            why,
+        # Read before the cancel. With the abort above set, the sweep's thread starts no unlink it
+        # has not already counted (see prune_expired's on_delete).
+        unaudited = self._tally.deleting - self._tally.audited
+        level = logging.ERROR if unaudited > 0 else logging.WARNING
+        outcome = (
+            f"It started deleting {unaudited} file(s) it had not audited, and each one it removed "
+            "has no upload.prune audit row"
+            if unaudited > 0
+            else "It had deleted no file it had not audited, so no upload.prune row is lost"
         )
+        _log.log(level, "uploaded-logs retention sweep %s; cancelling it. %s", why, outcome)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -1659,8 +1708,13 @@ class UploadRetentionRunner:
         """One :meth:`UploadStore.prune_and_audit` pass for ``now`` (default: the injected clock).
         The pass's orphan count rides back in the result; it is logged by the sweep and carries no
         metadata to audit (see :class:`PruneResult`)."""
+        tally = self._tally = _SweepTally()
         return await self._store.prune_and_audit(
-            self._audit, now=self._clock() if now is None else now, abort=self._abort
+            self._audit,
+            now=self._clock() if now is None else now,
+            abort=self._abort,
+            on_delete=tally.started_delete,
+            on_audited=tally.finished_audit,
         )
 
 
@@ -1686,9 +1740,11 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     A bare ``to_thread`` re-raises a cancellation at once while its thread keeps running. ``save``
     then pays its cross-shard reservation back and drops ``_quota_lock`` while the file is still
     being written, so a sibling can read the ledger and scan the disk and count neither. That breaks
-    the premise :class:`UploadQuotaError`'s ordering argument rests on. The write is bounded by
-    ``max_bytes``, so the wait is too. Further cancellations while waiting are absorbed, and a
-    ``CancelledError`` is raised once the thread is done.
+    the premise :class:`UploadQuotaError`'s ordering argument rests on. The save's thread runs the
+    quota's sidecar scan and then the write. The write is bounded by ``max_bytes``. The scan is
+    bounded by the number of sidecars in the dir, which per-uploader quotas cap for each uploader
+    but nothing caps overall. The wait is as long as both. Further cancellations while waiting are
+    absorbed, and a ``CancelledError`` is raised once the thread is done.
 
     The wait is on the executor's own Future, never on a Task wrapping ``to_thread``. ``asyncio.run``
     cancels every pending TASK at shutdown, so a Task here would be cancelled out from under the
@@ -1734,8 +1790,8 @@ async def _wait_to_completion[T](
     caller already logs is logged twice.
 
     ``cancel_bound`` limits the wait after a cancellation, in seconds; ``None`` waits as long as it
-    takes, which the bounded file write needs. A ledger call waits on the store, which may not be
-    bounded at all. At the bound this raises with ``fut`` still running, and the caller decides
+    takes, which the save's thread needs, since a thread cannot be stopped. A ledger call waits on
+    the store, which may not be bounded at all. At the bound this raises with ``fut`` still running, and the caller decides
     what to do with it. Under an anyio scope, the scope cancels again on every loop pass, so the
     wait costs CPU, and the bound limits that too.
 
