@@ -154,6 +154,17 @@ def test_an_env_reason_is_shown_by_its_key_never_its_default() -> None:
     assert reason.startswith("env('r')")
 
 
+@pytest.mark.parametrize("value", [0, False, []], ids=["zero", "false", "empty-list"])
+def test_a_falsy_wrong_type_reason_is_named_by_type_not_as_missing(value: object) -> None:
+    reg = Registry()
+    spec = DatabaseLookupSpec("LK", {"tls_hop_attested": True, "tls_hop_attested_reason": REASON})
+    spec.settings["tls_hop_attested_reason"] = value
+    reg.add_lookup(spec)
+    [hop] = attested_secure_hop_records(reg)
+    assert hop.reason == f"(not a string: {type(value).__name__})"
+    assert hop.refused
+
+
 # --- item 4: one reason rule for both readers --------------------------------------------------
 
 

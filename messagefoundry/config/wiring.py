@@ -5297,8 +5297,10 @@ def _attested_reason_text(value: object) -> str | None:
 
     A reason written past the factory may be any value. An ``env()`` reference is named by its key,
     never its default, and any other non-string, a list holding an ``env()`` included, is named by
-    its type only, so no default or ``repr`` reaches ``check`` output (vault BACKLOG #3139)."""
-    if not value:
+    its type only, so no default or ``repr`` reaches ``check`` output (vault BACKLOG #3139). Only
+    ``None`` and an empty string count as no reason, so a falsy wrong type such as ``0`` is still
+    named as a wrong type."""
+    if value is None or value == "":
         return None
     if isinstance(value, str):
         return value
