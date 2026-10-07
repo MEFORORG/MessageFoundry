@@ -1783,6 +1783,27 @@ has already swapped when that row is written. So a failed write is logged at ERR
 still answers success. It reports `degraded: true` with `audit` among its `failures`. A released
 reload carries that into its `approval.approved` row.
 
+**An ungated reload proves the audit log works before it swaps (vault BACKLOG #2254).** A reload
+that dual control does not hold has no `approval.release_attempted` row before it. So
+`POST /config/reload` writes its own `config_reload_attempted` row first, naming the requester and
+the requested directory. If the audit log refuses that row, the route answers **503**, nothing
+loads or swaps, and an `audit_write_failed` alert keyed `config_reload:inline` is raised. A dry run
+writes no such row, because it swaps nothing. Like the gate's row, it says *attempted*, and an
+attempt row with no row after it is not proof the reload was refused or cancelled. At least a
+refusal or cancellation whose own row then fails, and an unexpected fault in the reload, leave it
+alone. The 503 has the same two lost-COMMIT exceptions as the gate's, listed above, where the
+attempt row may have committed after all.
+
+**An inline or released reload's `config_reload` row names that reload's own config (vault
+BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
+the digest it took before the swap. The row is written after the swap, so a second reload or a
+connection flag toggle can move the engine on first. The row then still names its own config, but
+is marked `superseded` and `baseline_unchecked`, so the next start passes over it and does not
+compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
+fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
+runs just before the write, so a change after it is not caught. A cluster convergence reload's
+row is still read from the engine's live state when it is written.
+
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is `approval.too_early` and `approval.stale_requester`. A claim, a rejection or
