@@ -77,8 +77,10 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 ## 3. Encryption in transit — no PHI on the wire in cleartext
 
 - **API / WSS:** in-process TLS (`MEFOR_API_TLS_CERT_FILE` / `MEFOR_API_TLS_KEY_FILE`), or an upstream
-  TLS terminator (`tls_terminated_upstream` + `trusted_proxies`). A non-loopback API bind without TLS is
-  **refused at startup**. Behind a terminator with no `tls_cert_file`, the proxy-to-engine hop is
+  TLS terminator (`tls_terminated_upstream` + `trusted_proxies`). A non-loopback API bind with neither is
+  **refused at startup**. The engine's self-signed placeholder certificate does not count
+  ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+  Behind a terminator with no `tls_cert_file`, the proxy-to-engine hop is
   **plaintext** and not encrypted by the engine. Your site must keep it private, and `serve` requires
   `[api].plaintext_upstream_hop_acknowledged` to say so (see `docs/CONFIGURATION.md`).
 - **MLLP data plane:** **MLLP-over-TLS** (`tls=True` per connection). A non-loopback MLLP listener without

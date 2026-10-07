@@ -472,7 +472,8 @@ suite("engine control — the Start plan provisions before it serves (Wave 5)", 
   });
 
   test("starting without an administrator is a deliberate choice, and provisions nothing", async () => {
-    // A posture with sign-in off needs none; at the shipped posture serve refuses and names provision-admin.
+    // At the shipped posture serve refuses and names provision-admin; under warn or the notice waiver it
+    // starts with nobody able to manage users and roles. `serve` cannot run with sign-in off.
     const { fx, calls } = fakeEffects({ probes: [NEEDS], choice: "skip" });
     assert.strictEqual(await runStartPlan(fx), "servedWithoutAdmin");
     assert.deepStrictEqual(calls, ["probe", "choose", "serve"]);

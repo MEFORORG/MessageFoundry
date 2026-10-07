@@ -430,8 +430,8 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       non-loopback bind **without** an operator certificate (or a trusted terminator) is **refused at
       startup**. **Never use `--allow-insecure-bind` for real PHI.** It is a loud dev-only escape, and it
       works only under `[security].enforcement = warn`. It serves bearer tokens and PHI behind that
-      placeholder, which no trust store vouches for, so an on-path attacker can pose as the engine to
-      any client that has not pinned it.
+      placeholder. No trust store vouches for the placeholder. So an on-path attacker can pose as the
+      engine to any client that has not pinned it.
       (`serve` always requires sign-in; there is no switch that turns it off.)
 - [ ] **MLLP off-loopback requires native TLS too.** MLLP-over-TLS is built: set `tls = true` +
       `tls_cert_file`/`tls_key_file` per connection (opt-in mTLS via `tls_ca_file`; ≥ TLS 1.2). MLLP is
