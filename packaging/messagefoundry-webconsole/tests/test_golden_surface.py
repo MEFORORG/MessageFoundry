@@ -101,8 +101,8 @@ async def test_ui_route_table_matches_golden(engine: Engine) -> None:
 
 
 async def test_ui_write_action_registry_matches_golden(engine: Engine) -> None:
-    """The write-action registry is pinned as ``pattern<TAB>action``. This is the step-up re-auth
-    allow-list; a stale/misspelled/renamed pattern after a route move — the exact failure a
+    """The write-action registry is pinned as ``pattern<TAB>action<TAB>flags<TAB>label``. This is
+    the step-up re-auth allow-list; a stale/misspelled/renamed pattern after a route move — the exact failure a
     single-module registry can still make silently — diverges from the golden and fails here.
 
     THE ACTION COLUMN IS THE SECURITY-LOAD-BEARING HALF (BACKLOG #1148). ``action`` is the
@@ -151,10 +151,15 @@ async def test_ui_write_action_registry_matches_golden(engine: Engine) -> None:
     ``test_security_doc_drift::test_every_ui_route_appears_in_the_ui_route_map``, which compares the
     dependency name against a row in the public, tracked ``docs/SECURITY.md``. So the ROUTE's gate is
     guarded and environment-independent; it was the REGISTRATION's flags that were not.
+
+    THE LABEL COLUMN (vault BACKLOG #2764) is the words ``/ui/reauth`` shows the operator: "Confirm
+    it's you to: <label>". Pinned so a label cannot drift away from the action it names (a reworded
+    pattern keeping a stale label would tell the operator they confirm something they are not).
     """
     await _serve_ui_app(engine)  # mount so every module-level register_ui_action has fired
     actual = sorted(
         f"{action.path_re.pattern}\t{action.action or _UNTAGGED}\t{_continuation_flags(action)}"
+        f"\t{action.label}"
         for action in ui_auth._UI_WRITE_ACTIONS
     )
     golden = _read_golden("ui_write_actions.txt")

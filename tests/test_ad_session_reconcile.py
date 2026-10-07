@@ -37,7 +37,12 @@ from messagefoundry.auth.ldap import (
     LdapError,
     LdapReferralError,
 )
-from messagefoundry.auth.notifications import USERNAME_CHANGED
+from messagefoundry.auth.notifications import (
+    ACCOUNT_DISABLED,
+    DIRECTORY_SESSIONS_ENDED,
+    ROLES_CHANGED,
+    USERNAME_CHANGED,
+)
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
@@ -3423,5 +3428,68 @@ async def test_a_scope_revocation_sends_no_account_disabled_notice() -> None:
         plan = await service.reconcile_directory_sessions()
         assert [r.reason for r in plan.revocations] == [reconcile.SCOPE_CHANGED]
         assert notifier.sent == []
+    finally:
+        await store.close()
+
+
+#: vault BACKLOG #2140. The notice each revocation reason sends, decided once. ``None`` is no notice.
+#: ACCOUNT_DISABLED says an administrator disabled the account, so only the reason that READ the
+#: disabled bit may send it.
+_NOTICE_FOR_REASON: dict[str, str | None] = {
+    "directory_disabled": ACCOUNT_DISABLED,
+    "directory_absent": DIRECTORY_SESSIONS_ENDED,
+    "directory_undetermined": DIRECTORY_SESSIONS_ENDED,
+    "roles_changed": ROLES_CHANGED,
+    reconcile.SCOPE_CHANGED: None,
+}
+
+#: Every revocation reason the reconciler can plan, read from the code rather than listed here, so a
+#: new reason fails the test below until its notice is decided in the table above.
+_ALL_REVOCATION_REASONS = sorted(
+    {*reconcile.REVOKE_REASONS.values(), "roles_changed", reconcile.SCOPE_CHANGED}
+)
+
+
+@pytest.mark.parametrize("reason", _ALL_REVOCATION_REASONS)
+async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> None:
+    """vault BACKLOG #2140. ``directory_absent`` and ``directory_undetermined`` never read the
+    disabled bit, so they must not send ACCOUNT_DISABLED. Applied directly, so each reason is
+    exercised whether or not a fixture directory can produce it."""
+    assert reason in _NOTICE_FOR_REASON, f"no notice decided for revocation reason {reason!r}"
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        extra: dict[str, Any] = {}
+        if reason == "roles_changed":
+            extra["role_ids"] = ()
+        if reason == reconcile.SCOPE_CHANGED:
+            extra.update(scope_changed=True, scope_from=user.channel_scope, scope_to=None)
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason, **extra)
+        assert await service._apply_reconcile_revocation(revocation)
+        expected = _NOTICE_FOR_REASON[reason]
+        assert [e.event_type for e in notifier.sent] == ([] if expected is None else [expected])
+        if expected is not None:
+            assert notifier.sent[0].detail == {"reason": reason}
+    finally:
+        await store.close()
+
+
+async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -> None:
+    """vault BACKLOG #2140. Only a READ disabled bit may say "disabled", so a whole-account reason
+    the apply step does not name gets the neutral notice, never ACCOUNT_DISABLED."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="directory_synthetic_new_reason"
+        )
+        assert await service._apply_reconcile_revocation(revocation)
+        assert [e.event_type for e in notifier.sent] == [DIRECTORY_SESSIONS_ENDED]
     finally:
         await store.close()

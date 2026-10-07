@@ -258,6 +258,39 @@ _PATH_WORDS = {
 }
 
 
+#: The ``fed.idp_tls`` row's id and title.
+_TLS_ROW = ("fed.idp_tls", "IdP TLS trust")
+
+
+def _idp_opener(
+    settings: ServiceSettings, *, anchor: bool = True
+) -> urllib.request.OpenerDirector | CheckResult:
+    """Build the IdP opener with the pin, the CRL file and the enforcement dial the engine uses, or
+    return the ``fed.idp_tls`` FAIL or ERROR row that says why it did not build. Reads the anchor
+    and CRL files; opens no socket. ``anchor=False`` leaves the anchor and its pin out, for
+    :func:`idp_revocation_result` alone."""
+    from messagefoundry.auth.oidc_http import build_idp_opener
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
+    from messagefoundry.config.settings import SecurityEnforcement
+
+    auth = settings.auth
+    try:
+        return build_idp_opener(
+            auth.oidc_tls_ca_cert_file if anchor else None,
+            pin=auth.oidc_tls_ca_cert_pin if anchor else None,
+            enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+            crl_file=auth.oidc_tls_crl_file,
+        )
+    except OSError as exc:
+        return CheckResult(*_TLS_ROW, Status.FAIL, f"could not build the pinned TLS context: {exc}")
+    except TrustAnchorError as exc:
+        return CheckResult(*_TLS_ROW, Status.FAIL, f"the engine refuses this anchor: {exc}")
+    except ValueError as exc:  # harden_crl_check: a missing, expired, CRL-less or cert-bearing file
+        return CheckResult(*_TLS_ROW, Status.FAIL, f"the engine refuses this CRL file: {exc}")
+    except Exception as exc:
+        return CheckResult(*_TLS_ROW, Status.ERROR, f"{type(exc).__name__}: {exc}")
+
+
 def _tls_row(
     settings: ServiceSettings,
 ) -> tuple[CheckResult, urllib.request.OpenerDirector | None]:
@@ -277,32 +310,14 @@ def _tls_row(
 
     Returns the opener too, or ``None`` when it did not build, so ``fed.idp_revocation`` reads the
     same context rather than building and checking the anchor a second time (BACKLOG #1923)."""
-    from messagefoundry.auth.oidc_http import build_idp_opener
-    from messagefoundry.auth.trust_anchors import (
-        TrustAnchorError,
-        evaluate_anchor,
-        oidc_anchor_spec,
-    )
-    from messagefoundry.config.settings import SecurityEnforcement
+    from messagefoundry.auth.trust_anchors import evaluate_anchor, oidc_anchor_spec
 
-    rid, title = "fed.idp_tls", "IdP TLS trust"
+    rid, title = _TLS_ROW
     ca = settings.auth.oidc_tls_ca_cert_file
     pin = settings.auth.oidc_tls_ca_cert_pin
-    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
-    try:
-        opener = build_idp_opener(
-            ca, pin=pin, enforcing=enforcing, crl_file=settings.auth.oidc_tls_crl_file
-        )
-    except OSError as exc:
-        fail = f"could not build the pinned TLS context: {exc}"
-        return CheckResult(rid, title, Status.FAIL, fail), None
-    except TrustAnchorError as exc:
-        return CheckResult(rid, title, Status.FAIL, f"the engine refuses this anchor: {exc}"), None
-    except ValueError as exc:  # harden_crl_check: a missing, expired, CRL-less or cert-bearing file
-        fail = f"the engine refuses this CRL file: {exc}"
-        return CheckResult(rid, title, Status.FAIL, fail), None
-    except Exception as exc:
-        return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}"), None
+    opener = _idp_opener(settings)
+    if isinstance(opener, CheckResult):
+        return opener, None
     try:
         # A second read of the file, for the report only: the opener above loaded its own checked
         # bytes, and this verdict is what the row prints. Taking the opener's own verdict would
@@ -353,6 +368,10 @@ def _tls_row(
     ), opener
 
 
+#: The ``fed.idp_revocation`` row's id and title, which :func:`idp_revocation_result` shares.
+_REVOCATION_ROW = ("fed.idp_revocation", "IdP hop revocation guard (token + JWKS legs)")
+
+
 def _revocation_row(
     settings: ServiceSettings, opener: urllib.request.OpenerDirector | None
 ) -> CheckResult:
@@ -373,8 +392,13 @@ def _revocation_row(
     is MANUAL. The guards run only where the engine builds them, in the auth service, and ``serve``
     always builds one (vault BACKLOG #2719).
 
-    ``MEFOR_TLS_REVOCATION_ATTESTED`` is read from the environment ``verify`` runs in. Run it with the
-    service's environment, or the WARN and ALLOW wording may describe a different decision."""
+    ``MEFOR_TLS_REVOCATION_ATTESTED`` is read from the environment ``verify`` or ``check`` runs in,
+    not the service's. That can change the wording and never the status (BACKLOG #2131). Under ``enforce``
+    the variable cannot turn a REFUSE into an ALLOW (BACKLOG #299). Under ``warn`` it turns a WARN
+    into an ALLOW, and on an off-box leg with no CRL both are MANUAL.
+
+    This is the ONE place the guards' decisions become a status. ``messagefoundry check`` reaches
+    it through :func:`idp_revocation_result` rather than mapping them a second time."""
     from messagefoundry.auth.service import idp_revocation_guards
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.config.tls_policy import (
@@ -383,7 +407,7 @@ def _revocation_row(
         is_loopback_hop_host,
     )
 
-    rid, title = "fed.idp_revocation", "IdP hop revocation guard (token + JWKS legs)"
+    rid, title = _REVOCATION_ROW
     if opener is None:
         return CheckResult(
             rid,
@@ -435,6 +459,38 @@ def _revocation_row(
             rid, title, Status.FAIL, "the engine refuses to start: " + "; ".join(refusals)
         )
     return CheckResult(rid, title, status, "; ".join(notes))
+
+
+def idp_revocation_result(settings: ServiceSettings) -> CheckResult:
+    """``fed.idp_revocation`` on its own, for ``messagefoundry check`` (BACKLOG #2131).
+
+    It hands an opener to :func:`_revocation_row`, so the guards' decisions become a status in one
+    place. The caller checks ``[auth].oidc_enabled`` first: with federation off the engine builds
+    no opener.
+
+    **It reads no anchor.** A leg's decision needs only the hosts, the posture and whether the
+    context checks a CRL, and the anchor decides none of them. Whether the anchor loads, and its
+    ACL and path, are facts about the host ``serve`` runs on, not the machine running ``check``,
+    which may be CI. ``verify``'s ``fed.idp_tls`` row reports them on the host. So the opener here
+    loads the CRL file alone. Where that fails with an anchor configured, the failure may be one
+    the anchor would prevent, such as a CRL file bundling the anchor's CA, so the row is MANUAL.
+    With no anchor, this context is the engine's, so the failure is the engine's refusal."""
+    built = _idp_opener(settings, anchor=False)
+    if not isinstance(built, CheckResult):
+        return _revocation_row(settings, built)
+    if built.status is Status.FAIL and settings.auth.oidc_tls_ca_cert_file:
+        return CheckResult(
+            *_REVOCATION_ROW,
+            Status.MANUAL,
+            f"the CRL file does not load without [auth].oidc_tls_ca_cert_file, which this row "
+            f"does not read ({built.detail}). With the anchor the legs would cross on the CRL if "
+            "it loads: run `messagefoundry verify --section federation` on the host",
+        )
+    return CheckResult(
+        *_REVOCATION_ROW,
+        built.status,
+        f"the engine refuses to start: the IdP TLS context does not build ({built.detail})",
+    )
 
 
 def _read(path: str, rid: str, title: str) -> tuple[bytes | None, CheckResult | None]:

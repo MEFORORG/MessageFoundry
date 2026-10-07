@@ -369,12 +369,15 @@ class WebhookTransport:
         if scheme == "http" and not weakened_tls_escape_permitted(posture):
             raise ValueError(
                 "[alerts].webhook_url uses plaintext http; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use https"
+                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
+                "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
+                "or with no posture) — use https"
             )
         if scheme == "http":
             log.warning(
-                "webhook target uses plaintext http; permitted only because %s is set "
-                "(cleartext, MITM-able — trusted-network/dev use only)",
+                "webhook target uses plaintext http; permitted only because %s is set on an instance "
+                "at [security].enforcement = warn (cleartext, MITM-able — trusted-network/dev use "
+                "only)",
                 INSECURE_TLS_ESCAPE_ENV,
             )
         # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
@@ -1026,8 +1029,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
         # BACKLOG #315: the Administrator role was granted. `user:<username>` or `ad-group:<group>`
-        # stands in for "connection" (the key's grammar is on AlertSink). The granting administrator
-        # is an operator account name, not message content.
+        # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
+        # administrator's operator account name, or the fixed marker `<directory>` when a directory
+        # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
         self._emit(
             {
                 "type": "administrator_granted",

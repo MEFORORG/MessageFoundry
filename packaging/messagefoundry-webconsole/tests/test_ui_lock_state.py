@@ -10,6 +10,7 @@ not an administrator sees the list without any of it.
 
 from __future__ import annotations
 
+import html
 import time
 from collections.abc import AsyncIterator
 
@@ -17,11 +18,14 @@ import httpx
 import pytest
 from _ui_clients import cookie_login, provision, ui_client
 
+from messagefoundry.api.auth_models import UserLockState, UserSummary
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
+from messagefoundry_webconsole.pages.admin import _lock_card
 
 BADGE = "Locked until"
 
@@ -144,3 +148,51 @@ async def test_a_users_read_holder_sees_the_list_without_lock_state(engine: Engi
     assert "<th>Lock</th>" not in r.text
     assert BADGE not in r.text
     assert "failed attempt" not in r.text
+
+
+# --- the lock card's recovery text, by account kind (BACKLOG #2292) ---------------------------
+# Rendered from a constructed UserSummary, so the directory branch needs no AD fixture. The page
+# tests above cover only a local account. The provider comes from AuthProvider, so a renamed value
+# fails here rather than sending a directory account to the local text.
+
+_DIRECTORY_RECOVERY = (
+    "A lock ends on its own at the time shown. To end one early, run "
+    "messagefoundry admin-unlock on the engine host."
+)
+_PASSWORD_RESET = "reset this user's password"
+
+
+def _card_text(auth_provider: AuthProvider) -> str:
+    user = UserSummary(
+        id="u-1",
+        username="locked-one",
+        auth_provider=auth_provider.value,
+        disabled=False,
+        roles=[Role.VIEWER.value],
+        lock_state=UserLockState(
+            sign_in_locked=True,
+            locked_until=time.time() + 600,
+            failed_attempts=5,
+            lock_cycles=1,
+            second_step_locked=False,
+        ),
+    )
+    return html.unescape(str(_lock_card(user)))
+
+
+def test_a_directory_account_lock_card_names_only_the_host_unlock() -> None:
+    text = _card_text(AuthProvider.AD)
+    assert "Sign-in locks" in text  # the card rendered, so the absences below mean something
+    assert _DIRECTORY_RECOVERY in text
+    assert _PASSWORD_RESET not in text
+    assert "authenticator app" not in text
+
+
+def test_a_local_account_lock_card_names_the_password_reset_too() -> None:
+    # The control arm: the same card for a local account does carry the reset route.
+    text = _card_text(AuthProvider.LOCAL)
+    assert "Sign-in locks" in text
+    assert _PASSWORD_RESET in text
+    assert "authenticator app" in text  # so the directory arm's absence check can fail
+    assert "messagefoundry admin-unlock on the engine host" in text
+    assert _DIRECTORY_RECOVERY not in text

@@ -452,7 +452,7 @@ async def test_every_refused_combined_sign_in_answers_alike_on_the_json_and_cons
     assert user is not None
     secret = totp.generate_secret()
     await engine.store.set_totp_secret(user.id, secret=secret)
-    await engine.store.enable_totp(user.id, recovery_code_hashes=[])
+    assert await engine.store.enable_totp(user.id, recovery_code_hashes=[])
     now = [3_000_000.0]
 
     def code(valid: bool) -> str:
@@ -662,7 +662,11 @@ async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
     # Deliberately fewer live codes than slots: the padding is what makes a FAILED attempt stop
     # leaking how many remain, which is the half an attacker with only the password can measure.
     codes = ["AAAA-1111", "BBBB-2222", "CCCC-3333"]
-    await engine.store.enable_totp(user.id, recovery_code_hashes=[hash_password(c) for c in codes])
+    # enable_totp needs a staged secret (BACKLOG #2224); this test never verifies a TOTP code.
+    await engine.store.set_totp_secret(user.id, secret="JBSWY3DPEHPK3PXP")
+    assert await engine.store.enable_totp(
+        user.id, recovery_code_hashes=[hash_password(c) for c in codes]
+    )
 
     presented = {"first": codes[0], "last": codes[-1], "wrong": "ZZZZ-9999"}[present]
     calls["n"] = 0
@@ -714,7 +718,7 @@ async def test_a_failed_totp_attempt_costs_the_recovery_walk_whatever_the_reason
     await engine.store.set_totp_secret(user.id, secret=secret)
     # Fewer live codes than slots, so a walk that forgot the padding would show as 2, not 10.
     live = [hash_password(c) for c in ("AAAA-1111", "BBBB-2222")]
-    await engine.store.enable_totp(user.id, recovery_code_hashes=live)
+    assert await engine.store.enable_totp(user.id, recovery_code_hashes=live)
     walk = live + [svc._DUMMY_PASSWORD_HASH] * (slots - len(live))
     # A fixed arrival moment, so the step cannot roll over between minting and verifying the code.
     arrived = 1_900_000_000.0

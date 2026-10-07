@@ -25,13 +25,20 @@
   Nothing in it is built yet, and the Accepted decision above is unchanged.
   > **Superseded status text, kept as a record.** Until the Manager's acceptance this bullet read:
   > *"Amended 2026-09-28: Amendment A, status Proposed."*
+- **Amended 2026-10-06: Amendment B, Accepted by owner ruling.** Two owner rulings of 2026-10-06,
+  given in session to the batch 196 Manager, accept two limits of option E as residuals. A combined
+  sign-in gets no MFA time floor (BACKLOG #2404). The per-account lockout bound holds within one API
+  process, and does not reach a combined sign-in with both factors wrong (BACKLOG #2284). Amendment
+  B, at the end of this file, records both. It builds nothing. It ticks the pre-count item under *To
+  resolve on acceptance*, and changes neither the Decision nor Amendment A.
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1131 (the row this answers; ASVS 6.1.1) · BACKLOG #1236 (closed 2026-09-26;
   its cycle-cap remainder moved to #1131 by owner ruling) · BACKLOG #1138 (re-proof failures count
   toward lockout, and the per-session cap) · BACKLOG #1638 (a lock refuses directory sign-ins) ·
   [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
   (`admin-unlock`; option E amends it, see Decision item 8) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (passkeys) ·
-  [`docs/SECURITY.md`](../SECURITY.md), "The documented protection set (ASVS 6.1.1)"
+  [`docs/SECURITY.md`](../SECURITY.md), "The documented protection set (ASVS 6.1.1)" ·
+  BACKLOG #2404 and #2284 (the two residuals Amendment B records)
 
 ---
 
@@ -128,7 +135,8 @@ password-only, combined and second-step checks on one account now run one at a t
 those legs gets at most `lockout_threshold` verdicts before the lock refuses the rest. The
 paragraph above still holds, in part, across engine shards that each serve an API port (up to one
 extra verdict for each process beyond the first), and in full for a combined sign-in with both
-factors wrong, which the sign-in lock does not refuse.
+factors wrong, which the sign-in lock does not refuse. *Amendment B (2026-10-06) accepts both cases
+as residuals, by owner ruling.*
 
 ## Decision
 
@@ -706,7 +714,7 @@ no factor. The `_admin_unlock` audit gap that #1236's closing amendment lists is
       `--reset-cycles` flag for the case where the operator knows the campaign is over.
 - [ ] Whether `ACCOUNT_LOCKED` stays one event type with a closed-set detail naming the lock, or
       becomes two. Recommended: one type, with the detail.
-- [ ] Counting an attempt before it verifies, so a parallel burst gets 5 verdicts per cycle rather
+- [x] Counting an attempt before it verifies, so a parallel burst gets 5 verdicts per cycle rather
       than up to control 2's window. **Not in phase 1.** It conflicts with E, which picks the counter
       after the verify (the routing table in Decision item 3). It also collides with #1638:
       `_login_local` calls `record_login_success` only when no factor is owed, so a pre-count would
@@ -719,6 +727,8 @@ no factor. The `_admin_unlock` audit gap that #1236's closing amendment lists is
       API process without a pre-count, by queueing each account's checks; see the amendment after
       the serial-attacker paragraph under Context. A pre-count is still unbuilt, and the
       both-factors-wrong combined case and the cross-process case stay open as that amendment says.
+      *Ruled 2026-10-06, Amendment B (BACKLOG #2284):* no store-side pre-count is built. The owner
+      accepted both of those cases as residuals. This box was unticked until then.
 
 ---
 
@@ -1371,3 +1381,97 @@ ruling.
 - **AC-A9** -- WHEN the engine starts, and WHEN `messagefoundry verify` runs, THE SYSTEM SHALL name
   every covered local account that holds a chosen password and no factor with a way past, and
   every enabled TOTP secret it cannot decrypt, and SHALL NOT refuse to start on either.
+
+---
+
+## Amendment B (2026-10-06) -- two residuals of option E, accepted by owner ruling
+
+**Status: Accepted (2026-10-06), by two owner rulings given in session to the batch 196 Manager.**
+The Manager relayed them to the drafter in its own words. The wording below is that relay, not the
+owner's verbatim answer. This amendment builds nothing. It records two limits of option E as built,
+so nobody files them again as open work. The Decision and Amendment A stand unchanged.
+
+It answers BACKLOG #2404 and BACKLOG #2284. Every fact below was read at engine `origin/main`
+`c587076a4` on 2026-10-06. Find each by the symbol named. How ASVS scoring weighs either residual is
+record work for a Manager, and this amendment does not decide it.
+
+### Residual B1: a combined sign-in gets no MFA time floor (BACKLOG #2404)
+
+**What the code does.** `[auth].mfa_verify_min_elapsed_seconds` (1 s by default) floors the time
+between a sign-in and its second factor. `_second_factor_too_early` in `auth/service.py` applies it
+only while a session's factor is pending. Only `verify_mfa` and `finish_webauthn_assertion` call it.
+A combined sign-in carries the password and a TOTP code in one request. `_login_local` mints its
+session with the factor already satisfied, so there is no second step to time.
+
+**The bound.** Any code sent to a TOTP-enrolled local account puts a request on the combined path.
+But only a caller with both factors completes it: the password and a live TOTP code. A combined
+attempt with one factor right is refused and counts on the second-step counter (Decision item 3).
+On a local account that lock escalates (Decision item 5).
+
+**Owner ruling, 2026-10-06: accept as a recorded residual. No nonce, and no refusal.** The Manager
+put two reasons to the owner:
+
+1. A script needs both factors to complete a combined sign-in. A script that holds both can wait 1
+   second, and a wait that short defeats any timing check.
+2. The combined sign-in is how a TOTP-enrolled owner gets past a sign-in lock that someone who knows
+   only the username set on purpose. Refusing it would reverse option E.
+
+**Considered and declined.**
+
+- A server-issued, single-use sign-in nonce, whose age the engine checks against the floor. A script
+  fetches the nonce, waits out the floor, and signs in, so reason 1 defeats it.
+- Refusing the combined form while `mfa_verify_min_elapsed_seconds` is above 0. Reason 2 rules it
+  out, since the floor is on by default.
+
+**What would reopen it.** At least these:
+
+- a proposal for a timing check that a script holding both factors cannot pass by waiting;
+- option E being superseded, so that the combined sign-in goes away, and this residual with it.
+
+### Residual B2: the lockout bound holds within one API process, and not on a both-wrong combined sign-in (BACKLOG #2284)
+
+**What the code does.** BACKLOG #1943 bounds a burst on one account at `lockout_threshold` verifies,
+through a per-account queue (`_account_credential_lock`). The Context amendment after the
+serial-attacker paragraph names the two cases outside that bound. The `AuthService.login` docstring
+gives the detail:
+
+1. Across processes. Engine shards that each serve their own API port keep their own queues. When
+   the lock lands, up to one attempt per extra process can already be past the check.
+2. A combined sign-in with both factors wrong, while the sign-in lock is live. That lock does not
+   refuse a combined sign-in on a local account with TOTP enrolled, so each such attempt is still
+   verified. `_route_combined_failure` sends it to the sign-in counter. `next_lockout_state` counts
+   it, but a live lock is never extended (Decision item 4), so none of them moves the lock.
+
+**The bounds.** Case 1 is bounded by the process count: at most one extra verify per extra process
+each time the lock lands. Case 2 is not refused by any lock, so control 2, the sign-in limiter,
+bounds it: by default 10 attempts a minute per client address and 60 in total. That limiter is
+per API process too (`auth/ratelimit.py`), so each engine shard that serves the sign-in API adds its
+own window. **With control 2 turned off (`[auth].login_rate_limit_enabled = false`), only the
+per-account queue paces case 2.** It answers one failure at a time in each process, and nothing
+caps the count. Apart from control 2's own throttle answer, a both-wrong combined attempt gets the
+same fixed refusal as every other attempt.
+
+**Owner ruling, 2026-10-06: accept both cases as residuals in this amendment. No store-side
+pre-count.** The Manager put two reasons to the owner:
+
+1. A both-wrong combined attempt teaches an attacker nothing, and control 2 still bounds it.
+2. A pre-count collides with option E and with #1638. The last item under *To resolve on
+   acceptance* says why. E picks the counter after the verify. A pre-count would stand as a failure
+   until a right-password sign-in finished its second factor.
+
+**Considered and declined.**
+
+- A store-side reserve-then-refund pre-count, on all three backends. Each attempt would reserve a
+  count in the store before it verifies, then keep or refund it once the outcome is known. It would
+  hold the bound across processes (case 1). It would not change case 2, which is already counted
+  and is open because no lock refuses it. The owner declined it for the reasons above. A refund at
+  the verify would avoid the #1638 lock-out that reason 2 names. The reservation would still have to
+  pick a counter before the verify, which is where it collides with E.
+
+**What would reopen it.** At least these:
+
+- a pre-count design that picks E's counter correctly and does not lock out an owner who stops at
+  the code step;
+- a need for the per-account bound to hold across engine shards that serve the sign-in API;
+- a proposal to refuse case 2 under a live sign-in lock, which would have to keep the owner's way
+  past that lock.

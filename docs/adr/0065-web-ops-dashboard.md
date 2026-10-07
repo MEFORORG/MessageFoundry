@@ -138,6 +138,10 @@ desktop-console retirement ("option c", gated per #75).
 > `app.js`; graceful "Continue" fallback with JS off). **Security gate:** the re-auth `next` target is
 > validated by `is_safe_ui_action` to be a `/ui/messages/{id}/replay` path **only** — never an arbitrary
 > URL — so the flow cannot become an open-redirect / open-POST gadget.
+>
+> *Superseded in part by the 2026-10-06 amendment at the end of this file:* the "replay path **only**"
+> premise no longer held, so the auto-submit now applies only to a continuation the server issued to
+> the session.
 
 > **M3 addendum (2026-07-02) — dead-letter bulk replay.** A per-channel **Replay all dead** action
 > (`POST /ui/dead-letters/{channel_id}/replay`) reusing the JSON `replay_dead_letters` handler. Same
@@ -314,3 +318,53 @@ state is rendered **only on ACK-waiting outbounds**, by construction.
   since the send, `ConnectionRow.waiting_for_reply` SHALL be True; it SHALL be False before the delay
   elapses, once the reply resolves, and for any connector that does not await a reply.
   → `tests/test_waiting_for_reply.py::test_waiting_marker_respects_display_delay`
+
+---
+
+## Amendment (2026-10-06) -- the step-up auto-submit runs only a continuation the server issued (vault BACKLOG #2764)
+
+- **Status:** **Accepted (2026-10-06).** Owner ruling of 2026-10-06 on review finding I-1 of the
+  2026-10-02 full code review. Amends the M2b addendum above; it does not allocate a new ADR.
+
+**What changed under M2b's premise.** M2b allowed `/ui/reauth` to auto-submit its continuation because
+`next` could only be a single-message replay path. The write-action registry has since grown to cover
+user deletion, password and second-factor resets, role deletion, config reload, revoking every other
+session, turning off MFA and replaying every dead letter. `next` was still taken from the query string
+and checked only for registry membership, and nothing recorded that the server had asked for it. So a
+typed, bookmarked or clicked same-site link to `/ui/reauth?next=<a registered destructive action>`
+would turn an operator's routine re-authentication into that action, on a page that said only "This
+action needs a fresh sign-in confirmation". ADR 0077's single-use grant did not help: its purpose is
+derived from `next`, so it attached to the forged action.
+
+**Decision.**
+
+1. **The continuation is bound to the session server-side.** When a step-up gate refuses a same-origin
+   POST and `_reauth_redirect` issues the 303, it records the `auto_retry` continuation against that
+   session: keyed on the session token's hash and the exact `next`, single use, with a short TTL
+   (`REAUTH_CONTINUATION_TTL_SECONDS`), bounded per session and in total, and process-local. The
+   console routes that rotate the session token carry the record across the rotation. `POST
+   /ui/reauth` auto-submits only a continuation recorded for the session presenting it, and consumes
+   it as it does, so it runs once. Any other `auto_retry` `next` still lets the operator complete the
+   re-authentication, mints no ADR 0077 grant for it, and ends on a page that says by name that
+   nothing ran, linking back to `/ui` (`/ui/account` without `monitoring:read`). A bare redirect
+   would read as the action done to an operator whose entry lapsed. The federated step-up leg (`POST /ui/reauth/oidc`) applies the same test when it stages
+   the flow, and the single-use flow, bound to the session and the browser's flow cookie, carries the
+   binding to the callback, which the SameSite=Strict session cookie never reaches.
+2. **The pages name the action.** Every registry entry carries a required `label`. The re-auth page
+   reads "Confirm it's you to: <label>", and says plainly when nothing will run afterwards; the
+   continuation page names the action it is submitting. The labels are pinned in the registry golden.
+3. **The per-connection purge POST is no longer a registered continuation.** No page renders it (the
+   console purges through `/ui/connections/purge-confirm`), so the auto-submit had become its only
+   browser entry point. Its stale-window refusal now lands on the confirm page.
+
+**What stays.** The registry `fullmatch`, the `..` reject, the same-origin checks, SameSite=Strict
+cookies and the CSP are unchanged. `unlock` continuations (GET form pages) keep their 303-GET-redirect;
+they never auto-submit, so they need no record.
+
+**Consequence.** A continuation the record does not hold (it lapsed, the process restarted, it was
+evicted, or a rotation the console did not see moved the token, as the federated callback does for
+the session's other entries) costs the operator one more click on the action, and for an ADR 0077
+action-bound lane a second re-authentication, because no grant is minted for an entry the record
+does not hold. It never runs anything the session did not submit. The federated callback cannot
+yet name a dropped action: when the start leg finds nothing issued it stages the console landing,
+and the callback's landing page does not say that nothing ran.

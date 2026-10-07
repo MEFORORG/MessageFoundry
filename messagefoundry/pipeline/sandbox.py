@@ -89,6 +89,7 @@ import enum
 import logging
 import queue
 import secrets
+import signal
 import struct
 import subprocess
 import sys
@@ -477,6 +478,15 @@ def _read_frame_bytes(stream: Any) -> bytes | None:
 # hook.
 
 
+def _killed_by_cpu_cap(returncode: int | None) -> bool:
+    """Whether a worker's exit status is the POSIX ``RLIMIT_CPU`` soft limit's ``SIGXCPU`` (the
+    worker sets its hard limit one second higher so the kill is that, not an anonymous SIGKILL). The
+    reap that follows does not change it: the worker is already dead, so the reap collects the signal
+    it died of. Windows has no ``SIGXCPU``, and no CPU cap to report."""
+    sigxcpu = getattr(signal, "SIGXCPU", None)
+    return sigxcpu is not None and returncode == -int(sigxcpu)
+
+
 def _kill_single(proc: subprocess.Popen[bytes]) -> None:
     """Best-effort single-process kill (the reap fallback when no job/group is available)."""
     try:  # noqa: SIM105
@@ -733,6 +743,11 @@ class SandboxSession:
         except OSError:
             sink.put(_EOF)
 
+    def _cpu_cap_error(self, phase: str, name: str) -> SandboxError:
+        return SandboxError(
+            f"sandbox {phase} {name!r} exceeded the {self.policy.cpu_seconds}s CPU cap"
+        )
+
     def _kill(self, proc: subprocess.Popen[bytes] | None) -> None:
         if proc is None:
             return
@@ -893,11 +908,17 @@ class SandboxSession:
                 # Wall cap exceeded — the authoritative resource bound on every platform. Kill the
                 # runaway child (a busy-loop can't wedge intake) and fail closed.
                 self._kill(proc)
+                if _killed_by_cpu_cap(proc.returncode):
+                    # Dead of the CPU cap already, with a grandchild still holding its stdout open,
+                    # so no EOF came and the wall cap is only what noticed.
+                    raise self._cpu_cap_error(phase, name) from None
                 raise SandboxError(
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap"
                 ) from None
             if frame is _EOF:
                 self._kill(proc)
+                if _killed_by_cpu_cap(proc.returncode):
+                    raise self._cpu_cap_error(phase, name)
                 raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}")
             try:
                 # Decoding happens HERE, on the dispatch thread, inside this try — not on the daemon
