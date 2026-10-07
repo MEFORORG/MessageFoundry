@@ -43,6 +43,25 @@ this line.**
 
 ### Security
 
+- **Resend, edit-resend, upload resend, queue purge and config reload each take a proof bound to
+  that action.** A fresh session window no longer reaches them. Each needs a re-authentication made
+  for it, which it spends. The re-auth page mints that proof when it continues to the action's
+  confirm page, editor or auto-retry. The message editor asks for it before it opens, and the
+  resubmit spends it only after its own input checks pass. A refusal from the engine comes after the
+  spend, so the next submit asks again and re-opens the editor. A completed resend now answers with
+  a 303 to a new GET outcome page, `/ui/messages/{id}/resend-done` (post-redirect-get), so a
+  refresh re-renders the outcome and sends nothing. The confirm page always mints its own
+  idempotency key; one in its query string is ignored. A double-click on a resend or an
+  edit-resend asks for no second proof. Only an identical request rides on the first one's
+  proof: the same key, target and source, or the same edited body. A resend whose key the store
+  already holds needs no proof whatever its source, since the store answers it as a duplicate.
+  A repeat that arrives while the first is still running waits for it. If the engine refused the
+  first, the repeat gets the same refusal and runs nothing, and the next submit asks for a proof
+  again. A repeat of a request the store committed is answered as a duplicate, a request
+  cancelled after that commit included. Upload resend also needs `messages:edit`, on the
+  confirm page and on the POST, and the browse page offers its form only to a role that holds
+  it. Seam change: `AuthService.holds_action_step_up` and the core handler `prior_resend` are
+  new, and the console imports five new step-up action constants. (vault BACKLOG #2625)
 - **A route-level sign-in reject records where it came from.** The `/ui/oidc` start and callback
   legs and `GET /ui/sso` refuse some sign-ins themselves. Examples are a missing flow cookie, an
   IdP error, a malformed callback or Negotiate token, a failed start, and a non-navigation fetch.

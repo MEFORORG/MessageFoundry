@@ -8,15 +8,55 @@ import * as https from "node:https";
 
 import { engineHostKey, isRecord, trustRemedy } from "./engineTrustModel";
 
-/** A non-2xx engine response. `status` lets callers branch (e.g. 401 → (re)authenticate). */
+/**
+ * What a step-up refusal asked for (403 + `X-Step-Up-Required`). `action` is the
+ * `X-Step-Up-Action` the engine named for an action-bound route (ADR 0077, vault BACKLOG #2625),
+ * which a re-authentication sends back as `purpose`; `undefined` for a plain session-window
+ * step-up. `viaIdp` is `X-Step-Up-Via: idp`: that session steps up at the identity provider, in a
+ * browser, so no password re-proof here can satisfy it. The same three headers
+ * `messagefoundry/apiclient/client.py` reads.
+ */
+export interface StepUpSignal {
+  action: string | undefined;
+  viaIdp: boolean;
+}
+
+/** A non-2xx engine response. `status` lets callers branch (a 401 means sign in again). `stepUp`
+ *  is set only on a step-up refusal, so a caller can re-prove and retry (see stepUp.ts). */
 export class HttpError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly stepUp?: StepUpSignal,
   ) {
     super(message);
     this.name = "HttpError";
   }
+}
+
+/** An action id as the engine names one (`message_export`, `config_reload`). Server text headed for
+ *  a request body, so anything else is dropped rather than echoed back. */
+const STEP_UP_ACTION_RE = /^[a-z][a-z0-9_]{0,63}$/;
+
+/** Read the step-up signal off a non-2xx response's headers, or `undefined` when it is not one. */
+export function stepUpSignalOf(
+  status: number,
+  headers: http.IncomingHttpHeaders,
+): StepUpSignal | undefined {
+  const one = (name: string): string | undefined => {
+    const value = headers[name];
+    return Array.isArray(value) ? value[0] : value;
+  };
+  const required = one("x-step-up-required") !== undefined;
+  const viaIdp = one("x-step-up-via") === "idp";
+  if (status !== 403 || (!required && !viaIdp)) {
+    return undefined;
+  }
+  const action = one("x-step-up-action");
+  return {
+    action: action !== undefined && STEP_UP_ACTION_RE.test(action) ? action : undefined,
+    viaIdp,
+  };
 }
 
 /** Our own code for a request the engine accepted but never answered (see {@link GET_TIMEOUT_MS}).
@@ -352,7 +392,9 @@ function postReply(
           }
           return;
         }
-        reject(new HttpError(status, httpErrorMessage(status, text)));
+        reject(
+          new HttpError(status, httpErrorMessage(status, text), stepUpSignalOf(status, res.headers)),
+        );
       });
     });
     if (timeoutMs !== undefined) {
@@ -415,7 +457,9 @@ export function getJson<T>(
           }
           return;
         }
-        reject(new HttpError(status, httpErrorMessage(status, text)));
+        reject(
+          new HttpError(status, httpErrorMessage(status, text), stepUpSignalOf(status, res.headers)),
+        );
       });
     });
     // Fail an unanswered request (hung engine) after the cap: destroy it with a NetworkError carrying

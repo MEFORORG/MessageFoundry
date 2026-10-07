@@ -75,8 +75,13 @@ def _keyed_store(root: Path) -> UploadStore:
 
 
 async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
+    # The upload store is this file's subject, so a resend keeps the session window here.
+    # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
     service = AuthService(
-        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0, require_mfa=False, require_action_step_up=False
+        ),
     )
     await service.initialize()
     uid = await create_local_user_chosen(

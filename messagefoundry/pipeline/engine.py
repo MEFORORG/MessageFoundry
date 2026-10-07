@@ -96,6 +96,7 @@ from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import rotation_fingerprint_keys
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
+    REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
     ConnectionMetrics,
     DestinationMetrics,
@@ -103,6 +104,7 @@ from messagefoundry.store.store import (
     OperatorAudit,
     OwnedLanes,
     ReingressOutcome,
+    ResendKeyRecord,
     ResendOutcome,
     parse_audit_anchor,
     read_audit_anchor_file,
@@ -2583,6 +2585,24 @@ class Engine:
         if self._registry_runner is not None and self._registry_runner.running:
             self._registry_runner.notify_work()
         return requeued
+
+    async def prior_resend(
+        self, idempotency_key: str, *, message_id: str, to: str | None
+    ) -> ResendKeyRecord | None:
+        """The record of an already-run request this key repeats, or ``None``.
+
+        A repeat is the SAME request under the same key: a resend of ``message_id`` to the outbound
+        ``to``, or, with ``to=None``, an edit-and-resubmit re-ingress of ``message_id``. An unused key
+        and a key used for a different request (the store's 409 conflict) both answer ``None``, so
+        a caller treats them as a new request. Read-only, and it queues nothing: the web console
+        asks it before it demands a step-up proof, so a double-submit answers "already resent"
+        instead of sending the operator to re-authenticate (vault BACKLOG #2625)."""
+        record = await self.store.get_resend_record(idempotency_key)
+        if record is None or record.message_id != message_id:
+            return None
+        if to is None:
+            return record if record.to_destination.startswith(REINGRESS_TARGET_PREFIX) else None
+        return record if record.to_destination == to else None
 
     async def resend(
         self,

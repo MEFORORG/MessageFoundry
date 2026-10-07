@@ -1097,16 +1097,20 @@ class EngineClient:
         console's sensitive actions run on the Qt main thread, so a modal dialog is safe)."""
         self._step_up_handler = handler
 
-    def reauth(self, password: str) -> None:
+    def reauth(self, password: str, *, purpose: str | None = None) -> None:
         """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
         session's step-up window. Raises :class:`ApiError` (status 403) on a wrong password. Does not
         itself trigger the step-up handler (``/me/reauth`` is not a step-up-gated route).
 
         When the 403 that triggered this reauth named a per-action step-up (``X-Step-Up-Action``, ADR
         0077), the stashed action rides along as ``purpose`` so the engine mints a grant BOUND to it;
-        a plain session-window step-up posts ``{"password": …}`` unchanged."""
+        a plain session-window step-up posts ``{"password": …}`` unchanged.
+
+        ``purpose`` names the action up front instead, for a caller that proves BEFORE the call it
+        is about to make, so the refusal and the retry never happen (vault BACKLOG #2625: a timed
+        reload must not carry a step-up inside its timer). It wins over a stashed action."""
         self._refuse_credential_on_cleartext("a password")
-        action = self._pending_step_up_action
+        action = purpose if purpose is not None else self._pending_step_up_action
         self._pending_step_up_action = None  # single-use: one reauth per named action
         body: dict[str, str] = {"password": password}
         if action is not None:

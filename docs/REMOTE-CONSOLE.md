@@ -263,17 +263,17 @@ then held for a second, *distinct* approver holding `approvals:approve` instead 
 |---|---|---|---|
 | Start / stop / restart a connection, singly or over a selection | `/ui/connections/{name}/start`, `/stop`, `/restart`, `/ui/connections/bulk-control` | `connections:control` | — |
 | Toggle a connection's flag annotation — the one console write that persists to `connections.toml` | `/ui/connections/{name}/flag` | `config:deploy` | — |
-| Reload the graph from the engine's own startup config dir (executes your config Python) | `/ui/config/reload` | `config:deploy` | step-up; dual control **only if you add `config_reload` to `[approvals].operations`** — see the note above |
+| Reload the graph from the engine's own startup config dir (executes your config Python) | `/ui/config/reload` | `config:deploy` | step-up bound to the action `config_reload` (vault BACKLOG #2625), unless `[auth].require_action_step_up = false`; dual control **only if you add `config_reload` to `[approvals].operations`** — see the note above |
 | Replay one message | `/ui/messages/{message_id}/replay` | `messages:replay` | step-up |
 | Replay dead deliveries — for one channel, for one (channel, destination), or all of them | `/ui/dead-letters/{channel_id}/replay`, `/ui/dead-letters/{channel_id}/{destination_name}/replay`, `/ui/dead-letters/replay-all` | `messages:replay` | step-up + dual control |
-| Edit a message body and resend it (re-route, or direct to a chosen outbound) | `/ui/messages/{message_id}/edit-resend` | `messages:edit` **+** `messages:view_raw` | step-up |
-| Purge an outbound's queued deliveries, for one connection or a selection | `/ui/connections/{name}/purge/{scope}`, `/ui/connections/purge-bulk` | `messages:purge` | step-up + dual control |
+| Edit a message body and resend it (re-route, or direct to a chosen outbound) | `/ui/messages/{message_id}/edit-resend` | `messages:edit` **+** `messages:view_raw` | step-up bound to the action `message_edit_resend` (vault BACKLOG #2625), unless `[auth].require_action_step_up = false`; the editor asks for it before it opens |
+| Purge an outbound's queued deliveries, for one connection or a selection | `/ui/connections/{name}/purge/{scope}`, `/ui/connections/purge-bulk` | `messages:purge` | step-up bound to the action `connection_purge` (vault BACKLOG #2625), unless `[auth].require_action_step_up = false`; dual control |
 | Acknowledge / resolve / suspend / resume an alert | `/ui/alerts/{alert_id}/ack`, `/resolve`, `/suspend`, `/resume` | `monitoring:diagnose` | — |
 | Reset cumulative statistics — all of them, one connection, or a selection | `/ui/statistics/reset`, `/reset-one`, `/reset-many` | `monitoring:diagnose` | — |
 | Run an on-demand store integrity check (`PRAGMA quick_check` — reads, changes nothing) | `/ui/status/integrity-check` | `monitoring:diagnose` | — |
 | Activate / release a DR standby | `/ui/dr/activate`, `/ui/dr/release` | `dr:operate` | step-up |
 | Upload a message file into the engine — **writes real PHI at rest** | `/ui/uploaded-logs/upload` | `files:upload` | step-up |
-| Re-inject a message out of an uploaded file | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | step-up |
+| Re-inject a message out of an uploaded file | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` **+** `messages:edit` | step-up bound to the action `upload_resend` (vault BACKLOG #2625), unless `[auth].require_action_step_up = false` |
 | Delete an uploaded file | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | step-up |
 | Save / delete a message-search preset | `/ui/messages/search/presets`, `/presets/{preset_id}/delete` | `messages:read` | step-up on save |
 | Create / update / delete a user; set roles or channel scope; reset password or MFA; revoke their sessions | `/ui/users`, `/ui/users/{user_id}/update`, `/roles`, `/channel-scope`, `/reset-password`, `/reset-mfa`, `/revoke-sessions`, `/delete` | `users:manage` | step-up |

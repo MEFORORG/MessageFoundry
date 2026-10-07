@@ -93,6 +93,7 @@ from messagefoundry.store.store import (
     ReplyWaitState,
     ResendError,
     ResendKeyConflict,
+    ResendKeyRecord,
     ResendOutcome,
     ResendSourceAmbiguous,
     ResendSourceEmpty,
@@ -127,6 +128,7 @@ __all__ = [
     "ReingressOutcome",
     "ResendError",
     "ResendKeyConflict",
+    "ResendKeyRecord",
     "ResendOutcome",
     "ResendSourceAmbiguous",
     "ResendSourceEmpty",
@@ -1033,6 +1035,8 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         audit: OperatorAudit[int] | None = None,
     ) -> int: ...
+
+    async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None: ...
 
     async def resend_to(
         self,

@@ -15,19 +15,24 @@ from messagefoundry.api.models import (
     ReloadRequest,
 )
 from messagefoundry.auth import Identity, Permission
+from messagefoundry.auth.service import STEP_UP_ACTION_CONFIG_RELOAD
 
 from .. import pages
 from .._auth import (
     assert_same_origin,
     register_ui_action,
     require_ui,
-    require_ui_step_up,
+    require_ui_step_up_action,
 )
 
 # L3c: config reload is step-up-gated, so register it in the write-action allow-list (body-less
-# POST, no path params — the /ui/reauth flow may auto-retry it after step-up).
+# POST, no path params — the /ui/reauth flow may auto-retry it after step-up). Its proof is bound to
+# the reload (vault BACKLOG #2625), so the re-auth mints that grant for the auto-retry to spend.
 register_ui_action(
-    r"^/ui/config/reload$", Permission.CONFIG_DEPLOY, label="Reload the engine configuration"
+    r"^/ui/config/reload$",
+    Permission.CONFIG_DEPLOY,
+    action=STEP_UP_ACTION_CONFIG_RELOAD,
+    label="Reload the engine configuration",
 )
 
 
@@ -50,7 +55,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_config_reload(
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui_step_up(Permission.CONFIG_DEPLOY)),
+        # Action-bound, as POST /config/reload is (vault BACKLOG #2625). Enforced HERE: the JSON
+        # dependency does not run on this path, because the handler is called through the seam.
+        identity: Identity = Depends(
+            require_ui_step_up_action(STEP_UP_ACTION_CONFIG_RELOAD, Permission.CONFIG_DEPLOY)
+        ),
         gate: Any = Depends(deps.get_gate),
     ) -> HTMLResponse:
         assert_same_origin(request)
