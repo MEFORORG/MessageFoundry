@@ -2447,9 +2447,10 @@ def _check_hop_attested(config_dir: str | Path) -> CheckResult:
     The sibling of :func:`_check_cleartext_accepted`, with the opposite claim: an attested hop is
     ALLOWed rather than warned, so this line is where a reviewer sees what the engine is taking on
     trust. A declaration the build check refuses is listed and marked REFUSED, because it is never
-    crossed (vault BACKLOG #3139). Owner ruling 2026-09-24. Advisory (``required=False``): an attestation with a written reason
-    is a legitimate choice, not a config error. It reads through ``attested_secure_hops``, the same
-    reader as ``security_loosenings()`` and ``GET /security/posture``.
+    crossed (vault BACKLOG #3139). Owner ruling 2026-09-24. Advisory (``required=False``): an
+    attestation with a written reason is a legitimate choice, not a config error. It reads through
+    ``attested_secure_hop_records``, the walk behind ``attested_secure_hops``, which
+    ``security_loosenings()`` and ``GET /security/posture`` read, so all three list one set.
 
     SKIPs when the graph will not load, same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, attested_secure_hop_records, load_config

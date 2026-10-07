@@ -28,11 +28,12 @@ from messagefoundry.checks import _check_hop_attested
 from messagefoundry.config.models import hop_attestation_from_settings
 from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import (
-    REFUSED_ATTESTATION_MARK,
+    AttestedHop,
     DatabaseLookupSpec,
     FhirLookupSpec,
     Registry,
     WiringError,
+    attested_secure_hop_records,
     attested_secure_hops,
     env,
     load_config,
@@ -78,10 +79,14 @@ def test_the_advisory_line_escapes_a_reason_holding_a_newline(tmp_path: Path) ->
 
 def test_the_advisory_line_marks_a_refused_carrier_and_not_a_good_one(tmp_path: Path) -> None:
     reg = load_config(_forged_config(tmp_path), allow_empty=True)
-    reasons = dict(attested_secure_hops(reg))
-    assert reasons["reference:codes"].endswith(REFUSED_ATTESTATION_MARK)
-    assert reasons["reference:good"] == REASON
+    assert attested_secure_hop_records(reg) == [
+        AttestedHop("reference:codes", FORGED, refused=True),
+        AttestedHop("reference:good", REASON, refused=False),
+    ]
     detail = _check_hop_attested(tmp_path).detail
+    # The mark sits after the quoted reason, so it is the engine's word and not the author's.
+    assert 'reference:codes ("ok\\nWARNING forged line") REFUSED; ' in detail
+    assert detail.endswith(f'reference:good ("{REASON}")')
     assert "ALLOWed where" not in detail
     assert "hop(s) declare they are secure by means the engine cannot see. An enforcing gate " in (
         detail
@@ -107,7 +112,9 @@ def test_an_env_flag_is_marked_refused_in_the_report() -> None:
     spec.settings["tls_hop_attested"] = env("att", cast=bool)
     spec.settings["tls_hop_attested_reason"] = REASON
     reg.add_fhir_lookup(spec)
-    assert attested_secure_hops(reg) == [("fhir_lookup:LK", f"{REASON} {REFUSED_ATTESTATION_MARK}")]
+    assert attested_secure_hop_records(reg) == [AttestedHop("fhir_lookup:LK", REASON, refused=True)]
+    # The pair form carries no mark: the refusal is a field, never text in the reason.
+    assert attested_secure_hops(reg) == [("fhir_lookup:LK", REASON)]
 
 
 def test_an_attestation_beside_a_typed_cleartext_acceptance_is_marked_refused() -> None:
@@ -117,7 +124,7 @@ def test_an_attestation_beside_a_typed_cleartext_acceptance_is_marked_refused() 
     spec.settings["tls_hop_attested"] = True
     spec.settings["tls_hop_attested_reason"] = REASON
     reg.add_fhir_lookup(spec)
-    assert attested_secure_hops(reg) == [("fhir_lookup:LK", f"{REASON} {REFUSED_ATTESTATION_MARK}")]
+    assert attested_secure_hop_records(reg) == [AttestedHop("fhir_lookup:LK", REASON, refused=True)]
 
 
 def test_a_name_holding_a_newline_is_escaped_in_the_report() -> None:
