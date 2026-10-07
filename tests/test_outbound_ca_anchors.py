@@ -855,3 +855,216 @@ async def test_a_reload_does_not_read_a_lane_below_the_dr_threshold(
         assert await _rows(store, "outbound:OUT") == []
     finally:
         await runner.stop()
+
+
+# --- round 4: the Lander's hold on PR 2108 --------------------------------------------------------
+
+
+class _CountingSink:
+    """Counts ``connection_stopped`` alerts per connection; every other alert is a no-op."""
+
+    def __init__(self) -> None:
+        from messagefoundry.pipeline.alerts import LoggingAlertSink
+
+        self._base = LoggingAlertSink()
+        self.stopped: list[str] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append(name)
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self._base, attr)
+
+
+def _ftps_poller_registry(ca: Path, *, pin: str | None = None, schedule: Any = None) -> Registry:
+    """One inbound ``Ftp`` poller on a dead loopback port, routed nowhere, and no outbound."""
+    from messagefoundry.config.wiring import build_inbound_connection
+
+    kw: dict[str, Any] = {"tls_ca_file": str(ca)}
+    if pin is not None:
+        kw["tls_ca_pin"] = pin
+    reg = Registry()
+    spec = Ftp(host="127.0.0.1", port=9, tls=True, remote_dir="/out", **kw)
+    reg.add_inbound(build_inbound_connection("IB_FTPS", spec, router="r", schedule=schedule))
+    reg.add_router("r", lambda m: [])
+    return reg
+
+
+def _real_ca(tmp_path: Path) -> Path:
+    """A CA file an FTPS context loads, so a poller can bind for real."""
+    from tests.test_alert_smtp_tls import _self_signed_ca_pem
+
+    p = tmp_path / "real-ca.pem"
+    p.write_bytes(_self_signed_ca_pem())
+    return p
+
+
+def _runner(store: MessageStore, reg: Registry, **kw: Any) -> Any:
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    return RegistryRunner(
+        reg,
+        store,
+        egress=EgressSettings(deny_by_default=False),
+        lane_anchor_check=ta.make_lane_anchor_check(store, enforcing=True),
+        **kw,
+    )
+
+
+async def test_a_refused_scheduled_poller_alerts_once_over_three_ticks(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Lander hold, blocking: each in-window tick retries the start. The refusal is recorded once,
+    so three ticks give one ``connection_stopped`` alert, not one per tick. Red under: the operator
+    start path recording every refusal (35bc01e080)."""
+    from datetime import UTC, datetime, time
+
+    from messagefoundry.config.models import ActiveWindow, Schedule
+
+    schedule = Schedule(
+        windows=[
+            ActiveWindow(
+                days=frozenset(range(7)), start=time(0, 0), end=time(23, 59), timezone="UTC"
+            )
+        ]
+    )
+    reg = _ftps_poller_registry(_ca(tmp_path), pin="00" * 32, schedule=schedule)
+    sink = _CountingSink()
+    noon = datetime(2026, 7, 13, 12, tzinfo=UTC)
+    runner = _runner(store, reg, alert_sink=sink, schedule_clock=lambda: noon)
+    await runner.start()
+    try:
+        for _ in range(3):
+            await runner._reconcile_schedule("IB_FTPS", "inbound", schedule)
+        assert sink.stopped == ["IB_FTPS"], sink.stopped
+        assert not runner.inbound_running("IB_FTPS")
+    finally:
+        await runner.stop()
+
+
+async def test_a_refused_check_on_a_failed_lane_does_not_let_the_next_reload_skip_it(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix 1, in isolation. ``OUT`` fails its start for a reason that is not its CA, so it is
+    recorded failed but not marked. Its CA is then swapped. A connection test and a refused reload
+    each check it, and neither may mark it, or the next reload would keep the failure and skip the
+    check. Red under either ``fails_lane=False`` call reverted."""
+    from messagefoundry.api.app import _run_connection_test
+    from messagefoundry.pipeline import wiring_runner
+    from messagefoundry.transports import build_destination as real
+
+    calls = {"OUT": 0}
+
+    def flaky(dest: Any, **kw: Any) -> Any:
+        if dest.name == "OUT" and calls["OUT"] == 0:
+            calls["OUT"] += 1
+            raise RuntimeError("partner endpoint not ready")
+        return real(dest, **kw)
+
+    monkeypatch.setattr(wiring_runner, "build_destination", flaky)
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin=_sha(ca)))
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        assert "partner endpoint not ready" in runner.degraded_outbound()["OUT"]
+        ca.write_bytes(_block(b"substitute"))
+        await _run_connection_test(runner, "OUT", "outbound")
+        for _ in range(2):
+            with pytest.raises(WiringError, match=_PIN_MISMATCH):
+                await engine.reload_detail(cfg)
+    finally:
+        await engine.stop()
+
+
+async def test_a_marked_lane_with_a_live_connector_is_still_checked(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Fix 2, the ``_destinations`` clause. A lane with a live connector is running, so a reload
+    keeps it and must check it, whatever an old mark says. The mark and failure are planted, since
+    no path today leaves them on a live lane. Red under: the clause removed."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin=_sha(ca)))
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        assert "OUT" in runner._destinations
+        runner._anchor_refused.add(("outbound", "OUT"))
+        runner._failed[("outbound", "OUT")] = "planted"
+        ca.write_bytes(_block(b"substitute"))
+        with pytest.raises(WiringError, match=_PIN_MISMATCH):
+            await engine.reload_detail(cfg)
+    finally:
+        await engine.stop()
+
+
+async def test_a_marked_poller_that_is_bound_is_still_checked(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Fix 2, the ``bound`` clause. A poller listening before the reload is kept running, so the
+    reload must check it, whatever an old mark says. Planted as above. Red under: the clause
+    removed."""
+    ca = _real_ca(tmp_path)
+    pin = _sha(ca)
+    runner = _runner(store, _ftps_poller_registry(ca, pin=pin))
+    await runner.start()
+    try:
+        assert runner.inbound_running("IB_FTPS")
+        runner._anchor_refused.add(("inbound", "IB_FTPS"))
+        runner._failed[("inbound", "IB_FTPS")] = "planted"
+        ca.write_bytes(_block(b"substitute"))
+        with pytest.raises(WiringError, match=_PIN_MISMATCH):
+            await runner.reload(_ftps_poller_registry(ca, pin=pin))
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_rollback_does_not_rebind_a_poller_whose_ca_was_swapped(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix 4. A reload that fails after its quiesce restarts the old pollers. One whose CA was
+    swapped since is checked first: it stays down and reads failed, with one alert. Red under: the
+    rollback binding it unchecked."""
+    ca = _real_ca(tmp_path)
+    sink = _CountingSink()
+    runner = _runner(store, _ftps_poller_registry(ca, pin=_sha(ca)), alert_sink=sink)
+    await runner.start()
+    try:
+        assert runner.inbound_running("IB_FTPS")
+
+        async def swap_then_fail(old: Registry, new: Registry) -> None:
+            ca.write_bytes(_block(b"substitute"))
+            raise RuntimeError("reconcile failed")
+
+        monkeypatch.setattr(runner, "_reconcile_outbounds", swap_then_fail)
+        with pytest.raises(RuntimeError, match="reconcile failed"):
+            await runner.reload(_ftps_poller_registry(ca, pin=_sha(ca)))
+        assert not runner.inbound_running("IB_FTPS")
+        assert "IB_FTPS" in runner.degraded_inbound()
+        assert sink.stopped == ["IB_FTPS"]
+    finally:
+        await runner.stop()
+
+
+async def test_a_poller_whose_ca_was_removed_drops_its_old_refusal(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Lander Low: a poller that no longer names a CA has nothing to check, so its old refusal
+    must not stand. Red under: the early return leaving the mark."""
+    runner = _runner(store, _ftps_poller_registry(_ca(tmp_path), pin="00" * 32))
+    await runner.start()
+    try:
+        assert ("inbound", "IB_FTPS") in runner._anchor_refused
+        no_ca = Registry()
+        from messagefoundry.config.wiring import build_inbound_connection
+
+        spec = Ftp(host="127.0.0.1", port=9, tls=True, remote_dir="/out")
+        no_ca.add_inbound(build_inbound_connection("IB_FTPS", spec, router="r"))
+        no_ca.add_router("r", lambda m: [])
+        runner.registry = no_ca
+        await runner._check_inbound_lane_anchor("IB_FTPS")
+        assert ("inbound", "IB_FTPS") not in runner._anchor_refused
+    finally:
+        await runner.stop()

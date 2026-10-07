@@ -2693,11 +2693,16 @@ class RegistryRunner:
     async def _checked_inbound_start(self, name: str) -> None:
         """:meth:`_start_inbound_unsafe` after the lane check. A refused CA records the inbound
         failed before it re-raises, so a poller an operator or an alert rule restarts reads
-        ``failed``, not ``stopped`` (vault BACKLOG #2371)."""
+        ``failed``, not ``stopped`` (vault BACKLOG #2371).
+
+        Once only, as :meth:`_record_window_open_failure` records: a scheduled poller retries at
+        every in-window tick, and :meth:`_record_failed` alerts and logs a traceback each time it
+        runs. Every alert could re-fire a ``restart_inbound`` control action."""
         try:
             await self._check_inbound_lane_anchor(name)
         except (TrustAnchorError, ValueError) as exc:
-            self._record_failed(name, exc, kind="inbound")
+            if ("inbound", name) not in self._failed:
+                self._record_failed(name, exc, kind="inbound")
             raise
         await self._start_inbound_unsafe(name)
 
@@ -2968,21 +2973,25 @@ class RegistryRunner:
             if fails_lane:
                 self._anchor_refused.add((direction, name))
             raise
-        if fails_lane:
-            self._anchor_refused.discard((direction, name))
+        # A passing check clears the mark whoever asked: the CA a refusal named is good now.
+        self._anchor_refused.discard((direction, name))
 
     async def _check_inbound_lane_anchor(self, name: str) -> None:
         """:meth:`_check_lane_anchor` for an inbound ``Ftp`` poller about to bind, the one inbound
         that dials out. A no-op for any other inbound, a bound one, an unknown name and one not
         deployed: :meth:`_start_inbound_unsafe` answers those itself."""
         ic = self.registry.inbound.get(name)
+        if ic is not None and (
+            ic.spec.type is not ConnectorType.REMOTEFILE or not ic.spec.settings.get("tls_ca_file")
+        ):
+            # An SFTP poller, or FTPS with no CA: nothing to check, so no old refusal stands.
+            self._anchor_refused.discard(("inbound", name))
+            return
         if (
             self._lane_anchor_check is None
             or ic is None
             or name in self._sources
             or not ic.deployed
-            or ic.spec.type is not ConnectorType.REMOTEFILE
-            or not ic.spec.settings.get("tls_ca_file")  # an SFTP poller, or FTPS with no CA
         ):
             return
         source_cfg = _source_config(
@@ -6062,8 +6071,7 @@ class RegistryRunner:
                     await self._stop_inbound_unsafe(name)
                 for name in old_inbound_names:
                     try:
-                        await self._check_inbound_lane_anchor(name)  # vault BACKLOG #2371
-                        await self._start_inbound_unsafe(name)
+                        await self._checked_inbound_start(name)  # vault BACKLOG #2371
                     except Exception:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
