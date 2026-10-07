@@ -240,9 +240,10 @@ Written in EARS form, like the ADR's acceptance criteria.
 - **FR-24.** In Code, the developer build SHALL show a small steps outline beside the text and a
   *View as Steps* link above each `@handler` and `@router` def.
 - **FR-25.** WHILE the user lacks `code:edit`, THE DEVELOPER BUILD SHALL offer only the Steps layout,
-  with the analyst build's limits.
-- **FR-26.** The developer build keeps every ADR 0076 guardrail, including *Reopen With: Python* and
-  the text-editor fallback. It provides the Python editor with an open language server, git, a
+  with the analyst build's limits, including no route to a text editor for `.py` (Amendment G,
+  AC-G1, AC-G2 and AC-G5).
+- **FR-26.** For a `code:edit` holder, the developer build keeps every ADR 0076 guardrail,
+  including *Reopen With: Python* and the text-editor fallback. It provides the Python editor with an open language server, git, a
   terminal and the debugger. Pylance is licensed for Microsoft products only, so the choice is an open
   server such as basedpyright (spike S-1).
 
@@ -258,9 +259,17 @@ Written in EARS form, like the ADR's acceptance criteria.
   3. Inside each def body, the ordered sequence of hand-written source is unchanged: every `code` row's
      text, and the `test_src` of every control row the lens marks unrecognized (`lens.py` emits an
      unbounded `if` or `for` that way, not as a `code` row), compared by content and nesting, never by
-     line number. An insert above a `code` row therefore passes, and a moved,
+     line number. A change from one recognized test to another passes: a recognized test stays inside
+     the bounded grammar of ADR 0076 section 4, so it carries no arbitrary code. Only the analyst build's
+     UI keeps tests read-only (FR-9). An insert above a `code` row therefore passes, and a moved,
      added, removed or edited `code` row fails.
-  4. Every typed parameter at head is a literal or a template.
+  4. Every typed parameter that is new or changed between base and head is a literal or a template.
+     A developer-written dynamic parameter the change leaves alone does not fail it.
+  5. Every `send` and `route` row either matches base by content or is fully literal: one literal
+     destination per `Send`, the message argument a plain name, no `SetState` expression, and a
+     route's `handlers` non-empty or `unrouted`. The lens projects a `Send` with a computed
+     argument, or a dynamic route, as an ordinary row with no typed parameters (`_send_outbounds` and
+     `_route_row` in `messagefoundry/lens.py`), so items 3 and 4 alone would miss it.
   The command's name and home are settled at build (ADR 0201 decides the tier).
 - **FR-27a.** Owner ruling 3 says the check *"fails if a `code` row changed"*. Read literally, it
   would fail every developer change too. This spec reads it as: the check passes a Steps-only change,
@@ -443,7 +452,7 @@ means the finding applies only to a hosted design and is carried to the later AD
 | R7 | major | Not applicable to desktop: edits go through the document model, no broker. Hosted ADR | FR-11 |
 | R8 | major | Addressed by owner ruling 3: the repository check is an option, with guidance on when to turn it on | Section 5.4, ADR options |
 | R9 | major | Addressed: ADR 0076 Amendment G, with the BACKLOG #26 note and the corrected amendment citation | Amendment G, FR-7, FR-8 |
-| R10 | minor | Addressed: `code:steps` is the only engine change in this phase; the reload-commit requirement is dropped | Section 11, ADR D4 |
+| R10 | minor | Addressed: every engine change is listed (`code:steps`, the R1 fix, the check command, and a start-up route only if none fits); the reload-commit requirement is dropped | Section 11, ADR D4 |
 | R11 | minor | Addressed: `config:validate` marked declared, not enforced | Section 4 |
 | R12 | minor | Partly applicable: dry-run runs config code on the analyst's machine, as it does in `ide/` today. On a desktop the user can run code anyway. Hosted ADR | Section 8 note |
 | R13 | minor | Addressed | FR-15, ADR AC-7 |

@@ -96,8 +96,9 @@ that holds the Steps limit whatever tool made the change.**
   lists them.
 - **D5 -- The role check is the primary control, and it is a guardrail.** The editor signs in
   through the engine, finishes MFA and any required password change before it stores a token or reads
-  permissions, and on start-up proves a stored token on a route that is not MFA-exempt (review R2), re-reads them before each save rather than on a timer (review R3), and turns on only
-  the editing they allow. It stops an analyst changing Python through the editor. It does not stop a
+  permissions, and on start-up proves a stored token on a route that is not MFA-exempt (review R2).
+  It re-reads them before each save rather than on a timer (review R3), and turns on only the editing
+  they allow. It stops an analyst changing Python through the editor. It does not stop a
   change made with another tool. In the analyst build it also refuses a delete or move of a control
   block that holds a `code` row or an unrecognized test, which `ide/` allows today (Amendment G).
 - **D6 -- R1 is a precondition.** The analyst build does not ship until the lens refuses
@@ -106,15 +107,18 @@ that holds the Steps limit whatever tool made the change.**
 - **D7 -- The repository check is optional, and the project ships it.** A CI step decides whether a
   change is Steps-only: only existing Router or Handler modules changed; no byte changed outside the
   def bodies, which `lens parse` does not partition; the ordered hand-written source in each body
-  (`code` rows and unrecognized control tests, compared by content, not line) is unchanged; and every
-  typed parameter is a literal or a template. A Steps-only change passes. Any other change passes only
+  (`code` rows and unrecognized control tests, compared by content, not line) is unchanged; every
+  new or changed typed parameter is a literal or a template; and every `send` and `route` row matches
+  base or is fully literal, since the lens projects a computed `Send` argument or a dynamic route with
+  no typed parameters. A Steps-only change passes. Any other change passes only
   with an approval from a review group whose members hold `code:edit`, behind the site's branch
   protection. That reading of ruling 3 is this ADR's, not a ruling (spec FR-27a). The
   config-repository template (ADR 0017) carries the step commented out. Spec section 5.4 says when to
   turn it on.
 - **D8 -- The analyst build drops three ADR 0076 guardrails, for that build only.** No *Reopen With:
   Python*, no text-editor fallback on a parse failure, and the Steps view is the default editor rather
-  than opt-in. ADR 0076 Amendment G records this. The developer build keeps every guardrail.
+  than opt-in. ADR 0076 Amendment G records this. The developer build keeps every guardrail for a
+  `code:edit` holder, and applies the analyst limits to a user without it.
 - **D9 -- Edits save through the document model.** As `ide/` does today, so undo, dirty state and
   hot-exit keep working. There is no server-side broker in this phase.
 - **D10 -- Analyst Test never reveals PHI.** The analyst build runs Test against synthetic samples
@@ -178,7 +182,8 @@ on); promote stays `POST /config/reload` with step-up and the site's dual contro
 2. **Hosted Theia with a read-only workspace mount and a server-side edit broker** (the 2026-10-02
    design). **Deferred** to a later phase by owner ruling 2. It is the only design on record that
    enforces the Steps limit inside the editing session. Its costs are a gateway, per-user sandboxes,
-   central custody of engine tokens, and the review findings that spec Appendix A carries to the hosted ADR.
+   central custody of engine tokens, and the review findings that spec Appendix A carries to the
+   hosted ADR.
 3. **An analyst build that runs the `ide/` extension under `@theia/plugin-ext`.** Rejected. It saves
    the port but cannot leave out the terminal, tasks, debug, SCM, Monaco or AI (review R6), so the
    analyst build would not be simpler.
@@ -212,8 +217,8 @@ on); promote stays `POST /config/reload` with step-up and the site's dual contro
 ## Consequences
 
 **Positive** -- Analysts get an editor with one job. Nothing new runs on a server. Each token stays on
-its user's machine. The engine change is one permission. A site that needs a hard boundary can turn
-one on without the hosted design.
+its user's machine. The only engine API change is one permission. A site that needs a hard boundary
+can turn one on without the hosted design.
 
 **Negative / risks** -- The Steps view must be ported to a native Theia extension and then kept in
 step with `ide/` (spec section 9). Without the repository check, the Steps limit holds only for
