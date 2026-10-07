@@ -3,9 +3,8 @@
 """The fail-soft audit write: a row whose caller's answer stands whether or not it lands, and whose
 loss is logged at ERROR with its traceback (vault BACKLOG #2260).
 
-Before this module that shape existed in nine copies across ``api/``, ``auth/`` and the startup
-checks, each with its own catch. :func:`write_audit_soft` is that shape once. It owns the catch;
-each caller keeps its own log line, its own catch set and its own answer to a defect.
+:func:`write_audit_soft` owns the catch; each caller keeps its own log line, its own catch set and
+its own answer to a defect.
 
 Two neighbours are not this shape. A write that must stop the operation when the audit log refuses
 it answers 503 instead, as the inline reload's ``config_reload_attempted`` row does (vault BACKLOG

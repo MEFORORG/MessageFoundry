@@ -25,6 +25,7 @@ from messagefoundry.api import approvals as approvals_module
 from messagefoundry.api import tls as tls_module
 from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
+from tests._ast_sites import call_sites, parse_source
 
 _LOG = logging.getLogger("tests.audit_write")
 _ENGINE = Path(__file__).resolve().parents[1] / "messagefoundry"
@@ -245,15 +246,11 @@ def _soft_write_messages() -> list[str]:
     """Every literal ``message=`` passed to :func:`write_audit_soft` in the engine package."""
     found: list[str] = []
     for path in sorted(_ENGINE.rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "write_audit_soft"
-            ):
-                for kw in node.keywords:
-                    if kw.arg == "message":
-                        found.append(ast.literal_eval(kw.value))
+        text = path.read_text(encoding="utf-8")
+        if "write_audit_soft(" not in text:
+            continue
+        for call in call_sites(parse_source(text), "write_audit_soft", bare_only=True):
+            found.extend(ast.literal_eval(kw.value) for kw in call.keywords if kw.arg == "message")
     return found
 
 
@@ -265,5 +262,5 @@ def test_the_soft_write_messages_survive_the_console_and_redaction() -> None:
     # CONTROL: the nine call sites this module replaced. A scan that finds none proves nothing.
     assert len(messages) >= 9
     for message in messages:
-        message.encode("cp1252")
+        assert message.encode("cp1252", "replace").decode("cp1252") == message, message
         assert redaction.redact(message) == message, message

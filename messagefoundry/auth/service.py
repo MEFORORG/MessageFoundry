@@ -10471,8 +10471,7 @@ class AuthService:
                 detail["roles"] = list(roles)
             # The refusal below is the answer either way, and the traceback says why the row is
             # missing. ``defects=()``: a defect raised here would replace the refusal, so the route
-            # would answer 500 and keep the spent step-up grant (vault BACKLOG #2260). A fault
-            # outside the store-refusal set still raises.
+            # would answer 500 and keep the spent step-up grant (vault BACKLOG #2260).
             await write_audit_soft(
                 lambda: self._audit(
                     CREDENTIAL_ISSUE_REFUSED_ACTION,
