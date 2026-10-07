@@ -6318,7 +6318,7 @@ async def test_reauth_extra_less_with_credentials_renders_notice(
 
 def _ad_service(engine: Engine) -> AuthService:
     """An AuthService with a duck-typed fake directory (the _FakeLdap pattern)."""
-    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 
     principal = AdPrincipal(
         username="jdoe",
@@ -6330,8 +6330,10 @@ def _ad_service(engine: Engine) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
@@ -6514,7 +6516,7 @@ async def test_proxy_headers_middleware_rewrites_scheme_and_client() -> None:
 
 
 def _sso_service(engine: Engine) -> AuthService:
-    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 
     principal = AdPrincipal(
         username="jdoe",
@@ -6526,8 +6528,10 @@ def _sso_service(engine: Engine) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
@@ -7854,7 +7858,7 @@ def _oidc_settings(**over: object) -> AuthSettings:
 
 
 def _oidc_service(engine: Engine, **over: object) -> AuthService:
-    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 
     principal = AdPrincipal(
         username="jdoe",
@@ -7867,8 +7871,10 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if username == "jdoe" else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal)
 
         def resolve_principal(
             self, username: str, *, object_id: str | None = None

@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, DirectoryProbe
 from messagefoundry.auth.notifications import LOGIN_NEW_IP, SecurityEvent
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.auth.tokens import hash_token
@@ -288,8 +288,8 @@ async def test_a_wrong_password_from_a_new_address_writes_no_signal_row() -> Non
 
 
 class _FakeLdap:
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return None
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+        return DirectoryBind(DirectoryAnswer.NOT_FOUND)
 
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return None

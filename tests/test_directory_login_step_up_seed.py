@@ -28,7 +28,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS, SessionMechanism
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -70,8 +70,9 @@ def _principal(username: str = "jdoe") -> AdPrincipal:
 class _FakeLdap:
     """``authenticate`` is the live re-bind ``POST /me/reauth`` makes for a directory account."""
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return _principal(username) if password == AD_PW else None
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+        found = _principal(username) if password == AD_PW else None
+        return DirectoryBind(DirectoryAnswer.FOUND, found)
 
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return _principal(username)
