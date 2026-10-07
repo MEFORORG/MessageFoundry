@@ -1810,8 +1810,15 @@ def _anon_ftp_guard(
     """An :class:`~messagefoundry.transports.mllp.InsecureHopGuard` for an ANONYMOUS plain-``ftp`` hop
     (protocol ``ftp`` with no credentials), or ``None`` for any other protocol / a credentialed ftp.
 
-    Credentialed plain-ftp is already refused by :func:`_validate_common` (it puts the credential itself
-    on the wire in the clear); ``ftps``/``sftp`` are encrypted. The remaining gap #200 closes is an
+    Credentialed plain-ftp is refused outright by :func:`_validate_common` (it puts the credential
+    itself on the wire in the clear; vault BACKLOG #2636). Every non-test caller reaches this helper
+    only after that refusal has run (``_validate_common`` calls it below the refusal, and
+    ``RemoteFileDestination`` after calling ``_validate_common``), so the credentialed ``None`` arm
+    below is unreachable from them. The arm stays so the helper never labels a credentialed hop
+    "anonymous" and hands it a body-PHI guard; ``test_anon_guard_none_for_credentialed_ftp`` calls it
+    directly and pins the ``username`` half. ``None`` is not a refusal, so the arm does not fail
+    closed on its own: a new caller must have the ``_validate_common`` refusal run first.
+    ``ftps``/``sftp`` are encrypted. The remaining gap #200 closes is an
     ANONYMOUS plain-ftp hop — no credential, but the message BODY is still PHI over a cleartext channel.
     Keyed on the shared gradient off-loopback: loopback / per-connection-attested ALLOW, an ADR 0153
     ``cleartext_accepted`` declaration WARNs (loudly, audited), everything else REFUSES under ENFORCE.
@@ -1822,7 +1829,7 @@ def _anon_ftp_guard(
     if remote_file_protocol(s) != "ftp":
         return None
     if s.get("username") or s.get("password"):
-        return None  # credentialed ftp — covered by _validate_common's cleartext-credential refusal
+        return None  # credentialed ftp: _validate_common refused it outright before any caller
     reason = s.get("tls_hop_attested_reason")
     return InsecureHopGuard.capture(
         host=str(s["host"]),
@@ -1871,8 +1878,9 @@ def _validate_common(
         )
     # #200 (ADR 0092): an ANONYMOUS plain-ftp hop carries no credential but still ships the PHI body over
     # cleartext. Refuse a production-PHI hop off-loopback at the ENFORCED construction gate (the
-    # credentialed case above is the orthogonal credential-on-the-wire guard). No-op for ftps/sftp/
-    # credentialed-ftp, and byte-identical off the enforced gate (posture unstamped).
+    # credentialed case above is the orthogonal credential-on-the-wire guard, and has already
+    # raised, so only an anonymous ftp hop gets here with protocol ftp). No-op for ftps/sftp, and
+    # byte-identical off the enforced gate (posture unstamped).
     guard = _anon_ftp_guard(
         s,
         cleartext_accepted=cleartext_accepted,
@@ -1896,7 +1904,8 @@ class RemoteFileDestination(DestinationConnector):
             connection=config.name,
         )
         # #200 send-time backstop for an anonymous plain-ftp hop (the enforced refusal already fired in
-        # _validate_common at the construction gate). None for ftps/sftp/credentialed-ftp.
+        # _validate_common at the construction gate). None for ftps/sftp; a credentialed ftp hop
+        # never gets here, because _validate_common above refused it outright (vault BACKLOG #2636).
         self._hop_guard = _anon_ftp_guard(
             s,
             cleartext_accepted=config.cleartext_accepted,

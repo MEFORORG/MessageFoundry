@@ -629,10 +629,24 @@ every posture, with no escape (it puts the credential itself on the wire; vault 
 ## The `MEFOR_ALLOW_INSECURE_TLS` escape hatch
 
 Several connectors **fail closed** on a weakened-TLS or cleartext configuration unless the
-environment variable `MEFOR_ALLOW_INSECURE_TLS` is set. A credential over cleartext or over an
-unverified TLS session is not on this list: SMTP AUTH and FTP logins there are refused outright,
-whatever the escape says. It exists for **dev / trusted-lab** use only.
-With it set, these otherwise-refused settings become permitted (each logs a loud warning):
+environment variable `MEFOR_ALLOW_INSECURE_TLS` is set. It exists for **dev / trusted-lab** use
+only.
+
+Two connector logins are absent from the list below because the escape cannot release them. SMTP
+AUTH on an `Email` or `Direct` destination is refused outright over cleartext, or over a TLS session
+with the certificate or hostname check off. So is an FTP or FTPS `username`/`password` (vault
+BACKLOG #2636). **This is not a rule that no credential crosses an unverified or cleartext hop.** At
+least these still can, wherever the escape or another lever releases the cell that carries them
+(a per-connection `cleartext_accepted` or `tls_hop_attested` declaration with its reason, or a named
+service setting): a REST/SOAP auth header over plain `http` under `cleartext_accepted`, or over
+`https` under `verify_tls = false`; a SQL Server login under `TrustServerCertificate=true` or
+`Encrypt=false`; the AD service-account and user binds under `ad_tls_verify = false`, or over plain
+`ldap://` under `ad_allow_insecure_ldap = true`; the `[alerts]` SMTP relay login under
+`email_tls_verify = false` (it is refused over cleartext); and an SFTP password sent to an unknown
+host key.
+
+With `MEFOR_ALLOW_INSECURE_TLS` set, these otherwise-refused settings become permitted (each logs a
+loud warning):
 
 - REST/SOAP `verify_tls = false`. *(Clamped.)*
 - MLLP outbound `tls_verify = false`; FTPS `tls_verify = false` on an **anonymous** hop. *(Clamped.
