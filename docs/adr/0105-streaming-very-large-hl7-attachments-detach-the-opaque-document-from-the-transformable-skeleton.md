@@ -568,7 +568,8 @@ R10 of 2026-09-23 graded the cell `partial` on exactly that gap.
 **How an SVG is recognised.** Only markup can be an SVG. Markup here means bytes whose first byte,
 after any whitespace, NUL or byte-order mark, is `<`. No SVG reader renders anything else, so a PDF
 or an image under an SVG label is served as before. That covers SVGZ too: ingress already relabels
-gzip bytes under a `+xml` label as `application/octet-stream`.
+gzip bytes under a `+xml` label as `application/octet-stream`. *Corrected 2026-10-07 (BACKLOG
+#2391):* the relabel changes only the label, so that sentence was wrong. See the correction below.
 
 Markup is an SVG when either of two things holds:
 
@@ -581,7 +582,8 @@ there: an unsupported or false encoding declaration, an entity in the prolog, or
 Then a byte scan finds the root instead. The scan skips comments, processing instructions and
 declarations, and compares the name without regard to case or prefix. A browser may still read such
 a document as SVG, which is why the scan exists. An HTML page that only embeds an `<svg>` has an
-`html` root, so it is served as before.
+`html` root, so it is served as before. *Amended 2026-10-07 (BACKLOG #2391):* it is now refused;
+see the correction below.
 
 **What the sanitizer keeps.** `messagefoundry/api/svg_sanitize.py` parses through `defusedxml` and
 rebuilds the document from an allow-list:
@@ -637,7 +639,7 @@ them.
 - SVG content inside a document whose root is not `svg`, such as XHTML or another XML document that
   embeds an `<svg>` element, is not sanitized. It is served as before, under the inert-type downgrade
   and the sandbox CSP. That is the same exposure any other active XML or HTML attachment has, and it
-  sits outside 1.3.4's SVG scope.
+  sits outside 1.3.4's SVG scope. *Closed 2026-10-07 (BACKLOG #2391):* such a document is refused.
 - *Closed 2026-10-07 (BACKLOG #2387).* This bullet read: a refused download writes a WARNING log
   line and no audit row, as the route's other 422 does for an undecodable stored value, and whether
   a refusal belongs in the tamper-evident chain is open. That bullet was wrong in one respect: the
@@ -647,3 +649,86 @@ them.
   action, so a reader filtering on `attachment_download` never counts a refusal as a document that
   left. A refusal writes no `record_view`, since nothing was viewed.
 - No real browser has been run against the download.
+
+### Correction 2026-10-07: SVGZ, and SVG below another root (BACKLOG #2391)
+
+**The SVGZ sentence above was wrong.** Ingress does relabel gzip bytes under a `+xml` label: the
+detach in `pipeline/wiring_runner.py` stores `application/octet-stream` when
+`attachment_mime_agrees` finds no leading `<`. But the stored bytes are still gzip. The download's
+pre-check looked only for `<`, so it never called the sanitizer, and it served the gzip bytes as
+stored. They went out unsanitized, under `application/octet-stream`, a `.bin` name and the sandbox
+CSP. A label such as `image/svg+xml-compressed` or `application/gzip` is not relabelled at all.
+`test_svgz_through_ingress_is_served_sanitized_and_gzipped` drives all three labels through the
+real detach and the download, and fails against the sanitizer this correction replaces.
+
+**What the download does now.**
+
+1. A body that starts with the gzip magic is inflated, under the same 32 MiB bound. The bound is
+   applied while inflating, so a small bomb costs no more than the bound. A body may hold at most
+   16 gzip members.
+2. Where the inflate reaches damage, the body is refused, whatever it holds. Step 3 says when it
+   stops early. Damage covers at least a corrupt header or
+   block, a failed CRC or length check, a member cut short, more than 16 members, and any bytes
+   after the last member other than NUL padding, which includes NUL bytes between two members.
+   zlib keeps none of a call's output when the call raises, so there is nothing to judge, and a
+   reader that skips the trailer check may still show the document. *Corrected later on
+   2026-10-07:* the first version of this correction served such a body as stored, unsanitized.
+   The Lander found it on PR 2158.
+3. The first 64 KiB is inflated first. If its first byte past leading whitespace, NUL and
+   byte-order-mark bytes is not `<`, the body is served as stored without reading the rest. Damage
+   past that head is not seen. That cannot hide an SVG from a browser, since no browser renders a
+   document as SVG when its first byte past that noise is not `<`. A reader that autodetects EBCDIC
+   could; plain bytes rest on the same assumption. Bytes that are only that noise for the whole head
+   do not clear the body: it is inflated up to the bound, and the same first-byte rule then applies
+   to the whole output.
+4. Markup that passes the bound is refused, since it cannot be vetted.
+5. Otherwise the inflated document is judged like plain bytes. A sanitized SVG is gzipped again, so
+   the served copy keeps the stored representation. The audit row says `sanitized-svg`.
+
+**Markup whose root is not `svg` but which carries an SVG element is refused.** This covers XHTML,
+an XML document such as a CDA, and an HTML page with an inline `<svg>`. An SVG element means one in
+the SVG namespace, or one named `svg` in any namespace or none. Rewriting such a document would
+change the parts that are not SVG, which are verbatim clinical content, so it is refused instead.
+The refusing parser reads the whole document where it can. Where it stops, on an entity declaration,
+an encoding it does not support or a syntax error, a byte scan decides. The scan looks for an `svg`
+start tag under any prefix and in any case, for the SVG namespace name, and for a namespace name
+spelled with a reference. Where the parse stops, the document is also refused when any of these
+holds:
+
+- It holds the ISO-2022-JP escape byte. `ESC ( B` decodes to nothing, so `<s ESC ( B vg` reads as
+  `<svg` to a browser while no byte scan sees it. It is the one stateful encoding a browser decodes.
+  Every other one keeps ASCII as ASCII, or is UTF-16 or UTF-32, which the scans read after removing
+  NUL bytes. The root scan treats such a document as SVG, so an SVG root hidden this way is refused
+  too.
+- It has an attribute-list declaration. Its defaults can put an element in the SVG namespace with no
+  `xmlns=` on the element, and with the namespace spelled through references.
+- It declares an entity that could expand to markup: a value holding `<`, a reference that yields
+  `<` or `&`, or a parameter entity. Any byte of a name can be a reference, so no scan of spellings
+  can rule such an entity out. A text-only entity such as `&#160;` is accepted.
+
+No entity is expanded. The scan errs toward refusal, so a document it cannot parse that mentions the
+SVG namespace name in text, or holds `<svg` in a comment, is refused too. The root scan skips a
+declaration with the regex engine between its quotes, brackets and comments. It stops after 100,000
+of those steps and then treats the document as SVG, so it is refused rather than served unread.
+
+The trace scan also runs on a document the parser read cleanly. An HTML parser takes `<!-->` as an
+empty comment and reads no CDATA section or processing instruction, so an `<svg` that XML holds as
+text in one of those is a live element to it. So a well-formed document that writes `<svg` anywhere,
+even in a comment, is refused too. Only that tag counts on this path: a well-formed document that
+declares or names the SVG namespace without using it is served.
+
+**What this leaves open.**
+
+- A gzip inside a gzip is served as stored, since no SVG reader inflates twice.
+- A gzip body whose markup inflates past 32 MiB is refused even when it holds no SVG. So is one that
+  inflates to only NUL or byte-order-mark bytes up to the bound, since those count as leading noise.
+- Every download of markup now reads the whole document rather than stopping at its root.
+- The byte scan reads ASCII-compatible encodings, and UTF-16 and UTF-32 after removing NUL bytes.
+- These refusals catch documents with no SVG in them, by design:
+  - every ISO-2022-JP document, since pyexpat cannot read it and its Japanese text always holds the
+    escape byte;
+  - any document the parser cannot read that has an attribute-list declaration, even one that sets
+    no `xmlns`;
+  - any document whose root scan runs out of steps;
+  - any gzip whose damage the inflate reaches before its head clears it, such as a small damaged
+    PDF, whatever it holds.
