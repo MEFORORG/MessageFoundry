@@ -271,6 +271,33 @@ class BackupResult:
     #: the run alerts ``backup_failed`` with kind ``cleanup`` and records this in its audit row, and the
     #: next backup's sweep retries the directory.
     staging_leftover: str | None = None
+    #: Whether the archive carries the config dir under ``config/``, the dir this pass read, and,
+    #: when it could not be read, the fault's class name (vault BACKLOG #3094). A full run with
+    #: ``config_bundled`` false and a fault still succeeds: the store snapshot is worth keeping.
+    config_bundled: bool = False
+    config_dir: str | None = None
+    config_bundle_error: str | None = None
+
+
+@dataclass(frozen=True)
+class _ConfigBundle:
+    """What one pass found at its config dir; see :meth:`BackupRunner._inspect_config`."""
+
+    path: Path | None
+    bundled: bool
+    fingerprint: str | None
+    error: str | None
+
+    def manifest_fields(self) -> dict[str, object]:
+        """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
+        directory path, a digest and an exception class name."""
+        return {
+            "config_fingerprint": self.fingerprint,
+            "config_bundled": self.bundled,
+            # Named on a fault too, so the record says which directory failed.
+            "config_dir": str(self.path) if self.path is not None else None,
+            "config_bundle_error": self.error,
+        }
 
 
 @dataclass(frozen=True)
@@ -576,8 +603,16 @@ class BackupRunner:
                     raise BackupError(
                         "space", f"not enough free space to finish this backup: it {shortfall}"
                     )
-            # Taken once, off the loop, and recorded in both the manifest and the audit row.
-            fingerprint = await asyncio.to_thread(self._config_fingerprint, config_dir)
+            # Read once, off the loop, and recorded in both the manifest and the audit row.
+            bundle = await asyncio.to_thread(self._inspect_config, config_dir)
+            if config_only and bundle.error is not None:
+                # A config-only archive without its config holds nothing to restore, yet it would
+                # verify and take a keep-N slot from an archive that does. It fails instead.
+                raise BackupError(
+                    "snapshot",
+                    f"config-only backup: the config dir {config_dir} could not be read "
+                    f"({bundle.error}); nothing to archive",
+                )
             try:
                 (
                     snapshot_sha256,
@@ -594,8 +629,7 @@ class BackupRunner:
                     salt=salt,
                     config_only=config_only,
                     now=now,
-                    config_dir=config_dir,
-                    config_fingerprint=fingerprint,
+                    bundle=bundle,
                 )
             except (OSError, BackupCodecError) as exc:
                 kind = "write" if isinstance(exc, OSError) else "encrypt"
@@ -649,12 +683,15 @@ class BackupRunner:
             config_only=config_only,
             snapshot_method=s.snapshot_method,
             key_id=key_id,
-            config_fingerprint=fingerprint,
+            config_fingerprint=bundle.fingerprint,
             row_counts=row_counts,
             verify=verify,
             pruned=pruned,
             encrypted=key is not None,
             staging_leftover=staging_leftover,
+            config_bundled=bundle.bundled,
+            config_dir=str(bundle.path) if bundle.path is not None else None,
+            config_bundle_error=bundle.error,
         )
 
     async def _verify_and_publish(
@@ -831,8 +868,7 @@ class BackupRunner:
         key_id: str | None,
         config_only: bool,
         now: float,
-        config_dir: Path | None,
-        config_fingerprint: str | None,
+        bundle: _ConfigBundle,
         salt: bytes | None = None,
     ) -> tuple[str, dict[str, int], int, str | None]:
         """Run :meth:`_build_archive_blocking` in ``work`` and release ``work`` on every exit, from this
@@ -853,8 +889,7 @@ class BackupRunner:
                 salt=salt,
                 work_dir=work.path,
                 secure=work.secure,
-                config_dir=config_dir,
-                config_fingerprint=config_fingerprint,
+                bundle=bundle,
             )
         except BaseException as exc:
             leftover = work.release()
@@ -880,8 +915,7 @@ class BackupRunner:
         now: float,
         work_dir: Path,
         secure: bool,
-        config_dir: Path | None,
-        config_fingerprint: str | None,
+        bundle: _ConfigBundle,
         salt: bytes | None = None,
     ) -> tuple[str, dict[str, int], int]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
@@ -914,7 +948,7 @@ class BackupRunner:
             "config_only": config_only,
             "backend": self._backend_value(),
             "key_id": key_id,  # one-way fingerprint, NEVER key bytes
-            "config_fingerprint": config_fingerprint,
+            **bundle.manifest_fields(),
             "snapshot_sha256": snapshot_sha256,
             "row_counts": row_counts,
         }
@@ -927,8 +961,8 @@ class BackupRunner:
             with tarfile.open(fileobj=tar_fh, mode="w") as tar:
                 if snap_path is not None:
                     tar.add(snap_path, arcname=_STORE_MEMBER)
-                if self._settings.include_config and config_dir is not None:
-                    self._add_config_dir(tar, config_dir)
+                if bundle.bundled and bundle.path is not None:
+                    self._add_config_dir(tar, bundle.path)
                 info = tarfile.TarInfo(_MANIFEST_MEMBER)
                 info.size = len(manifest_bytes)
                 info.mtime = int(now)
@@ -1098,6 +1132,9 @@ class BackupRunner:
             "encrypted": result.encrypted,
             "key_id": result.key_id,  # one-way fingerprint — never key bytes
             "config_fingerprint": result.config_fingerprint,
+            "config_bundled": result.config_bundled,
+            "config_dir": result.config_dir,
+            "config_bundle_error": result.config_bundle_error,
             "snapshot_sha256": result.snapshot_sha256,
             "row_counts": result.row_counts,
             "verify": verify.status if verify is not None else "skipped",
@@ -1158,31 +1195,53 @@ class BackupRunner:
         current = source() if callable(source) else source
         return Path(current) if current is not None else None
 
-    @staticmethod
-    def _config_fingerprint(config_dir: Path | None) -> str | None:
-        """The ADR 0041 D1 digest of ``config_dir``, or ``None`` when there is none or it cannot be
-        read. Blocking; the caller runs it off the loop.
+    def _inspect_config(self, config_dir: Path | None) -> _ConfigBundle:
+        """Whether this pass can bundle ``config_dir``, and its ADR 0041 D1 digest. Blocking; the
+        caller runs it off the loop.
 
-        It catches what :meth:`Engine.fingerprint_bundle_blocking` catches, so a bundle a load
-        tolerates cannot fail a backup (vault BACKLOG #3094); that method is the rule's source of
-        record. A directory that is not there or cannot be listed is refused here too: the fold
-        lists through ``glob``, which swallows that error, so it would digest an empty bundle and
-        the digest would read as real. Either way the archive loses its fingerprint and the backup
-        goes on. The warning names the directory and a scrubbed reason, never config content."""
+        A directory that is gone or cannot be listed is not bundled, and the archive records that
+        with the fault's class name (vault BACKLOG #3094). The fold and the archive walk both list
+        through ``glob``, which swallows that error, so without this check the archive would carry
+        an empty ``config/``, and an empty-bundle digest, under a clean success. A full pass still
+        goes on, because the store snapshot is worth keeping; a config-only pass fails, in
+        :meth:`_do_backup`. The digest itself catches what
+        :meth:`Engine.fingerprint_bundle_blocking` catches, its rule's source of record, so a bundle
+        a load tolerates cannot fail a backup. Each warning names the directory and an error class
+        or a scrubbed reason, never config content. With ``include_config`` off nothing is bundled,
+        so a fault is not one the operator needs to hear about, and none is recorded."""
         if config_dir is None:
-            return None
+            return _ConfigBundle(path=None, bundled=False, fingerprint=None, error=None)
         from messagefoundry.config.fingerprint import config_fingerprint
 
+        include = self._settings.include_config
         try:
             # Raises the real reason (gone, not a directory, access denied) where glob would not.
             with os.scandir(config_dir):
                 pass
-            return config_fingerprint(config_dir)
+        except OSError as exc:
+            error = type(exc).__name__
+            if not include:
+                return _ConfigBundle(path=config_dir, bundled=False, fingerprint=None, error=None)
+            log.warning(
+                "DR backup: config dir %s could not be read (%s); this archive carries no config "
+                "and no config fingerprint",
+                config_dir,
+                error,
+            )
+            return _ConfigBundle(path=config_dir, bundled=False, fingerprint=None, error=error)
+        fingerprint: str | None = None
+        try:
+            fingerprint = config_fingerprint(config_dir)
         except (OSError, ValueError) as exc:
             log.warning(
                 "DR backup: config fingerprint failed for %s: %s", config_dir, safe_exc(exc)
             )
-            return None
+        return _ConfigBundle(
+            path=config_dir,
+            bundled=include,
+            fingerprint=fingerprint,
+            error=None,
+        )
 
     def _is_server_db(self) -> bool:
         return self._backend_value() in (StoreBackend.POSTGRES.value, StoreBackend.SQLSERVER.value)

@@ -23,7 +23,7 @@ import tarfile
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -36,11 +36,11 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.dr_backup import BackupRunner
+from messagefoundry.pipeline.dr_backup import BackupError, BackupRunner
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy
 from messagefoundry.pipeline.sharding import DEFAULT_SHARD, filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store import MessageStatus, MessageStore, Stage
+from messagefoundry.store import MessageStatus, MessageStore, Stage, Store
 from tests.test_dr_running_config_dir import _write_graph
 
 RAW = "MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||ADT^A01|DIR00001|P|2.5\rPID|1||MRN1\r"
@@ -92,6 +92,17 @@ async def backup_engine(tmp_path: Path) -> AsyncIterator[tuple[Engine, Path, Pat
         await engine.stop()
 
 
+async def _last_audit(store: Store) -> dict[str, object]:
+    rows = await store.list_audit(action="dr_backup")
+    assert rows
+    detail: dict[str, object] = json.loads(rows[0]["detail"])
+    return detail
+
+
+def _bundle_fields(record: dict[str, object]) -> tuple[object, object, object]:
+    return record["config_bundled"], record["config_dir"], record["config_bundle_error"]
+
+
 async def test_a_backup_after_a_reload_from_another_root_carries_that_root(
     backup_engine: tuple[Engine, Path, Path],
 ) -> None:
@@ -102,6 +113,7 @@ async def test_a_backup_after_a_reload_from_another_root_carries_that_root(
     first = await runner.run_once(now=1.0)
     assert first is not None
     assert first.config_fingerprint == fp.config_fingerprint(live)
+    assert (first.config_bundled, first.config_dir) == (True, str(live.resolve()))
 
     await engine.reload_detail(staging)
     assert engine.running_config_dir == staging.resolve()
@@ -112,27 +124,60 @@ async def test_a_backup_after_a_reload_from_another_root_carries_that_root(
     # The same digest the running graph's provenance recorded, and the archive carries those bytes.
     loaded = engine.loaded_config_fingerprint
     assert loaded is not None and second.config_fingerprint == loaded["fingerprint"]
+    # Which directory was bundled is recorded in both places.
+    bundled = (True, str(staging.resolve()), None)
+    assert _bundle_fields(await _last_audit(engine.store)) == bundled
     with _archive_tar(second.archive_path) as tar:
-        assert _manifest(tar)["config_fingerprint"] == second.config_fingerprint
+        manifest = _manifest(tar)
+        assert manifest["config_fingerprint"] == second.config_fingerprint
+        assert _bundle_fields(manifest) == bundled
         member = tar.extractfile("config/cfg.py")
         assert member is not None
         assert b"IB_STAGING_ADT" in member.read()
 
 
-@pytest.mark.parametrize("fault", ["unlistable-dir", "non-utf8-file-name"])
-async def test_a_config_read_fault_costs_the_fingerprint_not_the_backup(
+class _Run(NamedTuple):
+    fingerprint: str | None
+    manifest: dict[str, object]
+    audit: dict[str, object]
+    names: list[str]
+
+
+async def _backup_of(tmp_path: Path, cfg: Path) -> _Run:
+    tmp_path.mkdir(exist_ok=True)
+    db = tmp_path / "b.db"
+    store = await MessageStore.open(db)
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "out"), allow_unencrypted=True),
+        store_settings=StoreSettings(path=str(db)),
+        config_dir=cfg,
+    )
+    try:
+        result = await runner.run_once(now=1.0)
+        audit = await _last_audit(store)
+    finally:
+        await store.close()
+    assert result is not None and result.verify is not None and result.verify.status == "PASS"
+    with _archive_tar(result.archive_path) as tar:
+        return _Run(result.config_fingerprint, _manifest(tar), audit, tar.getnames())
+
+
+@pytest.mark.parametrize("fault", ["unlistable-dir", "gone-dir"])
+async def test_a_config_dir_that_cannot_be_read_is_recorded_as_not_bundled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     fault: str,
 ) -> None:
+    """The fold and the archive walk both list through glob, which swallows the error, so the
+    archive would carry an empty config/ under a clean success. The backup still succeeds, since
+    the store snapshot is worth keeping, and says plainly that it carries no config."""
     cfg, _staging = _roots(tmp_path)
-    db = tmp_path / "b.db"
-    store = await MessageStore.open(db)
     threads: list[threading.Thread] = []
     if fault == "unlistable-dir":
-        # Listing the dir is denied while stat still works. The fold lists through glob, which
-        # swallows this and would digest an empty bundle; the backup's own listing must not.
+        expected = "PermissionError"
+        # Listing the dir is denied while stat still works.
         real_scandir = os.scandir
 
         def scandir(path: Any = ".") -> Any:
@@ -147,77 +192,90 @@ async def test_a_config_read_fault_costs_the_fingerprint_not_the_backup(
 
         monkeypatch.setattr(os, "scandir", scandir)
     else:
-
-        def failing(directory: object) -> str:
-            threads.append(threading.current_thread())
-            # What the fold raises on a file name that is not UTF-8 (vault BACKLOG #2839).
-            raise UnicodeEncodeError("utf-8", "x\udc80", 1, 2, "surrogates not allowed")
-
-        monkeypatch.setattr(fp, "config_fingerprint", failing)
-    runner = BackupRunner(
-        store,
-        BackupSettings(enabled=True, destination=str(tmp_path / "out"), allow_unencrypted=True),
-        store_settings=StoreSettings(path=str(db)),
-        config_dir=cfg,
-    )
-    try:
-        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
-            result = await runner.run_once(now=1.0)
-    finally:
-        await store.close()
-    assert result is not None and result.config_fingerprint is None
-    assert result.verify is not None and result.verify.status == "PASS"
-    # Every read of the config dir, the fingerprint's among them, ran off the event loop.
-    assert threads and all(t is not threading.main_thread() for t in threads)
-    warnings = [r.getMessage() for r in caplog.records if "config fingerprint failed" in r.message]
-    assert len(warnings) == 1 and str(cfg) in warnings[0]
-    with _archive_tar(result.archive_path) as tar:
-        assert _manifest(tar)["config_fingerprint"] is None
-        if fault == "non-utf8-file-name":
-            assert "config/cfg.py" in tar.getnames(), "the config is still archived"
-    # The fault cost only the fingerprint: the plaintext staging dir under the data dir is gone.
-    staged = [p.name for p in tmp_path.glob("mefor-*") if p.is_dir()]
+        expected = "FileNotFoundError"
+        cfg = tmp_path / "gone"
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
+        run = await _backup_of(tmp_path, cfg)
+    assert run.fingerprint is None
+    not_bundled = (False, str(cfg), expected)
+    assert _bundle_fields(run.manifest) == not_bundled
+    assert _bundle_fields(run.audit) == not_bundled
+    assert run.manifest["config_fingerprint"] is None and run.audit["config_fingerprint"] is None
+    assert not [n for n in run.names if n.startswith("config/")]
+    warnings = [r.getMessage() for r in caplog.records if "could not be read" in r.message]
+    assert len(warnings) == 1 and str(cfg) in warnings[0] and expected in warnings[0]
+    if fault == "unlistable-dir":
+        # Every read of the config dir ran off the event loop.
+        assert threads and all(t is not threading.main_thread() for t in threads)
+    # The plaintext staging dir under the data dir is gone after the fault. The data dir holds the
+    # store, so the walk below reads a real population.
+    entries = list(tmp_path.iterdir())
+    assert entries
+    staged = [p.name for p in entries if p.name.startswith("mefor-") and p.is_dir()]
     assert staged == [], f"plaintext staging left behind: {staged}"
-    assert tmp_path.joinpath("b.db").is_file(), "control: the glob looks in the data dir"
 
 
-async def _backup_of(tmp_path: Path, cfg: Path) -> str | None:
-    tmp_path.mkdir(exist_ok=True)
+async def test_a_config_only_backup_of_an_unreadable_dir_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A config-only archive without its config holds nothing to restore, yet it would verify and
+    take a keep-N slot from one that does. It fails, through the existing failure path."""
     db = tmp_path / "b.db"
     store = await MessageStore.open(db)
     runner = BackupRunner(
         store,
         BackupSettings(enabled=True, destination=str(tmp_path / "out"), allow_unencrypted=True),
         store_settings=StoreSettings(path=str(db)),
-        config_dir=cfg,
+        config_dir=tmp_path / "gone",
     )
     try:
-        result = await runner.run_once(now=1.0)
+        with pytest.raises(BackupError) as raised:
+            await runner.run_once(now=1.0, force_config_only=True)
+        audit = await _last_audit(store)
     finally:
         await store.close()
-    assert result is not None and result.verify is not None and result.verify.status == "PASS"
-    return result.config_fingerprint
+    assert raised.value.kind == "snapshot" and "FileNotFoundError" in str(raised.value)
+    assert audit["outcome"] == "error"
+    # Control: the same runner shape with a readable dir writes a config-only archive.
+    cfg, _staging = _roots(tmp_path / "control")
+    run = await _backup_of(tmp_path / "control", cfg)
+    assert run.manifest["config_bundled"] is True and "config/cfg.py" in run.names
+
+
+async def test_a_fingerprint_fault_costs_only_the_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg, _staging = _roots(tmp_path)
+    threads: list[threading.Thread] = []
+
+    def failing(directory: object) -> str:
+        threads.append(threading.current_thread())
+        # What the fold raises on a file name that is not UTF-8 (vault BACKLOG #2839).
+        raise UnicodeEncodeError("utf-8", "x\udc80", 1, 2, "surrogates not allowed")
+
+    monkeypatch.setattr(fp, "config_fingerprint", failing)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
+        run = await _backup_of(tmp_path, cfg)
+    assert run.fingerprint is None
+    # Taken once, and off the event loop.
+    assert len(threads) == 1 and threads[0] is not threading.main_thread()
+    warnings = [r.getMessage() for r in caplog.records if "config fingerprint failed" in r.message]
+    assert len(warnings) == 1 and str(cfg) in warnings[0]
+    assert _bundle_fields(run.manifest) == (True, str(cfg), None)
+    assert "config/cfg.py" in run.names, "the config is still archived"
 
 
 async def test_a_real_non_utf8_file_name_costs_only_the_fingerprint(tmp_path: Path) -> None:
     """The fault unmocked: the name vault BACKLOG #2839 used, which the fold cannot encode."""
     cfg, _staging = _roots(tmp_path)
-    assert isinstance(await _backup_of(tmp_path / "control", cfg), str), "control: a digest"
+    assert isinstance((await _backup_of(tmp_path / "control", cfg)).fingerprint, str)
     (cfg / "environments").mkdir()
     try:
         (cfg / "environments" / "x\udc80.toml").write_text("", encoding="utf-8")
     except (OSError, UnicodeEncodeError):
         pytest.skip("this file system will not store a name that is not UTF-8")
-    assert await _backup_of(tmp_path / "bad", cfg) is None
-
-
-async def test_a_config_dir_that_has_gone_records_no_fingerprint(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A gone directory digests as an empty bundle, which would read as a real fingerprint."""
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
-        assert await _backup_of(tmp_path, tmp_path / "gone") is None
-    assert any("config fingerprint failed" in r.getMessage() for r in caplog.records)
+    run = await _backup_of(tmp_path / "bad", cfg)
+    assert run.fingerprint is None and run.manifest["config_bundled"] is True
 
 
 async def test_an_unexpected_fingerprint_fault_fails_the_pass_and_the_loop_survives(
