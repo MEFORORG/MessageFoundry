@@ -1319,7 +1319,7 @@ class UploadStore:
         now: float | None = None,
         retention_days: int | None = None,
         abort: threading.Event | None = None,
-        on_delete: Callable[[], None] | None = None,
+        tally: _SweepTally | None = None,
     ) -> PruneResult:
         """Age-based retention sweep (ASVS 5.2.4): delete every (blob, meta) pair whose ``uploaded_at`` is
         older than ``retention_days`` (default: the configured ``retention_days``), then sweep the write
@@ -1340,10 +1340,8 @@ class UploadStore:
         the scan and before each pair, then skips the orphan sweep and returns the pairs it did delete.
         A pair is never half-deleted by an abort.
 
-        ``on_delete`` is called in the pass's thread for each aged pair, right after the ``abort``
-        check and before the pair's unlinks. It lets a caller tell a pass that has deleted nothing
-        from one that may have, before the pass returns. It counts attempts, so a pair whose unlink
-        is refused counts too."""
+        ``tally`` records, as the pass goes, each pair it removes and the pair it is removing. The
+        retention runner uses it to name the files a timed-out stop loses (:class:`_SweepTally`)."""
         days = self._retention_days if retention_days is None else max(1, int(retention_days))
         at = time.time() if now is None else now
         cutoff = at - days * _SECONDS_PER_DAY
@@ -1357,51 +1355,19 @@ class UploadStore:
             for meta in metas:
                 if meta.uploaded_at >= cutoff:
                     continue
-                if stop.is_set():
+                if tally is None:
+                    if stop.is_set():
+                        break
+                elif not tally.begin(meta, stop):
                     break
-                # Counted before the path guard, so nothing runs between the abort check and the
-                # count. A pair the guard then refuses is over-counted, which errs toward the ERROR.
-                if on_delete is not None:
-                    on_delete()
-                # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
+                removed = False
                 try:
-                    blob_path, meta_path = self._paths(meta.file_id)
-                except UploadPathError:
-                    continue
-                # A refused unlink must not raise out of the loop: that would drop `pruned`, and with
-                # it the audit rows for every pair already deleted.
-                #
-                # The BODY goes first, and a pair is reported exactly when THIS pass removed its body,
-                # because the body is the PHI the audit row records the deletion of. Sidecar-first
-                # reported a pair whose body unlink was refused and left the body on disk, and it
-                # opened a window where a body with no sidecar is exactly what a concurrent pass's
-                # orphan sweep takes. Body-first keeps the sidecar in place until the body is gone,
-                # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
-                # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
-                # can overlap), so only its leftover sidecar is cleared, with no second report.
-                try:
-                    blob_path.unlink()
-                except FileNotFoundError:
-                    with contextlib.suppress(OSError):
-                        meta_path.unlink(missing_ok=True)
-                    continue
-                except OSError as exc:
-                    _log.warning(
-                        "uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc
-                    )
-                    continue
-                pruned.append(meta)
-                # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
-                # body gone and clears the sidecar without reporting the pair again.
-                try:
-                    meta_path.unlink(missing_ok=True)
-                except OSError as exc:
-                    _log.warning(
-                        "uploaded-logs prune removed the body of %s but not its sidecar; the next "
-                        "pass will clear it: %s",
-                        meta.file_id,
-                        exc,
-                    )
+                    removed = self._prune_pair_sync(meta)
+                finally:
+                    if tally is not None:
+                        tally.end(removed)
+                if removed:
+                    pruned.append(meta)
             if stop.is_set():
                 return PruneResult(pruned=pruned)
             # The orphan sweep runs AFTER the deletions, so a failure in it must not raise out of
@@ -1416,21 +1382,64 @@ class UploadStore:
 
         return await asyncio.to_thread(_prune)
 
+    def _prune_pair_sync(self, meta: UploadedFileMeta) -> bool:
+        """Remove one aged pair for :meth:`prune_expired`; True when THIS call removed its body.
+
+        Never raises: a raise would drop the pass's list, and with it the audit rows for every
+        pair already deleted. ``_paths`` resolves the path, which can touch the filesystem, so an
+        ``OSError`` there leaves the pair for the next pass like a refused unlink does."""
+        # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
+        try:
+            blob_path, meta_path = self._paths(meta.file_id)
+        except UploadPathError:
+            return False
+        except OSError as exc:
+            _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
+            return False
+        # The BODY goes first, and a pair is reported exactly when THIS pass removed its body,
+        # because the body is the PHI the audit row records the deletion of. Sidecar-first
+        # reported a pair whose body unlink was refused and left the body on disk, and it
+        # opened a window where a body with no sidecar is exactly what a concurrent pass's
+        # orphan sweep takes. Body-first keeps the sidecar in place until the body is gone,
+        # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
+        # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
+        # can overlap), so only its leftover sidecar is cleared, with no second report.
+        try:
+            blob_path.unlink()
+        except FileNotFoundError:
+            with contextlib.suppress(OSError):
+                meta_path.unlink(missing_ok=True)
+            return False
+        except OSError as exc:
+            _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
+            return False
+        # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
+        # body gone and clears the sidecar without reporting the pair again.
+        try:
+            meta_path.unlink(missing_ok=True)
+        except OSError as exc:
+            _log.warning(
+                "uploaded-logs prune removed the body of %s but not its sidecar; the next "
+                "pass will clear it: %s",
+                meta.file_id,
+                exc,
+            )
+        return True
+
     async def prune_and_audit(
         self,
         audit: Callable[[UploadedFileMeta], Awaitable[None]] | None,
         *,
         now: float | None = None,
         abort: threading.Event | None = None,
-        on_delete: Callable[[], None] | None = None,
-        on_audited: Callable[[], None] | None = None,
+        tally: _SweepTally | None = None,
     ) -> PruneResult:
         """One :meth:`prune_expired` pass, then one ``audit`` call per pruned file.
 
         The shared body of the retention runner and the save-time sweep. A failed audit call is
-        logged and the rest still run, so one bad row never costs the others. ``on_delete`` is
-        :meth:`prune_expired`'s, and ``on_audited`` is called after each audit call, failed or not."""
-        result = await self.prune_expired(now=now, abort=abort, on_delete=on_delete)
+        logged and the rest still run, so one bad row never costs the others. ``tally`` is
+        :meth:`prune_expired`'s, and also counts each audit call once it returns or raises."""
+        result = await self.prune_expired(now=now, abort=abort, tally=tally)
         if audit is not None:
             for meta in result.pruned:
                 try:
@@ -1442,8 +1451,8 @@ class UploadStore:
                         "uploaded-logs prune audit failed for %s; it has no upload.prune audit row",
                         meta.file_id,
                     )
-                if on_audited is not None:
-                    on_audited()
+                if tally is not None:
+                    tally.audited += 1
         return result
 
     async def prune_on_save(
@@ -1580,19 +1589,48 @@ _DEFAULT_STOP_TIMEOUT_SECONDS = 5.0
 class _SweepTally:
     """How far one runner sweep got, read by :meth:`UploadRetentionRunner.stop` when it times out.
 
-    ``deleting`` counts pairs the sweep's thread started deleting, and ``audited`` counts audit
-    calls that returned or raised. A raised call is counted because
-    :meth:`UploadStore.prune_and_audit` already logs it per file. Each sweep gets its own, so a thread a timed-out stop left running
-    never writes into the next sweep's counts. One writer per field, so no lock."""
+    ``removed`` lists each pair the sweep's thread removed, in the order it is audited, and
+    ``removing`` is the pair it is removing now. ``audited`` counts audit calls that returned or
+    raised; a raised call is counted because :meth:`UploadStore.prune_and_audit` already logs it.
+    So ``unaudited()`` names every removed file whose row has not been written, and only those.
 
-    deleting: int = 0
+    The abort check and the ``removing`` mark are one step under ``lock``, and so is the stop's
+    ``abort.set()``. A thread that passed the check is therefore already visible to the stop.
+    Each loop sweep gets its own tally, so a thread a timed-out stop left running never writes
+    into the next sweep's."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    removed: list[UploadedFileMeta] = field(default_factory=list)
+    removing: UploadedFileMeta | None = None
     audited: int = 0
 
-    def started_delete(self) -> None:
-        self.deleting += 1
+    def begin(self, meta: UploadedFileMeta, abort: threading.Event) -> bool:
+        """In the sweep's thread: mark ``meta`` as being removed, unless ``abort`` is set."""
+        with self.lock:
+            if abort.is_set():
+                return False
+            self.removing = meta
+            return True
 
-    def finished_audit(self) -> None:
-        self.audited += 1
+    def end(self, removed: bool) -> None:
+        """In the sweep's thread: the pair :meth:`begin` marked is settled."""
+        with self.lock:
+            if removed and self.removing is not None:
+                self.removed.append(self.removing)
+            self.removing = None
+
+    def abort(self, abort: threading.Event) -> None:
+        """Set ``abort`` so that no :meth:`begin` straddles it."""
+        with self.lock:
+            abort.set()
+
+    def unaudited(self) -> list[str]:
+        """The ``file_id`` of each removed, or being removed, file with no audit row yet."""
+        with self.lock:
+            ids = [m.file_id for m in self.removed[self.audited :]]
+            if self.removing is not None:
+                ids.append(self.removing.file_id)
+            return ids
 
 
 class UploadRetentionRunner:
@@ -1663,7 +1701,7 @@ class UploadRetentionRunner:
             return
         # Stop the sweep in flight, which holds THIS event, then give the runner a fresh one. Left
         # set, it made every later run_once() prune nothing, silently.
-        self._abort.set()
+        self._tally.abort(self._abort)
         self._abort = threading.Event()
         try:
             # shield: a timeout must not cancel the task mid-audit; the branches below decide that.
@@ -1673,17 +1711,23 @@ class UploadRetentionRunner:
             why = f"did not finish within {self._stop_timeout:g}s of shutdown"
         except asyncio.CancelledError:
             why = "was still running when shutdown itself was cancelled"
-        # Read before the cancel. With the abort above set, the sweep's thread starts no unlink it
-        # has not already counted (see prune_expired's on_delete).
-        unaudited = self._tally.deleting - self._tally.audited
-        level = logging.ERROR if unaudited > 0 else logging.WARNING
-        outcome = (
-            f"It started deleting {unaudited} file(s) it had not audited, and each one it removed "
-            "has no upload.prune audit row"
-            if unaudited > 0
-            else "It had deleted no file it had not audited, so no upload.prune row is lost"
-        )
-        _log.log(level, "uploaded-logs retention sweep %s; cancelling it. %s", why, outcome)
+        # Read before the cancel. With no audit callback no row was ever due, so none is lost.
+        lost = self._tally.unaudited() if self._audit is not None else []
+        if lost:
+            # An audit write the cancel interrupts may still land, so "may".
+            _log.error(
+                "uploaded-logs retention sweep %s; cancelling it. %d file(s) it removed, or was "
+                "removing, may have no upload.prune audit row: %s",
+                why,
+                len(lost),
+                ", ".join(lost[:20]) + (f" and {len(lost) - 20} more" if len(lost) > 20 else ""),
+            )
+        else:
+            _log.warning(
+                "uploaded-logs retention sweep %s; cancelling it. It had removed no aged pair "
+                "it had not audited, so no upload.prune row is lost",
+                why,
+            )
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -1693,7 +1737,9 @@ class UploadRetentionRunner:
         # must never take the engine down). Cooperatively cancellable via _stop.
         while not self._stop.is_set():
             try:
-                await self.run_once()
+                # The loop's sweep alone owns self._tally, so a direct run_once() never hides it.
+                self._tally = _SweepTally()
+                await self._sweep(self._tally)
             except Exception:
                 _log.exception("uploaded-logs retention prune failed; will retry next interval")
             await self._sleep(self._interval)
@@ -1708,13 +1754,14 @@ class UploadRetentionRunner:
         """One :meth:`UploadStore.prune_and_audit` pass for ``now`` (default: the injected clock).
         The pass's orphan count rides back in the result; it is logged by the sweep and carries no
         metadata to audit (see :class:`PruneResult`)."""
-        tally = self._tally = _SweepTally()
+        return await self._sweep(None, now)
+
+    async def _sweep(self, tally: _SweepTally | None, now: float | None = None) -> PruneResult:
         return await self._store.prune_and_audit(
             self._audit,
             now=self._clock() if now is None else now,
             abort=self._abort,
-            on_delete=tally.started_delete,
-            on_audited=tally.finished_audit,
+            tally=tally,
         )
 
 
@@ -1791,8 +1838,8 @@ async def _wait_to_completion[T](
 
     ``cancel_bound`` limits the wait after a cancellation, in seconds; ``None`` waits as long as it
     takes, which the save's thread needs, since a thread cannot be stopped. A ledger call waits on
-    the store, which may not be bounded at all. At the bound this raises with ``fut`` still running, and the caller decides
-    what to do with it. Under an anyio scope, the scope cancels again on every loop pass, so the
+    the store, which may not be bounded at all. At the bound this raises with ``fut`` still
+    running, and the caller decides what to do with it. Under an anyio scope, the scope cancels again on every loop pass, so the
     wait costs CPU, and the bound limits that too.
 
     **A caller already cancelled at entry gets the bound as well.** That is a ``finally`` running

@@ -555,7 +555,7 @@ async def test_a_sweep_stuck_past_the_stop_bound_is_cancelled_and_logged(
     record = await _stop_stuck_runner(store, *_pause_sweep_at_pair(store, 2), caplog)
     assert record.levelno == logging.ERROR, record.getMessage()
     assert "did not finish within 0.05s of shutdown" in record.getMessage()
-    assert "started deleting 2 file(s) it had not audited" in record.getMessage()
+    assert "2 file(s) it removed, or was removing, may have no" in record.getMessage()
 
 
 async def test_a_stuck_sweep_that_deleted_nothing_logs_no_audit_gap(
@@ -566,20 +566,49 @@ async def test_a_stuck_sweep_that_deleted_nothing_logs_no_audit_gap(
     it sees the abort and deletes nothing more, so no row is lost: a WARNING, not an ERROR."""
     store = _quota_store(tmp_path, retention_days=30)
     meta = await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
-    paused, release = threading.Event(), threading.Event()
+    paused, release, scanned = threading.Event(), threading.Event(), threading.Event()
     real_scan = store._scan_metas_sync
 
     def _stuck_scan() -> list[UploadedFileMeta]:
         paused.set()
         release.wait(timeout=10)
-        return real_scan()
+        try:
+            return real_scan()
+        finally:
+            scanned.set()
 
     monkeypatch.setattr(store, "_scan_metas_sync", _stuck_scan)
     record = await _stop_stuck_runner(store, paused, release, caplog)
     assert record.levelno == logging.WARNING, record.getMessage()
     assert "no upload.prune row is lost" in record.getMessage()
-    # The abort was set before the release, so the thread leaves the pair whole.
+    # The abort was set before the release, so the released thread leaves the pair whole. Nothing
+    # joins a cancelled to_thread job, so give it time to reach the pair before reading the disk.
+    assert await asyncio.to_thread(scanned.wait, 10)
+    await asyncio.sleep(0.2)
     assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+
+
+async def test_a_refused_unlink_is_not_counted_as_an_audit_gap(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2264 item 1, code review. A pair whose body unlink is refused was never removed, so
+    it owes no row. A sweep that then stalls in its orphan sweep loses nothing: a WARNING."""
+    store = _quota_store(tmp_path, retention_days=30)
+    await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    undeletable = tmp_path / "a-directory-cannot-be-unlinked"
+    undeletable.mkdir()
+    real_paths = store._paths
+    monkeypatch.setattr(store, "_paths", lambda fid: (undeletable, real_paths(fid)[1]))
+    paused, release = threading.Event(), threading.Event()
+
+    def _stuck_orphans(*, now: float) -> int:
+        paused.set()
+        release.wait(timeout=10)
+        return 0
+
+    monkeypatch.setattr(store, "_sweep_orphans_sync", _stuck_orphans)
+    record = await _stop_stuck_runner(store, paused, release, caplog)
+    assert record.levelno == logging.WARNING, record.getMessage()
 
 
 async def test_a_refused_body_unlink_is_not_reported_and_the_pair_stays_whole(
