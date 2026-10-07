@@ -218,6 +218,8 @@ def test_json_output_says_where_the_secrets_went_and_carries_none(
     assert "console" in body["secrets_shown_on"]
     assert body["recovery_codes_shown"] is True
     assert body["sessions_ended"] == 1
+    assert body["passkeys_kept"] is False
+    assert body["holder_notice"] in {"notices_off", "no_address", "no_channel"}
     assert _NEW_SECRET not in raw
 
 
@@ -238,9 +240,12 @@ def test_it_audits_the_os_user_and_never_the_seed(
     assert rows[0]["actor"] == f"cli:{getpass.getuser()}"
     detail = json.loads(str(rows[0]["detail"]))
     assert detail["username"] == _ADMIN
-    assert detail["sessions_ended"] == 1
+    # The row commits with the swap, so it records that every session ended, not a count.
+    assert detail["sessions_ended"] == "all"
     assert detail["provider"] == "local"
-    assert detail["holder_notice"] in {"notices_off", "no_address", "no_channel"}
+    assert detail["passkeys_kept"] is False
+    # The notice runs after the row commits, so the row cannot say what became of it.
+    assert "holder_notice" not in detail
     assert _NEW_SECRET not in str(rows[0]["detail"])
 
 
@@ -293,6 +298,10 @@ def test_a_directory_administrator_is_accepted(
             await store.set_user_roles("u-ad", [Role.ADMINISTRATOR.value], assigned_by="test")
             await store.set_totp_secret("u-ad", secret=PROVISION_TOTP_SECRET)
             assert await store.enable_totp("u-ad", recovery_code_hashes=[]) is True
+            # The local one disabled, so the directory Administrator is the sole enabled one.
+            local = await store.get_user_by_username(_ADMIN)
+            assert local is not None
+            await store.set_user_disabled(local.id, disabled=True)
         finally:
             await store.close()
 
@@ -374,8 +383,12 @@ def test_a_wrong_code_at_the_terminal_writes_nothing_and_the_old_seed_still_work
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
     error = _error(capsys)
     assert "nothing was written" in error
-    # The real prompt names this command, not provision-admin.
-    assert "NEW authenticator entry" in "".join(terminal.shown)
+    # The real prompt names this command, not provision-admin, and labels the new entry apart from
+    # the old one, which carries the bare username.
+    shown = "".join(terminal.shown)
+    assert "NEW authenticator entry" in shown
+    assert f"{_ADMIN} (replaced " in shown
+    assert f"otpauth://totp/MessageFoundry:{_ADMIN}%20%28replaced%20" in shown
     assert _state(db) == before
     assert _audit_rows(db) == []
 
@@ -510,3 +523,264 @@ def test_help_names_the_host_gate(capsys: pytest.CaptureFixture[str]) -> None:
         main([_CMD, "--help"])
     text = capsys.readouterr().out
     assert "admin-unlock" in text and "engine" in text and "stopped" in text
+
+
+# --- 4. review repairs: sole administrator, compare-and-set, atomic audit, after-commit failure ---
+
+
+def _with_store(db: Path, act: Any) -> Any:
+    """Run ``act(store)`` against the store at ``db`` and close it."""
+
+    async def run() -> Any:
+        store = await MessageStore.open(db)
+        try:
+            return await act(store)
+        finally:
+            await store.close()
+
+    return asyncio.run(run())
+
+
+def _live_terminal(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Enrol ``_NEW_SECRET`` with a live code, and return what the console device was shown."""
+    shown: list[str] = []
+
+    def enrol(**_k: object) -> tuple[str, str, float]:
+        at = time.time()
+        return _NEW_SECRET, totp.totp(_NEW_SECRET, now=at), at
+
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    monkeypatch.setattr(cli, "_show_on_terminal", shown.append)
+    return shown
+
+
+def test_a_second_enabled_administrator_is_refused_and_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ruling answers a SOLE Administrator. With another enabled one, that one resets this
+    account's MFA from the web console, so the host command refuses before the key is shown. A
+    disabled second Administrator does not count, so the control arm below goes through."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "two.db"
+    _seed(db)
+
+    async def add_admin(store: MessageStore) -> None:
+        await store.create_user(
+            user_id="u-second",
+            username="second-admin",
+            auth_provider="local",
+            password_hash=None,
+            password_generated=False,
+        )
+        await store.set_user_roles("u-second", [Role.ADMINISTRATOR.value], assigned_by="test")
+
+    _with_store(db, add_admin)
+    before = _state(db)
+    _refused_before_the_key(monkeypatch)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    error = _error(capsys)
+    assert "not the only enabled one" in error and "second-admin" in error
+    assert _state(db) == before
+    assert _audit_rows(db) == []
+
+    async def disable_second(store: MessageStore) -> None:
+        await store.set_user_disabled("u-second", disabled=True)
+
+    _with_store(db, disable_second)
+    _live_terminal(monkeypatch)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 0
+    assert _state(db)["secret"] == _NEW_SECRET
+
+
+def test_totp_on_with_no_seed_is_refused_with_its_own_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A row flagged TOTP-on with no seed is a damaged row. The command replaces a seed and never
+    creates one, so it says so before the key is shown rather than failing at the write."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "noseed.db"
+    _seed(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE users SET totp_secret=NULL WHERE username=?", (_ADMIN,))
+    _refused_before_the_key(monkeypatch)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    assert "no seed stored" in _error(capsys)
+    assert _audit_rows(db) == []
+
+
+def test_a_re_enrolment_during_the_prompt_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE COMPARE-AND-SET'S FALSE BRANCH. While the operator types, the account's TOTP is removed
+    and enrolled again with another seed. Every re-check passes (TOTP is on, with a seed), so only
+    the enrolment instant pinned before the prompt can tell. The write matches nothing, the newer
+    enrolment stands, and no audit row claims a replacement."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "reenrol.db"
+    _seed(db)
+    other_seed = base64.b32encode(b"enrolled-meanwhile!!").decode("ascii")
+
+    async def re_enrol(store: MessageStore) -> None:
+        user = await store.get_user_by_username(_ADMIN)
+        assert user is not None
+        await store.disable_totp(user.id)
+        await store.set_totp_secret(user.id, secret=other_seed)
+        assert await store.enable_totp(user.id, recovery_code_hashes=[], now=1.0) is True
+
+    def enrol_while_re_enrolled(**_k: object) -> tuple[str, str, float]:
+        _with_store(db, re_enrol)
+        at = time.time()
+        return _NEW_SECRET, totp.totp(_NEW_SECRET, now=at), at
+
+    shown = _live_terminal(monkeypatch)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol_while_re_enrolled)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    assert "enrolled again while this command ran" in _error(capsys)
+    after = _state(db)
+    assert (after["enabled"], after["secret"], after["sessions"]) == (True, other_seed, 1)
+    assert _audit_rows(db) == []
+    assert shown == [], "recovery codes were shown for a replacement that never landed"
+
+
+def test_a_refused_audit_append_rolls_the_swap_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The audit row shares the swap's transaction. When the append fails, the seed, the codes and
+    the sessions all stay as they were, no codes are shown, and the error says nothing was
+    written -- not that the store could not be opened."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "refused.db"
+    _seed(db)
+    before = _state(db)
+
+    async def refuse(*_a: object, **_k: object) -> object:
+        raise RuntimeError("probe: the audit append was refused")
+
+    shown = _live_terminal(monkeypatch)
+    monkeypatch.setattr(MessageStore, "_append_audit_row", refuse)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    error = _error(capsys)
+    assert "nothing was written" in error and "cannot open the store" not in error
+    monkeypatch.undo()  # the readers below append nothing, but use the real store
+    assert _state(db) == before
+    assert shown == []
+
+
+def test_record_audit_raising_no_longer_leaves_an_unrecorded_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    console: _Console,
+) -> None:
+    """THE REVIEWER'S PROBE. The first build appended its audit row with ``record_audit`` AFTER the
+    swap, and a ``record_audit`` that raised left the new seed live with no row and no codes shown.
+    The row now commits inside the swap's own transaction, so the same probe changes nothing: the
+    command succeeds, the row is there, and the codes reach the console."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "probe-record.db"
+    _seed(db)
+
+    async def refuse(*_a: object, **_k: object) -> None:
+        raise RuntimeError("probe: record_audit refused")
+
+    monkeypatch.setattr(MessageStore, "record_audit", refuse)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 0
+    assert _state(db)["secret"] == _NEW_SECRET
+    assert len(_audit_rows(db)) == 1
+    assert "New recovery codes" in "".join(console.shown)
+
+
+def test_a_failure_after_the_swap_still_shows_the_codes_and_says_the_seed_was_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    console: _Console,
+) -> None:
+    """After the commit only the store's close is left inside the store step. When it fails, the
+    seed has been replaced and audited, so the operator must still get the codes, and the error
+    must say the seed WAS replaced rather than read as a refusal or a store that would not open."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "after.db"
+    _seed(db)
+    committed: list[bool] = []
+    real_replace = MessageStore.replace_totp_enrolment
+    real_close = MessageStore.close
+
+    async def replace(self: MessageStore, *a: Any, **k: Any) -> int | None:
+        ended = await real_replace(self, *a, **k)
+        committed.append(ended is not None)
+        return ended
+
+    async def close(self: MessageStore) -> None:
+        await real_close(self)
+        if committed:
+            raise sqlite3.OperationalError("probe: close failed after the commit")
+
+    monkeypatch.setattr(MessageStore, "replace_totp_enrolment", replace)
+    monkeypatch.setattr(MessageStore, "close", close)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    body = json.loads(capsys.readouterr().out)
+    assert body["code"] == "replaced_then_failed"
+    assert "WAS replaced" in body["error"] and "cannot open the store" not in body["error"]
+    assert "New recovery codes" in "".join(console.shown)
+    monkeypatch.setattr(MessageStore, "close", real_close)
+    assert _state(db)["secret"] == _NEW_SECRET
+    assert len(_audit_rows(db)) == 1
+
+
+def test_kept_passkeys_are_warned_about_in_text_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    console: _Console,
+) -> None:
+    """Passkeys are a separate factor and are kept, so the operator is told they still sign in."""
+    from messagefoundry.store.store import WebAuthnCredential
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "passkey.db"
+    _seed(db)
+
+    async def add_passkey(store: MessageStore) -> None:
+        user = await store.get_user_by_username(_ADMIN)
+        assert user is not None
+        await store.add_webauthn_credential(
+            WebAuthnCredential(
+                credential_id_hash="synthetic-hash",
+                credential_id="c3ludGhldGlj",
+                user_id=user.id,
+                rp_id="localhost",
+                public_key="c3ludGhldGlj",
+                sign_count=0,
+                transports=None,
+                device_type="single_device",
+                backed_up=False,
+                label="synthetic key",
+                aaguid=None,
+                created_at=1.0,
+            )
+        )
+
+    _with_store(db, add_passkey)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db)]) == 0
+    assert "passkeys were kept" in capsys.readouterr().out
+
+
+def test_a_store_key_that_cannot_be_resolved_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Could not start, as provision-admin and rotate-key exit on the same error (BACKLOG #2081)."""
+    import messagefoundry.store.base as store_base
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "keyless.db"
+    _seed(db)
+    _refused_before_the_key(monkeypatch)
+
+    async def unresolved(*_a: object, **_k: object) -> object:
+        raise KeyProviderError("probe: the key provider is unreachable")
+
+    monkeypatch.setattr(store_base, "open_store", unresolved)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
+    assert "Nothing was written" in _error(capsys)

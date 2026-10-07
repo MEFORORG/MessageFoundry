@@ -11681,21 +11681,28 @@ class MessageStore:
         secret: str,
         recovery_code_hashes: list[str],
         step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
         now: float | None = None,
-    ) -> bool:
-        """Swap an ENABLED TOTP enrolment for a new secret in one UPDATE, and return whether it
-        wrote (ADR 0171 Amendment B, BACKLOG #2226).
+    ) -> int | None:
+        """Swap an ENABLED TOTP enrolment for a new secret, end the account's sessions and append
+        ``audit``, all in ONE transaction (ADR 0171 Amendment B, BACKLOG #2226). Returns the number
+        of sessions ended, or ``None`` when nothing was written.
 
         The secret, the recovery codes and the step high-water mark change together, and TOTP stays
         on throughout, so no reader ever sees the account without a factor. ``step`` is the step of
         the code that proved the new secret, so that code is spent. The write matches only a row
-        where TOTP is on, so it can never turn TOTP on for an account that did not have it."""
+        where TOTP is on, with a seed, and still enrolled at ``expected_enrolled_at``: a removal or a
+        re-enrolment that landed after the caller read the row is never overwritten, and TOTP can
+        never be turned on for an account that did not have it. The audit row and the session sweep
+        commit or roll back with the swap, so a refused audit append leaves the old seed in place."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE users SET totp_secret=?, totp_enrolled_at=?, totp_recovery_codes=?,"
                 " last_totp_step=?, updated_at=?"
-                " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL",
+                " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
+                " AND totp_enrolled_at IS ?",
                 (
                     self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
                     now,
@@ -11703,11 +11710,26 @@ class MessageStore:
                     step,
                     now,
                     user_id,
+                    expected_enrolled_at,
                 ),
             )
-            written = cur.rowcount > 0
+            if int(cur.rowcount) <= 0:
+                # Nothing written, so nothing is revoked or audited. The commit ends the empty
+                # transaction, as set_user_federated_subject does.
+                await self._commit()
+                return None
+            revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+            appended = await self._append_audit_row(
+                audit.action,
+                actor=audit.actor,
+                channel_id=None,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
             await self._commit()
-        return written
+        audit.tee(ts=now, row=appended)
+        return int(revoked.rowcount)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""

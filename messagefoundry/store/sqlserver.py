@@ -11374,24 +11374,74 @@ class SqlServerStore:
         secret: str,
         recovery_code_hashes: list[str],
         step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
         now: float | None = None,
-    ) -> bool:
-        """See the SQLite twin (ADR 0171 Amendment B). The OUTPUT rowset says whether it wrote."""
+    ) -> int | None:
+        """See the SQLite twin (ADR 0171 Amendment B). The swap, the session sweep and the audit row
+        share one transaction. This leg is CI-only, so a divergence from the SQLite and Postgres
+        bodies surfaces first in CI.
+
+        Both counts come from ``OUTPUT`` rowsets, as :meth:`revoke_user_sessions` counts (BACKLOG
+        #2283): ``cursor.rowcount`` under a session-wide ``SET NOCOUNT ON`` reports ``-1``. The
+        compare-and-set is spelled per case rather than with ``IS NOT DISTINCT FROM``, which
+        arrived only in SQL Server 2022. Same lock order as ``record_audit``: the in-process gate,
+        then the connection."""
         now = time.time() if now is None else now
-        rows = await self._execute_output(
-            "UPDATE users SET totp_secret=?, totp_enrolled_at=?, totp_recovery_codes=?,"
-            " last_totp_step=?, updated_at=? OUTPUT inserted.id"
-            " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL",
-            (
-                self._cipher.encrypt(secret, aad=cell_aad("users", "totp_secret", user_id)),
-                now,
-                json.dumps(recovery_code_hashes),
-                step,
-                now,
-                user_id,
-            ),
+        enrolled_term = (
+            " AND totp_enrolled_at IS NULL"
+            if expected_enrolled_at is None
+            else " AND totp_enrolled_at = ?"
         )
-        return bool(rows)
+        params: tuple[Any, ...] = (
+            self._cipher.encrypt(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            now,
+            json.dumps(recovery_code_hashes),
+            step,
+            now,
+            user_id,
+            *(() if expected_enrolled_at is None else (expected_enrolled_at,)),
+        )
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(
+                            "UPDATE users SET totp_secret=?, totp_enrolled_at=?,"
+                            " totp_recovery_codes=?, last_totp_step=?, updated_at=?"
+                            " OUTPUT inserted.id"
+                            " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
+                            + enrolled_term,
+                            params,
+                        )
+                        swapped = await cur.fetchall()  # drain, so the next execute is clean
+                        if not swapped:
+                            # Nothing written, so nothing is revoked or audited.
+                            await conn.rollback()
+                            return None
+                        await cur.execute(
+                            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
+                            " WHERE user_id=? AND revoked_at IS NULL",
+                            (now, user_id),
+                        )
+                        revoked = len(await cur.fetchall())
+                        appended = await self._append_audit_row(
+                            cur,
+                            audit.action,
+                            actor=audit.actor,
+                            channel_id=None,
+                            detail=audit.detail,
+                            client=audit.client,
+                            now=now,
+                        )
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
+                    raise
+        audit.tee(ts=now, row=appended)
+        return revoked
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now

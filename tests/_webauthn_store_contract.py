@@ -208,27 +208,63 @@ async def _assert_totp_contract(store: Any) -> None:
     assert await store.get_recovery_code_hashes("totp-u1") == []
     assert await store.enable_totp("missing-user", recovery_code_hashes=[], now=9.0) is False
 
-    # replace_totp_enrolment (ADR 0171 Amendment B, BACKLOG #2226): conditional on TOTP being ON, so
-    # it can never turn TOTP on for an account without it.
+    # replace_totp_enrolment (ADR 0171 Amendment B, BACKLOG #2226): conditional on TOTP being ON
+    # and on the enrolment instant the caller read, so it can never turn TOTP on for an account
+    # without it, nor overwrite a re-enrolment. The swap, the session sweep and the audit row are
+    # one transaction, so a refused write leaves none of them.
+    from messagefoundry.store.store import AuditAppend
+
+    action = "auth.admin_totp_reset"
+    audit = AuditAppend(action, actor="cli:contract", detail="{}")
+
+    async def audit_rows() -> int:
+        return len(await store.list_audit(limit=10, action=action))
+
     # The old seed reversed: a different valid base32 seed, without a second key-shaped literal.
     new_seed = "JBSWY3DPEHPK3PXP"[::-1]
-    replaced: dict[str, Any] = {"secret": new_seed, "recovery_code_hashes": ["n1"]}
-    assert await store.replace_totp_enrolment("totp-u1", step=200, now=10.0, **replaced) is False
+    replaced: dict[str, Any] = {"secret": new_seed, "recovery_code_hashes": ["n1"], "audit": audit}
+    assert (
+        await store.replace_totp_enrolment(
+            "totp-u1", step=200, expected_enrolled_at=None, now=10.0, **replaced
+        )
+        is None
+    )
     user = await store.get_user("totp-u1")
     assert user is not None and user.totp_enabled is False
     assert await store.get_totp_secret("totp-u1") is None
+    assert await audit_rows() == 0
     # On an enabled row it swaps the seed, the codes and the step in one write, with TOTP still on.
     await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=11.0)
     assert await store.enable_totp("totp-u1", recovery_code_hashes=["o1", "o2"], now=12.0) is True
     assert await store.consume_totp_step("totp-u1", 300) is True  # the old seed's history
-    assert await store.replace_totp_enrolment("totp-u1", step=200, now=13.0, **replaced) is True
+    await store.create_session(
+        token_hash="totp-u1-session", user_id="totp-u1", expires_at=1e12, auth_mechanism="password"
+    )
+    # A stale compare-and-set (an enrolment instant the row no longer holds) writes nothing at all.
+    stale = await store.replace_totp_enrolment(
+        "totp-u1", step=200, expected_enrolled_at=11.5, now=12.5, **replaced
+    )
+    assert stale is None
+    assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXP"
+    assert len(await store.list_sessions("totp-u1")) == 1
+    assert await audit_rows() == 0
+    ended = await store.replace_totp_enrolment(
+        "totp-u1", step=200, expected_enrolled_at=12.0, now=13.0, **replaced
+    )
+    assert ended == 1
     user = await store.get_user("totp-u1")
     assert user is not None and user.totp_enabled is True
     assert await store.get_totp_secret("totp-u1") == new_seed
     assert await store.get_recovery_code_hashes("totp-u1") == ["n1"]
+    assert await store.list_sessions("totp-u1") == []
+    assert await audit_rows() == 1
     # The high-water mark is the proving code's step, not the old seed's: 200 is spent, 201 is not.
     assert await store.consume_totp_step("totp-u1", 200) is False
     assert await store.consume_totp_step("totp-u1", 201) is True
-    assert await store.replace_totp_enrolment("missing-user", step=1, now=14.0, **replaced) is False
+    missing = await store.replace_totp_enrolment(
+        "missing-user", step=1, expected_enrolled_at=None, now=14.0, **replaced
+    )
+    assert missing is None
+    assert await audit_rows() == 1
 
     await store.delete_user("totp-u1")

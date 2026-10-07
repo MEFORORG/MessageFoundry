@@ -7647,21 +7647,46 @@ class PostgresStore:
         secret: str,
         recovery_code_hashes: list[str],
         step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
         now: float | None = None,
-    ) -> bool:
-        """See the SQLite twin (ADR 0171 Amendment B). The row count says whether it wrote."""
+    ) -> int | None:
+        """See the SQLite twin (ADR 0171 Amendment B). The swap, the session sweep and the audit row
+        share one transaction. This leg is CI-only, so a divergence from the SQLite and SQL Server
+        bodies surfaces first in CI. ``IS NOT DISTINCT FROM`` is the null-safe compare-and-set."""
         now = time.time() if now is None else now
-        written = await self._execute(
-            "UPDATE users SET totp_secret=$1, totp_enrolled_at=$2, totp_recovery_codes=$3,"
-            " last_totp_step=$4, updated_at=$2"
-            " WHERE id=$5 AND totp_enabled=TRUE AND totp_secret IS NOT NULL",
-            self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
-            now,
-            json.dumps(recovery_code_hashes),
-            step,
-            user_id,
-        )
-        return written > 0
+        # `record=False` as `create_user` passes: a CLI write is not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            result = await conn.execute(
+                "UPDATE users SET totp_secret=$1, totp_enrolled_at=$2, totp_recovery_codes=$3,"
+                " last_totp_step=$4, updated_at=$2"
+                " WHERE id=$5 AND totp_enabled=TRUE AND totp_secret IS NOT NULL"
+                " AND totp_enrolled_at IS NOT DISTINCT FROM $6",
+                self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+                now,
+                json.dumps(recovery_code_hashes),
+                step,
+                user_id,
+                expected_enrolled_at,
+            )
+            if _rowcount(result) <= 0:
+                return None  # nothing written, so nothing is revoked or audited
+            revoked = await conn.execute(
+                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
+                now,
+                user_id,
+            )
+            appended = await self._append_audit_row(
+                conn,
+                audit.action,
+                actor=audit.actor,
+                channel_id=None,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
+        audit.tee(ts=now, row=appended)
+        return _rowcount(revoked)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
