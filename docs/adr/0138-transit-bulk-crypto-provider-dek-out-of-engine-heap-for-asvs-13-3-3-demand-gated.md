@@ -3,7 +3,7 @@
 
 # ADR 0138 — Transit bulk-crypto provider: move the store DEK out of engine heap for ASVS 13.3.3 (demand-gated)
 
-- **Status:** Accepted (2026-07-20) — **Increment 1 built + verified** (see *Implementation status*); the deferred legs stay demand-gated. Amended 2026-09-28: the AES-GCM invocation bound on this path is a **documented operator precondition**, weaker than the engine's counted bound, and it does not meet owner ruling R3 (see the amendment at the end).
+- **Status:** Accepted (2026-07-20) — **Increment 1 built + verified** (see *Implementation status*); the deferred legs stay demand-gated. Amended 2026-09-28: the AES-GCM invocation bound on this path is a **documented operator precondition**, weaker than the engine's counted bound, and it does not meet owner ruling R3 (see the amendment at the end). Amended 2026-10-07: the engine records who attested the bound for the configured Transit key name, in an audited store row only the CLI writes, and `serve` refuses without it under enforce (BACKLOG #2337).
 - **Date:** 2026-07-20
 - **Related:** [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md) (the KeyProvider seam this extends) · [ADR 0109](0109-at-rest-encryption-fail-closed-on-an-undeclared-phi-posture.md) (Rejected — undeclared-PHI fail-closed) · ASVS-L3-ASSESSMENT-2026-07-20.md §3 (13.3.3 Fail) · ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5 · solutions research (`ASVS-L3-FAILS-SOLUTIONS-RESEARCH-2026-07-20.md`) · BACKLOG **#271** · CLAUDE.md §2 (reliability/at-rest), §9 (PHI/HIPAA)
 
@@ -192,4 +192,35 @@ whether that answer carries the rotation settings was not checked for this amend
 exists today, and neither is the R3 attestation surface either.
 
 The operator-facing statement of this precondition belongs in the `cipher_provider` row of
-`docs/CONFIGURATION.md`. That row does not carry it yet.
+`docs/CONFIGURATION.md`. That row does not carry it yet. *(Since the 2026-10-07 amendment it
+does, as precondition (3).)*
+
+## Amendment 2026-10-07 — the engine records who attested the bound, and refuses without it (BACKLOG #2337)
+
+The owner settled the R3 attestation surface on 2026-10-07, given to the batch 201 Manager in
+session. Three rulings:
+
+1. A reasoned config declaration with no who and when does not meet R3. The engine records who
+   attested and when.
+2. The record is a new audited row in the store, on all three backends. Only a CLI command writes
+   it, with the `cli:<osuser>` actor other host-run commands use. `serve` reads it at start. There
+   is no new RBAC permission and no API endpoint.
+3. It binds to the Transit data-key NAME. Pointing the store at another key name voids it.
+   Rotating versions inside one key does not, because the operator attests to that key's rotation
+   policy. A CLI command withdraws it, also audited.
+
+**What was built.** The one-row `transit_bound_attestation` table holds the key name, the reason,
+the actor and the time. `messagefoundry store attest-transit-bound --reason` writes it and
+`messagefoundry store withdraw-transit-bound` deletes it. Each commits its audit row
+(`store.transit_bound_attested`, `store.transit_bound_withdrawn`) in the same transaction, so the
+row never exists without the record of who wrote it. `Engine.start` calls
+`enforce_transit_bound_attestation` first, before recovery or any listener. With no row naming
+the live cipher's key, it raises `TransitBoundUnattestedError` under `[security].enforcement =
+enforce` and logs a warning under `warn`. `GET /security/posture` reports the row in
+`transit_bound_attestation`.
+
+**What it does not change.** The engine still counts no Transit encrypts. The 2026-09-28
+weaknesses 1 and 2 above stand: passing 2^32 on one key version is silent, and a burst can outrun
+a schedule. Weakness 3 narrows only to this: the engine now knows that a named operator vouched
+for the schedule, and when. It still does not read the key's rotation settings. Whether this
+meets R3 is a scorecard call, not this amendment's.
