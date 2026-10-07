@@ -743,26 +743,50 @@ def test_a_keyless_chain_under_the_opt_out_does_not_warn(
     assert "WARNING" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("seq", [1, 2, 3])
 def test_a_row_that_is_not_utf8_fails_the_check_and_its_text_is_not_printed(
-    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    seq: int, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Vault BACKLOG #3054, item 10. A row holding text that is not valid UTF-8 exited 2, "could not
     start", with the row's text in the line. The driver refuses it during the walk, after the open,
     so a writer could plant one to turn a broken chain into a 2. It is exit 1 with a FAIL line that
     names the error's classes only. The control is the same chain before the write, which exits 0
-    under the opt-out."""
+    under the opt-out. Row 1 is read by the open, not the walk, and gets the same line."""
     _opt_out(monkeypatch)
     db = shell / "keyless.db"
     _keyless_chain(db)
     assert main(["audit-verify", "--db", str(db)]) == 0  # the control
     capsys.readouterr()
-    _write(db, "UPDATE audit_log SET actor = CAST(x'ff524f574d41524b4552' AS TEXT) WHERE seq = 2")
+    _write(
+        db,
+        f"UPDATE audit_log SET actor = CAST(x'ff524f574d41524b4552' AS TEXT) WHERE seq = {seq}",
+    )
     rc = main(["audit-verify", "--db", str(db)])
     captured = capsys.readouterr()
     assert rc == 1, (captured.out, captured.err)
     assert captured.out.startswith("FAIL: the audit chain check stopped part way"), captured.out
     assert "(OperationalError)" in captured.out, captured.out
     assert "ROWMARKER" not in captured.out + captured.err, captured.err
+
+
+def test_a_driver_error_at_the_open_that_is_not_a_chain_read_still_exits_2(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the row arm above: a driver error raised by the open but not while it read
+    the chain, such as a server refusing the connection, is still "could not start", exit 2."""
+    from messagefoundry.store import base as store_base
+
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert "cannot open the store at" in captured.err and "FAIL" not in captured.out
 
 
 def test_a_store_open_error_cuts_the_row_text_sqlite_quotes(

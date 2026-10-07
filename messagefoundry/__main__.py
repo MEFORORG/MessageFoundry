@@ -7776,7 +7776,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
     )
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.keyprovider import KeyProviderError
-    from messagefoundry.store.store import AuditVerdict
+    from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE, AuditVerdict
 
     # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
     # succeeding, and refusing it early keeps a typo from costing a store open.
@@ -7844,10 +7844,18 @@ def _audit_verify(args: argparse.Namespace) -> int:
                     ),
                 )
             )
-        except CipherError as exc:
-            # The open reads the chain's first row and, under Transit, MACs it there, so a row's
-            # content reaches this too. A key that does not resolve was turned into exit 2 above.
-            raise stopped(exc) from exc
+        except walk_errors as exc:
+            # The open reads the chain's first rows and, under Transit, MACs the genesis row there,
+            # so a row's content reaches this too: a Transit refusal, or a row the driver cannot
+            # read. Those are the chain's evidence, not a store that could not start, so they get
+            # the walk's FAIL line (vault BACKLOG #3054, item 10). Any other driver error at the
+            # open, such as a server that refuses the connection, stays exit 2 below. A key that
+            # does not resolve was turned into exit 2 by the wrapper.
+            if isinstance(exc, CipherError) or AUDIT_CHAIN_READ_NOTE in getattr(
+                exc, "__notes__", ()
+            ):
+                raise stopped(exc) from exc
+            raise
         try:
             verdict = await store.verify_audit_chain(expected_anchor=expected_anchor)
             if not verdict[0] or (verdict.keyless_walk and keyless_refusal is not None):

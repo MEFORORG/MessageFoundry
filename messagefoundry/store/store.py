@@ -2898,7 +2898,24 @@ class AuditRangeHost(Protocol):
     ) -> None: ...
 
 
+#: The note :func:`load_audit_chain` adds to any error it raises (vault BACKLOG #3054, item 10). Such
+#: an error came from reading, or starting, the audit chain's own rows, so a caller that verifies the
+#: chain can treat it as evidence about those rows rather than as a store that could not start. A
+#: note and not a new class, so every other caller catches the error exactly as before.
+AUDIT_CHAIN_READ_NOTE = "raised while the store read the audit chain's rows at open"
+
+
 async def load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
+    """At open: learn the chain's state from its rows; see :func:`_load_audit_chain`. Any error is
+    re-raised unchanged, with :data:`AUDIT_CHAIN_READ_NOTE` added."""
+    try:
+        await _load_audit_chain(host, read_only=read_only)
+    except Exception as exc:
+        exc.add_note(AUDIT_CHAIN_READ_NOTE)
+        raise
+
+
+async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
     """At open: learn the chain's state from the chain itself, and start it when it is empty (vault
     BACKLOG #2594). Shared by all three backends.
 
