@@ -1363,29 +1363,31 @@ invariant rather than a property of the moved row):
    generator-shaped too, and no `elif` or `else` body may hold a `code` row or a dynamic row.
 6. Every read of a name stays dominated by that name's bindings: every path from the start of the
    body to the read passes a binding of the name (Manager decision 2026-10-07, after review).
-   Dominance is over the set of the name's bindings. A binding other than a loop header or a
-   `with` header, earlier in the same suite as the read or earlier in a suite that encloses it,
-   dominates the read. An `if` whose every arm binds the name, with an `else`, dominates a later
-   read; one arm alone does not. A loop target (`for x in ...`) does not dominate a read after the
-   loop, because a loop may run zero times. A binding inside a `with` body, or a `with ... as x`
-   target, does not dominate a read after the block (Manager decision
-   2026-10-07, after review, adopting the R1 code's stricter rule). A For Each header dominates only
-   reads inside its own body, so a row that uses its index, such as `occurrence=i`, may not move out
-   of the loop (Manager decision 2026-10-07, after review). A move of either end, a binding or a
-   reading row, that breaks this is refused, and so is a delete of a binding that leaves a read
-   undominated. Each of those would leave a read unbound, at least whenever a condition is false. A
-   block that holds a Read Field or assigned lookup row is also never moved or deleted; that refusal
-   is conservative, and applies even when every read sits inside the block.
-7. A typed row never moves past a `code` row, a dynamic row, a hand-written header or the fan-out
-   `return sends`, and never moves into or out of a typed block that holds a `code` row (Manager
-   decision 2026-10-07, after review, adopting the R1 code's stricter rule). This answers the
-   Lander's PR 2155 finding 1. An insert at the same place is still allowed; a move is refused
+   Dominance is over the set of the name's bindings. A binding other than a loop header or a `with`
+   header, earlier in the same suite as the read or earlier in a suite that encloses it, dominates
+   the read. An `if` whose every arm binds the name, with an `else`, dominates a later read; an `if`
+   with an arm that neither binds the name nor leaves the body does not. A loop target (`for x in
+   ...`) does not dominate a read after the loop, because a loop may run zero times. A binding inside
+   a `with` body does not dominate a read after the block (Manager decision 2026-10-07, after review,
+   adopting the R1 code's stricter rule). The R1 code's dominance check differs from this text in
+   both directions for at least a `match` walrus, an `if` whose other arm returns, and a `try` whose
+   handlers raise; this text is the target. A For Each header dominates only reads inside its own
+   body, so a row that uses its index, such as `occurrence=i`, may not move out of the loop (Manager
+   decision 2026-10-07, after review). A move of either end, a binding or a reading row, that breaks
+   this is refused, and so is a delete of a binding that leaves a read undominated. Each of those
+   would leave a read unbound, at least whenever a condition is false. A block that holds a Read
+   Field or assigned lookup row is also never moved or deleted; that refusal is conservative, and
+   applies even when every read sits inside the block.
+7. A typed row never moves past at least a `code` row, a dynamic row, a hand-written header or the
+   fan-out `return sends`, and never moves into or out of a typed block that holds a `code` row
+   (Manager decision 2026-10-07, after review, adopting the R1 code's stricter rule). This answers
+   the Lander's PR 2155 finding 1. An insert at the same place is still allowed; a move is refused
    because the lens checks that every protected statement keeps the statements before it, and a move
    past one changes them.
 8. A typed `return` or `raise` keeps its whole suite path, top level included: lifted out of its
-   guard, a filter or a raise would run on every message. R1 still accepts a typed row moved below a
-   typed `return Send(...)`, where it would never run; that is a gap for R1. A row never moves past
-   the fan-out `return sends`, though it may move past `sends = []` (Manager decision 2026-10-07,
+   guard, a filter or a raise would run on every message. A typed row never moves below a typed
+   `return` or `raise` in its suite, where it would never run. A row never moves past the fan-out
+   `return sends`, though it may move past `sends = []` (Manager decision 2026-10-07,
    after review, adopting the R1 code's stricter rule).
 
 A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
@@ -1403,16 +1405,18 @@ landed.
 **Where the rule and the R1 code stand.** Read at R1 head `71fe1207f4`, `_refuse_untyped_structure`
 refuses a move or delete of any row that is not wholly typed, and `_refuse_typed_only_result` then
 checks the result with `_refuse_shifted_code` and an unbound-read check.
-`tests/test_lens_typed_only_repair.py` pins rules 6 to 8: the `else` binding moved below its use, an
-insert reading a `with` binding after the block (an insert, not a move), a drop past code, a drop
-into a typed block that holds code, and a raise lifted out of its guard. Where the R1 code is
+`tests/test_lens_typed_only_repair.py` pins cases of rules 6 to 8: the `else` binding moved below
+its use, an insert reading a `with` binding after the block (an insert, not a move, and run without
+typed-only mode), a drop past code, a drop into a typed block that holds code, and a raise lifted
+out of its guard. Where the R1 code is
 stricter than this text, this text adopts the code's rule, because the code is tested and fails
 closed (Manager decision 2026-10-07, after review, adopting the R1 code's stricter rule). At least
 two of its refusals are conservative, refusing some edits that would be safe:
 
-- a whole block holding a typed `return` or `raise`, moved past another block with the same header,
-  is refused;
-- a read of a `with` binding after the block is refused, even where the body always runs.
+- an edit that renumbers a protected block with the same header as another, a delete included, is
+  refused when one of the blocks holds a typed `return` or `raise`;
+- a new read after a `with` block of a name bound in its body, or bound by its `as` target, is
+  refused, though the body always runs and Python binds the `as` target before it.
 
 ### G.7 The R1 fix: values a typed edit may write
 
@@ -1449,15 +1453,12 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
   integer arithmetic over literals whose result is 1 or more (so `2 * 3`, but not `1 - 1`), a 1-based
   loop index (every loop binding it is `range(k, n)` or `range(k, n, step)` with literal `k` and
   `step` of 1 or more), or that index plus integer-literal arithmetic of 0 or more.
-  `repetition=None` is allowed (Manager decision
-  2026-10-07, after review, adopting the R1 code's stricter rule). A name such as `occurrence=OCC`
-  bound to a module-level number is refused, conservatively;
+  `repetition=None` is allowed (Manager decision 2026-10-07, after review, adopting the R1 code's
+  stricter rule). So a name such as `occurrence=OCC`, bound to a module-level number, is refused.
+  This is the rule the ADR requires; R1 does not yet apply it everywhere (see the gap list below);
 - for the value of Set Field and Add Repetition, only a value that is text: a string literal, a name
-  or read that may hold text, or a template. A number, `None` or a list is refused. Here this text
-  is stricter than R1 at `71fe1207f4`: its `_refuse_non_text_value` refuses literals and numeric
-  names, but admits any other name, so a module-level `NONE = None`, `FLAG = True` or
-  `TUP = ("a", "b")` passes and writes a `msg.set` that fails on every message. The text is the
-  target, and R1 must close this gap;
+  or read that may hold text, or a template. A number, `None` or a list is refused. R1 does not yet
+  apply this to every name (see the gap list below);
 - a plain name other than `msg`, not a dunder, that cannot hold message content:
   - a For Each `range` loop index;
   - a module-level name bound exactly once, to a literal of an immutable type: a `str`, number,
@@ -1528,10 +1529,29 @@ tuple holding a `frozenset`.
 **Limits of a static check.** The predicate reads the source and runs nothing, so code that
 reaches module state by a route the source does not spell out can still defeat it. These remain, at
 least: `getattr(h, "__globals__")`, `from sys import modules as mm`, and
-`importlib.import_module(__name__)`. Each needs a hand-written `code` row. Separately, only
-`set_params` honours a message parameter that is not named `msg`. The other edits assume `msg`, so
-an `insert_row` into `def h(message)` writes `msg.set(...)`, which raises NameError on every
-message. That needs no hand-written row, and is a gap for R1.
+`importlib.import_module(__name__)`. Each needs a hand-written `code` row.
+
+**Gaps and limits in the R1 code at `71fe1207f4`.** Items 1 to 7 are places where this amendment
+is stricter than the code; item 8 is a limit. The list is at least these, not a complete one:
+
+1. A `msg.field(...)` read inside a Set Field value accepts `occurrence=0`, `occurrence=OCC` and
+   `repetition=0`. The insert writes a `msg.set` that raises ValueError on every message. Being
+   closed in PR 2155's current repair round.
+2. `_read_sites` scoping: a lambda default such as `col=col`, a comprehension's first iterable, an
+   attribute or subscript target in a comprehension, and a lambda nested in a default are not
+   scoped correctly. Being closed in PR 2155's current repair round.
+3. Alias forms of `builtins` do not void inert names, as `builtins.globals` does. Being closed in PR
+   2155's current repair round.
+4. `range(1, *rest)` is read as a 1-based loop. Being closed in PR 2155's current repair round.
+5. `_refuse_non_text_value` refuses literals and numeric names but admits any other name, so a
+   module-level `NONE = None`, `FLAG = True` or `TUP = ("a", "b")` passes as a Set Field value and
+   writes a `msg.set` that fails on every message.
+6. A typed row may move below a typed `return Send(...)`, a typed `raise` or a filter `return []`,
+   where it never runs (rule 8).
+7. Only `set_params` honours a message parameter that is not named `msg`. The other edits assume
+   `msg`, so an `insert_row` into `def h(message)` writes `msg.set(...)`, which raises NameError on
+   every message unless a global `msg` exists. This needs no hand-written row.
+8. An imported send destination cannot be retargeted yet.
 
 **A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
 `_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`

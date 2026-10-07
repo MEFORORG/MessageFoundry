@@ -564,7 +564,8 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
 
   FR-41 does not list a row using `occurrence=i` moved out of its For Each loop. The repository
   check has no FR-40 item that tests for an unbound read (section 5.2), so it would pass that move.
-  The lens refuses it under typed-only mode (Amendment G, AC-G6).
+  The lens refuses it (Amendment G, G.6 rule 6; at R1 head `71fe1207f4` it does so in every
+  mode, not only typed-only).
 
   It SHALL pass an ordinary Steps edit, an insert above a `code` row, and one of each sanctioned shape
   in items 2 and 3 (spike S-4).
