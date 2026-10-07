@@ -213,6 +213,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    tee_audits,
     totp_enable_term,
     verify_audit_rows,
 )
@@ -3852,8 +3853,8 @@ class SqlServerStore:
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
-                    "runtime (schema_management=external: no db_ddladmin, and no UPDATE, DELETE, "
-                    "ALTER, CONTROL or take ownership on audit_log)"
+                    "runtime (schema_management=external: no db_ddladmin, and no UPDATE/DELETE/"
+                    "ALTER/CONTROL or take ownership on audit_log)"
                     if external
                     else "auto-mode"
                 )
@@ -6448,7 +6449,7 @@ class SqlServerStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where: list[str] = []
@@ -6553,7 +6554,7 @@ class SqlServerStore:
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where = [_ACTIVE_ALERT_STATUS_SQL]
@@ -6571,7 +6572,7 @@ class SqlServerStore:
         return [self._alert_instance_row(r) for r in rows]
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         # BACKLOG #1564 — see the SQLite twin: same active predicate, same RBAC scope, aggregate over
         # every row in scope rather than over a page. The rank CASE is shared so it cannot drift.
@@ -6588,7 +6589,7 @@ class SqlServerStore:
         return _alert_summary(row)
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         where = ["id=?"]
         params: list[Any] = [alert_id]
@@ -6694,7 +6695,7 @@ class SqlServerStore:
                 raise
         if int(changed) == 0:
             return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
         self, alert_id: int, *, now: float | None = None
@@ -6714,7 +6715,7 @@ class SqlServerStore:
                 raise
         if int(changed) == 0:
             return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         rows = await self._fetchall(
@@ -10423,7 +10424,7 @@ class SqlServerStore:
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -10460,7 +10461,7 @@ class SqlServerStore:
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int:
@@ -10485,7 +10486,7 @@ class SqlServerStore:
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51) — see ``MessageStore.search_messages``.
         Pre-filter on the indexed metadata, then decrypt + match each candidate body in memory off the
@@ -10544,7 +10545,7 @@ class SqlServerStore:
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[dict[str, Any]]:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         rows = await self._fetchall(
@@ -10571,7 +10572,7 @@ class SqlServerStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM queue o{where}", params)
@@ -10582,7 +10583,7 @@ class SqlServerStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
         narrowed by the two clauses :meth:`replay_dead` applies. The database collation decides
@@ -11274,6 +11275,47 @@ class SqlServerStore:
                 raise
         return int(count) > 0
 
+    async def _execute_with_audits(
+        self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float
+    ) -> None:
+        """Run one account write and append its ``audits`` in the same transaction.
+
+        The contract is ``AuthStore.create_user``'s. With no audits it is a plain :meth:`_execute`.
+        The write opens the transaction, which the applock inside the append needs. Same lock order
+        as `record_audit`: the in-process gate, then the connection.
+
+        THE IN-PROCESS ``_audit_lock`` IS HELD ACROSS THE WRITE, so every ``record_audit`` in this
+        process waits behind it. BACKLOG #2222 reviews that scope for a first sign-in's INSERT
+        only; the directory repoint's UPDATE and the administrator's create (BACKLOG #2221) widen
+        it and are not yet in that item."""
+        if not audits:
+            await self._execute(sql, params)
+            return
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(sql, params)
+                        appended = [
+                            await self._append_audit_row(
+                                cur,
+                                a.action,
+                                actor=a.actor,
+                                channel_id=None,
+                                detail=a.detail,
+                                client=a.client,
+                                now=now,
+                            )
+                            for a in audits
+                        ]
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits(audits, appended, ts=now)
+
     async def create_user(
         self,
         *,
@@ -11289,7 +11331,7 @@ class SqlServerStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -11315,33 +11357,7 @@ class SqlServerStore:
             directory_object_id,
             1 if password_generated else 0,
         )
-        if audit is None:
-            await self._execute(sql, params)
-            return
-        # BACKLOG #2100. The audit row joins the INSERT's transaction, so a failed append rolls the
-        # account back. The INSERT opens that transaction, which the applock inside the append
-        # needs. Same lock order as `record_audit`: the in-process gate, then the connection.
-        async with self._audit_lock:  # noqa: SIM117
-            async with self._acquire() as conn:
-                try:
-                    async with self._cursor(conn) as cur:
-                        await cur.execute(sql, params)
-                        appended = await self._append_audit_row(
-                            cur,
-                            audit.action,
-                            actor=audit.actor,
-                            channel_id=None,
-                            detail=audit.detail,
-                            client=audit.client,
-                            now=now,
-                        )
-                        await self._commit(conn)
-                except Exception:
-                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
-                    # detached close of the raw connection cannot race the cursor's own close.
-                    await self._rollback_or_discard(conn)
-                    raise
-        audit.tee(ts=now, row=appended)
+        await self._execute_with_audits(sql, params, audits, now=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=?", (user_id,))
@@ -11464,6 +11480,82 @@ class SqlServerStore:
             (now, json.dumps(recovery_code_hashes), now, user_id),
         )
         return bool(rows)
+
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> int | None:
+        """See the SQLite twin (ADR 0171 Amendment B). The swap, the session sweep and the audit row
+        share one transaction. This leg is CI-only, so a divergence from the SQLite and Postgres
+        bodies surfaces first in CI.
+
+        Both counts come from ``OUTPUT`` rowsets, as :meth:`revoke_user_sessions` counts (BACKLOG
+        #2283): ``cursor.rowcount`` under a session-wide ``SET NOCOUNT ON`` reports ``-1``. The
+        compare-and-set is spelled per case rather than with ``IS NOT DISTINCT FROM``, which
+        arrived only in SQL Server 2022. Same lock order as ``record_audit``: the in-process gate,
+        then the connection."""
+        now = time.time() if now is None else now
+        enrolled_term = (
+            " AND totp_enrolled_at IS NULL"
+            if expected_enrolled_at is None
+            else " AND totp_enrolled_at = ?"
+        )
+        params: tuple[Any, ...] = (
+            self._cipher.encrypt(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            now,
+            json.dumps(recovery_code_hashes),
+            step,
+            now,
+            user_id,
+            *(() if expected_enrolled_at is None else (expected_enrolled_at,)),
+        )
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(
+                            "UPDATE users SET totp_secret=?, totp_enrolled_at=?,"
+                            " totp_recovery_codes=?, last_totp_step=?, updated_at=?"
+                            " OUTPUT inserted.id"
+                            " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
+                            + enrolled_term,
+                            params,
+                        )
+                        swapped = await cur.fetchall()  # drain, so the next execute is clean
+                        if not swapped:
+                            # Nothing written, so nothing is revoked or audited.
+                            await conn.rollback()
+                            return None
+                        await cur.execute(
+                            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
+                            " WHERE user_id=? AND revoked_at IS NULL",
+                            (now, user_id),
+                        )
+                        revoked = len(await cur.fetchall())
+                        appended = await self._append_audit_row(
+                            cur,
+                            audit.action,
+                            actor=audit.actor,
+                            channel_id=None,
+                            detail=audit.detail,
+                            client=audit.client,
+                            now=now,
+                        )
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
+                    raise
+        audit.tee(ts=now, row=appended)
+        return revoked
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -11679,15 +11771,19 @@ class SqlServerStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits``: see
+        ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
-        await self._execute(
+        await self._execute_with_audits(
             "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
             (display_name, email, now, user_id),
+            audits,
+            now=now,
         )
 
     async def set_user_notify_email(

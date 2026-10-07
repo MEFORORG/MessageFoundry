@@ -107,7 +107,9 @@ class _AlertStateStore(Protocol):
         self, *, event_type: str, connection: str, now: float | None = ...
     ) -> int: ...
 
-    async def list_active_alert_instances(self, *, limit: int = ...) -> Sequence[Any]: ...
+    async def list_active_alert_instances(
+        self, *, limit: int = ..., allowed_channels: Sequence[str] | None
+    ) -> Sequence[Any]: ...
 
 
 #: Auto-resolution map (ADR 0044 D2): an inverse lifecycle event type resolves the matching open
@@ -1312,7 +1314,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if store is None:
             return
         try:
-            rows = await store.list_active_alert_instances(limit=1000)
+            rows = await store.list_active_alert_instances(limit=1000, allowed_channels=None)
         except Exception:
             log.warning("alert suspend-cache prime failed", exc_info=True)
             return

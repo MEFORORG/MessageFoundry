@@ -482,7 +482,16 @@ _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
 # useful line timestamp survives that pass's DOB/date-run redaction — while a date *inside* the message
 # body (a likely DOB) is still redacted. A non-ISO timestamp simply isn't protected here (over-redacted,
 # the safe direction).
-_LEADING_TS = re.compile(r"^\s*\d{4}[-/]\d{2}[-/]\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)?")
+#
+# The JSON log format (``logging_setup.JsonFormatter``) opens every line with the same timestamp as its
+# ``time`` key, ``{"time": "2026-10-06T12:30:00Z", ...``, and that is carved too, together with its
+# key and both quotes so the body keeps balanced quotes for the structured JSON pass. It survived
+# without this only because the date pass read no date glued to a ``T``; vault BACKLOG #2784 made it
+# read one, so without the carve every JSON line would lose its timestamp.
+_LEADING_TS = re.compile(
+    r'^\s*(?:\{"time": "\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"'
+    r"|\d{4}[-/]\d{2}[-/]\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)?)"
+)
 
 
 # WHY THE CREDENTIAL STAGE IS TWO LAYERS, AND WHY THE SHARED ONE RUNS LAST (BACKLOG #2694).

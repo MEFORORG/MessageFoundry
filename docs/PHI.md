@@ -36,8 +36,9 @@ levels:
 - **Data plane** (inbound MLLP / TCP / X12 / DB-poll feeds) — **network-bound in any real install**
   (feeds arrive from other systems on the LAN, not `127.0.0.1`), protected by **TLS on the wire**
   (MLLP-over-TLS, built), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
-  not cross the LAN in cleartext — and can't accidentally: the bind-guard **refuses any non-loopback
-  *plaintext* API/MLLP bind** (ADR 0002 §0).
+  not cross the LAN in cleartext — and can't accidentally: the bind-guards **refuse a non-loopback
+  *plaintext* listener**, at least MLLP, raw TCP and X12 (ADR 0002 §0). An off-loopback API bind needs
+  an operator certificate or a declared TLS-terminating proxy (§4).
 - **Inbound web-service listener** (a partner calling *into* MEFOR) — **built**, as the inbound
   [`Http(...)` listener](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023). It is a
   distinct surface with its own controls: TLS or mTLS, `source_ip_allowlist`, and `intake_auth`, which
@@ -69,7 +70,7 @@ Which accounts the requirement covers is stated in
 | Local user reading the DB file directly | Yes | Owner-only file ACL (built, **SQLite store only** — on a server-DB store the `.mdf`/`.ldf`/tempdb permissions are the DBA's) + at-rest body encryption when a key is set (built — §3); volume encryption for the rest |
 | Stolen DB file / backup | Yes | At-rest body + `summary`/`metadata` encryption (built — §3) + required volume encryption for WAL/temp |
 | PHI in logs / CI output / shell redirects | **Yes** | "Never log bodies" rule + global log redaction (`RedactionFilter`) + `safe_exc()` chokepoint + prod-DEBUG startup guard (built — §7) |
-| Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS + MLLP-over-TLS built** (Gate #4, §4) — *enable them*; the bind-guard refuses non-loopback plaintext; + your network segmentation |
+| Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS is always on, except behind a declared proxy with no operator certificate; MLLP-over-TLS is built** (Gate #4, §4) — *enable MLLP TLS per connection*; the bind-guards refuse a non-loopback plaintext listener, and an off-loopback API bind needs an operator certificate or a declared TLS-terminating proxy; + your network segmentation |
 | Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log forwarding to your SIEM (built; set `[logging].forward_*` — [§7](#7-logging--phi-redaction)) for evidence beyond the host |
 | **Public-internet attacker** | **Out of scope by design** | MEFOR is **not** internet-facing (trust boundary above); off-loopback exposure is internal-only and TLS-required |
 | Misconfigured outbound destination | Yes | Destination allowlist (`[egress].allowed_*`, §4) |
@@ -1061,7 +1062,7 @@ audit chain or be false.
 |---|---|---|
 | MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true` or `serve --allow-insecure-bind`. | — |
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
-| Engine API ↔ console | Loopback HTTP by default; off-loopback requires TLS — **in-process** (`[api].tls_cert_file`, WP-13a) **or upstream** at a trusted reverse proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15) `[BUILT]`. Upstream, the proxy-to-engine hop is plaintext unless `tls_cert_file` is set; the site secures it, and `serve` requires `plaintext_upstream_hop_acknowledged` (BACKLOG #1179). HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
+| Engine API ↔ console | **The engine always serves TLS** ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)) `[BUILT]`, loopback included. An operator certificate (`[api].tls_cert_file`, WP-13a) wins; with none set, the engine mints a self-signed placeholder on first run. Off loopback, `serve` refuses that placeholder. Only `[security].enforcement = warn` with `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) accepts it. So an exposed bind needs an operator certificate **or** a trusted reverse proxy that terminates TLS upstream (`tls_terminated_upstream` + `trusted_proxies`, WP-15). That proxy is the one topology where the engine itself serves plaintext: with no `tls_cert_file`, the proxy-to-engine hop is plaintext, the site secures it, and `serve` requires `plaintext_upstream_hop_acknowledged` (BACKLOG #1179). HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]`. No LDAP referral is followed, so the bind credentials never leave this hop for a referred host; a referral refuses the sign-in (BACKLOG #2530, 2026-09-30). A multi-domain forest would need a global catalog or a search base in the bound controller's own domain. | — |
 | PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation via `[store].ssl_root_cert` file-pin (Postgres CA-bundle, SQL Server ODBC 18.1+ `ServerCertificate` leaf-pin) **or** a Windows machine-store (`LocalMachine\Root`) CA import. | — |
 
@@ -1330,6 +1331,21 @@ or non-name-shaped identifier, still governed by the "never put PHI in an except
 The HL7 delimiters are **read from the message's MSH header** rather than assumed to be `| ^ ~ &`
 (BACKLOG #1572), so a feed declaring its own separators is covered; before that fix a custom-delimiter
 message matched nothing and a deploying site would have logged its identifiers in full.
+
+Since vault BACKLOG #2784 the heuristic also takes, at least: a full HL7 DTM after an eight-digit
+date (`19800505123000-0500`, fraction included), an ISO date-time in either form (`1980-05-05T12:30`,
+`19800505T123000`, with `Z` or a numeric offset), a family-comma-given name (`Doe, Jane`,
+`DOE, JANE`, up to four tokens a side) and a dashed SSN (`123-45-6789`). It still does NOT take, at
+least: a US `MM/DD/YYYY` date with a time glued to it, an undashed or spaced SSN, and a name with an
+apostrophe or an inner capital (`O'Brien`, `McDoe`). One engine-owned shape is carved out by name: a
+backup archive's stamp followed by `.mfbak`. The price is over-redaction of a 10-, 12- or 14-digit
+number opening `19` or `20`, of any ISO time in a message, and of upper-case codes joined with a
+comma. Engine text works around that at its source, which is a convention and not a guarantee:
+`redaction.log_timestamp` renders an engine time as `06 Oct 2026 12:30:00 +0000`, which no pattern
+reads, and code lists are joined with `/` or `:`. `tests/test_engine_text_survives_the_name_run.py`
+catches at least a literal `isoformat()` or `*_iso` rendered into an f-string, a logging argument or
+an exception message, and a comma run in a message literal; it cannot see a time passed whole to
+`%s` or a code list joined at run time, so some engine text can still lose a time or a code.
 Reinforcing that convention, `messagefoundry check` ships an **advisory `raise-fstring` lint** that
 AST-scans the config-dir Router/Handler modules and flags a `raise` whose message is built from a
 variable — at least an f-string `raise ValueError(f"bad {x}")`, a `+` concatenation, a `%` format and
@@ -1378,8 +1394,10 @@ installed by `_install_phi_filters`, reached through `configure_logging` in the 
    16.4.1). The alphabet is stated once, in `_escapes_in_a_log_line` in
    [`controlchars.py`](../messagefoundry/controlchars.py); read it there.
 
-`redact()` rewrites only HL7-shaped spans plus date/DOB runs and multi-token name runs, so ordinary
-operational lines are untouched. This makes `safe_exc()` (above) the explicit chokepoint and the global
+`redact()` rewrites HL7-shaped spans plus, at least, the free-text and structured shapes described
+under *Exception-path redaction* above (among them dates and date-times, dashed SSNs, name runs with
+or without a comma, a labelled MRN and labelled JSON/DICOM/XML values), so most ordinary operational
+lines are untouched; the over-redaction that section names is the exception. This makes `safe_exc()` (above) the explicit chokepoint and the global
 filters the backstop for anything that reaches a handler un-redacted. `configure_logging` used to
 silence python-hl7's PHI-prone loggers as well; python-hl7 is retired, and the built-in parser that
 replaced it logs no field value.
@@ -1901,7 +1919,7 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `ORC-9` | Order transaction time | `date` |
 | `OBR-7`, `OBX-14` | Observation times | `date` |
 | `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5`, `FT1-4` | Appointment, administration, procedure and transaction times | `date` |
-| `GT1-8`, `IN1-18`, `NK1-16` | Dates of birth of the guarantor, the insured and a contact | `dob`, a fabricated date, like `PID-7`. A time after the eight date digits is kept. Anything else after them is dropped |
+| `GT1-8`, `IN1-18`, `NK1-16` | Dates of birth of the guarantor, the insured and a contact | `dob`, a fabricated date, like `PID-7`. A time after the eight date digits keeps its width as zeros, and an offset becomes `+0000` (vault BACKLOG #2767). Anything else after them is dropped |
 | `PID-12` | County code | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
 

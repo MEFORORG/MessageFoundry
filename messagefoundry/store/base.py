@@ -1071,6 +1071,9 @@ class QueueStore(StoreLifecycle, Protocol):
         :func:`~messagefoundry.store.metadata.user_metadata`."""
         ...
 
+    # ``allowed_channels`` is a REQUIRED keyword on every read below that takes it (BACKLOG #2627).
+    # ``None`` still means every channel, but a caller must now write it, so a route that forgets the
+    # scope fails mypy rather than reading the whole estate. Engine-internal callers pass ``None``.
     async def list_messages(
         self,
         *,
@@ -1080,7 +1083,7 @@ class QueueStore(StoreLifecycle, Protocol):
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> Sequence[Row]: ...
@@ -1092,7 +1095,7 @@ class QueueStore(StoreLifecycle, Protocol):
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int: ...
@@ -1106,7 +1109,7 @@ class QueueStore(StoreLifecycle, Protocol):
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): metadata pre-filter in SQL, then decrypt +
         match each candidate body in memory off the event loop — the only mechanism that works while the
@@ -1122,7 +1125,7 @@ class QueueStore(StoreLifecycle, Protocol):
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> Sequence[Row]: ...
 
     async def count_dead(
@@ -1130,7 +1133,7 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int: ...
 
     async def list_replay_targets(
@@ -1138,7 +1141,7 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The distinct ``(channel_id, destination_name)`` pairs for which :meth:`replay_dead`
         would re-queue at least one row, sorted, under the :meth:`count_dead` filters and
@@ -1233,7 +1236,7 @@ class QueueStore(StoreLifecycle, Protocol):
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         """Read connection events newest-first, optionally filtered by ``connection``, an ``kinds``
         allow-set, and a ``since`` timestamp. ``reason`` is decrypted at the boundary. The read accessor
@@ -1277,7 +1280,7 @@ class QueueStore(StoreLifecycle, Protocol):
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         """Read **open + acknowledged** alert instances newest-``last_seen`` first — the read accessor for
         the ``GET /alerts/active`` route. Runs on the lockfree read path; ``limit`` clamped server-side.
@@ -1286,7 +1289,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         """The count + worst severity of **open + acknowledged** instances across the WHOLE of the
         caller's scope (BACKLOG #1564) — the nav alert bell's read, which a page of rows cannot answer.
@@ -1336,7 +1339,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         """Read one alert instance by id (any status), RBAC-scoped like
         :meth:`list_active_alert_instances` — the API echo after an ack/resolve. ``None`` if unknown or
@@ -1855,7 +1858,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Insert one account row.
 
@@ -1872,8 +1875,9 @@ class AuthStore(Protocol):
         is bound as the notification address instead: an administrator's checked address for a
         directory account created without a sign-in (BACKLOG #2021).
 
-        ``audit``, when given, is appended to the audit chain in the SAME transaction as the INSERT,
-        so the two commit or roll back together, then teed off-box (BACKLOG #2100)."""
+        ``audits`` are appended to the audit chain, in order, in the SAME transaction as the INSERT,
+        so the account and its records commit or roll back together, then teed off-box (BACKLOG
+        #2100, #2221)."""
         ...
 
     async def get_user(self, user_id: str) -> UserRecord | None: ...
@@ -2028,7 +2032,13 @@ class AuthStore(Protocol):
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-    ) -> None: ...
+        audits: Sequence[AuditAppend] = (),
+    ) -> None:
+        """Write the account's profile fields, never ``notify_email`` (BACKLOG #1139).
+
+        ``audits`` commit in the SAME transaction as the UPDATE, as ``create_user``'s do (BACKLOG
+        #2221)."""
+        ...
 
     # The ONLY writer of ``users.notify_email`` after account creation, which seeds it once from the
     # address it was given (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security notice is addressed
@@ -2086,6 +2096,25 @@ class AuthStore(Protocol):
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
     ) -> bool: ...
+
+    # ADR 0171 Amendment B (BACKLOG #2226), for `admin-reset-totp`: swaps an ENABLED enrolment's
+    # secret, recovery codes and step high-water mark in ONE UPDATE, with TOTP on throughout, so the
+    # account never passes through zero factors. The same transaction ends the account's sessions
+    # and appends `audit`, so the swap is never live unrecorded. Conditional on TOTP being on and
+    # on `totp_enrolled_at` still being `expected_enrolled_at` (compare-and-set against the
+    # caller's read). Returns the sessions ended, or None when nothing was written; a caller must
+    # refuse on None.
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> int | None: ...
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None: ...
 

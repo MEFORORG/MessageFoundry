@@ -1041,7 +1041,7 @@ async def test_edit_editor_refused_to_a_custom_role_without_view_raw(engine: Eng
     )
     await _add_with_role_ids(service, "resubmitter", [role.id])
     mid = await _seed(engine)
-    before = len(await engine.store.list_messages(limit=50))
+    before = len(await engine.store.list_messages(limit=50, allowed_channels=None))
     async with _client(engine, service) as c:
         await _cookie_login(c, "resubmitter")  # a fresh login counts as a recent step-up
         r = await c.get(f"/ui/messages/{mid}/edit")
@@ -1060,7 +1060,9 @@ async def test_edit_editor_refused_to_a_custom_role_without_view_raw(engine: Eng
         assert r.status_code == 403
         assert "DOE^JANE" not in r.text
         assert "data-original" not in r.text
-    assert len(await engine.store.list_messages(limit=50)) == before  # no child was minted
+    assert (
+        len(await engine.store.list_messages(limit=50, allowed_channels=None)) == before
+    )  # no child was minted
 
 
 async def test_edit_editor_opens_for_a_custom_role_holding_both(engine: Engine) -> None:
@@ -1285,7 +1287,7 @@ async def test_edit_stale_stepup_redirects_get_and_post_to_edit_form(engine: Eng
         # The reauth_next maps the POST to the /edit FORM, never the /edit-resend POST path.
         assert r.headers["location"] == f"/ui/reauth?next=/ui/messages/{mid}/edit"
     # The body never outlived the bounced request — only the origin exists.
-    assert await engine.store.count_messages() == 1
+    assert await engine.store.count_messages(allowed_channels=None) == 1
 
 
 async def test_edit_resend_cross_site_and_cookie_on_json(engine: Engine) -> None:

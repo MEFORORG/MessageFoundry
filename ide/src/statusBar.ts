@@ -828,9 +828,11 @@ async function chooseToProvision(): Promise<"provision" | "skip" | undefined> {
   const provision = "Provision administrator";
   const skip = "Start without one";
   const pick = await vscode.window.showWarningMessage(
-    "This engine's store has no enabled administrator, so nobody can sign in to it. Provision one now? " +
-      "Start without one only if sign-in is off for this engine. At the shipped settings it refuses to " +
-      "start; under other settings it starts with nobody able to sign in.",
+    "This engine's store has no enabled administrator, so nobody can manage its users and roles. " +
+      "Provision one now? At the shipped settings the engine refuses to start without one. This " +
+      "check lets it start under [security].enforcement = warn, or with the security-notice " +
+      "requirement waived. Other checks under enforce may still refuse the start. If it starts, it " +
+      "routes HL7, but no account can manage users or roles until you provision one.",
     { modal: true },
     provision,
     skip,

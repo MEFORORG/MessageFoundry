@@ -41,7 +41,7 @@ from messagefoundry.config.models import ConnectorType, ContentType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.keywrap import KeyWrapRefused
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.transports import build_destination, build_source, remotefile
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -49,7 +49,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
 )
 from messagefoundry.transports.egress import check_egress_allowed, check_source_allowed
-from messagefoundry.transports.file import DEFAULT_MAX_FILE_BYTES
+from messagefoundry.transports.file import DEFAULT_MAX_FILE_BYTES, render_filename
 from messagefoundry.transports.remotefile import (
     _APPROVED_SFTP_CIPHERS,
     _APPROVED_SFTP_MACS,
@@ -66,12 +66,12 @@ from messagefoundry.transports.remotefile import (
     _SftpClient,
 )
 from tests._approved_key_wrap import approved_pkcs8_pem
-from tests.test_encode_wire_body import (
+from tests._content_free import (
     CJK_CHAR,
     PAYLOAD,
     SECRET_CHAR,
-    _assert_content_free,
-    _escapes,
+    assert_content_free,
+    escapes,
 )
 
 #: Small chunk for the fake client, so a test body is delivered in several pieces without needing a
@@ -480,7 +480,7 @@ async def test_an_unencodable_payload_is_a_permanent_content_free_refusal(
     with caplog.at_level(logging.DEBUG), pytest.raises(NegativeAckError) as ei:
         await dest.send(payload)
     exc = ei.value
-    _assert_content_free(exc, encoding=encoding)
+    assert_content_free(exc, encoding=encoding)
     # One line at a time, minus the File lines: a checkout path may itself hold "e9" or an accent.
     frames = "".join(traceback.format_exception(exc)).splitlines()
     surfaces = {
@@ -493,7 +493,7 @@ async def test_an_unencodable_payload_is_a_permanent_content_free_refusal(
     for where, text in surfaces.items():
         assert _BODY_MARKER not in text, f"message content reached the {where}"
         for ch in (SECRET_CHAR, CJK_CHAR, _LONE_SURROGATE):
-            for form in _escapes(ch):
+            for form in escapes(ch):
                 assert form not in text, f"a message character reached the {where} as {form!r}"
     # The same bytes never encode on a retry, so the row dead-letters on the first attempt. A bad
     # MESSAGE, so neither flag may stop the whole lane.
@@ -522,6 +522,80 @@ async def test_an_encodable_payload_still_uploads(
     dest = _dest(monkeypatch, client, protocol=protocol, filename="msg.hl7", encoding=encoding)
     await dest.send(payload)
     assert client.files == {"/in/msg.hl7": payload.encode(encoding)}
+
+
+#: Synthetic. MSH-10 and PID-5.1 carry markers, so a name rendered from either is distinctive.
+_CONTROL_ID = "CTLZQ7731"
+_NAME_FIELD = "NAMEZQMARK"
+_NAMED_BODY = (
+    f"MSH|^~\\&|SENDER|FAC|RECV|FAC|20260714||ADT^A01|{_CONTROL_ID}|P|2.5\r"
+    f"PID|1||42||{_NAME_FIELD}^Zaf{SECRET_CHAR}r\r"
+)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [None, "{PID-5.1}_{MSH-10}.hl7"],
+    ids=["default-template", "name-field-template"],
+)
+async def test_the_refusal_never_carries_the_rendered_file_name(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, template: str | None
+) -> None:
+    """The upload name is rendered from the message, so a label that carried it would put message
+    content in the stored error. The other refusal tests pin a fixed ``msg.hl7``, so
+    they cannot see that; this one renders from MSH-10 and PID-5 (vault BACKLOG #3044)."""
+    client = _FakeClient()
+    over: dict[str, Any] = {} if template is None else {"filename": template}
+    dest = _dest(monkeypatch, client, encoding="us-ascii", **over)
+    rendered = render_filename(dest._filename_template, _NAMED_BODY, fallback="FALLBACKZQ")
+    # Arming: the shipped default really is MSH-10, and both templates resolve to the markers.
+    assert template is not None or dest._filename_template == "{MSH-10}.hl7"
+    assert _CONTROL_ID in rendered and "FALLBACKZQ" not in rendered
+    assert template is None or _NAME_FIELD in rendered
+    with caplog.at_level(logging.DEBUG), pytest.raises(NegativeAckError) as ei:
+        await dest.send(_NAMED_BODY)
+    exc = ei.value
+    assert exc.code == "encoding"
+    for where, text in {
+        "str": str(exc),
+        "repr": repr(exc),
+        "stored error": safe_exc(exc),
+        "log": caplog.text,
+    }.items():
+        for marker in (_CONTROL_ID, _NAME_FIELD):
+            assert marker not in text, f"the rendered file name reached the {where}"
+
+
+async def test_a_long_host_and_dir_leave_the_charset_and_position_in_the_stored_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stored error is cut short twice: by ``safe_exc``, then by the store's own ``safe_text``
+    over the type-prefixed text. A label carrying ``host:remote_dir`` was one long token, and the
+    cut drops a crossing token whole, so a long host and directory took the charset and position
+    with them. The label is fixed now, so their length cannot reach the refusal."""
+    client = _FakeClient()
+    host = "sftp.partner-hospital-integration-gateway.example.org"
+    remote_dir = "/" + "/".join(["partner_inbound_drop_directory"] * 8)
+    dest = _dest(monkeypatch, client, host=host, remote_dir=remote_dir, encoding="us-ascii")
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(_NAMED_BODY)
+    # What dead_letter_now persists for a permanent refusal.
+    stored = safe_text(safe_exc(ei.value))
+    position = _NAMED_BODY.index(SECRET_CHAR)
+    assert f"'us-ascii' (first offending character at position {position})" in stored
+    assert "REMOTEFILE upload" in stored
+    assert "partner_inbound_drop_directory" not in stored and host not in stored
+
+
+async def test_an_explicit_none_encoding_is_utf_8_as_on_the_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``None`` means "not declared". Read as given, ``.encode(None)`` raised a TypeError, which is
+    an internal error: under ``internal_error = stop`` it stopped the lane (vault BACKLOG #3044)."""
+    client = _FakeClient()
+    dest = _dest(monkeypatch, client, filename="msg.hl7", encoding=None)
+    await dest.send(_NAMED_BODY)
+    assert client.files == {"/in/msg.hl7": _NAMED_BODY.encode("utf-8")}
 
 
 # === source ==================================================================
@@ -2763,7 +2837,7 @@ async def test_a_refused_auth_tls_stops_the_lane_and_keeps_the_row(
         assert retry_until is None
         pending = OutboxStatus.PENDING.value
         assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every row kept"
-        assert await runner.store.count_dead() == 0
+        assert await runner.store.count_dead(allowed_channels=None) == 0
         assert len(sink.stopped) == 1
         assert sink.stopped[0][0] == _E2E_DEST
         assert "configuration fault" in sink.stopped[0][1]
@@ -2795,7 +2869,7 @@ async def test_a_refused_auth_tls_on_a_batch_stops_the_lane_and_keeps_every_row(
         assert retry_until is None
         pending = OutboxStatus.PENDING.value
         assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every member kept"
-        assert await runner.store.count_dead() == 0
+        assert await runner.store.count_dead(allowed_channels=None) == 0
         assert [name for name, _ in sink.stopped] == [_E2E_DEST]
         assert "configuration fault" in sink.stopped[0][1]
         assert ("outbound", _E2E_DEST) in runner._stop_held

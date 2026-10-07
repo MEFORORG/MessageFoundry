@@ -290,7 +290,7 @@ async def test_delivery_untouched_when_disabled(
         assert len(collector.deliveries) == 1
 
         async def _processed() -> bool:
-            msgs = await store.list_messages()
+            msgs = await store.list_messages(allowed_channels=None)
             return len(msgs) == 1 and msgs[0]["status"] == MessageStatus.PROCESSED.value
 
         await _until(_processed)

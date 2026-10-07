@@ -36,14 +36,14 @@ from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.email import EmailDestination, envelope_address_problem
 from messagefoundry.transports.mllp import InsecureHopGuard
-from tests._egress_policy import permitting
-from tests.test_encode_wire_body import (
+from tests._content_free import (
     CJK_CHAR,
     PAYLOAD,
     SECRET_CHAR,
-    _assert_content_free,
-    _escapes,
+    assert_content_free,
+    escapes,
 )
+from tests._egress_policy import permitting
 
 
 class _FakeSMTP:
@@ -1418,7 +1418,7 @@ class _Py315SetContent(EmailMessage):
 
 def _assert_refused_content_free(exc: BaseException, *, codec_named: str) -> None:
     assert _BODY_MARKER not in str(getattr(exc, "object", "")), "the error carries the payload"
-    _assert_content_free(exc, encoding=codec_named)
+    assert_content_free(exc, encoding=codec_named)
     # One line at a time, minus the File lines: a checkout path may itself hold "e9" or an accent.
     frames = "".join(traceback.format_exception(exc)).splitlines()
     surfaces = {
@@ -1430,7 +1430,7 @@ def _assert_refused_content_free(exc: BaseException, *, codec_named: str) -> Non
     for where, text in surfaces.items():
         assert _BODY_MARKER not in text, f"message content reached the {where}"
         for ch in (SECRET_CHAR, CJK_CHAR, _LONE_SURROGATE):
-            for form in _escapes(ch):
+            for form in escapes(ch):
                 assert form not in text, f"a message character reached the {where} as {form!r}"
     # The same bytes never encode on a retry, so the row dead-letters on the first attempt. A bad
     # MESSAGE, so neither flag may stop the whole lane.
@@ -1532,7 +1532,7 @@ async def test_a_subject_fault_is_not_reported_as_the_body(wire: _WireCapture) -
     assert exc.config_fault is True and exc.permanent is True
     assert exc.__cause__ is None and exc.__context__ is None
     stored = safe_exc(exc)
-    for form in _escapes(_LONE_SURROGATE):
+    for form in escapes(_LONE_SURROGATE):
         assert form not in stored, f"the subject character reached the stored error as {form!r}"
     assert wire.connections == 0
 

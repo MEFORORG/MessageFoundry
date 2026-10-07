@@ -93,7 +93,9 @@ federated sign-in on a site that turned the claim gate off.
    own checks", as `docs/SECURITY.md` says, and no single-use step-up grant bounds it. Today most
    attempts also cost a ceremony, because `finish_webauthn_registration` pops the staged challenge
    before it verifies the response. A call with an empty or over-long label is the exception: the
-   method refuses it before the pop, so the challenge stays staged.
+   method refuses it before the pop, so the challenge stays staged. Since BACKLOG #2389 a call
+   inside the login-to-MFA floor is a second exception. It is refused before the pop too, and it
+   verifies nothing, so it gains no information about the response.
 
 That is the chain BACKLOG #2609 ran end to end. Someone who holds only a directory password signs
 in by Windows SSO, re-proves the same password, and enrols an authenticator they control. They then
