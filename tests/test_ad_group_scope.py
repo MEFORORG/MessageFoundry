@@ -700,6 +700,9 @@ async def test_a_sign_in_that_takes_over_a_legacy_scope_mid_save_is_a_conflict(
     assert r.status_code == 409
     assert "changed hands" in r.json()["detail"]
     assert await _scope_row(engine, ada_id) == ('["IB_B"]', SCOPE_SOURCE_AD)  # the sign-in's
+    # BACKLOG #2271: one row, whose owner is the one read after the failed write.
+    [row] = await _audit_rows(engine)
+    assert (row["reason"], row["expected_source"], row["owner"]) == ("source_changed", "ad", "ad")
 
 
 @pytest.mark.parametrize(
@@ -766,7 +769,7 @@ async def test_a_sign_in_between_the_read_and_the_write_is_a_conflict(
         "username": "ada",
         "reason": "source_changed",
         "expected_source": expected_source,
-        "owner": SCOPE_SOURCE_MANUAL,
+        "owner": SCOPE_SOURCE_AD,  # who took it, read after the write failed
     }
 
 
@@ -808,6 +811,33 @@ async def test_each_refused_save_writes_one_audit_row(engine: Engine) -> None:
     assert await _audit_rows(engine, "user.channel_scope_changed") == [
         {"actor": "boss", "user_id": ada_id, "channels": ["IB_Z"]}
     ]
+
+
+async def test_a_refusal_whose_audit_row_fails_still_answers_409(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2271: a store that refuses the refusal's audit row does not turn the 409 into a
+    500, so the console still shows a refused save with the edits kept."""
+    service = await _admin_service(engine)
+    ada_id = await _directory_scoped_user(engine, service)
+    store = engine.store
+    real = store.record_audit
+    attempts: list[str] = []
+
+    async def refuse_the_refusal_row(action: str, **kwargs: object) -> None:
+        if action == CHANNEL_SCOPE_CHANGE_REFUSED_ACTION:
+            attempts.append(action)
+            raise RuntimeError("audit append refused")
+        await real(action, **kwargs)  # type: ignore[arg-type]
+
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _boss_headers(c)
+        monkeypatch.setattr(store, "record_audit", refuse_the_refusal_row)
+        r = await c.put(f"/users/{ada_id}/channel-scope", json={"channels": ["IB_Z"]}, headers=h)
+    assert r.status_code == 409
+    assert attempts == [CHANNEL_SCOPE_CHANGE_REFUSED_ACTION]  # the row was tried, then refused
+    assert await _scope_row(engine, ada_id) == ('["IB_A"]', SCOPE_SOURCE_AD)
 
 
 async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:
