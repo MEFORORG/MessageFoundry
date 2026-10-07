@@ -499,6 +499,8 @@ class Engine:
         # AND dr.activate): then the runner binds only connections whose resolved tier rank >=
         # dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the runner
         # → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
+        # A DR box that is not activated passes dr_standby instead, and binds no inbound listener
+        # until it is (vault BACKLOG #3140).
         self._priority_default = priority_default
         self._dr_settings = dr_settings or DrSettings()
         # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
@@ -725,6 +727,15 @@ class Engine:
         threshold is consistently applied across reloads."""
         return self._dr_settings.priority_threshold if self._dr_active else None
 
+    def _dr_standby_threshold(self) -> Priority | None:
+        """``[dr].priority_threshold`` on a DR standby that is not activated, else ``None``. The
+        runner binds no inbound listener while it is set (vault BACKLOG #3140), because ADR 0048's
+        load balancer moves the VIP to the node that answers. It judges the listeners an
+        activation would bind, so a reload here refuses what that activation would refuse."""
+        if self._dr_settings.enabled and not self._dr_active:
+            return self._dr_settings.priority_threshold
+        return None
+
     @property
     def dr_active(self) -> bool:
         """Whether the engine is running under the DR run-profile this boot (#61, ADR 0048)."""
@@ -777,18 +788,21 @@ class Engine:
         The runner takes its threshold at construction and reads it on every start and reload, so
         a flip of the latch alone parked nothing on a running box (vault BACKLOG #3067). Every
         runtime flip goes through here, so the two cannot disagree. It binds and unbinds nothing:
-        the next reload does."""
+        the next reload does. A release hands the runner the passive standby's threshold, so that
+        reload binds no listener (vault BACKLOG #3140)."""
         self._dr_active = active
         if self._registry_runner is not None:
-            self._registry_runner.set_dr_threshold(self._dr_run_threshold())
+            self._registry_runner.set_dr_threshold(
+                self._dr_run_threshold(), standby=self._dr_standby_threshold()
+            )
 
     async def _dr_activate_profile(self) -> None:
         """Engine callback the DR coordinator runs to BEGIN serving under the DR run-profile (#61, ADR
         0048 step 4): latch the run-profile ON, hand the runner the threshold, and re-apply the
         running graph so the runner binds only connections at/above ``[dr].priority_threshold`` (the
-        rest report ``status:"filtered"``). A reload (not a cold start) so a box already serving its
-        full graph drops to the critical set in place, with in-flight rows preserved (the reload is
-        quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
+        rest report ``status:"filtered"``). A reload (not a cold start) so a passive box, which binds
+        no listener (vault BACKLOG #3140), binds the critical set in place, with in-flight rows
+        preserved (the reload is quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
         from :meth:`_dr_config_drift`.
 
         It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
@@ -1010,6 +1024,7 @@ class Engine:
             intake_gate=self._intake_gate,
             priority_default=self._priority_default,
             dr_threshold=self._dr_run_threshold(),
+            dr_standby=self._dr_standby_threshold(),
             alert_sink=self._alert_sink,
             egress=self._egress_settings,
             hop_posture=self._hop_posture,
@@ -2435,6 +2450,7 @@ class Engine:
                 stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
                 priority_default=self._priority_default,
                 dr_threshold=self._dr_run_threshold(),
+                dr_standby=self._dr_standby_threshold(),
                 alert_sink=self._alert_sink,
                 egress=self._egress_settings,
                 hop_posture=self._hop_posture,

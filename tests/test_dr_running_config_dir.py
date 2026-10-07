@@ -100,8 +100,9 @@ _NEVER = (
 
 def _write_tiered_graph(
     cfg: Path, tmp_path: Path, *, norm_schedule: str | None = None, norm_auto_start: bool = True
-) -> None:
-    """One critical and one normal MLLP inbound, each with an outbound of the same tier."""
+) -> tuple[int, int]:
+    """One critical and one normal MLLP inbound, each with an outbound of the same tier. Returns
+    the two ports, critical first."""
     cfg.mkdir(parents=True, exist_ok=True)
     out_crit, out_norm = tmp_path / "out-crit", tmp_path / "out-norm"
     out_crit.mkdir(exist_ok=True)
@@ -126,6 +127,7 @@ def _write_tiered_graph(
         "    return [Send('OB_CRIT_ADT', msg), Send('OB_NORM_ADT', msg)]\n",
         encoding="utf-8",
     )
+    return crit_port, norm_port
 
 
 class _Box(NamedTuple):
@@ -210,9 +212,9 @@ async def test_an_activation_parks_the_normal_feed_and_keeps_the_critical_one(bo
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
     assert rr is not None
-    # Control: a passive box serves its full graph.
-    assert rr.inbound_running(_CRIT) and rr.inbound_running(_NORM)
-    assert rr.filtered_inbound() == {} and rr.filtered_outbound() == {}
+    # A passive box binds no listener, of any tier (vault BACKLOG #3140), and parks no outbound.
+    assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
+    assert set(rr.filtered_inbound()) == {_CRIT, _NORM} and rr.filtered_outbound() == {}
 
     coord = engine.dr_coordinator
     assert coord is not None
@@ -231,9 +233,10 @@ async def test_an_activation_parks_the_normal_feed_and_keeps_the_critical_one(bo
     assert rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
 
 
-async def test_a_release_then_a_reload_binds_the_normal_feed_again(box: _Box) -> None:
+async def test_a_release_then_a_reload_returns_to_the_passive_bind_set(box: _Box) -> None:
     """Red before #3067 in the other direction: a runner built under the profile kept its threshold
-    after a release, so every later reload went on parking the normal feeds."""
+    after a release, so every later reload went on parking the normal outbound. Since vault BACKLOG
+    #3140 the released box is passive again, so that reload binds no listener of any tier."""
     engine = box.engine
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
@@ -245,13 +248,15 @@ async def test_a_release_then_a_reload_binds_the_normal_feed_again(box: _Box) ->
 
     await coord.release(actor="alice")
     assert engine.dr_active is False and rr.dr_threshold is None
+    assert rr.dr_standby is Priority.CRITICAL
     assert not rr.inbound_running(_CRIT)  # the release unbound all intake
-    # Until the next reload a parked feed stays parked, so the scheduler cannot bind it.
-    assert _NORM in rr.filtered_inbound()
+    # Parked at once, not at the next reload, so the scheduler cannot bind either feed (#3140).
+    assert set(rr.filtered_inbound()) == {_CRIT, _NORM}
 
     await engine.reload_detail(box.tiered)
-    assert rr.inbound_running(_CRIT) and rr.inbound_running(_NORM)
-    assert rr.filtered_inbound() == {} and rr.filtered_outbound() == {}
+    assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
+    assert set(rr.filtered_inbound()) == {_CRIT, _NORM}
+    assert rr.filtered_outbound() == {}  # the outbound park lifts, as #3067 built it
 
 
 async def _norm_row(engine: Engine, message_id: str) -> dict[str, Any]:
@@ -605,7 +610,7 @@ async def test_a_reload_that_fails_after_the_threshold_is_set_puts_it_back(
     seen: list[object] = []
 
     async def failing_reload(registry: object = None) -> None:
-        seen.append(rr.dr_threshold)
+        seen.append((rr.dr_threshold, rr.dr_standby))
         raise OSError("a listener could not bind")
 
     monkeypatch.setattr(rr, "reload", failing_reload)
@@ -615,8 +620,8 @@ async def test_a_reload_that_fails_after_the_threshold_is_set_puts_it_back(
         await coord.activate(actor="alice")
 
     assert caught.value.kind == "profile"
-    assert seen == [Priority.CRITICAL]  # control: the threshold was on when the reload ran
-    assert rr.dr_threshold is None
+    assert seen == [(Priority.CRITICAL, None)]  # control: the threshold was on when the reload ran
+    assert rr.dr_threshold is None and rr.dr_standby is Priority.CRITICAL
     assert coord.active is False and engine.dr_active is False
 
 
@@ -643,11 +648,12 @@ async def test_a_refused_activation_puts_the_threshold_back(
     assert caught.value.kind == "profile"
     assert "could not bind the priority feeds" in str(caught.value)
     assert coord.active is False and engine.dr_active is False
-    assert rr.dr_threshold is None
-    assert rr.inbound_running(_CRIT) and rr.inbound_running(_NORM)
+    assert rr.dr_threshold is None and rr.dr_standby is Priority.CRITICAL
+    assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
     monkeypatch.setattr(engine, "preflight_registry", real_preflight)
     await engine.reload_detail(box.tiered)
-    assert rr.inbound_running(_NORM)
+    assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)  # still passive
+    assert rr.filtered_outbound() == {}  # and parking no outbound
 
 
 async def test_an_activation_preflights_the_running_graph_and_does_not_guard_it(
