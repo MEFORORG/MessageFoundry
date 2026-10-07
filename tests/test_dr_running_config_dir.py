@@ -663,18 +663,14 @@ async def test_an_activation_preflights_the_running_graph_and_does_not_guard_it(
     running = rr.registry
     guarded: list[object] = []
     preflighted: list[object] = []
-    real_guard = engine.guard_registry
     real_preflight = engine.preflight_registry
-
-    def spy_guard(registry: Any) -> None:
-        guarded.append(registry)
-        real_guard(registry)
 
     async def spy_preflight(registry: Any) -> None:
         preflighted.append(registry)
         await real_preflight(registry)
 
-    monkeypatch.setattr(engine, "guard_registry", spy_guard)
+    # The guard callable itself, not the guard_registry wrapper, so a direct call to either counts.
+    monkeypatch.setattr(engine, "_registry_guard", guarded.append)
     monkeypatch.setattr(engine, "preflight_registry", spy_preflight)
     coord = engine.dr_coordinator
     assert coord is not None

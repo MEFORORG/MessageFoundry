@@ -780,12 +780,13 @@ class Engine:
 
         It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
         (vault BACKLOG #2184, engine PR 2070). The preflight reads anchor files, which can change
-        after the graph loaded. The guard judges only the graph and the startup settings, and
-        neither has changed. It already judged this graph when it loaded, through
-        :meth:`reload_detail` or the managed app's first load, over the whole graph and before the
-        shard filter. ``rr.registry`` is the filtered graph, so a guard here would judge less than
-        that load did. A graph an embedder hands to :meth:`add_registry` meets neither check at
-        load. That is a fact about embedding, and an activation is not where it changes."""
+        after the graph loaded. The guard ``serve`` wires, the static-credential guard, judges only
+        the graph and the startup settings, and neither has changed. It already judged this graph
+        when it loaded, through :meth:`reload_detail` or the managed app's first load, over the
+        whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
+        filtered graph, so a guard here would judge less than that load did. A graph an embedder
+        hands to :meth:`add_registry` meets neither check at load. That is a fact about embedding,
+        and an activation is not where it changes."""
         was_active = self._dr_active
         rr = self._registry_runner
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
@@ -795,8 +796,8 @@ class Engine:
         # dir, so a dir on a share at the failed site cannot refuse it after the takeover hook moved
         # the VIP. The settings and registry preflights are the trust-anchor checks reload_detail
         # runs before a swap; they read anchor files and write audit rows, and they refuse before
-        # anything changes. The graph guard and the env-values re-read are not repeated: the graph
-        # is unchanged, and the values are the ones the runner holds. rr.reload still runs
+        # anything changes. The graph guard is not repeated; the docstring says why. Nor is the
+        # env-values re-read: the values are the ones the runner holds. rr.reload still runs
         # build_check, so the egress and exposure gates still run. The threshold goes to the runner
         # after the preflights and before the reload, which is where the runner re-evaluates every
         # connection. rr.reload() re-applies whichever graph is current once it holds the reload
