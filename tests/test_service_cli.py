@@ -35,23 +35,113 @@ def test_service_status_dispatch(
     assert capsys.readouterr().out.strip() == "running"
 
 
-def test_service_start_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_service_start_dispatch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     calls: list[tuple[str, str]] = []
 
-    def _control(action: str, name: str) -> bool:
+    def _control(action: str, name: str) -> svc.ServiceControlOutcome:
         calls.append((action, name))
-        return True
+        return svc.ServiceControlOutcome.DISPATCHED
 
-    monkeypatch.setattr(svc, "control_service", _control)
+    monkeypatch.setattr(svc, "control_service_ex", _control)
 
     assert main(["service", "start", "--name", "MyEngine"]) == 0
     assert calls == [("start", "MyEngine")]
+    assert "completed" in capsys.readouterr().out
 
 
 def test_service_stop_off_windows_returns_1(monkeypatch: pytest.MonkeyPatch) -> None:
-    # control_service returns False off Windows (no-op); the CLI surfaces that as a non-zero exit.
-    monkeypatch.setattr(svc, "control_service", lambda action, name: False)
+    # control_service_ex is UNSUPPORTED off Windows (no-op); the CLI surfaces that as a non-zero exit.
+    monkeypatch.setattr(
+        svc, "control_service_ex", lambda action, name: svc.ServiceControlOutcome.UNSUPPORTED
+    )
     assert main(["service", "stop"]) == 1
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+@pytest.mark.parametrize(
+    ("outcome", "says"),
+    [
+        (svc.ServiceControlOutcome.CANCELLED, "UAC prompt was declined"),
+        (svc.ServiceControlOutcome.FAILED, "failed"),
+        (svc.ServiceControlOutcome.UNSUPPORTED, "Windows-only"),
+    ],
+)
+def test_service_start_stop_refused_elevation_exits_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    outcome: svc.ServiceControlOutcome,
+    says: str,
+) -> None:
+    """A declined UAC prompt or a failed elevation is a non-zero exit with the reason on stderr, so
+    a wrapper script never reads it as success (vault BACKLOG #2787). The elevation is stubbed."""
+    monkeypatch.setattr(svc, "control_service_ex", lambda action, name: outcome)
+
+    assert main(["service", action, "--name", "MyEngine"]) == 1
+    captured = capsys.readouterr()
+    assert says in captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize(("action", "state"), [("stop", "stopped"), ("start", "running")])
+def test_service_already_in_the_requested_state_exits_0_without_elevating(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    state: str,
+) -> None:
+    """Stopping a stopped service is the end state asked for, not a failure: `net stop` exits
+    non-zero there, and an operator script or the uninstall path that stops first must not abort.
+    The state is asked first, so no UAC prompt is raised for a no-op."""
+    elevations: list[str] = []
+
+    def _control(action: str, name: str) -> svc.ServiceControlOutcome:
+        elevations.append(action)
+        return svc.ServiceControlOutcome.FAILED
+
+    monkeypatch.setattr(svc, "service_state", lambda name: state)
+    monkeypatch.setattr(svc, "control_service_ex", _control)
+
+    assert main(["service", action, "--name", "MyEngine"]) == 0
+    captured = capsys.readouterr()
+    assert f"already {state}" in captured.out
+    assert captured.err == ""
+    assert elevations == []
+
+
+@pytest.mark.parametrize(("action", "state"), [("stop", "stopped"), ("start", "running")])
+def test_service_reaching_the_state_during_a_failed_call_exits_0(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    state: str,
+) -> None:
+    """The state is asked again after a FAILED, for a service that got there while `net` ran."""
+    states = iter(["running" if state == "stopped" else "stopped", state])
+    monkeypatch.setattr(svc, "service_state", lambda name: next(states))
+    monkeypatch.setattr(
+        svc, "control_service_ex", lambda action, name: svc.ServiceControlOutcome.FAILED
+    )
+
+    assert main(["service", action, "--name", "MyEngine"]) == 0
+    assert f"already {state}" in capsys.readouterr().out
+
+
+def test_service_stop_that_genuinely_fails_still_exits_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: a stop that fails with the service still running is a failure."""
+    monkeypatch.setattr(svc, "service_state", lambda name: "running")
+    monkeypatch.setattr(
+        svc, "control_service_ex", lambda action, name: svc.ServiceControlOutcome.FAILED
+    )
+
+    assert main(["service", "stop", "--name", "MyEngine"]) == 1
+    captured = capsys.readouterr()
+    assert "failed" in captured.err
+    assert captured.out == ""
 
 
 def test_service_install_requires_env(capsys: pytest.CaptureFixture[str]) -> None:
@@ -63,14 +153,37 @@ def test_service_install_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     installs: list[tuple[str, str]] = []
     monkeypatch.setattr(svc, "install_script_path", lambda: Path("install-service.ps1"))
 
-    def _install(script: str, env: str) -> bool:
+    def _install(script: str, env: str) -> svc.ServiceControlOutcome:
         installs.append((script, env))
-        return True
+        return svc.ServiceControlOutcome.DISPATCHED
 
     monkeypatch.setattr(svc, "install_service", _install)
 
     assert main(["service", "install", "--env", "dev"]) == 0
     assert installs == [("install-service.ps1", "dev")]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "says"),
+    [
+        (svc.ServiceControlOutcome.FAILED, "did not launch"),
+        (svc.ServiceControlOutcome.UNSUPPORTED, "Windows-only"),
+    ],
+)
+def test_service_install_refused_launch_exits_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    outcome: svc.ServiceControlOutcome,
+    says: str,
+) -> None:
+    """A declined UAC prompt or a failed launch of the installer exits 1 (vault BACKLOG #2787)."""
+    monkeypatch.setattr(svc, "install_script_path", lambda: Path("install-service.ps1"))
+    monkeypatch.setattr(svc, "install_service", lambda script, env: outcome)
+
+    assert main(["service", "install", "--env", "dev"]) == 1
+    captured = capsys.readouterr()
+    assert says in captured.err
+    assert captured.out == ""
 
 
 def test_service_install_missing_script(

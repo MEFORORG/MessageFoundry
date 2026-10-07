@@ -392,7 +392,8 @@ class AlertSink(Protocol):
         narrow its channel scope (ADR 0079 mechanism 2, ADR 0198). The same event as the
         ``auth.ad_session_revoked`` audit row. ``name`` is the account's username, so each revoked
         principal pages on its own; ``reason`` is ``directory_absent``, ``directory_disabled``,
-        ``directory_undetermined``, ``roles_changed`` or ``scope_changed``.
+        ``directory_undetermined``, ``directory_object_id_missing`` (BACKLOG #2434),
+        ``roles_changed`` or ``scope_changed``.
         No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 

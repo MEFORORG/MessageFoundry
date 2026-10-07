@@ -16,6 +16,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import pytest
@@ -24,16 +25,19 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.config.settings import AiSettings, AuthSettings, EgressSettings
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
+    LogLevelRefused,
     current_log_level,
+    level_refused_on_production,
     set_runtime_level,
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests.test_api_reload import _write_valid_config
 
 PW = "a-strong-test-passphrase"  # ≥15, satisfies the ASVS policy
 
@@ -68,7 +72,7 @@ def _restore_log_levels() -> Iterator[None]:
 
 
 def test_set_runtime_level_applies_root_and_uvicorn() -> None:
-    set_runtime_level("DEBUG")
+    set_runtime_level("DEBUG", production=False)
     assert logging.getLogger().level == logging.DEBUG
     # The three uvicorn loggers are re-levelled to match (so the override reaches request logs too).
     assert logging.getLogger("uvicorn").level == logging.DEBUG
@@ -77,13 +81,49 @@ def test_set_runtime_level_applies_root_and_uvicorn() -> None:
 
 
 def test_set_runtime_level_is_case_insensitive_and_returns_normalized() -> None:
-    assert set_runtime_level("warning") == "WARNING"
+    assert set_runtime_level("warning", production=False) == "WARNING"
     assert current_log_level() == "WARNING"
 
 
 def test_set_runtime_level_rejects_unknown_level() -> None:
     with pytest.raises(ValueError, match="invalid log level"):
-        set_runtime_level("VERBOSE")
+        set_runtime_level("VERBOSE", production=False)
+
+
+# --- the production DEBUG refusal (vault BACKLOG #2777) -------------------------
+
+
+def test_the_shared_predicate_refuses_debug_only_on_a_production_tier() -> None:
+    """The one predicate serve's Gate #1 and the run-time setter share. RED when either arm moves:
+    a production tier admitting DEBUG, or a non-production tier refusing it."""
+    assert level_refused_on_production("DEBUG", production=True)
+    assert level_refused_on_production("debug", production=True)
+    assert not level_refused_on_production("DEBUG", production=False)
+    for level in ("INFO", "WARNING", "ERROR", "CRITICAL"):
+        assert not level_refused_on_production(level, production=True)
+    # Keyed on the numeric threshold, not the name: anything more verbose than DEBUG, or a name
+    # logging does not know, is refused rather than waved past both gates.
+    assert level_refused_on_production("NOTSET", production=True)
+    assert level_refused_on_production("TRACE", production=True)
+
+
+def test_set_runtime_level_refuses_debug_on_production_and_leaves_the_level() -> None:
+    set_runtime_level("INFO", production=False)
+    with pytest.raises(LogLevelRefused, match="production instance"):
+        set_runtime_level("debug", production=True)
+    # Refused BEFORE anything is applied: neither the root nor a uvicorn logger moved.
+    assert logging.getLogger().level == logging.INFO
+    assert logging.getLogger("uvicorn.access").level == logging.INFO
+    # A production instance still moves between the levels it may run at.
+    assert set_runtime_level("WARNING", production=True) == "WARNING"
+
+
+def test_a_refused_level_is_not_reported_as_an_invalid_one() -> None:
+    """The route maps ValueError to 400 (bad request) and LogLevelRefused to 403 (policy). If the
+    refusal were a ValueError the route's 400 arm would swallow it and the denial audit would not run."""
+    assert not issubclass(LogLevelRefused, ValueError)
+    with pytest.raises(ValueError):
+        set_runtime_level("VERBOSE", production=True)
 
 
 # --- API fixtures (modelled on tests/test_content_search.py) --------------------
@@ -104,9 +144,19 @@ async def _service(engine: Engine) -> AuthService:
 
 
 def _client(
-    engine: Engine, service: AuthService, *, log_dir: str | None = None
+    engine: Engine,
+    service: AuthService,
+    *,
+    log_dir: str | None = None,
+    ai: AiSettings | None | Literal["dev"] = "dev",
 ) -> httpx.AsyncClient:
-    app = create_app(engine, auth=service, log_dir=log_dir, configured_log_level="INFO")
+    # A resolved NON-production posture by default, built fresh per app so no test shares one mutable
+    # settings object, and DEBUG stays reachable unless a test asks for a production one.
+    if ai == "dev":
+        ai = AiSettings(environment="dev")
+    app = create_app(
+        engine, auth=service, log_dir=log_dir, configured_log_level="INFO", ai_settings=ai
+    )
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
@@ -201,6 +251,103 @@ async def test_logging_level_denied_without_monitoring_diagnose(engine: Engine) 
         assert (await c.get("/logging/level", headers=_auth(token))).status_code == 403
         r = await c.patch("/logging/level", headers=_auth(token), json={"level": "DEBUG"})
         assert r.status_code == 403
+
+
+# --- PATCH /logging/level on a production instance (vault BACKLOG #2777) -----------
+
+
+async def _audit(engine: Engine, action: str) -> list[dict[str, object]]:
+    return [dict(x) for x in await engine.store.list_audit(limit=50) if x["action"] == action]
+
+
+@pytest.mark.parametrize(
+    "ai",
+    [
+        pytest.param(AiSettings(environment="prod"), id="prod-env-derived"),
+        pytest.param(AiSettings(environment="site-a", production=True), id="explicit-tier"),
+        # serve always resolves the tier before the app exists; an embedder that does not gets the
+        # strictest answer rather than a permissive default.
+        pytest.param(None, id="unresolved-fails-closed"),
+    ],
+)
+async def test_patch_logging_level_refuses_debug_on_a_production_instance(
+    engine: Engine, ai: AiSettings | None
+) -> None:
+    """The run-time route applies serve's Gate #1: a production instance cannot be SWITCHED to DEBUG
+    any more than it can START at it. RED against the pre-#2777 route, which answered 200 and set it."""
+    set_runtime_level("INFO", production=False)
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    async with _client(engine, service, ai=ai) as c:
+        token = await _login(c, "op")
+        r = await c.patch("/logging/level", headers=_auth(token), json={"level": "debug"})
+        assert r.status_code == 403, r.text
+        detail = r.json()["detail"]
+        # The refusal names the posture and the legitimate route, so it does not read as a missing
+        # permission.
+        assert "production instance" in detail
+        assert "non-production instance" in detail
+        assert "do not relabel" in detail
+        assert logging.getLogger().level == logging.INFO
+        # The read half reports the untouched level and does not offer the refused one.
+        got = (await c.get("/logging/level", headers=_auth(token))).json()
+        assert got["level"] == "INFO"
+        assert got["levels"] == ["INFO", "WARNING", "ERROR", "CRITICAL"]
+    denied = await _audit(engine, "logging_level_change_denied")
+    assert len(denied) == 1, "the refused attempt must be audited"
+    assert denied[0]["actor"] == "op"
+    assert json.loads(str(denied[0]["detail"])) == {
+        "from": "INFO",
+        "requested": "DEBUG",
+        "reason": "production_instance",
+    }
+    assert not await _audit(engine, "logging_level_change"), "nothing changed, so no change row"
+
+
+async def test_a_production_instance_still_moves_between_the_levels_it_may_run_at(
+    engine: Engine,
+) -> None:
+    """The negative control for the refusal: a route that refused EVERY production PATCH would pass the
+    test above and fail here."""
+    set_runtime_level("INFO", production=False)
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    async with _client(engine, service, ai=AiSettings(environment="prod")) as c:
+        token = await _login(c, "op")
+        r = await c.patch("/logging/level", headers=_auth(token), json={"level": "WARNING"})
+        assert r.status_code == 200, r.text
+        assert logging.getLogger().level == logging.WARNING
+    assert await _audit(engine, "logging_level_change")
+    assert not await _audit(engine, "logging_level_change_denied")
+
+
+async def test_a_config_reload_does_not_bring_debug_back_on_a_production_instance(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """ADR 0130 keeps a run-time override across /config/reload. On a production instance there must be
+    no DEBUG for it to keep, and the reload must not move the level itself.
+
+    The run-time level (WARNING) differs from the configured baseline (INFO) on purpose: a reload that
+    re-ran configure_logging would re-assert INFO and fail the level assertion, which a test starting at
+    the baseline could not see. DEBUG is still refused afterwards, so the reload did not reopen it."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    app = create_app(
+        engine,
+        allow_no_auth=True,
+        configured_log_level="INFO",
+        ai_settings=AiSettings(environment="prod"),
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        assert (await c.patch("/logging/level", json={"level": "WARNING"})).status_code == 200
+        assert (await c.patch("/logging/level", json={"level": "DEBUG"})).status_code == 403
+        r = await c.post("/config/reload", json={"config_dir": str(cfg)})
+        assert r.status_code == 200, r.text
+        assert r.json()["inbound"] == 1, "the reload must really have swapped the graph"
+        assert logging.getLogger().level == logging.WARNING
+        assert (await c.patch("/logging/level", json={"level": "DEBUG"})).status_code == 403
+        assert logging.getLogger().level == logging.WARNING
+    assert len(await _audit(engine, "logging_level_change_denied")) == 2
 
 
 # --- GET /logs/tail -------------------------------------------------------------
