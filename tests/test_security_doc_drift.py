@@ -354,6 +354,11 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
     ),
     "AlertsConfig": "sink configuration; credentials never returned",
     "AttachmentInfo": "content_type/id/total_bytes — attachment metadata, never bytes",
+    "ConnectionEventList": (
+        "GET /events envelope: limit/offset/total/before_id + ConnectionEventInfo rows (mapped; "
+        "reason gated, BACKLOG #2443); the envelope's own fields are counts and a row id (BACKLOG "
+        "#2438)"
+    ),
     "DeadLetterList": (
         "envelope: limit/offset/total + DeadLetterRow rows (mapped) + DeadLetterTarget replay "
         "targets + the replayable_in_scope flag"

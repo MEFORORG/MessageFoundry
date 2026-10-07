@@ -422,12 +422,16 @@ class ConnectionEventInfo(PhiGatedModel):
 class ConnectionEventList(BaseModel):
     """One page of the event log and the total it sits in (BACKLOG #2438). ``total`` counts every
     event under the same filters and channel scope, so ``offset`` and ``limit`` place this page.
-    The console's ``/ui/events`` page reads it; ``GET /events`` returns ``events`` as a bare list
-    and states ``total`` in a header."""
+    ``GET /events`` returns it, and the console's ``/ui/events`` page reads it.
+
+    ``before_id`` is the snapshot the page was read under, as ``AuditList.before_id`` states: only
+    events whose ``id`` is below it. The log is ordered by ``ts``, but ``id`` grows on insert, so
+    the pin also holds when a burst flush lands an older ``ts`` among rows already paged."""
 
     total: int
     limit: int
     offset: int
+    before_id: int | None
     events: list[ConnectionEventInfo]
 
 

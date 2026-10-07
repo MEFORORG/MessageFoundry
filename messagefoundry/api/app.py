@@ -209,6 +209,7 @@ from messagefoundry.api.multipart import (
     parse_single_file_upload,
 )
 from messagefoundry.api.outlive import OutlivingOperations
+from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
@@ -239,6 +240,7 @@ from messagefoundry.api.tls import GeneratedPairReplaced, record_generated_pair_
 from messagefoundry.api.validation import (
     MAX_EVENT_KINDS,
     MAX_EXPORT_IDS,
+    PAGE_BIND_MAX,
     ConnectionName,
     ControlIdFilter,
     DigestId,
@@ -495,10 +497,6 @@ _NO_STORE_ROUTE_PATHS = frozenset(
     }
 )
 _log = logging.getLogger(__name__)
-
-#: The response header ``GET /events`` states its total in, so its body can stay a bare list
-#: (BACKLOG #2438). The paged list routes that return a model carry ``total`` in the body instead.
-TOTAL_COUNT_HEADER: Final = "X-Total-Count"
 
 #: The two monitoring rows whose ``reason`` is masked until a per-item reveal (BACKLOG #2443).
 _ReasonInfo = TypeVar("_ReasonInfo", ConnectionEventInfo, AlertInstanceInfo)
@@ -4119,6 +4117,39 @@ def create_app(
             )
         return out
 
+    async def _admit_event_read(
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        connection: str | None,
+        reveal: int | None,
+    ) -> Sequence[str] | None:
+        """The gates every event-log read passes, and the channel scope it then reads under."""
+        await _admit_reveal(request, identity, reveal)
+        # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
+        # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
+        if connection is not None and not identity.can_access_channel(connection):
+            await _audit_channel_denied(engine, identity, connection, client_ip(request))
+            raise HTTPException(403, "connection is outside your channel scope")
+        return _scope(identity)
+
+    async def _event_infos(
+        rows: Sequence[Any],
+        *,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        reveal: int | None,
+    ) -> list[ConnectionEventInfo]:
+        return await _redact_reasons(
+            [_conn_event_info(r) for r in rows],
+            engine=engine,
+            identity=identity,
+            request=request,
+            reveal=reveal,
+            audit_action="connection_event_reveal",
+        )
+
     async def _connection_event_page(
         *,
         request: Request,
@@ -4129,67 +4160,74 @@ def create_app(
         since: float | None,
         limit: int,
         offset: int = 0,
+        before_id: int | None = None,
         reveal: int | None = None,
-        count: bool = True,
     ) -> ConnectionEventList:
         """One page of the event log and the total it sits in (BACKLOG #2438): the one body of
         ``GET /events`` and of the console's ``/ui/events`` page, so both read the same rows under
         the same gates. The total is counted under the same filters and channel scope as the page,
         so a scoped caller is told how many events IT can page through and no more.
 
-        Called in-process by the console, so every argument is a plain value. ``reveal`` and the
-        redaction of ``reason`` behave as :func:`list_connection_events` states. ``count=False``
-        skips the count for a caller that shows no total, and ``total`` is then the page length."""
-        await _admit_reveal(request, identity, reveal)
-        # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
-        # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
-        if connection is not None and not identity.can_access_channel(connection):
-            await _audit_channel_denied(engine, identity, connection, client_ip(request))
-            raise HTTPException(403, "connection is outside your channel scope")
-        scope = _scope(identity)
-        rows = await engine.store.list_connection_events(
-            connection=connection,
-            kinds=kind,
-            since=since,
-            limit=limit,
-            offset=offset,
-            allowed_channels=scope,
-        )
-        total = (
-            await engine.store.count_connection_events(
-                connection=connection, kinds=kind, since=since, allowed_channels=scope
-            )
-            if count
-            else len(rows)
-        )
-        events = await _redact_reasons(
-            [_conn_event_info(r) for r in rows],
-            engine=engine,
-            identity=identity,
-            request=request,
-            reveal=reveal,
-            audit_action="connection_event_reveal",
-        )
-        return ConnectionEventList(total=total, limit=limit, offset=offset, events=events)
+        Every page is pinned below ``before_id``. A caller that names none gets the newest event's
+        ``id`` plus one, read in the same query as the total, and passes it back with the next
+        offset. Without the pin, events arriving between clicks would shift every row down, and a
+        reveal would re-read a window its event had already left.
 
-    @app.get("/events", response_model=list[ConnectionEventInfo])
+        Called in-process by the console, so every argument is a plain value. ``reveal`` and the
+        redaction of ``reason`` behave as :func:`list_connection_events` states."""
+        scope = await _admit_event_read(request, engine, identity, connection, reveal)
+        where: dict[str, Any] = {
+            "connection": connection,
+            "kinds": kind,
+            "since": since,
+            "allowed_channels": scope,
+        }
+        counted: int | None = None
+        if before_id is None:
+            counted, newest = await engine.store.connection_event_extent(**where)
+            before_id = newest + 1 if newest else None
+        rows = await engine.store.list_connection_events(
+            limit=limit, offset=offset, before_id=before_id, **where
+        )
+        pin = before_id
+
+        async def _count() -> int:
+            if counted is not None:
+                return counted
+            total, _newest = await engine.store.connection_event_extent(before_id=pin, **where)
+            return total
+
+        total = await page_total(len(rows), limit=limit, offset=offset, count=_count)
+        events = await _event_infos(
+            rows, request=request, engine=engine, identity=identity, reveal=reveal
+        )
+        return ConnectionEventList(
+            total=total, limit=limit, offset=offset, before_id=before_id, events=events
+        )
+
+    @app.get("/events", response_model=ConnectionEventList)
     async def list_connection_events(
         request: Request,
-        response: Response,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
         connection: ConnectionName | None = Query(None),
         kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
-        offset: int = Query(0, ge=0),
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        before_id: int | None = Query(
+            None,
+            ge=1,
+            le=PAGE_BIND_MAX,
+            description="the snapshot pin a previous page returned; omit it on the first page",
+        ),
         reveal: Annotated[int | None, Query(ge=1)] = None,
-    ) -> list[ConnectionEventInfo]:
+    ) -> ConnectionEventList:
         """The Corepoint-style connection/transport event log (#46), newest first. Optionally filtered
         by ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp.
 
-        Paged by ``offset`` (BACKLOG #2438). The body stays a bare list, and the
-        ``X-Total-Count`` header carries the total under the same filters and channel scope.
+        Paged by ``offset`` against ``total``, under the ``before_id`` snapshot pin (BACKLOG
+        #2438); :func:`_connection_event_page` states why the pin exists.
 
         Not PHI-free: ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives it a
         protection level. The route is gated by ``monitoring:read``, so ``reason`` is gated
@@ -4198,7 +4236,7 @@ def create_app(
         ``messages:view_summary``, charges the PHI-read budget, and is audited as
         ``connection_event_reveal``. The response is served ``no-store``
         (``_NO_STORE_ROUTE_PATHS``)."""
-        page = await _connection_event_page(
+        return await _connection_event_page(
             request=request,
             engine=engine,
             identity=identity,
@@ -4207,10 +4245,9 @@ def create_app(
             since=since,
             limit=limit,
             offset=offset,
+            before_id=before_id,
             reveal=reveal,
         )
-        response.headers[TOTAL_COUNT_HEADER] = str(page.total)
-        return page.events
 
     async def _ui_connection_events(
         *,
@@ -4223,21 +4260,17 @@ def create_app(
         limit: int,
         reveal: int | None = None,
     ) -> list[ConnectionEventInfo]:
-        """The console's unpaged event read, for a connection's detail page: the first ``limit``
-        events as a bare list, as ``GET /events`` returned them before it paged (BACKLOG #2438).
-        The paged ``/ui/events`` page calls :func:`_connection_event_page` instead."""
-        page = await _connection_event_page(
-            request=request,
-            engine=engine,
-            identity=identity,
-            connection=connection,
-            kind=kind,
-            since=since,
-            limit=limit,
-            reveal=reveal,
-            count=False,
+        """The console's unpaged event read, for a connection's detail page: the newest ``limit``
+        events as a bare list, under the gates ``GET /events`` applies, with no total and no pin.
+        The paged ``/ui/events`` page calls :func:`_connection_event_page` instead (BACKLOG
+        #2438)."""
+        scope = await _admit_event_read(request, engine, identity, connection, reveal)
+        rows = await engine.store.list_connection_events(
+            connection=connection, kinds=kind, since=since, limit=limit, allowed_channels=scope
         )
-        return page.events
+        return await _event_infos(
+            rows, request=request, engine=engine, identity=identity, reveal=reveal
+        )
 
     @app.get("/connections/{name}/events", response_model=list[ConnectionEventInfo])
     async def list_connection_events_for(

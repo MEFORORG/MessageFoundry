@@ -1255,14 +1255,17 @@ class QueueStore(StoreLifecycle, Protocol):
         since: float | None = None,
         limit: int = 100,
         offset: int = 0,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         """Read connection events newest-first, optionally filtered by ``connection``, an ``kinds``
         allow-set, and a ``since`` timestamp. ``reason`` is decrypted at the boundary. The read accessor
         for the engine ``GET /events`` route + the console "Event Log" page; runs on the
         lockfree read path. ``limit`` is clamped server-side. ``offset`` skips that many rows of the
-        same filtered, scoped, ordered set (BACKLOG #2438); :meth:`count_connection_events` is its
-        total.
+        same filtered, scoped, ordered set (BACKLOG #2438); :meth:`connection_event_extent` is its
+        total. ``before_id`` keeps only rows whose ``id`` is below it. The order is by ``ts``, but an
+        ``id`` is assigned on insert, so pinning ``before_id`` holds a pager to one snapshot even
+        when a burst flush inserts an older ``ts`` among the rows already paged.
 
         ``allowed_channels`` applies the same per-channel RBAC scope as :meth:`list_dead` /
         :meth:`list_messages`: ``None`` = all channels (no restriction); a set restricts the read to
@@ -1272,16 +1275,19 @@ class QueueStore(StoreLifecycle, Protocol):
         an empty set matches nothing."""
         ...
 
-    async def count_connection_events(
+    async def connection_event_extent(
         self,
         *,
         connection: str | None = None,
         kinds: Sequence[str] | None = None,
         since: float | None = None,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
-    ) -> int:
-        """How many rows :meth:`list_connection_events` pages through for the same filters and the
-        same ``allowed_channels`` scope, with no ``limit`` or ``offset`` (BACKLOG #2438)."""
+    ) -> tuple[int, int]:
+        """``(total, newest id)`` of the set :meth:`list_connection_events` pages through for the
+        same filters, ``before_id`` and ``allowed_channels`` scope, with no ``limit`` or ``offset``
+        (BACKLOG #2438). The newest id is 0 for an empty set. One query, so the pager's snapshot
+        and its total come from one read."""
         ...
 
     # --- operator alert-state (resolvable alert instances, ADR 0044 #56) ------
@@ -1746,7 +1752,7 @@ class AuditStore(Protocol):
     async def count_audit(
         self,
         *,
-        limit: int | None = None,
+        limit: int | None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
@@ -1762,12 +1768,19 @@ class AuditStore(Protocol):
         ...
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100, offset: int = 0
-    ) -> Sequence[Row]: ...
+        self, username: str, *, limit: int = 100, offset: int = 0, before_id: int | None = None
+    ) -> Sequence[Row]:
+        """``username``'s own ``auth.*`` rows (``id``, ``ts``, ``action``, ``detail``), newest first.
+        ``offset`` pages them, and ``before_id`` keeps only rows whose ``id`` is below it, so a pager
+        that passes its first page's newest ``id`` plus one reads one snapshot while new rows
+        arrive (BACKLOG #2438)."""
+        ...
 
-    async def count_security_events_for_user(self, username: str) -> int:
-        """How many rows :meth:`security_events_for_user` pages through for ``username``, with no
-        ``limit`` or ``offset`` (BACKLOG #2438)."""
+    async def count_security_events_for_user(
+        self, username: str, *, before_id: int | None = None
+    ) -> int:
+        """How many rows :meth:`security_events_for_user` pages through for ``username`` and the
+        same ``before_id``, with no ``limit`` or ``offset`` (BACKLOG #2438)."""
         ...
 
     async def create_pending_approval(

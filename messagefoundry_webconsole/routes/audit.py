@@ -11,6 +11,7 @@ from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.validation import (
     AUDIT_EXPORT_DEFAULT_LIMIT,
     AUDIT_EXPORT_MAX_LIMIT,
+    PAGE_BIND_MAX,
     ActionFilter,
     ActorFilter,
     EpochSeconds,
@@ -43,9 +44,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui(Permission.AUDIT_READ)),
         limit: int = Query(_AUDIT_PAGE, ge=1, le=1000),
-        offset: int = Query(0, ge=0),
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        before_id: int | None = Query(None, ge=1, le=PAGE_BIND_MAX),
     ) -> HTMLResponse:
-        data = await admin.list_audit(service=service, _=identity, limit=limit, offset=offset)
+        data = await admin.list_audit(
+            service=service, _=identity, limit=limit, offset=offset, before_id=before_id
+        )
         return HTMLResponse(
             pages.audit_log(
                 data,
@@ -91,9 +95,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui()),
         limit: int = Query(_SECURITY_EVENTS_PAGE, ge=1, le=1000),
-        offset: int = Query(0, ge=0),
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        before_id: int | None = Query(None, ge=1, le=PAGE_BIND_MAX),
     ) -> HTMLResponse:
         data = await admin.my_security_events(
-            service=service, identity=identity, limit=limit, offset=offset
+            service=service, identity=identity, limit=limit, offset=offset, before_id=before_id
         )
         return HTMLResponse(pages.security_events(data))

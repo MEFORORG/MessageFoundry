@@ -234,6 +234,11 @@ ActionFilter = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTERN, 
 AUDIT_EXPORT_DEFAULT_LIMIT = 10_000
 AUDIT_EXPORT_MAX_LIMIT = 1_000_000
 
+#: The largest ``offset`` or ``before_id`` a paged list route accepts (BACKLOG #2438): a signed
+#: 64-bit integer, the widest value SQLite, asyncpg and pyodbc all bind. Pydantic accepts any int,
+#: so without this bound a huge offset reached the driver and came back as a 500.
+PAGE_BIND_MAX = 2**63 - 1
+
 #: An operator-chosen display label, such as a saved preset's name. Printable, bounded as it ships.
 DisplayLabel = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTERN, max_length=128)]
 

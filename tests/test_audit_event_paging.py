@@ -17,7 +17,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import TOTAL_COUNT_HEADER
+from messagefoundry.api.validation import PAGE_BIND_MAX
 from messagefoundry.auth import Role
 from messagefoundry.auth.audit_visibility import LOCKED_REFUSAL_DETAIL
 from messagefoundry.config.settings import EgressSettings
@@ -113,6 +113,53 @@ async def test_get_audit_pages_and_totals_what_the_caller_may_read(engine: Engin
         assert (await c.get("/audit", params={"offset": -1}, headers=aud)).status_code == 422
 
 
+async def test_get_audit_pages_do_not_repeat_the_grant_row_each_read_writes(
+    engine: Engine,
+) -> None:
+    """Every ``GET /audit`` writes its own ``auth.permission_granted`` row before it reads, so an
+    unpinned offset walk repeats one row per page. Passing back ``before_id`` walks one snapshot:
+    the pages join to the first page's listing with nothing repeated, and the total holds still."""
+    service = await _service(engine)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    await _seed_trail(engine)
+    async with _client(engine, service) as c:
+        root = _auth((await _login(c, "root")).json()["token"])
+        first = (await c.get("/audit", params={"limit": 3}, headers=root)).json()
+        pin, total = first["before_id"], first["total"]
+        assert isinstance(pin, int) and total > 6
+        seen = [(e["ts"], e["action"], e["detail"]) for e in first["entries"]]
+        offset = 3
+        while offset < total:
+            page = (
+                await c.get(
+                    "/audit",
+                    params={"limit": 3, "offset": offset, "before_id": pin},
+                    headers=root,
+                )
+            ).json()
+            assert page["total"] == total and page["before_id"] == pin
+            seen += [(e["ts"], e["action"], e["detail"]) for e in page["entries"]]
+            offset += 3
+        assert len(seen) == total
+        # The whole snapshot read at once is the same sequence the pages joined into.
+        once = (
+            await c.get("/audit", params={"limit": 1000, "before_id": pin}, headers=root)
+        ).json()
+        assert seen == [(e["ts"], e["action"], e["detail"]) for e in once["entries"]]
+
+
+@pytest.mark.parametrize("path", ["/audit", "/me/security-events", "/events"])
+async def test_an_offset_past_a_64_bit_bind_is_refused_not_a_500(engine: Engine, path: str) -> None:
+    service = await _service(engine)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "root")).json()["token"])
+        for name in ("offset", "before_id"):
+            too_big = await c.get(path, params={name: PAGE_BIND_MAX + 1}, headers=h)
+            assert too_big.status_code == 422, (name, too_big.text)
+        assert (await c.get(path, params={"offset": PAGE_BIND_MAX}, headers=h)).status_code == 200
+
+
 async def test_get_me_security_events_pages_with_a_total(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "alice", Role.VIEWER)
@@ -121,14 +168,23 @@ async def test_get_me_security_events_pages_with_a_total(engine: Engine) -> None
         for i in range(3):
             await engine.store.record_audit("auth.test_seed", actor="alice", detail=f'{{"n":{i}}}')
         whole = (await c.get("/me/security-events", headers=h)).json()
-        total = whole["total"]
-        assert total == len(whole["events"]) >= 3
-        second = (await c.get("/me/security-events?limit=1&offset=1", headers=h)).json()
+        total, pin = whole["total"], whole["before_id"]
+        assert total == len(whole["events"]) >= 3 and isinstance(pin, int)
+        # A row the caller writes after the first page stays out of the pinned pages.
+        await engine.store.record_audit("auth.test_seed", actor="alice", detail='{"n":"late"}')
+        second = (
+            await c.get(
+                "/me/security-events",
+                params={"limit": 1, "offset": 1, "before_id": pin},
+                headers=h,
+            )
+        ).json()
         assert second["total"] == total and second["offset"] == 1 and second["limit"] == 1
+        assert second["before_id"] == pin
         assert second["events"] == whole["events"][1:2]
 
 
-async def test_get_events_takes_an_offset_and_states_the_total_in_a_header(engine: Engine) -> None:
+async def test_get_events_pages_by_offset_under_a_snapshot_pin(engine: Engine) -> None:
     for i in range(5):
         await engine.store.record_connection_event(
             connection="IB_PAGE",
@@ -140,10 +196,23 @@ async def test_get_events_takes_an_offset_and_states_the_total_in_a_header(engin
         )
     app = create_app(engine, allow_no_auth=True)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        whole = await c.get("/events")
-        assert whole.headers[TOTAL_COUNT_HEADER] == "5"
-        page = await c.get("/events", params={"limit": 2, "offset": 2})
+        whole = (await c.get("/events")).json()
+        assert whole["total"] == 5 and len(whole["events"]) == 5
+        pin = whole["before_id"]
+        assert pin == max(e["id"] for e in whole["events"]) + 1
+        # A late event with an OLD ts lands mid-list, as a burst flush writes one. The pin keeps it
+        # off the later pages, so page two is still rows two and three of the first read.
+        await engine.store.record_connection_event(
+            connection="IB_PAGE",
+            transport="mllp",
+            direction="inbound",
+            kind="closed",
+            peer_host=None,
+            now=102.5,
+        )
+        page = await c.get("/events", params={"limit": 2, "offset": 2, "before_id": pin})
         assert page.status_code == 200
-        assert page.headers[TOTAL_COUNT_HEADER] == "5"
-        assert [e["id"] for e in page.json()] == [e["id"] for e in whole.json()][2:4]
+        body = page.json()
+        assert body["total"] == 5 and body["before_id"] == pin
+        assert [e["id"] for e in body["events"]] == [e["id"] for e in whole["events"]][2:4]
         assert (await c.get("/events", params={"offset": -1})).status_code == 422

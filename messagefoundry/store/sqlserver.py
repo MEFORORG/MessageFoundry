@@ -191,9 +191,11 @@ from messagefoundry.store.store import (
     WebAuthnCredential,
     _alert_summary,
     _append_channel_scope,
+    _connection_event_where,
     _dead_target_pairs,
     _opt_float,
     _qmark_cutoff_case,
+    _security_events_where,
     _session_cap_groups,
     _session_live_params,
     audit_append_refusal,
@@ -6469,12 +6471,13 @@ class SqlServerStore:
         since: float | None = None,
         limit: int = 100,
         offset: int = 0,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         # The same ``?`` WHERE text as SQLite, so the per-channel scope lives in one place.
-        clause, params = MessageStore._connection_event_where(
-            connection, kinds, since, allowed_channels
+        clause, params = _connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
         )
         # OFFSET/FETCH rather than TOP (?), because TOP cannot skip (BACKLOG #2438). Both binds
         # follow the WHERE values, in the order their placeholders appear.
@@ -6502,23 +6505,25 @@ class SqlServerStore:
             for r in rows
         ]
 
-    async def count_connection_events(
+    async def connection_event_extent(
         self,
         *,
         connection: str | None = None,
         kinds: Sequence[str] | None = None,
         since: float | None = None,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
-    ) -> int:
-        """The total :meth:`list_connection_events` pages through (BACKLOG #2438)."""
+    ) -> tuple[int, int]:
+        """The total :meth:`list_connection_events` pages through, and its newest ``id`` or 0
+        (BACKLOG #2438)."""
         # The same ``?`` WHERE text as SQLite, so the per-channel scope lives in one place.
-        clause, params = MessageStore._connection_event_where(
-            connection, kinds, since, allowed_channels
+        clause, params = _connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
         )
         row = await self._fetchone(
-            f"SELECT COUNT(*) AS n FROM connection_event{clause}", tuple(params)
+            f"SELECT COUNT(*) AS n, MAX(id) AS top FROM connection_event{clause}", tuple(params)
         )
-        return int(row["n"]) if row is not None else 0
+        return (int(row["n"]), int(row["top"] or 0)) if row is not None else (0, 0)
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
     # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
@@ -11227,7 +11232,7 @@ class SqlServerStore:
     async def count_audit(
         self,
         *,
-        limit: int | None = None,
+        limit: int | None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
@@ -11279,28 +11284,29 @@ class SqlServerStore:
         )
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100, offset: int = 0
+        self, username: str, *, limit: int = 100, offset: int = 0, before_id: int | None = None
     ) -> list[dict[str, Any]]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
         /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
         user only by email, when one can be sent. ``auth/notifications.py`` states the rule.
-        ``offset`` pages it (BACKLOG #2438). FETCH refuses a zero row count, so a zero limit
-        returns nothing here, as the ``TOP (0)`` it replaced did."""
+        ``offset`` pages it, and ``before_id`` pins the pages to one snapshot (BACKLOG #2438).
+        FETCH refuses a zero row count, so a zero limit returns nothing here, as the ``TOP (0)`` it
+        replaced did."""
         if limit < 1:
             return []
+        where, params = _security_events_where(username, before_id)
         return await self._fetchall(
-            "SELECT ts, action, detail FROM audit_log "
-            "WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC"
+            f"SELECT id, ts, action, detail FROM audit_log{where} ORDER BY id DESC"
             " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
-            (username, max(offset, 0), limit),
+            (*params, max(offset, 0), limit),
         )
 
-    async def count_security_events_for_user(self, username: str) -> int:
+    async def count_security_events_for_user(
+        self, username: str, *, before_id: int | None = None
+    ) -> int:
         """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
-        row = await self._fetchone(
-            "SELECT COUNT(*) AS n FROM audit_log WHERE actor = ? AND action LIKE 'auth.%'",
-            (username,),
-        )
+        where, params = _security_events_where(username, before_id)
+        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM audit_log{where}", tuple(params))
         return int(row["n"]) if row is not None else 0
 
     # --- dual-control approvals (ASVS 2.3.5) ---------------------------------

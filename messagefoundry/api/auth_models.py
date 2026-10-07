@@ -482,12 +482,18 @@ class AuditList(BaseModel):
     ``withheld`` is True when the caller's permissions leave a class of rows out of this listing
     and its total: the lock rows a reader without ``users:manage`` does not see (BACKLOG #1131,
     #2446). It is a fact about the CALLER, not about this page. It is True whether or not any such
-    row falls in the filtered range, so it cannot tell a reader whether a lock happened."""
+    row falls in the filtered range, so it cannot tell a reader whether a lock happened.
+
+    ``before_id`` is the snapshot the page was read under: only rows whose ``id`` is below it. A
+    reader passes it back with the next ``offset``, so rows written after the first page, such as
+    the grant row ``GET /audit`` itself writes, neither repeat a row across pages nor move the
+    total. It is None only when the listing was empty and there was nothing to pin."""
 
     entries: list[AuditEntry]
     total: int
     limit: int
     offset: int
+    before_id: int | None
     withheld: bool
 
 
@@ -522,9 +528,10 @@ class SecurityEventInfo(BaseModel):
 
 class SecurityEventsList(BaseModel):
     """One page of the caller's own security events (BACKLOG #2438), placed within ``total`` as
-    :class:`AuditList` places its page."""
+    :class:`AuditList` places its page, and pinned to ``before_id`` as that page is."""
 
     events: list[SecurityEventInfo]
     total: int
     limit: int
     offset: int
+    before_id: int | None

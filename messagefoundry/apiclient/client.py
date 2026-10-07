@@ -60,7 +60,7 @@ from messagefoundry.api.models import (
     ClusterStatus,
     ClusterStepdownResult,
     ConfigProvenance,
-    ConnectionEventInfo,
+    ConnectionEventList,
     ConnectionRow,
     DeadLetterList,
     DeadLetterReplayResult,
@@ -1346,18 +1346,26 @@ class EngineClient:
         kind: str | None = None,
         limit: int = 200,
         offset: int = 0,
+        before_id: int | None = None,
         reveal: int | None = None,
-    ) -> list[ConnectionEventInfo]:
+    ) -> ConnectionEventList:
         """The Corepoint-style connection/transport event log (#46), newest first. It needs only
         ``monitoring:read``, but it is not PHI-free: ``reason`` is scrubbed free text that
         ``docs/PHI.md`` section 2 gives a protection level. So ``reason`` is null without
         ``messages:view_summary`` and a fixed mask with it, and ``reveal`` names ONE event whose
-        reason comes back whole, an audited PHI read (BACKLOG #2443). ``offset`` pages it; the
-        route states the total in its ``X-Total-Count`` header (BACKLOG #2438)."""
+        reason comes back whole, an audited PHI read (BACKLOG #2443). ``offset`` pages it against
+        the result's ``total``; pass the result's ``before_id`` back with the next offset so the
+        pages read one snapshot (BACKLOG #2438)."""
         response = self._get(
-            "/events", connection=connection, kind=kind, limit=limit, offset=offset, reveal=reveal
+            "/events",
+            connection=connection,
+            kind=kind,
+            limit=limit,
+            offset=offset,
+            before_id=before_id,
+            reveal=reveal,
         )
-        return [ConnectionEventInfo.model_validate(e) for e in response.json()]
+        return ConnectionEventList.model_validate(response.json())
 
     def replay_dead_letters(
         self, *, channel_id: str | None = None, destination_name: str | None = None
@@ -1817,9 +1825,14 @@ class EngineClient:
     def delete_user(self, user_id: str) -> None:
         self._request("DELETE", f"/users/{_seg(user_id)}")
 
-    def audit(self, *, limit: int = 100, offset: int = 0) -> AuditList:
-        """One page of the audit trail; ``total`` on the result places it (BACKLOG #2438)."""
-        return _decode(self._get("/audit", limit=limit, offset=offset), AuditList)
+    def audit(
+        self, *, limit: int = 100, offset: int = 0, before_id: int | None = None
+    ) -> AuditList:
+        """One page of the audit trail; ``total`` on the result places it, and its ``before_id``
+        passed back with the next offset keeps the pages on one snapshot (BACKLOG #2438)."""
+        return _decode(
+            self._get("/audit", limit=limit, offset=offset, before_id=before_id), AuditList
+        )
 
     def ad_group_map(self) -> AdGroupMap:
         return _decode(self._get("/ad-group-map"), AdGroupMap)

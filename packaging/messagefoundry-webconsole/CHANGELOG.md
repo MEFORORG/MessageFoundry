@@ -25,10 +25,12 @@ this line.**
 - **The audit, security-event and event-log pages page past their first window.** `/ui/audit`,
   `/ui/security-events` and `/ui/events` take `limit` and `offset` and draw the shared pager, so
   each says which rows of how many it shows, with Previous and Next links. They used to show only
-  the newest rows, with no way to reach older ones from the console. The event log's pager and its
-  reason reveals carry the page's filters and position. Seam change: `AuditList` and
-  `SecurityEventsList` carry `total`, `limit` and `offset`, and `CoreHandlers` gains
-  `connection_event_page`. (BACKLOG #2438)
+  the newest rows, with no way to reach older ones from the console. Each pager link carries the
+  snapshot the first page was read under, so rows written between clicks do not shift the pages.
+  The event log's pager and its reason reveals carry the page's filters, position and snapshot, so
+  a reveal reads the window it was clicked on. Seam change: `AuditList`, `SecurityEventsList` and
+  the new `ConnectionEventList` carry `total`, `limit`, `offset` and `before_id`, and
+  `CoreHandlers` gains `connection_event_page`. (BACKLOG #2438)
 - **The audit page exports, and says when rows are withheld.** `/ui/audit` links to the new
   `/ui/audit/export` for a holder of `audit:export`. That route streams the engine's audit CSV from
   the console session, so an auditor who signs in only through OIDC, and so holds no bearer token,

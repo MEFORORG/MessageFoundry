@@ -76,6 +76,13 @@ async def check_audit_paging(store: Any, tag: str) -> None:
     # The capped count the export uses still caps.
     assert await store.count_audit(actor=who, exclude=_EXCLUDE, limit=4) == 4
 
+    # Pinned below the first page's newest id, a page and the total ignore a row written later.
+    pin = int(whole[0]["id"]) + 1
+    await store.record_audit("auth.mfa_failed", actor=who, detail=None)
+    assert await store.count_audit(actor=who, exclude=_EXCLUDE, limit=None, before_id=pin) == 7
+    pinned = await store.list_audit(actor=who, exclude=_EXCLUDE, limit=2, offset=2, before_id=pin)
+    assert [r["id"] for r in pinned] == [r["id"] for r in whole[2:4]]
+
 
 async def check_security_events_paging(store: Any, tag: str) -> None:
     """``security_events_for_user`` with ``offset`` against ``count_security_events_for_user``."""
@@ -97,6 +104,15 @@ async def check_security_events_paging(store: Any, tag: str) -> None:
         walked = await _walk(read, page)
         assert [r["detail"] for r in walked] == [r["detail"] for r in whole], page
 
+    # The snapshot pin: rows written after the first page stay out of the later pages and the
+    # total, so a walk that started before them neither repeats a row nor moves its count.
+    pin = int(whole[0]["id"]) + 1
+    await store.record_audit("auth.login_success", actor=who, detail='{"n": "late"}')
+    assert await store.count_security_events_for_user(who, before_id=pin) == 5
+    assert await store.count_security_events_for_user(who) == 6
+    pinned = await store.security_events_for_user(who, limit=2, offset=2, before_id=pin)
+    assert [r["detail"] for r in pinned] == [r["detail"] for r in whole[2:4]]
+
 
 def _event(connection: str, direction: str, kind: str, now: float) -> dict[str, Any]:
     return {
@@ -112,7 +128,7 @@ def _event(connection: str, direction: str, kind: str, now: float) -> dict[str, 
 
 
 async def check_connection_event_paging(store: Any, tag: str) -> None:
-    """``list_connection_events`` with ``offset`` against ``count_connection_events``, filtered by
+    """``list_connection_events`` with ``offset`` against ``connection_event_extent``, filtered by
     kind and scoped to a channel set."""
     mine, theirs, out = f"IB_{tag}_A", f"IB_{tag}_B", f"OB_{tag}_C"
     # Far in the future, so ``since`` isolates these rows from any a shared server database holds.
@@ -129,19 +145,19 @@ async def check_connection_event_paging(store: Any, tag: str) -> None:
     # outbound one, and the total counts the same set.
     scoped = await store.list_connection_events(since=since, limit=100, allowed_channels=[mine])
     assert len(scoped) == 9 and {e.connection for e in scoped} == {mine}
-    assert await store.count_connection_events(since=since, allowed_channels=[mine]) == 9
-    assert await store.count_connection_events(since=since, allowed_channels=None) == 19
+    total, newest = await store.connection_event_extent(since=since, allowed_channels=[mine])
+    assert total == 9 and newest == max(e.id for e in scoped)
+    assert (await store.connection_event_extent(since=since, allowed_channels=None))[0] == 19
 
     filtered = await store.list_connection_events(
         connection=mine, kinds=["established"], since=since, limit=100, allowed_channels=None
     )
     assert len(filtered) == 6
     assert (
-        await store.count_connection_events(
+        await store.connection_event_extent(
             connection=mine, kinds=["established"], since=since, allowed_channels=None
         )
-        == 6
-    )
+    )[0] == 6
 
     async def read(*, limit: int, offset: int) -> Any:
         return await store.list_connection_events(
@@ -152,3 +168,19 @@ async def check_connection_event_paging(store: Any, tag: str) -> None:
         walked = await _walk(read, page)
         assert [e.id for e in walked] == [e.id for e in scoped], page
     assert await read(limit=5, offset=9) == []
+
+    # The snapshot pin holds even against a late event whose ts lands mid-list, the shape a burst
+    # flush writes: the order is by ts, but the pin is by id, and a later insert has a larger id.
+    pin = newest + 1
+    await store.record_connection_events([_event(mine, "inbound", "closed", base + 4.25)])
+    assert (
+        await store.connection_event_extent(since=since, before_id=pin, allowed_channels=[mine])
+    ) == (9, newest)
+    pinned = await store.list_connection_events(
+        since=since, limit=3, offset=3, before_id=pin, allowed_channels=[mine]
+    )
+    assert [e.id for e in pinned] == [e.id for e in scoped[3:6]]
+    # The empty set reports no newest id, so a pager has nothing to pin.
+    assert await store.connection_event_extent(
+        connection=f"IB_{tag}_none", since=since, allowed_channels=None
+    ) == (0, 0)

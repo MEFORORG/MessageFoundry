@@ -98,6 +98,11 @@ def _pager(
     and not of this builder, and a zero would 500 the whole page on the division below.
     """
     limit = max(limit, 1)
+    # The total may be a second read beside the rows, and a retention purge between the two can
+    # shrink it below what this page plainly shows. Floor it, or "201-400 of 350" would hide Next.
+    # Only a page WITH rows proves a floor: an empty window past the end proves nothing.
+    if shown:
+        total = max(total, offset + shown)
     active = {k: v for k, v in (filters or {}).items() if v}
 
     def _link(label: str, target: int) -> Markup:

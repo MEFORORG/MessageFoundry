@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import ConnectionEventList
+from messagefoundry.api.validation import PAGE_BIND_MAX
 from messagefoundry.auth import Identity, Permission
 
 from .. import pages
@@ -121,7 +122,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         connection: str | None = Query(None, max_length=256),
         kind: str | None = Query(None, max_length=64),
         limit: int = Query(EVENTS_PAGE, ge=1, le=1000),
-        offset: int = Query(0, ge=0),
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        before_id: int | None = Query(None, ge=1, le=PAGE_BIND_MAX),
     ) -> HTMLResponse:
         return await _events_page(
             request,
@@ -131,6 +133,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             kind=kind,
             limit=limit,
             offset=offset,
+            before_id=before_id,
             reveal=None,
         )
 
@@ -148,7 +151,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         connection: str | None = Query(None, max_length=256),
         kind: str | None = Query(None, max_length=64),
         limit: int = Query(EVENTS_PAGE, ge=1, le=1000),
-        offset: int = Query(0, ge=0),
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        before_id: int | None = Query(None, ge=1, le=PAGE_BIND_MAX),
     ) -> HTMLResponse:
         return await _events_page(
             request,
@@ -158,6 +162,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             kind=kind,
             limit=limit,
             offset=offset,
+            before_id=before_id,
             reveal=event_id,
         )
 
@@ -170,6 +175,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         kind: str | None,
         limit: int,
         offset: int,
+        before_id: int | None,
         reveal: int | None,
     ) -> HTMLResponse:
         # L6b (#75 parity): expose the JSON handler's event-kind filter (a single kind from
@@ -186,7 +192,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if refusal is not None:
             # No rows: the filter was never applied, and a table under a refusal banner would read
             # as the result of the filter the operator typed.
-            empty = ConnectionEventList(total=0, limit=limit, offset=offset, events=[])
+            empty = ConnectionEventList(
+                total=0, limit=limit, offset=offset, before_id=before_id, events=[]
+            )
             return HTMLResponse(
                 pages.events(empty, connection=conn, kind=evt_kind, error=refusal), status_code=400
             )
@@ -202,6 +210,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             since=None,
             limit=limit,
             offset=offset,
+            before_id=before_id,
             request=request,
             reveal=reveal,
         )

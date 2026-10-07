@@ -408,12 +408,14 @@ def events(
     headers = ["When", "Connection", "Transport", "Dir", "Kind", "Peer", "Reason"]
     rows = data.events
     filters = {"connection": connection, "kind": kind}
+    if data.before_id is not None:
+        filters["before_id"] = str(data.before_id)
     # The filters ride the reveal link as query values, never as path segments, so urlencode
     # escapes them; a blank one is left off, as the filter form's own GET would send it. The page
-    # position rides it too, or a reveal from page two would re-read page one and miss its event.
+    # position and its snapshot pin ride it too, always: a reveal that dropped either would read
+    # a different window, miss its event, and still charge and audit the read (BACKLOG #2438).
     query: dict[str, object] = {k: v for k, v in filters.items() if v}
-    if data.offset:
-        query.update(limit=data.limit, offset=data.offset)
+    query.update(limit=data.limit, offset=data.offset)
     back = urlencode(query)
     suffix = f"?{back}" if back else ""
     body = [

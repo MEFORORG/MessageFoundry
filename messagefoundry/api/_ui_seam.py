@@ -312,12 +312,17 @@ from typing import Any
 #: ``AdminHandlers`` gained the required ``export_audit``, which the new ``/ui/audit/export``
 #: streams from the console session. The digest moved because both grew.
 #:
+#: BACKLOG #2438, the review's repair: the three list models gained the required ``before_id``,
+#: the snapshot a page was read under, and ``list_audit``, ``my_security_events`` and
+#: ``connection_event_page`` take it as a keyword. Without it, the grant row each audit read
+#: writes made every page repeat a row. The digest moved because the DTO surface grew.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "938fb5a9d0e3045a"
+ENGINE_UI_SEAM: str = "2677d024d9417ddb"
 
 
 @dataclass(frozen=True, slots=True)

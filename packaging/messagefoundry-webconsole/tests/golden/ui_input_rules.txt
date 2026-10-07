@@ -1,8 +1,8 @@
 GET /ui/account	m	query	-	-
 GET /ui/account/sessions	m	query	-	-
 GET /ui/approvals	m	query	-	-
-GET /ui/audit/export	action	query	-	-
-GET /ui/audit/export	actor	query	control id	422
+GET /ui/audit/export	action	query	action filter	422
+GET /ui/audit/export	actor	query	actor filter|control id	422
 GET /ui/cluster	m	query	-	-
 GET /ui/connection/{name}	name	path	-	-
 GET /ui/connection/{name}/events/{event_id}/reason	name	path	-	-

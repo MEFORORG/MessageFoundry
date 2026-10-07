@@ -5141,10 +5141,13 @@ class PostgresStore:
         since: float | None = None,
         limit: int = 100,
         offset: int = 0,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
-        clause, params = self._connection_event_where(connection, kinds, since, allowed_channels)
+        clause, params = self._connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
         params += [limit, max(offset, 0)]
         rows = await self._pool.fetch(
             "SELECT id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
@@ -5170,28 +5173,35 @@ class PostgresStore:
             for r in rows
         ]
 
-    async def count_connection_events(
+    async def connection_event_extent(
         self,
         *,
         connection: str | None = None,
         kinds: Sequence[str] | None = None,
         since: float | None = None,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
-    ) -> int:
-        """The total :meth:`list_connection_events` pages through (BACKLOG #2438)."""
-        clause, params = self._connection_event_where(connection, kinds, since, allowed_channels)
-        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM connection_event{clause}", *params)
-        return int(row["n"]) if row is not None else 0
+    ) -> tuple[int, int]:
+        """The total :meth:`list_connection_events` pages through, and its newest ``id`` or 0
+        (BACKLOG #2438)."""
+        clause, params = self._connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        row = await self._fetchone(
+            f"SELECT COUNT(*) AS n, MAX(id) AS top FROM connection_event{clause}", *params
+        )
+        return (int(row["n"]), int(row["top"] or 0)) if row is not None else (0, 0)
 
     @staticmethod
     def _connection_event_where(
         connection: str | None,
         kinds: Sequence[str] | None,
         since: float | None,
+        before_id: int | None,
         allowed_channels: Sequence[str] | None,
     ) -> tuple[str, list[Any]]:
         """The ``WHERE`` text and its bound ``$N`` values shared by :meth:`list_connection_events`
-        and :meth:`count_connection_events`, so a page and its total read the same set."""
+        and :meth:`connection_event_extent`, so a page and its total read the same set."""
         where: list[str] = []
         params: list[Any] = []
         if connection is not None:
@@ -5204,6 +5214,9 @@ class PostgresStore:
         if since is not None:
             params.append(since)
             where.append(f"ts>=${len(params)}")
+        if before_id is not None:
+            params.append(before_id)
+            where.append(f"id<${len(params)}")
         # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
         # outbound row (which spans channels), matching the SQLite path and the metadata/purge boundary.
         if allowed_channels is not None:
@@ -7326,7 +7339,7 @@ class PostgresStore:
     async def count_audit(
         self,
         *,
-        limit: int | None = None,
+        limit: int | None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
@@ -7377,26 +7390,28 @@ class PostgresStore:
         return [dict(r) for r in rows]
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100, offset: int = 0
+        self, username: str, *, limit: int = 100, offset: int = 0, before_id: int | None = None
     ) -> Sequence[Row]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
         /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
         user only by email, when one can be sent. ``auth/notifications.py`` states the rule.
-        ``offset`` pages it (BACKLOG #2438)."""
+        ``offset`` pages it, and ``before_id`` pins the pages to one snapshot (BACKLOG #2438)."""
+        where, params = _security_events_where_pg(username, before_id)
+        n = len(params)
         return await self._fetchall(
-            "SELECT ts, action, detail FROM audit_log "
-            "WHERE actor = $1 AND action LIKE 'auth.%' ORDER BY id DESC LIMIT $2 OFFSET $3",
-            username,
+            f"SELECT id, ts, action, detail FROM audit_log{where} ORDER BY id DESC"
+            f" LIMIT ${n + 1} OFFSET ${n + 2}",
+            *params,
             limit,
             max(offset, 0),
         )
 
-    async def count_security_events_for_user(self, username: str) -> int:
+    async def count_security_events_for_user(
+        self, username: str, *, before_id: int | None = None
+    ) -> int:
         """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
-        row = await self._fetchone(
-            "SELECT COUNT(*) AS n FROM audit_log WHERE actor = $1 AND action LIKE 'auth.%'",
-            username,
-        )
+        where, params = _security_events_where_pg(username, before_id)
+        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM audit_log{where}", *params)
         return int(row["n"]) if row is not None else 0
 
     # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
@@ -9335,6 +9350,17 @@ def _pg_cutoff_case(
     )  # ELSE — connections with no override use the global window
     sql = f"(CASE {column} {' '.join(whens)} ELSE ${idx}::double precision END)"
     return sql, params, idx + 1
+
+
+def _security_events_where_pg(username: str, before_id: int | None) -> tuple[str, list[Any]]:
+    """The ``$N`` ``WHERE`` text and values for one user's security-event page and its total
+    (BACKLOG #2438), shared so the two count one set. The SQLite builder states the rule."""
+    params: list[Any] = [username]
+    clause = " WHERE actor = $1 AND action LIKE 'auth.%'"
+    if before_id is not None:
+        params.append(before_id)
+        clause += " AND id < $2"
+    return clause, params
 
 
 def _append_channel_scope_pg(

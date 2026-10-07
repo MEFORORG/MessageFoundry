@@ -340,7 +340,13 @@ async def test_the_audit_and_security_event_pages_page_against_a_total(engine: E
             assert ">Next<" in first.text and ">Previous<" not in first.text, path
             href = _next_href(first.text)
             assert href.startswith(f"{path}?"), path
-            assert _query(href) == {"limit": "3", "offset": "3"}, path
+            query = _query(href)
+            # The snapshot pin rides the link, so the rows the console writes between clicks
+            # (its own grant rows among them) neither shift the window nor move the total.
+            pin = query.pop("before_id")
+            assert pin.isdigit(), path
+            assert query == {"limit": "3", "offset": "3"}, path
+            await service.store.record_audit("auth.test_seed", actor="op", detail='{"n": "late"}')
             second = await c.get(href)
             assert second.status_code == 200, second.text
             assert _window(second.text, noun) == (4, 6, total), path
@@ -382,7 +388,12 @@ async def test_the_event_log_pager_and_its_reveals_carry_the_filters_and_positio
         assert first.status_code == 200, first.text
         assert "1-2 of 3 event(s)" in first.text
         href = _next_href(first.text)
-        assert _query(href) == {"connection": "IB_A", "kind": "closed", "limit": "2", "offset": "2"}
+        query = _query(href)
+        pin = query.pop("before_id")
+        assert pin.isdigit()
+        assert query == {"connection": "IB_A", "kind": "closed", "limit": "2", "offset": "2"}
+        # A late event with an older ts lands mid-list; the pin keeps it off page two.
+        await ev("IB_A", "closed", 100.5, reason="eof")
         last = await c.get(href)
         assert last.status_code == 200, last.text
         assert "3-3 of 3 event(s)" in last.text
@@ -394,4 +405,5 @@ async def test_the_event_log_pager_and_its_reveals_carry_the_filters_and_positio
             "kind": "closed",
             "limit": "2",
             "offset": "2",
+            "before_id": pin,
         }

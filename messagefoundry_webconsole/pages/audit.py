@@ -49,6 +49,12 @@ ADMIN_CHANGES_NOTE = (
 )
 
 
+def _pin(before_id: int | None) -> dict[str, str]:
+    """The snapshot pin a pager link carries (BACKLOG #2438), so Next and Previous read the set
+    this page was read from while new rows arrive at the head of the trail."""
+    return {"before_id": str(before_id)} if before_id is not None else {}
+
+
 def _export_note(export_limit: int | None) -> Markup:
     """How to export, for a reader who may (BACKLOG #2446), or nothing for one who may not.
 
@@ -97,6 +103,7 @@ def audit_log(data: AuditList, *, export_limit: int | None = None) -> Markup:
             offset=data.offset,
             shown=len(data.entries),
             noun="entry(s)",
+            filters=_pin(data.before_id),
         ),
         active="audit",
     )
@@ -132,6 +139,7 @@ def security_events(data: SecurityEventsList) -> Markup:
             offset=data.offset,
             shown=len(data.events),
             noun="event(s)",
+            filters=_pin(data.before_id),
         ),
         active="security-events",
     )
