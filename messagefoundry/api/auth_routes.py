@@ -125,6 +125,7 @@ from messagefoundry.auth.service import (
     FederatedBindingChanged,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
+    LastAdministratorRefused,
     NotifyEmailAlreadySet,
     TemporaryPasswordUnavailable,
     UsernameTaken,
@@ -1106,20 +1107,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         current = await service.store.get_user(user_id)
         if current is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        if body.disabled and user_id == identity.user_id:
+        # The stored id, not the path's spelling: a store whose id column compares case-insensitively
+        # (SQL Server) finds the row from another spelling, and the console seam passes a plain str.
+        if body.disabled and current.id == identity.user_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot disable your own account")
-        # SEC-015: disabling is a lock-out path equivalent to stripping the admin role — apply the
-        # same last-admin guard the roles endpoint enforces, so an admin can't disable every other
-        # admin and erase the dual-admin safeguard. (is_last_enabled_admin only fires when the target
-        # IS the sole enabled admin, so this no-ops for non-admins and non-last admins.)
-        if (
-            "disabled" in body.model_fields_set
-            and body.disabled
-            and await service.is_last_enabled_admin(user_id)
-        ):
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "cannot disable the last administrator"
-            )
+        # SEC-015: disabling is a lock-out path equivalent to stripping the admin role, so it carries
+        # the same last-admin guard. The guard is inside service.update_user now, in one store
+        # transaction with the write (vault BACKLOG #2779); LastAdministratorRefused is mapped below.
         # PATCH is partial: only fields actually present in the body should change. Omitted
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
@@ -1147,6 +1141,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # Raised before any write, so this refuses the whole save. The message names the rule
             # and never echoes the value.
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except LastAdministratorRefused as exc:
+            # Ordinarily raised before any write. When a concurrent removal got past the service's
+            # early read, the profile edit has landed (audited, with disable_refused) and only the
+            # disable was refused; see AuthService.update_user.
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="updated")
 
     @app.delete("/users/{user_id}", response_model=SimpleMessage)
@@ -1155,15 +1154,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        if user_id == identity.user_id:
+        target = await service.store.get_user(user_id)
+        # Compared on the stored id as well as the path's, for the reason update_user gives.
+        if user_id == identity.user_id or (target is not None and target.id == identity.user_id):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot delete your own account")
-        if await service.store.get_user(user_id) is None:
+        if target is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        # SEC-015: deleting the last enabled admin is the same lock-out path — guard it for symmetry
-        # with the roles/disable endpoints (no-ops unless the target is the sole enabled admin).
-        if await service.is_last_enabled_admin(user_id):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot delete the last administrator")
-        await service.delete_user(user_id, actor=identity.username)
+        # SEC-015: deleting the last enabled admin is the same lock-out path. service.delete_user
+        # checks and deletes in one store transaction (vault BACKLOG #2779).
+        try:
+            await service.delete_user(user_id, actor=identity.username)
+        except LastAdministratorRefused as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="deleted")
 
     @app.delete("/users/{user_id}/sessions", response_model=SimpleMessage)
@@ -1193,17 +1195,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD users get roles from the AD-group map"
             )
-        if Role.ADMINISTRATOR.value not in body.roles and await service.is_last_enabled_admin(
-            user_id
-        ):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot remove the last administrator")
         # BACKLOG #315: promotion mints an approver exactly as creation does, so it pages too. Only a
         # GRANT pages: re-saving an existing Administrator's roles changes nothing.
         granted = (
             Role.ADMINISTRATOR.value in body.roles
             and Role.ADMINISTRATOR.value not in await service.store.get_user_role_ids(user_id)
         )
-        await service.set_roles(user_id, body.roles, actor=identity.username)
+        try:
+            # The last-administrator guard is inside, in one store transaction with the role write
+            # (vault BACKLOG #2779).
+            await service.set_roles(user_id, body.roles, actor=identity.username)
+        except LastAdministratorRefused as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         if granted:
             _alert_administrator_granted(
                 app, f"user:{user.username}", via="roles_changed", granted_by=identity.username

@@ -43,6 +43,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.redaction import safe_name
 
 if TYPE_CHECKING:
     from messagefoundry.auth.ldap_tls import NarrowedTls
@@ -122,6 +123,10 @@ class DirectoryAnswer(Enum):
     #: like a disabled account on every sign-in path (BACKLOG #1639); told apart here so the
     #: reconciler can hold a wave of them (ADR 0195) instead of revoking it.
     UNDETERMINED = "undetermined"
+    #: The search matched more than one entry, so none is provably the account asked about (vault
+    #: BACKLOG #2778). Refused on every sign-in path; the reconciler reads it as absent, and the
+    #: step-up re-bind audits it as ``not_in_directory`` and does not count it.
+    AMBIGUOUS = "ambiguous"
 
 
 @dataclass(frozen=True)
@@ -313,7 +318,8 @@ def _principal_from(info: dict[str, Any], user_dn: str, groups: frozenset[str]) 
 #: session reconciler probes it once per user per pass (``ad_session_recheck_seconds``, 300 by
 #: default), so an unreadable attribute would otherwise emit one identical line per user every five
 #: minutes. ``_probe_principal`` logs its own failure at DEBUG for exactly that reason; this keeps the
-#: louder level and pays for it by saying each thing once.
+#: louder level and pays for it by saying each thing once. Since vault BACKLOG #2778 it also holds
+#: ``ambiguous:<label>`` keys, one per name that matched more than one entry.
 _object_guid_shapes_warned: set[str] = set()
 
 
@@ -821,8 +827,9 @@ class LdapAuthenticator:
         fallback_username: str,
         expected_object_id: str | None = None,
     ) -> _Lookup:
-        """Run one user search and extract the entry. ``info`` is ``None`` for no match, a disabled
-        account or an undetermined one, and ``answer`` says which (ADR 0195 rule item 2).
+        """Run one user search and extract the entry. ``info`` is ``None`` for no match, more than
+        one match (``AMBIGUOUS``, vault BACKLOG #2778), a disabled account or an undetermined one,
+        and ``answer`` says which (ADR 0195 rule item 2).
 
         ``expected_object_id``, the canonical id an id-keyed search asked for, makes an entry that
         does not read it back a no-match, before its account state is read (BACKLOG #2027). See
@@ -858,6 +865,22 @@ class LdapAuthenticator:
         )
         if not conn.entries:
             return _Lookup(DirectoryAnswer.NOT_FOUND)
+        if len(conn.entries) > 1:
+            # Vault BACKLOG #2778. The name filter matches sAMAccountName OR userPrincipalName, and
+            # a directory may legally give one account a UPN prefix equal to another's
+            # sAMAccountName. Taking entries[0] would let the server's result order pick which
+            # account signs in. No entry is provably the one asked about, so none is. Logged with
+            # a label for the name and the count only, once per name: the attempts repeat at
+            # sign-in rate, and the set of names stays bounded by the collisions the directory holds.
+            label = safe_name(fallback_username)
+            _warn_once(
+                f"ambiguous:{label}",
+                "AD user search for %s matched %d directory entries; refusing it as ambiguous "
+                "(logged once per name)",
+                label,
+                len(conn.entries),
+            )
+            return _Lookup(DirectoryAnswer.AMBIGUOUS)
         e = conn.entries[0]
         own: str | None = None
         if expected_object_id is not None:
