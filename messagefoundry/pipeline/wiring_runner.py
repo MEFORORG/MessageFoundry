@@ -2198,6 +2198,8 @@ class RegistryRunner:
     async def _close_lookup_executor(executor: DatabaseLookupExecutor) -> None:
         try:
             await executor.aclose()
+        # Broad on purpose: this runs as a detached task whose exception nothing else retrieves,
+        # so anything not logged here would surface only as "exception was never retrieved".
         except Exception:
             log.exception("could not close a retired lookup executor's pools")
 
@@ -4975,14 +4977,26 @@ class RegistryRunner:
         # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop.
         # No-op unless [sandbox].mode=subprocess actually spawned any.
         await self._close_sandbox_sessions()
+        if self._lookup_close_tasks:
+            # A reload's retired executor may still be closing. Waited on, never cancelled: a
+            # cancelled close leaves its pools open, and the set keeps an abandoned one alive.
+            # asyncio.wait, unlike gather, does not cancel them if this teardown is itself
+            # cancelled. Under DEMOTE the wait is bounded by the budget and a timeout continues the
+            # sequence (ADR 0157: every DEMOTE bound is absorbed where it is set). Before the live
+            # close below, so a raise there cannot skip it.
+            _done, still = await asyncio.wait(
+                self._lookup_close_tasks, timeout=budget if demote else None
+            )
+            if still:
+                log.warning(
+                    "teardown: %d retired lookup executor close(s) still pending after %.1fs; "
+                    "left running",
+                    len(still),
+                    budget,
+                )
         if self._lookup_executor is not None:
             await self._lookup_executor.aclose()
             self._lookup_executor = None
-        if self._lookup_close_tasks:
-            # A reload's retired executor may still be closing. Waited on, never cancelled: a
-            # cancelled close leaves its pools open. asyncio.wait, unlike gather, does not cancel
-            # them if this teardown is itself cancelled.
-            await asyncio.wait(self._lookup_close_tasks)
         self._workers.clear()
         self._router_workers.clear()
         self._transform_workers.clear()
@@ -6024,7 +6038,9 @@ class RegistryRunner:
                 # 2. Swap the registry and restart inbound listeners from it (intake back up first).
                 self.registry = new_registry
                 # Rebuild the live-lookup executor from the new graph, with no await since the swap, so
-                # no running worker sees the new graph with the old graph's lookups or inline cache.
+                # no worker that reads them after the swap pairs the new graph with the old graph's
+                # lookups or inline cache. (A worker that read _inline_ok BEFORE the swap and then
+                # awaited still pairs it with the new registry; that race predates this ordering.)
                 # build_check already validated the new specs, so this can't fail on a bad spec here.
                 # The OLD executor is closed only once the swap commits, below the except, since a
                 # rollback puts it back, pools and all.
@@ -6163,9 +6179,10 @@ class RegistryRunner:
                     )
                 self.registry = old
                 # The lookup executors and ADR 0057 inline eligibility follow the registry back, before
-                # the first await below, so no worker sees the restored graph with the refused graph's
-                # lookups (a db_lookup naming a connection only the old graph declares would fail), or
-                # takes or skips the inline path for the wrong graph. A no-op if step 2 never got there.
+                # the first await below, so no worker that reads them after the restore pairs the old
+                # graph with the refused graph's lookups (a db_lookup naming a connection only the old
+                # graph declares would fail) or takes or skips the inline path for the wrong graph. A
+                # no-op if step 2 never got there.
                 if self._lookup_executor is not old_lookup_executor:
                     self._retire_lookup_executor(self._lookup_executor)
                 self._lookup_executor = old_lookup_executor

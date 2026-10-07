@@ -32,7 +32,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, TeardownReason
 from messagefoundry.store import MessageStore
 from messagefoundry.transports.database import DatabaseLookupExecutor
 
@@ -128,7 +128,11 @@ async def _failed_reload(
             await runner.reload(new)
         return
     task = asyncio.create_task(runner.reload(new))
-    await asyncio.wait_for(entered.wait(), 10)
+    reached = asyncio.create_task(entered.wait())
+    # FIRST_COMPLETED, so a reload that fails before step 3 surfaces here instead of timing out.
+    await asyncio.wait({task, reached}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+    reached.cancel()
+    assert entered.is_set(), task.exception() if task.done() else "step 3 not reached within 10s"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -184,6 +188,35 @@ async def test_a_rolled_back_reload_drops_the_refused_graphs_lookup_executors(
         assert runner._inline_ok["file_in"] is True
         # The executor built for the refused graph is closed by the rollback, not leaked.
         assert [ex.connections for ex in closed] == [frozenset({"clarity"})]
+    finally:
+        await runner.stop()
+
+
+async def test_the_rollback_restores_before_its_first_await(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The rollback's first await is _close_sandbox_sessions. Whatever runs during it, and every
+    # await after it, must already see the old graph's executors and inline eligibility.
+    runner = await _runner(store, _registry(tmp_path, with_lookups=True))
+    try:
+        old_db, old_fhir = runner._lookup_executor, runner._fhir_lookup_executor
+        old_inline = dict(runner._inline_ok)
+        seen: list[tuple[object, object, dict[str, bool]]] = []
+        real_close = runner._close_sandbox_sessions
+
+        async def recording_close() -> None:
+            seen.append(
+                (runner._lookup_executor, runner._fhir_lookup_executor, dict(runner._inline_ok))
+            )
+            await real_close()
+
+        monkeypatch.setattr(runner, "_close_sandbox_sessions", recording_close)
+        await _failed_reload(runner, _registry(tmp_path, with_lookups=False), "raise", monkeypatch)
+        await _settle_closes(runner)
+
+        # [0] is the forward step 2 call, made before the rebuild; [1] is the rollback's.
+        assert len(seen) == 2
+        assert seen[1] == (old_db, old_fhir, old_inline)
     finally:
         await runner.stop()
 
@@ -254,31 +287,74 @@ async def test_a_slow_close_of_the_old_executor_neither_holds_the_reload_nor_lea
     # reload returns anyway (no cancellation can land in the close and make it look failed), and
     # stop() waits for the close rather than abandoning the pools.
     runner = await _runner(store, _registry(tmp_path, with_lookups=True))
-    old_db = runner._lookup_executor
-    assert old_db is not None
     release = asyncio.Event()
-    finished: list[DatabaseLookupExecutor] = []
-    real = DatabaseLookupExecutor.aclose
-
-    async def slow_aclose(self: DatabaseLookupExecutor) -> None:
-        if self is old_db:
-            await release.wait()
-        await real(self)
-        finished.append(self)
-
-    monkeypatch.setattr(DatabaseLookupExecutor, "aclose", slow_aclose)
     try:
+        old_db = runner._lookup_executor
+        assert old_db is not None
+        finished: list[DatabaseLookupExecutor] = []
+        real = DatabaseLookupExecutor.aclose
+
+        async def slow_aclose(self: DatabaseLookupExecutor) -> None:
+            if self is old_db:
+                await release.wait()
+            await real(self)
+            finished.append(self)
+
+        monkeypatch.setattr(DatabaseLookupExecutor, "aclose", slow_aclose)
         new = _registry(tmp_path, with_lookups=True)
         await asyncio.wait_for(runner.reload(new), 10)
         assert runner.registry is new
         assert old_db not in finished
 
+        # Teardown's last await before the retired-close wait is _close_sandbox_sessions, so once
+        # it has returned the stop is at (or past) that wait. No wall clock: spin the loop instead.
+        reached = asyncio.Event()
+        real_close = runner._close_sandbox_sessions
+
+        async def marking_close() -> None:
+            await real_close()
+            reached.set()
+
+        monkeypatch.setattr(runner, "_close_sandbox_sessions", marking_close)
         stopping = asyncio.create_task(runner.stop())
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(reached.wait(), 10)
+        for _ in range(50):
+            await asyncio.sleep(0)
         assert not stopping.done()
         release.set()
         await asyncio.wait_for(stopping, 10)
         assert old_db in finished
     finally:
         release.set()
+        await runner.stop()
+
+
+async def test_a_demote_stop_bounds_the_wait_on_a_hanging_retired_close(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADR 0157: every DEMOTE bound is absorbed where it is set. A retired executor whose close never
+    # finishes must not hold a demotion past its budget; the close is left running, not cancelled.
+    runner = await _runner(store, _registry(tmp_path, with_lookups=True))
+    release = asyncio.Event()
+    try:
+        old_db = runner._lookup_executor
+        assert old_db is not None
+        real = DatabaseLookupExecutor.aclose
+
+        async def hanging_aclose(self: DatabaseLookupExecutor) -> None:
+            if self is old_db:
+                await release.wait()
+            await real(self)
+
+        monkeypatch.setattr(DatabaseLookupExecutor, "aclose", hanging_aclose)
+        await asyncio.wait_for(runner.reload(_registry(tmp_path, with_lookups=True)), 10)
+        pending = set(runner._lookup_close_tasks)
+        assert len(pending) == 1
+
+        await asyncio.wait_for(runner.stop(reason=TeardownReason.DEMOTE, budget_seconds=0.2), 5)
+        assert not runner._running
+        assert not any(t.done() for t in pending)  # abandoned, not cancelled
+    finally:
+        release.set()
+        await _settle_closes(runner)
         await runner.stop()
