@@ -1210,7 +1210,7 @@ property of the product rather than of the host's MIME registry.
 The allow-list decides what is **declared**, never whether the file is served: an unrecognized type
 downloads exactly as a refused one does. The response carries `Content-Disposition: attachment` (a
 download, never an inline render), `X-Content-Type-Options: nosniff` (no MIME re-sniff), and
-`Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'` (an opaque origin with scripts/forms disabled, and no framing),
+`Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'; base-uri 'none'` (an opaque origin with scripts/forms disabled, and no framing),
 re-asserted on the `/ui` delegate from **outside** the console's own CSP writers, so a browser-active
 representation can never execute in the application origin, and none can be framed.
 `frame-ancestors` is named in that policy rather than left to the API's security header

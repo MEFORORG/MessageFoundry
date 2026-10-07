@@ -256,10 +256,10 @@ def _validated_header(name: str, value: str) -> str:
     return f"{name}: {value}"
 
 
-#: The browser-safety baseline every response from this listener carries (ASVS 3.4.4 / 3.4.6).
+#: The browser-safety baseline every response from this listener carries (ASVS 3.4.3 / 3.4.4 / 3.4.6).
 #:
 #: **This is a deliberate SECOND copy of ``api/header_floor.BASELINE_SECURITY_HEADERS`` and the
-#: ``frame-ancestors`` policy beside it, and the duplication is forced by the dependency rule this
+#: floor's CSP beside it (``FLOOR_CSP``: frame-ancestors and base-uri), and the duplication is forced by the dependency rule this
 #: module's own docstring states: ``transports/`` must not import ``api/``** (and ``header_floor``
 #: imports Starlette, which has no business in a connector). A copy that can drift silently is the
 #: failure ``header_floor`` exists to end, so it does not drift silently here either:
@@ -274,7 +274,10 @@ _BASELINE_RESPONSE_HEADERS: tuple[tuple[str, str], ...] = (
     ("X-Content-Type-Options", "nosniff"),
     ("Referrer-Policy", "no-referrer"),
     ("X-Frame-Options", "DENY"),
-    ("Content-Security-Policy", "frame-ancestors 'none'"),
+    # base-uri beside frame-ancestors, as the API floor sends it (ASVS 3.4.3, BACKLOG #2341). One
+    # field, decided by NAME: no caller of build_response supplies a CSP today (handlers cannot set
+    # response headers here), and one that did would own the whole policy, as the test pins.
+    ("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'"),
 )
 
 
