@@ -971,7 +971,6 @@ class Engine:
         sandbox_policy = SandboxPolicy(
             mode=SandboxMode(_sb.mode),
             wall_seconds=_sb.wall_seconds,
-            cpu_seconds=_sb.cpu_seconds,
             mem_mb=_sb.mem_mb,
             startup_seconds=_sb.startup_seconds,
             pass_environment=_sb.pass_environment,

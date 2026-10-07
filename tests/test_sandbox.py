@@ -206,6 +206,17 @@ def h_busy(msg):
         pass
 
 
+@handler("h_spin")
+def h_spin(msg):
+    # A short, legitimate CPU-bound call: it burns a quarter-second of CPU and returns.
+    import time
+
+    end = time.process_time() + 0.25
+    while time.process_time() < end:
+        pass
+    return Send("OB_T", "SPUN")
+
+
 @handler("h_lookup")
 def h_lookup(msg):
     db_lookup("SOME_DB", "select 1", ())  # live bridge — forbidden in the sandbox
@@ -329,57 +340,27 @@ def test_busy_loop_is_wall_capped_and_recovers(graph: tuple[Registry, str]) -> N
         session.close()
 
 
-# The CPU cap is a POSIX RLIMIT_CPU limit, which counts the worker's whole life, bootstrap included.
-# These pin that the bootstrap's own CPU is not charged to the first call's budget, and that a
-# CPU-cap kill is reported as one rather than as a crash. Windows has no RLIMIT_CPU; the wall cap
-# governs there.
+# Vault BACKLOG #3133 part 1, owner ruling 2026-10-07: the worker sets no RLIMIT_CPU. That limit
+# counts the whole life of a process, and the worker is persistent, so it was a lifetime budget: a
+# reused worker died on its tenth 0.15 s call. The old soft limit was ceil(boot CPU + 2 s), so never
+# more than boot plus 3 s, and its SIGXCPU killed the worker. Seventeen 0.25 s calls spend 4.25 s,
+# past it whatever the boot cost, while each call stays far inside the wall cap. Windows never had
+# the limit, so the test only means something on POSIX.
 
 
-def test_a_cpu_cap_kill_is_reported_as_the_cpu_cap(graph: tuple[Registry, str]) -> None:
+@pytest.mark.skipif(sys.platform == "win32", reason="RLIMIT_CPU is POSIX-only")
+def test_a_reused_worker_has_no_lifetime_cpu_budget(graph: tuple[Registry, str]) -> None:
     registry, config_dir = graph
-    session = SandboxSession(
-        SandboxPolicy(
-            mode=SandboxMode.SUBPROCESS,
-            wall_seconds=1.0 if sys.platform == "win32" else 30.0,
-            cpu_seconds=1.0,
-        ),
-        inbound="IB_T",
-        config_dir=config_dir,
-        env=None,
-        graph=None,
-    )
-    expected = "wall cap" if sys.platform == "win32" else "1.0s CPU cap"
+    session = _session(config_dir)
     try:
-        with pytest.raises(SandboxError, match=expected):
-            _deliveries(registry, "h_busy", sandbox=session, run_context=RunContext())
-    finally:
-        session.close()
-
-
-def test_a_cpu_heavy_boot_does_not_turn_the_wall_cap_into_a_crash(tmp_path: Path) -> None:
-    # The CI shape (merge-group run 37515761354): a slow runner spends more CPU booting the worker,
-    # and with that CPU charged to the call's budget the busy loop hit RLIMIT_CPU before the 1 s wall cap and was
-    # reported as a crash. A config module that burns 1.6 s of CPU at import stands in for that boot.
-    source = _GRAPH.replace("__SENTINEL__", repr(str(_sentinel_path(tmp_path))))
-    (tmp_path / "graph.py").write_text(source, encoding="utf-8")
-    (tmp_path / "slow_boot.py").write_text(
-        "import time\n"
-        "_end = time.process_time() + 1.6\n"
-        "while time.process_time() < _end:\n"
-        "    pass\n",
-        encoding="utf-8",
-    )
-    registry = load_config(tmp_path)
-    session = SandboxSession(
-        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=1.0, cpu_seconds=2.0),
-        inbound="IB_T",
-        config_dir=str(tmp_path),
-        env=None,
-        graph=None,
-    )
-    try:
-        with pytest.raises(SandboxError, match="wall cap"):
-            _deliveries(registry, "h_busy", sandbox=session, run_context=RunContext())
+        pids: set[int] = set()
+        for _ in range(17):
+            delivered = _deliveries(registry, "h_spin", sandbox=session, run_context=RunContext())
+            assert delivered == [("OB_T", "SPUN")]
+            assert session._proc is not None
+            pids.add(session._proc.pid)
+        # One worker served every call: none was killed and quietly respawned.
+        assert len(pids) == 1
     finally:
         session.close()
 
