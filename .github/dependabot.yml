@@ -270,6 +270,28 @@ updates:
         applies-to: security-updates
         patterns: ["*"]
 
+  # The npm tools CI runs, installed from this directory's committed lock (what they are, and why a
+  # lock and why jscpd stays on 4.x: the description in ci/npm-tools/package.json; vault BACKLOG
+  # #2793). The lock freezes their transitive tree, so this entry is what still moves it when a fix
+  # ships. Every npm bump holds for review (dependabot-auto-merge.yml's npm allow row is empty).
+  - package-ecosystem: "npm"
+    directory: "/ci/npm-tools"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+    ignore:
+      - dependency-name: "jscpd"
+        versions: [">=5.0.0"]
+    groups:
+      ci-npm-tools:
+        patterns: ["*"]
+      ci-npm-tools-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
   # NO ENTRY for `/.github/actions/cla-assistant-lite`, and the absence is a DECISION rather than an
   # oversight (BACKLOG #1578). That directory vendors the archived `contributor-assistant/github-action`
   # as a compiled ncc/webpack bundle, and the upstream lockfile it was built from is committed beside
