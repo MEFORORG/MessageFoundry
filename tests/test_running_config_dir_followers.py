@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The DR backup and the subprocess sandbox follow the running config dir (vault BACKLOG #3094).
 
-Both read the STARTUP ``--config`` dir. After an operator reload from another allowed root, the
-backup archived and fingerprinted a directory the engine no longer runs, and a
-``[sandbox].mode=subprocess`` worker re-loaded the startup graph, whose shape differs from the
-graph the parent serves, so every sandboxed dispatch was refused. The backup now reads
+In the code before this change both read the STARTUP ``--config`` dir. After an operator reload
+from another allowed root, the backup would archive and fingerprint a directory the engine no
+longer runs, and a ``[sandbox].mode=subprocess`` worker would re-load the startup graph, whose
+shape differs from the graph the parent serves, so every sandboxed dispatch would be refused. The
+backup now reads
 :attr:`Engine.running_config_dir` once per pass and takes its digest off the event loop under the
 shared best-effort rule. A worker loads ``Registry.source_dir``, the directory the served graph came
 from. Each reading below sits beside a control that tells the two roots apart. Synthetic HL7 only.
@@ -135,7 +136,11 @@ async def test_a_config_read_fault_costs_the_fingerprint_not_the_backup(
         real_scandir = os.scandir
 
         def scandir(path: Any = ".") -> Any:
-            if Path(path) == cfg:
+            # On Linux shutil.rmtree walks by file descriptor and calls scandir(<int fd>); the
+            # staging cleanup goes through here too, so anything that is not a path passes
+            # straight through. Path(<int>) raised TypeError there and the cleanup kept the
+            # plaintext staging dir (the ubuntu red on PR 2140).
+            if isinstance(path, str | os.PathLike) and Path(path) == cfg:
                 threads.append(threading.current_thread())
                 raise PermissionError(13, "Permission denied", str(path))
             return real_scandir(path)
@@ -162,14 +167,18 @@ async def test_a_config_read_fault_costs_the_fingerprint_not_the_backup(
         await store.close()
     assert result is not None and result.config_fingerprint is None
     assert result.verify is not None and result.verify.status == "PASS"
-    # Taken off the event loop, first by the fingerprint.
-    assert threads and threads[0] is not threading.main_thread()
+    # Every read of the config dir, the fingerprint's among them, ran off the event loop.
+    assert threads and all(t is not threading.main_thread() for t in threads)
     warnings = [r.getMessage() for r in caplog.records if "config fingerprint failed" in r.message]
     assert len(warnings) == 1 and str(cfg) in warnings[0]
     with _archive_tar(result.archive_path) as tar:
         assert _manifest(tar)["config_fingerprint"] is None
         if fault == "non-utf8-file-name":
             assert "config/cfg.py" in tar.getnames(), "the config is still archived"
+    # The fault cost only the fingerprint: the plaintext staging dir under the data dir is gone.
+    staged = [p.name for p in tmp_path.glob("mefor-*") if p.is_dir()]
+    assert staged == [], f"plaintext staging left behind: {staged}"
+    assert tmp_path.joinpath("b.db").is_file(), "control: the glob looks in the data dir"
 
 
 async def _backup_of(tmp_path: Path, cfg: Path) -> str | None:
