@@ -811,7 +811,9 @@ def test_send_set_params_refuses_to_overwrite_a_computed_destination() -> None:
     edit = {"line_start": 3, "line_end": 3, "op": "set_params", "params": {"to": {"expr": '"OB"'}}}
     with pytest.raises(LensRewriteError, match="computed by code"):
         rewrite_source(src, edit)
-    named = src.replace("pick(msg)", "OB_DEST")
+    # A module-level literal is inert, so it may be overwritten (Manager decision 2026-10-07).
+    named = 'OB_DEST = "OB_X"\n\n\n' + src.replace("pick(msg)", "OB_DEST")
+    edit = {**edit, "line_start": 6, "line_end": 6}
     assert 'return Send("OB", msg)' in rewrite_source(named, edit)
 
 
