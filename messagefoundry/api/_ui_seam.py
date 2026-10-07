@@ -306,14 +306,16 @@ from typing import Any
 #: lanes (export has no console route). A method the console calls, so a skew would be an
 #: AttributeError at request time; it forces a bump. Unnumbered, as above. Re-derived on the tree
 #: merged with vault BACKLOG #3062 (``AuthService.enabled`` removed), which moved the digest on its
-#: own; the value below covers both changes.
+#: own; the value below covers both changes. ``CoreHandlers`` then gained the REQUIRED
+#: ``prior_resend``, the read-only repeat lookup the resend and edit-resend routes ask before they
+#: demand a proof; a console without it fails the ``UiDeps`` construction.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "3e6c70a45a02a682"
+ENGINE_UI_SEAM: str = "bd65aff6f5a79dc6"
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +361,9 @@ class CoreHandlers:
     # ``reload_config``; each /ui route in front of one re-asserts the same action.
     resend_message: Callable[..., Awaitable[Any]]
     edit_resend_message: Callable[..., Awaitable[Any]]  # edit-and-resubmit (ADR 0090 §9, seam v2)
+    # Vault BACKLOG #2625: whether a resend or edit-and-resubmit key repeats a request that
+    # already ran. Read-only. The console asks it before it demands a step-up proof.
+    prior_resend: Callable[..., Awaitable[Any]]
     replay_dead_letters: Callable[..., Awaitable[Any]]
     list_active_alerts: Callable[..., Awaitable[Any]]
     alerts_rules: Callable[..., Awaitable[Any]]

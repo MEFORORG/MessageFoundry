@@ -79,6 +79,7 @@ __all__ = [
     "set_oidc_flow_cookie",
     "set_session_cookie",
     "spend_ui_action_step_up",
+    "proof_spent_for",
 ]
 
 COOKIE_NAME = "mf_session"
@@ -1220,12 +1221,14 @@ def require_ui_step_up_action(
     are before doing work a re-auth would throw away. The route that performs the action must
     still spend it, either through its own gate or through :func:`spend_ui_action_step_up`.
 
-    ``repeat`` answers whether the request repeats one that already RAN under the same idempotency
-    key (vault BACKLOG #2625). When it does, the gate asks for no proof: a repeat queues nothing,
-    and the route answers it as a duplicate. Everything else the gate checks still runs, and only
-    with ``spend=False``, so a request that is not a repeat is still spent in the route before it
-    acts. Without it, a double-click spent the proof on the first submit and sent the second to
-    re-authenticate, onto a confirm page with a fresh key."""
+    ``repeat`` answers whether the request repeats one that already ran, or is running, under the
+    same idempotency key (vault BACKLOG #2625). When it does, the gate asks for no fresh proof: the
+    store answers the repeat as ADR 0090's duplicate, so it queues nothing. Only with
+    ``spend=False``, so anything that is not a repeat is still spent in the route before it acts;
+    and only while action binding is on, with the factor-binding refusal still applied first. Under
+    the org opt-out the session window is checked as on any other request. Without it, a
+    double-click spent the proof on the first submit and sent the second to re-authenticate, onto
+    a confirm page with a fresh key."""
     if repeat is not None and spend:
         raise ValueError("repeat needs spend=False: the route must spend the proof itself")
     # mfa_refusal, NOT allow_mfa_pending: the base's gate refuses and audits a pending session, and
@@ -1250,17 +1253,65 @@ def require_ui_step_up_action(
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         if new_ip:
             raise _reauth_redirect(request, nxt)
-        if repeat is not None and await repeat(request):
+        if await _ui_action_step_up_ok(auth, token, action, spend=spend):
             return identity
-        if not await _ui_action_step_up_ok(auth, token, action, spend=spend):
-            raise _reauth_redirect(request, nxt)
-        return identity
+        # Asked only once the proof is missing, and after it rather than before: a second POST in
+        # flight can find the proof gone because the first just spent it, and the first's spend is
+        # what marks this one as its repeat. The factor-binding refusal still applies first.
+        if (
+            repeat is not None
+            and auth.action_step_up_required
+            and not await auth.factor_binding_is_blocked(token, action)
+            and await repeat(request)
+        ):
+            return identity
+        raise _reauth_redirect(request, nxt)
 
     return mark_route_gate(dependency)
 
 
+class _SpentForKey:
+    """Which requests a session has already spent an action-bound proof on (vault BACKLOG #2625),
+    each named by the caller from its idempotency key AND what the key acts on, so the same key
+    aimed elsewhere is not taken for a repeat. In memory and synchronous, so a second POST in flight beside the first finds the spend
+    before the first one's resend commits; ``resend_log`` cannot tell it that yet. Keyed by the
+    session's token hash, the action and the key; bounded and TTL'd like the continuations, and
+    a drop only means the repeat asks for a proof again."""
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+
+    def put(self, token: str, action: str, key: str) -> None:
+        now = time.monotonic()
+        entry = (hash_token(token), action, key)
+        self._entries.pop(entry, None)
+        self._entries[entry] = now + REAUTH_CONTINUATION_TTL_SECONDS
+        while self._entries and next(iter(self._entries.values())) <= now:
+            self._entries.popitem(last=False)
+        while len(self._entries) > _REAUTH_CONTINUATION_SESSIONS_MAX:
+            self._entries.popitem(last=False)
+
+    def holds(self, token: str | None, action: str, key: str) -> bool:
+        if not token:
+            return False
+        deadline = self._entries.get((hash_token(token), action, key))
+        return deadline is not None and deadline > time.monotonic()
+
+
+_SPENT_FOR_KEY = _SpentForKey()
+
+
+def proof_spent_for(request: Request, action: str, key: str) -> bool:
+    """Whether this session already spent its ``action`` proof on idempotency key ``key``."""
+    return _SPENT_FOR_KEY.holds(session_token(request), action, key)
+
+
 async def spend_ui_action_step_up(
-    request: Request, action: str, *, reauth_next: Callable[[Request], str]
+    request: Request,
+    action: str,
+    *,
+    reauth_next: Callable[[Request], str],
+    key: str | None = None,
 ) -> None:
     """Spend the grant a ``spend=False`` gate let through, just before the action runs (vault
     BACKLOG #2625). A route takes this split when it checks its own input first: a refusal of that
@@ -1271,8 +1322,16 @@ async def spend_ui_action_step_up(
     auth = get_auth(request)
     if auth is None or not auth.action_step_up_required:
         return
-    if not await _ui_action_step_up_ok(auth, session_token(request), action):
+    token = session_token(request)
+    # ``key`` ties the spend to one idempotency key: a second POST with the same key, in flight
+    # beside the first, rides on the proof the first spent rather than asking for another. The
+    # store makes that second one ADR 0090's duplicate, so it queues nothing.
+    if key is not None and _SPENT_FOR_KEY.holds(token, action, key):
+        return
+    if not await _ui_action_step_up_ok(auth, token, action):
         raise _reauth_redirect(request, reauth_next(request))
+    if key is not None and token:
+        _SPENT_FOR_KEY.put(token, action, key)
 
 
 def require_ui_reauth_only_action(

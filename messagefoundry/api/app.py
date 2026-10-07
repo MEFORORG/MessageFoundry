@@ -5787,6 +5787,14 @@ def create_app(
             outbox_id=outcome.outbox_id,
         )
 
+    async def prior_resend(
+        *, engine: Engine, idempotency_key: str, message_id: str, to: str | None
+    ) -> object:
+        """The web console's repeat lookup (vault BACKLOG #2625), on the seam rather than reached
+        through the engine object: the record of an already-run resend (``to``) or re-ingress
+        (``to=None``) this key repeats, or ``None``. Read-only; it queues nothing."""
+        return await engine.prior_resend(idempotency_key, message_id=message_id, to=to)
+
     @app.post("/messages/{message_id}/edit-resend", response_model=EditResendResult)
     async def edit_resend_message(
         message_id: ResourceId,
@@ -8081,6 +8089,7 @@ def create_app(
                 replay_message=replay_message,
                 resend_message=resend_message,
                 edit_resend_message=edit_resend_message,
+                prior_resend=prior_resend,
                 replay_dead_letters=replay_dead_letters,
                 list_active_alerts=list_active_alerts,
                 alerts_rules=alerts_rules,

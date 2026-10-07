@@ -37,10 +37,12 @@ this line.**
   spend, so the next submit asks again and re-opens the editor. A completed resend now answers with
   a 303 to a new GET outcome page, `/ui/messages/{id}/resend-done` (post-redirect-get), so a
   refresh re-renders the outcome and sends nothing. The confirm page always mints its own
-  idempotency key; one in its query string is ignored. Upload resend also needs `messages:edit`, on the confirm page and on the POST, and the browse page offers
-  its form only to a role that holds it. Seam change:
-  `AuthService.holds_action_step_up` is new, and the console imports five new step-up action
-  constants. (vault BACKLOG #2625)
+  idempotency key; one in its query string is ignored. A same-key repeat of a resend or
+  edit-resend that already ran, or is still running (a double-click), asks for no fresh proof and is
+  answered as a duplicate. Upload resend also needs `messages:edit`, on the confirm page and on the
+  POST, and the browse page offers its form only to a role that holds it. Seam change:
+  `AuthService.holds_action_step_up` and the core handler `prior_resend` are new, and the console
+  imports five new step-up action constants. (vault BACKLOG #2625)
 - **A route-level sign-in reject records where it came from.** The `/ui/oidc` start and callback
   legs and `GET /ui/sso` refuse some sign-ins themselves. Examples are a missing flow cookie, an
   IdP error, a malformed callback or Negotiate token, a failed start, and a non-navigation fetch.

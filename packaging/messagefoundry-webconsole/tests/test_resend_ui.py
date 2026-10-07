@@ -14,6 +14,7 @@ which injects into an INBOUND. Both live in test_webui.py / test_uploaded_logs_u
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
@@ -599,6 +600,28 @@ async def test_a_double_submit_with_one_proof_resends_once_and_says_so(
         # Control: the repeat really did ride on no proof. A NEW key now has none to spend.
         fresh = await _post_resend(c, mid, key="k2", mint=False)
         assert fresh.status_code == 303 and fresh.headers["location"].startswith("/ui/reauth?")
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert len(rows) == 1
+
+
+async def test_two_submits_in_flight_together_ride_one_proof(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """A real double-click: the second POST leaves before the first has committed, so resend_log
+    cannot yet tell it that the key ran. The proof the first spent on that key carries it instead.
+    Both land on the outcome page, one resend is queued, and neither goes to re-auth."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        await _mint(c, mid)  # the one proof
+        answers = await asyncio.gather(*(_post_resend(c, mid, mint=False) for _ in range(2)))
+        assert all(a.status_code == 200 for a in answers), [a.headers for a in answers]
+        assert sum("Resend queued" in a.text for a in answers) == 1
+        assert sum("Already resent" in a.text for a in answers) == 1
     rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
     assert len(rows) == 1
 

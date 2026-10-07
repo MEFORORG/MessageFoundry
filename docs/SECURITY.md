@@ -2091,8 +2091,10 @@ drops an edit the operator is about to type, and a refusal of the console's own 
 A refusal from the engine handler comes after the spend: the next submit asks again and re-opens the
 editor from the stored body, as an expired grant (300 s by default) does. The console resend checks
 its own input before it spends the proof too. On both, a same-key repeat of a request that already
-ran asks for no proof: the key is bound to that request in `resend_log`, so the handler can only
-answer it as ADR 0090's duplicate, and a double-click lands on "already resent". One grant covers one request, and a bulk purge from the console is one request. The
+ran, or is still running, asks for no fresh proof: the session's spend of the proof on that key,
+or the key's `resend_log` row, marks it, and the store answers it as ADR 0090's duplicate. A
+double-clicked resend lands on "already resent"; a repeated edit-resend lands on the child the
+first one made. One grant covers one request, and a bulk purge from the console is one request. The
 grant is keyed on the session and the action, not on a target. The rest of the step-up surface keeps
 the shared window on purpose: a bound proof is a typed password per action, and an operator replaying
 dead letters during an incident would type it per message. `[auth].require_action_step_up = false`

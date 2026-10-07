@@ -195,6 +195,10 @@ async def test_an_edit_resubmit_repeated_with_one_proof_lands_once(
             == answers[1].headers["location"]
             != f"/ui/messages/{mid}"
         )
+        # Control: the repeat rode on no proof, and the first one did spend it. A NEW key asks.
+        fresh = {**form, "idempotency_key": "k2"}
+        r = await c.post(f"/ui/messages/{mid}/edit-resend", data=fresh, headers=SAME_ORIGIN)
+        assert _reauth_next(r) == editor
     rows = await engine.store.list_messages(limit=50, allowed_channels=None)
     children = [m for m in rows if m["id"] != mid]
     assert len(children) == 1
