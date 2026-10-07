@@ -5266,8 +5266,8 @@ def _cert_import(args: argparse.Namespace) -> int:
 
     The bundle passphrase comes ONLY from ``MEFOR_PFX_PASSWORD``. Unset means ``password=None``, which
     only an unencrypted bundle with no MAC can use (BACKLOG #1352). Set but empty is the empty
-    passphrase, so a bundle whose PBMAC1 MAC used one can be imported (BACKLOG #2456). It is never a CLI arg and
-    never echoed. A bad password / malformed bundle is
+    passphrase, so a bundle whose PBMAC1 MAC used one can be imported (BACKLOG #2456). It is never
+    a CLI arg and never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
     public; key.pem is written by :func:`_write_private_key`, which refuses to overwrite."""
     import os

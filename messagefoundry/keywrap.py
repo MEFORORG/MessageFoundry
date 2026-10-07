@@ -34,7 +34,8 @@ encrypted; only a bundle with clear bags and no MAC at all derives nothing from 
 passes. SSH keys cannot reach an approved derivation at all,
 so the SFTP connector refuses an encrypted one outright (:func:`ssh_key_encrypted`). A database
 driver's own client key is checked as a key file before the driver opens it, when ``odbc_params``
-names it with ``sslkey``; a key libpq finds by itself (``PGSSLKEY``, its default path) is not.
+names it with ``sslkey`` and the driver reads that keyword. A key the driver finds by itself is not
+checked, which on psqlODBC is every client key (BACKLOG #2423).
 
 What this does NOT check, so a reader does not assume it: the content cipher inside PBES2 (that is a
 cipher question, not a derivation one), the inside of a PKCS#12 part that is itself encrypted
@@ -480,7 +481,8 @@ _REEXPORT: Final = (
 #: check, the same as a PEM key file.
 _CLEAR_BAG_REMEDY: Final = (
     f"The MAC rule applies even though no bag is encrypted. {_REEXPORT}. Or drop the MAC: openssl "
-    "pkcs12 -export -keypbe NONE -certpbe NONE -nomac. A bundle with no MAC has no integrity "
+    "pkcs12 -export -keypbe NONE -certpbe NONE -nomac -in <cert> -inkey <key> -out <new pfx>. "
+    "A bundle with no MAC has no integrity "
     "check, so nothing detects a change to the file, as with a PEM key"
 )
 
