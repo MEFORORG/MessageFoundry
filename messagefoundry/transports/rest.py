@@ -41,7 +41,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, flag_from_settings
 from messagefoundry.config.settings import hop_insecure_escape_downgrades
 from messagefoundry.config.tls_policy import (
     MIRRORED_CONNECTION_SETTING,
@@ -838,7 +838,7 @@ def cleartext_acceptance_from_settings(
     reason = s.get("cleartext_reason")
     connection = s.get(MIRRORED_CONNECTION_SETTING)
     return (
-        bool(s.get("cleartext_accepted", False)),
+        flag_from_settings(s, "cleartext_accepted"),
         None if reason is None else str(reason),
         None if connection is None else str(connection),
     )

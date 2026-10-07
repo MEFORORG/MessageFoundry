@@ -9246,6 +9246,18 @@ def create_managed_app(
                     _log.exception(
                         "approval gate: the shutdown drain failed; continuing the teardown"
                     )
+            # BACKLOG #2216: a lock notice still in flight reads and writes the audit log, then
+            # hands its mail to the security notifier, so it drains before engine.stop() closes the
+            # store and before that notifier stops below. Bounded, and it logs and cancels what it
+            # cannot finish; guarded like the drain above so a failure cannot skip engine.stop().
+            if auth is not None:
+                try:
+                    await auth.close_background()
+                except Exception:
+                    _log.exception(
+                        "auth: the shutdown drain of background notices failed; continuing the "
+                        "teardown"
+                    )
             # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
             # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
             # called it, so every clean restart dropped the open hour's PHI-summary access audit --
