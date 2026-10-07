@@ -8959,8 +8959,8 @@ class AuthService:
         _log.warning(
             "no enabled Administrator can sign in without an outside identity service (the "
             "directory or a federated identity provider); each is a directory account or a local "
-            "one with no usable password: %s. If that service is down, nobody can sign in to "
-            "manage this engine, and `messagefoundry provision-admin` will not create a local "
+            "one with no usable password: %s. If that service is down, no Administrator can sign "
+            "in to manage this engine, and `messagefoundry provision-admin` will not create a local "
             "Administrator while these accounts exist. Create a local Administrator now, before "
             "an outage (docs/SECURITY.md, 'Keep a local Administrator').",
             ", ".join(names),
