@@ -79,7 +79,9 @@ CANDIDATE_DIR_SUFFIX = ".edit"
 #: random part, eight characters with no dot, so an operator's own ``.x.edit`` directory and a
 #: sibling file's candidates (``.<name>.bak.<random>.edit``) never match. A test pins this against
 #: the real ``mkdtemp``, so a change in its naming fails loudly rather than leaking candidates.
-_CANDIDATE_DIR_RE = re.compile(rf"\.(?P<name>.+)\.[a-z0-9_]{{8}}{re.escape(CANDIDATE_DIR_SUFFIX)}")
+#: A literal, so the static regex scanner and its ReDoS lint can read it; the trailing ``\.edit``
+#: is ``CANDIDATE_DIR_SUFFIX``, which a test holds the two to.
+_CANDIDATE_DIR_RE = re.compile(r"\.(?P<name>.+)\.[a-z0-9_]{8}\.edit")
 
 #: A candidate directory older than this is a leftover from a killed editor, never a live edit:
 #: a live one lasts one validation. Old enough to stay safe on a file system that cannot lock.
