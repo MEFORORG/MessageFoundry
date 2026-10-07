@@ -1784,10 +1784,27 @@ paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own au
 answers **409**: that is at least `approval.too_early`, `approval.stale_requester` and
 `approval.no_longer_gated`. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
-error, as listed above. Every audit row write that fails with an error is logged at ERROR with its
-detail, and raises an `audit_write_failed` alert keyed `approval:<id>`, carrying the row's action
-name. A call cancelled mid-write, for example by the request timeout, logs nothing and raises no
-alert.
+error, as listed above.
+
+A failed audit row write is logged at ERROR and raises an `audit_write_failed` alert keyed
+`approval:<id>`, carrying the row's action name, on at least these paths:
+
+- a refusal's row, or an outcome row written alone after its status. The log line carries the
+  row's detail;
+- the request or repeat write. The log line names the actor and the operation;
+- a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
+  The log line carries the exception, not the row's detail.
+
+Some failed writes are logged at ERROR and page nothing. At least two are: a restart that cannot
+move a leftover `executing` row to `interrupted`, which stays `executing` for the next start to
+retry; and an outcome whose combined write failed and whose status write then found the row
+already moved. That second case most likely means the combined write committed and only its reply
+was lost.
+
+A cancelled call, for example by the request timeout, gets no ERROR line and no alert from the gate
+on at least the request or repeat write and a rejection. The gate shields at least the claim, each
+outcome and a resolution from a cancel. Those writes finish on their own, and log and page as
+above.
 
 What this does not cover, at least: a store that refuses READS of the request row or the
 requester's account still answers a raw 500. A request or a repeat whose write fails is not mapped
