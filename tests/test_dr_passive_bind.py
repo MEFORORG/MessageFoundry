@@ -268,15 +268,18 @@ async def test_a_failed_release_parks_a_normal_feed_a_reload_added_during_the_dr
         assert await _accepts(crit_port) and not await _accepts(added_port)
 
 
+@pytest.mark.parametrize("norm_auto_start", [True, False], ids=["auto_start", "no_auto_start"])
 async def test_a_failed_release_parks_a_feed_an_operator_started_before_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, norm_auto_start: bool
 ) -> None:
     """A deliberate choice, pinned here: the restore errs toward parking. A below-threshold
     feed an operator started before the release is parked after a failed one, so only an
     operator start brings it back. Leaving it unmarked needed a record of which parks an
-    operator overrode, and a stand-in for that record left a re-tiered feed unparked."""
+    operator overrode, and a stand-in for that record left a re-tiered feed unparked. The
+    ``no_auto_start`` case was unmarked, so an alert rule bound it, until the park marked every
+    inbound it stopped."""
     cfg = tmp_path / "cfg"
-    _crit_port, norm_port = _write_graph(cfg, tmp_path)
+    crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=norm_auto_start)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
         rr = engine.registry_runner
         assert rr is not None
@@ -290,10 +293,13 @@ async def test_a_failed_release_parks_a_feed_an_operator_started_before_it(
         monkeypatch.setattr(engine, "_drain_pipeline", failing_drain)
         with pytest.raises(OSError):
             await engine._dr_release_drain()
+        assert engine.dr_active and rr.dr_standby is None
         assert set(rr.filtered_inbound()) == {_NORM}
         assert not await _accepts(norm_port)  # the park unbound it
         await _alert_control_action(engine, "restart_inbound", _NORM)
         assert not await _accepts(norm_port)
+        await engine.reload_detail(cfg)
+        assert await _accepts(crit_port) and not await _accepts(norm_port)
         await rr.start_inbound(_NORM, operator=True)
         assert await _accepts(norm_port)
 

@@ -2606,8 +2606,9 @@ class RegistryRunner:
         are written again under them, so the scheduler and an alert rule still leave a feed below
         the threshold down. That includes a feed parked before the release and one a reload
         parked during it. It errs toward parking: a below-threshold feed an operator started
-        before the release is parked too. Nothing is bound here: the critical listeners the park
-        unbound come back on the next reload."""
+        before the release is parked too. Nothing is bound here. The listeners at or above the
+        threshold that the park unbound come back on the next reload, except an ``auto_start =
+        false`` one, which needs an operator start."""
         self._dr_threshold = state.threshold
         self._dr_standby = state.standby
         self._rewrite_inbound_parks(state.parked)
@@ -2617,12 +2618,19 @@ class RegistryRunner:
         reload lock, for ``POST /dr/release`` (vault BACKLOG #3140). The DR threshold is kept, so
         the outbounds the profile parks hold their rows through the drain. Run again after the
         drain, it unbinds a listener an operator started meanwhile, so the release returns with
-        none bound."""
+        none bound.
+
+        Each inbound it stops gets a marker, even one with ``auto_start = false``, and even when
+        a later stop raises. So if the release fails, :meth:`restore_dr_intake` judges every one
+        of them against the profile."""
         async with self._reload_lock:
             self.set_dr_threshold(self._dr_threshold, standby=standby)
-            for name in list(self.registry.inbound):
-                await self._stop_inbound_unsafe(name)
-            self.set_dr_threshold(self._dr_threshold, standby=standby)
+            stopping = frozenset(self._sources)
+            try:
+                for name in list(self.registry.inbound):
+                    await self._stop_inbound_unsafe(name)
+            finally:
+                self._rewrite_inbound_parks(stopping)
 
     def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).

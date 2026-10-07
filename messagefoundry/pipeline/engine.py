@@ -929,10 +929,11 @@ class Engine:
         part of it held on outbounds the engine parks; and ``drained``, whether every OTHER row
         drained (vault BACKLOG #3067). The coordinator records them rather than claiming a drain.
 
-        If any step fails, the runner's DR thresholds and inbound parks go back to what the
-        profile had, since the coordinator keeps the box active (vault BACKLOG #3140). The
-        critical listeners the park unbound stay down until a reload, their schedule window or
-        an alert rule's restart binds them again."""
+        If any step fails, the coordinator keeps the box active, so the runner's DR thresholds
+        come back and every idle feed below the threshold is parked, even one an operator had
+        started (vault BACKLOG #3140). The listeners at or above the threshold that the park
+        unbound stay down until a reload, their schedule window or an alert rule's restart binds
+        them again; an ``auto_start = false`` one needs an operator start."""
         rr = self._registry_runner
         if rr is None:
             # No graph, so nothing to unbind, no worker to drain with and no parked outbound.
@@ -953,7 +954,7 @@ class Engine:
         except BaseException:
             # The coordinator keeps the box active, so the runner leaves the standby with it. The
             # profile's markers are written again from the graph as it is now, so the feeds below
-            # the threshold stay parked, and the next reload binds the critical set again.
+            # the threshold stay parked, and the next reload binds the ones at or above it.
             rr.restore_dr_intake(before)
             raise
         self._set_dr_active(False)
