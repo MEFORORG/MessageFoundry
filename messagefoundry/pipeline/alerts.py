@@ -367,8 +367,9 @@ class AlertSink(Protocol):
 
         ``name`` keys the subject the lost row was about. The approval gate is the only emitter, and
         uses ``approval:<approval id>``, the key :meth:`approval_too_early` uses. ``action`` is the
-        audit action of the lost row, such as ``approval.approved``. The row's detail is NOT carried:
-        the ERROR log line written beside this alert holds it. It is raised whether the gate then
+        audit action of the lost row, such as ``approval.approved``. The row's detail is NOT carried.
+        The ERROR log line written beside this alert holds what the gate had: the row's detail on
+        some paths, only the exception on others (docs/SECURITY.md). It is raised whether the gate then
         refused the request (a claim it could not write with its ``approval.release_attempted`` row
         answers 503) or went ahead (the operation had already run). It is not a connection-scoped
         event, so no

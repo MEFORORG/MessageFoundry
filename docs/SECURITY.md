@@ -1786,8 +1786,8 @@ answers **409**: that is at least `approval.too_early`, `approval.stale_requeste
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
 error, as listed above.
 
-A failed audit row write is logged at ERROR and raises an `audit_write_failed` alert keyed
-`approval:<id>`, carrying the row's action name, on at least these paths:
+On at least these paths, a failed audit row write is logged at ERROR and pages
+`audit_write_failed`. That alert is keyed `approval:<id>` and carries the row's action name.
 
 - a refusal's row, or an outcome row written alone after its status. The log line carries the
   row's detail;
@@ -1795,16 +1795,17 @@ A failed audit row write is logged at ERROR and raises an `audit_write_failed` a
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
   The log line carries the exception, not the row's detail.
 
-Some failed writes are logged at ERROR and page nothing. At least two are: a restart that cannot
-move a leftover `executing` row to `interrupted`, which stays `executing` for the next start to
-retry; and an outcome whose combined write failed and whose status write then found the row
-already moved. That second case most likely means the combined write committed and only its reply
-was lost.
+Some failed writes are logged at ERROR and page nothing. At least these two are:
 
-A cancelled call, for example by the request timeout, gets no ERROR line and no alert from the gate
-on at least the request or repeat write and a rejection. The gate shields at least the claim, each
-outcome and a resolution from a cancel. Those writes finish on their own, and log and page as
-above.
+- a restart that cannot move a leftover `executing` row to `interrupted`. The row stays
+  `executing`, and the next start tries again;
+- an outcome whose combined write failed, when its status write then found the row already moved.
+  The combined write most likely committed, and only its reply was lost.
+
+A call can be cancelled mid-write, for example by the request timeout. The gate then writes no
+ERROR line and no alert for at least these writes: the request or repeat write, a rejection, and a
+refusal's row. The gate shields at least the claim, each outcome and a resolution from a cancel.
+Those writes finish on their own, and log and page as above.
 
 What this does not cover, at least: a store that refuses READS of the request row or the
 requester's account still answers a raw 500. A request or a repeat whose write fails is not mapped
@@ -1849,7 +1850,9 @@ the row to one of three outcomes. Each move carries its own audit row, after the
 The operation has run, or its outcome is unknown, by the time one of the first three is written, so
 that write never fails the call. If the move and its row cannot be written together, the gate
 writes the status alone, so an audit outage never leaves the row at `executing`. It then writes the
-audit row alone. If that fails too, the loss is logged at ERROR and pages `audit_write_failed`.
+audit row alone. If that fails too, the loss is logged at ERROR and pages `audit_write_failed`. The
+exception is a status write that finds the row already moved. The gate then writes no second row
+and pages nothing, as above.
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`

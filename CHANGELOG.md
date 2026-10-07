@@ -29,12 +29,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **The approval gate answers a mapped status during an audit or store outage, and pages.** A
   too-early, stale-requester or no-longer-gated refusal whose audit row fails still answers 409. A
   claim, rejection or resolution that cannot be written with its audit row answers 503. A new
-  `audit_write_failed` alert, keyed `approval:<id>`, fires on at least those failed writes, a
-  refusal's row, an outcome row written alone, and the request write. Some failures are logged and
-  page nothing. A cancelled request or rejection gets no ERROR line or alert from the gate.
-  docs/SECURITY.md names at least these cases. Store reads on these routes are not covered. Nor is
-  a failed
-  request write, which still answers 500, or 503 if the request times out. (vault `BACKLOG #2255`)
+  `audit_write_failed` alert, keyed `approval:<id>`, fires when at least those writes fail. It also
+  fires for a refusal's row, an outcome row written alone, and the request write. Some failures are
+  logged and page nothing. A cancel mid-write gets no ERROR line or alert on at least the request
+  write, a rejection and a refusal's row. docs/SECURITY.md names these cases. A failed store read on
+  these routes still answers 500. So does a failed request write, or 503 if the call times out.
+  (vault `BACKLOG #2255`)
 - **Each approval state change and its audit row are now one write.** The request and
   `approval.requested`, the claim and `approval.release_attempted`, a rejection, each release
   outcome and a resolve each commit or roll back together, on all three store backends. A request

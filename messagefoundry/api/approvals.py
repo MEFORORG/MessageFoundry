@@ -588,8 +588,10 @@ class ApprovalGate:
         **The writes on this path answer a mapped status in a store outage (vault BACKLOG #2255).** A
         refusal's own audit row (``approval.too_early``, ``approval.stale_requester``,
         ``approval.no_longer_gated``) that fails to write is logged and the refusal still answers
-        409, since it runs nothing. Every audit row the gate loses also raises the
-        ``audit_write_failed`` alert. The store READS here (the request row, the requester's
+        409, since it runs nothing. At least those rows, the claim and an outcome row written
+        alone raise the ``audit_write_failed`` alert when their write fails with an error. A cancel
+        during a refusal row's write, and :meth:`_settle`'s already-moved case, page nothing;
+        docs/SECURITY.md names at least these cases. The store READS here (the request row, the requester's
         account) are not mapped, so a store that refuses reads can still answer a raw 500.
 
         **Who writes the post-execution audit row.** The gate writes ``approval.approved``; an
@@ -926,6 +928,8 @@ class ApprovalGate:
         **When the combined write fails**, the status is written alone, so an audit outage never
         leaves the row ``executing``. Then the audit row is written alone. If that fails as well,
         the loss is logged at ERROR with the detail and pages ``audit_write_failed``. If the status
+        write finds the row already moved, the combined write most likely committed, so no second
+        row is written and nothing pages; the ERROR line says to check the audit log. If the status
         write fails too, the row may still read ``executing`` until this process restarts, when
         :meth:`reconcile_after_restart` moves it to ``interrupted`` (BACKLOG #2087 limb 4).
 
@@ -1528,7 +1532,8 @@ class ApprovalGate:
     ) -> ApprovalError:
         """Log and page a fault on a status write made before anything ran, and return the 503
         that answers it (vault BACKLOG #2255). The status and its ``action`` audit row are one
-        write, so neither landed, and the store cannot say which of the two refused. So this
+        write, so neither landed, unless the COMMIT landed despite the error (docs/SECURITY.md
+        lists at least those cases). The store cannot say which of the two refused. So this
         pages ``audit_write_failed`` for any fault on that write, a pool timeout included: the
         row WAS lost, whatever the cause, and the ERROR line beside it carries the exception that
         says which. ``what`` names the decision in the log and the detail; ``retry`` tells the
