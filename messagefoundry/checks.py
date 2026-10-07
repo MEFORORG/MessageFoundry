@@ -2375,11 +2375,13 @@ def _quoted_text(text: str) -> str:
     """``text`` as one double-quoted token that its own content cannot close or extend.
 
     JSON string quoting escapes every quote, backslash and C0 control, so a reason cannot end its
-    token and write a separator, a second entry or a mark after it. The log escape then covers what
-    JSON leaves raw, such as U+2028 and the bidirectional controls (vault BACKLOG #3139)."""
+    token and write a separator, a second entry or a mark after it. ``ensure_ascii`` also writes
+    every non-ASCII character as ``\\uXXXX``, so a lookalike quote such as U+02BA or U+FF02, or a
+    right-to-left letter, cannot fake that end for a human reader. The log escape then covers DEL,
+    the one ASCII control JSON leaves raw (vault BACKLOG #3139)."""
     from messagefoundry.controlchars import scrub_control_chars
 
-    return scrub_control_chars(json.dumps(text, ensure_ascii=False))
+    return scrub_control_chars(json.dumps(text))
 
 
 def _declared_entry(name: str, reason: str | None, *, refused: bool = False) -> str:

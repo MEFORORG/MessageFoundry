@@ -2,11 +2,12 @@
   strict hop-policy reader (vault BACKLOG #2232). The build check already refused each config here.
   (`vault BACKLOG #3139`)
   - The `tls-hop-attested`, `cleartext-accepted` and `tls-revocation-attested` lines of
-    `messagefoundry check` show each entry as `name ("reason")`. The reason is quoted and escaped, so
-    a newline cannot split the line, and a reason cannot fake a second entry.
-  - The `tls-hop-attested` line marks an entry the build check refuses as `REFUSED`, after the
-    quotes. The mark comes from a field the engine sets, so a reason cannot supply or imitate it. The
-    line no longer says every listed hop is allowed.
+    `messagefoundry check` show each entry as `name ("reason")`. A name outside letters, digits and
+    `_.:-` is quoted too. Quotes, controls and non-ASCII characters are escaped, so a newline cannot
+    split the line, and a lookalike quote cannot fake the end of a reason.
+  - The `tls-hop-attested` line marks an entry the build check refuses as `REFUSED`, at the end of
+    the entry. The mark comes from a field the engine sets, not from the reason text. The line no
+    longer says every listed hop is allowed.
   - `serve` now refuses a reference set at start, before any sync, when its source carries a hop
     flag or attestation pair the build check refuses. That covers at least a raw `env()` or other
     non-boolean flag, and a missing, blank, non-string or control-character reason. It used to fail

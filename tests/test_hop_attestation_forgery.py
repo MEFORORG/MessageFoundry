@@ -28,6 +28,12 @@ FORGERIES = {
     "entry-separator": "x); db_lookup:ghost (y",
     "quote-closer": 'x") REFUSED; db_lookup:ghost ("y',
     "trailing-mark": "sidecar) REFUSED",
+    # Lookalike quotes and a right-to-left run: JSON alone leaves them raw, and a reader sees an end
+    # quote, the mark and a second entry that a parser does not.
+    "modifier-quote": "sidecarʺ) REFUSED; db_lookup:ghost (ʺTLS at sidecar",
+    "fullwidth-quote": "sidecar＂） REFUSED； db_lookup:ghost (＂y",
+    "curly-quote": "sidecar”) REFUSED; db_lookup:ghost (“y",
+    "rtl-run": "אב) REFUSED; db_lookup:ghost (ג",
 }
 
 _QUOTED = r'"(?:[^"\\]|\\.)*"'
@@ -79,6 +85,10 @@ def test_a_reason_renders_as_one_quoted_live_entry(tmp_path: Path, reason: str) 
     assert detail.startswith("1 hop(s) declare")
     # Exactly one entry, the author's text intact inside it, and no mark from the engine.
     assert _entries(detail) == [("OB", reason, False)]
+    # The parse above is what a program reads. A person reads the glyphs, so no author character
+    # may reach the line outside ASCII, where a lookalike quote or a bidi run could fool the eye.
+    listed = detail.split(" — ", 1)[1]
+    assert listed.isascii(), listed.encode("ascii", "backslashreplace")
 
 
 @pytest.mark.parametrize("reason", list(FORGERIES.values()), ids=list(FORGERIES))
