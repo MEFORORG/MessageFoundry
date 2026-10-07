@@ -1083,8 +1083,8 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 [`api/app.py`](../messagefoundry/api/app.py) (72 HTTP + 1 WebSocket) and 43 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
 and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 120 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 240
-(116 + the 123 console routes + the `/ui/static` mount). Of the 116: **97 are permission-gated**, 19 are
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 241
+(116 + the 124 console routes + the `/ui/static` mount). Of the 116: **97 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -1355,7 +1355,7 @@ functions too, and they gate on the **same 29-permission catalogue** through par
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 111 of the 121 carry a gate; the 10 that do not are the
+**Route → permission map (`/ui` plane).** 114 of the 124 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the

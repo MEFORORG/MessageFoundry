@@ -20,6 +20,18 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
+### Added
+
+- **The approvals page resolves an interrupted release, and shows what each hold captured.** An
+  `interrupted` release offers the resolve, *Effects applied* or *Effects not applied*, behind a
+  required "I checked its effects" box, through `POST /ui/approvals/{id}/resolve/{outcome}`. It
+  asks for the same fresh step-up as the engine's resolve (`BACKLOG #2460`). Each row shows the
+  parameters its hold captured (`BACKLOG #2458`). Approve is not offered on the requester's own
+  request, which offers Withdraw, on a row whose stored parameters are unreadable, or on a row
+  whose operation dual control no longer gates; those offer Reject and say why. Seam change:
+  `resolve_action` joins the handlers, and `PendingApprovalInfo` gains `params`,
+  `caller_is_requester` and `gated`.
+
 ### Fixed
 
 - **A temporary password's deadline is stated in the past tense once it has passed.** The factor
@@ -120,18 +132,12 @@ Console 0.3.0 does not work with engine 0.5.0 either, so upgrade the two togethe
   `/ui/approvals`, under Admin, lists the open requests. Each pending one has Approve and Reject,
   through the same engine handlers as `POST /approvals/{id}/approve` and `/reject`, so the engine
   still refuses a requester approving their own request. A refusal renders as a page with the
-  engine's reason, and a too-new request keeps its `Retry-After`. An `interrupted` release offers
-  the resolve, *Effects applied* or *Effects not applied*, behind a required "I checked its
-  effects" box, through `POST /ui/approvals/{id}/resolve/{outcome}`, which asks for the same fresh
-  step-up as the engine's resolve (`BACKLOG #2460`). Each row shows the parameters its hold
-  captured (`BACKLOG #2458`). Approve is not offered on the requester's own request, which offers
-  Withdraw, on a row whose stored parameters are unreadable, or on a row whose operation dual
-  control no longer gates; those offer Reject and say why. The
+  engine's reason, and a too-new request keeps its `Retry-After`. `interrupted` releases are listed
+  without buttons, since the engine answers them 409; the resolve step stays on the engine API. The
   held-for-approval pages, and a bulk purge result with a held destination, now link to it. A
   release whose operation skipped its work or came back degraded says so above the result. Each
-  route asserts `approvals:approve`. The seam gains `list_approvals`, `approve_action`,
-  `reject_action` and `resolve_action`, and `PendingApprovalInfo` gains `params`,
-  `caller_is_requester` and `gated`, so the seam digest moved.
+  route asserts `approvals:approve`. The seam gains `list_approvals`, `approve_action` and
+  `reject_action`, so the seam digest moved.
 - **A session signed in through the identity provider steps up there** (`BACKLOG #296`, ADR 0142
   Amendment B). For such a session `/ui/reauth` shows no password field, only a Continue button to
   the sign-in provider. It posts to the new `POST /ui/reauth/oidc`, registered only when federation

@@ -300,6 +300,11 @@ from typing import Any
 #: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
 #: signatures changed.
 #:
+#: Batch 197 wave 2 (approvals): ``CoreHandlers`` gains a required ``resolve_action`` for the console's resolve of
+#: an interrupted release, with the ``ApprovalResolveRequest`` DTO and its ``outcome`` values.
+#: ``PendingApprovalInfo`` gains ``params``, ``caller_is_requester`` and ``gated``. An older
+#: console fails at ``UiDeps`` construction, so the digest moved for this too.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
