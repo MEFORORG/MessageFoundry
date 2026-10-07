@@ -40,11 +40,29 @@ def log_note(template: str, /, *values: object) -> None:
     ``msg.field(...)`` reads). **Every value is redacted by default** — replaced with
     :data:`TRACE_REDACTED` — so no PHI reaches the log unless :data:`_reveal` is explicitly set. Never
     raises: a diagnostic must not fail a transform (a malformed template is swallowed, not propagated)."""
+    if not _logger.isEnabledFor(logging.DEBUG):
+        return  # nothing would be emitted, so neither the format's cost nor its failure is paid
     shown: tuple[object, ...] = values if _reveal else tuple(TRACE_REDACTED for _ in values)
     try:
-        _logger.debug(template.format(*shown))
-    except (IndexError, KeyError, ValueError):
-        _logger.debug("log_note: could not format %r with %d value(s)", template, len(values))
+        line = template.format(*shown)
+    except Exception as exc:  # noqa: BLE001 - the "never raises" boundary of a diagnostic helper
+        # Exception, not a list of types, and deliberately (vault BACKLOG #2789). The format runs the
+        # template's own spec and, under the dev reveal, each value's __format__/__getattr__/
+        # __getitem__/__repr__, so what it can raise is open-ended: at least AttributeError,
+        # IndexError, KeyError, MemoryError, OverflowError, RecursionError, TypeError and ValueError
+        # are measured, and two review rounds each found one more past a fixed tuple. The contract is
+        # that a diagnostic never fails a transform, so this is the specific catch for it. It is not
+        # BaseException: KeyboardInterrupt, SystemExit and CancelledError still propagate. Not silent
+        # either: the failure is logged, by type name only, since its text can quote a slot or a
+        # revealed value.
+        _logger.debug(
+            "log_note: could not format %r with %d value(s): %s",
+            template,
+            len(values),
+            type(exc).__name__,
+        )
+        return
+    _logger.debug(line)
 
 
 def checkpoint(msg: Message, label: str = "") -> None:

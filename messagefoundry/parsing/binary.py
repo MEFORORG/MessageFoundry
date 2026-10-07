@@ -502,20 +502,37 @@ async def reattach_documents_in_hl7(
     into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle likewise fails loud via
     :func:`parse_doc_ref`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
     :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched."""
-    # Local import keeps the one-way dependency (message.py imports binary.py, never the reverse) — the
-    # cycle is broken by importing inside the function, exactly as _strip_obx_ed does.
+    # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
+    # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
+    # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
+    # there, and only the engine calls this function.
+    import asyncio
+
     from messagefoundry.parsing.message import Message
 
-    message = Message.parse(text)
-    reattached = 0
-    count = message.count_segments("OBX")
-    for occ in range(1, count + 1):
-        value = message.field("OBX-5.5", occurrence=occ) or ""
-        if not is_doc_ref(value):
-            continue
-        sha256, _content_type = parse_doc_ref(
-            value
-        )  # DocRefError on a malformed handle → fail loud
+    # The parse, each splice and the re-encode run in a thread (vault BACKLOG #2757): the splice and
+    # the encode scale with the document, and this runs on every delivery attempt. Measured 2026-10-06
+    # on SQLite with the AES-GCM cipher, the longest event-loop stall fell from 0.5-0.8 s to 0.3-0.4 s
+    # at a 64 MiB document and stayed about 0.1 s at 15 MiB: the splice's escape pass over the whole
+    # value is one string operation, which holds the GIL in any thread. Only `reader` runs on the
+    # loop, where the store read belongs. Only one thread touches `message` at a time.
+    def _handles() -> tuple[Message, list[tuple[int, str]]]:
+        message = Message.parse(text)
+        found: list[tuple[int, str]] = []
+        for occ in range(1, message.count_segments("OBX") + 1):
+            value = message.field("OBX-5.5", occurrence=occ) or ""
+            if is_doc_ref(value):
+                # DocRefError on a malformed handle -> fail loud, before any read.
+                found.append((occ, parse_doc_ref(value)[0]))
+        return message, found
+
+    message, handles = await asyncio.to_thread(_handles)
+    if not handles:
+        # No handle in any OBX-5.5 — return the ORIGINAL text unchanged (byte-identical). The caller's
+        # DOC_REF_MARKER substring gate may pass on a marker sitting outside an OBX-5.5 ED value; that is
+        # not a detached document, so it is carried through verbatim (mirrors strip's no-op return).
+        return text
+    for occ, sha256 in handles:
         verbatim = await reader(sha256)
         if verbatim is None:
             # The handle names a document the store no longer has (missing / GC'd). Fail loud rather
@@ -524,11 +541,5 @@ async def reattach_documents_in_hl7(
                 f"attachment {sha256!r} not found for re-attach (missing / GC'd); refusing to "
                 "deliver an un-hydrated document handle"
             )
-        message.set("OBX-5.5", verbatim, occurrence=occ)
-        reattached += 1
-    if reattached == 0:
-        # No handle in any OBX-5.5 — return the ORIGINAL text unchanged (byte-identical). The caller's
-        # DOC_REF_MARKER substring gate may pass on a marker sitting outside an OBX-5.5 ED value; that is
-        # not a detached document, so it is carried through verbatim (mirrors strip's no-op return).
-        return text
-    return message.encode()
+        await asyncio.to_thread(message.set, "OBX-5.5", verbatim, occurrence=occ)
+    return await asyncio.to_thread(message.encode)

@@ -644,6 +644,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     import_corepoint.add_argument(
         "--out", required=True, help="config directory to write the generated modules into"
     )
+    import_corepoint.add_argument(
+        "--force",
+        action="store_true",
+        help="replace modules already in --out under the names this import writes (without it, an "
+        "existing module is refused and nothing is written)",
+    )
     import_corepoint.add_argument("--json", action="store_true", help="emit a JSON import summary")
 
     init = sub.add_parser(
@@ -5021,11 +5027,12 @@ def _import(args: argparse.Namespace) -> int:
 
     Writes one ``@router``/``@handler`` module per channel into ``--out`` and reports the count-and-log
     summary (mapped vs. unmapped actions). The export is untrusted data — a malformed export is a clean
-    error + exit 1, never a traceback."""
+    error + exit 1, never a traceback. A module already in ``--out`` under a name this import writes
+    is refused (exit 1, naming each file, nothing written) unless ``--force`` is given."""
     from messagefoundry.corepoint_import import CorepointImportError, import_corepoint
 
     try:
-        result = import_corepoint(args.export, args.out)
+        result = import_corepoint(args.export, args.out, force=args.force)
     except (CorepointImportError, OSError, RecursionError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
@@ -5094,10 +5101,14 @@ def _init(args: argparse.Namespace) -> int:
 
 def _service(args: argparse.Namespace) -> int:
     """Control the engine's Windows service (ADR 0088). ``status`` queries state (no elevation);
-    ``start``/``stop`` elevate once via UAC; ``install`` runs scripts/service/install-service.ps1
-    elevated. The engine can't stop/start its *own* hosting service through the API, so this is a
-    local, out-of-band CLI over the Windows SCM. Off Windows the actions are no-ops (return 1) and
-    ``status`` prints ``unavailable``."""
+    ``start``/``stop`` elevate once via UAC and wait for the elevated ``net`` command; ``install``
+    runs scripts/service/install-service.ps1 elevated. The engine can't stop/start its *own* hosting
+    service through the API, so this is a local, out-of-band CLI over the Windows SCM. Off Windows
+    the actions are no-ops (return 1) and ``status`` prints ``unavailable``.
+
+    A declined UAC prompt or a failed elevation exits 1 with the reason on stderr, so a wrapper
+    script never reads a refused action as success (vault BACKLOG #2787). A service already in the
+    requested state exits 0, so ``stop`` and ``start`` are idempotent."""
     from messagefoundry import service as svc
 
     action = args.action
@@ -5121,28 +5132,56 @@ def _service(args: argparse.Namespace) -> int:
             )
             return 2
         try:
-            started = svc.install_service(str(script), args.env)
+            launched = svc.install_service(str(script), args.env)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        if not started:
+        if launched is svc.ServiceControlOutcome.DISPATCHED:
+            print(f"launched the elevated installer for environment {args.env!r}")
+            return 0
+        if launched is svc.ServiceControlOutcome.UNSUPPORTED:
             print("error: `service install` is Windows-only", file=sys.stderr)
-            return 1
-        print(f"launched the elevated installer for environment {args.env!r}")
+        else:
+            print(
+                "error: the elevated installer did not launch: the UAC prompt was declined or the "
+                "launch failed; nothing was installed",
+                file=sys.stderr,
+            )
+        return 1
+    # start / stop. Already in the requested state is success, not a failure: `net stop` of a stopped
+    # service exits non-zero, and an operator script or the uninstall path that stops first must not
+    # abort on it. Asked BEFORE elevating, so a no-op raises no UAC prompt, and again after a FAILED,
+    # for a service that reached the state while this ran.
+    wanted = "stopped" if action == "stop" else "running"
+    already = f"service {args.name!r} is already {wanted}; nothing to {action}"
+    if svc.service_state(args.name) == wanted:
+        print(already)
         return 0
-    # start / stop
     try:
-        started = svc.control_service(action, args.name)
+        outcome = svc.control_service_ex(action, args.name)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if not started:
+    if outcome is svc.ServiceControlOutcome.DISPATCHED:
+        print(f"elevated `net {action}` of service {args.name!r} completed")
+        return 0
+    if outcome is svc.ServiceControlOutcome.UNSUPPORTED:
         print(f"error: `service {action}` is Windows-only", file=sys.stderr)
-        return 1
-    print(
-        f"requested elevated `{action}` of service {args.name!r}; poll `service status` for state"
-    )
-    return 0
+    elif outcome is svc.ServiceControlOutcome.CANCELLED:
+        print(
+            f"error: the UAC prompt was declined; `service {action}` of {args.name!r} did not run",
+            file=sys.stderr,
+        )
+    elif svc.service_state(args.name) == wanted:
+        print(already)
+        return 0
+    else:
+        print(
+            f"error: `service {action}` of {args.name!r} failed: elevation failed, `net {action}` "
+            "exited non-zero, or it did not finish in time; check `service status`",
+            file=sys.stderr,
+        )
+    return 1
 
 
 def _gen_key(_args: argparse.Namespace) -> int:

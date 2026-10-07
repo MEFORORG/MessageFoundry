@@ -4775,6 +4775,15 @@ class Registry:
     # only, for the same reason as `all_loopback_inbound`: every other reader of `inbound` must keep
     # seeing only this shard's, so a map here would re-leak foreign inbounds into filtered-only paths.
     all_inbound: frozenset[str] | None = None
+    # EVERY pass-through (PT) inbound in the deployment, NAME -> its declared `deployed` flag, pinned
+    # beside the shard identity by the same filter (None on an unfiltered graph / single-shard config).
+    # A Handler's `Send` into a PT is a fact about the CONFIG, not about which shard owns the PT: the
+    # transform writes the child INGRESS row to the UNIFIED store and the owning shard's router worker
+    # drains it. Keyed off `inbound` alone, every Send into a sibling shard's PT failed at transform
+    # (vault BACKLOG #2755). The flag rides along because `transform_one` declines a Send to a
+    # not-deployed target (ADR 0111) and must decide that identically on every shard. Names and a
+    # flag only, not the connections, for the same reason as `all_loopback_inbound`.
+    all_pt_inbound: Mapping[str, bool] | None = None
 
     def inbound_names(self) -> frozenset[str]:
         """Every inbound connection NAME in the deployment — the pinned unfiltered set when this is one
@@ -4795,6 +4804,19 @@ class Registry:
         return frozenset(
             name for name, ic in self.inbound.items() if ic.spec.type is ConnectorType.LOOPBACK
         )
+
+    def passthrough_inbounds(self) -> Mapping[str, bool]:
+        """Every pass-through (PT) inbound in the deployment, NAME -> its ``deployed`` flag — the
+        pinned unfiltered map when this is one engine shard's filtered view, else derived from this
+        graph's own inbounds. The source the shard filter pins from, and the key for the PT backend
+        gate: a shard that owns no PT but Sends into a sibling's still writes PT children."""
+        if self.all_pt_inbound is not None:
+            return self.all_pt_inbound
+        return {
+            name: ic.deployed
+            for name, ic in self.inbound.items()
+            if ic.spec.type is ConnectorType.PT
+        }
 
     def add_inbound(self, conn: InboundConnection) -> None:
         _require_connection_name(conn, "inbound connection")
