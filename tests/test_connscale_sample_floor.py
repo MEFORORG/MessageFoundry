@@ -240,8 +240,8 @@ async def test_a_poller_that_never_answers_cannot_hold_the_step_open(
     that box, and only the first factor is the property. So both halves of the bound are read off the
     loop's own decisions: the poller counts the polls made after the hold ended, and the make-up
     sleeps are recorded as the delays the loop ASKED for, which no runner's speed can move. That is
-    also stricter than the stopwatch was: one extra attempt, or a make-up tick asking for twice the
-    interval, both fitted inside the old 1.05 s and both fail here."""
+    also stricter than the stopwatch was: a floor taking one extra attempt fitted inside the old
+    1.05 s, and fails here. A make-up tick asking for 2x the interval only grazed it, at 1.05 s."""
     slept: list[float] = []
     real_sleep = asyncio.sleep
 
