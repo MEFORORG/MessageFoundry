@@ -39,6 +39,17 @@ this line.**
   administrator made to the account is not listed there, and that it is emailed when it can be.
   Seam change: `AuditList` carries `withheld`, and `AdminHandlers` gains `export_audit`.
   (BACKLOG #2446)
+- **The approvals page resolves an interrupted release, and shows what each hold captured.** An
+  `interrupted` release offers the resolve, *Effects applied* or *Effects not applied*, behind a
+  required "I checked its effects" box, through `POST /ui/approvals/{id}/resolve/{outcome}`. It
+  asks for the same fresh step-up as the engine's resolve (`BACKLOG #2460`). Each row shows the
+  parameters its hold captured (`BACKLOG #2458`). Approve is not offered on the requester's own
+  request, on a row whose stored parameters are unreadable, or on a row whose operation dual
+  control no longer gates. Each such row says why and offers the reject instead, labelled
+  Withdraw on the requester's own row and Reject on anyone else's. Seam change:
+  `resolve_action` joins the handlers, and `PendingApprovalInfo` gains `params`,
+  `caller_is_requester` and `gated`. The console also imports `ResolveOutcome` from
+  `messagefoundry.api.models`, so on an older engine it fails at import, before the seam check.
 
 ### Fixed
 

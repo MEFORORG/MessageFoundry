@@ -317,12 +317,21 @@ from typing import Any
 #: ``connection_event_page`` take it as a keyword. Without it, the grant row each audit read
 #: writes made every page repeat a row. The digest moved because the DTO surface grew.
 #:
+#: Vault BACKLOG #2460 / #2458: ``CoreHandlers`` gains a required ``resolve_action`` for the
+#: console's resolve of an interrupted release, with ``ApprovalResolveRequest`` and its ``outcome``
+#: values. ``PendingApprovalInfo`` gains ``params``, ``caller_is_requester`` and ``gated``. The
+#: digest moved because the surface grew. An older console on this engine is refused at mount by the
+#: digest. A newer console on an older engine fails earlier, at import: its approvals modules import
+#: the alias ``ResolveOutcome`` from ``api.models``. The engine reports that as an installed console
+#: that failed to import (BACKLOG #1907), before any digest check runs. The digest records the
+#: alias's values, not its name, so renaming it alone would not move the digest.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "2677d024d9417ddb"
+ENGINE_UI_SEAM: str = "f52c268c93850fb8"
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,8 +422,8 @@ class CoreHandlers:
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
     # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on approve
     # and reject, so each /ui route asserts approvals:approve through require_ui, which paces a /ui
-    # write the same way. The resolve of an interrupted release is not on the seam: its JSON gate is
-    # require_step_up and the console renders those rows read-only.
+    # write the same way. The resolve of an interrupted release (BACKLOG #2460) has the JSON gate
+    # require_step_up, so its /ui route takes require_ui_step_up for the same fresh re-proof.
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]
@@ -422,6 +431,7 @@ class CoreHandlers:
     # GET /events' gates. ``list_connection_events`` above stays the unpaged bare-list read the
     # connection detail page uses.
     connection_event_page: Callable[..., Awaitable[Any]]
+    resolve_action: Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)

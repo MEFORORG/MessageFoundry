@@ -75,6 +75,7 @@ POST /ui/alerts/{alert_id}/resume
 POST /ui/alerts/{alert_id}/suspend
 POST /ui/approvals/{approval_id}/approve
 POST /ui/approvals/{approval_id}/reject
+POST /ui/approvals/{approval_id}/resolve/{outcome}
 POST /ui/cluster/force-stepdown
 POST /ui/cluster/stepdown
 POST /ui/config/reload

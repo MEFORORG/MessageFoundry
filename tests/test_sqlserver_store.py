@@ -856,6 +856,22 @@ async def test_pending_approval_store_contract(store) -> None:
     await _assert_pending_approval_contract(store)
 
 
+async def test_approval_transition_audit_contract(store) -> None:
+    """vault BACKLOG #2255 on the SQL Server backend: a request or a transition and its audit row
+    commit or roll back together, and a transition that matches no row writes no row."""
+    from tests._pending_approval_store_contract import _assert_transition_audit_contract
+
+    await _assert_transition_audit_contract(store)
+
+
+async def test_approval_repeat_request_contract(store) -> None:
+    """vault BACKLOG #2445 on the SQL Server backend: a repeat request joins the open one, and
+    concurrent repeats file one request between them."""
+    from tests._pending_approval_store_contract import _assert_repeat_request_contract
+
+    await _assert_repeat_request_contract(store)
+
+
 async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
     """BACKLOG #2624 on the real SQL Server backend: each operator mutation takes the audit applock
     inside its own transaction, at the append, so a failed append rolls it back. The applock needs that transaction open, and each mutation's first statement opens it."""
@@ -879,6 +895,14 @@ async def test_interrupted_approval_resolution_contract(store) -> None:
     from tests._pending_approval_store_contract import _assert_interrupted_resolution_contract
 
     await _assert_interrupted_resolution_contract(store)
+
+
+async def test_restart_reconcile_contract(store) -> None:
+    """BACKLOG #1562: the claim writes this backend's ``claim_owner`` column, and a restarted gate
+    moves only its own ``executing`` rows (and unowned ones) to ``interrupted``."""
+    from tests._pending_approval_store_contract import _assert_restart_reconcile_contract
+
+    await _assert_restart_reconcile_contract(store)
 
 
 async def test_directory_identity_store_contract(store) -> None:
