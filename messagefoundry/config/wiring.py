@@ -4865,6 +4865,11 @@ class Registry:
     # not-deployed target (ADR 0111) and must decide that identically on every shard. Names and a
     # flag only, not the connections, for the same reason as `all_loopback_inbound`.
     all_pt_inbound: Mapping[str, bool] | None = None
+    # The directory :func:`load_config` read this graph from, or None for a graph built in code. A
+    # `[sandbox].mode=subprocess` worker re-loads its Router/Handler functions from here, so after
+    # an operator reload from another root the workers load the root the running graph came from,
+    # not the startup dir (vault BACKLOG #3094). Carried with the graph, so it swaps atomically.
+    source_dir: Path | None = None
 
     def inbound_names(self) -> frozenset[str]:
         """Every inbound connection NAME in the deployment — the pinned unfiltered set when this is one
@@ -7305,7 +7310,8 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
     if not directory.is_dir():
         raise FileNotFoundError(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)
-    registry = Registry()
+    # Resolved, so a worker that spawns later loads this target even if a link in the path moves.
+    registry = Registry(source_dir=directory.resolve())
     # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the
     # config modules, so a module-top-level code_set(...) capture resolves. A bad/duplicate table is a
     # WiringError here (fail loud), like a bad env value; a missing codesets/ dir is fine (no tables).
