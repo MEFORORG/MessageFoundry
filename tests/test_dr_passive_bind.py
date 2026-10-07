@@ -241,8 +241,9 @@ async def test_a_failed_release_parks_a_normal_feed_a_reload_added_during_the_dr
     before the park. Red with a restore that put back only the pre-release markers: the feed a
     reload added mid-drain had none, and an alert rule bound it on an active box."""
     cfg = tmp_path / "cfg"
-    crit_port, _norm_port = _write_graph(cfg, tmp_path)
-    (added_port,) = _free_ports(1)
+    crit_port, norm_port = _write_graph(cfg, tmp_path)
+    # Those two sockets are closed now, so the OS may hand either back; skip them.
+    added_port = next(p for p in _free_ports(3) if p not in (crit_port, norm_port))
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
         rr = engine.registry_runner
         assert rr is not None
@@ -265,6 +266,33 @@ async def test_a_failed_release_parks_a_normal_feed_a_reload_added_during_the_dr
         assert not await _accepts(added_port)
         await engine.reload_detail(cfg)
         assert await _accepts(crit_port) and not await _accepts(added_port)
+
+
+async def test_a_failed_release_leaves_an_operator_start_from_before_it_unparked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0048 Decision 3: after an operator starts a parked feed, the calendar owns it again.
+    A release that fails gives it back as it was, unbound by the park but with no marker, so the
+    scheduler and an alert rule may bind it again. Parking it instead would undo that start."""
+    cfg = tmp_path / "cfg"
+    _crit_port, norm_port = _write_graph(cfg, tmp_path)
+    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+        rr = engine.registry_runner
+        assert rr is not None
+        await engine._dr_activate_profile()
+        await rr.start_inbound(_NORM, operator=True)
+        assert rr.inbound_filtered(_NORM) is None and await _accepts(norm_port)
+
+        async def failing_drain() -> tuple[int, int]:
+            raise OSError("injected release failure")
+
+        monkeypatch.setattr(engine, "_drain_pipeline", failing_drain)
+        with pytest.raises(OSError):
+            await engine._dr_release_drain()
+        assert rr.filtered_inbound() == {}
+        assert not await _accepts(norm_port)  # the park unbound it
+        await _alert_control_action(engine, "restart_inbound", _NORM)
+        assert await _accepts(norm_port)
 
 
 @pytest.mark.parametrize("norm_auto_start", [True, False], ids=["auto_start", "operator_started"])
