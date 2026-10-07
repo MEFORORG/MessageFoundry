@@ -2580,8 +2580,9 @@ class RegistryRunner:
         """Write every inbound DR marker again under the current thresholds (vault BACKLOG #3140).
 
         An idle inbound is marked when start would bind it, or when it holds a marker now or is
-        named in ``held``. That second test keeps the park of an ``auto_start = false`` feed a
-        reload parked after an operator start. A listening inbound, or a name the registry no
+        named in ``held``. That second test keeps the park of an ``auto_start = false`` feed:
+        one a reload parked after an operator start, one :meth:`park_intake` stopped, or one a
+        failed release must park again. A listening inbound, or a name the registry no
         longer declares, gets none. It reads the registry as it is now, so a feed a reload added,
         dropped or re-tiered is judged on its current tier."""
         marked = {name for (kind, name) in self._filtered if kind == "inbound"} | held
@@ -2606,9 +2607,9 @@ class RegistryRunner:
         are written again under them, so the scheduler and an alert rule still leave a feed below
         the threshold down. That includes a feed parked before the release and one a reload
         parked during it. It errs toward parking: a below-threshold feed an operator started
-        before the release is parked too. Nothing is bound here. The listeners at or above the
-        threshold that the park unbound come back on the next reload, except an ``auto_start =
-        false`` one, which needs an operator start."""
+        before the release is parked too, when the park stopped it. Nothing is bound here. The
+        listeners at or above the threshold that the park unbound come back on the next reload,
+        except an ``auto_start = false`` one, which the reload skips."""
         self._dr_threshold = state.threshold
         self._dr_standby = state.standby
         self._rewrite_inbound_parks(state.parked)
