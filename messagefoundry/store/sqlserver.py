@@ -3227,10 +3227,16 @@ class SqlServerStore:
             # wedged, so releasing the executor only on the success path would leak its threads in
             # exactly the case this except exists for.
             try:
-                pool.close()
-                await pool.wait_closed()
-            finally:
-                executor.shutdown(wait=False)
+                try:
+                    pool.close()
+                    await pool.wait_closed()
+                finally:
+                    executor.shutdown(wait=False)
+            except Exception as cleanup:
+                # Logged by class, so it never replaces the open's own error (vault BACKLOG #3054).
+                log.warning(
+                    "closing the pool after a failed open also failed (%s)", type(cleanup).__name__
+                )
             raise
         return store
 

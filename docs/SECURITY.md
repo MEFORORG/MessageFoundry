@@ -1255,7 +1255,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up` | the needle-bearing sibling of the export GET (BACKLOG #1184); same two permissions, same fail-closed-on-either behaviour, same pre-stream audit — only the criteria's carrier differs |
 | `GET` | `/messages/{message_id}` | `messages:view_raw` | `require_phi_read` | per-property redaction of the wrapper **and** each nested `OutboxInfo`/`EventInfo`; returns **no body** (BACKLOG #2345); `summary` and `metadata` come back display-masked unless the request passes `reveal_summary=true`, and the `message_view` audit row lists the properties returned complete in `revealed` (BACKLOG #2346); the error text (`error`, each `outbox[].last_error`, each `events[].detail`) comes back as a fixed `****` mask unless the request passes `reveal_errors=true`, a separate act, recorded in `revealed` as `error`, `outbox.last_error` and `events.detail` (BACKLOG #2436) |
 | `GET` | `/messages/{message_id}/raw` | `messages:view_raw` | `require_phi_read` | the raw body, as its own act: writes a `message_body_view` audit row carrying a `surface`. An HTTP caller declares `harness`, `apiclient` or `api` (the default); the engine records `console` itself for the web console's in-process call, and the query parameter does not accept it (BACKLOG #2345) |
-| `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes |
+| `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes, audited `attachment_download`; the handler's two 422 refusals (an undecodable stored value, an SVG it cannot sanitize) serve nothing and are audited `attachment_download_refused` with a `reason`; a request-validation 422 never reaches the handler and is not (BACKLOG #2387) |
 | `GET` | `/messages/{message_id}/responses` | `messages:read` | `require_phi_read` | the reply **body** additionally needs `messages:view_raw` **and** `messages:view_summary`, enforced inline at the route; without either, `body` is null |
 | `GET` | `/messages/{message_id}/outbound` | `messages:view_raw` + `messages:view_summary` | `require_phi_read` | the transformed outbound payload; one of the two-permission routes on the JSON plane, and it fails closed on either: a caller missing one gets 403 and an `auth.permission_denied` row. Owner ruling R18 makes this request the reveal act only for a `messages:view_summary` holder. Minting now refuses a custom role holding `messages:view_raw` alone, so this gate is the second line (ASVS 14.2.6, vault BACKLOG #1187) |
 | `POST` | `/messages/{message_id}/replay` | `messages:replay` | `require_step_up` | per-channel scope |
@@ -4637,16 +4637,41 @@ onto keyless rows fails the verify, and is also reported as
 | Exit | Meaning |
 |---|---|
 | `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
-| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. An error the command does not classify, such as a malformed key or a Transit outage part way through the walk, also exits 1 and prints no `FAIL` line, so by the code alone a job cannot tell it from a broken chain. |
-| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, and an empty log in a shell that holds no key and whose settings require one. |
+| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. A key, key-provider or database error that stops the check part way prints one too, such as a Transit outage or a row that is not UTF-8. That line names the error's class and its cause's class, never its text. It says the rest of the chain was not checked. Before vault BACKLOG #3054 these exited 1 or 2 with no `FAIL` line. An error the command does not classify still exits 1 with none. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
 | `5` | The chain is keyless and walked clean as plain SHA-256. This shell holds no key, and its settings require one. So the chain was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move between 4 and 5 means. |
 
 For exit 2 the verifier refuses each case rather than creating or migrating the evidence it was asked
 to check, and it opens read-only so it cannot write to that file either way. It never spends `1` on
-any of them. A store key that cannot be resolved is refused while the store opens, before it reads
-a row.
+any of them. A store key that cannot be resolved, or that is not base64 of 32 bytes, is refused
+while the store opens, before it reads a row.
+
+**A check stopped part way stays exit 1, deliberately.** Under
+`cipher_provider = "vault_transit"` each row goes to Transit for its MAC. So a row's own content can
+make Transit refuse, for example a row too large for one request. A row the driver cannot read does
+the same. A code that read as "not checked" would let a writer plant such a row and hide every
+break. The walk reports a break only when it finishes, so a break it had already met is lost too.
+The cause's class on the `FAIL` line is a hint, not a diagnosis: a refused row can also surface as
+a connection error. The open reads some of the chain's rows too, such as row 1 and the newest row.
+A driver, connection or decode error raised during those reads gets the same line and exits 1. So
+a lock or an outage at that moment also exits 1. The store marks those errors, so the split is
+by where the error arose. A driver or connection error raised anywhere else in the open is
+"could not start", exit 2. That covers at least a refused connection, a failed login
+and an unreadable path. One exception holds in the open and in the walk: a table, column,
+type or grant the read needs that is missing exits 2. It says the store does not match this
+build, not anything about a row. A failed close of the store never changes the exit code; it prints a warning
+naming the error's class. A server driver's error that carries a SQLSTATE is shown as its
+class, SQLSTATE and native error number, not its text, because a server message can quote a
+stored value. Other errors, at least a refused connection, go through the log's PHI redaction,
+which works by pattern and cannot promise to catch every value.
+
+At least one older case also exits 2 and is not a finding about the chain. An audit log emptied
+out of band, verified in a shell that holds no key and whose settings require one, exits 2: the
+store open refuses it, as the paragraph on that setup below says. A writer can cause it, so a 2
+from a job that ran clean before is worth the same look as a 1. A store-open error that quotes a
+row's text has that text cut from its line.
 
 Exits 4 and 5 are each decided by a flag the store's verify sets only in a process that holds no
 key, so nothing a database holds can turn a verify run with the key into either (vault BACKLOG
@@ -4680,7 +4705,11 @@ The warning is a sign, not a diagnosis: a clean keyless walk cannot tell a store
 from a keyed chain rewritten as keyless. Run the job with the settings and key the engine runs
 with: a keyless store then passes with exit 0 and no warning, and a keyed chain rewritten as
 keyless fails with exit 1. Do not clear the 5 by giving the job the keyless opt-out unless the
-engine runs under it too. A job that moves from 0 to 4 or 5 has at least one of these causes: it
+engine runs under it too: under the opt-out, in a shell with no key, a keyed chain rewritten whole
+as keyless exits 0 with no warning, because a keyless chain is what those settings expect. Only a
+run with the key shows that rewrite. An expected anchor that matched rules out a rewrite only
+since the anchor was taken, because a rewrite changes the head. `audit-anchor` verifies nothing, so
+an anchor taken after a rewrite matches it, and the warning names that cause. A job that moves from 0 to 4 or 5 has at least one of these causes: it
 lost the key it ran with, it lost the opt-out, or it moved from a build before #3054. Neither move
 comes from the database alone, but the database may have changed too. So find out what changed the
 job, then re-run it with the engine's settings and key. An empty log in this setup

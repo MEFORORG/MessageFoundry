@@ -369,3 +369,25 @@ def test_the_shared_hostile_xml_corpus_is_refused(name: str) -> None:
     else:
         with pytest.raises(SvgRejected):
             sanitize_svg(document)
+
+
+_PLANTED = "SYNTHETICPLANTEDSVG"
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        f'<!DOCTYPE svg [<!ENTITY {_PLANTED} "x">]><svg/>'.encode(),
+        f'<!DOCTYPE svg [<!ENTITY e SYSTEM "http://{_PLANTED}/">]><svg>&e;</svg>'.encode(),
+        f'<?xml version="1.0" encoding="x-{_PLANTED}"?><svg/>'.encode(),
+    ],
+    ids=["entity-name", "system-id", "encoding-label"],
+)
+def test_a_refusal_keeps_the_parser_error_off_its_chain(doc: bytes) -> None:
+    """The parser's error can quote sender text, so the refusal carries only its type name and
+    neither chain link reaches it (BACKLOG #2387, #1796)."""
+    with pytest.raises(SvgRejected) as caught:
+        sanitize_svg(doc)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert _PLANTED not in str(caught.value)

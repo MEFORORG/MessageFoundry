@@ -102,6 +102,7 @@ from messagefoundry.store.store import (
     StreamingAttachmentsUnsupported,
     UserRecord,
     WebAuthnCredential,
+    note_audit_chain_read,
 )
 
 log = logging.getLogger(__name__)
@@ -2800,7 +2801,25 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
     + retired decrypt-only keyring, ``write_v2=aad_bind``). Exposed so a store-DECOUPLED PHI-at-rest
     surface — the offline uploaded-logs files (ADR 0134) — encrypts under the identical DEK / keyring /
     rotation posture as the message store, without reaching into a live ``Store`` instance's private
-    cipher. No key configured → the identity cipher (plaintext), exactly like the store."""
+    cipher. No key configured → the identity cipher (plaintext), exactly like the store.
+
+    A ``ValueError`` from the build is raised as :class:`StoreCipherConfigError`, which subclasses
+    it: at least a key that is not base64 of 32 bytes, an unknown ``cipher_provider`` and a Transit
+    client setting it refuses. Each comes from the settings or the key provider before the store
+    reads a row, so a caller can treat that class as "could not start" where a bare ``ValueError``
+    from the open could mean anything (vault BACKLOG #3054, item 8)."""
+    try:
+        return _build_store_cipher(settings)
+    except ValueError as exc:
+        raise StoreCipherConfigError(str(exc)) from exc
+
+
+class StoreCipherConfigError(ValueError):
+    """The store cipher could not be built from the settings; see :func:`build_store_cipher`. Its
+    text is the build error's, which names settings and variables, never a key."""
+
+
+def _build_store_cipher(settings: StoreSettings) -> Cipher:
     if settings.cipher_provider == "vault_transit":
         # ADR 0138: bulk at-rest crypto INSIDE Vault/OpenBao Transit — the plaintext DEK never enters
         # engine heap (ASVS 13.3.3). Lazy-imported so the base install pulls no Vault SDK; fails closed at
@@ -3005,6 +3024,80 @@ def store_driver_errors() -> tuple[type[Exception], ...]:
     return tuple(errors)
 
 
+def store_connect_errors() -> tuple[type[Exception], ...]:
+    """What a store raises when it cannot reach its database, beyond :func:`store_driver_errors`
+    (vault BACKLOG #3054, item 10). At least ``OSError``, which asyncpg raises for a refused
+    connection, :class:`StoreAcquireTimeout`, a pool borrow that waited out a database that stopped
+    answering, and pyodbc's ``Error`` root. pyodbc raises the root itself for every SQLSTATE it does
+    not map, such as a missing ODBC driver (01000) or a deadlock victim (40001), and its
+    ``InterfaceError`` for a failed login (28000). The pyodbc entry is left out when it is not
+    installed."""
+    errors: list[type[Exception]] = [OSError, StoreAcquireTimeout]
+    try:
+        import pyodbc
+    except ImportError:
+        pass
+    else:
+        errors.append(pyodbc.Error)
+    return tuple(errors)
+
+
+def store_open_errors() -> tuple[type[Exception], ...]:
+    """:func:`store_driver_errors` and :func:`store_connect_errors`: at least the driver and
+    connection errors a store open can raise, on any backend."""
+    return (*store_driver_errors(), *store_connect_errors())
+
+
+def audit_chain_read_errors() -> tuple[type[Exception], ...]:
+    """What a read of the audit chain's rows can raise from the store: :func:`store_open_errors`,
+    and ``UnicodeError``, which a driver raises decoding a row's text. The one list both the open's
+    tag (:func:`~messagefoundry.store.store.note_audit_chain_read`) and ``audit-verify`` read, so
+    the two cannot drift (vault BACKLOG #3054, item 10)."""
+    return (*store_open_errors(), UnicodeError)
+
+
+def driver_sqlstate(exc: BaseException) -> str | None:
+    """The 5-character SQLSTATE a server driver's error carries, or ``None``: asyncpg's
+    ``sqlstate`` attribute, or pyodbc's first argument. Only a server driver's own error is read for
+    one, so an ``OSError("reset")`` is never given a SQLSTATE of ``reset``."""
+    state = getattr(exc, "sqlstate", None)
+    if state is None and _is_server_driver_error(exc) and exc.args:
+        state = exc.args[0]
+    if isinstance(state, str) and len(state) == 5 and state.isalnum():
+        return state
+    return None
+
+
+def _is_server_driver_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a server driver's error: one of :func:`store_driver_errors` or pyodbc's
+    root, and not SQLite's."""
+    import sqlite3
+
+    bases = [*store_driver_errors()]
+    try:
+        import pyodbc
+    except ImportError:
+        pass
+    else:
+        bases.append(pyodbc.Error)
+    return isinstance(exc, tuple(bases)) and not isinstance(exc, sqlite3.Error)
+
+
+def is_store_shape_error(exc: BaseException) -> bool:
+    """Whether ``exc`` says the store's tables, columns, types or grants are not what a read needs,
+    and not anything about a row: SQLite's schema-step error, or SQLSTATE class 42 (syntax error or
+    access rule violation). SQL Server reports at least a lock timeout and a full log under the
+    generic 42000 too, so that one counts only with native error 229 or 230, a denied permission."""
+    from messagefoundry.store.schema_verify import is_schema_step_error
+
+    if is_schema_step_error(exc):
+        return True
+    state = driver_sqlstate(exc)
+    if state == "42000":
+        return any(f"({code})" in str(exc) for code in (229, 230))
+    return state is not None and state.startswith("42")
+
+
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     """The configured SQLite path when nothing is there, else ``None``.
 
@@ -3152,7 +3245,9 @@ async def _refuse_to_start_a_keyless_chain(
         # A keyed chain is never empty, since it holds its genesis row. So an empty log is one
         # nobody has started, and this handle's first append would start it keyless.
         starts_keyless = count == 0
-    except BaseException:
+    except BaseException as exc:
+        # The anchor read is a read of the chain's newest row (vault BACKLOG #3054, item 10).
+        note_audit_chain_read(exc)
         await _close_quietly(store)
         raise
     if starts_keyless:
@@ -3164,8 +3259,14 @@ async def _close_quietly(store: Store) -> None:
     """Close ``store`` on an error path without letting a close failure replace the real error."""
     try:
         await store.close()
-    except Exception:
-        log.warning("closing the store after a failed open also failed", exc_info=True)
+    except Exception as exc:
+        # Class and SQLSTATE only: a driver's text is not this function's to vouch for (vault
+        # BACKLOG #3054), and those two are what a diagnosis needs.
+        log.warning(
+            "closing the store after a failed open also failed (%s, SQLSTATE %s)",
+            type(exc).__name__,
+            driver_sqlstate(exc),
+        )
 
 
 async def _open_backend(

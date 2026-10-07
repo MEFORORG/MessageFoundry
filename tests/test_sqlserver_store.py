@@ -4877,7 +4877,7 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     ``asyncio.run`` internally, which raises inside a running loop, so ``asyncio.to_thread`` gives it a
     fresh loop + its own pool against the same server DB."""
     from messagefoundry.__main__ import main
-    from tests._phi_gate_provisions import setenv_at_rest_opt_out
+    from tests._phi_gate_provisions import delenv_at_rest_opt_out, setenv_at_rest_opt_out
 
     # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
     # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
@@ -4888,6 +4888,16 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     assert rc == 0
     out = capsys.readouterr().out
     assert "OK:" in out and "verified 2" in out
+
+    # Vault BACKLOG #3110, item 3: the same clean keyless chain from a shell whose settings require
+    # a key exits 5 on this backend too. The exit is decided in the CLI, so this pins that nothing
+    # backend-specific sits between the walk's flag and the code.
+    delenv_at_rest_opt_out(monkeypatch)
+    rc = await asyncio.to_thread(main, ["audit-verify"])
+    captured = capsys.readouterr()
+    assert rc == 5, (captured.out, captured.err)
+    assert captured.out.startswith("NOT CHECKED: "), captured.out
+    assert "WARNING: the audit chain is keyless" in captured.err, captured.err
 
 
 async def test_audit_anchor_cli_server(store, capsys, monkeypatch) -> None:

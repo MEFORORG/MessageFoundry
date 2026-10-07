@@ -331,8 +331,9 @@ def test_a_missing_store_is_refused_rather_than_created(
     username, and must not leave an empty store behind."""
     monkeypatch.chdir(tmp_path)
     missing = tmp_path / "nope.db"
+    # 2, could not start (vault BACKLOG #3110, item 4); it was 1, the code for an account refusal.
     assert (
-        main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(missing), "--json"]) == 1
+        main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(missing), "--json"]) == 2
     )
     assert "refusing to create one" in _error(capsys)
     assert not missing.exists()

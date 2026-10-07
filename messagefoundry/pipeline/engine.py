@@ -1526,7 +1526,7 @@ class Engine:
                 self.store,
                 self._backup_settings,
                 store_settings=self._store_settings,
-                config_dir=self.config_dir,
+                config_dir=lambda: self.running_config_dir,
                 engine_version=self._engine_version,
                 instance=self._active_environment or "",
                 alert_sink=self._alert_sink,
@@ -1875,7 +1875,8 @@ class Engine:
             # ADR 0157 C6: demotion is BOUNDED — the source and dispatcher phases only. Phases after
             # them (connector aclose, executor shutdown, sandbox close) remain unbounded; they run
             # after the graph has stopped so they cannot extend the split-brain window, but do NOT
-            # describe this as 'the demotion teardown is bounded'.
+            # describe this as 'the demotion teardown is bounded'. The lookup-executor close that
+            # follows them takes the budget too; RegistryRunner._teardown_body states how.
             budget, _headroom = demote_stop_budget(
                 lease_ttl_seconds=self._cluster_settings.leader_lease_ttl_seconds,
                 fence_timeout_seconds=self._cluster_settings.leader_fence_timeout_seconds,
