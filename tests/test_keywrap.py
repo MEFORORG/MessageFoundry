@@ -39,6 +39,7 @@ from tests._approved_key_wrap import (
     PBES2,
     PBKDF2,
     SCRYPT,
+    _pfx_parts,
     approved_pfx,
     integer,
     octets,
@@ -768,6 +769,50 @@ def test_the_clear_bag_note_is_only_on_a_clear_bag_refusal(material: Material) -
     assert encrypted is not None and "rather than PBMAC1" in encrypted
     assert "no bag is encrypted" not in encrypted
     assert clear is not None and "no bag is encrypted" in clear
+
+
+def test_a_clear_bag_refusal_says_the_problem_before_the_remedy(material: Material) -> None:
+    # BACKLOG #2456. The reason, then "It is refused.", then the routes, and the no-MAC route says
+    # the file then has no integrity check. The encrypted-bag arm offers no no-MAC route at all.
+    clear = _p12_refusal(_clear_bags(material))
+    assert clear is not None
+    order = [
+        "rather than PBMAC1",
+        "It is refused.",
+        "no bag is encrypted",
+        "-pbmac1_pbkdf2",
+        "-nomac",
+    ]
+    positions = [clear.index(part) for part in order]
+    assert positions == sorted(positions), clear
+    assert "no integrity check" in clear
+    encrypted = _p12_refusal(pkcs12_bundle(material.key, _p12_cert(material.key), b"synthetic-pfx"))
+    assert encrypted is not None and "-nomac" not in encrypted
+
+
+def test_an_unreadable_mac_on_readable_bags_names_the_mac(material: Material) -> None:
+    # BACKLOG #2456. The bags read, so the refusal names the MAC rather than the whole bundle. A
+    # truncated bundle, which this reader cannot walk at all, is the control for the other text.
+    head, _ = _pfx_parts(_clear_bags(material))
+    bad_mac = seq(head, seq(integer(1)))
+    refusal = _p12_refusal(bad_mac)
+    assert refusal is not None and "carries a MAC this engine cannot read" in refusal
+    assert "-nomac" in refusal  # the bags are clear, so the clear-bag routes apply
+    whole = _p12_refusal(_clear_bags(material)[:-4])
+    assert whole is not None and "is a PKCS#12 bundle this engine cannot read" in whole
+
+
+def test_an_empty_passphrase_pbmac1_bundle_passes_only_at_the_floor(material: Material) -> None:
+    # BACKLOG #2456. An empty passphrase is a passphrase. Given as one, a PBMAC1 MAC at the floor
+    # passes; with none given, the refusal says how to give it. The PBMAC1 MAC under the floor, and
+    # cryptography's NoEncryption MAC, both keyed by the empty passphrase, are still refused.
+    clear = without_mac(_clear_bags(material))
+    at_floor = with_pbmac1(clear, b"", iterations=600_000)
+    assert _p12_refusal(at_floor, given=True) is None
+    unset = _p12_refusal(at_floor, given=False)
+    assert unset is not None and "set u to the empty string" in unset
+    for weak in (with_pbmac1(clear, b"", iterations=2048), _clear_bags(material)):
+        assert _p12_refusal(weak, given=True) is not None
 
 
 def test_an_encrypted_pkcs12_bundle_with_no_mac_is_refused(material: Material) -> None:

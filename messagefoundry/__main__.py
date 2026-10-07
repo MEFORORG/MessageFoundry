@@ -5264,8 +5264,9 @@ def _cert(args: argparse.Namespace) -> int:
 def _cert_import(args: argparse.Namespace) -> int:
     """`cert import` — import a PKCS#12/.pfx bundle into the PEM files the TLS loaders read.
 
-    The bundle passphrase comes ONLY from ``MEFOR_PFX_PASSWORD`` (absent or empty means ``password=None``,
-    which only an unencrypted bundle with no MAC can use, BACKLOG #1352); it is never a CLI arg and
+    The bundle passphrase comes ONLY from ``MEFOR_PFX_PASSWORD``. Unset means ``password=None``, which
+    only an unencrypted bundle with no MAC can use (BACKLOG #1352). Set but empty is the empty
+    passphrase, so a bundle whose PBMAC1 MAC used one can be imported (BACKLOG #2456). It is never a CLI arg and
     never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
     public; key.pem is written by :func:`_write_private_key`, which refuses to overwrite."""
@@ -5281,7 +5282,7 @@ def _cert_import(args: argparse.Namespace) -> int:
         return _cert_fail(f"cannot read --pfx {args.pfx!r}: {exc}", as_json=args.json)
 
     pw_env = os.environ.get("MEFOR_PFX_PASSWORD")
-    password = pw_env.encode() if pw_env else None
+    password = None if pw_env is None else pw_env.encode()
     from messagefoundry.keywrap import KeyWrapRefused
 
     try:

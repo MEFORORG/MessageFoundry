@@ -2877,13 +2877,22 @@ scrypt passes at its Appendix C floor.
 openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in <old key> -out <new key>
 ```
 
-**A PKCS#12 bundle for `cert import`** must have PBES2 bags at the floor and a **PBMAC1** MAC at
-the floor. A MAC keyed by the PKCS#12 KDF is refused even over SHA-256, and that is what most
-exports carry, OpenSSL's default included. **The MAC rule holds when the bags are not encrypted**
-(`-keypbe NONE -certpbe NONE`): that MAC still runs the passphrase through the PKCS#12 KDF, so it is
-refused too. So is `cryptography`'s `NoEncryption` output, whose MAC uses an empty passphrase. An
-unencrypted bundle with no MAC at all (`-nomac`) passes with no passphrase, since nothing in it
-comes from a password. Re-export with OpenSSL 3.4 or later:
+**A PKCS#12 bundle for `cert import`** passes in one of two shapes:
+
+- PBES2 bags at the floor, or unencrypted bags, with a **PBMAC1** MAC at the floor;
+- unencrypted bags with no MAC at all (`-keypbe NONE -certpbe NONE -nomac`). Nothing in it comes
+  from a password, so it needs no passphrase. **It also has no integrity check**: nothing detects a
+  change to the file, the same as a PEM key file.
+
+Every other MAC is refused, unencrypted bags or not, because it runs the passphrase through the
+PKCS#12 KDF. That holds even over SHA-256, and it is what most exports carry, OpenSSL's default
+included. It also holds when the passphrase is empty, as in `cryptography`'s `NoEncryption` output.
+
+The passphrase comes from `MEFOR_PFX_PASSWORD`. A bundle whose passphrase is empty needs that
+variable set to the empty string; unset means no passphrase. PowerShell and cmd cannot set an empty
+variable, so from those, re-export the bundle with a passphrase.
+
+Re-export with OpenSSL 3.4 or later:
 
 ```
 openssl pkcs12 -export -keypbe AES-256-CBC -certpbe AES-256-CBC -iter 600000 -pbmac1_pbkdf2 -pbmac1_pbkdf2_md sha256 -in <cert> -inkey <key> -out <new pfx>

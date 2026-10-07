@@ -296,6 +296,39 @@ def test_import_accepts_unencrypted_bags_under_an_approved_mac_or_none(
     assert (tmp_path / "a" / "key.pem").exists() and (tmp_path / "b" / "key.pem").exists()
 
 
+def test_import_accepts_a_no_mac_bundle_when_a_passphrase_is_set(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2456. Nothing in a clear, MAC-less bundle uses a passphrase, so a configured one is
+    # simply unused; it neither blocks the import nor leaks.
+    key, cert = _make_cert()
+    monkeypatch.setenv("MEFOR_PFX_PASSWORD", _CLEAR_PASS)
+    no_mac = tmp_path / "nomac.pfx"
+    no_mac.write_bytes(clear_pfx(key, cert))
+    out = tmp_path / "o"
+    assert main(["cert", "import", "--pfx", str(no_mac), "--out-dir", str(out)]) == 0
+    captured = capsys.readouterr()
+    assert _CLEAR_PASS not in captured.out + captured.err
+    assert (out / "key.pem").exists()
+
+
+def test_import_takes_an_empty_passphrase_set_as_the_empty_string(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2456. A clear bundle whose PBMAC1 MAC at the floor is keyed by the empty passphrase.
+    # Unset reads as no passphrase and is refused with the way through; set but empty imports.
+    key, cert = _make_cert()
+    pfx_path = tmp_path / "empty.pfx"
+    pfx_path.write_bytes(clear_pfx_with_mac(key, cert, b"", "pbmac1"))
+    monkeypatch.delenv("MEFOR_PFX_PASSWORD", raising=False)
+    assert main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(tmp_path / "a")]) == 2
+    assert "MEFOR_PFX_PASSWORD to the empty string" in capsys.readouterr().err
+    monkeypatch.setenv("MEFOR_PFX_PASSWORD", "")
+    assert main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(tmp_path / "b")]) == 0
+    capsys.readouterr()
+    assert (tmp_path / "b" / "key.pem").exists()
+
+
 def test_import_accepts_the_approved_bundle_with_a_ca_chain(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
