@@ -1208,3 +1208,77 @@ def test_r7_control_a_relative_builtins_module_keeps_inert_names() -> None:
     line = len(src.splitlines())
     edit = _edit("set_params", line, params={"to": {"expr": "OB_DEST"}})
     assert "return Send(OB_DEST, msg)" in rewrite_source(src, edit)
+
+
+# --- review of 11f5ddd5c4..b0beb2f930 -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        "import sys\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    getattr(sys._getframe(), "f_globals")["OB_DEST"] = 1\n',
+        "import sys\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    getattr(sys, "modules")[__name__].OB_DEST = 1\n',
+        "import sys\nfrom operator import attrgetter\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    attrgetter("modules")(sys)[__name__].OB_DEST = 1\n',
+        "from sys import modules\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        "    modules[__name__].OB_DEST = 1\n",
+        'locals()["OB_DEST"] = 1\n',
+        "import sys\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    sys._getframe().f_builtins["globals"]()["OB_DEST"] = 1\n',
+    ],
+    ids=[
+        "getattr-f_globals",
+        "getattr-modules",
+        "from-attrgetter",
+        "from-modules",
+        "locals",
+        "f_builtins",
+    ],
+)
+def test_r8_routes_to_module_globals_void_inert_names(write: str) -> None:
+    src = (
+        f'OB_DEST = "OB_X"\n\n\n{write}\n\n@handler("H")\ndef h(msg):\n    return Send("OB", msg)\n'
+    )
+    line = len(src.splitlines())
+    _refused(src, _edit("set_params", line, params={"to": {"expr": "OB_DEST"}}), match=REFUSED)
+
+
+# --- Lander review of PR 2154: indexes inside a field read --------------------------------------
+
+_OCC = """\
+OCC = 2
+
+
+@handler("H")
+def h(msg):
+    for i in range(1, msg.count_segments("OBX") + 1):
+        pass
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize(
+    ("read", "ok"),
+    [
+        ('msg.field("OBX-5", occurrence=0)', False),
+        ('msg.field("OBX-5", occurrence=OCC)', False),
+        ('msg.field("OBX-5", repetition=0)', False),
+        ('msg.field("OBX-5", occurrence=2)', True),
+        ('msg.field("OBX-5", occurrence=i + 1)', True),
+        ('msg.field("OBX-5", repetition=None)', True),
+    ],
+)
+def test_r9_an_index_inside_a_field_read_is_1_or_more(read: str, ok: bool) -> None:
+    edit = _edit(
+        "insert_row",
+        7,
+        position="before",
+        action="set_field",
+        params={"path": "OBX-3", "value": {"expr": read}},
+    )
+    if ok:
+        assert read in rewrite_source(_OCC, edit)
+    else:
+        _refused(_OCC, edit, match=REFUSED)

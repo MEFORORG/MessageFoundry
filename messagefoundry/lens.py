@@ -4291,8 +4291,14 @@ def _is_field_call(node: ast.expr, *, scope: _Scope) -> bool:
         and all(
             kw.arg in ("occurrence", "repetition")
             and (
-                (isinstance(kw.value, ast.Constant) and type(kw.value.value) is int)
-                or (isinstance(kw.value, ast.Name) and kw.value.id in scope.numeric)
+                # The same 1-or-more rule as a top-level occurrence (Lander review of PR 2154):
+                # ``occurrence=0`` or ``occurrence=OCC`` raises ValueError on every message.
+                _is_index_value(kw.value, scope)
+                or (
+                    kw.arg == "repetition"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is None
+                )
             )
             for kw in node.keywords
         )
@@ -4588,7 +4594,7 @@ def _table_scope(scope: _Scope) -> _Scope:
 _NO_NAMES = _Scope(frozenset({"msg"}), frozenset(), frozenset())
 
 #: Builtins that let a module rebind its own globals where :func:`_inert_module_literals` cannot see.
-_GLOBALS_WRITERS = frozenset({"globals", "vars", "exec", "eval", "setattr", "__import__"})
+_GLOBALS_WRITERS = frozenset({"globals", "locals", "vars", "exec", "eval", "setattr", "__import__"})
 
 #: Attributes that reach a module's globals: ``h.__globals__``, ``sys.modules``, ``mod.__dict__``.
 _GLOBALS_ATTRS = frozenset(
@@ -4598,6 +4604,8 @@ _GLOBALS_ATTRS = frozenset(
         "__builtins__",
         "modules",
         "f_globals",
+        "f_locals",
+        "f_builtins",
         "__getattribute__",
         "attrgetter",
     }
@@ -4768,7 +4776,14 @@ def _reaches_globals(n: ast.AST, safe_getattr: set[int]) -> bool:
     if isinstance(n, ast.Import):
         return any(al.name.split(".")[0] in _BUILTINS_ROUTES for al in n.names)
     if isinstance(n, ast.ImportFrom):
-        return not n.level and (n.module or "").split(".")[0] in _BUILTINS_ROUTES
+        if n.level:
+            return False
+        # ``from sys import modules`` or ``from operator import attrgetter`` binds a plain name
+        # that the attribute check never sees (review of b0beb2f930, findings 2 and 3).
+        imported = {al.name for al in n.names}
+        return (n.module or "").split(".")[0] in _BUILTINS_ROUTES or bool(
+            imported & (_GLOBALS_ATTRS | _GLOBALS_WRITERS)
+        )
     return False
 
 
@@ -4783,6 +4798,7 @@ def _safe_getattr_names(tree: ast.Module) -> set[int]:
                 isinstance(name, ast.Constant)
                 and isinstance(name.value, str)
                 and not _is_dunder(name.value)
+                and name.value not in _GLOBALS_ATTRS
             ):
                 out.add(id(n.func))
     return out
