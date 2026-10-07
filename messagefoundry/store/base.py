@@ -1858,7 +1858,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Insert one account row.
 
@@ -1875,8 +1875,9 @@ class AuthStore(Protocol):
         is bound as the notification address instead: an administrator's checked address for a
         directory account created without a sign-in (BACKLOG #2021).
 
-        ``audit``, when given, is appended to the audit chain in the SAME transaction as the INSERT,
-        so the two commit or roll back together, then teed off-box (BACKLOG #2100)."""
+        ``audits`` are appended to the audit chain, in order, in the SAME transaction as the INSERT,
+        so the account and its records commit or roll back together, then teed off-box (BACKLOG
+        #2100, #2221)."""
         ...
 
     async def get_user(self, user_id: str) -> UserRecord | None: ...
@@ -2031,7 +2032,13 @@ class AuthStore(Protocol):
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-    ) -> None: ...
+        audits: Sequence[AuditAppend] = (),
+    ) -> None:
+        """Write the account's profile fields, never ``notify_email`` (BACKLOG #1139).
+
+        ``audits`` commit in the SAME transaction as the UPDATE, as ``create_user``'s do (BACKLOG
+        #2221)."""
+        ...
 
     # The ONLY writer of ``users.notify_email`` after account creation, which seeds it once from the
     # address it was given (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security notice is addressed
