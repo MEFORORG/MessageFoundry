@@ -1414,7 +1414,7 @@ async def _audit_refused_reload(
         action = "config_reload_denied"
         status, answer = 403, "config directory is not an allowed reload root"
     elif isinstance(exc, FileNotFoundError):
-        _log.warning("config reload failed (missing dir): %s", scrub_log_argument(str(exc)))
+        _log.warning("config reload failed (missing dir): %s", scrub_log_argument(safe_exc(exc)))
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     else:
@@ -1422,7 +1422,7 @@ async def _audit_refused_reload(
         _log.warning(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
-            scrub_log_argument(str(exc)),
+            scrub_log_argument(safe_exc(exc)),
         )
         action = "config_reload_failed"
         detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
@@ -1431,9 +1431,11 @@ async def _audit_refused_reload(
     try:
         await engine.store.record_audit(action, actor=actor, detail=row, client=client)
     except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
-        # The exc above and this row carry the caller's requested directory, so every log line
-        # here is scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps``
-        # already escaped the row, so the scrub leaves it byte-identical and parseable.
+        # The exc above and this row carry the caller's requested directory, so their arguments
+        # are scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps``
+        # already escaped the row, so the scrub leaves it byte-identical and parseable. The
+        # traceback is not an argument: a caller's chained refusal can still carry the directory
+        # into it, and only the handler's ControlCharScrubFilter escapes that.
         _log.exception(
             "a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
             action,

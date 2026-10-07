@@ -811,8 +811,9 @@ async def test_a_lost_refusal_row_cannot_forge_a_log_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """CodeQL py/log-injection on PR 2115. A refused reload logs the caller's requested directory
-    twice: in the refusal WARNING and in the lost-row ERROR. Neither may start a new line, and the
-    lost row must still parse back to the detail that was lost."""
+    twice: in the refusal WARNING and in the lost-row ERROR. Neither message may start a new line,
+    and the lost row must still parse back to the detail that was lost. This reads the messages,
+    not a traceback: a route's chained refusal is left to the handler filter, as app.py says."""
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         status, _answer = await _audit_refused_reload(
             _AUDIT_DOWN,

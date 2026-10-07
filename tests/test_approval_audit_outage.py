@@ -426,20 +426,13 @@ def test_the_logging_sink_logs_audit_write_failed(caplog: pytest.LogCaptureFixtu
 # --- CodeQL py/log-injection: a lost request row cannot forge a log line (PR 2115) --------------
 
 
-class _RequestWriteFails(_StandingStore):
-    """The real store, failing the one write that files a request and its approval.requested row."""
-
-    async def create_pending_approval(self, **kwargs: Any) -> Any:
-        raise sqlite3.OperationalError(_FAULT)
-
-
 async def test_a_lost_request_row_cannot_forge_a_log_line(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The lost-detail ERROR names the requester, a username. A CR or LF in it must not start a new
     log line. caplog's handler has no ControlCharScrubFilter, so this reads the call site's scrub."""
     sink = _Sink()
-    gate = _gate(_RequestWriteFails(store), sink)
+    gate = _gate(_Faulty(store, audit_fails=("approval.requested",)), sink)
     with (
         caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"),
         pytest.raises(sqlite3.OperationalError),
