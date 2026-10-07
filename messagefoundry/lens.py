@@ -4274,7 +4274,8 @@ def _insert_value_policy(call: str, pname: str) -> str:
 def _is_field_call(node: ast.expr, *, scope: _Scope) -> bool:
     """Whether ``node`` is ``msg.field("LIT")`` with only ``occurrence=``/``repetition=`` keywords whose
     values are 1 or more on every message (:func:`_is_index_value`: int arithmetic, a 1-based
-    For-Each index such as ``occurrence=i``, or that index plus a non-negative literal), or a
+    For-Each index such as ``occurrence=i``, or that index with a non-negative literal added on
+    either side, ``i + 1`` or ``2 + i``), or a
     ``repetition=None``.
 
     Stricter than :func:`_is_bounded_message_read`, which also admits extra POSITIONAL constants:
@@ -4294,7 +4295,9 @@ def _is_field_call(node: ast.expr, *, scope: _Scope) -> bool:
             kw.arg in ("occurrence", "repetition")
             and (
                 # The same 1-or-more rule as a top-level occurrence (Lander review of PR 2154):
-                # ``occurrence=0`` or ``occurrence=OCC`` raises ValueError on every message.
+                # ``occurrence=0`` raises ValueError on every message. ``occurrence=OCC`` is
+                # refused because the lens does not bound a module name's value, not because it
+                # always raises (Manager decision 2026-10-07: conservative, fails closed).
                 _is_index_value(kw.value, scope)
                 or (
                     kw.arg == "repetition"
@@ -4758,20 +4761,27 @@ _BUILTINS_ROUTES = frozenset({"builtins", "__builtins__", "importlib"})
 
 
 def _reaches_globals(n: ast.AST, safe_getattr: set[int]) -> bool:
-    """Whether ``n`` may let the module rebind its own globals where the inert check cannot see.
+    """Whether ``n`` is one of the routes this check knows by which a module could rebind its own
+    globals where the inert check cannot see.
 
-    Covered: a :data:`_GLOBALS_WRITERS` name; a :data:`_GLOBALS_ATTRS` attribute (``h.__globals__``,
-    ``sys.modules``); ANY touch of ``builtins``, ``__builtins__`` or ``importlib``, whether by name,
-    import or alias (``import builtins as b``, ``from builtins import globals as g``); and a
-    ``getattr`` used any way but a direct call with a non-dunder string literal name, so an alias
-    (``ga = getattr``) counts too (Lander review of 71fe1207f4, finding 4). ``safe_getattr`` holds
-    the ``id`` of each ``getattr`` name node that IS such a direct call, and whose name is not in
-    :data:`_GLOBALS_ATTRS`. ``locals``, a frame's ``f_globals``, ``f_locals`` and ``f_builtins``,
-    ``__getattribute__`` and ``operator.attrgetter`` count too, and so does an absolute
-    ``from X import <name>`` of any of those names (``from sys import modules``). A relative import
-    from a sibling module named ``builtins`` does not count. This is a deny list, so a bypass not
-    listed here remains possible: a re-export under another name, ``inspect.getmodule``, a
-    self-import and the like are known to pass."""
+    It catches at least these shapes:
+
+    * a bare name in :data:`_GLOBALS_WRITERS` (``globals``, ``locals``, ``exec`` and the like) or in
+      :data:`_BUILTINS_ROUTES` (``builtins``, ``__builtins__``, ``importlib``);
+    * an attribute named in :data:`_GLOBALS_ATTRS` (``h.__globals__``, ``sys.modules``, a frame's
+      ``f_globals``, ``operator.attrgetter``);
+    * ``import builtins`` or ``importlib`` under any alias, and an absolute ``from X import <name>``
+      where ``X`` is one of those modules or ``<name>`` is in any of the three sets
+      (``from sys import modules``, ``from inspect import builtins as b``);
+    * a ``getattr`` name used any way but a direct call whose attribute name is a non-dunder string
+      literal outside those sets (``safe_getattr`` holds the ``id`` of each such safe call).
+
+    It is a deny list and does NOT catch every route. Known to pass: ``inspect.builtins.globals()``,
+    a ``match`` class pattern capturing ``__globals__``, ``pkgutil.resolve_name`` and other
+    resolver strings, ``inspect.getmodule``, ``gc.get_referrers``, a self-import, a re-export under
+    another name, and a relative import. Each needs hand-written code that deliberately hides a
+    module global; that is outside this guard's scope, which is analyst edits through the lens and
+    accidental flows (Manager decision 2026-10-07, on PR 2155)."""
     if isinstance(n, ast.Name):
         if n.id == "getattr":
             return id(n) not in safe_getattr
@@ -4783,18 +4793,24 @@ def _reaches_globals(n: ast.AST, safe_getattr: set[int]) -> bool:
     if isinstance(n, ast.ImportFrom):
         if n.level:
             return False
-        # ``from sys import modules`` or ``from operator import attrgetter`` binds a plain name
-        # that the attribute check never sees (review of b0beb2f930, findings 2 and 3).
+        # ``from sys import modules`` or ``from inspect import builtins`` binds a plain name that
+        # the attribute check never sees (review of b0beb2f930, findings 2 and 3; Lander review of
+        # 21159e57d6).
         imported = {al.name for al in n.names}
         return (n.module or "").split(".")[0] in _BUILTINS_ROUTES or bool(
-            imported & (_GLOBALS_ATTRS | _GLOBALS_WRITERS)
+            imported & _GLOBALS_ROUTE_NAMES
         )
     return False
 
 
+#: Every name :func:`_reaches_globals` treats as a route when it is imported or fetched by name.
+_GLOBALS_ROUTE_NAMES = _GLOBALS_ATTRS | _GLOBALS_WRITERS | _BUILTINS_ROUTES
+
+
 def _safe_getattr_names(tree: ast.Module) -> set[int]:
-    """The ``id`` of each ``getattr`` name that is called directly with a non-dunder string literal
-    as its attribute name (:func:`_reaches_globals`)."""
+    """The ``id`` of each ``getattr`` name that is called directly with a string literal attribute
+    name that is not a dunder and not in :data:`_GLOBALS_ROUTE_NAMES`, so
+    ``getattr(inspect, "builtins")`` is not safe (:func:`_reaches_globals`)."""
     out: set[int] = set()
     for n in ast.walk(tree):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "getattr":
@@ -4803,7 +4819,7 @@ def _safe_getattr_names(tree: ast.Module) -> set[int]:
                 isinstance(name, ast.Constant)
                 and isinstance(name.value, str)
                 and not _is_dunder(name.value)
-                and name.value not in _GLOBALS_ATTRS
+                and name.value not in _GLOBALS_ROUTE_NAMES
             ):
                 out.add(id(n.func))
     return out
@@ -4821,12 +4837,13 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
     ``"code_set"`` (when any binding is a ``code_set`` capture) or ``"other"``.
 
     Manager decision 2026-10-07 (Lander review of PR 2155, finding 7; PR 2154 F6). A name qualifies
-    only when EVERY binding of it at module scope is ``NAME = <literal>`` of an immutable type
-    (:func:`_literal_kind`), and nothing anywhere in the module mutates it: no attribute call on it,
-    no attribute or subscript store or delete through it, no augmented assignment. So ``SEEN = []``
-    never qualifies: ``SEEN.append(msg.field("PID-3"))`` fills it from the message. A star import, or
-    a use of a builtin in :data:`_GLOBALS_WRITERS`, can rebind any global unseen, so either one leaves
-    no name inert."""
+    only when it has exactly ONE binding at module scope, ``NAME = <literal>`` of an immutable type
+    (:func:`_literal_kind`), and nothing in the module mutates it: no attribute call on it, no
+    attribute or subscript store or delete through it, no augmented assignment. So ``SEEN = []``
+    never qualifies: ``SEEN.append(msg.field("PID-3"))`` fills it from the message. A star import,
+    or any route :func:`_reaches_globals` knows, leaves no name inert. That check is a deny list:
+    hand-written code that deliberately rebinds a global by a route it does not know is outside its
+    scope (Manager decision 2026-10-07, on PR 2155)."""
     values: dict[str, list[ast.expr | None]] = {}
     binds: dict[str, int] = {}
     pending: list[ast.AST] = list(tree.body)

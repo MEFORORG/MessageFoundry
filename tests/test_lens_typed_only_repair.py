@@ -1282,3 +1282,25 @@ def test_r9_an_index_inside_a_field_read_is_1_or_more(read: str, ok: bool) -> No
         assert read in rewrite_source(_OCC, edit)
     else:
         _refused(_OCC, edit, match=REFUSED)
+
+
+# --- Lander review of 21159e57d6: the two cheap closes -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        "import inspect\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    getattr(inspect, "builtins").globals()["OB_DEST"] = 1\n',
+        'import os\n\n\ndef poke():  # type: ignore[no-untyped-def]\n    getattr(os, "globals")\n',
+        "from inspect import builtins as b\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    b.globals()["OB_DEST"] = 1\n',
+    ],
+    ids=["getattr-builtins-literal", "getattr-writer-literal", "from-import-builtins"],
+)
+def test_r10_a_literal_route_name_voids_inert_names(write: str) -> None:
+    src = (
+        f'OB_DEST = "OB_X"\n\n\n{write}\n\n@handler("H")\ndef h(msg):\n    return Send("OB", msg)\n'
+    )
+    line = len(src.splitlines())
+    _refused(src, _edit("set_params", line, params={"to": {"expr": "OB_DEST"}}), match=REFUSED)
