@@ -867,8 +867,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         caller's own requests elsewhere keep writing ``auth.*`` rows under their name. The pin is a
         timestamp, never a row id, for the reason :mod:`messagefoundry.api.paging` gives."""
 
-        # Pass ``identity.username`` at each call, never through a local alias: the username
-        # access-key screen reads the argument's own text, so an alias hides both calls from it.
+        # Pass ``identity.username`` at each call, never through a local alias. The username
+        # access-key screen matches the argument's shape, and an alias hides both calls from it.
         async def read(n: int, skip: int, pin: float | None) -> list[dict[str, Any]]:
             return await service.security_events_for(
                 identity.username, limit=n, offset=skip, until=pin
