@@ -4045,21 +4045,25 @@ uses the same host gate as `admin-unlock`.
    stored. It also refuses an Administrator who is not the only enabled one, and names another:
    that administrator resets the account from the web console (Users, Reset MFA).
 2. It shows a new key and its `otpauth://` URI on the console only, never on stdout or stderr. The
-   URI names the new entry `<name> (replaced <date>)`, so the app lists it apart from the old one.
-   Add it as a new entry and type the code it shows.
+   URI names the new entry `<name> (replaced <date>-<time>)`, so the app lists it apart from the
+   old one. Add it as a new entry and type the code it shows.
 3. Only after a good code does it write. One transaction swaps the seed and the recovery codes,
    ends every session of the account and writes the audit row, and it leaves TOTP on throughout.
    So the account never has no factor, and the swap is never live unrecorded. A wrong code, a lost
    console or a refused audit row writes nothing, and the old entry keeps working. So does a
    removal or a new enrolment that lands while you type: the write checks the enrolment it read.
+   When it writes nothing after showing the key, it tells you to delete the new entry.
 4. It shows the new recovery codes on the console once. The old entry and the old codes stop
    working. Delete the old entry, the one named after the bare username, from the app.
 
 The audit row is `auth.admin_totp_reset`, naming the OS user. After it, the command sends the
 account an `mfa_enabled` notice where a relay is configured. It keeps passkeys and says so when the
 account has one; remove one from the web console if its device may be compromised too. It does not
-clear a lockout; run `admin-unlock` for that. If anything fails after the write, the command says
-the seed WAS replaced and still shows the new codes. Another account's authenticator is reset from
+clear a lockout; run `admin-unlock` for that. When the store reports an error during or after the
+write, the command re-reads the account. Where it finds the new seed, it says the seed WAS replaced,
+shows the new codes and exits 3. Where it cannot re-read, it exits 3 and says the outcome is
+unknown: keep both entries and try the new one first. A refusal exits 1 and has written nothing.
+Another account's authenticator is reset from
 the web console (Reset MFA), because a host-run replacement would leave the new seed with whoever
 ran it.
 

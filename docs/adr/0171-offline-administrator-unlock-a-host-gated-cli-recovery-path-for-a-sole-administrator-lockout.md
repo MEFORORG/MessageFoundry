@@ -170,10 +170,14 @@ order:
    pins the account's id and its `totp_enrolled_at`.
 2. It generates a new seed in memory and shows the key and its URI on the console device, never on
    stdout or stderr. It uses the same terminal enrolment as `provision-admin` (ADR 0197
-   Amendment A). The URI labels the entry `<username> (replaced <date>)`, so the app lists it apart
-   from the old entry, which carries the bare username; the prompt says which one to delete. The
-   operator adds the seed to the authenticator app and types a code. Five wrong codes, or no
-   terminal, refuse with nothing written.
+   Amendment A). The URI labels the entry `<username> (replaced <date>-<time>)`, so the app lists
+   it apart from the old entry, which carries the bare username, and apart from a second run's
+   entry; the prompt says which one to delete. There is no colon in it, because the URI's label
+   uses one to separate the issuer. The operator adds the seed to the authenticator app and types
+   a code. Five wrong codes, or no terminal, refuse with nothing written. The command names the OS
+   user for the audit row before the key is shown, so a shell that cannot name one is refused
+   before the operator enrols anything. Every refusal after the key was shown tells the operator
+   to delete the new entry, whose seed was never stored.
 3. It reopens the store, asks the same refusals again, refuses a row whose id changed, and makes
    **one transaction**, `replace_totp_enrolment`. That writes the new seed, new recovery-code hashes
    and the proving code's step, ends every session of the account, and appends the audit row. Its
@@ -271,15 +275,30 @@ transaction, the shape `create_user` already uses for BACKLOG #2100: the swap an
 together or not at all. The pre-check still runs before the key is shown, so the ordinary refusal
 costs the operator no enrolment.
 
-**After the commit, nothing may hide the swap.** Only the store's close, the codes on the console
-and the notice are left. The codes are shown first, then the notice runs, best effort. A failure
-after the commit is reported as what it is: the seed WAS replaced, and the codes are still shown.
+**An error does not say whether the commit landed, so the command reads it back.** On a server
+backend an error can follow the COMMIT: a lost acknowledgment, or a pool release that fails after
+the transaction ended. So when the swap raises, the command re-reads the stored seed before it
+says anything.
+
+| the re-read finds | the command says | exit |
+|---|---|---|
+| the old seed, and the error was a store refusal | nothing was written; the old entry still works; delete the new one | 1 |
+| the new seed | the seed WAS replaced, then something failed; the new codes are shown | 3 |
+| nothing, because it failed too | the outcome is UNKNOWN; keep both entries and try the new one; the codes are shown | 3 |
+
+A failure after a confirmed commit, the store's close or a Ctrl-C included, takes the second row.
+After the commit only the store's close, the codes on the console and the notice are left. The
+codes are shown first, then the notice runs, best effort. **Exit 3 is new to this command and
+deliberate:** 1 is a refusal that wrote nothing and 2 is "could not start", and a script reading
+only the code must not take a replaced seed for either. The `--json` body carries `"replaced":
+true` and the report fields beside the error.
 
 ### A named store method, on all three backends
 
 `replace_totp_enrolment` joins the Store protocol, on SQLite, PostgreSQL and SQL Server. It takes
 the pinned `expected_enrolled_at` and an `AuditAppend`, and returns the number of sessions ended, or
-`None` when it wrote nothing. No existing method can swap the seed with TOTP on. `enable_totp` writes only where TOTP is off, and
+`None` when it wrote nothing. No existing method can swap the seed with TOTP on. `enable_totp`
+writes only where TOTP is off, and
 `set_totp_secret` leaves the old recovery codes and step. Every composition of the existing methods
 passes through a state the property above forbids. The shared TOTP store contract,
 `tests/_webauthn_store_contract.py`, covers the method on every backend.
@@ -290,6 +309,12 @@ passes through a state the property above forbids. The shared TOTP store contrac
   database, so it grants nothing new. It does not stop such a person enrolling their own seed on the
   Administrator; the audit row and the notice record that it happened.
 - "Run it with the engine stopped" is documented, not checked. The compare-and-set write, and the
-  session sweep in its transaction, narrow what a live engine could race.
+  session sweep in its transaction, narrow what a live engine could race. They pin the TOTP
+  enrolment only. A role removal, a disable or a newly enabled peer Administrator that lands in the
+  moment between the second refusal check and the UPDATE is not caught; with the engine stopped
+  nothing can make one.
+- The sole-Administrator check is a fourth copy of the enabled-Administrator predicate, beside the
+  three in `AuthService`, and it reads the roles one user at a time, as `is_last_enabled_admin`
+  does. One shared query for the predicate is unbuilt.
 - A store key that cannot be resolved exits 2 here, as it does for `provision-admin`.
   `admin-unlock` does not route that error yet.
