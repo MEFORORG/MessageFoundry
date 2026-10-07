@@ -28,7 +28,9 @@ def escapes(ch: str) -> list[str]:
     to catch. ``\\xe9`` identifies the character exactly; it is a disclosure, not a redaction."""
     return [
         ch,
-        ch.encode("unicode_escape").decode("ascii"),  # '\xe9' / '病'
+        ch.encode("unicode_escape").decode(
+            "ascii"
+        ),  # '\xe9', and a backslash-u escape for CJK_CHAR
         f"{ord(ch):x}",  # 'e9' / '75c5'
         f"\\u{ord(ch):04x}",  # '\\u00e9': a \u escape below U+0100, which unicode_escape never writes
         repr(ch),

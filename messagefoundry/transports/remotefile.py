@@ -1984,8 +1984,9 @@ class RemoteFileDestination(DestinationConnector):
         # the fallback, so it is refused here.
         _check_template_fits(self._filename_template, "", FILENAME_MAX_BYTES)
         self._overwrite = bool(s.get("overwrite", False))
-        # An explicit None is "not declared", as on the source: utf-8. Left None, .encode(None)
-        # raised a TypeError that reached the internal-error arm (vault BACKLOG #3044).
+        # An explicit None is "not declared": utf-8, as the source's batch split reads it. Left
+        # None, .encode(None) raised a TypeError that reached the internal-error arm (vault
+        # BACKLOG #3044).
         self._encoding: str = s.get("encoding") or "utf-8"
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (ensure_dir creates the upload dir on the first send). When on, remote_dir
@@ -2077,8 +2078,7 @@ class RemoteFileDestination(DestinationConnector):
         # server. The remote path limit is the partner's and is not known here, so there is no
         # directory budget; a server refusal is classified by its own reply.
         # The shared helper, not a bare .encode(): a UnicodeEncodeError names a character of the
-        # message and holds the WHOLE payload on `.object` (#1920). It runs first, before any I/O
-        # and before the name is rendered from the message, so the name cannot reach the refusal.
+        # message and holds the WHOLE payload on `.object` (#1920). It runs first, before any I/O.
         # Not a _RemoteError, so send() lets it through and the row dead-letters under either
         # internal_error policy. The label is fixed: the stored error is cut short, and a label
         # carrying host:remote_dir as one long token was dropped whole (vault BACKLOG #3044).
