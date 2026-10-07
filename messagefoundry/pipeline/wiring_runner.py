@@ -2559,15 +2559,19 @@ class RegistryRunner:
         status says why its outbound has no connector. A ``standby`` also parks, at once, each
         inbound that would bind and is not listening, which after a release is every one, so the
         scheduler or an alert rule's restart cannot bind it before that reload (vault BACKLOG
-        #3140)."""
-        if standby is None and self._dr_standby is not None:
-            # Leaving the passive standby: its inbound markers go, and the reload that follows
-            # writes the profile's own. Until then the door refuses what the profile parks.
+        #3140). Leaving the standby swaps its markers for the profile's, at once, for the same
+        reason."""
+        leaving = standby is None and self._dr_standby is not None
+        if leaving:
+            # The standby's markers park every inbound. The profile's, written below, park only the
+            # ones under its threshold. The scheduler and an alert rule read them, so without them a
+            # box still active after a failed release bound a below-threshold feed (vault BACKLOG
+            # #3140), and so could a tick before an activation's reload.
             for key in [k for k in self._filtered if k[0] == "inbound"]:
                 del self._filtered[key]
         self._dr_threshold = threshold
         self._dr_standby = standby
-        if standby is not None:
+        if standby is not None or leaving:
             for name, ic in self.registry.inbound.items():
                 if name not in self._sources and inbound_listener_starts(ic):
                     self._dr_filters_out(name, ic.priority, kind="inbound")
@@ -2806,8 +2810,9 @@ class RegistryRunner:
     def _dr_refuses(self, name: str, *, operator: bool) -> bool:
         """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
         #3140). The fence is enforced here, at the door, so no engine path binds a listener on a
-        passive box whatever its ``filtered`` marker says; the marker only reports the park. An operator start overrides it, as ADR 0048
-        Decision 3 says. An unknown or not-deployed name is not refused, so it still raises."""
+        passive box whatever its ``filtered`` marker says; the marker only reports the park. An
+        operator start overrides it, as ADR 0048 Decision 3 says. An unknown or not-deployed name
+        is not refused, so it still raises."""
         ic = self.registry.inbound.get(name)
         if operator or ic is None or not ic.deployed:
             return False

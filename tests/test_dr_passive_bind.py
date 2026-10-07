@@ -160,3 +160,62 @@ async def test_no_engine_door_binds_a_listener_while_a_release_drains(
         await engine._dr_release_drain()
         assert mid_drain == [False]
         assert _CRIT in rr.filtered_inbound()
+
+
+async def test_a_release_whose_drain_fails_keeps_the_profile_parking_the_normal_feed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed drain leaves the box active, so the profile still parks the normal feed. Red at
+    ``dcbeb5de0b``: leaving the standby purged every inbound marker, and an alert rule's restart
+    then bound the below-threshold listener on a box that was still serving the DR profile."""
+    cfg = tmp_path / "cfg"
+    crit_port, norm_port = _write_graph(cfg, tmp_path)
+    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+        rr = engine.registry_runner
+        assert rr is not None
+        await engine._dr_activate_profile()
+
+        async def failing_drain() -> tuple[int, int]:
+            raise RuntimeError("drain query failed")
+
+        monkeypatch.setattr(engine, "_drain_pipeline", failing_drain)
+        with pytest.raises(RuntimeError, match="drain query failed"):
+            await engine._dr_release_drain()
+        assert engine.dr_active and rr.dr_standby is None
+        assert rr.inbound_filtered(_NORM) is not None
+        await _alert_control_action(engine, "restart_inbound", _NORM)
+        assert not await _accepts(norm_port)
+        # Still active, so the operator's reload binds the critical set again and nothing else.
+        await engine.reload_detail(cfg)
+        assert await _accepts(crit_port) and not await _accepts(norm_port)
+
+
+async def test_a_release_whose_first_park_fails_leaves_the_box_active_and_reloadable(
+    tmp_path: Path,
+) -> None:
+    """The first park is inside the release's guard, so its failure leaves the state a failed
+    drain leaves: active, out of the standby, the normal feed parked by the profile. Red at
+    ``dcbeb5de0b``: the park ran outside the guard, so the runner kept the standby on an active
+    box and the operator's reload bound nothing, not even the critical feed."""
+    cfg = tmp_path / "cfg"
+    crit_port, norm_port = _write_graph(cfg, tmp_path)
+    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+        rr = engine.registry_runner
+        assert rr is not None
+        await engine._dr_activate_profile()
+        source = rr._sources[_CRIT]
+        real_stop = source.stop
+
+        async def stop_then_raise() -> None:
+            await real_stop()
+            raise OSError("listener close failed")
+
+        source.stop = stop_then_raise  # type: ignore[method-assign]
+        with pytest.raises(OSError, match="listener close failed"):
+            await engine._dr_release_drain()
+        assert engine.dr_active and rr.dr_standby is None
+        assert rr.inbound_filtered(_NORM) is not None
+        await _alert_control_action(engine, "restart_inbound", _NORM)
+        assert not await _accepts(norm_port)
+        await engine.reload_detail(cfg)
+        assert await _accepts(crit_port) and not await _accepts(norm_port)
