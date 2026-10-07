@@ -1100,7 +1100,9 @@ class _LoadedConfig:
     outbound: int | None
     fingerprint: Mapping[str, object] | None
     #: The graph object itself. An applied reload swaps it for a new one before it rebinds the
-    #: fingerprint, so comparing it by identity sees a reload still in flight.
+    #: fingerprint, so comparing it by identity sees a reload still in flight. The start's row uses
+    #: that; a reload's row does not, since an in-flight reload may still roll back (vault BACKLOG
+    #: #2257; see :func:`_record_reload_audit`).
     registry: Registry | None
 
     @classmethod

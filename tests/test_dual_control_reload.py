@@ -531,7 +531,8 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
         async def _fail_b(*_args: Any) -> None:
             # B's registry is live here, before the rollback. Let A write its row now, then fail.
             b_mid_swap.set()
-            await a_written.wait()
+            # Bounded: B holds the runner's reload lock here, and runs on past a client timeout.
+            await asyncio.wait_for(a_written.wait(), timeout=30)
             raise RuntimeError("an outbound would not start")
 
         async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
