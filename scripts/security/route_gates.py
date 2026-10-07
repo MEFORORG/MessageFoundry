@@ -93,20 +93,22 @@ if TYPE_CHECKING:
     from fastapi.routing import RouteContext
 
 
-class MissingFastAPISymbol(ImportError):
-    """The installed FastAPI lacks a name the walk reads (vault BACKLOG #3055).
+class MissingFastAPISymbol(RuntimeError):
+    """The installed FastAPI lacks a name a route guard reads (vault BACKLOG #3055).
 
-    An ``ImportError``, because on the oldest releases the first missing name is
-    ``iter_route_contexts`` and the module cannot import at all."""
+    Not an ``ImportError``: it is raised mostly at walk time, and a caller that skips on a missing
+    optional import must not read a renamed FastAPI internal as "not installed". The one read at
+    import time is re-raised as an ``ImportError`` below."""
 
 
 def fastapi_symbol(owner: object, name: str) -> Any:
     """``owner.name``, or :class:`MissingFastAPISymbol` naming the installed FastAPI and the name.
 
-    Every FastAPI name a guard reads that a release could drop or rename goes through here:
+    A FastAPI name a guard reads that a release could drop or rename goes through here, so the run
+    fails with the name in the message rather than reading less and passing. At least these do:
     ``iter_route_contexts``, the rebuilt route FastAPI serves for a non-API route reached through an
-    include, and the low-priority route list. So the run fails with the name in the message rather
-    than reading less and passing."""
+    include, the low-priority route list, and the two callable classifiers the thread-pool guard
+    reads. Names FastAPI documents, such as ``RouteContext.original_route``, are read directly."""
     try:
         return getattr(owner, name)
     except AttributeError:
@@ -119,9 +121,12 @@ def fastapi_symbol(owner: object, name: str) -> Any:
 
 
 # Public, but missing from releases below the floor, which then fail to import this module by name.
-iter_route_contexts: Callable[[Sequence[BaseRoute]], Iterator[RouteContext]] = fastapi_symbol(
-    fastapi.routing, "iter_route_contexts"
-)
+try:
+    iter_route_contexts: Callable[[Sequence[BaseRoute]], Iterator[RouteContext]] = fastapi_symbol(
+        fastapi.routing, "iter_route_contexts"
+    )
+except MissingFastAPISymbol as missing:
+    raise ImportError(str(missing)) from missing
 
 #: Substituted for every ``{path_param}`` when a template must become a concrete request target. It is
 #: deliberately a recognisable, non-existent identifier: a probe must never name a real resource, and a
@@ -508,19 +513,27 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
         original: BaseRoute = context.original_route
         if isinstance(original, APIRoute):
             yield original, context
-        elif id(original) in registered:
-            yield original, original
-        else:
-            # A non-API route reached through an include is served by a rebuilt copy that carries
-            # the include's prefix and, for a WebSocket, its dependencies. FastAPI keeps it on a
-            # field it does not promise, and the unprefixed original is the wrong path to report.
-            served = fastapi_symbol(context, "starlette_route")
-            if not isinstance(served, BaseRoute):
+            continue
+        # A non-API route reached through an include is served by a rebuilt copy that carries the
+        # include's prefix and, for a WebSocket, its dependencies. A route registered on ``owner``
+        # has no copy and is served as it is. The copy is read first, so a route object registered
+        # both ways still reports its prefixed path through the include.
+        served = getattr(context, "starlette_route", None)
+        if not isinstance(served, BaseRoute):
+            if id(original) not in registered:
+                # Reached through an include, so the copy must exist. FastAPI does not promise the
+                # field, and the unprefixed original is the wrong path to report.
+                served = fastapi_symbol(context, "starlette_route")
                 raise ValueError(
                     f"FastAPI {fastapi.__version__} serves an included {type(original).__name__} "
                     f"with no rebuilt route ({served!r}), so the walk cannot read its path"
                 )
-            yield original, served
+            served = original
+        if isinstance(served, Mount):
+            # Refused here and not only when a walk descends, because a walk descends only into a
+            # mount with routes, and a mount holding nothing but a frontend group has none.
+            _refuse_low_priority_routes(served)
+        yield original, served
 
 
 def _kind(declared_on: Any, effective: Any, *, websocket: bool) -> tuple[RouteKind, str | None]:

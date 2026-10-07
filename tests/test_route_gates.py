@@ -680,8 +680,37 @@ def _frontend_in_a_mounted_app(app: FastAPI, directory: str) -> None:
     app.mount("/mounted", inner)
 
 
+def _frontend_alone_in_a_mounted_app(app: FastAPI, directory: str) -> None:
+    inner = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    inner.frontend("/", directory=directory, check_dir=False)
+    app.mount("/spa", inner)
+
+
+def _frontend_alone_in_a_mounted_router(app: FastAPI, directory: str) -> None:
+    inner = APIRouter()
+    inner.frontend("/", directory=directory, check_dir=False)
+    app.router.routes.append(Mount("/spa", app=inner))
+
+
+def _frontend_alone_in_an_included_mount(app: FastAPI, directory: str) -> None:
+    inner = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    inner.frontend("/", directory=directory, check_dir=False)
+    sub = APIRouter()
+    sub.mount("/spa", inner)
+    app.include_router(sub, prefix="/inc")
+
+
 @pytest.mark.parametrize(
-    "register", [_frontend_on_the_app, _frontend_in_an_include, _frontend_in_a_mounted_app]
+    "register",
+    [
+        _frontend_on_the_app,
+        _frontend_in_an_include,
+        _frontend_in_a_mounted_app,
+        # A mount whose only content is the group has no routes, so a walk never descends into it.
+        _frontend_alone_in_a_mounted_app,
+        _frontend_alone_in_a_mounted_router,
+        _frontend_alone_in_an_included_mount,
+    ],
 )
 def test_a_frontend_group_fails_the_walk_rather_than_passing_unvisited(
     register: Callable[[FastAPI, str], None], tmp_path: Path
@@ -702,3 +731,16 @@ def test_a_renamed_low_priority_list_fails_the_walk_by_name(
     monkeypatch.delattr(APIRouter, "_iter_low_priority_routes")
     with pytest.raises(route_gates.MissingFastAPISymbol, match="_iter_low_priority_routes"):
         route_gates.route_rows(FastAPI(openapi_url=None))
+
+
+def test_a_route_registered_directly_and_through_an_include_reports_both_paths() -> None:
+    """The rebuilt route is read before the registered-here test, so a shared route object still
+    reports the prefixed path FastAPI serves through the include."""
+    shared = Route("/plain", _plain)
+    sub = APIRouter()
+    sub.routes.append(shared)
+    app = FastAPI(openapi_url=None)
+    app.router.routes.append(shared)
+    app.include_router(sub, prefix="/inc")
+    rows = _rows_by_key(app)
+    assert ("GET", "/plain") in rows and ("GET", "/inc/plain") in rows, sorted(rows)

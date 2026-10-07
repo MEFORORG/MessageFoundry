@@ -29,17 +29,27 @@ def test_floors_are_read_from_the_lower_bound_and_skip_what_does_not_apply(tmp_p
             tmp_path,
             "Fast_API>=0.140.0",
             "uvicorn>=0.29,<0.50",
+            "compatible~=2.3",
+            "pinned==1.4",
+            "wildcard==1.4.*",
             "nofloor",
             "elsewhere>=1.0; sys_platform == 'never'",
         )
     )
-    assert floors == {"fast-api": Version("0.140.0"), "uvicorn": Version("0.29")}
+    assert floors == {
+        "fast-api": Version("0.140.0"),
+        "uvicorn": Version("0.29"),
+        "compatible": Version("2.3"),
+        "pinned": Version("1.4"),
+        "wildcard": None,
+        "nofloor": None,
+    }
 
 
 def test_the_shipped_pyproject_declares_the_fastapi_floor() -> None:
     """The control for the parser: the real file yields the floor the route walk rests on."""
-    floors = declared_floors(_ROOT / "pyproject.toml")
-    assert floors["fastapi"] >= Version("0.140.0")
+    floor = declared_floors(_ROOT / "pyproject.toml")["fastapi"]
+    assert floor is not None and floor >= Version("0.140.0")
 
 
 def _installed(versions: dict[str, str | None]) -> Callable[[str], Version | None]:
@@ -51,22 +61,28 @@ def _installed(versions: dict[str, str | None]) -> Callable[[str], Version | Non
 
 
 def test_each_verdict() -> None:
-    floors = {
+    floors: dict[str, Version | None] = {
         "at-floor": Version("1.0"),
         "above": Version("1.0"),
         "raised": Version("1.0"),
+        "raised-below": Version("2.0"),
         "stale-raise": Version("1.0"),
         "missing": Version("1.0"),
+        "unreadable": None,
     }
     installed = {
         "at-floor": "1.0.0",
         "above": "1.1",
         "raised": "1.2",
+        "raised-below": "1.9",
         "stale-raise": "1.0",
         "missing": None,
+        "unreadable": "1.0",
     }
     lines, failures = check(
-        floors, ["raised", "Stale_Raise", "unknown"], installed=_installed(installed)
+        floors,
+        ["raised", "raised-below", "Stale_Raise", "unknown"],
+        installed=_installed(installed),
     )
     assert lines == [
         "at-floor 1.0.0: at its floor",
@@ -75,7 +91,9 @@ def test_each_verdict() -> None:
     assert failures == [
         "above: installed 1.1, but the declared floor is 1.0",
         "missing: declared >=1.0 but not installed",
+        "raised-below: installed 1.9, BELOW the declared floor 2.0",
         "stale-raise: listed as raised but installed at its floor 1.0; drop it from --raised",
+        "unreadable: declares no floor this check can read; write it as >=X",
         "unknown: listed as raised but declares no floor that applies here",
     ]
 

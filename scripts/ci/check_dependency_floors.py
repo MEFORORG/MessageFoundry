@@ -34,18 +34,26 @@ from packaging.version import Version
 _ROOT = Path(__file__).resolve().parents[2]
 
 
-def declared_floors(pyproject: Path) -> dict[str, Version]:
-    """``{canonical name: floor}`` for each runtime dependency whose marker applies here and that
-    declares a ``>=`` bound."""
+#: Specifier operators whose version is a lower bound. ``==X.*`` and ``>X`` name no installable
+#: lowest release, so a dependency written only with those reads as having no floor.
+_FLOOR_OPERATORS = frozenset({">=", "~=", "==", "==="})
+
+
+def declared_floors(pyproject: Path) -> dict[str, Version | None]:
+    """``{canonical name: floor}`` for each runtime dependency whose marker applies here. The floor
+    is ``None`` when no specifier gives one, so :func:`check` can refuse rather than skip it."""
     project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
-    floors: dict[str, Version] = {}
+    floors: dict[str, Version | None] = {}
     for line in project.get("dependencies", []):
         requirement = Requirement(line)
         if requirement.marker is not None and not requirement.marker.evaluate():
             continue
-        bounds = [Version(s.version) for s in requirement.specifier if s.operator == ">="]
-        if bounds:
-            floors[canonicalize_name(requirement.name)] = max(bounds)
+        bounds = [
+            Version(s.version)
+            for s in requirement.specifier
+            if s.operator in _FLOOR_OPERATORS and not s.version.endswith(".*")
+        ]
+        floors[canonicalize_name(requirement.name)] = max(bounds) if bounds else None
     return floors
 
 
@@ -57,7 +65,7 @@ def _installed(name: str) -> Version | None:
 
 
 def check(
-    floors: dict[str, Version],
+    floors: dict[str, Version | None],
     raised: Iterable[str],
     installed: Callable[[str], Version | None] = _installed,
 ) -> tuple[list[str], list[str]]:
@@ -68,8 +76,12 @@ def check(
     for name in sorted(floors):
         floor, found = floors[name], installed(name)
         raised_on_purpose = name in expected_raised
-        if found is None:
+        if floor is None:
+            failures.append(f"{name}: declares no floor this check can read; write it as >=X")
+        elif found is None:
             failures.append(f"{name}: declared >={floor} but not installed")
+        elif found < floor:
+            failures.append(f"{name}: installed {found}, BELOW the declared floor {floor}")
         elif found == floor:
             if raised_on_purpose:
                 failures.append(

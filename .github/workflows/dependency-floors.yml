@@ -18,8 +18,8 @@
 # `uv pip compile --resolution lowest-direct --python-version 3.14`, with and without
 # `--only-binary :all:`, and a real install of the result on Windows. The leg does not hide them.
 # The override file below raises the two that need it, and check_dependency_floors.py lists each
-# raised RUNTIME floor in `--raised`. So a runtime dependency above its floor for any other reason
-# reds the run, and so does a listed one that is back at its floor.
+# raised RUNTIME floor in `--raised`. So a runtime dependency off its floor for any other reason
+# reds the run, and so does a listed one that is back at or below its floor.
 #   - pydantic>=2.6 resolves to 2.9.0, whose pydantic-core 2.23.2 has no cp314 wheel. Its sdist is a
 #     Rust build, which failed locally. 2.12.0 (pydantic-core 2.41.1) is the lowest release uv finds
 #     a cp314 wheel for.
@@ -29,7 +29,10 @@
 #     ("'build_ext' object has no attribute 'cython_sources'"). 6.0.3 is the lowest release uv finds
 #     a cp314 wheel for.
 # Raising those floors in pyproject.toml is a separate change. When one lands, drop its override and
-# its `--raised` entry here in the same pull request, or this leg goes red.
+# its `--raised` entry here in the same pull request. A stale runtime entry reds this leg; the pyyaml
+# override does NOT, because the floor check reads only runtime dependencies, so drop it by hand.
+#
+# A red weekly run reaches nobody on its own, so nightly-notice.yml watches this workflow by name.
 name: dependency floors
 
 on:
@@ -38,6 +41,12 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "packaging/messagefoundry-webconsole/pyproject.toml"
+      # The engine surface the guards walk: a change here can use a FastAPI or Starlette feature
+      # newer than the floor.
+      - "messagefoundry/api/**"
+      - "messagefoundry/auth/**"
+      - "messagefoundry_webconsole/**"
+      - "tests/conftest.py"
       - "scripts/security/route_gates.py"
       - "scripts/ci/check_dependency_floors.py"
       - "tests/test_route_gates.py"
@@ -81,6 +90,7 @@ jobs:
             pyproject.toml
             packaging/messagefoundry-webconsole/pyproject.toml
       - name: Install the engine at its declared floors
+        id: install
         run: |
           set -euo pipefail
           # The two overrides are the floors that cannot install on Python 3.14; see the header.
@@ -92,11 +102,15 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/ci/check_dependency_floors.py --raised pydantic --raised pyspnego
-      - name: Import the route walk and build the full surface
+      # The two steps below run even when the floor check reds, so one unrelated dependency off its
+      # floor does not hide whether the engine works at the FastAPI floor this leg was filed for.
+      - name: Import the engine, the web console and the route walk
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           set -euo pipefail
-          python -c "from scripts.security.route_gates import full_surface_app, route_rows; print(len(route_rows(full_surface_app())), 'route rows')"
+          python -c "import messagefoundry.api.app, messagefoundry_webconsole, scripts.security.route_gates"
       - name: Run the route-walk and thread-pool guards
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           set -euo pipefail
           python -m pytest -p no:cacheprovider tests/test_route_gates.py tests/test_thread_pool_fairness_baseline.py tests/test_check_dependency_floors.py

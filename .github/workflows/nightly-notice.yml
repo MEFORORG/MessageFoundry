@@ -75,6 +75,10 @@ name: Nightly failure notice
 # other place to appear. A surviving mutation means a test that names a property cannot see it broken,
 # and a finding nobody receives is the silence this file exists to end.
 #
+# `dependency floors` WAS ADDED FOR VAULT BACKLOG #3055. Its weekly run installs the lowest releases
+# pyproject.toml allows, so an upstream yank or release can red it with no commit here and no pull
+# request to show it on. It is advisory and not required, so this watch is where that red appears.
+#
 # A WATCHED WORKFLOW MUST HAVE A `schedule:` TRIGGER. The job below fires only when the completed
 # run's event was `schedule`, so watching a workflow with no cron adds a name that can never match:
 # dead config that reads as coverage. `tests/test_nightly_notice.py` pins this for every watched name.
@@ -90,7 +94,7 @@ name: Nightly failure notice
 # every input arrives through `env:` and nothing here interpolates `${{ }}` into the script.
 on:
   workflow_run:
-    workflows: ["CI", "Security", "DAST", "Stalled PRs", "Required workflow state", "security.txt renewal", "Invariant mutations"]
+    workflows: ["CI", "Security", "DAST", "Stalled PRs", "Required workflow state", "security.txt renewal", "Invariant mutations", "dependency floors"]
     types: [completed]
 
 # Read-only by default; the one job that writes escalates to `issues: write` and nothing else.
@@ -247,6 +251,18 @@ jobs:
             refactoring moved. Reproduce it with \`--only <id>\`.
           - No \`# ran\` line and no \`error:\` line: the run step timed out or never started. The
             first row missing from the list is the one that hung. Read the step that failed."
+              ;;
+            "dependency floors")
+              DETAIL="Here that covers the weekly install at the lowest releases \`pyproject.toml\`
+          allows, and the route-walk and thread-pool guards run against them. Nothing here changed in
+          the repository if no pull request touched a dependency, so read the failing step first.
+
+          - The install failed: a declared floor no longer installs on Python 3.14, for example a
+            yanked release. Raise that floor in \`pyproject.toml\`.
+          - The floor check failed: a runtime dependency landed off its floor, or a \`--raised\`
+            entry in \`.github/workflows/dependency-floors.yml\` is no longer needed.
+          - A guard failed: the engine does not work at its declared floors. Fix the code or raise
+            the floor; the failure names the missing FastAPI symbol when that is the cause."
               ;;
           esac
 
