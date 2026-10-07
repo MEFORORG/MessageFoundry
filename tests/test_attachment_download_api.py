@@ -29,6 +29,7 @@ negative control and is asserted just as hard.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import mimetypes
 from collections.abc import AsyncIterator
@@ -290,6 +291,8 @@ async def test_download_audits_view_and_download_before_returning(
     detail = dl[0]["detail"] or ""
     assert mid in detail and ref in detail
     assert DOC_B64 not in detail
+    # A served download is never also recorded as a refusal (BACKLOG #2387).
+    assert not [a for a in audit if a["action"] == "attachment_download_refused"]
 
 
 async def test_download_never_logs_bytes(
@@ -775,14 +778,46 @@ async def test_svg_served_copy_is_sanitized_and_stored_value_is_untouched(
 async def test_svg_that_cannot_be_sanitized_is_refused_and_not_audited_as_served(
     engine: Engine, client: httpx.AsyncClient, label: str, prefix: bytes, suffix: bytes
 ) -> None:
-    """Fail closed: no copy of an SVG the parser cannot vet leaves the route, not even the original."""
+    """Fail closed: no copy of an SVG the parser cannot vet leaves the route, not even the original.
+    The attempt is still audited, as a refusal and never as a download (BACKLOG #2387)."""
     mid, ref = await _seed_labelled(engine, label, marker=label, prefix=prefix, suffix=suffix)
     before = await _stored_value(engine, ref)
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 422
     assert b"synthetic document" not in r.content
-    assert not [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
+    await _assert_one_refusal_row(engine, mid, ref, "svg_unsanitizable")
     assert await _stored_value(engine, ref) == before
+
+
+async def _assert_one_refusal_row(engine: Engine, mid: str, ref: str, reason: str) -> None:
+    """Exactly one ``attachment_download_refused`` row whose detail is the id pair and ``reason`` and
+    nothing else, so no byte of the document; no ``attachment_download`` row; no 'viewed' event."""
+    audit = await engine.store.list_audit()
+    assert not [a for a in audit if a["action"] == "attachment_download"]
+    (row,) = [a for a in audit if a["action"] == "attachment_download_refused"]
+    assert row["actor"]
+    assert row["client"]
+    assert row["channel_id"] == "ch1"
+    assert json.loads(row["detail"]) == {"message_id": mid, "attachment_id": ref, "reason": reason}
+    assert not any(e["event"] == "viewed" for e in await engine.store.events_for(mid))
+
+
+async def test_undecodable_stored_value_is_refused_and_audited_as_a_refusal(
+    engine: Engine, client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The route's other 422, a stored value that is not clean base64, gets the same refusal row."""
+    # No whitespace in the marker: the route strips whitespace before decoding, so a spaced marker
+    # would miss a leak of the normalized value.
+    ref = await engine.store.put_attachment(["%%synthetic-undecodable-marker%%"], "application/pdf")
+    mid = await engine.store.enqueue_ingress(channel_id="ch1", raw=ADT, attachment_refs=[ref])
+    with caplog.at_level(logging.WARNING):
+        r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 422
+    assert b"synthetic-undecodable-marker" not in r.content
+    logged = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "stored value is not decodable" in logged
+    assert "undecodable-marker" not in logged
+    await _assert_one_refusal_row(engine, mid, ref, "undecodable")
 
 
 async def test_svg_label_on_non_markup_bytes_is_served_unchanged(

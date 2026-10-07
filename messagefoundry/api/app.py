@@ -5419,6 +5419,8 @@ def create_app(
         delivery buffer-once posture); an SVG is then sanitized or refused (see the comment below).
         Every download is audited (``record_view`` + an
         ``attachment_download`` row in the tamper-evident chain, docs/PHI.md §6) BEFORE the bytes leave.
+        The handler's two 422 refusals (an undecodable stored value, an SVG it cannot sanitize) write
+        an ``attachment_download_refused`` row naming its ``reason`` instead.
         The document bytes/base64 are **never logged**."""
         # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
         # channel (per-channel RBAC), mirroring get_message.
@@ -5438,17 +5440,40 @@ def create_app(
             )
         except KeyError as exc:
             raise HTTPException(404, f"attachment content unavailable: {attachment_id}") from exc
+        audit_detail: dict[str, str] = {"message_id": message_id, "attachment_id": attachment_id}
+
+        async def audit(action: str, **extra: str) -> None:
+            # The one writer of this route's rows: the acting user and the id pair, never a byte.
+            await engine.store.record_audit(
+                action,
+                actor=identity.username,
+                channel_id=row["channel_id"],
+                detail=json.dumps({**audit_detail, **extra}),
+                client=client_ip(request),
+            )
+
         try:
             body = base64.b64decode("".join(verbatim.split()), validate=True)
         except (binascii.Error, ValueError) as exc:
-            # A stored value that isn't clean base64 is corruption — surface it, never the bytes.
+            # A stored value that isn't clean base64 — store corruption, or a sender value that was
+            # never base64 (detach does not validate it) — is refused; surface it, never the bytes.
+            # Each of this handler's two 422s is an attempted PHI read by an authorized actor, so it
+            # goes in the tamper-evident chain (BACKLOG #2387), under its own action so no reader
+            # filtering on attachment_download counts it as a document that left. No record_view,
+            # since nothing was viewed.
+            _log.warning(
+                "attachment download refused: stored value is not decodable "
+                "(message=%s attachment=%s)",
+                message_id,
+                attachment_id,
+            )
+            await audit("attachment_download_refused", reason="undecodable")
             raise HTTPException(422, "attachment content is not decodable") from exc
         # ASVS 1.3.4 (ADR 0105, amendment 2026-09-28): an SVG is served as its tag and attribute
         # allow-listed copy. Only the SERVED bytes change; the stored OBX-5.5 value stays verbatim. An
-        # SVG the parser cannot vet is refused before the audit, since no byte of it leaves. The
-        # pre-check keeps a PDF or an image off the thread pool. The audit row says when the served
-        # bytes are a sanitized copy, so they are never mistaken for the stored document's.
-        audit_detail = {"message_id": message_id, "attachment_id": attachment_id}
+        # SVG the parser cannot vet is refused, and audited as a refusal, since no byte of it leaves.
+        # The pre-check keeps a PDF or an image off the thread pool. The audit row says when the
+        # served bytes are a sanitized copy, so they are never mistaken for the stored document's.
         if may_be_svg(body):
             try:
                 async with svg_sanitize_slots:
@@ -5460,6 +5485,7 @@ def create_app(
                     message_id,
                     attachment_id,
                 )
+                await audit("attachment_download_refused", reason="svg_unsanitizable")
                 raise HTTPException(422, "attachment is SVG that cannot be sanitized") from exc
             if served is not body:
                 body = served
@@ -5467,13 +5493,7 @@ def create_app(
         # Audit the PHI access BEFORE the bytes leave: record_view for the per-message timeline +
         # attachment_download in the tamper-evident chain (with the acting user + the id pair, NO bytes).
         await engine.store.record_view(message_id, actor=identity.username)
-        await engine.store.record_audit(
-            "attachment_download",
-            actor=identity.username,
-            channel_id=row["channel_id"],
-            detail=json.dumps(audit_detail),
-            client=client_ip(request),
-        )
+        await audit("attachment_download")
         # Neutralize at serve (ASVS 1.3.4): the sender-influenced OBX-5.2 label is declared only when it
         # names one of the inert types on the _INERT_ATTACHMENT_TYPES allow-list, so a browser-active
         # label (svg/html/hta/script and every type nobody listed) is declared as the inert binary type,

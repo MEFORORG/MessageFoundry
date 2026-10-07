@@ -708,7 +708,9 @@ per tier which of those its code provides, and an operator carries the rest
   `GET /messages/{message_id}/attachments/{attachment_id}` rides the *same* `messages:view_raw` gate and
   channel scope, **plus a `message_attachment` linkage check** — a guessed content address that is not
   linked to an in-scope message is a 404 — and writes a `record_view` **and** an `attachment_download`
-  audit row **before** any byte leaves. `response.body` is exposed by `GET /messages/{id}/responses`
+  audit row **before** any byte leaves. A 422 refusal (an SVG it cannot sanitize, or a stored value
+  that will not decode) serves nothing and writes an `attachment_download_refused` row naming the
+  reason (BACKLOG #2387). `response.body` is exposed by `GET /messages/{id}/responses`
   only when the caller *also* holds `messages:view_raw` and `messages:view_summary` (vault BACKLOG
   #1187). `shared_body.body` has **no direct read API**
   (reachable only via the delivery deref and the resend source read). Uploaded-log blobs are `files:*`
@@ -1270,9 +1272,11 @@ Every PHI access is recorded in the append-only `audit_log` with the **acting us
 `message_view` (opening one message, with `revealed` listing which of `summary` and `metadata`
 that open returned complete), `message_body_view` (its raw body, with a `surface` naming
 which client asked: `harness`, `apiclient` or `api` as the HTTP caller declares it, or `console`,
-which the engine records itself for the web console), `summary_access` (patient summaries),
-plus the auth and admin events
-listed in [SECURITY.md](SECURITY.md). Each row carries actor, action, timestamp, channel, the
+which the engine records itself for the web console), `summary_access` (patient summaries) and
+`attachment_download` (a detached document's bytes, with `"served": "sanitized-svg"` when they
+are a sanitized copy). A refused download is not an access, since it serves nothing, and writes
+`attachment_download_refused` with a `reason` (BACKLOG #2387). These sit beside the auth and admin
+events listed in [SECURITY.md](SECURITY.md). Each row carries actor, action, timestamp, channel, the
 caller's `client` address, and a JSON `detail` (filters, counts, exposed control IDs — **not** the
 bodies). Read the trail via `GET /audit` (`audit:read`).
 
