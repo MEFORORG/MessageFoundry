@@ -119,11 +119,12 @@ async def test_a_backup_after_a_reload_from_another_root_carries_that_root(
 @pytest.mark.parametrize(
     "fault",
     [
+        # A directory that cannot be listed. An unreadable FILE is skipped by the fold itself.
         OSError(13, "Permission denied"),
         # What the fold raises on a file name that is not UTF-8 (vault BACKLOG #2839).
         UnicodeEncodeError("utf-8", "x\udc80", 1, 2, "surrogates not allowed"),
     ],
-    ids=["unreadable-file", "non-utf8-file-name"],
+    ids=["unlistable-dir", "non-utf8-file-name"],
 )
 async def test_a_config_read_fault_costs_the_fingerprint_not_the_backup(
     tmp_path: Path,
@@ -161,6 +162,45 @@ async def test_a_config_read_fault_costs_the_fingerprint_not_the_backup(
     with _archive_tar(result.archive_path) as tar:
         assert _manifest(tar)["config_fingerprint"] is None
         assert "config/cfg.py" in tar.getnames(), "the config is still archived"
+
+
+async def _backup_of(tmp_path: Path, cfg: Path) -> str | None:
+    tmp_path.mkdir(exist_ok=True)
+    db = tmp_path / "b.db"
+    store = await MessageStore.open(db)
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "out"), allow_unencrypted=True),
+        store_settings=StoreSettings(path=str(db)),
+        config_dir=cfg,
+    )
+    try:
+        result = await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None and result.verify is not None and result.verify.status == "PASS"
+    return result.config_fingerprint
+
+
+async def test_a_real_non_utf8_file_name_costs_only_the_fingerprint(tmp_path: Path) -> None:
+    """The fault unmocked: the name vault BACKLOG #2839 used, which the fold cannot encode."""
+    cfg, _staging = _roots(tmp_path)
+    assert isinstance(await _backup_of(tmp_path / "control", cfg), str), "control: a digest"
+    (cfg / "environments").mkdir()
+    try:
+        (cfg / "environments" / "x\udc80.toml").write_text("", encoding="utf-8")
+    except (OSError, UnicodeEncodeError):
+        pytest.skip("this file system will not store a name that is not UTF-8")
+    assert await _backup_of(tmp_path / "bad", cfg) is None
+
+
+async def test_a_config_dir_that_has_gone_records_no_fingerprint(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A gone directory digests as an empty bundle, which would read as a real fingerprint."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
+        assert await _backup_of(tmp_path, tmp_path / "gone") is None
+    assert any("config fingerprint failed" in r.getMessage() for r in caplog.records)
 
 
 async def test_an_unexpected_fingerprint_fault_fails_the_pass_and_the_loop_survives(
@@ -209,11 +249,16 @@ async def test_an_unexpected_fingerprint_fault_fails_the_pass_and_the_loop_survi
 # --- the subprocess sandbox --------------------------------------------------------------------
 
 
-def test_load_config_records_the_directory_and_the_shard_filter_keeps_it(tmp_path: Path) -> None:
+def test_load_config_records_the_directory_and_the_shard_filter_keeps_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     live, staging = _roots(tmp_path)
-    assert load_config(live).source_dir == live
-    assert load_config(staging).source_dir == staging
-    assert filter_registry_for_shard(load_config(staging), DEFAULT_SHARD).source_dir == staging
+    # A relative --config is recorded resolved, so a worker spawned later loads the same target.
+    monkeypatch.chdir(tmp_path)
+    assert load_config("live").source_dir == live.resolve()
+    assert load_config(staging).source_dir == staging.resolve()
+    shard = filter_registry_for_shard(load_config(staging), DEFAULT_SHARD)
+    assert shard.source_dir == staging.resolve()
     assert Registry().source_dir is None, "a graph built in code names no directory"
 
 

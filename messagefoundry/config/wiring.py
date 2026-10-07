@@ -7228,7 +7228,8 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
     if not directory.is_dir():
         raise FileNotFoundError(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)
-    registry = Registry(source_dir=directory)
+    # Resolved, so a worker that spawns later loads this target even if a link in the path moves.
+    registry = Registry(source_dir=directory.resolve())
     # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the
     # config modules, so a module-top-level code_set(...) capture resolves. A bad/duplicate table is a
     # WiringError here (fail loud), like a bad env value; a missing codesets/ dir is fine (no tables).

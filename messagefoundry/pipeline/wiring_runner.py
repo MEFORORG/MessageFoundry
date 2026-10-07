@@ -4299,8 +4299,8 @@ class RegistryRunner:
         Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode=subprocess``
         AND a config dir is known. The child re-loads the graph to look a function up by name, from
         ``Registry.source_dir`` (the directory the served graph came from), else the constructor's
-        ``sandbox_config_source``. Every registry swap closes the sessions, so a reload from another
-        root moves the children with it (vault BACKLOG #3094). **A graph built in code with no
+        ``sandbox_config_source``. A reload of a running runner closes the sessions, so a reload
+        from another root moves the children with it (vault BACKLOG #3094). **A graph built in code with no
         config dir cannot isolate**, and degrades to in-process. That degradation is **silent**: a
         library embedder that asked for ``subprocess`` gets the in-process path and nothing says so.
         Every ``serve`` route carries a config dir. The :class:`SandboxSession` object is created

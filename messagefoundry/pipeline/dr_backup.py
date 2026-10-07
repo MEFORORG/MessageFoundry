@@ -1163,15 +1163,19 @@ class BackupRunner:
         """The ADR 0041 D1 digest of ``config_dir``, or ``None`` when there is none or it cannot be
         read. Blocking; the caller runs it off the loop.
 
-        The same best-effort rule as every config load (``Engine.fingerprint_bundle_blocking``,
-        vault BACKLOG #3094): OSError is an unreadable file, ValueError a file name that is not
-        UTF-8. Either costs the archive its fingerprint, never the backup. The warning names the
-        directory and a scrubbed reason, never config content."""
+        It catches what :meth:`Engine.fingerprint_bundle_blocking` catches, so a bundle a load
+        tolerates cannot fail a backup (vault BACKLOG #3094); that method is the rule's source of
+        record. A directory that is not there is refused here too, because the digest of a missing
+        directory is the digest of an empty bundle and would read as real. Either way the archive
+        loses its fingerprint and the backup goes on. The warning names the directory and a
+        scrubbed reason, never config content."""
         if config_dir is None:
             return None
         from messagefoundry.config.fingerprint import config_fingerprint
 
         try:
+            if not config_dir.is_dir():
+                raise FileNotFoundError(f"config directory not found: {config_dir}")
             return config_fingerprint(config_dir)
         except (OSError, ValueError) as exc:
             log.warning(
