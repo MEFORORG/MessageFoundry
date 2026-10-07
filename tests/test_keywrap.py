@@ -39,6 +39,7 @@ from tests._approved_key_wrap import (
     PBES2,
     PBKDF2,
     SCRYPT,
+    _pfx_parts,
     approved_pfx,
     integer,
     octets,
@@ -770,6 +771,50 @@ def test_the_clear_bag_note_is_only_on_a_clear_bag_refusal(material: Material) -
     assert clear is not None and "no bag is encrypted" in clear
 
 
+def test_a_clear_bag_refusal_says_the_problem_before_the_remedy(material: Material) -> None:
+    # BACKLOG #2456. The reason, then "It is refused.", then the routes, and the no-MAC route says
+    # the file then has no integrity check. The encrypted-bag arm offers no no-MAC route at all.
+    clear = _p12_refusal(_clear_bags(material))
+    assert clear is not None
+    order = [
+        "rather than PBMAC1",
+        "It is refused.",
+        "no bag is encrypted",
+        "-pbmac1_pbkdf2",
+        "-nomac",
+    ]
+    positions = [clear.index(part) for part in order]
+    assert positions == sorted(positions), clear
+    assert "no integrity check" in clear
+    encrypted = _p12_refusal(pkcs12_bundle(material.key, _p12_cert(material.key), b"synthetic-pfx"))
+    assert encrypted is not None and "-nomac" not in encrypted
+
+
+def test_an_unreadable_mac_on_readable_bags_names_the_mac(material: Material) -> None:
+    # BACKLOG #2456. The bags read, so the refusal names the MAC rather than the whole bundle. A
+    # truncated bundle, which this reader cannot walk at all, is the control for the other text.
+    head, _ = _pfx_parts(_clear_bags(material))
+    bad_mac = seq(head, seq(integer(1)))
+    refusal = _p12_refusal(bad_mac)
+    assert refusal is not None and "carries a MAC this engine cannot read" in refusal
+    assert "-nomac" in refusal  # the bags are clear, so the clear-bag routes apply
+    whole = _p12_refusal(_clear_bags(material)[:-4])
+    assert whole is not None and "is a PKCS#12 bundle this engine cannot read" in whole
+
+
+def test_an_empty_passphrase_pbmac1_bundle_passes_only_at_the_floor(material: Material) -> None:
+    # BACKLOG #2456. An empty passphrase is a passphrase. Given as one, a PBMAC1 MAC at the floor
+    # passes; with none given, the refusal says how to give it. The PBMAC1 MAC under the floor, and
+    # cryptography's NoEncryption MAC, both keyed by the empty passphrase, are still refused.
+    clear = without_mac(_clear_bags(material))
+    at_floor = with_pbmac1(clear, b"", iterations=600_000)
+    assert _p12_refusal(at_floor, given=True) is None
+    unset = _p12_refusal(at_floor, given=False)
+    assert unset is not None and "set u to the empty string" in unset
+    for weak in (with_pbmac1(clear, b"", iterations=2048), _clear_bags(material)):
+        assert _p12_refusal(weak, given=True) is not None
+
+
 def test_an_encrypted_pkcs12_bundle_with_no_mac_is_refused(material: Material) -> None:
     # The approved bundle is the control: the same bytes with only the MacData dropped must flip.
     approved = approved_pfx(material.key, _p12_cert(material.key), b"synthetic-pfx")
@@ -966,6 +1011,31 @@ def test_a_database_driver_key_needs_its_sslpassword_and_passes_when_approved(
         _odbc(tmp_path, material.wraps["approved"], None)
     assert "sslkey=" in _odbc(tmp_path, material.wraps["approved"], _PASSPHRASE)
     assert "sslkey=" not in _odbc(tmp_path, None, None)
+
+
+@pytest.mark.parametrize("spelling", ["pqopt", "PQOPT", "PqOpt"])
+def test_a_driver_key_passed_through_pqopt_is_refused(
+    tmp_path: Path, material: Material, spelling: str
+) -> None:
+    # BACKLOG #2423. psqlODBC hands pqopt to libpq whole, so a key named there would reach the
+    # driver without the wrap check. pqopt is refused outright, before any key file is read. The
+    # control is the same weak key under bare sslkey, which the wrap check refuses.
+    from messagefoundry.transports.database import _build_odbc_dsn
+
+    weak = _write(tmp_path, "client.key", material.wraps["best-available-2048"])
+    settings = {
+        "dialect": "generic",
+        "odbc_driver": "PostgreSQL Unicode",
+        "server": "db.test",
+        "odbc_params": {"SSLmode": "verify-full", spelling: f"sslkey={weak}"},
+    }
+    with pytest.raises(ValueError, match="must not set") as refused:
+        _build_odbc_dsn(settings)
+    assert not isinstance(refused.value, KeyWrapRefused)
+    assert weak not in str(refused.value)
+    settings["odbc_params"] = {"SSLmode": "verify-full", "sslkey": weak, "sslpassword": _PASSPHRASE}
+    with pytest.raises(KeyWrapRefused, match="2048 iterations"):
+        _build_odbc_dsn(settings)
 
 
 @pytest.mark.parametrize("keyword", ["sslkey", "sslpassword"])
