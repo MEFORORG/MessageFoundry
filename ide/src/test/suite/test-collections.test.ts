@@ -6,9 +6,12 @@ import {
   compareCase,
   compareMessages,
   DEFAULT_VOLATILE_FIELDS,
+  heldAfterIncoming,
+  heldAfterPost,
   isVolatile,
   judgeCollectionRun,
   pickCaseDetail,
+  releaseRun,
   type ExpectedDelivery,
 } from "../../testCollections";
 
@@ -202,6 +205,76 @@ suite("testCollections.pickCaseDetail — the host answers only a request for a 
     ];
     for (const [why, run, index, h] of refused) {
       assert.strictEqual(pickCaseDetail(h, run, index), null, why);
+    }
+  });
+});
+
+// BACKLOG #2441: the webview's leaveRun releases the held run, and only on an exact id match.
+suite("testCollections.releaseRun — leaving the run view stops the host answering for it", () => {
+  const details = [{ error: null, deliveries: [] }];
+  const held = { id: 4, details };
+
+  test("the held run's id releases it, so its caseDetail gets no answer", () => {
+    assert.strictEqual(pickCaseDetail(held, 4, 0), details[0], "control: answered before the leave");
+    assert.strictEqual(pickCaseDetail(releaseRun(held, 4), 4, 0), null);
+  });
+
+  test("any other value keeps the held run answerable", () => {
+    const kept: [string, unknown][] = [
+      ["an older run", 3],
+      ["a newer run", 5],
+      ["a string run id", "4"],
+      ["no run id", undefined],
+      ["null", null],
+      ["an object", { id: 4 }],
+    ];
+    for (const [why, run] of kept) {
+      assert.strictEqual(releaseRun(held, run), held, why);
+      assert.strictEqual(pickCaseDetail(releaseRun(held, run), 4, 0), details[0], why);
+    }
+  });
+
+  test("nothing held stays nothing held", () => {
+    assert.strictEqual(releaseRun(null, 4), null);
+  });
+});
+
+// BACKLOG #2441, the host's own half: a replacing view releases the run when posted, with no leaveRun
+// needed from the webview. (A fresh page load's ready is answered by dropRun() in testBench.ts.)
+suite("testCollections.heldAfterPost / heldAfterIncoming — the host drops the run on its own", () => {
+  const details = [{ error: null, deliveries: [] }];
+  const held = { id: 4, details };
+
+  test("posting any view but caseDetail or collectionRun releases the run (control: those two keep it)", () => {
+    // "aNewView" stands for a view type added later: it must release by default, not keep.
+    for (const type of ["detail", "trace", "hex", "collections", "aNewView"]) {
+      assert.strictEqual(pickCaseDetail(heldAfterPost(held, type), 4, 0), null, type);
+    }
+    for (const type of ["caseDetail", "collectionRun"]) {
+      assert.strictEqual(heldAfterPost(held, type), held, `control: ${type}`);
+      assert.strictEqual(pickCaseDetail(heldAfterPost(held, type), 4, 0), details[0], `control: ${type}`);
+    }
+  });
+
+  test("leaveRun releases only an exact id match, as releaseRun does", () => {
+    assert.strictEqual(heldAfterIncoming(held, { command: "leaveRun", run: 4 }), null);
+    assert.strictEqual(heldAfterIncoming(held, { command: "leaveRun", run: "4" }), held);
+    assert.strictEqual(heldAfterIncoming(held, { command: "leaveRun" }), held);
+  });
+
+  test("any other message, or no object at all, keeps the held run", () => {
+    const kept: [string, unknown][] = [
+      ["a caseDetail request", { command: "caseDetail", run: 4, index: 0 }],
+      ["a load request", { command: "load" }],
+      // The host answers ready with dropRun() instead, which also bumps viewGen; see heldAfterIncoming.
+      ["ready", { command: "ready" }],
+      ["null", null],
+      ["undefined", undefined],
+      ["a string", "ready"],
+      ["an array", ["ready"]],
+    ];
+    for (const [why, m] of kept) {
+      assert.strictEqual(heldAfterIncoming(held, m), held, why);
     }
   });
 });
