@@ -53,6 +53,7 @@ import keyword
 import math
 import re
 import unicodedata
+import warnings
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
@@ -2378,7 +2379,12 @@ def _is_typed_for(node: ast.For) -> bool:
         segment = it.args[1].left.args[0].value
     if not isinstance(segment, str):
         return False
-    rendered = ast.parse(_render_template({"template": "for_each", "segment_id": segment}).strip())
+    try:
+        rendered = ast.parse(
+            _render_template({"template": "for_each", "segment_id": segment}).strip()
+        )
+    except (SyntaxError, ValueError):
+        return False  # a segment id no typed input renders (a newline, a NUL)
     expected = rendered.body[0]
     return (
         isinstance(expected, ast.For)
@@ -2393,45 +2399,96 @@ def _refuse_untyped_structure(
     row: dict[str, Any],
     rows: list[dict[str, Any]],
     op: str,
+    edit: dict[str, Any],
     line_start: int,
     line_end: int,
 ) -> None:
     """In ``typed_only`` mode, refuse a move or delete that would carry code the Steps view does not
     show as typed rows (Manager decision 2026-10-07, Theia review finding R1).
 
-    Refused: a lone ``code`` row, and a control block whose header is not one the templates render
-    from typed inputs (:func:`_is_typed_if_test`, :func:`_is_typed_for`), whose body nests any other
-    block (``while``, ``try``, ``with``, ``match``, a ``def``), or whose body holds a ``code`` row with
-    any statement other than ``pass`` (a comment-only or ``pass`` row is what a typed edit leaves)."""
+    The moved or deleted statement must be typed (:func:`_is_typed_stmt`). A move must also leave typed
+    code around it: an up/down move swaps with its neighbour, so the neighbour must be typed too, and a
+    drop must land beside a typed anchor whose every enclosing block is a typed ``if`` or ``for``."""
     refusal = (
         f"{op} of the rows at lines {line_start}-{line_end} is refused in typed-only mode - it would "
         "move or remove code the Steps view does not show as typed steps; edit it as text"
     )
+    code_spans = [(r["line_start"], r["line_end"]) for r in rows if r["kind"] == "code"]
+    bindings = [
+        (r["line_start"], r["line_end"])
+        for r in rows
+        if r.get("action") == "read_field" or r.get("assign_to")
+    ]
     if row["kind"] == "code":
         raise LensRewriteError(refusal)
-    if row["kind"] != "control":
-        return
-    block = next(
-        (s for s in ast.walk(handler_node) if isinstance(s, ast.stmt) and s.lineno == line_start),
-        None,
-    )
-    if not isinstance(block, ast.If | ast.For):
+    located = _locate_stmt_by_header(handler_node.body, line_start)
+    if located is None:
         raise LensRewriteError(refusal)
-    code_spans = [(r["line_start"], r["line_end"]) for r in rows if r["kind"] == "code"]
-    for node in ast.walk(block):
-        if isinstance(node, ast.If):
-            if not _is_typed_if_test(node.test):
-                raise LensRewriteError(refusal)
-        elif isinstance(node, ast.For):
-            if not _is_typed_for(node):
-                raise LensRewriteError(refusal)
-        elif isinstance(node, ast.stmt):
-            if _is_compound(node):
-                raise LensRewriteError(refusal)
-            if not isinstance(node, ast.Pass) and any(
-                lo <= node.lineno <= hi for lo, hi in code_spans
+    suite, idx = located
+    moved = suite[idx]
+    if not _is_typed_stmt(moved, code_spans, bindings, top=True):
+        raise LensRewriteError(refusal)
+    if op != "move_row":
+        return
+    others: list[ast.stmt] = []
+    if edit.get("to_line_start") is not None:
+        dest = _locate_stmt_by_header(handler_node.body, edit["to_line_start"])
+        if dest is None:
+            return  # the move itself refuses an unknown drop target
+        anchor = dest[0][dest[1]]
+        others.append(anchor)
+        parents = {
+            id(child): node
+            for node in ast.walk(handler_node)
+            for child in ast.iter_child_nodes(node)
+        }
+        node: ast.AST | None = parents.get(id(anchor))
+        while node is not None and node is not handler_node:
+            if not (
+                (isinstance(node, ast.If) and _is_typed_if_test(node.test))
+                or (isinstance(node, ast.For) and _is_typed_for(node))
             ):
                 raise LensRewriteError(refusal)
+            node = parents.get(id(node))
+    elif edit.get("direction") == "up" and idx > 0:
+        others.append(suite[idx - 1])
+    elif edit.get("direction") == "down" and idx < len(suite) - 1:
+        others.append(suite[idx + 1])
+    if not all(_is_typed_stmt(s, code_spans, bindings, top=True) for s in others):
+        raise LensRewriteError(refusal)
+
+
+def _is_typed_stmt(
+    stmt: ast.stmt,
+    code_spans: list[tuple[int, int]],
+    bindings: list[tuple[int, int]],
+    *,
+    top: bool,
+) -> bool:
+    """Whether ``stmt`` and everything nested in it is what typed Steps edits produce.
+
+    A simple statement is typed unless it sits in a ``code`` row (``pass`` excepted: the templates seed
+    it). An ``if`` or ``for`` is typed when its header is one the templates render from typed inputs
+    (:func:`_is_typed_if_test`, :func:`_is_typed_for`) and its whole body is typed. Any other block is
+    not. Inside a block (``top`` False), a row that binds a name (a Read Field, an assigned lookup) is
+    not typed either: moving or removing the block would strand a later use of that name."""
+    if isinstance(stmt, ast.If):
+        if not _is_typed_if_test(stmt.test):
+            return False
+    elif isinstance(stmt, ast.For):
+        if not _is_typed_for(stmt):
+            return False
+    elif _is_compound(stmt):
+        return False
+    else:
+        if isinstance(stmt, ast.Pass):
+            return True
+        line = stmt.lineno
+        if any(lo <= line <= hi for lo, hi in code_spans):
+            return False
+        return top or not any(lo <= line <= hi for lo, hi in bindings)
+    children = [*stmt.body, *stmt.orelse]
+    return all(_is_typed_stmt(c, code_spans, bindings, top=False) for c in children)
 
 
 def _is_compound(node: ast.stmt) -> bool:
@@ -2609,7 +2666,7 @@ def rewrite_source(
             for c in contracts
             if c["handler"] == row["_handler"] and c.get("role", "handler") == role
         )
-        _refuse_untyped_structure(handler_node, row, rows, op, line_start, line_end)
+        _refuse_untyped_structure(handler_node, row, rows, op, edit, line_start, line_end)
 
     if op == "set_params" and kind == "note":
         # A note has no ``ast`` node, so every statement locator is unusable — this is the lens's only
@@ -2729,16 +2786,19 @@ def _assert_reparses(result: str, module: str) -> None:
 
     A last-line defense: every op is engineered to preserve validity, but re-parsing the result and
     refusing on a :class:`SyntaxError` guarantees the lens never writes broken Python into a user's file.
-    This is ``ast.parse`` ONLY — it does not run ``ruff format --check``. The complementary format-
+    This is ``ast.parse`` plus ``compile`` ONLY — it does not run ``ruff format --check``. The complementary format-
     cleanliness half of gate 3 is enforced per-op *before* emission (each op only ever produces canonical
     text): :func:`_apply_insert_row` refuses a rendered line over the column limit, and the reindent path
     refuses a depth change that would over-run (:func:`_reindent_block`) or collapse
     (:func:`_has_collapsible_wrapped_stmt`) a line — so the output ``ruff format`` would produce is the
-    output the lens already wrote. Static-only: this parses (it never imports/executes) the result."""
+    output the lens already wrote. Static-only: this parses and compiles (it never imports or executes) the result."""
     try:
         # `compile` too: it runs nothing, and it refuses what parses but cannot compile -- an
         # `await` in a sync handler, a walrus rebinding a comprehension variable (Theia review R1).
-        compile(ast.parse(result), module, "exec", dont_inherit=True)
+        with warnings.catch_warnings():
+            # A SyntaxWarning in code the user already had is not this rewrite's to report.
+            warnings.simplefilter("ignore", SyntaxWarning)
+            compile(ast.parse(result), module, "exec", dont_inherit=True)
     except SyntaxError as exc:
         raise LensRewriteError(
             f"{module}: the rewrite would produce invalid Python ({exc.msg} at line {exc.lineno}) - "
@@ -3111,7 +3171,9 @@ def _apply_set_route(
             "splice; edit it as text"
         )
     base = stmt.value
-    literal = (isinstance(base, ast.Constant) and isinstance(base.value, str)) or (
+    literal = (
+        isinstance(base, ast.Constant) and (base.value is None or isinstance(base.value, str))
+    ) or (
         isinstance(base, ast.List | ast.Tuple)
         and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in base.elts)
     )
@@ -3719,15 +3781,30 @@ def _is_inert_value(node: ast.expr, *, reads_ok: bool, blocked: frozenset[str]) 
     if isinstance(node, ast.UnaryOp | ast.BinOp):
         return _is_arithmetic(node, reads_ok=reads_ok, blocked=blocked, names_ok=True)
     if isinstance(node, ast.List | ast.Tuple | ast.Set):
-        return all(_is_inert_value(e, reads_ok=reads_ok, blocked=blocked) for e in node.elts)
+        return all(
+            _is_inert_value(e, reads_ok=reads_ok, blocked=blocked)
+            and (not isinstance(node, ast.Set) or _is_hashable_shape(e))
+            for e in node.elts
+        )
     if isinstance(node, ast.Dict):
         return all(
             k is not None
+            and _is_hashable_shape(k)
             and _is_inert_value(k, reads_ok=reads_ok, blocked=blocked)
             and _is_inert_value(v, reads_ok=reads_ok, blocked=blocked)
             for k, v in zip(node.keys, node.values, strict=True)
         )
     return False
+
+
+def _is_hashable_shape(node: ast.expr) -> bool:
+    """Whether `node` can be a set member or dict key: not a list, dict or set, nor a tuple holding
+    one (`{[1]}` runs nothing, but raises TypeError on every message)."""
+    if isinstance(node, ast.List | ast.Dict | ast.Set):
+        return False
+    if isinstance(node, ast.Tuple):
+        return all(_is_hashable_shape(e) for e in node.elts)
+    return True
 
 
 def _is_arithmetic(
@@ -3762,6 +3839,10 @@ def _is_arithmetic(
     ) and _is_arithmetic(node.right, reads_ok=reads_ok, blocked=blocked, names_ok=False)
 
 
+#: The FHIR search value classes an inserted `fhir_lookup` may construct; their import is injected.
+_FHIR_VALUE_OBJECTS = frozenset({"FhirToken", "FhirRaw"})
+
+
 def _is_fhir_value_object(v: ast.expr, *, blocked: frozenset[str]) -> bool:
     """``FhirToken(system, code)`` with a literal system and a code that may read the message, or
     ``FhirRaw(<string literal>)``: the documented FHIR search value objects. ``FhirRaw`` is author
@@ -3769,6 +3850,8 @@ def _is_fhir_value_object(v: ast.expr, *, blocked: frozenset[str]) -> bool:
     data, so it takes a literal only."""
     if not (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and not v.keywords):
         return False
+    if v.func.id in blocked:
+        return False  # a local of that name shadows the class
     if v.func.id == "FhirToken":
         return (
             len(v.args) == 2
@@ -3841,7 +3924,8 @@ def _message_locals(
     of those may have been read from the message (``pid5 = msg.field("PID-5")``). A loop index is
     exempt only when every binding of the name is a ``for <name> in range(...)`` target, and only while
     ``range`` is the builtin: rebound in the handler or module, or possibly supplied by a star import,
-    voids the exemption. What is left is a module-level binding no function rebinds (an import, a
+    voids the exemption. Its bounds may come from the message (``range(int(msg[...]))``), but the
+    builtin yields only ints, so the index carries a number and never message text. What is left is a module-level binding no function rebinds (an import, a
     constant, a ``code_set`` capture) or a name not bound yet; neither holds message content, because
     module code runs before any message exists."""
     bound = _bound_names(func)
@@ -4261,6 +4345,13 @@ def _apply_insert_row(
         # the just-inserted row stays between its intended neighbors; the whole result is re-parse + ruff
         # gated by the caller (§6-sanctioned exception to the row-scoped byte-splice).
         lines.insert(_last_import_line(module_tree), f"from messagefoundry import {action}" + term)
+    # A FHIR search value object the params use needs its import too, or the line raises NameError.
+    used = {n.id for n in ast.walk(ast.parse(rendered)) if isinstance(n, ast.Name)}
+    for name in sorted(_FHIR_VALUE_OBJECTS & used):
+        if not _name_in_scope(module_tree, name):
+            lines.insert(
+                _last_import_line(module_tree), f"from messagefoundry import {name}" + term
+            )
     return "".join(lines)
 
 

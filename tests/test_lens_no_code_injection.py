@@ -25,6 +25,7 @@ import ast
 import json
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -856,6 +857,152 @@ def test_typed_only_refuses_moving_or_deleting_untyped_code(op: str, line: int) 
     assert info.value.code == "refused"
 
 
-@pytest.mark.parametrize(("op", "line"), [("move_row", 4), ("delete_row", 4), ("delete_row", 10)])
+@pytest.mark.parametrize(("op", "line"), [("delete_row", 4), ("delete_row", 10)])
 def test_typed_only_still_moves_and_deletes_typed_blocks(op: str, line: int) -> None:
     assert _struct(op, line, typed_only=True) != _STRUCT
+
+
+# --- round 3 repair -------------------------------------------------------------------------------
+
+
+def test_route_set_params_still_edits_an_unrouted_return_none() -> None:
+    src = '@router("R")\ndef r(msg):\n    return None\n'
+    edit = {"line_start": 3, "line_end": 3, "op": "set_params", "params": {"handlers": ["H1"]}}
+    assert 'return ["H1"]' in rewrite_source(src, edit, contract=2)
+
+
+def test_a_for_header_with_an_unrenderable_segment_is_a_clean_refusal() -> None:
+    src = _STRUCT.replace('count_segments("OBX")', 'count_segments("O\\nX")')
+    with pytest.raises(LensRewriteError, match="typed-only mode"):
+        rewrite_source(src, {"line_start": 10, "line_end": 10, "op": "delete_row"}, typed_only=True)
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        # Swapping a typed row with an untyped neighbour moves the untyped one too.
+        {"line_start": 4, "line_end": 4, "op": "move_row", "direction": "up"},
+        # Dropping a typed row into an untyped block.
+        {
+            "line_start": 12,
+            "line_end": 12,
+            "op": "move_row",
+            "to_line_start": 9,
+            "to_position": "before",
+        },
+    ],
+    ids=["swap-with-code", "drop-into-untyped-if"],
+)
+def test_typed_only_refuses_a_move_that_shifts_untyped_code(edit: dict[str, Any]) -> None:
+    assert rewrite_source(_STRUCT, edit) != _STRUCT
+    with pytest.raises(LensRewriteError, match="typed-only mode"):
+        rewrite_source(_STRUCT, edit, typed_only=True)
+
+
+_CHAINS = """\
+@handler("H")
+def h(msg):
+    if msg.field("A") == "1":
+        pass
+    elif msg.field("B"):
+        pass
+    else:
+        msg.set("C", "x")
+    if msg.field("A"):
+        pass
+    elif re.match("x", msg["A"] or ""):
+        pass
+    if msg.field("A"):
+        pass
+    else:
+        z = compute(msg)
+    if msg.field("A"):
+        while True:
+            break
+    if msg.field("A"):
+        x = msg.field("B")
+    if msg.field("A"):
+        raise ValueError("stop")
+    raise ValueError("end")
+"""
+
+
+@pytest.mark.parametrize(
+    ("line", "ok"),
+    [
+        (3, True),  # a typed if/elif/else chain
+        (9, False),  # an untyped elif
+        (13, False),  # a code row in the else
+        (17, False),  # a while nested in a typed if
+        (20, False),  # a Read Field binding inside the block
+        (22, True),  # a typed raise inside a typed if
+    ],
+)
+def test_typed_only_delete_walks_the_whole_chain(line: int, ok: bool) -> None:
+    edit = {"line_start": line, "line_end": line, "op": "delete_row"}
+    if ok:
+        assert rewrite_source(_CHAINS, edit, typed_only=True) != _CHAINS
+    else:
+        with pytest.raises(LensRewriteError, match="typed-only mode"):
+            rewrite_source(_CHAINS, edit, typed_only=True)
+
+
+def test_typed_only_moves_a_typed_raise_row() -> None:
+    rows = parse_source(_CHAINS)[0]["rows"]
+    last = next(r for r in rows if r["line_start"] == 24)
+    edit = {"line_start": 24, "line_end": last["line_end"], "op": "move_row", "direction": "up"}
+    assert rewrite_source(_CHAINS, edit, typed_only=True) != _CHAINS
+
+
+def test_the_cli_typed_only_flag_refuses_moving_a_code_row(tmp_path: Path) -> None:
+    module = tmp_path / "h.py"
+    module.write_text(_STRUCT, encoding="utf-8")
+    edit = {"line_start": 3, "line_end": 3, "op": "move_row", "direction": "down"}
+    assert _cli(module, edit).returncode == 0
+    proc = _cli(module, edit, "--typed-only")
+    assert proc.returncode != 0
+    assert json.loads(proc.stdout)["code"] == "refused"
+
+
+def test_a_syntax_warning_in_existing_code_does_not_block_an_edit() -> None:
+    src = SOURCE.replace('    pid5 = msg.field("PID-5")\n', '    flag = pid5 is "x"\n')
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = rewrite_source(
+            src,
+            {
+                "line_start": _SEND,
+                "line_end": _SEND,
+                "op": "insert_row",
+                "position": "before",
+                "action": "set_field",
+                "params": {"path": "PID-3.1", "value": "B"},
+            },
+        )
+    assert 'msg.set("PID-3.1", "B")' in out
+
+
+def test_a_fhir_value_object_gets_its_import_and_cannot_be_shadowed() -> None:
+    params = {
+        "connection": "EPIC",
+        "query": "Patient",
+        "params": {"expr": '{"id": FhirToken("MRN", msg["A"] or "")}'},
+    }
+    assert "from messagefoundry import FhirToken" in _insert(params, "fhir_lookup")
+    shadowed = SOURCE.replace('    pid5 = msg.field("PID-5")\n', "    FhirToken = 1\n")
+    edit = {
+        "line_start": _SEND,
+        "line_end": _SEND,
+        "op": "insert_row",
+        "position": "before",
+        "action": "fhir_lookup",
+        "params": params,
+    }
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        rewrite_source(shadowed, edit)
+
+
+@pytest.mark.parametrize("expr", ["{[1]}", "{(1, [2]): 1}", '{{"a": 1}: 2}'])
+def test_an_unhashable_set_member_or_dict_key_is_refused(expr: str) -> None:
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        _insert({"src": "PID-5", "sep": "^", "dests": {"expr": expr}}, "split_field")
