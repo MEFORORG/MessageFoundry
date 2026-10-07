@@ -1361,25 +1361,30 @@ invariant rather than a property of the moved row):
 5. A deleted or moved block takes no hand-written Python with it: no `code` row, no dynamic row, and
    no hand-written header. A delete of an `if` covers its whole chain: every `elif` test must be
    generator-shaped too, and no `elif` or `else` body may hold a `code` row or a dynamic row.
-6. Every read of a name stays dominated by that name's bindings: every path from the start of
-   the body to the read passes a binding of the name (Manager decision 2026-10-07, after review).
-   Dominance is over the set of the name's bindings. A binding other than a For Each header,
-   earlier in the same suite as the read or earlier in a suite that encloses it, dominates the
-   read. An `if` whose every arm binds
-   the name, with an `else`, dominates a later read; one arm alone does not. A For Each header
-   dominates only reads inside its own body, so a row that uses its index, such as `occurrence=i`,
-   may not move out of the loop (Manager decision 2026-10-07, after review). A move of either end,
-   a binding or a reading row, that breaks this is refused, and so is a delete of a binding that
-   leaves a read undominated. Each of those would leave a read unbound, at least whenever a
-   condition is false. A block that holds a Read Field or assigned lookup row is also never moved
-   or deleted; that refusal is conservative, and applies even when every read sits inside the
-   block.
+6. Every read of a name stays dominated by that name's bindings: every path from the start of the
+   body to the read passes a binding of the name (Manager decision 2026-10-07, after review).
+   Dominance is over the set of the name's bindings. A binding other than a For Each header, earlier
+   in the same suite as the read or earlier in a suite that encloses it, dominates the read. An `if`
+   whose every arm binds the name, with an `else`, dominates a later read; one arm alone does not. A
+   binding inside a `with` body does not dominate a read after the block (Manager decision
+   2026-10-07, after review, adopting the R1 code's stricter rule). A For Each header dominates only
+   reads inside its own body, so a row that uses its index, such as `occurrence=i`, may not move out
+   of the loop (Manager decision 2026-10-07, after review). A move of either end, a binding or a
+   reading row, that breaks this is refused, and so is a delete of a binding that leaves a read
+   undominated. Each of those would leave a read unbound, at least whenever a condition is false. A
+   block that holds a Read Field or assigned lookup row is also never moved or deleted; that refusal
+   is conservative, and applies even when every read sits inside the block.
+7. A typed row never moves past a `code` row in the same suite, and never moves into a typed block
+   that holds a `code` row (Manager decision 2026-10-07, after review, adopting the R1 code's
+   stricter rule). This answers the Lander's PR 2155 finding 1. An insert at the same place is still
+   allowed; a move is refused because the lens checks that every protected statement keeps the
+   statements before it, and a move past one changes them.
+8. A typed `return` or `raise` keeps its own guard block: lifted out, a filter or a raise would run
+   on every message. A row never moves past the fan-out `return sends`, though it may move past
+   `sends = []` (Manager decision 2026-10-07, after review, adopting the R1 code's stricter rule).
 
-A typed row that is not dynamic may move past a `code` row in the same suite, unless rule 6 refuses
-it: rule 2 holds, and the result is the same as inserting the typed row there, which the analyst
-build already allows. A `pass`
-statement does not count as a `code` row for this rule, so an analyst can delete a block whose body
-is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager decisions
+A `pass` statement does not count as a `code` row for this rule, so an analyst can delete a block
+whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager decisions
 2026-10-07, from spike S-4, which found that the repository check needs them (ADR 0208 spec FR-40).
 
 This narrows, in typed-only mode only, at least: §2 Phase 3 and §5 of this ADR; ADR 0106; the
@@ -1389,27 +1394,32 @@ editable-kind guard in `rewrite_source` (`messagefoundry/lens.py`) calls the ADR
 Steps cut reuses. None of those texts is changed; this amendment is the record. None of it has
 landed.
 
-**This rule is the target, and the R1 tests are evidence only once they match it.** Read at R1
-head `c172beda9c`, `_refuse_untyped_structure` refuses a move or delete of any row that is not wholly
-typed (`_is_typed_stmt`, which also refuses a block holding a Read Field or assigned lookup row),
-and `_refuse_typed_only_result` then checks the result for shifted `code` rows
-(`_refuse_shifted_code`) and unbound reads (`_unbound_reads`). This review has not checked that
-code line by line against rules 1 to 6. Where R1 admits what this rule refuses, the R1 code is what
-has to change. One such gap is open: R1 compares per-name counts of unbound reads before and after
-an edit, and never counts a binding after its block. So a read the base already over-counts can
-hide a new real one. With `if c: x = ...` and `else: x = ...` above `use(x)`, moving the `else`
-binding below `use(x)` leaves the count unchanged, so R1 admits the move. Rule 6 refuses it, and
-the handler would raise UnboundLocalError whenever `c` is false. R1 must close this.
+**Where the rule and the R1 code stand.** Read at R1 head `71fe1207f4`, `_refuse_untyped_structure`
+refuses a move or delete of any row that is not wholly typed, and `_refuse_typed_only_result` then
+checks the result with `_refuse_shifted_code` and an unbound-read check.
+`tests/test_lens_typed_only_repair.py` pins rules 6 to 8: the `else` binding moved below its use, the
+`with` binding, a drop past code, a drop into a typed block that holds code, and a raise lifted out
+of its guard. Where the R1 code is stricter than this text, this text adopts the code's rule, because
+the code is tested and fails closed (Manager decision 2026-10-07, after review, adopting the R1
+code's stricter rule). At least two of its refusals are conservative, refusing some edits that would
+be safe:
+
+- a whole block moved past another block with the same header is refused;
+- a read of a `with` binding after the block is refused, even where the body always runs.
 
 ### G.7 The R1 fix: values a typed edit may write
 
 Amendment E's 2026-09-29 note (E.11, rule 3) records that structural inserts (`insert_row` and the
-insert templates) *"still splice an `{"expr": ...}` verbatim"*, and that the note does not cover them.
-The R1 fix would change that, in every mode, at least as follows:
+insert templates) *"still splice an `{"expr": ...}` verbatim"*, and that the note does not cover
+them. The R1 fix would change that, in every mode, at least as follows:
 
 - An `{"expr": ...}` on an `insert_row` (including its occurrence keywords), on `insert_code_lookup`
   (including the code-lookup default), or on a send row's `set_params` destination would be refused
   unless it is **inert**.
+- `set_params` on a send row would overwrite an existing destination only when that slot is a literal
+  or an inert name. A destination computed by code, or held in a handler local, is refused, and so is
+  a destination imported from another module, which cannot be retargeted yet (Manager decision
+  2026-10-07, after review, adopting the R1 code's stricter rule).
 - `assign_to` would refuse `msg`, builtins, reserved names, dunder names, and any name the handler
   or module already binds or reads.
 - `set_params` on a `route` row whose base `handlers` is not a literal list would be refused
@@ -1424,8 +1434,19 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
 `FhirRaw(<string literal>)`, named below.
 
 - a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
-- `+` and `-` over numbers and admitted names; `*`, `/` and `//` over number literals only, with a
-  non-zero divisor; never `%` or `**`;
+- `+` and `-` over numbers and numeric names; `*`, `/` and `//` over number literals only, with a
+  non-zero divisor; never `%` or `**`. Arithmetic takes only names bound to a number, never a name
+  that may hold text (Manager decision 2026-10-07, after review, adopting the R1 code's stricter
+  rule);
+- for an `occurrence` keyword, only a value that is 1 or more on every message: integer arithmetic
+  over literals whose result is 1 or more (so `2 * 3`, but not `1 - 1`), a 1-based loop index (every
+  loop binding it is `range(k, n)` or `range(k, n, step)` with literal `k` and `step` of 1 or more),
+  or that index plus a non-negative literal. `repetition=None` is allowed (Manager decision
+  2026-10-07, after review, adopting the R1 code's stricter rule). A name such as `occurrence=OCC`
+  bound to a module-level number is refused, conservatively;
+- for the value of Set Field and Add Repetition, only a value that is text: a string literal, a name
+  or read that may hold text, or a template. A number, `None` or a list is refused (Manager decision
+  2026-10-07, after review, adopting the R1 code's stricter rule);
 - a plain name other than `msg`, not a dunder, that cannot hold message content:
   - a For Each `range` loop index;
   - a module-level name bound exactly once, to a literal of an immutable type: a `str`, number,
@@ -1481,23 +1502,23 @@ branch, not yet merged), except for the name ceiling. Elsewhere, where this list
 those tests differ, the tests win. `set_params` on action, lookup and diagnostic rows already
 refuses a `dynamic` value (AC-M5).
 
-**Where the R1 branch stands on the ceiling.** Read at R1 head `c172beda9c`, `_message_scope` builds
+**Where the R1 branch stands on the ceiling.** Read at R1 head `71fe1207f4`, `_message_scope` builds
 an allow list: handler locals, For Each `range` indexes, and module-level names
 `_inert_module_literals` admits, with `code_set` captures held apart and admitted only for
 `code_lookup`'s `table` (`_table_scope`). The `reads_ok` path admits only those names and handler
 locals, so `SEEN` and a `code_set` name are refused there too; `tests/test_lens_typed_only_repair.py`
-pins `SEEN` in `set_field.value` as refused. These differences from the ceiling remain, at least,
-and R1 is being told to match:
+pins `SEEN` in `set_field.value` as refused. The four differences recorded against `c172beda9c`
+are closed at `71fe1207f4`: a name must have exactly one module-level binding; a `global`-declared
+name is not a handler local (`test_g7_a_global_declared_name_is_not_a_handler_local`); a `code_set`
+capture counts only when `code_set` is imported unaliased from `messagefoundry`
+(`_imported_from_messagefoundry`); and `_literal_kind` refuses `frozenset()`, a nested tuple and a
+tuple holding a `frozenset`.
 
-1. `_inert_module_literals` admits a name whose every binding is a literal, so a name with several
-   literal bindings passes, and so does a `code_set` name with a second `code_set` binding.
-2. `_message_scope` puts every name any function declares `global` into its locals, and the
-   `reads_ok` path admits locals. So `NAME = code_set("lab")` plus `def f(): global NAME` lets
-   `NAME` into a value param, and a `global`-declared `SEEN` passes the same way.
-3. `_literal_kind` matches the bare name `code_set` with no check that it is the one imported from
-   `messagefoundry`.
-4. `_literal_kind` admits `frozenset()` with no argument, and a tuple holding a `frozenset`, both
-   outside the immutable-literal bullet.
+**Limits of a static check.** The predicate reads the source and runs nothing, so code that
+reaches module state by a route the source does not spell out can still defeat it. These remain, at
+least: `getattr(h, "__globals__")`, `from sys import modules as mm`, and
+`importlib.import_module(__name__)`. Each needs a hand-written `code` row. And only `set_params`
+honours a message parameter that is not named `msg`; the other edits assume `msg`.
 
 **A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
 `_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
@@ -1539,7 +1560,8 @@ change is being built separately and has not landed.
   mode. Among those, the R1 branch's `_validated_raw_test` refuses a raw `test` that is not one
   condition on one line, or that holds a `yield`, or an `await` outside an `async def` element. THE
   SYSTEM SHALL accept every typed `template` edit in either mode, subject to G.7.
-- [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite` call.
+- [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite`
+  call.
 - [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`
   G.7 refuses, or a `set_params` on a route row whose base `handlers` is not a literal list, THEN
   `lens rewrite` SHALL refuse it, in every mode. R1 payloads 3 and 4 (G.5) are refusal tests, and
