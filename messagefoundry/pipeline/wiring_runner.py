@@ -3069,6 +3069,16 @@ class RegistryRunner:
             return False
         return _anchor_key(settings) == key
 
+    def _holds_anchor_failure(self, name: str) -> bool:
+        """Whether outbound ``name`` is down because a build refused its CA: marked, recorded
+        failed, and with no connector (vault BACKLOG #2371). Asked after a reload commits, when
+        :meth:`_keeps_anchor_failure` has already decided the lane stays failed."""
+        return (
+            ("outbound", name) in self._anchor_refused
+            and ("outbound", name) in self._failed
+            and name not in self._destinations
+        )
+
     def _reload_anchor_lanes(
         self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
     ) -> list[tuple[Direction, str, Mapping[str, Any]]]:
@@ -3294,12 +3304,15 @@ class RegistryRunner:
         """Resume a lane the calendar parked, now that its schedule is gone. Left paused whenever
         something other than the calendar also holds it down: an operator-required STOP, a #122 log
         halt, ``deployed=False`` or ``auto_start=False``. The lane then stays as that state leaves
-        it, and the ordinary recovery for that state brings it up."""
+        it, and the ordinary recovery for that state brings it up. So does a refused CA the reload
+        kept (vault BACKLOG #2371): resuming would rebuild it, alert again and unpause a lane with no
+        connector."""
         if (
             self._schedule_holds(name, "outbound")
             or self._delivery_halted
             or not self._deployed(name, "outbound")
             or not self._auto_start_enabled(name, "outbound")
+            or self._holds_anchor_failure(name)
         ):
             return
         if self._dr_parked(name):

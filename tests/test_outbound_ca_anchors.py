@@ -1137,3 +1137,109 @@ async def test_the_control_route_audits_a_refused_poller_start(
         assert [json.loads(row["detail"])["connection"] for row in rows] == ["IB_FTPS"]
     finally:
         await engine.stop()
+
+
+# --- round 5: review #10 and #13 -------------------------------------------------------------------
+
+
+def _outbound_registry(ca: Path, pin: str, **kw: Any) -> Registry:
+    """One Rest outbound ``OUT`` with a CA and pin, plus any ``outbound()`` keywords."""
+    from messagefoundry.config.wiring import build_outbound_connection
+
+    reg = Registry()
+    spec = Rest(url="https://partner.example.org/api", tls_ca_file=str(ca), tls_ca_pin=pin)
+    reg.add_outbound(build_outbound_connection("OUT", spec, **kw))
+    return reg
+
+
+async def test_removing_the_schedule_of_a_ca_refused_lane_does_not_resume_it(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review #10. The calendar parked ``OUT`` while its CA kept it failed. A reload that only
+    removes the schedule must leave it failed and paused, with no connector and no second alert.
+    Red under: the resume path ignoring the kept CA failure (4b0a186bd5)."""
+    from datetime import UTC, datetime, time
+
+    from messagefoundry.config.models import ActiveWindow, Schedule
+
+    schedule = Schedule(
+        windows=[
+            ActiveWindow(
+                days=frozenset(range(7)), start=time(8, 0), end=time(17, 0), timezone="UTC"
+            )
+        ]
+    )
+    now = [datetime(2026, 7, 13, 9, tzinfo=UTC)]
+    ca = _ca(tmp_path)
+    sink = _CountingSink()
+    runner = _runner(
+        store,
+        _outbound_registry(ca, "00" * 32, schedule=schedule),
+        alert_sink=sink,
+        schedule_clock=lambda: now[0],
+    )
+    await runner.start()
+    try:
+        assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
+        now[0] = datetime(2026, 7, 13, 18, tzinfo=UTC)  # the window closes: the calendar parks it
+        await runner._reconcile_schedule("OUT", "outbound", schedule)
+        assert "OUT" in runner._schedule_parked
+        await runner.reload(_outbound_registry(ca, "00" * 32))  # the schedule alone is removed
+        assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
+        assert "OUT" in runner._outbound_paused
+        assert "OUT" not in runner._destinations
+        assert sink.stopped == ["OUT"], sink.stopped
+    finally:
+        await runner.stop()
+
+
+async def test_a_dr_release_checks_a_lane_whose_ca_failure_the_park_ended(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review #13, DR. A DR park clears the lane's failed record, so it no longer keeps its CA
+    failure. The park's own reload reads nothing for it. The first reload after the release builds
+    it, so it checks it, and a CA still refused refuses that reload (the ADR 0031 amendment's
+    Consequences; review #2 asks whether the park should keep the failure instead)."""
+    from messagefoundry.config.models import Priority
+
+    ca = _ca(tmp_path)
+    reg = _outbound_registry(ca, "00" * 32, priority=Priority.LOW)
+    runner = _runner(store, reg)
+    await runner.start()
+    try:
+        assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
+        runner.set_dr_threshold(Priority.NORMAL)
+        await runner.reload(_outbound_registry(ca, "00" * 32, priority=Priority.LOW))
+        assert "OUT" not in runner.degraded_outbound()  # parked, and its failed record cleared
+        runner.set_dr_threshold(None)
+        with pytest.raises(WiringError, match=_PIN_MISMATCH):
+            await runner.reload(_outbound_registry(ca, "00" * 32, priority=Priority.LOW))
+    finally:
+        await runner.stop()
+
+
+async def test_a_lane_mark_clears_once_its_ca_check_passes(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review #13, the mark. An operator start whose check passes clears it. A reload whose
+    pre-check passes clears it once the reload commits. Red under either clear removed."""
+    good = _block(b"partner-ca")
+    ca = _ca(tmp_path)
+    pin = _sha(ca)
+    ca.write_bytes(_block(b"substitute"))
+    runner = _runner(store, _outbound_registry(ca, pin))
+    await runner.start()
+    try:
+        assert ("outbound", "OUT") in runner._anchor_refused
+        ca.write_bytes(good)
+        await runner.start_outbound("OUT")
+        assert ("outbound", "OUT") not in runner._anchor_refused
+        assert "OUT" in runner._destinations
+
+        ca.write_bytes(_block(b"substitute"))
+        runner._anchor_refused[("outbound", "OUT")] = (str(ca), pin)  # as a past refusal left it
+        ca.write_bytes(good)
+        await runner.reload(_outbound_registry(ca, pin))
+        assert ("outbound", "OUT") not in runner._anchor_refused
+    finally:
+        await runner.stop()
