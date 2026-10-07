@@ -1393,7 +1393,10 @@ head `c172beda9c`, `_refuse_untyped_structure` refuses a move or delete of any r
 typed (`_is_typed_stmt`, which also refuses a block holding a Read Field or assigned lookup row),
 and `_refuse_typed_only_result` then checks the result for shifted `code` rows
 (`_refuse_shifted_code`) and unbound reads (`_unbound_reads`). This review has not checked that
-code line by line against rules 1 to 6. Where the two differ, the R1 code is what has to change.
+code line by line against rules 1 to 6. Where R1 admits what this rule refuses, the R1 code is what
+has to change. R1 may refuse more than the rule requires: for example, its `_unbound_reads` never
+counts a binding after its block, so it refuses a move that an `if` and `else` both binding the name
+would make safe under rule 6. That is stricter, and safe.
 
 ### G.7 The R1 fix: values a typed edit may write
 
@@ -1413,7 +1416,7 @@ The R1 fix would change that, in every mode, at least as follows:
 describes it for a reader. **The list is not a gate.** No check, test or requirement may treat it as
 the definition of inert; a checker calls the lens's predicate (Manager decision 2026-10-07, after
 review). The list is a lower bound: the predicate admits at least these. It has one ceiling, the
-module-level name rule below, and one exception to "calls nothing": admitted values call nothing
+name ceiling below, and one exception to "calls nothing": admitted values call nothing
 except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...)` and
 `FhirRaw(<string literal>)`, named below.
 
@@ -1454,11 +1457,14 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
     `code` row; the analyst build neither adds this path nor closes it (Manager decision
     2026-10-07, after review);
   - in value params, lookup-params values and `FhirToken`'s second argument, which may also carry
-    message content, a handler local other than `msg` (a name the handler itself binds, such as
-    `pid5`), and nothing beyond what this list admits elsewhere;
+    message content, a handler local other than `msg`, and nothing beyond what this list admits
+    elsewhere. A *handler local* is a name the handler itself binds, such as `pid5`, and that no
+    function in the module declares `global` or `nonlocal`. A declared name is shared state, so it
+    could carry one message's data into the next;
   - **these bullets are a ceiling, on every path, value params included: the predicate SHALL NOT
-    admit a name beyond a handler local, a For Each `range` index, a module-level name the first
-    bullet admits, or a `code_set` name as `code_lookup`'s `table`, whatever the R1 tests say**
+    admit a name beyond a handler local, a For Each `range` index, a module-level name the
+    immutable-literal bullet admits, or a `code_set` name as `code_lookup`'s `table`, whatever the
+    R1 tests say**
     (Manager decision 2026-10-07, after review, adopting R1 head `c172beda9c`'s rule; this reverses
     the round-6 decision that scoped the ceiling to non-value params);
 - a list, tuple, set or dict built only from inert values, with no splat;
@@ -1468,7 +1474,7 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
   `FhirToken(literal, read)` or `FhirRaw(<string literal>)`.
 
 **The source of record is the R1 fix's tests** (`tests/test_lens_no_code_injection.py` on the R1
-branch, not yet merged), except for the module-level name ceiling. Elsewhere, where this list and
+branch, not yet merged), except for the name ceiling. Elsewhere, where this list and
 those tests differ, the tests win. `set_params` on action, lookup and diagnostic rows already
 refuses a `dynamic` value (AC-M5).
 
@@ -1477,10 +1483,18 @@ an allow list: handler locals, For Each `range` indexes, and module-level names
 `_inert_module_literals` admits, with `code_set` captures held apart and admitted only for
 `code_lookup`'s `table` (`_table_scope`). The `reads_ok` path admits only those names and handler
 locals, so `SEEN` and a `code_set` name are refused there too; `tests/test_lens_typed_only_repair.py`
-pins `SEEN` in `set_field.value` as refused. Two differences from the ceiling remain, and R1 is being
-told to match: `_inert_module_literals` admits a name whose every binding is a literal, so a name
-with several literal bindings passes, and a `code_set` name with a second `code_set` binding passes.
-Whether R1 checks that `code_set` is the name imported from `messagefoundry` was not checked here.
+pins `SEEN` in `set_field.value` as refused. These differences from the ceiling remain, at least,
+and R1 is being told to match:
+
+1. `_inert_module_literals` admits a name whose every binding is a literal, so a name with several
+   literal bindings passes, and so does a `code_set` name with a second `code_set` binding.
+2. `_message_scope` puts every name any function declares `global` into its locals, and the
+   `reads_ok` path admits locals. So `NAME = code_set("lab")` plus `def f(): global NAME` lets
+   `NAME` into a value param, and a `global`-declared `SEEN` passes the same way.
+3. `_literal_kind` matches the bare name `code_set` with no check that it is the one imported from
+   `messagefoundry`.
+4. `_literal_kind` admits `frozenset()` with no argument, and a tuple holding a `frozenset`, both
+   outside the immutable-literal bullet.
 
 **A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
 `_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
@@ -1512,7 +1526,8 @@ change is being built separately and has not landed.
 - [ ] **AC-G6** -- WHILE `lens rewrite` runs in typed-only mode, IF an edit is a `paste_block`, an If
   `template` or Else If `insert_clause` edit with a `test` key, or a move or delete that breaks the
   structure rule of G.6, THEN THE SYSTEM SHALL refuse it with the generic `refused` code and write
-  nothing. R1 payloads 1 and 2 (G.5) are refusal tests. The R1 fix's tests verify this; they land
+  nothing. R1 payloads 1 and 2 (G.5) are refusal tests, and so is a row using `occurrence=i`
+  moved out of its For Each loop (G.6 rule 6). The R1 fix's tests verify this; they land
   separately.
 - [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL NOT refuse a
   `paste_block` or a raw `test` for being one; each still passes the checks the lens applies in every
@@ -1527,5 +1542,5 @@ change is being built separately and has not landed.
   binds `NAME = code_set("<literal>")`: `SEEN` as a `checkpoint` label, in a `log_note` template,
   as a lookup-params value, as `FhirToken("MRN", SEEN)` and in a value param; and `NAME` as a
   `checkpoint` label, in a `log_note` template, as a lookup-params value, as
-  `FhirToken("MRN", NAME)` and in a value param. A row using `occurrence=i` moved out of its For
-  Each loop is a refusal test under typed-only mode (G.6 rule 6).
+  `FhirToken("MRN", NAME)` and in a value param. So is `NAME` in a value param when some function
+  in the module declares `global NAME`.

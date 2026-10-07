@@ -178,8 +178,7 @@ site's ordinary review is what would catch these (D-C):
   a Read Field row for this reason (the `read_field` gate in `rewrite_source`,
   `messagefoundry/lens.py`). That gate keys on `read_field` alone, because it was written for Read
   Field rows (ADR 0089 row 4, BACKLOG #1505), so it does not yet cover a lookup's `assign_to`.
-  Under typed-only mode, the R1 branch's `_is_typed_stmt` already refuses a moved or deleted block
-  that holds a Read Field or assigned lookup row. The rest of rule 6 is open work for the R1 fix.
+  Where the R1 branch stands on rule 6 is recorded once, in Amendment G, G.6.
 
 **What already gates what runs, under both:** a change reaches a running engine only when someone with
 `config:deploy` reloads it, under the existing step-up and the site's `[approvals]` dual control. That
@@ -342,9 +341,11 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   behind "details". Messages MAY name components: handler, router, connection and code-set names.
   No message SHALL contain "code view", "View as Code", Python source, a traceback, or a function or
   variable name from the code other than a component name, outside the "details" toggle. Dialogs
-  count as messages too. Two sit on the Steps path: the save prompt when a dirty tab closes, and the
+  are messages too. Two sit on the Steps path: the save prompt when a dirty tab closes, and the
   browser's leave-page prompt. A message that offers an action SHALL offer it as a button in the
-  panel (Manager decision 2026-10-07, from spike S-2).
+  panel (Manager decision 2026-10-07, from spike S-2). A native dialog the analyst build cannot
+  draw in the panel, such as the leave-page prompt, is exempt from the panel rule only, and still
+  meets the wording rules. What the Electron build shows in its place is settled at build.
 
 ### 7.3 Steps-level operations
 
@@ -559,9 +560,11 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   - with `SEEN = []` (and a `SEEN.append(...)`) and a module-level `NAME = code_set("<literal>")`
     at base: `NAME` as a `checkpoint` label, in a `log_note` template, as a lookup-params value, as
     `FhirToken("MRN", NAME)` or in a value param; and `SEEN` as a lookup-params value, as
-    `FhirToken("MRN", SEEN)` or in a value param (G.7; Manager decision 2026-10-07, after review);
-  - a row using `occurrence=i` moved out of its For Each loop (G.6 rule 6; Manager decision
-    2026-10-07, after review).
+    `FhirToken("MRN", SEEN)` or in a value param (G.7; Manager decision 2026-10-07, after review).
+
+  FR-41 does not list a row using `occurrence=i` moved out of its For Each loop. The repository
+  check has no FR-40 item that tests for an unbound read (section 5.2), so it would pass that move.
+  The lens refuses it under typed-only mode (Amendment G, AC-G6).
 
   It SHALL pass an ordinary Steps edit, an insert above a `code` row, and one of each sanctioned shape
   in items 2 and 3 (spike S-4).
@@ -680,10 +683,14 @@ decision 2026-10-07, from spike S-2):
    `workbench.action.files.newUntitledFile`, `workbench.action.files.pickNewFile`, `file.saveAs`,
    `file.compare`, `compare:first` and `compare:second`.
 
-The analyst build must also stop a `.py` being **written** without being opened: through an
-untitled buffer, *Save As*, *Compare*, or a rename or copy into a `.py`. It rebinds `FileService`
-for this, because a file-operation participant cannot block a move: Theia logs the participant's
-error and carries on. A shipped build SHALL NOT expose test hooks on `window`.
+The analyst build must also stop a `.py` being **written** without being opened. The routes
+include at least an untitled buffer, *Save As* and *Compare* (closed by layer 4), a rename or copy
+from another file into a `.py` (closed by a `FileService` rebind), and an upload, a drop into the
+navigator, and a copy of one `.py` over another. The spike's `FileService` rebind guards only a
+move or copy from a file that is not a `.py` into a `.py`, and its walk skipped upload, so the
+last three are open for the build. The rebind, not a file-operation participant, is the mechanism,
+because a participant cannot block a move: Theia logs the participant's error and carries on. A
+shipped build SHALL NOT expose test hooks on `window`.
 
 On a desktop the build split is about simplicity, not a security boundary. Test in either build runs
 config code on the user's machine, as `ide/` does today (review R12). Section 5 says what the controls
@@ -824,7 +831,7 @@ In CI these would start as separate, **non-required** jobs (section 12). Spike S
 | S-1 | Does a native Theia Steps extension render and edit `samples/config`, and how much of `ide/` does it reuse? | Parse, render, edit, undo and Test work in a pinned Theia build; hot-exit is verified or dropped from FR-26; the shared share of `stepsModel.ts` and the `acquireVsCodeApi` shim are measured; the typed-row versus `code`-row share over `samples/config` is recorded; the Theia version and language server are recorded; @theia/playwright runs at that version (section 16). **Met except the Test and language-server legs**, measured on a browser target: branch `claude/theia-spike-s1` at `cd97e6b1b4`, under `theia-spike/`, not merged, on Theia 1.76.0. Hot-exit was dropped (FR-26). Test is open because it needs the D-B generator-spec engine change, which is not built. No language server was recorded. The Electron build is checked by spike S-3 (Manager decision 2026-10-07, after review) |
 | S-2 | Does the analyst build have no text-editor route for `.py`? | A scripted walk of every command, menu and *Open With* entry opens no `.py` in Monaco, and finds no pop-up notification (FR-17). **Met on the browser build**: branch `claude/theia-spike-s2` at `d35ae64158`, under `theia-spike/`, not merged. The Electron build still needs the same walk (section 16, layer 4) |
 | S-3 | Does the analyst build install and run on a managed Windows image? | It installs and runs Test without administrator rights, as the Electron build; installer size and memory use are recorded. It is also the first check of the Electron target, which spike S-1 did not run |
-| S-4 | The repository check as a CI step on a sample config repository | It meets FR-41, run from a base-ref workflow per section 5.4. **Classifier half met by the spike**: branch `claude/theia-spike-s4-steps-only` at `673faa7c60`, `scripts/theia_spike/steps_only.py` with 80 tests in `tests/test_theia_steps_only_spike.py`, not merged. The base-ref workflow half is untested |
+| S-4 | The repository check as a CI step on a sample config repository | It meets FR-41, run from a base-ref workflow per section 5.4. **Classifier half met by the spike against FR-41 as it stood then**: branch `claude/theia-spike-s4-steps-only` at `673faa7c60`, `scripts/theia_spike/steps_only.py` with 80 tests in `tests/test_theia_steps_only_spike.py`, not merged. The FR-41 cases added later (the lookup-params, `FhirToken` and value-param cases for `SEEN` and a `code_set` name) are untested. The base-ref workflow half is untested |
 
 ---
 
