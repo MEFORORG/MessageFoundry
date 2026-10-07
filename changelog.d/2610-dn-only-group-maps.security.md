@@ -9,9 +9,16 @@
   matches nothing, and there is no compatibility path; re-enter it as a DN. `SECURITY.md` said the
   short form was the group's `sAMAccountName`; it now states the DN-only rule. (vault
   `BACKLOG #2610`)
+- **Group map keys and a user's groups are compared in one canonical DN form.** Each side is
+  parsed, lower-cased, unescaped and escaped again one way, with the parts of a multi-valued RDN
+  sorted. So `CN=C# Developers,...`, which Active Directory writes with the `#` unescaped,
+  `CN=C\# Developers,...` and `CN=C\23 Developers,...` all name the same group, and a space after a
+  comma is ignored. The maps store the canonical form, which is what `GET` now returns. (vault
+  `BACKLOG #2610`)
 - **A Windows SSO step names a client only when the Kerberos context that checked the ticket
-  finished.** For SSPI and native GSSAPI that is the context's own `complete` flag. pyspnego's own
-  Negotiate wrapper, used where GSSAPI offers no native SPNEGO, can stay incomplete after one step
-  while the Kerberos context inside it finished, so there that inner context is read, and only a
-  Kerberos one counts. This is defence in depth; no provider is known to name a client on an
-  unfinished context. Kerberos realm handling is unchanged. (vault `BACKLOG #2610`)
+  finished.** On Windows that is the SSPI context's own `complete` flag. On Linux every sign-in
+  goes through pyspnego's own Negotiate wrapper, because pyspnego 0.12's GSSAPI proxy offers
+  Kerberos only and never Negotiate. That wrapper can stay incomplete after one step while the
+  Kerberos context inside it finished, so there the inner context is read, and only a Kerberos one
+  counts. This is defence in depth; no provider is known to name a client on an unfinished context.
+  Kerberos realm handling is unchanged. (vault `BACKLOG #2610`)

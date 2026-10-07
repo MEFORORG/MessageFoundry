@@ -3016,9 +3016,15 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
 ### AD-group → role mapping
 
 An admin sets which AD groups govern which role via `GET/PUT /ad-group-map` (or the web console). A
-group is named by its **full distinguished name (DN)** and nothing else, matched case-insensitively.
-`PUT /ad-group-map` and `PUT /ad-group-scope-map` refuse any other key with a 400, and a user's
-groups are read as DNs only. A user in multiple mapped groups gets the union of those roles.
+group is named by its **full distinguished name (DN)** and nothing else. `PUT /ad-group-map` and
+`PUT /ad-group-scope-map` refuse any other key with a 400, and a user's groups are read as DNs
+only. A user in multiple mapped groups gets the union of those roles.
+
+**Keys and a user's groups are compared in one canonical form.** The engine parses each DN, then
+lower-cases it, unescapes each value and escapes it again one way, and sorts the parts of a
+multi-valued RDN. The maps store that form. So a key matches however either side spells the DN:
+Active Directory writes `CN=C# Developers,OU=Groups,...` with the `#` unescaped, and
+`CN=C\# Developers` and `CN=C\23 Developers` name the same group.
 
 **A short name is refused because the engine cannot tell two same-named groups apart** (BACKLOG
 #2610). This section used to say a key could be the group's `sAMAccountName`, which is unique in a

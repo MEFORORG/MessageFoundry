@@ -101,7 +101,7 @@ from messagefoundry.auth import (
     Role,
 )
 from messagefoundry.auth.audit_visibility import audit_exclusion_for
-from messagefoundry.auth.ldap import LdapError, is_group_dn
+from messagefoundry.auth.ldap import LdapError, canonical_group_dn
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
     ENROL_AUTHENTICATOR_FIRST,
@@ -364,13 +364,17 @@ async def _validate_roles(service: AuthService, roles: list[str]) -> None:
 _GROUPS_NAMED = 3
 
 
-def _validate_group_dns(groups: list[str]) -> None:
-    """Refuse a group map key that is not a full distinguished name (BACKLOG #2610).
+def _canonical_group_dns(groups: list[str]) -> list[str]:
+    """Each group map key in canonical form, or a 400 if any is not a full DN (BACKLOG #2610).
 
-    Both ``PUT /ad-group-map`` and ``PUT /ad-group-scope-map`` call this before any write. A short
-    name used to match a same-named group in any unit, so it is refused rather than stored. A blank
-    key is left to the store, which drops it as it always has."""
-    bad = sorted({g.strip() for g in groups if g.strip() and not is_group_dn(g)})
+    Both ``PUT /ad-group-map`` and ``PUT /ad-group-scope-map`` call this before any write and store
+    what it returns, in the same order. A short name used to match a same-named group in any unit,
+    so it is refused rather than stored. The canonical form is the one ``_resolve_groups`` gives a
+    member's groups, so a key matches however it escapes a value (:func:`canonical_group_dn`). The
+    store still folds case and strips, which is a no-op on it. A blank key stays blank, and the
+    store drops it as it always has."""
+    canonical = [canonical_group_dn(g) if g.strip() else "" for g in groups]
+    bad = sorted({g.strip() for g, c in zip(groups, canonical, strict=True) if c is None})
     if bad:
         named = ", ".join(bad[:_GROUPS_NAMED])
         more = len(bad) - _GROUPS_NAMED
@@ -380,6 +384,7 @@ def _validate_group_dns(groups: list[str]) -> None:
             f"CN=MF-Admins,OU=Groups,DC=example,DC=com; refused: {named}"
             + (f" and {more} more" if more > 0 else ""),
         )
+    return [c or "" for c in canonical]
 
 
 def add_auth_routes(app: FastAPI) -> AdminHandlers:
@@ -1490,7 +1495,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        _validate_group_dns([e.ad_group for e in body.entries])
+        groups = _canonical_group_dns([e.ad_group for e in body.entries])
         await _validate_roles(service, [e.role for e in body.entries])
 
         # BACKLOG #315: mapping a group to Administrator makes every member who signs in an approver,
@@ -1505,7 +1510,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
         before = await admin_groups() if grants else set()
         await service.set_ad_group_map(
-            [(e.ad_group, e.role) for e in body.entries], actor=identity.username
+            [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
+            actor=identity.username,
         )
         for group in sorted((await admin_groups() - before) if grants else set()):
             _alert_administrator_granted(
@@ -1529,9 +1535,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        _validate_group_dns([e.ad_group for e in body.entries])
+        groups = _canonical_group_dns([e.ad_group for e in body.entries])
         await service.set_ad_group_scope_map(
-            [(e.ad_group, e.channel) for e in body.entries], actor=identity.username
+            [(g, e.channel) for g, e in zip(groups, body.entries, strict=True)],
+            actor=identity.username,
         )
         return SimpleMessage(detail="ad-group scope map updated")
 

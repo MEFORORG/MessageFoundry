@@ -21,7 +21,12 @@ import spnego
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import ldap as ldap_mod
-from messagefoundry.auth.ldap import LdapAuthenticator, is_group_dn, kerberos_principal
+from messagefoundry.auth.ldap import (
+    LdapAuthenticator,
+    canonical_group_dn,
+    is_group_dn,
+    kerberos_principal,
+)
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -34,6 +39,11 @@ PW = "Sup3rSecret!!"
 #: The group an administrator meant to map, and a same-named one somebody made in another unit.
 LEGIT = "CN=MF-Admins,OU=Groups,DC=example,DC=invalid"
 ROGUE = "CN=MF-Admins,OU=Contractors,DC=example,DC=invalid"
+
+#: A group whose name holds a ``#`` after its first character. RFC 4514 escapes ``#`` only at the
+#: start of a value, and Active Directory writes it unescaped in ``memberOf``.
+SHARP = "CN=C# Developers,OU=Groups,DC=example,DC=invalid"
+SHARP_CANON = "cn=c# developers,ou=groups,dc=example,dc=invalid"
 
 
 class _Entry:
@@ -136,6 +146,8 @@ async def test_a_stored_short_name_key_matches_no_group(store: MessageStore) -> 
         "CN=Smith\\, Pat,OU=Groups,DC=example,DC=invalid",
         "CN=A+OU=B,DC=example",  # a multi-valued first RDN is still followed by a second RDN
         f"  {LEGIT}  ",  # the store strips; so does the check
+        "CN=MF-Admins, OU=Groups,DC=example",  # a space after a separator is padding
+        "CN=C# Developers,DC=example",  # a "#" after a value's first character is literal
     ],
 )
 def test_a_full_dn_is_a_group_dn(value: str) -> None:
@@ -148,15 +160,74 @@ def test_a_full_dn_is_a_group_dn(value: str) -> None:
         "MF-Admins",  # a short name
         "CN=MF-Admins",  # one RDN names no unit
         "CN=A+OU=B",  # one multi-valued RDN is still one RDN
-        "CN=MF-Admins, OU=Groups,DC=example",  # a space after a separator
         "CN=MF-Admins,,DC=example",
         "CN=,DC=example",
+        "CN=   ,DC=example",  # padding only: an empty value
+        "CN=MF-Admins,DC=example,",  # a trailing separator
+        "CN=#4142,DC=example",  # an unescaped leading "#" is a BER hex string
+        'CN="MF-Admins",DC=example',  # a quoted value
+        "CN=MF-Admins;DC=example",  # the old ";" separator
+        "CN=MF-Admins,DC=example\\",  # a trailing lone backslash
+        "CN=\\ff,DC=example",  # not UTF-8 once unescaped
+        "C N=MF-Admins,DC=example",  # not an attribute type
         "example\\MF-Admins",
         "",
     ],
 )
 def test_anything_else_is_not_a_group_dn(value: str) -> None:
     assert not is_group_dn(value)
+    assert canonical_group_dn(value) is None
+
+
+# --- every spelling of one DN has one canonical form ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("spelling", "canonical"),
+    [
+        # The directory's own spelling, the RFC 4514 escape, and the hex escape of one "#".
+        (SHARP, SHARP_CANON),
+        ("cn=C\\# developers,ou=Groups,dc=example,dc=invalid", SHARP_CANON),
+        ("CN=C\\23 Developers,OU=Groups,DC=example,DC=invalid", SHARP_CANON),
+        # A comma escaped two ways, and a space after a separator.
+        ("CN=Smith\\, Pat,OU=Groups,DC=example", "cn=smith\\, pat,ou=groups,dc=example"),
+        ("CN=Smith\\2C Pat, OU=Groups, DC=example", "cn=smith\\, pat,ou=groups,dc=example"),
+        # A multi-valued RDN in either order, with the attribute types in any case.
+        ("CN=Ops+OU=Lab,DC=example", "cn=ops+ou=lab,dc=example"),
+        ("ou=Lab+cn=Ops,DC=example", "cn=ops+ou=lab,dc=example"),
+        # Escapes a canonical value must keep, and a multi-byte UTF-8 hex escape.
+        ("CN=\\#lead\\ ,DC=example", "cn=\\#lead\\ ,dc=example"),
+        ("CN=a\\+b\\<c\\>,DC=example", "cn=a\\+b\\<c\\>,dc=example"),
+        ("CN=Caf\\C3\\A9,DC=example", "cn=café,dc=example"),
+        ("CN=a\\00b,DC=example", "cn=a\\00b,dc=example"),
+        # A dotted-OID attribute type. Three arcs, so it is not mistaken for an IP address.
+        ("2.5.77=Ops,DC=example", "2.5.77=ops,dc=example"),
+    ],
+)
+def test_each_spelling_has_one_canonical_form(spelling: str, canonical: str) -> None:
+    assert canonical_group_dn(spelling) == canonical
+    # Stable: canonicalising again changes nothing, and neither does the store's own fold.
+    assert canonical_group_dn(canonical) == canonical
+    assert canonical.strip().lower() == canonical
+
+
+def test_resolve_groups_canonicalises_direct_and_nested_dns() -> None:
+    """``memberOf`` and the nested search both come back canonical, so a key written with an
+    escape the directory does not use still names the group. A DN with no canonical form is
+    dropped: no stored key can name it."""
+    nested = [_Entry("CN=Ops+OU=Lab,OU=Groups,DC=example,DC=invalid", "unused")]
+    got = _groups_of([SHARP, 'CN="quoted",DC=example'], nested)
+    assert got == {SHARP_CANON, "cn=ops+ou=lab,ou=groups,dc=example,dc=invalid"}
+
+
+async def test_a_multi_valued_rdn_in_either_order_matches(store: MessageStore) -> None:
+    """A key that lists a multi-valued RDN's parts in the other order from the directory still
+    maps the member. The key is canonicalised the way the routes do before the store write."""
+    canonical = canonical_group_dn("OU=Lab+CN=Ops,OU=Groups,DC=example,DC=invalid")
+    assert canonical is not None
+    await store.set_ad_group_role_map([(canonical, Role.OPERATOR.value)])
+    member = _groups_of(["CN=Ops+OU=Lab,OU=Groups,DC=example,DC=invalid"])
+    assert await store.roles_for_ad_groups(member) == {Role.OPERATOR.value}
 
 
 # --- both PUT routes refuse a short-name key ------------------------------------------------------
@@ -229,6 +300,35 @@ async def test_a_map_write_refuses_a_short_name_and_takes_a_dn(
         assert (await c.put(path, json=full, headers=h)).status_code == 200
         got = (await c.get(path, headers=h)).json()["entries"]
         assert got == [{"ad_group": LEGIT.lower(), field: value}]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        SHARP,  # the spelling the directory itself writes
+        "cn=C\\# developers,ou=Groups,dc=example,dc=invalid",  # escaped
+        "CN=C\\23 Developers,OU=Groups,DC=example,DC=invalid",  # hex-escaped
+    ],
+)
+async def test_a_group_with_a_sharp_in_its_name_can_be_mapped(engine: Engine, key: str) -> None:
+    """The Lander's finding on PR 2107. Fails on ``ba38a0d850`` for the unescaped arm: ldap3's
+    parser refused the ``#`` and the route answered 400. The two escaped arms were accepted there
+    but stored a key the directory's unescaped DN never equalled, so the member got nothing. Every
+    spelling now stores one canonical key, and a member whose ``memberOf`` carries the directory's
+    own spelling gets the role and the channel."""
+    transport = await _admin_transport(engine)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        login = {"username": "boss", "password": PW, "provider": "local"}
+        h = {"Authorization": f"Bearer {(await c.post('/auth/login', json=login)).json()['token']}"}
+        role = {"entries": [{"ad_group": key, "role": Role.OPERATOR.value}]}
+        r = await c.put("/ad-group-map", json=role, headers=h)
+        assert r.status_code == 200, r.text
+        scope = {"entries": [{"ad_group": key, "channel": "IB_DEV"}]}
+        r = await c.put("/ad-group-scope-map", json=scope, headers=h)
+        assert r.status_code == 200, r.text
+    member = _groups_of([SHARP])
+    assert await engine.store.roles_for_ad_groups(member) == {Role.OPERATOR.value}
+    assert await engine.store.channels_for_ad_groups(member) == {"IB_DEV"}
 
 
 # --- review point (c): an incomplete SPNEGO context names no client ------------------------------
