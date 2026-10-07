@@ -304,14 +304,16 @@ from typing import Any
 #: message editor calls to ask for an action-bound proof without spending it, and the console imports
 #: five new step-up action constants, for the resend, edit-resend, upload-resend, purge and reload
 #: lanes (export has no console route). A method the console calls, so a skew would be an
-#: AttributeError at request time; it forces a bump. Unnumbered, as above.
+#: AttributeError at request time; it forces a bump. Unnumbered, as above. Re-derived on the tree
+#: merged with vault BACKLOG #3062 (``AuthService.enabled`` removed), which moved the digest on its
+#: own; the value below covers both changes.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "ef12c8e7e68d7d70"
+ENGINE_UI_SEAM: str = "3e6c70a45a02a682"
 
 
 @dataclass(frozen=True, slots=True)

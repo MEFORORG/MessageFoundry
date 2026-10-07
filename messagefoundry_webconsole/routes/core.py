@@ -478,7 +478,7 @@ async def _has_stale_session_cookie(request: Request, auth: AuthService | None) 
     token = session_token(request)
     if not token:
         return False
-    if auth is None or not auth.enabled:
+    if auth is None:
         return True  # a cookie with no auth configured can never authenticate
     return await auth.identity_for_token(token, activity=False) is None
 
@@ -570,7 +570,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # cookie yet), so this origin check is the only login-CSRF control available here.
         assert_same_origin(request)
         auth = get_auth(request)
-        if auth is None or not auth.enabled:
+        if auth is None:
             raise HTTPException(503, "authentication is not configured")
         client = request.client.host if request.client else None
         if not auth.allow_login_attempt(client):

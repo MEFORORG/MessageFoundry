@@ -41,6 +41,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store import OutboxStatus
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._operator_audit_atomic_contract import AppendFailed, failing_append
 
 PW = "a-strong-test-passphrase"
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -688,11 +689,11 @@ async def test_a_failed_approved_row_after_the_operation_ran_still_reports_succe
     )
 
 
-async def test_a_failed_replay_audit_row_is_not_compensated_to_failed(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The executor's own dead_letter_replay row fails AFTER the deliveries were re-queued. Pre-fix
-    the raise reached the gate's compensation and the row read 'failed' for a replay that ran."""
+async def test_a_released_replay_whose_audit_row_fails_requeues_nothing(engine: Engine) -> None:
+    """BACKLOG #2624: the executor's dead_letter_replay row commits with the re-queue. So a failed
+    append re-queues nothing, and the gate's compensation records a replay that did not run as
+    'failed', which is now true. Before #2624 (and under #1940) the deliveries were already
+    re-queued when the row failed, so the executor logged and reported a replay with no row."""
     await _dead_letter(engine)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -700,20 +701,16 @@ async def test_a_failed_replay_audit_row_is_not_compensated_to_failed(
     async with _client(engine, service, ON) as c:
         approval_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
         admin = await _token(c, "approver")
-        _fail_audit_for(monkeypatch, engine, "dead_letter_replay")
-        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
-            ok = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
-        assert ok.status_code == 200
-        assert ok.json()["result"] == {"requeued": 1}  # the replay really ran
+        with failing_append(engine.store, "dead_letter_replay"), pytest.raises(AppendFailed):
+            await c.post(f"/approvals/{approval_id}/approve", headers=admin)
 
     row = await engine.store.get_pending_approval(approval_id)
-    assert row is not None and str(row["status"]) == "approved"
-    assert await engine.store.list_audit(action="approval.failed") == []
-    assert len(await engine.store.list_audit(action="approval.approved")) == 1
-    assert any(
-        r.levelno == logging.ERROR and "dead_letter_replay audit row failed" in r.getMessage()
-        for r in caplog.records
-    )
+    assert row is not None and str(row["status"]) == "failed"
+    failed = await engine.store.list_audit(action="approval.failed")
+    assert len(failed) == 1 and json.loads(str(failed[0]["detail"]))["error"] == "AppendFailed"
+    assert await engine.store.list_audit(action="approval.approved") == []
+    assert await engine.store.list_audit(action="dead_letter_replay") == []
+    assert await engine.store.count_dead(allowed_channels=None) == 1  # still dead-lettered
 
 
 async def test_a_normal_release_writes_one_release_row_and_one_approved_row(

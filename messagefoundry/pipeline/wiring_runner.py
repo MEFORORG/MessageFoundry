@@ -190,6 +190,7 @@ from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import (
     MessageStatus,
     OutboxItem,
+    OutboxStatus,
     QueueStore,
     Stage,
     StreamingAttachmentsUnsupported,
@@ -522,6 +523,11 @@ class _RefusalLog:
     """The WARNING a permanent refusal writes after the delivery worker dead-letters it, throttled per
     (connection, refusal code) (BACKLOG #3043).
 
+    A transient failure that ran out a finite ``max_attempts`` writes the same line, with
+    ``exhausted=True`` (BACKLOG #3108). Its pairs are keyed ``exhausted:<code>``, so they do not
+    share a window or a held count with permanent refusals of the same code. Both kinds do share
+    the cross-pair cap below, which bounds the whole log, not one kind of line.
+
     **What the line may carry.** The connection, the outbox row id (and the message id where the
     caller has it), the exception's class name and its ``code``. Never ``str(exc)`` or
     ``safe_exc(exc)``: a partner's reject text (MSA-3, an HTTP body) can echo the message, and
@@ -578,15 +584,23 @@ class _RefusalLog:
         self._lines_since = -math.inf
 
     def warning(
-        self, name: str, exc: NegativeAckError, rows: int, message: str, *args: object
+        self,
+        name: str,
+        exc: DeliveryError,
+        rows: int,
+        message: str,
+        *args: object,
+        exhausted: bool = False,
+        stacklevel: int = 2,
     ) -> None:
         """Log ``message % args`` at WARNING, followed by ``exc``'s class name and code, unless the
         pair ``(name, code)`` logged inside the window, in which case count its ``rows``. Call it
         AFTER the dead-letter write, so a line never claims a dead-letter that did not happen."""
-        # getattr: a connector may raise a subclass that never set `code` (see _lane_stopping_fault).
-        # A missing code must not turn the fail-fast dead-letter into an AttributeError loop.
+        # getattr: a connector may raise a subclass that never set `code` (see _lane_stopping_fault),
+        # and a plain DeliveryError has none. A missing code must not turn the dead-letter into an
+        # AttributeError loop.
         code = str(getattr(exc, "code", "?"))
-        key = (name, code)
+        key = (name, f"exhausted:{code}" if exhausted else code)
         now = self._clock()
         last, held = self._state.get(key, (-math.inf, 0))
         if now - self._lines_since >= self._window:
@@ -606,13 +620,11 @@ class _RefusalLog:
         message += " (%s, code %r)"
         args = (*args, type(exc).__name__, code)
         if held:
-            message += (
-                " (%d more row(s) refused with this code on this connection since its last line)"
-            )
-            args = (*args, held)
+            message += " (%d more row(s) %s with this code on this connection since its last line)"
+            args = (*args, held, "dead-lettered at the retry cap" if exhausted else "refused")
         message += "; more with this code in the next %.0f s are counted, not logged"
         args = (*args, self._window)
-        log.warning(message, *args, stacklevel=2)
+        log.warning(message, *args, stacklevel=stacklevel)
 
 
 # A queue_buildup alert re-fires at most this often per connection while the lane stays over threshold,
@@ -7370,6 +7382,7 @@ class RegistryRunner:
                 )
             else:
                 retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
+                await self._note_retry_exhausted(name, exc, retry, retry_until, [item])
                 await self._delivery_failure_alert_checks(name)
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756: a store READ the send needed failed (the document re-attach or the
@@ -7386,6 +7399,7 @@ class RegistryRunner:
             # per policy (the shipped cap is 100 attempts, then the row dead-letters into the
             # replayable DLQ — bounded, not discarded).
             retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
+            await self._note_retry_exhausted(name, exc, retry, retry_until, [item])
             await self._delivery_failure_alert_checks(name)
             # #46: edge-trigger connection_lost (+ throttled alert) on the lane going down.
             self._note_lane_unhealthy(name, item.id, exc)
@@ -7622,6 +7636,7 @@ class RegistryRunner:
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
         # the head is PARSED, for the BHS separators + the BHS-11 control id.
         refused: list[_RefusedMember] = []
+        kept = list(items)  # the rows behind `ids`, so a failure arm can read the head's attempts
         try:
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
@@ -7679,6 +7694,7 @@ class RegistryRunner:
                 )
             else:
                 retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
+                await self._note_retry_exhausted(name, exc, retry, retry_until, kept, batch=True)
                 await self._delivery_failure_alert_checks(name)
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756, the batch twin of the single-row arm: nothing was sent, so all N
@@ -7689,6 +7705,7 @@ class RegistryRunner:
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
+            await self._note_retry_exhausted(name, exc, retry, retry_until, kept, batch=True)
             await self._delivery_failure_alert_checks(name)
             self._note_lane_unhealthy(name, ids[0] if ids else head.id, exc)
         except Exception as exc:
@@ -9142,6 +9159,65 @@ class RegistryRunner:
         if oldest_age < threshold.max_oldest_seconds:
             return  # oldest message hasn't stalled long enough yet
         self._fire_stall(name, age=oldest_age, now=now)
+
+    async def _note_retry_exhausted(
+        self,
+        name: str,
+        exc: DeliveryError,
+        retry: RetryPolicy,
+        retry_until: float | None,
+        rows: Sequence[OutboxItem],
+        *,
+        batch: bool = False,
+    ) -> None:
+        """Write the content-free WARNING when a transient failure's ``mark_failed`` (``rows`` the one
+        row) or ``mark_batch_failed`` (``batch``, ``rows`` the members it was handed, head first)
+        just dead-lettered at a finite ``max_attempts`` (BACKLOG #3108). Before this, the store
+        wrote DEAD with no log line at all. Call it AFTER that write.
+
+        The store returns ``None`` for a dead-lettered row, but also for a vanished one and, on
+        Postgres and SQL Server, for a final write the H1 epoch fence rolled back and re-pended. So
+        a ``None`` alone proves nothing. The store's own rule, ``max_attempts is not None and
+        attempts >= max_attempts`` on the attempts the claim returned, first skips every case
+        below the cap with no read. At the cap, one read of the head row's status confirms DEAD
+        before the line claims it. This costs one read per dead-letter, and only on this path.
+        The read is a diagnostic, so it never raises out of the failure arm: if it fails, the line
+        still goes out and says the DEAD is unconfirmed, naming only the read's exception class.
+        Throttled with the permanent-refusal line, under its own ``exhausted:`` key."""
+        # An empty batch also returns None, with nothing dead-lettered.
+        if retry_until is not None or retry.max_attempts is None or not rows:
+            return
+        head = rows[0]  # mark_batch_failed decides from its first member
+        if head.attempts < retry.max_attempts:
+            return
+        unconfirmed = ""
+        try:
+            outbox = await self.store.outbox_for(head.message_id)
+        except Exception as read_exc:  # noqa: BLE001 -- a diagnostic read must not change the arm
+            unconfirmed = f"; unconfirmed, the status read failed ({type(read_exc).__name__})"
+        else:
+            if not any(
+                r["id"] == head.id and r["status"] == OutboxStatus.DEAD.value for r in outbox
+            ):
+                return
+        subject_args: tuple[object, ...]
+        if batch:
+            subject, subject_args = "a batch of %d (head outbox row %s)", (len(rows), head.id)
+        else:
+            subject, subject_args = "outbox row %s (message %s)", (head.id, head.message_id)
+        self._refusal_log.warning(
+            name,
+            exc,
+            len(rows),
+            "delivery worker %r: " + subject + " failed and was dead-lettered at the retry cap, "
+            "after %d attempt(s)" + (" of its head" if batch else "") + "%s",
+            name,
+            *subject_args,
+            head.attempts,
+            unconfirmed,
+            exhausted=True,
+            stacklevel=3,
+        )
 
     def _note_store_read_fault(
         self, name: str, exc: _StoreReadFault, rows: int, retry_until: float | None

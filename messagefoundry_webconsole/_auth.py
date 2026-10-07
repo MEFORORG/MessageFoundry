@@ -422,7 +422,7 @@ def require_ui(
 
     async def dependency(request: Request) -> Identity:
         auth = get_auth(request)
-        if auth is None or not auth.enabled:
+        if auth is None:
             # The browser UI always needs a real session — no allow_no_auth shortcut here.
             raise _login_redirect()
         token = session_token(request)
@@ -1124,7 +1124,7 @@ def require_ui_step_up(
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
         auth = get_auth(request)
-        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+        if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
@@ -1162,7 +1162,7 @@ def require_ui_reauth_only(
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + permission (+ must-change gate)
         auth = get_auth(request)
-        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+        if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
@@ -1230,7 +1230,7 @@ def require_ui_step_up_action(
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
         auth = get_auth(request)
-        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+        if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
@@ -1252,10 +1252,10 @@ async def spend_ui_action_step_up(
     BACKLOG #2625). A route takes this split when it checks its own input first: a refusal of that
     input then costs the operator no proof. Sends the browser to ``/ui/reauth`` when the grant is
     gone, for instance spent by a second tab. ``reauth_next`` is the gate's own, so both refusals
-    land on one page. No-op with auth off, as the gate is, and under the org opt-out, where there
-    is no grant and the gate has already checked the window on this request."""
+    land on one page. No-op with no auth service, as the gate is, and under the org opt-out,
+    where there is no grant and the gate has already checked the window on this request."""
     auth = get_auth(request)
-    if auth is None or not auth.enabled or not auth.action_step_up_required:
+    if auth is None or not auth.action_step_up_required:
         return
     if not await _ui_action_step_up_ok(auth, session_token(request), action):
         raise _reauth_redirect(request, reauth_next(request))
@@ -1303,7 +1303,7 @@ def require_ui_reauth_only_action(
         # cookie auth + permission (+ must-change gate) + the pending refusal above
         identity = await base(request)
         auth = get_auth(request)
-        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+        if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
@@ -1342,8 +1342,8 @@ async def authorize_ui_ws(
     token = session_token(websocket)
     if not token:
         return None, None
-    auth = getattr(websocket.app.state, "auth", None)
-    if auth is None or not auth.enabled:
+    auth: AuthService | None = getattr(websocket.app.state, "auth", None)
+    if auth is None:
         return None, None
     # activity=False (ASVS 14.3.1): app.js now re-opens this socket on a TIMER after a drop, and a
     # timer is not user activity. The page load that opened the first socket already counted.

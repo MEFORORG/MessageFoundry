@@ -15,8 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import traceback
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
@@ -35,10 +34,9 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports.base import DestinationConnector, NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
+from tests._refusal_log_capture import TOKEN, until
+from tests._refusal_log_capture import assert_no_token as _assert_no_token
 
-# The planted token. ASCII on purpose: the encoding test puts a non-ASCII character right after it,
-# so the token itself is what an ASCII-safe leak (a repr, an escaped string) would still carry.
-TOKEN = "ZQXPLANTEDTOKEN"
 OUT = "file_out"
 LOGGER = "messagefoundry.pipeline.wiring_runner"
 
@@ -114,26 +112,6 @@ class _Refuses:
         return None
 
 
-def _record_texts(record: logging.LogRecord) -> Iterable[str]:
-    yield record.getMessage()
-    yield repr(vars(record))  # msg, args and any extra attribute
-    if record.exc_info and record.exc_info[1] is not None:
-        yield "".join(traceback.format_exception(record.exc_info[1]))
-    if record.exc_text:
-        yield record.exc_text
-    if record.stack_info:
-        yield record.stack_info
-
-
-def _assert_no_token(records: Iterable[logging.LogRecord]) -> None:
-    leaks = [
-        f"{r.name}:{r.levelname}:{r.getMessage()}"
-        for r in records
-        if any(TOKEN in text for text in _record_texts(r))
-    ]
-    assert not leaks, f"a log record carries the planted payload token: {leaks}"
-
-
 def _refusal_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [
         r
@@ -169,6 +147,7 @@ async def test_charset_refusal_through_the_real_worker_logs_one_content_free_war
     (inbox / "a.hl7").write_bytes(_adt(1, name=TOKEN + "é").encode("utf-8"))
     try:
         await _until_dead(store, 1)
+        await until(lambda: len(_refusal_lines(caplog)) == 1, "the refusal line")
     finally:
         await runner.stop()
 
@@ -196,6 +175,7 @@ async def test_a_refusal_whose_text_echoes_the_payload_logs_none_of_it(
     (inbox / "a.hl7").write_bytes(_adt(1).encode("utf-8"))
     try:
         await _until_dead(store, 1)
+        await until(lambda: len(_refusal_lines(caplog)) == 1, "the refusal line")
     finally:
         await runner.stop()
 
@@ -218,6 +198,11 @@ async def test_the_warning_is_throttled_per_connection_and_code_and_reports_what
         for n in (1, 2, 3):
             (inbox / f"{n}.hl7").write_bytes(_adt(n).encode("utf-8"))
         await _until_dead(store, 3)
+        # Wait until rows 2 and 3 are counted, or a clock moved early would let row 3 log itself.
+        await until(
+            lambda: runner._refusal_log._state.get((OUT, "AR"), (0.0, 0))[1] == 2,
+            "two held rows",
+        )
         # Every refused row was still dead-lettered: only the log line is throttled.
         (only,) = _refusal_lines(caplog)
         assert "more row(s) refused" not in only.getMessage()
@@ -225,6 +210,7 @@ async def test_the_warning_is_throttled_per_connection_and_code_and_reports_what
         now[0] += 61.0  # past the window: the next refusal logs and reports the two it held
         (inbox / "4.hl7").write_bytes(_adt(4).encode("utf-8"))
         await _until_dead(store, 4)
+        await until(lambda: len(_refusal_lines(caplog)) == 2, "the second refusal line")
     finally:
         await runner.stop()
 

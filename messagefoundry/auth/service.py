@@ -2219,17 +2219,12 @@ def oidc_client_auth_from_settings(
 
 
 class AuthService:
-    """Authentication + RBAC orchestration over an :class:`AuthStore` and the configured directory."""
+    """Authentication + RBAC orchestration over an :class:`AuthStore` and the configured directory.
 
-    @property
-    def enabled(self) -> bool:
-        """Always True: a service that exists requires sign-in (vault BACKLOG #2825).
-
-        The open mode is NO service, opted into with the app factories' ``allow_no_auth=True``; both
-        factories refuse that opt-in beside a service. No setting turns a built service off, and the
-        property has no setter. So the ``auth is None or not auth.enabled`` guards in the API and
-        the web console mean ``auth is None``."""
-        return True
+    A service that exists requires sign-in. The open mode is NO service, opted into with the app
+    factories' ``allow_no_auth=True``, and both factories refuse that opt-in beside a service. So
+    the API and the web console ask only ``auth is None``; the class has no ``enabled`` switch for
+    them to read (vault BACKLOG #2825, #3062)."""
 
     def __init__(
         self,

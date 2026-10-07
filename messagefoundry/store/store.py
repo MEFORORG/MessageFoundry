@@ -4067,7 +4067,8 @@ class AuditAppend:
 
     For a record that must not outlive, or be outlived by, the row it describes. Written as a
     second call, a crash between the two kept the change and lost its record. ``create_user`` and
-    ``update_user_profile`` take them (BACKLOG #2221). Each joins the hash chain
+    ``update_user_profile`` take them (BACKLOG #2221), and so do the operator mutations through an
+    :data:`OperatorAudit` (BACKLOG #2624). Each joins the hash chain
     :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
     """
 
@@ -4075,13 +4076,14 @@ class AuditAppend:
     actor: str | None = None
     detail: str | None = None
     client: str | None = None
+    channel_id: str | None = None
 
     def tee(self, *, ts: float, row: AppendedAuditRow) -> None:
         """Forward the committed row off-box, as ``record_audit`` does after its own commit."""
         emit_audit_tee(
             action=self.action,
             actor=self.actor,
-            channel_id=None,
+            channel_id=self.channel_id,
             detail=self.detail,
             client=self.client,
             ts=ts,
@@ -4100,6 +4102,66 @@ def tee_audits(
     """
     for audit, row in zip(audits, rows, strict=True):
         audit.tee(ts=ts, row=row)
+
+
+type OperatorAudit[R] = Callable[[R], AuditAppend | None]
+"""The audit row an operator mutation commits WITH its change, built from the change's result.
+
+Replay, dead-letter replay, resend, re-ingress and purge take one (BACKLOG #2624). The store calls
+it inside the mutation's own transaction, once the result is known, and appends the row it returns
+before the one commit. So a crash, or a failed append, keeps both or neither. ``None`` means this
+result records nothing, as a replay that re-queued no row records nothing. The row's detail can
+carry the result, such as a count, which is why this is a function and not a row.
+
+It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
+row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
+not read chain state."""
+
+
+def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
+    """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624)."""
+    if audit is None:
+        return ()
+    row = audit(result)
+    return () if row is None else (row,)
+
+
+class AuditedWrite:
+    """Tee a write's audit rows off-box once its transaction has committed (BACKLOG #2624).
+
+    The write appends its rows inside its own transaction and hands them to :meth:`add`. Enter this
+    OUTSIDE the transaction and the writer lock, so it exits after both: a clean exit means the rows
+    are durable and tees them, outside the lock, as ``record_audit`` does. An exception tees nothing.
+    That is right for a failed commit. It also drops the tee when the exception comes after the
+    commit, such as a cancellation while the pool takes the connection back; ``record_audit`` has the
+    same window. The tee is the off-box copy, and the committed row stays in the chain. Holding the rows here, not in a local,
+    is what lets a write with several ``return`` paths inside its transaction tee from every one.
+    """
+
+    __slots__ = ("_audits", "_rows", "now")
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+        self._audits: list[AuditAppend] = []
+        self._rows: list[AppendedAuditRow] = []
+
+    def add(self, audits: Sequence[AuditAppend], rows: Sequence[AppendedAuditRow]) -> None:
+        """Hold rows the transaction appended, one per audit, in order, until it commits."""
+        self._audits.extend(audits)
+        self._rows.extend(rows)
+
+    def flush(self) -> None:
+        """Tee the held rows. Call it only once their transaction has committed."""
+        audits, rows = self._audits, self._rows
+        self._audits, self._rows = [], []
+        tee_audits(audits, rows, ts=self.now)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, exc_type: type[BaseException] | None, *_exc: object) -> None:
+        if exc_type is None:
+            self.flush()
 
 
 def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
@@ -7219,6 +7281,7 @@ class MessageStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
+        audit: OperatorAudit[str] | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001 Step A).
@@ -7313,12 +7376,19 @@ class MessageStore:
                     "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
                     (mid, ref),
                 )
+            if audit is not None:  # an operator's inject (BACKLOG #2624); a live receipt has none
+                await self._append_operator_audit(written, audit, mid)
             return mid
 
+        # BACKLOG #2624: an inject's audit row is teed by on_commit, which runs once the batch has
+        # committed and only then, even if this caller is cancelled while it waits.
+        written = AuditedWrite(now)
         # HAZARD B: the inbound ACK / HTTP-202 is built only after this returns, so under group-commit
         # _run_grouped must not return until the ingress member's batch is durably committed (the
         # committer resolves the future post-commit). We never ACK data a crash could still lose.
-        result = await self._run_grouped(_body)
+        result = await self._run_grouped(
+            _body, on_commit=(lambda _mid: written.flush()) if audit is not None else None
+        )
         assert isinstance(result, str)  # nosec B101 — _body returns mid (str)
         return result
 
@@ -9597,7 +9667,13 @@ class MessageStore:
             )
             return len(orphans)
 
-    async def replay(self, message_id: str, now: float | None = None) -> int:
+    async def replay(
+        self,
+        message_id: str,
+        now: float | None = None,
+        *,
+        audit: OperatorAudit[int] | None = None,
+    ) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset) — the message-level
         recovery path. **Two modes, by whether anything is stuck:**
 
@@ -9635,9 +9711,12 @@ class MessageStore:
         ``ERROR``. Replay does not retransmit a pass-through ``Send``: the marker carries no body, and
         the child it produced is its own message, replayable in its own right. The ``stuck`` count
         leaves this predicate out for the same reason as the erased-body one: a depth-capped DEAD
-        marker is a real failure, so the parent stays in RECOVER mode and keeps its ``ERROR``."""
+        marker is a real failure, so the parent stays in RECOVER mode and keeps its ``ERROR``.
+
+        ``audit`` builds the operator's audit row from the count, and the row commits with the
+        replay (BACKLOG #2624, :data:`OperatorAudit`)."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND status IN (?, ?)",
                 (message_id, OutboxStatus.DEAD.value, OutboxStatus.PENDING.value),
@@ -9692,8 +9771,10 @@ class MessageStore:
                     (status, message_id),
                 )
                 await self._event(message_id, "replayed", None, f"{cur.rowcount} row(s)", now)
+            count = cur.rowcount
+            await self._append_operator_audit(written, audit, count)
             await self._commit()
-            return cur.rowcount
+        return count
 
     async def resend_to(
         self,
@@ -9704,6 +9785,7 @@ class MessageStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[ResendOutcome] | None = None,
     ) -> ResendOutcome:
         """Resend a message's **stored transformed body** to an ALTERNATE outbound ``to`` (ADR 0090,
         BACKLOG #123). Ships exactly what we sent — the retained ``done``/``cancelled`` outbound
@@ -9732,9 +9814,12 @@ class MessageStore:
         :class:`ResendSourceEmpty` (retention nulled the source body — must-fix #2),
         :class:`ResendSourceAmbiguous` (``from_`` omitted with >1 delivered destination), or
         :class:`ResendKeyConflict` (the ``idempotency_key`` was already used for a different
-        message/target — review #123-4)."""
+        message/target — review #123-4).
+
+        ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
+        commits with the resend (BACKLOG #2624, :data:`OperatorAudit`)."""
         now = time.time() if now is None else now
-        async with _writer_txn(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
             # row. INSERT OR IGNORE + rowcount is the atomic test-and-set on the UNIQUE resend_key.
             ins = await self._db.execute(
@@ -9762,14 +9847,16 @@ class MessageStore:
                         f" {pr['message_id']!r} to {pr['to_destination']!r}; it cannot be reused for"
                         f" message {message_id!r} to {to!r}"
                     )
-                await self._commit()
-                return ResendOutcome(
+                outcome = ResendOutcome(
                     status="duplicate",
                     message_id=message_id,
                     to_destination=pr["to_destination"] if pr else to,
                     from_destination=pr["from_destination"] if pr else (from_ or ""),
                     outbox_id=pr["outbox_id"] if pr else None,
                 )
+                await self._append_operator_audit(written, audit, outcome)
+                await self._commit()
+                return outcome
             if body_override is not None:
                 # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                 # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN
@@ -9914,14 +10001,16 @@ class MessageStore:
                 "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
                 (outbox_id, idempotency_key),
             )
-            await self._commit()
-            return ResendOutcome(
+            outcome = ResendOutcome(
                 status="resent",
                 message_id=message_id,
                 to_destination=to,
                 from_destination=src_dest,
                 outbox_id=outbox_id,
             )
+            await self._append_operator_audit(written, audit, outcome)
+            await self._commit()
+            return outcome
 
     async def reingress(
         self,
@@ -9930,6 +10019,7 @@ class MessageStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
+        audit: OperatorAudit[ReingressOutcome] | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-enter an EDITED body onto the
         ORIGIN message's channel as a **fresh, correlated ``RECEIVED`` child message** at the ingress
@@ -9947,9 +10037,12 @@ class MessageStore:
 
         Raises :class:`ReingressOriginMissing` (origin gone — belt-and-suspenders; the API 404s first) or
         :class:`ResendKeyConflict` (the key was already used for a DIFFERENT origin/target). No mutation
-        on a raise (the whole txn rolls back)."""
+        on a raise (the whole txn rolls back).
+
+        ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
+        commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`)."""
         now = time.time() if now is None else now
-        async with _writer_txn(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
                 "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=?",
                 (origin_message_id,),
@@ -9982,13 +10075,15 @@ class MessageStore:
                         f" resubmit ({pr['message_id']!r} -> {pr['to_destination']!r}); it cannot be"
                         f" reused for message {origin_message_id!r}"
                     )
-                await self._commit()
-                return ReingressOutcome(
+                outcome = ReingressOutcome(
                     status="duplicate",
                     message_id=origin_message_id,
                     new_message_id=(pr["outbox_id"] if pr else "") or "",
                     channel_id=channel_id,
                 )
+                await self._append_operator_audit(written, audit, outcome)
+                await self._commit()
+                return outcome
             # Correlate the child to the origin (mirrors _insert_passthrough_child): correlation_id /
             # _root_id / _depth link the logs, plus an explicit `edited_from` for the edit provenance.
             raw_meta = self._dec(
@@ -10059,13 +10154,15 @@ class MessageStore:
                 "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
                 (new_mid, idempotency_key),
             )
-            await self._commit()
-            return ReingressOutcome(
+            outcome = ReingressOutcome(
                 status="resubmitted",
                 message_id=origin_message_id,
                 new_message_id=new_mid,
                 channel_id=channel_id,
             )
+            await self._append_operator_audit(written, audit, outcome)
+            await self._commit()
+            return outcome
 
     @staticmethod
     def _edit_resubmit_message_id(idempotency_key: str, channel: str, body: str) -> str:
@@ -10088,6 +10185,7 @@ class MessageStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Re-queue **dead-lettered outbound deliveries** only (optionally scoped to a channel/
         destination): set them back to ``pending`` with attempts reset, revert each affected message
@@ -10118,12 +10216,13 @@ class MessageStore:
             where.append("destination_name=?")
             params.append(destination_name)
         clause = " AND ".join(where)
-        async with _writer_guard(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 f"SELECT DISTINCT message_id FROM queue WHERE {clause}", tuple(params)
             )
             message_ids = [r["message_id"] for r in await cur.fetchall()]
             if not message_ids:
+                await self._commit_operator_noop(written, audit, 0)
                 return 0
             # All-or-nothing, matching the SQL Server backend's atomicity.
             upd = await self._db.execute(
@@ -10138,6 +10237,7 @@ class MessageStore:
                     (MessageStatus.ROUTED.value, message_id, MessageStatus.ERROR.value),
                 )
                 await self._event(message_id, "replayed", None, "dead-letter replay", now)
+            await self._append_operator_audit(written, audit, upd.rowcount)
             await self._commit()
             return upd.rowcount
 
@@ -10148,6 +10248,7 @@ class MessageStore:
         *,
         top_only: bool = False,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, append
         a ``cancelled`` audit event each, and finalize any message whose deliveries are now all
@@ -10159,9 +10260,12 @@ class MessageStore:
         ``channel_id`` it is the oldest row from that producer, which is the lane head only when no
         other inbound feeds the destination; the API passes ``None``. On an unordered lane there is no
         blocking head, and this still cancels the oldest row. Inflight/dead rows are left untouched
-        (dead uses :meth:`replay`). Returns the number cancelled."""
+        (dead uses :meth:`replay`). Returns the number cancelled.
+
+        ``audit`` builds the operator's audit row from the count, zero included, and the row commits
+        with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
             # ix_queue_fifo_out_seq in rowid order; only outbound rows carry a destination_name anyway.
             where = ["stage=?", "destination_name=?", "status=?"]
@@ -10183,6 +10287,7 @@ class MessageStore:
             cur = await self._db.execute(query, tuple(params))
             rows = await cur.fetchall()
             if not rows:
+                await self._commit_operator_noop(written, audit, 0)
                 return 0
             ids = [r["id"] for r in rows]
             placeholders = ",".join("?" * len(ids))
@@ -10196,6 +10301,7 @@ class MessageStore:
                 )
             for message_id in {r["message_id"] for r in rows}:
                 await self._maybe_finalize_message(message_id, now)
+            await self._append_operator_audit(written, audit, len(ids))
             await self._commit()
             return len(ids)
 
@@ -11071,10 +11177,32 @@ class MessageStore:
         """Append each of a write's ``audits``, in order, inside its writer transaction (#2100)."""
         return [
             await self._append_audit_row(
-                a.action, actor=a.actor, channel_id=None, detail=a.detail, client=a.client, now=now
+                a.action,
+                actor=a.actor,
+                channel_id=a.channel_id,
+                detail=a.detail,
+                client=a.client,
+                now=now,
             )
             for a in audits
         ]
+
+    async def _append_operator_audit[R](
+        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+    ) -> None:
+        """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
+        that fails rolls the mutation back with it. ``written`` tees the row once the commit lands."""
+        audits = operator_audits(audit, result)
+        written.add(audits, await self._append_audits(audits, now=written.now))
+
+    async def _commit_operator_noop[R](
+        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+    ) -> None:
+        """Audit an operator mutation that found nothing to change (BACKLOG #2624). Its row may be
+        the only write, so commit only when there is one: a bare commit would count a transaction."""
+        await self._append_operator_audit(written, audit, result)
+        if self._db.in_transaction:
+            await self._commit()
 
     @staticmethod
     def _audit_where(
@@ -11869,7 +11997,7 @@ class MessageStore:
             appended = await self._append_audit_row(
                 audit.action,
                 actor=audit.actor,
-                channel_id=None,
+                channel_id=audit.channel_id,
                 detail=audit.detail,
                 client=audit.client,
                 now=now,

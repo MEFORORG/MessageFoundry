@@ -35,6 +35,7 @@ Anything stated to an operator about this refusal must carry that scope — see
 from __future__ import annotations
 
 import difflib
+import functools
 import ipaddress
 import logging
 import os
@@ -396,8 +397,29 @@ class _Section(_InputHidingModel):
     # fail to start. Two further reasons the model is the wrong surface: pydantic's extra_forbidden error
     # echoes the offending VALUE and the CLI prints the exception verbatim to a log file, so a mistyped
     # SECRET key would disclose the secret; and `security show` validates SecuritySettings directly, so a
-    # forbidding model would deny an operator the very view they use to repair the typo.
+    # forbidding model would deny an operator the very view they use to repair the typo. The one
+    # exception is a REMOVED key (_refuse_removed_keys below): it is no typo, and its refusal names
+    # the fix and echoes no value.
     model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_removed_keys(cls, data: Any) -> Any:
+        """Refuse a REMOVED key (``_REMOVED_KEYS``) loudly rather than drop it (vault BACKLOG #3062).
+
+        The loader refuses these keys from a file or the environment before any model is built. A
+        section built in code skips the loader, and ``extra="ignore"`` would drop the key, so
+        ``SecuritySettings(require_sign_in=False)`` would quietly keep sign-in on. Unlike a blanket
+        ``extra="forbid"``, this names only keys that were removed, and its message carries no value.
+        So ``security show`` on a file still holding one refuses with the fix in its message, and the
+        operator removes the line, by hand or with ``security set`` and a ``null`` value.
+
+        Keys are checked in ``_REMOVED_KEYS`` order, so the key named is the one the loader names."""
+        if isinstance(data, Mapping) and (removed := _removed_keys_for(cls)):
+            for key, refusal in removed.items():
+                if key in data:
+                    raise ValueError(refusal)
+        return data
 
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind.
@@ -6738,6 +6760,30 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
     ),
 }
 
+
+def _removed_key_message(section: str, key: str, reason: str) -> str:
+    return (
+        f"[{section}].{key} was REMOVED and is no longer accepted: {reason} "
+        "(see docs/CONFIGURATION.md)."
+    )
+
+
+@functools.cache
+def _removed_keys_for(model: type[BaseModel]) -> dict[str, str]:
+    """``key -> refusal`` for the :data:`_REMOVED_KEYS` of the section(s) ``model`` validates.
+
+    Read through :func:`_section_models`, so a section gains the model-level refusal by being
+    listed in ``_REMOVED_KEYS`` and nothing else, and a subclass of a section inherits its
+    refusals. Called only when a model is built, never at import, so every name it reads exists by
+    then. A section built at module level anywhere above this function would raise ``NameError``."""
+    sections = {name for name, m in _section_models().items() if issubclass(model, m)}
+    return {
+        key: _removed_key_message(section, key, reason)
+        for (section, key), reason in _REMOVED_KEYS.items()
+        if section in sections
+    }
+
+
 #: ``[security]`` key → ``(section, field)`` for the switches that map 1:1 onto a settable internal field.
 #: The non-1:1 switches (network host, at-rest encryption, the posture lever, require_encryption_for_remote)
 #: are handled explicitly in :func:`_desugar_security`.
@@ -6767,10 +6813,7 @@ def _reject_relocated_keys(data: Mapping[str, Any]) -> None:
     for (section, key), reason in _REMOVED_KEYS.items():
         sect = data.get(section)
         if isinstance(sect, dict) and key in sect:
-            raise ValueError(
-                f"[{section}].{key} was REMOVED and is no longer accepted: {reason} "
-                "(see docs/CONFIGURATION.md)."
-            )
+            raise ValueError(_removed_key_message(section, key, reason))
     for (section, key), replacement in _RELOCATED_TO_SECURITY.items():
         sect = data.get(section)
         if isinstance(sect, dict) and key in sect:
@@ -6958,8 +7001,8 @@ def _auth_default(field: str) -> Any:
 
 def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     """The ``[auth]`` anti-automation limits set LOOSER THAN THEIR SHIPPED DEFAULT, as
-    ``(switch, risk)`` entries for :func:`security_loosenings`, which calls this only while sign-in is
-    on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2 and 7.1.2 each field cites).
+    ``(switch, risk)`` entries for :func:`security_loosenings`, which always calls this, since sign-in
+    is always on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2 and 7.1.2 each field cites).
 
     **Why the default is the cutoff.** The first pass named only the values the code reads as OFF,
     and a vault re-read then measured near-off values that were just as off in effect and silent: a
@@ -7261,7 +7304,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     # --- the second-factor time floor (BACKLOG #2301, ASVS 2.4.2): _second_factor_too_early refuses
     # a code or passkey that completes an MFA-pending session sooner than this after sign-in, and
     # skips the check at 0 or less. It applies to any account with a factor, whether or not
-    # [security].require_mfa is on, so it is gated on sign-in only.
+    # [security].require_mfa is on, so it is named whatever require_mfa says.
     #
     # Its entry does NOT quote the configured value, unlike every other floor here. CodeQL's
     # py/clear-text-logging-sensitive-data reads an attribute named mfa_* as a password source, and

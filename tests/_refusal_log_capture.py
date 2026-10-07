@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The planted-token leak scan and the bounded wait the dead-letter WARNING tests share (BACKLOG
+#3043, #3108).
+
+One copy on purpose: a second scanner can drift, and a weaker copy passes a leak.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import traceback
+from collections.abc import Callable, Iterable
+
+# The planted token. ASCII on purpose: a test may put a non-ASCII character right after it, so the
+# token itself is what an ASCII-safe leak (a repr, an escaped string) would still carry.
+TOKEN = "ZQXPLANTEDTOKEN"
+
+
+def record_texts(record: logging.LogRecord) -> Iterable[str]:
+    """Every text a record can carry: message, args and other attributes, exc_info, stack_info."""
+    yield record.getMessage()
+    yield repr(vars(record))  # msg, args and any extra attribute
+    if record.exc_info and record.exc_info[1] is not None:
+        yield "".join(traceback.format_exception(record.exc_info[1]))
+    if record.exc_text:
+        yield record.exc_text
+    if record.stack_info:
+        yield record.stack_info
+
+
+def assert_no_token(
+    records: Iterable[logging.LogRecord], *, skip_message: str | None = None
+) -> None:
+    """Fail if any record carries :data:`TOKEN`. ``skip_message`` names one whole message the caller
+    has reported elsewhere and is not testing; nothing else is skipped."""
+    leaks = [
+        f"{r.name}:{r.levelname}:{r.getMessage()}"
+        for r in records
+        if r.getMessage() != skip_message and any(TOKEN in text for text in record_texts(r))
+    ]
+    assert not leaks, f"a log record carries the planted payload token: {leaks}"
+
+
+async def until(done: Callable[[], bool], what: str, timeout: float = 5.0) -> None:
+    """Poll ``done`` until it holds, or fail naming ``what`` after ``timeout`` seconds.
+
+    A real-worker test must wait on the LOG it asserts, not on the store. The worker writes the
+    line after the store commit, sometimes after another await, so a test that saw the DEAD row and
+    then stopped the runner could cancel the worker before the line (BACKLOG #3108, windows-2022)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not done():
+        if loop.time() > deadline:
+            raise AssertionError(f"{what} not reached within {timeout}s")
+        await asyncio.sleep(0.02)

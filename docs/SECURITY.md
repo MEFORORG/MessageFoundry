@@ -631,6 +631,17 @@ records those accesses (no double-audit). The web console's gates write no grant
 `authorize_ui_ws`, which every same-origin browser `/ws/stats` handshake passes through. BACKLOG #1197
 tracks that gap.
 
+So on the console, an operator action's own audit row is its only record. **At least these operator
+mutations commit that row in the same transaction as the change they record (vault BACKLOG #2624):**
+message replay, dead-letter replay (inline and released), an inline purge, resend, edit-and-resubmit
+(direct and re-route), and the uploaded-log inject. A released purge is not in the set; see
+[Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235). That holds on all three store backends. A crash between the
+change and its row, or a failed append, now keeps both or neither. Before, each row was a second write
+after the commit, so a crash between the two would have kept a console action with no row in the
+audit chain on a first deployment. A config reload is not in this set: its graph swaps before its row
+is written, as [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+describes.
+
 That is the shipped default as of BACKLOG #1277 (2026-09-02). Until then the grant audit was **scoped**
 to the sensitive / state-changing / config / user-mgmt permission set (`_GRANT_AUDIT_PERMISSIONS` in
 `api/security.py`) on non-GET requests only, on the ground that console polling and the `/ws/stats` feed
@@ -1805,6 +1816,11 @@ compare against it. Only a committed reload or a flag toggle that moves the engi
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
 runs just before the write, so a change after it is not caught. A cluster convergence reload's
 row is still read from the engine's live state when it is written.
+
+Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624). Its `dead_letter_replay` row
+commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
+request moves to `failed`, and `approval.failed` names the error type. A released purge still writes
+no `connection_purge` row of its own; its count is only in `approval.approved`.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still

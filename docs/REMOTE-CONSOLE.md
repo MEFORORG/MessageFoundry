@@ -188,8 +188,8 @@ Windows SSO or OIDC. The directory password sign-in is retired (BACKLOG #1137). 
 account is not exempt from the engine's second factor
 ([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)). Note:
 
-- `serve` refuses to start with sign-in off, on every bind, loopback included. No setting turns it
-  off (vault BACKLOG #2719).
+- Sign-in is always required, on every bind, loopback included. No setting turns it off (vault
+  BACKLOG #2719).
 - `[security].require_mfa` is **on by default**, and MFA is an access gate: an enrolled-pending session
   gets `403` + `X-MFA-Required: 1` on every authorized route. **Leave it on** — that default, not the
   startup gate below, is the control.

@@ -276,8 +276,8 @@ false premise.
   instance carries patient data (ADR 0186), so the mode had no in-scope use. It could not repair
   an account either: with no auth service, creating an account, unbinding one and reading the audit
   log all answered 503.
-- **What replaced it:** nothing. `serve` refuses to start with sign-in off, on every bind, at any
-  `enforcement` level. A config or environment that still sets `[security].require_sign_in`, or the
+- **What replaced it:** nothing. Sign-in is always on, on every bind, at any `enforcement` level,
+  and no setting turns it off. A config or environment that still sets `[security].require_sign_in`, or the
   `[auth].enabled` key it had replaced, is refused at load as REMOVED. For a site whose every
   Administrator signs in through an outside service, the answer is a local Administrator made
   before the outage ([SECURITY.md](SECURITY.md#keep-a-local-administrator)).
@@ -390,8 +390,8 @@ false premise.
 - **Compensating controls:** front the admin surface with an MFA-enforcing proxy; prefer `require_mfa = true`
   (native TOTP); enable `admin_new_ip_step_up`. A startup **AUDIT** line records the override and the posture
   view (`GET /security/posture`) names it.
-- **Still refused:** every **other** strict-enforcement PHI floor item (cleartext off-box bind, auth off on
-  any bind, open egress, unbounded retention) — this ack lifts **only** the single-factor-at-exposure refusal,
+- **Still refused:** every **other** strict-enforcement PHI floor item (cleartext off-box bind, open egress,
+  unbounded retention) — this ack lifts **only** the single-factor-at-exposure refusal,
   and only at exposure. `require_mfa` off on a **loopback** bind with no declared proxy is not refused
   (no exposure), so this ack is a no-op there.
 
@@ -476,9 +476,8 @@ is refused, so an opt-out does nothing and is not reported.
   is `enforce`-equivalent already).
 - **Compensating controls:** return to `enforce` before carrying real patient traffic; the warnings + startup
   **AUDIT** line + posture view keep the deviation visible.
-- **Still refused (even at `warn`):** the **no-auth** hard refuse (sign-in off, on any bind, loopback
-  included; vault BACKLOG #2719) is
-  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
+- **Still refused (even at `warn`):** running without sign-in. No setting turns it off, on any bind,
+  loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
   per-connection `cleartext_accepted` declaration is the way to cross one, recorded per hop.
