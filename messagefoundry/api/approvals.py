@@ -442,11 +442,12 @@ class ApprovalGate:
         request: the store makes the check and the insert one serialized step.
 
         **A repeat that reaches here has already paid its step-up.** The JSON purge and reload
-        routes take a single-use proof bound to their action (vault BACKLOG #2625) and call
-        :meth:`rejoin` BEFORE they demand it, so at least there a repeat of an open request is
-        answered without a new proof and never gets this far. A repeat still arrives here with a
-        spent proof in at least two cases: a console purge or reload, whose gate demands a proof on
-        every request, and a repeat that races the first request's commit.
+        routes take a single-use proof bound to their action (vault BACKLOG #2625). A request that
+        brought no proof calls :meth:`rejoin` BEFORE the proof is demanded, so there a repeat of an
+        open request is answered without one and never gets this far. A repeat still arrives here
+        with a spent proof in at least three cases: a JSON repeat that brought a proof, a console
+        purge or reload, whose gate demands a proof on every request, and a repeat that races the
+        first request's commit.
 
         **A different requester gets their own request.** The requester of record is the person
         whose authority :meth:`approve` re-checks (ASVS 8.3.2), and the executors attribute their

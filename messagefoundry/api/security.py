@@ -1400,11 +1400,14 @@ def require_step_up_action(
     is told the IdP leg instead (:func:`_step_up_refusal`). When the org opts out it falls back to
     the legacy session-window behaviour.
 
-    ``proof_in_route=True`` moves ONLY the proof into the route, which must then call
-    :func:`spend_step_up_action` before it runs anything or files anything. Everything else still
-    runs here: permissions, pacing, the MFA gate, the new-address check and the factor-binding
-    refusal. Purge and reload use it (vault BACKLOG #2625 with #2445), so a repeat that only rejoins
-    the requester's open dual-control hold needs no new proof and burns none."""
+    ``proof_in_route=True`` moves the single-use pop into the route, which must then call
+    :func:`spend_step_up_action` before it holds or runs anything. The rest still runs here, at
+    least the permissions, pacing, the MFA gate, the new-address check and the factor-binding
+    refusal; under the org opt-out the session-window check stays here too, because reading a
+    window spends nothing. Purge and reload use it (vault BACKLOG #2625), so a repeat that only
+    rejoins the requester's open dual-control hold needs no new proof.
+    ``tests/test_bound_step_up_hold_rejoin.py`` pins that each such route spends before any return
+    other than a rejoin."""
     base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
@@ -1438,7 +1441,16 @@ def require_step_up_action(
             if proof_in_route:
                 # Every check but the pop. The factor-binding refusal is the one _action_step_up_ok
                 # runs above its fork; it pops nothing, so it can run here as well as at the spend.
-                if new_ip or await auth.factor_binding_is_blocked(token, action):
+                # Under the opt-out the window is the whole step-up and reading it pops nothing, so
+                # a repeat that rejoins a hold still needs a live window.
+                if (
+                    new_ip
+                    or await auth.factor_binding_is_blocked(token, action)
+                    or (
+                        not auth.action_step_up_required
+                        and not await auth.has_recent_step_up(token)
+                    )
+                ):
                     raise await _step_up_refusal(auth, token, action)
             elif new_ip or not await _action_step_up_ok(auth, token, action):
                 raise await _step_up_refusal(auth, token, action)
@@ -1452,14 +1464,29 @@ async def spend_step_up_action(request: Request, action: str) -> None:
 
     Spends the caller's single-use grant for ``action``, or reads the session window when the org
     opted out, and refuses as the dependency would: 403 with ``X-Step-Up-Action``. A route calls it
-    once it knows the request will file a hold or run, and never on a path that does neither. With
-    no auth service attached it does nothing, as the dependency does."""
+    before it holds or runs anything. A refusal the route makes after the spend, such as a 404 or
+    a 409, still costs the proof. With no auth service attached it does nothing, as the dependency
+    does."""
     auth = get_auth(request)
     if auth is None:
         return
     token = bearer_token(request)
     if not await _action_step_up_ok(auth, token, action):
         raise await _step_up_refusal(auth, token, action)
+
+
+async def holds_step_up_action(request: Request, action: str) -> bool:
+    """Whether the caller brought a live grant bound to ``action``, WITHOUT spending it.
+
+    Purge and reload ask before they look for an open hold to rejoin (vault BACKLOG #2625). A
+    request that brought a proof spends it and goes through the gate, which joins a repeat on its
+    own, so one typed proof never outlives the request it came with. Only a request with no proof
+    rejoins without one. False under the org opt-out, where there is no grant to bring, and with no
+    auth service attached."""
+    auth = get_auth(request)
+    if auth is None or not auth.action_step_up_required:
+        return False
+    return await auth.holds_action_step_up(bearer_token(request), action)
 
 
 def require_reauth_only_action(

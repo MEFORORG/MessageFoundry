@@ -204,9 +204,11 @@ def test_the_engine_answers_a_hold_with_the_status_the_client_discriminates_on()
         "own 202 again, or the scan stopped matching the code"
     )
     held_ops = set(re.findall(r'return _held_reply\(response, \w+, "(\w+)"\)', source))
-    assert held_ops == {"connection_purge", "dead_letter_replay", "config_reload"}, (
-        f"the operations answered through _held_reply are {sorted(held_ops)}; one per gated route "
-        f"({len(_GATED_ROUTES)}) is expected"
+    gated_ops = {operation for _label, _call, operation, _done in _GATED_CALLS}
+    assert len(gated_ops) == len(_GATED_ROUTES)
+    assert held_ops == gated_ops, (
+        f"the operations answered through _held_reply are {sorted(held_ops)}, but the client's "
+        f"gated calls are {sorted(gated_ops)}"
     )
     assert set(holds) == {str(_HTTP_PENDING_APPROVAL)}, (
         f"the engine holds with {sorted(set(holds))} but the client discriminates on "

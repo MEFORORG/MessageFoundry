@@ -9,13 +9,19 @@ of its hold id. These tests run with BOTH controls on, as shipped for the proof 
 operator enables dual control, and pin for each action that:
 
 * a first request without a proof is refused, and with one it is held (202);
-* a repeat with no new proof gets the same hold id, and the rejoin does not spend a proof it finds;
+* a repeat with no new proof gets the same hold id;
+* a repeat that brings a proof spends it and still gets the same hold id;
 * a different request with no proof is refused, and holds nothing new;
 * another requester's identical request is their own, so it needs its own proof.
+
+They also pin that the rest of the gate still applies to a proof-free repeat (the opt-out's window,
+the new-address check), that a purge repeat is refused once the purge would be, and, by reading the
+source, that each route spends its proof before any return other than a rejoin.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -62,12 +68,14 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _service(engine: Engine) -> AuthService:
+async def _service(engine: Engine, *, require_action_step_up: bool = True) -> AuthService:
     # require_action_step_up is pinned ON, the shipped default, because it is half of the subject.
     service = AuthService(
         engine.store,
         AuthSettings(
-            admin_write_min_interval_seconds=0, require_mfa=False, require_action_step_up=True
+            admin_write_min_interval_seconds=0,
+            require_mfa=False,
+            require_action_step_up=require_action_step_up,
         ),
     )
     await service.initialize()
@@ -168,14 +176,25 @@ async def test_a_repeated_purge_rejoins_its_hold_without_a_new_proof(
         assert _refused_for(theirs, action), theirs.text
         assert await _pending_ids(c, admin) == [held]
 
-        # A rejoin spends nothing: a proof minted before a repeat still opens the next request.
+        # A repeat that brings a proof spends it, so it cannot open a different purge afterwards.
         token = await _reauth(c, token, action)
-        rejoined = await c.post("/connections/OB/purge", headers=_auth(token))
-        assert rejoined.status_code == 202 and rejoined.json()["approval_id"] == held
+        paid = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert paid.status_code == 202 and paid.json()["approval_id"] == held
+        assert await _repeat_rows(engine) == 2
         top = await c.post("/connections/OB/purge?scope=top", headers=_auth(token))
-        assert top.status_code == 202, top.text
-        assert top.json()["approval_id"] != held
-        assert await _pending_ids(c, admin) == sorted([held, str(top.json()["approval_id"])])
+        assert _refused_for(top, action), top.text
+        assert await _pending_ids(c, admin) == [held]
+
+        # Once the purge would be refused, a repeat is refused too, never told it is still held.
+        rr = engine.registry_runner
+        assert rr is not None
+        await rr.start_outbound("OB")
+        assert rr.outbound_quiesced("OB") is False
+        doomed = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert _refused_for(doomed, action), doomed.text
+        token = await _reauth(c, token, action)
+        doomed = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert doomed.status_code == 409, doomed.text
         assert await _repeat_rows(engine) == 2
 
 
@@ -217,10 +236,112 @@ async def test_a_repeated_reload_rejoins_its_hold_without_a_new_proof(engine: En
         assert await _pending_ids(c, admin) == [held]
 
         token = await _reauth(c, token, action)
-        rejoined = await c.post("/config/reload", json={}, headers=_auth(token))
-        assert rejoined.status_code == 202 and rejoined.json()["approval_id"] == held
-        second = await c.post("/config/reload", json=named, headers=_auth(token))
-        assert second.status_code == 202, second.text
-        assert second.json()["approval_id"] != held
-        assert await _pending_ids(c, admin) == sorted([held, str(second.json()["approval_id"])])
+        paid = await c.post("/config/reload", json={}, headers=_auth(token))
+        assert paid.status_code == 202 and paid.json()["approval_id"] == held
         assert await _repeat_rows(engine) == 2
+        second = await c.post("/config/reload", json=named, headers=_auth(token))
+        assert _refused_for(second, action), second.text
+        assert await _pending_ids(c, admin) == [held]
+
+
+async def test_a_proof_free_repeat_still_meets_the_rest_of_the_gate(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rejoin skips the proof and nothing else: a repeat from a new address is refused."""
+    service = await _service(engine)
+    await _add(service, "deployer", ["administrator"])
+    action = STEP_UP_ACTION_CONFIG_RELOAD
+    async with _client(engine, service) as c:
+        token = await _reauth(c, await _login(c, "deployer"), action)
+        first = await c.post("/config/reload", json={}, headers=_auth(token))
+        assert first.status_code == 202, first.text
+
+        async def _new_address(*_args: object, **_kwargs: object) -> bool:
+            return True
+
+        monkeypatch.setattr(service, "flag_new_client_ip", _new_address)
+        again = await c.post("/config/reload", json={}, headers=_auth(token))
+        assert _refused_for(again, action), again.text
+        assert await _repeat_rows(engine) == 0
+
+
+async def test_under_the_opt_out_a_repeat_still_needs_a_live_window(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no grant to spend, the window is the whole step-up, and reading it spends nothing."""
+    service = await _service(engine, require_action_step_up=False)
+    await _add(service, "deployer", ["administrator"])
+    async with _client(engine, service) as c:
+        token = await _login(c, "deployer")  # a local login opens the window
+        first = await c.post("/config/reload", json={}, headers=_auth(token))
+        assert first.status_code == 202, first.text
+        held = first.json()["approval_id"]
+        again = await c.post("/config/reload", json={}, headers=_auth(token))
+        assert again.status_code == 202 and again.json()["approval_id"] == held
+
+        async def _stale(*_args: object, **_kwargs: object) -> bool:
+            return False
+
+        monkeypatch.setattr(service, "has_recent_step_up", _stale)
+        stale = await c.post("/config/reload", json={}, headers=_auth(token))
+        assert stale.status_code == 403, stale.text
+        assert stale.headers.get("X-Step-Up-Required") == "1"
+        assert await _repeat_rows(engine) == 1
+
+
+def _proof_in_route_routes() -> dict[str, ast.AsyncFunctionDef]:
+    """Every route function in ``api/app.py`` whose gate is ``require_step_up_action(...,
+    proof_in_route=True)``, by name."""
+    app_py = Path(__file__).resolve().parents[1] / "messagefoundry" / "api" / "app.py"
+    found: dict[str, ast.AsyncFunctionDef] = {}
+    for node in ast.walk(ast.parse(app_py.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        for default in node.args.defaults:
+            for call in ast.walk(default):
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == "require_step_up_action"
+                    and any(
+                        k.arg == "proof_in_route"
+                        and isinstance(k.value, ast.Constant)
+                        and k.value.value is True
+                        for k in call.keywords
+                    )
+                ):
+                    found[node.name] = node
+    return found
+
+
+def _calls(node: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
+        for n in ast.walk(node)
+    )
+
+
+def test_each_proof_in_route_route_spends_before_it_returns_anything_but_a_rejoin() -> None:
+    """``proof_in_route=True`` leaves the pop to the route, so a route that returns before its
+    spend, other than with a rejoined hold, would run with no proof while every gate-classifying
+    guard still reads it as action-bound. The spend must be a top-level statement of the body,
+    and every return before it must be ``_held_reply``."""
+    routes = _proof_in_route_routes()
+    # Positive control: the walk finds the two routes vault BACKLOG #2625 moved, by name.
+    assert set(routes) == {"purge_connection", "reload_config"}, sorted(routes)
+    for name, func in routes.items():
+        spend_at = next(
+            (i for i, stmt in enumerate(func.body) if _calls(stmt, "spend_step_up_action")), None
+        )
+        assert spend_at is not None, f"{name} never calls spend_step_up_action"
+        spend_stmt = func.body[spend_at]
+        assert isinstance(spend_stmt, ast.Expr) and isinstance(spend_stmt.value, ast.Await), (
+            f"{name}: the spend must be a plain top-level await, not inside a branch"
+        )
+        for stmt in func.body[:spend_at]:
+            for ret in (n for n in ast.walk(stmt) if isinstance(n, ast.Return)):
+                assert (
+                    isinstance(ret.value, ast.Call)
+                    and isinstance(ret.value.func, ast.Name)
+                    and ret.value.func.id == "_held_reply"
+                ), f"{name} returns something other than a rejoined hold before its spend"

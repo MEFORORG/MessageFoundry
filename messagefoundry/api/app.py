@@ -226,6 +226,7 @@ from messagefoundry.api.security import (
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
     get_auth,
+    holds_step_up_action,
     optional_identity,
     pending_credential_deadline,
     public_route,
@@ -838,6 +839,30 @@ def _purge_hold_params(name: str, scope: str) -> dict[str, Any]:
 def _reload_hold_params(config_dir: str | None, requester: str) -> dict[str, Any]:
     """What a held reload captures; shared by the guard and the rejoin as for a purge."""
     return {"config_dir": config_dir, "requester": requester}
+
+
+def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException | None:
+    """Why a purge of outbound ``name`` would be refused right now, or ``None``. The route raises
+    it, and the proof-free rejoin reads it first, so a repeat is told its hold id only while the
+    purge it repeats would still be held (vault BACKLOG #2625)."""
+    if rr is None or name not in rr.registry.outbound:
+        return HTTPException(404, f"no such outbound connection: {name}")
+    # ADR 0073: purge is owner-only on a sharded engine — a non-owning shard's quiesced signal is
+    # vacuous (it never runs the lane), so it would green-light a purge racing the owner's claims.
+    owner = rr.destination_owner(name)
+    if owner is not None and owner != rr.registry.shard_id:
+        return HTTPException(
+            409,
+            f"outbound {name!r} is owned by engine shard {owner!r} — stop and purge it on that "
+            "shard's API",
+        )
+    # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
+    # a running/still-"stopping" outbound may have a claimed INFLIGHT row cancel_queued cannot cancel,
+    # so purge must wait until the lane is paused AND fully quiesced. The load-bearing dual-control
+    # re-check lives in the `_purge` approval executor (the release path never re-enters the route).
+    if not rr.outbound_quiesced(name):
+        return HTTPException(409, "stop the outbound and let it quiesce before purging its queue")
+    return None
 
 
 def _held_reply(response: Response, approval_id: str, operation: str) -> PendingApprovalResponse:
@@ -4011,10 +4036,16 @@ def create_app(
     ) -> PurgeResult | PendingApprovalResponse:
         """Soft-cancel queued deliveries to an outbound connection (across all inbounds).
 
-        A repeat of the caller's own open dual-control hold answers its 202 again with no new
-        step-up proof (vault BACKLOG #2625 with #2445). Any other request spends the proof bound to
-        ``connection_purge`` before it is held or run."""
-        if gate is not None and _purge_in_scope(identity):
+        A repeat of the caller's own open dual-control hold, sent with no proof, answers its 202
+        again (vault BACKLOG #2625). It does so only while the purge would still be held, so a
+        repeat for an outbound since restarted or removed is refused as a first request is. Any
+        other request spends the proof bound to ``connection_purge`` before it is held or run."""
+        if (
+            gate is not None
+            and _purge_in_scope(identity)
+            and _purge_target_refusal(engine.registry_runner, name) is None
+            and not await holds_step_up_action(request, STEP_UP_ACTION_CONNECTION_PURGE)
+        ):
             held = await gate.rejoin(
                 "connection_purge",
                 _purge_hold_params(name, scope),
@@ -4054,26 +4085,9 @@ def create_app(
             raise HTTPException(
                 403, "channel-scoped users cannot purge a shared outbound connection"
             )
-        rr = engine.registry_runner
-        if rr is None or name not in rr.registry.outbound:
-            raise HTTPException(404, f"no such outbound connection: {name}")
-        # ADR 0073: purge is owner-only on a sharded engine — a non-owning shard's quiesced signal is
-        # vacuous (it never runs the lane), so it would green-light a purge racing the owner's claims.
-        owner = rr.destination_owner(name)
-        if owner is not None and owner != rr.registry.shard_id:
-            raise HTTPException(
-                409,
-                f"outbound {name!r} is owned by engine shard {owner!r} — stop and purge it on that "
-                "shard's API",
-            )
-        # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
-        # a running/still-"stopping" outbound may have a claimed INFLIGHT row cancel_queued cannot cancel,
-        # so purge must wait until the lane is paused AND fully quiesced. The load-bearing dual-control
-        # re-check lives in the `_purge` approval executor (the release path never re-enters this handler).
-        if not rr.outbound_quiesced(name):
-            raise HTTPException(
-                409, "stop the outbound and let it quiesce before purging its queue"
-            )
+        refusal = _purge_target_refusal(engine.registry_runner, name)
+        if refusal is not None:
+            raise refusal
         if (
             gate is not None
         ):  # dual-control: hold for a second approver when [approvals] gates purge
@@ -4908,13 +4922,17 @@ def create_app(
         An inline reload writes ``config_reload_attempted`` before it swaps anything, and answers 503
         without reloading when the audit log refuses that row (vault BACKLOG #2254).
 
-        A repeat of the caller's own open hold answers its 202 again with no new step-up proof
-        (vault BACKLOG #2625 with #2445). Any other request, a ``dry_run`` included, spends the
-        proof bound to ``config_reload`` first.
+        A repeat of the caller's own open hold, sent with no proof, answers its 202 again (vault
+        BACKLOG #2625). Any other request, a ``dry_run`` included, spends the proof bound to
+        ``config_reload`` first.
 
         Error responses are intentionally generic (the detail is logged server-side, not returned)
         so a config:deploy holder can't probe the filesystem via reload error text."""
-        if gate is not None and not req.dry_run:
+        if (
+            gate is not None
+            and not req.dry_run
+            and not await holds_step_up_action(request, STEP_UP_ACTION_CONFIG_RELOAD)
+        ):
             held = await gate.rejoin(
                 "config_reload",
                 _reload_hold_params(req.config_dir, user.username),

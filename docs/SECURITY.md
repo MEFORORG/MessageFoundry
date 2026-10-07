@@ -1805,21 +1805,27 @@ one person's ask must not ride on another person's standing.
 **A repeat of an open purge or reload needs no new step-up proof on the JSON plane (vault BACKLOG
 #2625).** `POST /connections/{name}/purge` and `POST /config/reload` take a single-use proof bound to
 their action, listed under [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753).
-Each route looks for the caller's open request first. If it finds one, it answers the same **202**
-and writes the same `approval.request_repeated` row, and spends no proof. Every other request spends
-the proof before it is held or run, so a first request, or a different one, still needs it. The
-rest of the route's gate applies to a repeat as well, at least the permission, pacing, the second
-factor, the new-address check and the factor-binding refusal. At least these limits apply:
+A request that brings no proof looks for the caller's open request first. If it finds one, it
+answers the same **202**, writes the same `approval.request_repeated` row and needs no proof. A
+request that brings a proof spends it, and the store's rule above joins it if it repeats an open
+request, so one typed proof never outlives the request it came with. Every other request needs the
+proof before it is held or run, so a first request, or a different one, still needs it. A purge
+repeat is answered only while the purge would still be held: if the outbound has since been
+restarted, removed or owned by another engine shard, the repeat is refused as a first request is.
+The rest of the route's gate applies to a repeat as well. That is at least the permission, pacing,
+the second factor, the new-address check, the factor-binding refusal and, under
+`[auth].require_action_step_up = false`, the session window. At least these limits apply:
 
 - the lookup and its audit row are two steps. A request approved, rejected or expired between them
   is still named in the **202**. Nothing new is held or run because of it;
 - the lookup reads the newest 1000 open requests. A repeat of an older one needs a proof, and the
   store's rule above then joins it;
+- a session with no proof can learn whether it holds an open request matching what it sends, and
+  each match writes an `approval.request_repeated` row naming that session's user. Only its own
+  requests match, and pacing limits how often it can ask;
 - the console's purge and reload ask for a proof on every request. A repeat there goes to re-auth,
   and joins only when the operator submits it again;
-- a repeat that races the first request's commit may spend a proof and then join;
-- with `[auth].require_action_step_up = false` the two routes read the session window in place of a
-  proof, and a repeat skips that window check in the same way.
+- a repeat that races the first request's commit may spend a proof and then join.
 
 **A held request cannot be released once dual control stops applying to it.** If an operator turns
 `[approvals].enabled` off, or removes the operation from `[approvals].operations`, a request held
@@ -2244,7 +2250,7 @@ dead letters during an incident would type it per message. `[auth].require_actio
 puts these routes back on the window, as it does every action-bound route.
 
 Under dual control, a JSON purge or reload that repeats the caller's own open request answers with
-that request's id and spends no proof. [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+that request's id, and needs no proof when it brings none. [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
 states when, and its limits.
 
 Upload resend also needs `messages:edit` beside `files:browse` (vault BACKLOG #2625). It injects a
