@@ -171,7 +171,9 @@ async def _assert_pool_is_clean_and_reusable(store: MessageStore) -> None:
     for i, conn in enumerate(store._read_conns):
         assert not conn.in_transaction, f"pooled connection {i} went back inside a transaction"
     for i in range(2 * _READ_POOL_SIZE):
-        assert await store.count_messages() == 1, f"read {i} saw the wrong data"
+        assert await store.count_messages(allowed_channels=None) == 1, (
+            f"read {i} saw the wrong data"
+        )
 
 
 @pytest.mark.parametrize("arm", ARMS)
@@ -185,14 +187,14 @@ async def test_pooled_read_unwinds(tmp_path: Path, point: str, arm: str) -> None
         trap.arm(point, raise_instead=arm == "control")
 
         if arm == "cancel":
-            task = asyncio.create_task(store.count_messages())
+            task = asyncio.create_task(store.count_messages(allowed_channels=None))
             await asyncio.wait_for(trap.reached.wait(), WAIT)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
         else:
             with pytest.raises(_Boom):
-                await store.count_messages()
+                await store.count_messages(allowed_channels=None)
 
         assert trap.rollback_finished.is_set(), "the failed read never rolled its transaction back"
         await _assert_pool_is_clean_and_reusable(store)
@@ -213,7 +215,7 @@ async def test_pooled_read_survives_a_second_cancellation(tmp_path: Path, point:
         trap.stall_rollback = 0.05  # hold the ROLLBACK open long enough to cancel into it
         trap.arm(point)
 
-        task = asyncio.create_task(store.count_messages())
+        task = asyncio.create_task(store.count_messages(allowed_channels=None))
         await asyncio.wait_for(trap.reached.wait(), WAIT)
         task.cancel()
         await asyncio.wait_for(trap.rollback_started.wait(), WAIT)
@@ -248,7 +250,7 @@ async def test_a_cancellation_mid_begin_leaves_the_next_borrower_a_usable_connec
 
         trap = _ReadTrap([only])
         trap.arm(BEGIN)
-        task = asyncio.create_task(store.count_messages())
+        task = asyncio.create_task(store.count_messages(allowed_channels=None))
         await asyncio.wait_for(trap.reached.wait(), WAIT)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -257,8 +259,10 @@ async def test_a_cancellation_mid_begin_leaves_the_next_borrower_a_usable_connec
         assert pool.qsize() == 1, "the connection never came back"
         assert not only.in_transaction, "the connection went back inside a transaction"
         # The next borrower is necessarily this same connection - it is the only one in the queue.
-        assert await store.count_messages() == 1
-        assert await store.count_messages() == 1  # ...and it did not re-dirty itself
+        assert await store.count_messages(allowed_channels=None) == 1
+        assert (
+            await store.count_messages(allowed_channels=None) == 1
+        )  # ...and it did not re-dirty itself
 
         for conn in parked:
             pool.put_nowait(conn)

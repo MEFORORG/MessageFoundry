@@ -14,6 +14,7 @@ when not gated).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -26,6 +27,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.api.app import _compare_start_config, _record_reload_audit
 from messagefoundry.auth import Role
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
@@ -105,13 +107,15 @@ def _client(
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
-def _fail_config_reload_audit(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> None:
-    """Make only the config_reload audit write fail, so every other row (the login, the request)
+def _fail_config_reload_audit(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, failing: str = "config_reload"
+) -> None:
+    """Make only the ``failing`` audit write fail, so every other row (the login, the request)
     still lands."""
     real = engine.store.record_audit
 
     async def _record(action: str, **kwargs: Any) -> None:
-        if action == "config_reload":
+        if action == failing:
             raise sqlite3.OperationalError("disk I/O error")
         await real(action, **kwargs)
 
@@ -317,6 +321,276 @@ async def test_config_reload_inline_when_not_gated(engine: Engine) -> None:
     assert "config_reload" in [a["action"] for a in await engine.store.list_audit(limit=50)]
 
 
+# --- vault BACKLOG #2254: an ungated reload proves the audit log works before it swaps ----
+
+
+async def test_an_inline_reload_the_audit_log_refuses_does_not_deploy(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Pre-fix nothing was written before the swap, so an audit log that refused writes still let
+    the new config go live, and the only trace was the degraded `audit` step on the answer."""
+    service = await _service(engine)
+    await _add(service, "deployer", Role.ADMINISTRATOR)
+    before = engine.registry_runner
+    reloads: list[object] = []
+    real_reload = engine.reload_detail
+
+    async def _counting(*args: Any, **kwargs: Any) -> Any:
+        reloads.append(args)
+        return await real_reload(*args, **kwargs)
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "deployer")
+        monkeypatch.setattr(engine, "reload_detail", _counting)
+        _fail_config_reload_audit(monkeypatch, engine, "config_reload_attempted")
+        with caplog.at_level(logging.WARNING):
+            r = await c.post("/config/reload", json={}, headers=headers)
+    assert r.status_code == 503, r.text
+    assert "did not run" in r.json()["detail"]
+    assert reloads == [], "the engine was never asked to load or swap"
+    assert engine.registry_runner is before
+    assert engine.last_reload_dir is None
+    assert await engine.store.list_audit(action="config_reload") == []
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("refused the config_reload_attempted row" in m for m in messages)
+    assert any(
+        "audit_write_failed" in m and "config_reload_attempted" in m and "config_reload:inline" in m
+        for m in messages
+    ), "the default LoggingAlertSink raised the alert"
+
+
+async def test_an_inline_reload_writes_its_attempt_row_before_the_swap(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = await _service(engine)
+    await _add(service, "deployer", Role.ADMINISTRATOR)
+    seen: list[tuple[str, object]] = []
+    real_record = engine.store.record_audit
+
+    async def _spy(action: str, **kwargs: Any) -> None:
+        # What the engine is running at the moment each row is written: last_reload_dir moves only
+        # once an applied reload has swapped the graph.
+        seen.append((action, engine.last_reload_dir))
+        await real_record(action, **kwargs)
+
+    async with _client(engine, service, NOT_GATED) as c:
+        headers = await _token(c, "deployer")
+        monkeypatch.setattr(engine.store, "record_audit", _spy)
+        r = await c.post("/config/reload", json={}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert dict(seen)["config_reload_attempted"] is None, "written before the swap"
+    assert dict(seen)["config_reload"] is not None
+    (row,) = await engine.store.list_audit(action="config_reload_attempted")
+    assert row["actor"] == "deployer"
+    assert json.loads(row["detail"]) == {"requested": None, "dry_run": False}
+
+
+async def test_a_dry_run_and_a_released_reload_write_no_attempt_row(engine: Engine) -> None:
+    """A dry run swaps nothing. A released reload already has the gate's approval.release_attempted
+    row before it, so a second pre-swap row would only repeat it."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, GATED) as c:
+        op = await _token(c, "op")
+        dry = await c.post("/config/reload", json={"dry_run": True}, headers=op)
+        assert dry.status_code == 200, dry.text
+        approval_id = (await c.post("/config/reload", json={}, headers=op)).json()["approval_id"]
+        ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "approver"))
+        assert ok.status_code == 200, ok.text
+    assert await engine.store.list_audit(action="config_reload_attempted") == []
+    assert len(await engine.store.list_audit(action="approval.release_attempted")) == 1
+
+
+# --- vault BACKLOG #2257: each reload's row names its own config ---------------
+
+
+async def test_two_overlapping_reloads_each_record_their_own_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reload's row is written after its swap, outside the runner's swap lock. Pre-fix the row
+    read the engine's live state then, so a second reload that swapped in between put its own
+    directory, counts and digest on the first reload's row. Here reload A is held in its post-swap
+    reference sync while reload B runs to completion."""
+    cfg_a, cfg_b = tmp_path / "cfg_a", tmp_path / "cfg_b"
+    _write_valid_config(cfg_a, tmp_path / "in_a", tmp_path / "out_a")
+    _write_valid_config(cfg_b, tmp_path / "in_b", tmp_path / "out_b")
+    # B differs from A by a second inbound, so its counts and digest both differ.
+    (cfg_b / "cfg2.py").write_text(
+        "from messagefoundry import inbound, File\n"
+        f"inbound('IB_T_ORU', File(directory={str(tmp_path / 'in_b2')!r}, pattern='*.hl7', "
+        "poll_seconds=1.0), router='r')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "in_b2").mkdir()
+    engine = await Engine.create(
+        tmp_path / "overlap.db",
+        poll_interval=0.02,
+        config_dir=cfg_a,
+        config_reload_roots=[cfg_b],
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await _service(engine)
+        await _add(service, "alice", Role.ADMINISTRATOR)
+        await _add(service, "bob", Role.ADMINISTRATOR)
+        a_held, release_a = asyncio.Event(), asyncio.Event()
+        real_sync = engine._reconcile_reference_sync
+
+        async def _hold_a(*, startup: bool) -> None:
+            if not a_held.is_set():  # A, after its swap and before its row
+                a_held.set()
+                await release_a.wait()
+            await real_sync(startup=startup)
+
+        async with _client(engine, service, NOT_GATED) as c:
+            alice, bob = await _token(c, "alice"), await _token(c, "bob")
+            monkeypatch.setattr(engine, "_reconcile_reference_sync", _hold_a)
+            reload_a = asyncio.ensure_future(c.post("/config/reload", json={}, headers=alice))
+            try:
+                await asyncio.wait_for(a_held.wait(), timeout=30)
+                # B swaps and writes its row while A sits between its own swap and its row.
+                r_b = await c.post("/config/reload", json={"config_dir": str(cfg_b)}, headers=bob)
+            finally:
+                release_a.set()  # never leave A parked, whatever failed above
+            r_a = await asyncio.wait_for(reload_a, timeout=30)
+        assert r_a.status_code == 200 and r_b.status_code == 200, (r_a.text, r_b.text)
+        assert (r_a.json()["inbound"], r_b.json()["inbound"]) == (1, 2)
+        assert engine.last_reload_dir == cfg_b.resolve(), "B's graph is the one running"
+
+        newest_first = await engine.store.list_audit(action="config_reload")
+        assert [r["actor"] for r in newest_first] == ["alice", "bob"]
+        rows = {r["actor"]: json.loads(r["detail"]) for r in newest_first}
+        digest_a, _ = await engine.fingerprint_bundle(cfg_a.resolve())
+        digest_b, _ = await engine.fingerprint_bundle(cfg_b.resolve())
+        assert digest_a is not None and digest_b is not None
+        assert digest_a["fingerprint"] != digest_b["fingerprint"]
+        for actor, cfg, inbound, digest in (
+            ("alice", cfg_a, 1, digest_a),
+            ("bob", cfg_b, 2, digest_b),
+        ):
+            row = rows[actor]
+            assert row["dir"] == str(cfg.resolve()), actor
+            assert row["inbound"] == inbound, actor
+            assert row["fingerprint"] == digest["fingerprint"], actor
+        # A's row is the newest but names a graph the engine no longer runs, so it is no baseline:
+        # the next start passes over it to B's.
+        assert rows["alice"]["superseded"] is True and rows["alice"]["baseline_unchecked"] is True
+        assert "superseded" not in rows["bob"] and "baseline_unchecked" not in rows["bob"]
+    finally:
+        await engine.stop()
+
+
+async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lander hold on PR 2135. Reload A sits between its swap and its row while reload B swaps and
+    then fails and rolls back to A's graph. A's row is written while B's graph is briefly live. A
+    graph-identity test then marked A's row superseded, so the next start compared against an
+    older row and raised a false config_changed. Only a committed reload or a flag toggle moves the
+    loaded fingerprint, so A's row must stay a baseline."""
+    cfg_a, cfg_b = tmp_path / "cfg_a", tmp_path / "cfg_b"
+    _write_valid_config(cfg_a, tmp_path / "in_a", tmp_path / "out_a")
+    _write_valid_config(cfg_b, tmp_path / "in_b", tmp_path / "out_b")
+    (cfg_b / "extra.py").write_text("# B differs from A\n", encoding="utf-8")
+    engine = await Engine.create(
+        tmp_path / "rollback.db",
+        poll_interval=0.02,
+        config_dir=cfg_a,
+        config_reload_roots=[cfg_b],
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        digest_a, _ = await engine.fingerprint_bundle(cfg_a.resolve())
+        assert digest_a is not None
+        # An older baseline under another digest: the row a false alert would compare against.
+        await engine.store.record_audit(
+            "config_loaded",
+            actor="system",
+            detail=json.dumps({**digest_a, "fingerprint": "0" * 64, "dry_run": False}),
+        )
+        service = await _service(engine)
+        await _add(service, "alice", Role.ADMINISTRATOR)
+        await _add(service, "bob", Role.ADMINISTRATOR)
+        a_held, release_a = asyncio.Event(), asyncio.Event()
+        b_mid_swap, a_written = asyncio.Event(), asyncio.Event()
+        a_written_mid_swap = asyncio.Event()
+        real_sync = engine._reconcile_reference_sync
+        real_record = engine.store.record_audit
+
+        async def _hold_a(*, startup: bool) -> None:
+            if not a_held.is_set():  # A, after its swap and before its row
+                a_held.set()
+                await release_a.wait()
+            await real_sync(startup=startup)
+
+        async def _spy(action: str, **kwargs: Any) -> None:
+            await real_record(action, **kwargs)
+            if action == "config_reload" and kwargs.get("actor") == "alice":
+                a_written.set()
+
+        async def _fail_b(*_args: Any) -> None:
+            # B's registry is live here, before the rollback. Let A write its row now, then fail.
+            b_mid_swap.set()
+            # Bounded: B holds the runner's reload lock here, and runs on past a client timeout.
+            await asyncio.wait_for(a_written.wait(), timeout=30)
+            a_written_mid_swap.set()  # proves the ordering; a timeout above would skip this
+            raise RuntimeError("an outbound would not start")
+
+        async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+            alice, bob = await _token(c, "alice"), await _token(c, "bob")
+            monkeypatch.setattr(engine, "_reconcile_reference_sync", _hold_a)
+            monkeypatch.setattr(engine.store, "record_audit", _spy)
+            reload_a = asyncio.ensure_future(c.post("/config/reload", json={}, headers=alice))
+            reload_b: asyncio.Future[httpx.Response] | None = None
+            try:
+                await asyncio.wait_for(a_held.wait(), timeout=30)
+                rr = engine.registry_runner
+                assert rr is not None
+                monkeypatch.setattr(rr, "_reconcile_outbounds", _fail_b)
+                reload_b = asyncio.ensure_future(
+                    c.post("/config/reload", json={"config_dir": str(cfg_b)}, headers=bob)
+                )
+                await asyncio.wait_for(b_mid_swap.wait(), timeout=30)
+            finally:
+                release_a.set()  # never leave A parked, whatever failed above
+            r_a = await asyncio.wait_for(reload_a, timeout=30)
+            assert reload_b is not None
+            r_b = await asyncio.wait_for(reload_b, timeout=30)
+        assert r_a.status_code == 200, r_a.text
+        assert r_b.status_code == 500, r_b.text  # B failed after its swap and rolled back
+        assert a_written_mid_swap.is_set(), "A's row was not written while B's graph was live"
+        assert engine.last_reload_dir == cfg_a.resolve(), "A's graph is the one running"
+
+        (row,) = await engine.store.list_audit(action="config_reload")
+        detail = json.loads(row["detail"])
+        assert row["actor"] == "alice" and detail["fingerprint"] == digest_a["fingerprint"]
+        assert "superseded" not in detail and "baseline_unchecked" not in detail
+        outcome, comparison = await _compare_start_config(engine, digest_a)
+        assert outcome == "compared" and comparison is not None
+        assert comparison.baseline_action == "config_reload"
+        assert not comparison.changed, "a false config_changed on the next start"
+    finally:
+        await engine.stop()
+
+
+async def test_a_reload_row_written_after_a_flag_toggle_is_no_baseline(engine: Engine) -> None:
+    """vault BACKLOG #2257: a connection flag toggle moves the loaded fingerprint without swapping
+    the graph. A reload row written after one names a digest the engine no longer reports, so it
+    marks itself superseded too. The toggle is stood in for by the rebind it performs."""
+    outcome = await engine.reload_detail(propagate=False)
+    assert outcome.fingerprint is not None
+    assert await _record_reload_audit(engine, actor="before", outcome=outcome) == []
+    loaded = engine.loaded_config_fingerprint
+    assert loaded is not None
+    engine.loaded_config_fingerprint = dict(loaded)  # what set_connection_flag does
+    assert await _record_reload_audit(engine, actor="after", outcome=outcome) == []
+    rows = {r["actor"]: json.loads(r["detail"]) for r in await engine.store.list_audit()}
+    assert "superseded" not in rows["before"]
+    assert rows["after"]["superseded"] is True and rows["after"]["baseline_unchecked"] is True
+    assert rows["after"]["fingerprint"] == outcome.fingerprint["fingerprint"]
+
+
 # --- a dry-run is never held (it swaps nothing) -------------------------------
 
 
@@ -398,6 +672,171 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
         assert "pin_mismatch" in events
     finally:
         await engine.stop()
+
+
+# --- vault BACKLOG #2459: a released reload is refused like an inline one, never a 500 ----------
+
+
+async def _hold_then_release(
+    engine: Engine, service: AuthService, body: dict[str, Any], between: Any = None
+) -> tuple[str, httpx.Response]:
+    """Hold a reload as one admin, run ``between``, then release it as another."""
+    await _add(service, "op", Role.ADMINISTRATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    # raise_app_exceptions=False, so the pre-fix 500 arrives as a response rather than a raise.
+    async with _client(engine, service, GATED, raise_app_exceptions=False) as c:
+        op, admin = await _token(c, "op"), await _token(c, "approver")
+        held = await c.post("/config/reload", json=body, headers=op)
+        assert held.status_code == 202, held.text
+        approval_id = held.json()["approval_id"]
+        if between is not None:
+            between()
+        return approval_id, await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+
+
+async def test_a_released_reload_whose_config_dir_vanished_answers_422_and_records_it(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Before vault BACKLOG #2459 the executor caught WiringError only, so a directory removed
+    between the hold and the release raised FileNotFoundError out of the approve route as a 500,
+    with no config_reload_failed row. It now answers 422 with the inline route's detail, records
+    the row the inline route records, and the gate marks the request failed. 422, not the inline
+    404: on the approve route 404 means "no such approval request"."""
+    import shutil
+
+    service = await _service(engine)
+    live = engine.registry_runner
+    before = live.registry if live is not None else None
+    approval_id, r = await _hold_then_release(
+        engine, service, {}, between=lambda: shutil.rmtree(tmp_path / "cfg")
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == "config directory not found"
+    rr = engine.registry_runner
+    assert (rr.registry if rr is not None else None) is before  # nothing swapped
+    failed = [
+        json.loads(row["detail"])
+        for row in await engine.store.list_audit(action="config_reload_failed")
+    ]
+    assert failed == [{"requested": None, "dry_run": False, "reason": "not_found"}]
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
+    assert len(await engine.store.list_audit(action="approval.failed")) == 1
+
+
+async def test_a_released_reload_outside_the_reload_roots_answers_422_and_records_it(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The guard holds a reload before the engine resolves its directory, so a held request can name
+    a directory outside the reload roots. Before vault BACKLOG #2459 its release raised
+    ConfigReloadDenied as a 500. It now answers 422 with the inline route's detail and its
+    denied row."""
+    elsewhere = tmp_path / "elsewhere"
+    _write_valid_config(elsewhere, tmp_path / "in2", tmp_path / "out2")
+    service = await _service(engine)
+    approval_id, r = await _hold_then_release(engine, service, {"config_dir": str(elsewhere)})
+    assert r.status_code == 422, r.text  # not 403, which means self-approval on this route
+    assert r.json()["detail"] == "config directory is not an allowed reload root"
+    denied = [
+        json.loads(row["detail"])
+        for row in await engine.store.list_audit(action="config_reload_denied")
+    ]
+    assert denied == [{"requested": str(elsewhere), "dry_run": False}]
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
+
+
+async def test_a_refused_release_whose_audit_row_fails_still_answers_422(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #2255 review: the refusal's own row used to be a hard write, so an audit outage
+    turned the mapped refusal into a raw 500. The refusal changed nothing, so it still answers 422
+    and the lost row is logged at ERROR."""
+    import shutil
+
+    real = engine.store.record_audit
+
+    async def _record(action: str, **kwargs: Any) -> None:
+        if action == "config_reload_failed":
+            raise sqlite3.OperationalError("disk I/O error")
+        await real(action, **kwargs)
+
+    service = await _service(engine)
+
+    def _break() -> None:
+        shutil.rmtree(tmp_path / "cfg")
+        monkeypatch.setattr(engine.store, "record_audit", _record)
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+        _approval_id, r = await _hold_then_release(engine, service, {}, between=_break)
+    assert r.status_code == 422, r.text
+    assert any(
+        rec.levelno == logging.ERROR and "config_reload_failed audit row failed" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #2753 made a released reload outlive the approve request; vault BACKLOG #2459
+    gave its refusal the inline route's row and answer. Batch 197 merged the two. This pins the
+    structure that lets a refusal's row survive a timed-out approve, without timing one out: the
+    outliving operation itself ends in the 422, not in the raw FileNotFoundError, and the refusal
+    row is already written when it ends."""
+    from messagefoundry.api.approvals import ApprovalError
+    from messagefoundry.api.outlive import OutlivingOperations
+
+    ended: list[tuple[str, BaseException | None, int]] = []
+    real_run = OutlivingOperations.run
+
+    async def _spy(self: OutlivingOperations, coro: Any, label: str) -> Any:
+        async def _watched() -> Any:
+            try:
+                result = await coro
+            except BaseException as exc:
+                rows = await engine.store.list_audit(action="config_reload_failed")
+                ended.append((label, exc, len(rows)))
+                raise
+            ended.append((label, None, -1))
+            return result
+
+        return await real_run(self, _watched(), label)
+
+    secret_dir = "missing-config-dir-text"
+
+    async def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise FileNotFoundError(f"config directory not found: {secret_dir}")
+
+    monkeypatch.setattr(OutlivingOperations, "run", _spy)
+    service = await _service(engine)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        _approval_id, r = await _hold_then_release(
+            engine,
+            service,
+            {},
+            between=lambda: monkeypatch.setattr(engine, "reload_detail", _refuse),
+        )
+    assert r.status_code == 422, r.text
+    released = [(exc, rows) for label, exc, rows in ended if label == "released config reload"]
+    assert len(released) == 1
+    exc, rows_when_it_ended = released[0]
+    assert isinstance(exc, ApprovalError) and exc.status == 422
+    assert rows_when_it_ended == 1  # written inside the operation, not after it
+    marks = [
+        rec
+        for rec in caplog.records
+        if rec.getMessage().startswith("released config reload refused")
+    ]
+    assert len(marks) == 1
+    assert marks[0].levelno == logging.WARNING
+    # The marker names the type only, never the exception text.
+    assert marks[0].getMessage() == "released config reload refused: FileNotFoundError"
 
 
 # --- BACKLOG #2183: a released reload audits an unreadable inbound CA as trust_anchor -------------

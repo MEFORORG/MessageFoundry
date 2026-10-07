@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -19,7 +20,7 @@ from messagefoundry.api import create_app
 from messagefoundry.api.security import deadline_utc
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService, CurrentPasswordCheck
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import RetryPolicy
@@ -349,7 +350,11 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
     # factor must NOT be locked out — the enroll/confirm routes are gated by an action-bound PASSWORD
     # step-up, never by the MFA gate, so there is no chicken-and-egg deadlock. Drive the whole escape
     # path end-to-end under the DEFAULT settings and confirm the admin ends up MFA-enrolled + satisfied.
-    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))  # require_mfa on
+    # require_mfa on. The login-to-MFA floor is off, since the confirm below runs at once on the
+    # session it signed in and the floor covers it (BACKLOG #2389); the floor has its own suite.
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         lr = (await _login(c, "adm")).json()
@@ -377,6 +382,53 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         # marked the session second-factor-satisfied — the session is now usable. No lockout occurred.
         status = (await c.get("/me/mfa", headers=_auth(tok))).json()
         assert status["enabled"] is True and status["required"] is True
+
+
+async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_code(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2389, at the route. The floor's refusal must reach the caller exactly as a wrong code
+    # does, a 400 "invalid code", or the status would tell a script about timing. The route spends
+    # its single-use password step-up before the service runs, so the retry needs a fresh one, which
+    # is what docs/SECURITY.md says. The service-level cases are in test_second_step_time_floors.py.
+    #
+    # A 30 s floor on the real clock, rather than a faked one held just inside 1 s: a session whose
+    # clock steps BACK behind its own stamps is ended, so the clock here only ever moves forward.
+    floor = 30.0
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=floor, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        # The TOTP clock is pinned, so one code stays good across the re-proofs below however slow
+        # the runner is. Strict skew 0 would otherwise fail it at a 30 s step boundary.
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        good = totp.totp(secret, now=t0)
+
+        early = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
+        assert (early.status_code, early.json()) == (400, {"detail": "invalid code"})
+        retry = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
+        assert retry.status_code == 403 and retry.headers.get("X-Step-Up-Required") == "1"
+
+        # Past the floor: a genuinely wrong code gets the very answer the early good code got.
+        monkeypatch.setattr(
+            "messagefoundry.auth.service.time",
+            SimpleNamespace(time=lambda: time.time() + floor, monotonic=time.monotonic),
+        )
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        wrong = str((int(good) + 1) % 1_000_000).zfill(6)
+        refused = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": wrong})
+        assert (refused.status_code, refused.json()) == (early.status_code, early.json())
+
+        # CONTROL: the same good code now activates MFA, so the early refusal spent no TOTP step.
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        served = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
+        assert served.status_code == 200 and served.json()["recovery_codes"]
 
 
 async def test_security_events_feed_payload_is_phi_free(engine: Engine) -> None:
@@ -967,6 +1019,146 @@ async def test_audit_csv_export_content_and_audit_event(engine: Engine) -> None:
     assert '"count": 1' in exports[0]["detail"]
 
 
+async def _export_with_read_spy(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, query: str, *, page: int
+) -> tuple[list[str], dict[str, Any], list[tuple[int, int]], list[int]]:
+    """Run ``GET /audit/export`` with the page size pinned to ``page``, every store read recorded
+    as ``(limit asked, rows returned)`` and every ``count_audit`` result recorded. Returns the CSV
+    data lines, the export's own ``audit.export`` detail, the reads and the counts."""
+    from messagefoundry.api import auth_routes
+
+    # raising=False keeps the control arm meaningful: on code without paging the reads, not a
+    # missing name, are what fails.
+    monkeypatch.setattr(auth_routes, "_AUDIT_EXPORT_PAGE", page, raising=False)
+    service = await _service(engine)
+    await _add(service, "auditor", Role.AUDITOR)
+    reads: list[tuple[int, int]] = []
+    counts: list[int] = []
+    real = engine.store.list_audit
+    real_count = getattr(engine.store, "count_audit", None)
+
+    async def spy(**kw: Any) -> Any:
+        rows = await real(**kw)
+        reads.append((kw["limit"], len(rows)))
+        return rows
+
+    async def count_spy(**kw: Any) -> int:
+        assert real_count is not None
+        n: int = await real_count(**kw)
+        counts.append(n)
+        return n
+
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "auditor")).json()["token"])
+        monkeypatch.setattr(engine.store, "list_audit", spy)
+        monkeypatch.setattr(engine.store, "count_audit", count_spy, raising=False)
+        resp = await c.get(f"/audit/export?format=csv&{query}", headers=h)
+        monkeypatch.setattr(engine.store, "list_audit", real)
+        assert resp.status_code == 200
+    lines = [ln for ln in resp.text.splitlines() if ln]
+    assert lines[0] == "ts,actor,action,channel_id,client,detail"
+    exports = await engine.store.list_audit(action="audit.export", limit=1)
+    return lines[1:], json.loads(exports[0]["detail"]), reads, counts
+
+
+async def test_audit_export_reads_the_trail_in_pages(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2776: the export holds one page of rows at a time, not the whole result. Seven
+    rows at a page of two must arrive whole and newest first over four reads, none larger than a
+    page, and the recorded count must be the rows sent. Before the fix this was ONE read of every
+    row, which the per-read bound below refuses."""
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    data, detail, reads, counts = await _export_with_read_spy(
+        engine, monkeypatch, "actor=alice", page=2
+    )
+    assert [float(ln.split(",")[0]) for ln in data] == [106.0 - i for i in range(7)]
+    assert all(asked <= 2 and got <= 2 for asked, got in reads), reads
+    assert len(reads) == 4, reads
+    assert detail["count"] == 7 and counts == [7]
+
+
+async def test_audit_export_stops_at_the_limit_and_the_count(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``limit`` still caps the paged export: seven matching rows and ``limit=5`` send the five
+    newest, read no row past them, and record ``count`` 5."""
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    data, detail, reads, counts = await _export_with_read_spy(
+        engine, monkeypatch, "actor=alice&limit=5", page=2
+    )
+    assert [float(ln.split(",")[0]) for ln in data] == [106.0, 105.0, 104.0, 103.0, 102.0]
+    assert sum(got for _asked, got in reads) == 5, reads
+    assert detail["count"] == 5 and detail["filter"]["limit"] == 5 and counts == [5]
+
+
+@pytest.mark.parametrize(
+    ("query", "sent", "read"),
+    [("actor=alice", 7, (10, 7)), ("actor=alice&limit=3", 3, (3, 3))],
+    ids=["short-first-page", "first-page-holds-the-limit"],
+)
+async def test_audit_export_whose_first_page_is_the_result_runs_no_count(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    sent: int,
+    read: tuple[int, int],
+) -> None:
+    """A first page that is short, or that already holds ``limit`` rows, is the whole result, so the
+    export records its length and runs no count query."""
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    data, detail, reads, counts = await _export_with_read_spy(engine, monkeypatch, query, page=10)
+    assert len(data) == sent and detail["count"] == sent
+    assert reads == [read] and counts == []
+
+
+async def test_audit_export_never_contains_its_own_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unfiltered, the trail grows while the export streams: its own ``audit.export`` row is written
+    after the first page is read. The later pages sit below the first page, so that row is never
+    sent, and the recorded count equals the rows sent. A guard on the cursor: the old single read
+    passes it too, and a cursor that started above the first page would fail it."""
+    for i in range(5):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    data, detail, _, _ = await _export_with_read_spy(engine, monkeypatch, "", page=2)
+    assert not any(",audit.export," in ln for ln in data), data
+    assert detail["count"] == len(data) >= 5
+
+
+async def test_audit_export_logs_a_stream_cut_short(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A later page is read after the 200 and the ``audit.export`` row, so a store failure there
+    can only end the body early. The engine log must say how many of the counted rows were sent."""
+    from messagefoundry.api import auth_routes
+
+    monkeypatch.setattr(auth_routes, "_AUDIT_EXPORT_PAGE", 2)
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    service = await _service(engine)
+    await _add(service, "auditor", Role.AUDITOR)
+    real = engine.store.list_audit
+
+    async def failing_second_page(**kw: Any) -> Any:
+        if kw.get("before_id") is not None:
+            raise RuntimeError("the store went away")
+        return await real(**kw)
+
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "auditor")).json()["token"])
+        monkeypatch.setattr(engine.store, "list_audit", failing_second_page)
+        with (
+            caplog.at_level(logging.WARNING, logger="messagefoundry.api.auth_routes"),
+            pytest.raises(RuntimeError),
+        ):
+            await c.get("/audit/export?format=csv&actor=alice", headers=h)
+    assert "audit export by auditor ended early: 2 of 7 rows sent" in caplog.text
+
+
 async def test_audit_export_denied_to_unauthorized_role(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "vw", Role.VIEWER)
@@ -1272,7 +1464,13 @@ async def test_require_paced_inherits_the_mfa_access_gate(engine: Engine) -> Non
     # the gate: once the second factor is satisfied, the paced route passes while the step-up route
     # keeps demanding a fresh password proof. Pinning it there keeps the original intent testable
     # instead of deleting the coverage.
-    service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
+    # The floor is off: the confirm below runs at once on the signed-in session (BACKLOG #2389).
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=True, mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False
+        ),
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)  # second factor not enrolled
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
@@ -1349,9 +1547,9 @@ async def test_connection_test_and_integrity_check_are_paced(engine: Engine) -> 
 
 #: BACKLOG #287 (ASVS 2.4.2): the three state-changing routes that stayed on plain require() after the
 #: #193 sweep. Each entry is (method, path, json body, the status an admitted request gets). None of
-#: them needs a live dependency: the preset id names no row, the log level is set to the value the
-#: root logger already holds (filled in at run time), and the test-email request finds no [alerts]
-#: mail transport configured, so it answers without dialling anything.
+#: them needs a live dependency: the preset id names no row, the log level is set to one the instance
+#: accepts, the current one where it can be (filled in at run time), and the test-email request
+#: finds no [alerts] mail transport configured, so it answers without dialling anything.
 _PACED_BY_287: tuple[tuple[str, str, dict[str, object] | None, int], ...] = (
     ("DELETE", "/search/presets/" + "a" * 32, None, 404),
     ("PATCH", "/logging/level", None, 200),
@@ -1398,9 +1596,14 @@ async def test_backlog_287_routes_are_paced(
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "adm")).json()["token"])
         if path == "/logging/level":
+            # A level this instance ACCEPTS: the client passes no [ai] posture, so it counts as
+            # production and DEBUG is refused (vault BACKLOG #2777). Re-PATCHing the current level
+            # would make this test depend on whatever level the root logger was left at.
             current = await c.get("/logging/level", headers=h)
             assert current.status_code == 200
-            body = {"level": current.json()["level"]}
+            level = current.json()["level"]
+            accepted = current.json()["levels"]
+            body = {"level": level if level in accepted else accepted[0]}
         for _ in range(2):
             admitted = await c.request(method, path, json=body, headers=h)
             assert admitted.status_code == admitted_status, admitted.text
@@ -1759,8 +1962,10 @@ async def test_ad_session_maps_groups_and_grants_permission(engine: Engine) -> N
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
@@ -2189,7 +2394,10 @@ async def test_disabling_the_LAST_second_factor_is_a_400_not_a_500(
     ``/me/mfa/confirm`` route already mapped ValueError to 400; this one did not, so adding the guard
     without touching the route would have turned a refusal into an internal error.
     """
-    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
+    # The floor is off: the confirm below runs at once on the signed-in session (BACKLOG #2389).
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]

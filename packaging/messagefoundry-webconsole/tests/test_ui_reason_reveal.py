@@ -48,10 +48,10 @@ async def _seed(engine: Engine) -> tuple[int, int, int]:
         reason=_ALERT,
         now=100.0,
     )
-    events = await engine.store.list_connection_events()
+    events = await engine.store.list_connection_events(allowed_channels=None)
     lost = next(e.id for e in events if e.reason == _LOST)
     other = next(e.id for e in events if e.reason == _OTHER)
-    (alert,) = await engine.store.list_active_alert_instances(limit=10)
+    (alert,) = await engine.store.list_active_alert_instances(limit=10, allowed_channels=None)
     return lost, other, alert.id
 
 

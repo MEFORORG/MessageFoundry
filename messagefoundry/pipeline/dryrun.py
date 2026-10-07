@@ -561,8 +561,14 @@ def transform_one(
         # closed HERE if unknown: an undeliverable target would otherwise enqueue a row no worker drains
         # (silent accept-and-strand). A non-PT inbound is NOT a valid target (only an outbound or a PT).
         tic = registry.inbound.get(send.to)
+        foreign_pt = registry.all_pt_inbound
         if tic is not None and tic.spec.type is ConnectorType.PT:
             is_pt, deployed = True, tic.deployed
+        elif tic is None and foreign_pt is not None and send.to in foreign_pt:
+            # Engine-sharded: a PT ANOTHER shard owns (vault BACKLOG #2755). `inbound` holds only this
+            # shard's, so resolve against the pinned whole-config PT map. The child INGRESS row lands
+            # in the unified store (ADR 0063) and the owning shard's router worker drains it.
+            is_pt, deployed = True, foreign_pt[send.to]
         else:
             is_pt = False
             oc = registry.outbound.get(send.to)
@@ -922,12 +928,14 @@ def dry_run(
     **THIS FUNCTION TAKES NO ``sandbox`` ARGUMENT AND ALWAYS RUNS ROUTERS/HANDLERS IN-PROCESS.** It is
     therefore blind to ``[sandbox].mode``. That matches ``serve`` on the shipped default (``off``),
     and diverges from it at ``[sandbox].mode=subprocess``: ``messagefoundry check`` and
-    ``messagefoundry dryrun`` do not preview the isolation such a site's engine applies. A Handler
-    calling the live ``db_lookup``/``fhir_lookup`` bridges passes here and then **fails closed at**
-    ``serve``; ``[sandbox].wall_seconds`` is likewise unenforced here. Stated rather than fixed,
-    deliberately: the peer entry points :func:`route_only` / :func:`transform_one` below DO take
-    ``sandbox=`` and honour it, so the seam exists — teaching the gate to spawn a worker child per
-    inbound is its own change with its own cost.
+    ``messagefoundry dryrun`` do not preview the isolation such a site's engine applies;
+    ``docs/CONFIGURATION.md``, section ``[sandbox]``, lists where they differ. That gap is stated
+    rather than fixed, deliberately: the peer entry points :func:`route_only` / :func:`transform_one`
+    below DO take ``sandbox=`` and honour it, so the seam exists — teaching the gate to spawn a worker
+    child per inbound is its own change with its own cost.
+
+    The live ``db_lookup``/``fhir_lookup`` bridges are not part of that gap. They have no runner here,
+    so a Handler that reaches either and does not catch the error returns ``ERROR``.
     """
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:

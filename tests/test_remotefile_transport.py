@@ -39,10 +39,9 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.keywrap import KeyWrapRefused
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.transports import build_destination, build_source, remotefile
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -50,7 +49,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
 )
 from messagefoundry.transports.egress import check_egress_allowed, check_source_allowed
-from messagefoundry.transports.file import DEFAULT_MAX_FILE_BYTES
+from messagefoundry.transports.file import DEFAULT_MAX_FILE_BYTES, render_filename
 from messagefoundry.transports.remotefile import (
     _APPROVED_SFTP_CIPHERS,
     _APPROVED_SFTP_MACS,
@@ -67,12 +66,12 @@ from messagefoundry.transports.remotefile import (
     _SftpClient,
 )
 from tests._approved_key_wrap import approved_pkcs8_pem
-from tests.test_encode_wire_body import (
+from tests._content_free import (
     CJK_CHAR,
     PAYLOAD,
     SECRET_CHAR,
-    _assert_content_free,
-    _escapes,
+    assert_content_free,
+    escapes,
 )
 
 #: Small chunk for the fake client, so a test body is delivered in several pieces without needing a
@@ -481,7 +480,7 @@ async def test_an_unencodable_payload_is_a_permanent_content_free_refusal(
     with caplog.at_level(logging.DEBUG), pytest.raises(NegativeAckError) as ei:
         await dest.send(payload)
     exc = ei.value
-    _assert_content_free(exc, encoding=encoding)
+    assert_content_free(exc, encoding=encoding)
     # One line at a time, minus the File lines: a checkout path may itself hold "e9" or an accent.
     frames = "".join(traceback.format_exception(exc)).splitlines()
     surfaces = {
@@ -494,7 +493,7 @@ async def test_an_unencodable_payload_is_a_permanent_content_free_refusal(
     for where, text in surfaces.items():
         assert _BODY_MARKER not in text, f"message content reached the {where}"
         for ch in (SECRET_CHAR, CJK_CHAR, _LONE_SURROGATE):
-            for form in _escapes(ch):
+            for form in escapes(ch):
                 assert form not in text, f"a message character reached the {where} as {form!r}"
     # The same bytes never encode on a retry, so the row dead-letters on the first attempt. A bad
     # MESSAGE, so neither flag may stop the whole lane.
@@ -523,6 +522,80 @@ async def test_an_encodable_payload_still_uploads(
     dest = _dest(monkeypatch, client, protocol=protocol, filename="msg.hl7", encoding=encoding)
     await dest.send(payload)
     assert client.files == {"/in/msg.hl7": payload.encode(encoding)}
+
+
+#: Synthetic. MSH-10 and PID-5.1 carry markers, so a name rendered from either is distinctive.
+_CONTROL_ID = "CTLZQ7731"
+_NAME_FIELD = "NAMEZQMARK"
+_NAMED_BODY = (
+    f"MSH|^~\\&|SENDER|FAC|RECV|FAC|20260714||ADT^A01|{_CONTROL_ID}|P|2.5\r"
+    f"PID|1||42||{_NAME_FIELD}^Zaf{SECRET_CHAR}r\r"
+)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [None, "{PID-5.1}_{MSH-10}.hl7"],
+    ids=["default-template", "name-field-template"],
+)
+async def test_the_refusal_never_carries_the_rendered_file_name(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, template: str | None
+) -> None:
+    """The upload name is rendered from the message, so a label that carried it would put message
+    content in the stored error. The other refusal tests pin a fixed ``msg.hl7``, so
+    they cannot see that; this one renders from MSH-10 and PID-5 (vault BACKLOG #3044)."""
+    client = _FakeClient()
+    over: dict[str, Any] = {} if template is None else {"filename": template}
+    dest = _dest(monkeypatch, client, encoding="us-ascii", **over)
+    rendered = render_filename(dest._filename_template, _NAMED_BODY, fallback="FALLBACKZQ")
+    # Arming: the shipped default really is MSH-10, and both templates resolve to the markers.
+    assert template is not None or dest._filename_template == "{MSH-10}.hl7"
+    assert _CONTROL_ID in rendered and "FALLBACKZQ" not in rendered
+    assert template is None or _NAME_FIELD in rendered
+    with caplog.at_level(logging.DEBUG), pytest.raises(NegativeAckError) as ei:
+        await dest.send(_NAMED_BODY)
+    exc = ei.value
+    assert exc.code == "encoding"
+    for where, text in {
+        "str": str(exc),
+        "repr": repr(exc),
+        "stored error": safe_exc(exc),
+        "log": caplog.text,
+    }.items():
+        for marker in (_CONTROL_ID, _NAME_FIELD):
+            assert marker not in text, f"the rendered file name reached the {where}"
+
+
+async def test_a_long_host_and_dir_leave_the_charset_and_position_in_the_stored_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stored error is cut short twice: by ``safe_exc``, then by the store's own ``safe_text``
+    over the type-prefixed text. A label carrying ``host:remote_dir`` was one long token, and the
+    cut drops a crossing token whole, so a long host and directory took the charset and position
+    with them. The label is fixed now, so their length cannot reach the refusal."""
+    client = _FakeClient()
+    host = "sftp.partner-hospital-integration-gateway.example.org"
+    remote_dir = "/" + "/".join(["partner_inbound_drop_directory"] * 8)
+    dest = _dest(monkeypatch, client, host=host, remote_dir=remote_dir, encoding="us-ascii")
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(_NAMED_BODY)
+    # What dead_letter_now persists for a permanent refusal.
+    stored = safe_text(safe_exc(ei.value))
+    position = _NAMED_BODY.index(SECRET_CHAR)
+    assert f"'us-ascii' (first offending character at position {position})" in stored
+    assert "REMOTEFILE upload" in stored
+    assert "partner_inbound_drop_directory" not in stored and host not in stored
+
+
+async def test_an_explicit_none_encoding_is_utf_8_as_on_the_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``None`` means "not declared". Read as given, ``.encode(None)`` raised a TypeError, which is
+    an internal error: under ``internal_error = stop`` it stopped the lane (vault BACKLOG #3044)."""
+    client = _FakeClient()
+    dest = _dest(monkeypatch, client, filename="msg.hl7", encoding=None)
+    await dest.send(_NAMED_BODY)
+    assert client.files == {"/in/msg.hl7": _NAMED_BODY.encode("utf-8")}
 
 
 # === source ==================================================================
@@ -1091,15 +1164,32 @@ def test_plain_ftp_with_credentials_refused_without_escape(
         )
 
 
-def test_plain_ftp_with_credentials_allowed_with_escape(
+@pytest.mark.parametrize(
+    "credential", [{"username": "u"}, {"password": "p"}], ids=["username", "password"]
+)
+def test_plain_ftp_with_credentials_refused_even_with_escape(
     escape_at_warn: None,
-    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    credential: dict[str, str],
 ) -> None:
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    dest = build_destination(
-        _ftp_dest(username="u", password="p"), egress=EgressSettings(deny_by_default=False)
-    )
-    assert isinstance(dest, RemoteFileDestination)  # builds (warns), not refused
+    """Vault BACKLOG #2636: absolute, as SMTP refuses a cleartext credential. The escape on a warn
+    posture used to release it with a WARNING; now it is refused in both directions, and the
+    connector logs no WARNING of any wording before the refusal."""
+    remotefile_log = "messagefoundry.transports.remotefile"
+    settings = _ftp_dest(**credential).settings
+    with caplog.at_level(logging.WARNING, logger=remotefile_log):
+        with pytest.raises(ValueError, match="CLEARTEXT") as out:
+            RemoteFileDestination(
+                Destination(name="OB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+            )
+        with pytest.raises(ValueError, match="CLEARTEXT") as inb:
+            RemoteFileSource(
+                Source(name="IB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+            )
+    for refusal in (out.value, inb.value):
+        assert "MEFOR_ALLOW_INSECURE_TLS" not in str(refusal)  # no escape is offered
+    assert "'OB_RF'" in str(out.value) and "'inbound:IB_RF'" in str(inb.value)
+    assert not [r for r in caplog.records if r.name == remotefile_log]
 
 
 def test_plain_ftp_without_credentials_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2519,10 +2609,10 @@ def test_a_refused_credential_is_still_a_credential_fault(
 
 
 def _scripted_plain_ftp(monkeypatch: pytest.MonkeyPatch, *, refuse_at: str, reply: str) -> None:
-    """Make ``ftplib.FTP`` a :class:`_ScriptedFtp`, for plain FTP under the insecure escape."""
+    """Make ``ftplib.FTP`` a :class:`_ScriptedFtp`, for a plain-FTP session. No escape: a built
+    plain-ftp hop is anonymous (vault BACKLOG #2636), and :func:`_plain_client` skips the build."""
     import ftplib as _ftplib
 
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     _ScriptedFtp.instances = []
 
     class _Plain(_ScriptedFtp):
@@ -2631,7 +2721,8 @@ _CONFIG_FAULTS = [
     pytest.param(
         "ftps", "prot_p", "536 Requested PROT level not supported by mechanism.", id="prot-p"
     ),
-    pytest.param("plain", "login", _TLS_DEMANDS[0], id="tls-demand"),
+    # ProFTPD's TLSRequired reply, sent to any login: the plain arm below logs in anonymously.
+    pytest.param("plain", "login", _TLS_DEMANDS[1], id="tls-demand"),
 ]
 
 
@@ -2643,14 +2734,14 @@ def _config_fault_dest(
         _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
     else:
         _scripted_plain_ftp(monkeypatch, refuse_at=refuse_at, reply=reply)
-    # A credentialed plain-ftp hop needs the escape on a warn posture (vault BACKLOG #2354). FTPS
-    # needs no escape, so it keeps the default (unstamped) posture.
-    posture = HopPosture(enforcing=False) if kind == "plain" else None
-    with active_hop_posture(posture):
-        return build_destination(
-            _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over),
-            egress=EgressSettings(deny_by_default=False),
-        )
+    # A credentialed plain-ftp hop is refused outright (vault BACKLOG #2636), so the plain session
+    # is anonymous, scripted with a TLS demand a server sends to any login. FTPS keeps its
+    # credential. Both keep the default (unstamped) posture.
+    credential = {"username": "u", "password": "p"} if kind == "ftps" else {}
+    return build_destination(
+        _ftp_dest(tls=kind == "ftps", filename="m.hl7", **credential, **over),
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 @pytest.mark.parametrize(("kind", "refuse_at", "reply"), _CONFIG_FAULTS)
@@ -2746,7 +2837,7 @@ async def test_a_refused_auth_tls_stops_the_lane_and_keeps_the_row(
         assert retry_until is None
         pending = OutboxStatus.PENDING.value
         assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every row kept"
-        assert await runner.store.count_dead() == 0
+        assert await runner.store.count_dead(allowed_channels=None) == 0
         assert len(sink.stopped) == 1
         assert sink.stopped[0][0] == _E2E_DEST
         assert "configuration fault" in sink.stopped[0][1]
@@ -2778,7 +2869,7 @@ async def test_a_refused_auth_tls_on_a_batch_stops_the_lane_and_keeps_every_row(
         assert retry_until is None
         pending = OutboxStatus.PENDING.value
         assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every member kept"
-        assert await runner.store.count_dead() == 0
+        assert await runner.store.count_dead(allowed_channels=None) == 0
         assert [name for name, _ in sink.stopped] == [_E2E_DEST]
         assert "configuration fault" in sink.stopped[0][1]
         assert ("outbound", _E2E_DEST) in runner._stop_held

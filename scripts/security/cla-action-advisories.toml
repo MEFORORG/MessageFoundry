@@ -9,11 +9,14 @@
 # reviewed pull request, with a comment above the entry saying who triaged it and what they found.
 # The script prints what to check first.
 #
-# NO ENTRY HERE HAS BEEN TRIAGED YET, SO NONE CARRIES THAT COMMENT. The first 35 are the whole
-# result of the first audit, run 2026-09-29 with npm 11.5.2, recorded as found. Nobody has yet judged whether each is reachable in the
-# bundle's runtime path, and listing them here is not that judgement. Some affect packages the
-# lockfile marks `dev` only (the @babel packages, for example). Others do not: lodash, lodash.set
-# and js-yaml are among the packages the lockfile does not mark `dev`.
+# AN ENTRY WITH NO TRIAGE COMMENT ABOVE IT HAS NOT BEEN TRIAGED. The first 35 are the whole result
+# of the first audit, run 2026-09-29 with npm 11.5.2, recorded as found. Nobody has yet judged
+# whether each is reachable in the bundle's runtime path, and listing them here is not that
+# judgement. Some affect packages the lockfile marks `dev` only (the @babel packages, for example).
+# Others do not: lodash, lodash.set and js-yaml are among the packages the lockfile does not mark
+# `dev`. The bundle measurement recorded with the 2026-10-07 entries also finds no js-yaml or
+# braces code in the bundle. That bears on the js-yaml entries and on braces GHSA-grv7-fg5c-xmjg,
+# the same braces 3.0.2 node as the triaged GHSA-vfj7-8cjw-p6xm, but they have not been re-triaged.
 #
 # Each entry is one advisory id and the package npm reported it against. Only those two fields are
 # compared. Severity and title are printed live from the audit.
@@ -174,3 +177,53 @@ package = "brace-expansion"
 [[advisory]]
 id = "GHSA-qhr7-859c-m2p7"
 package = "brace-expansion"
+
+# TWO MORE, RECORDED AND TRIAGED 2026-10-07 (cla-action-audit advisories 2026-10-06). The braces
+# advisory first turned the scheduled job red on 2026-10-03 (Security run 37118736851, issue 1979,
+# where a Lander comment triaged it as dev-only), and it stayed the only new one through 2026-10-05.
+# sprintf-js first appears in run 37465869403 on 2026-10-06 (job 112276619489), which reports both.
+# A local run of this gate on 2026-10-07, with npm 11.5.2 (the major the job's Node 24 ships),
+# matched coverage (561 of 561) and reported exactly these two beyond the baseline; npm 10.9.4 gave
+# the same result.
+#
+# WHO TRIAGED IT: Claude, an AI agent, as a Builder subagent of a Manager seat, on branch
+# claude/nifty-bell-hvh28w-w4-cla, checked by an AI code review at effort xhigh. No person had
+# triaged it when this was written. The pull request that lands it is its review gate; whether a
+# person read this reasoning is recorded there, not here.
+#
+# NO PATCHED RELEASE OF EITHER PACKAGE EXISTS, read from each advisory's GitHub page on 2026-10-07:
+# braces is affected through 3.0.3 and sprintf-js through 1.1.3. npm still reports a fix as
+# available for both, by moving a PARENT: for sprintf-js, argparse 2.x or js-yaml 4.x drops it from
+# the tree. That was not done, because the lockfile is a verbatim record of the pinned upstream
+# commit, and editing it would change the record without changing a byte of the bundle that runs.
+#
+# NEITHER PACKAGE'S CODE IS IN THE VENDORED BUNDLE. dist/index.js is not minified, so a package's
+# own identifiers survive in it, while its NAME often does not (the bundler replaces require paths
+# with module ids). So the probes are identifiers. Each of these returns 0 in dist/index.js:
+# "sprintf" (case-insensitive), "ArgumentParser" (argparse), "YAMLException" and "safeLoad"
+# (js-yaml), "Toolkit" (actions-toolkit), "CHAR_ZERO_WIDTH_NOBREAK_SPACE" (a constant braces
+# defines, as picomatch also does), "toRegexRange" (fill-range, braces' own dependency).
+# Control on the same file and instrument: "function getInput|function setFailed", two functions
+# of @actions/core, which the bundle does carry, returns 2, so an identifier probe can find a
+# bundled package and the zeros are not a dead instrument. "isMatch" is deliberately not a probe:
+# it hits lodash, which shares the name with micromatch. The bundle, not the lockfile, is what
+# cla.yml runs, so this reading is what bounds exposure.
+# tests/test_cla_action_advisory_gate.py re-runs these probes and the control, so a re-vendored
+# bundle that carries any of this code reds there and forces a re-triage of both entries.
+
+# braces 3.0.2: stack exhaustion through deeply nested brace patterns (high). The lockfile marks it
+# `dev`; its only parent is micromatch 4.0.5, itself `dev`, reached from the jest toolchain.
+# Upstream build tooling, absent from the bundle, so not reachable where the bundle runs.
+[[advisory]]
+id = "GHSA-vfj7-8cjw-p6xm"
+package = "braces"
+
+# sprintf-js 1.0.3: an unbounded precision specifier in the FORMAT STRING throws RangeError
+# (moderate). NOT marked `dev`. Its only parent is argparse 1.0.10, whose only parent is js-yaml
+# 3.13.1, which has a runtime parent (actions-toolkit) and a dev one (@istanbuljs/load-nyc-config).
+# Not reachable, for two independent reasons. None of that chain's code is in the bundle (above).
+# And js-yaml 3.13.1 requires argparse only from bin/js-yaml.js, its command-line entry point, and
+# from no file under lib/ (read from the published tarball, 2026-10-07).
+[[advisory]]
+id = "GHSA-hp3w-g68c-fv3c"
+package = "sprintf-js"

@@ -672,7 +672,7 @@ def test_group_writable_refusal_carries_its_own_fix(
         # /remove:g would take read away too, and the engine may read the anchor through the group.
         assert "/remove:g" not in message
         # The rights it names are the check's own, so the text cannot drift from the parser.
-        assert ", ".join(sorted(ta._WRITE_RIGHTS)) in message
+        assert "/".join(sorted(ta._WRITE_RIGHTS)) in message
         assert any(line.startswith(f"Then run icacls {q} again.") for line in lines)
     else:
         assert f"  chmod go-w {shlex.quote(str(p))}" in lines
@@ -1326,28 +1326,35 @@ async def test_the_start_and_the_reload_refuse_an_ad_trusted_certificate_block_a
 @pytest.mark.parametrize(
     ("settings", "inbound"),
     [
-        ({"tls": True, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32}, False),  # outbound
+        ({"tls": True, "tls_ca_pin": "ab" * 32}, False),  # outbound, no CA to pin
+        ({"tls": False, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32}, False),  # no TLS
         ({"tls": True, "tls_ca_pin": "ab" * 32}, True),  # inbound, no CA to pin
         ({"tls": False, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32}, True),  # no TLS
     ],
 )
 def test_a_ca_pin_nothing_reads_is_refused(settings: dict, inbound: bool) -> None:
     """A tls_ca_pin set where no check reads it would read as a pin and enforce nothing."""
-    with pytest.raises(ValueError, match="tls_ca_pin is set on"):
+    with pytest.raises(ValueError, match="tls_ca_pin is set"):
         ta.refuse_an_unread_ca_pin(settings, inbound=inbound, connector="x")
-    # The control: the one place it is read, and every place it is absent.
-    ta.refuse_an_unread_ca_pin(
-        {"tls": True, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32}, inbound=True, connector="x"
-    )
+    # The control: the places it is read, in both directions since vault BACKLOG #2371, and every
+    # place it is absent.
+    for direction in (True, False):
+        ta.refuse_an_unread_ca_pin(
+            {"tls": True, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32},
+            inbound=direction,
+            connector="x",
+        )
     ta.refuse_an_unread_ca_pin({**settings, "tls_ca_pin": None}, inbound=inbound, connector="x")
 
 
 def test_the_builders_refuse_a_ca_pin_nothing_reads() -> None:
-    """Wired into both MLLP directions and both DICOM directions, before the tls check."""
+    """Wired into both MLLP directions and both DICOM directions, before the tls check. Since vault
+    BACKLOG #2371 an outbound reads a pin beside tls and a tls_ca_file, so the outbound arm here is
+    a pin with no CA."""
     from messagefoundry.transports.dicom import _client_ssl_context, _server_ssl_context
     from messagefoundry.transports.mllp import _mllp_ssl_context
 
-    pinned = {"tls": True, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32}
+    pinned = {"tls": True, "tls_ca_pin": "ab" * 32}
     with pytest.raises(ValueError, match="MLLP destination: tls_ca_pin"):
         _mllp_ssl_context(pinned, server=False)
     with pytest.raises(ValueError, match="DICOM destination: tls_ca_pin"):
@@ -1374,7 +1381,7 @@ async def test_a_nul_in_an_inbound_ca_path_is_a_refused_config_not_a_crash(
         f"outbound('OUT', File(directory={str(tmp_path / 'out')!r}))\n" + _GRAPH_TAIL,
         encoding="utf-8",
     )
-    with pytest.raises(WiringError, match="an inbound trust anchor was refused") as err:
+    with pytest.raises(WiringError, match="a connection trust anchor was refused") as err:
         await ta.make_registry_anchor_preflight(store, enforcing=True)(load_config(cfg), {})
     # BACKLOG #2183: the cause is an anchor refusal, as the settings preflight's is.
     assert isinstance(err.value.__cause__, TrustAnchorError)
@@ -1502,16 +1509,27 @@ async def test_every_reload_route_refuses_a_swapped_settings_anchor(
     engine, cfg = await _anchored_engine(tmp_path, spec)
     try:
         await engine.reload_detail(cfg)  # a graph goes live; the DR route only acts on a live one
-        before = engine.registry_runner.registry
+        rr = engine.registry_runner
+        real_reload = rr.reload
+        applied: list[object] = []
+
+        async def counting(registry: Any = None) -> None:
+            applied.append(registry)
+            await real_reload(registry)
+
+        # Counted at the runner, not by registry identity: the DR route re-applies the graph it
+        # already holds (vault BACKLOG #3067), so its registry object never changes.
+        monkeypatch.setattr(rr, "reload", counting)
         await route(engine, cfg)  # the control: an unchanged anchor reloads
         live = engine.registry_runner.registry
-        assert live is not before  # the control really reloaded
+        assert len(applied) == 1  # the control really reloaded
         assert "pin_mismatch" not in {r["event"] for r in await _rows(engine.store, "ad")}
 
         anchor.write_bytes(_block(b"evil"))  # swapped after the check that started it
         with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
             await route(engine, cfg)
         assert isinstance(err.value.__cause__, TrustAnchorError)
+        assert len(applied) == 1  # nothing was re-applied
         assert engine.registry_runner.registry is live  # nothing was swapped
         assert "pin_mismatch" in {r["event"] for r in await _rows(engine.store, "ad")}
     finally:
@@ -1549,8 +1567,8 @@ async def test_a_reload_refuses_a_settings_anchor_swapped_for_a_crl(
 async def test_the_dr_profile_reload_without_a_config_dir_refuses_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The DR profile reload re-runs the live graph in place when the engine has no config dir, and
-    that branch never reaches reload_detail, so it runs the preflight itself. A refusal also leaves
+    """The DR profile reload re-runs the live graph in place, with or without a config dir (vault
+    BACKLOG #3067), and never reaches reload_detail, so it runs the preflight itself. A refusal also leaves
     the DR latch off, or the next reload would park feeds on a box that is not DR-active."""
     from messagefoundry.config.wiring import WiringError, load_config
 
@@ -1561,7 +1579,7 @@ async def test_the_dr_profile_reload_without_a_config_dir_refuses_too(
     try:
         rr = engine.add_registry(load_config(cfg))
 
-        async def spy(registry: object) -> None:
+        async def spy(registry: object = None) -> None:
             reloaded.append(registry)
 
         monkeypatch.setattr(rr, "reload", spy)
@@ -2129,7 +2147,7 @@ async def test_the_registry_preflight_refuses_an_unreadable_ca_as_an_anchor(
 
     cfg = tmp_path / "cfg"
     _one_listener_graph(cfg, tmp_path / "gone.pem")
-    with pytest.raises(WiringError, match="an inbound trust anchor was refused") as err:
+    with pytest.raises(WiringError, match="a connection trust anchor was refused") as err:
         await ta.make_registry_anchor_preflight(store, enforcing=True)(load_config(cfg), {})
     assert isinstance(err.value.__cause__, TrustAnchorError)
     assert isinstance(err.value.__cause__.__cause__, FileNotFoundError)

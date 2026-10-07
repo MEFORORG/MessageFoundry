@@ -23,6 +23,10 @@ dist/
 out/
 harness_io/
 *.log
+# A config editor's cross-process lock file, and a candidate directory a killed edit left, when
+# the CLI or the engine edits a config dir in place, such as samples/config (vault BACKLOG #2782)
+.mefor-edit.lock
+.*.????????.edit/
 
 # One-time bootstrap admin credential written next to the store (consumed + deleted by the operator) — never commit
 bootstrap-admin.txt

@@ -22,17 +22,12 @@ checks). Two checks are **required** (they can block a commit):
   **THAT PREVIEW GUARANTEE IS SCOPED TO ``snapshot_on_send``, AND ONE OTHER SETTING BREAKS IT.** The
   dry run ALWAYS executes Routers/Handlers **in-process**: :func:`messagefoundry.pipeline.dryrun.dry_run`
   takes no ``sandbox`` argument, so it never consults ``[sandbox].mode``. On the shipped default
-  (``off``) that costs nothing, because ``serve`` runs them in-process too — but a site that has
-  turned ``[sandbox].mode=subprocess`` on gets two consequences a reader must not have to infer. A
-  Handler calling the live ``db_lookup``/``fhir_lookup`` bridges **passes this gate green and then
-  fails closed at** ``serve``, because those bridges re-enter the event loop and the child refuses
-  them. And ``[sandbox].wall_seconds`` is not enforced here either, so a Handler slow enough to be
-  killed and dead-lettered at ``serve`` finishes clean in the preview. Neither is a gate defect to
-  route around: **the fix for both is to run the feed under ``serve``**, or to set
-  ``[sandbox].mode=off`` for a Handler that genuinely needs live enrichment — noting that
-  ``[sandbox]`` is a single **engine-wide** section (one ``SandboxPolicy`` is rendered for the whole
-  graph and a connection carries no per-connection sandbox field), so that ``off`` takes every Router
-  and Handler in the process out of the sandbox, not just the one that needs enrichment.
+  (``off``) that costs nothing, because ``serve`` runs them in-process too. At
+  ``[sandbox].mode=subprocess`` the preview stops matching ``serve`` in at least two ways
+  (``wall_seconds`` and the worker's environment allowlist); ``docs/CONFIGURATION.md``, section
+  ``[sandbox]``, states them once. A Handler reaching ``db_lookup``/``fhir_lookup`` is not one of
+  them. The dry run has no lookup runner, so the call raises here in every mode. Unless the Handler
+  catches it, this gate fails unless the fixture's ``.expect`` declares ``ERROR``.
 
 A third required check, ``posture``, is **best-effort**: when a ``messagefoundry.toml`` is present
 (searched from ``config_dir`` upward + the CWD) it loads the service settings and — if an active
@@ -114,6 +109,15 @@ if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings
 
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
+
+
+def _config_modules(base: Path) -> list[Path]:
+    """The config dir's ``*.py`` files, by the loader's own rule: a dot-named backup is never run, so
+    the static lints do not report on it either (vault BACKLOG #2781)."""
+    from messagefoundry.config.wiring import config_py_files
+
+    return config_py_files(base)
+
 
 # What ``_parse_config_module`` raises on a config module it cannot turn into a tree (BACKLOG #1858).
 # The advisory legs skip such a file, because ``validate`` runs first and names it: the loader's broad
@@ -520,7 +524,7 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
             "raise-fstring", ok=True, required=False, skipped=True, detail="not a config dir"
         )
     hits: list[str] = []
-    for path in sorted(base.glob("*.py")):
+    for path in _config_modules(base):
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -650,7 +654,7 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
             "accepts-candidate", ok=True, required=False, skipped=True, detail="not a config dir"
         )
     hits: list[str] = []
-    for path in sorted(base.glob("*.py")):
+    for path in _config_modules(base):
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -1556,12 +1560,12 @@ def _check_handler_security(
             "handler-security", ok=True, required=False, skipped=True, detail="not a config dir"
         )
     # sibling config modules (the dir's own *.py stems) are first-party for the unvetted-import rule.
-    local_modules = frozenset(p.stem for p in base.glob("*.py"))
+    local_modules = frozenset(p.stem for p in _config_modules(base))
     # unvetted-import needs a trustworthy shipped-dep set to tell operator-added from shipped; if the
     # metadata probe degraded to empty, skip the rule entirely rather than flag/block on a blind vet.
     shipped = _shipped_dep_import_roots()
     hits: list[str] = []
-    for path in sorted(base.glob("*.py")):
+    for path in _config_modules(base):
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -2524,8 +2528,10 @@ def _check_hostname_unchecked(config_dir: str | Path) -> CheckResult:
     that chains to the anchor is accepted whatever host it names.
 
     Advisory (``required=False``) on the ``tls_allow_expired`` precedent: a per-connection TLS
-    relaxation is reported, not refused, under any ``[security].enforcement``. SKIPs when the graph
-    will not load, the same convention as its siblings."""
+    relaxation is reported, not refused, under any ``[security].enforcement``. A credentialed SMTP or
+    FTPS hop that declares it is refused at its own construction instead (#1314, vault BACKLOG
+    #2636); this line does not repeat that refusal. SKIPs when the graph will not load, the same
+    convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, hostname_unchecked_hops, load_config
 
     name = "tls-check-hostname"

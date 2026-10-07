@@ -208,7 +208,8 @@ suite("engine control — planActions offers lifecycle only under the right cont
 });
 
 // ADR 0183 Amendment A, Wave 5 (BACKLOG #1136, ASVS 6.3.2). The engine creates no account on its own, so
-// a `serve` the IDE starts would come up with nobody able to sign in. Start therefore provisions an
+// a `serve` the IDE starts would be refused at the shipped posture, or come up with nobody able to manage
+// users and roles. Start therefore provisions an
 // Administrator first, with `provision-admin` in its OWN terminal (the password is typed there, never
 // passed), and treats "an enabled Administrator already exists" as go-ahead.
 
@@ -471,7 +472,8 @@ suite("engine control — the Start plan provisions before it serves (Wave 5)", 
   });
 
   test("starting without an administrator is a deliberate choice, and provisions nothing", async () => {
-    // A posture with sign-in off needs none; at the shipped posture serve refuses and names provision-admin.
+    // At the shipped posture serve refuses and names provision-admin; under warn or the notice waiver it
+    // starts with nobody able to manage users and roles. `serve` cannot run with sign-in off.
     const { fx, calls } = fakeEffects({ probes: [NEEDS], choice: "skip" });
     assert.strictEqual(await runStartPlan(fx), "servedWithoutAdmin");
     assert.deepStrictEqual(calls, ["probe", "choose", "serve"]);

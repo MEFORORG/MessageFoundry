@@ -327,6 +327,22 @@ async def test_a_repoint_is_still_announced_to_a_mirror_the_birth_test_would_ado
         await store.close()
 
 
+def _refuse_audit_appends(store: Any, *, after: int = 0) -> None:
+    """Make audit appends on ``store`` raise once ``after`` more have run (BACKLOG #2100, #2221).
+
+    Any backend. Each append reads the chain key once, so the hook counts appends."""
+    allowed = [after]
+    key = store._audit_append_mac
+
+    def _refuse() -> Any:
+        if allowed[0] > 0:
+            allowed[0] -= 1
+            return key()
+        raise RuntimeError("audit append refused")
+
+    store._audit_append_mac = _refuse
+
+
 async def test_a_refused_birth_and_its_audit_row_roll_back_together() -> None:
     """BACKLOG #2100. The not-adopted row commits with the INSERT, so no crash can keep one and
     lose the other. Driven by refusing the audit append: before #2100 the account survived it."""
@@ -334,17 +350,131 @@ async def test_a_refused_birth_and_its_audit_row_roll_back_together() -> None:
     try:
         service = _ad_service(store)
         await service.initialize()
-
-        def _refuse() -> Any:
-            raise RuntimeError("audit append refused")
-
-        store._audit_append_mac = _refuse  # type: ignore[method-assign]
+        _refuse_audit_appends(store)
         with pytest.raises(RuntimeError, match="audit append refused"):
             await service._create_directory_row(
                 _directory_principal("torn", _UNADOPTABLE_DIRECTORY_MAIL[0][1]), client=None
             )
         assert await store.get_user_by_username("torn") is None
         assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
+    finally:
+        await store.close()
+
+
+async def test_a_directory_repoint_and_its_audit_row_commit_together() -> None:
+    """BACKLOG #2221. The ``auth.ad_profile_email_changed`` row commits in the UPDATE's transaction.
+
+    A refused append now leaves the old address standing. Before #2221 the UPDATE had already
+    committed, so the account kept the new address with no record of the change. The upsert is
+    called directly, so the profile write is the first thing to append a row and nothing earlier
+    on the sign-in path can be what raised."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        out = await service._complete_ad_login(
+            _directory_principal("repoint", "first@example.org"), None, mfa_verified=True
+        )
+        assert out.ok
+        before = await store.get_user_by_username("repoint")
+        assert before is not None and before.email == "first@example.org"
+
+        _refuse_audit_appends(store)
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await service._upsert_ad_user(
+                _directory_principal("repoint", _CORRECTED), by_name=before, federated=False
+            )
+        after = await store.get_user_by_username("repoint")
+        assert after is not None and after.email == "first@example.org"
+        assert await store.list_audit(action="auth.ad_profile_email_changed") == []
+    finally:
+        await store.close()
+
+
+async def test_a_directory_repoint_still_writes_its_row_with_the_change() -> None:
+    """The control for the test above: with the append working, both the address and the row land,
+    and a sign-in that changes nothing writes no row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        for mail in ("first@example.org", _CORRECTED, _CORRECTED):
+            out = await service._complete_ad_login(
+                _directory_principal("repoint", mail), None, mfa_verified=True
+            )
+            assert out.ok, mail
+        user = await store.get_user_by_username("repoint")
+        assert user is not None and user.email == _CORRECTED
+        [row] = await store.list_audit(action="auth.ad_profile_email_changed")
+        assert row["actor"] == "repoint"
+        assert json.loads(row["detail"]) == {"user_id": user.id, "source": "directory"}
+        ok, message = await store.verify_audit_chain()
+        assert ok, message
+    finally:
+        await store.close()
+
+
+class _ResolvingDirectory:
+    """The one LDAP call an administrator's directory create makes: a lookup by name."""
+
+    def __init__(self, principal: AdPrincipal) -> None:
+        self._principal = principal
+
+    def resolve_principal(self, username: str, *, object_id: str | None = None) -> AdPrincipal:
+        return self._principal
+
+
+async def test_an_administrator_directory_create_and_its_row_commit_together() -> None:
+    """BACKLOG #2221. The administrator's ``user.created`` row commits in the INSERT's transaction.
+
+    A refused append now takes the account with it. Before #2221 the account had already
+    committed, so it stood with no record of who created it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        service._ldap = _ResolvingDirectory(  # type: ignore[assignment]
+            _directory_principal("made", "made@example.org")
+        )
+        _refuse_audit_appends(store)
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await service.create_directory_account("made", actor="admin")
+        assert await store.get_user_by_username("made") is None
+        assert await store.list_audit(action="user.created") == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("mail", ["made@example.org", _UNADOPTABLE_DIRECTORY_MAIL[0][1]])
+async def test_an_administrator_directory_create_writes_its_rows_with_the_insert(
+    mail: str,
+) -> None:
+    """The control for the test above. The account and its ``user.created`` row both land. When
+    the directory's ``mail`` is not adopted, the not-adopted row lands too, first, in the same
+    transaction, and the chain verifies over both."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        service._ldap = _ResolvingDirectory(  # type: ignore[assignment]
+            _directory_principal("made", mail)
+        )
+        adopted = AuthService.suggested_notify_email(mail) is not None
+        user_id = await service.create_directory_account(
+            "made", actor="admin", notify_email=None if adopted else ADDRESS
+        )
+        assert await store.get_user(user_id) is not None
+        rows = [
+            r
+            for r in await store.list_audit(actor="admin")
+            if r["action"] in ("user.created", "auth.ad_notify_email_not_adopted")
+        ]
+        expected = (
+            ["user.created"] if adopted else ["auth.ad_notify_email_not_adopted", "user.created"]
+        )
+        assert [r["action"] for r in sorted(rows, key=lambda r: r["seq"])] == expected
+        ok, message = await store.verify_audit_chain()
+        assert ok, message
     finally:
         await store.close()
 
@@ -807,7 +937,7 @@ async def test_every_store_backend_commits_the_audit_row_with_the_insert(
         auth_provider="ad",
         email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
         adopt_notify_email=False,
-        audit=AuditAppend("auth.ad_notify_email_not_adopted", actor=name, detail=detail),
+        audits=(AuditAppend("auth.ad_notify_email_not_adopted", actor=name, detail=detail),),
         password_generated=False,
     )
     try:
@@ -828,11 +958,7 @@ async def test_every_store_backend_rolls_the_insert_back_with_a_refused_audit_ro
     record cannot be lost while the account it describes survives."""
     name = f"torn-{uuid4().hex[:12]}"
     user_id = uuid4().hex
-
-    def _refuse() -> Any:
-        raise RuntimeError("audit append refused")
-
-    backend_store._audit_append_mac = _refuse
+    _refuse_audit_appends(backend_store)
     try:
         with pytest.raises(RuntimeError, match="audit append refused"):
             await backend_store.create_user(
@@ -841,7 +967,7 @@ async def test_every_store_backend_rolls_the_insert_back_with_a_refused_audit_ro
                 auth_provider="ad",
                 email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
                 adopt_notify_email=False,
-                audit=AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
+                audits=(AuditAppend("auth.ad_notify_email_not_adopted", actor=name),),
                 password_generated=False,
             )
         assert await backend_store.get_user(user_id) is None
@@ -849,6 +975,100 @@ async def test_every_store_backend_rolls_the_insert_back_with_a_refused_audit_ro
         assert rows == []
     finally:
         # A server database outlives the run, so a regression's leftover row goes with the test.
+        await backend_store.delete_user(user_id)
+
+
+async def test_every_store_backend_commits_several_audit_rows_with_the_insert_in_order(
+    backend_store: Any,
+) -> None:
+    """BACKLOG #2221. An administrator's directory create carries two rows: the not-adopted one
+    and ``user.created``. Both join the INSERT's transaction, in the order given."""
+    name = f"tworows-{uuid4().hex[:12]}"
+    user_id = uuid4().hex
+    await backend_store.create_user(
+        user_id=user_id,
+        username=name,
+        auth_provider="ad",
+        email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
+        adopt_notify_email=False,
+        notify_email=ADDRESS,
+        audits=(
+            AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
+            AuditAppend("user.created", actor=name),
+        ),
+        password_generated=False,
+    )
+    try:
+        rows = sorted(await backend_store.list_audit(actor=name), key=lambda r: r["seq"])
+        assert [r["action"] for r in rows] == ["auth.ad_notify_email_not_adopted", "user.created"]
+        assert rows[1]["seq"] == rows[0]["seq"] + 1
+    finally:
+        await backend_store.delete_user(user_id)
+
+
+async def test_every_store_backend_rolls_everything_back_when_the_second_row_fails(
+    backend_store: Any,
+) -> None:
+    """BACKLOG #2221. A refusal on the second of two rows takes the first row and the account with
+    it, so no partial record survives a birth that did not happen."""
+    name = f"secondrow-{uuid4().hex[:12]}"
+    user_id = uuid4().hex
+    _refuse_audit_appends(backend_store, after=1)
+    try:
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await backend_store.create_user(
+                user_id=user_id,
+                username=name,
+                auth_provider="ad",
+                email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
+                adopt_notify_email=False,
+                notify_email=ADDRESS,
+                audits=(
+                    AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
+                    AuditAppend("user.created", actor=name),
+                ),
+                password_generated=False,
+            )
+        assert await backend_store.get_user(user_id) is None
+        assert await backend_store.list_audit(actor=name) == []
+    finally:
+        await backend_store.delete_user(user_id)
+
+
+async def test_every_store_backend_commits_the_audit_row_with_the_profile_update(
+    backend_store: Any,
+) -> None:
+    """BACKLOG #2221. The directory repoint's row joins the UPDATE's transaction: with the append
+    working both land, and with it refused the old address stands and no row is written."""
+    name = f"repoint-{uuid4().hex[:12]}"
+    user_id = uuid4().hex
+    await backend_store.create_user(
+        user_id=user_id,
+        username=name,
+        auth_provider="ad",
+        email="first@example.org",
+        password_generated=False,
+    )
+    try:
+        detail = json.dumps({"user_id": user_id, "source": "directory"})
+        changed = (AuditAppend("auth.ad_profile_email_changed", actor=name, detail=detail),)
+        await backend_store.update_user_profile(
+            user_id, display_name=name, email="second@example.org", audits=changed
+        )
+        user = await backend_store.get_user(user_id)
+        assert user is not None and user.email == "second@example.org"
+        rows = await backend_store.list_audit(action="auth.ad_profile_email_changed", actor=name)
+        assert len(rows) == 1 and rows[0]["detail"] == detail
+        _refuse_audit_appends(backend_store)
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await backend_store.update_user_profile(
+                user_id, display_name=name, email="third@example.org", audits=changed
+            )
+        user = await backend_store.get_user(user_id)
+        assert user is not None and user.email == "second@example.org"
+        rows = await backend_store.list_audit(action="auth.ad_profile_email_changed", actor=name)
+        assert len(rows) == 1
+    finally:
         await backend_store.delete_user(user_id)
 
 

@@ -152,7 +152,7 @@ async def test_content_match_on_encrypted_store(tmp_path: Path) -> None:
         assert all(ADT not in v and ADT2 not in v for v in at_rest)
 
         spec = make_spec(content="JANE", field_path=None, field_value=None)
-        result = await store.search_messages(spec)
+        result = await store.search_messages(spec, allowed_channels=None)
         assert result.matched == 1
         assert result.rows[0]["control_id"] == "MSG1"
         assert "raw" not in result.rows[0]  # metadata-only result — no decrypted body returned
@@ -166,7 +166,7 @@ async def test_field_path_match(tmp_path: Path) -> None:
     try:
         await _seed(store)
         spec = make_spec(content=None, field_path="PID-5.1", field_value="ROE")
-        result = await store.search_messages(spec)
+        result = await store.search_messages(spec, allowed_channels=None)
         assert result.matched == 1 and result.rows[0]["control_id"] == "MSG2"
     finally:
         await store.close()
@@ -179,7 +179,7 @@ async def test_metadata_prefilter_bounds_scan(tmp_path: Path) -> None:
         await _seed(store)
         # Channel pre-filter to IB_A: only one candidate row is even considered (scanned == 1).
         spec = make_spec(content="ADT", field_path=None, field_value=None)
-        result = await store.search_messages(spec, channel_id="IB_A")
+        result = await store.search_messages(spec, channel_id="IB_A", allowed_channels=None)
         assert result.scanned == 1 and result.matched == 1
         assert result.rows[0]["channel_id"] == "IB_A"
     finally:
@@ -198,7 +198,7 @@ async def test_scan_cap_truncates(tmp_path: Path) -> None:
         spec = make_spec(
             content="no-such-needle-xyz", field_path=None, field_value=None, scan_limit=3
         )
-        result = await store.search_messages(spec)
+        result = await store.search_messages(spec, allowed_channels=None)
         assert result.scanned == 3 and result.matched == 0 and result.truncated is True
     finally:
         await store.close()
@@ -295,7 +295,7 @@ async def test_result_cap_limits_returned_rows(tmp_path: Path) -> None:
                 channel_id="IB_A", raw=ADT, deliveries=[], control_id=f"C{i}"
             )
         spec = make_spec(content="JANE", field_path=None, field_value=None)
-        result = await store.search_messages(spec, limit=2)
+        result = await store.search_messages(spec, limit=2, allowed_channels=None)
         assert result.matched == 2 and len(result.rows) == 2  # result cap honored
     finally:
         await store.close()
@@ -307,7 +307,7 @@ async def test_identity_store_matches_same_as_encrypted(tmp_path: Path) -> None:
     try:
         await _seed(store)
         spec = make_spec(content="JANE", field_path=None, field_value=None)
-        result = await store.search_messages(spec)
+        result = await store.search_messages(spec, allowed_channels=None)
         assert result.matched == 1 and result.rows[0]["control_id"] == "MSG1"
     finally:
         await store.close()
@@ -327,7 +327,7 @@ async def test_scan_runs_off_event_loop(tmp_path: Path, monkeypatch: pytest.Monk
 
         monkeypatch.setattr(asyncio, "to_thread", _spy)
         spec = make_spec(content="JANE", field_path=None, field_value=None)
-        await store.search_messages(spec)
+        await store.search_messages(spec, allowed_channels=None)
         assert "_scan_rows" in calls  # the per-row decrypt loop went off the loop
     finally:
         await store.close()
@@ -340,7 +340,7 @@ async def test_no_decrypt_leak_in_logs(tmp_path: Path, caplog: pytest.LogCapture
         await _seed(store)
         with caplog.at_level(logging.DEBUG):
             spec = make_spec(content="JANE", field_path=None, field_value=None)
-            await store.search_messages(spec)
+            await store.search_messages(spec, allowed_channels=None)
         text = "\n".join(r.getMessage() for r in caplog.records)
         assert "JANE" not in text and "DOE" not in text and "MRN9001" not in text
     finally:

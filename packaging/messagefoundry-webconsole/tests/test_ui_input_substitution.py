@@ -72,7 +72,7 @@ async def _open_alert(engine: Engine, now: float) -> int:
     await engine.store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=now
     )
-    rows = await engine.store.list_active_alert_instances()
+    rows = await engine.store.list_active_alert_instances(allowed_channels=None)
     assert rows, "the seeded alert instance must be on the active list"
     return rows[0].id
 
@@ -86,7 +86,7 @@ async def _suspend_audit(engine: Engine) -> list[str]:
 
 
 async def _suspended_until(engine: Engine, alert_id: int) -> float | None:
-    row = await engine.store.get_alert_instance(alert_id)
+    row = await engine.store.get_alert_instance(alert_id, allowed_channels=None)
     assert row is not None
     return row.suspended_until
 

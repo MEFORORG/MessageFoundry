@@ -18,6 +18,7 @@ worth pinning because two of these jobs execute third-party code fetched at run 
 only holdable because the jobs surface findings via workflow commands rather than SARIF upload.
 """
 
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -31,6 +32,8 @@ _WORKFLOW = _REPO / ".github" / "workflows" / "quality-advisory.yml"
 _CI_QUALITY_LOCK = _REPO / "ci" / "locks" / "ci-quality.lock"
 #: The path as the workflow spells it.
 _CI_QUALITY_LOCK_REF = "ci/locks/ci-quality.lock"
+#: The manifest of the committed npm lock jscpd is installed from (vault BACKLOG #2793).
+_NPM_TOOLS_MANIFEST = _REPO / "ci" / "npm-tools" / "package.json"
 
 
 def _group_pin(package: str) -> str:
@@ -63,7 +66,7 @@ def _group_pin(package: str) -> str:
 # contexts are not in the required-checks set.
 _ANALYSIS_MARKERS = (
     "ruff check",
-    "npx --yes jscpd",
+    "node_modules/.bin/jscpd",
     "diff-cover coverage.xml",
     "mutmut run",
     "mutmut results",
@@ -161,7 +164,7 @@ def test_workflow_grants_no_permissions_by_default(workflow: dict) -> None:
 
 def test_no_job_holds_any_write_scope(workflow: dict) -> None:
     """Least privilege. Both the clone and complexity jobs execute third-party code fetched at run
-    time (`npx --yes jscpd`, `pipx install ruff`) with no integrity pin, so handing them a
+    time (jscpd from npm, ruff from PyPI), so handing them a
     write-scoped repository token would be a real regression. This does NOT by itself stop the jobs
     gating a merge -- see the module docstring -- it just keeps their blast radius at zero."""
     for name, job in workflow["jobs"].items():
@@ -216,9 +219,18 @@ def test_every_action_is_sha_pinned_with_a_version_comment(workflow: dict, raw: 
             assert re.search(r"#\s*v", line), f"missing version comment: {line.strip()}"
 
 
-def test_jscpd_stays_on_4x(raw: str) -> None:
-    """npm `latest` is a 5.x Rust rewrite shipped as platform binaries with a different CLI."""
-    assert re.search(r"jscpd@4\.\d+\.\d+", raw), "jscpd must stay pinned to a 4.x release"
+def test_jscpd_stays_on_4x() -> None:
+    """npm `latest` is a 5.x Rust rewrite shipped as platform binaries with a different CLI.
+
+    The pin moved from an `npx --yes jscpd@4.0.5` line in the workflow into the committed npm lock
+    the workflow installs from (vault BACKLOG #2793), so it is read there. That the lock agrees with
+    this declaration, and that the workflow installs and runs that copy, is
+    tests/test_ci_tool_and_image_pins.py's to hold."""
+    manifest = json.loads(_NPM_TOOLS_MANIFEST.read_text(encoding="utf-8"))
+    declared = manifest["dependencies"]["jscpd"]
+    assert re.fullmatch(r"4\.\d+\.\d+", declared), (
+        f"jscpd must stay pinned to an exact 4.x: {declared!r}"
+    )
 
 
 def test_diff_cover_is_pinned_exactly(workflow: dict) -> None:

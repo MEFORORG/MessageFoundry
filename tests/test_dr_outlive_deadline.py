@@ -112,16 +112,17 @@ def _graph(tmp_path: Path) -> Registry:
             priority=Priority.CRITICAL,
         )
     )
-    # Start-disabled, so its lane is parked: a row routed to it waits in the outbound stage and
-    # never drains, the shape of a row for a parked outbound on a DR box (vault BACKLOG #2752).
+    # An operator pauses this one after activation (_activate_directly), so a row routed to it
+    # waits in the outbound stage and never drains (vault BACKLOG #2752). Not a start-disabled
+    # lane: the engine parks that one, and the release drain leaves a row held on an engine-parked
+    # outbound out of its wait and counts it as held (vault BACKLOG #3067).
     reg.add_outbound(
         OutboundConnection(
-            "parked_out",
+            "paused_out",
             ConnectionSpec(
-                ConnectorType.FILE, {"directory": str(outdir), "filename": "{MSH-10}.parked"}
+                ConnectorType.FILE, {"directory": str(outdir), "filename": "{MSH-10}.paused"}
             ),
             priority=Priority.CRITICAL,
-            auto_start=False,
         )
     )
     reg.add_inbound(
@@ -216,13 +217,17 @@ def _coordinator(engine: Engine) -> DrCoordinator:
 
 async def _activate_directly(engine: Engine) -> int:
     """Promote the box through the coordinator, so a release test starts from a real activation,
-    then queue one row for the parked outbound. Returns the staged depth, which cannot drain."""
+    then pause one outbound and queue one row for it. Returns the staged depth, which cannot
+    drain, and none of which is held on an engine-parked outbound."""
     result = await _coordinator(engine).activate(actor="dradmin")
     assert result.active and engine.dr_active
+    rr = engine.registry_runner
+    assert rr is not None
+    await rr.stop_outbound("paused_out")
     await engine.store.enqueue_message(
         channel_id="file_in",
         raw=_ADT,
-        deliveries=[("parked_out", _ADT)],
+        deliveries=[("paused_out", _ADT)],
         control_id="LOW1",
         now=2.0,
     )
@@ -300,7 +305,14 @@ async def test_a_release_whose_drain_gives_up_inside_the_deadline_answers_with_t
     body = r.json()
     assert body["active"] is False and body["depth_left"] == depth
     rows = await _rows(engine.store, "dr.release")
-    assert rows == [{"depth_left": depth, "drained": False, "vip_hook_ran": False}]
+    assert rows == [
+        {
+            "depth_left": depth,
+            "drained": False,
+            "held_on_parked_outbounds": 0,
+            "vip_hook_ran": False,
+        }
+    ]
 
 
 async def test_a_release_cancelled_in_its_drain_stays_active_and_records_why(
@@ -406,7 +418,7 @@ async def test_the_engine_puts_its_dr_latch_back_when_the_profile_reload_is_canc
     assert rr is not None
     entered = asyncio.Event()
 
-    async def hung_reload(_registry: Registry) -> None:
+    async def hung_reload(_registry: Registry | None = None) -> None:
         entered.set()
         await asyncio.Event().wait()
 
@@ -452,6 +464,51 @@ async def test_an_activation_whose_row_was_not_written_is_recorded_by_the_retry(
     rows = await _rows(store, "dr.activate")
     assert len(rows) == 1 and rows[0]["recorded_late"] is True
     assert rows[0]["archive"].endswith(".mfbak")
+
+
+async def test_an_activation_cancelled_while_reading_its_provenance_stays_active(
+    seeded: tuple[Engine, str],
+) -> None:
+    """The provenance (a config-dir digest, bounded by the takeover timeout) is read after the
+    run-profile is applied. A cancellation there must leave the box recorded as active, with its
+    dr.activate row written late, never as a passive box that is serving (vault BACKLOG #3067)."""
+    engine, _archive = seeded
+    coord = _coordinator(engine)
+    entered = asyncio.Event()
+
+    async def hung_provenance() -> dict[str, object]:
+        entered.set()
+        await asyncio.Event().wait()
+        return {}
+
+    coord._provenance = hung_provenance
+    task = asyncio.create_task(coord.activate(actor="dradmin"))
+    await asyncio.wait_for(entered.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert coord.active and engine.dr_active
+    assert await _rows(engine.store, "dr_activation_aborted") == []
+    rows = await _rows(engine.store, "dr.activate")
+    assert len(rows) == 1 and rows[0]["recorded_late"] is True
+
+
+async def test_a_provenance_fault_is_recorded_and_does_not_fail_the_activation(
+    seeded: tuple[Engine, str],
+) -> None:
+    engine, _archive = seeded
+    coord = _coordinator(engine)
+
+    async def broken_provenance() -> dict[str, object]:
+        raise RuntimeError("the digest could not be taken")
+
+    coord._provenance = broken_provenance
+    result = await coord.activate(actor="dradmin")
+    assert result.active and coord.active and engine.dr_active
+    (row,) = await _rows(engine.store, "dr.activate")
+    assert "digest could not be taken" in str(row["provenance_error"])
+    assert "recorded_late" not in row
 
 
 async def test_an_activation_cancelled_while_writing_its_row_writes_it_late(
@@ -604,7 +661,7 @@ async def test_a_release_cancelled_while_recording_a_failed_drain_still_leaves_a
     entered = asyncio.Event()
     hang = {"once": True}
 
-    async def failing_drain() -> int:
+    async def failing_drain() -> dict[str, object]:
         raise RuntimeError("the drain could not run")
 
     async def hanging_record(action: str, *args: Any, **kwargs: Any) -> Any:

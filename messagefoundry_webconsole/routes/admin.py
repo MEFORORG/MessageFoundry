@@ -162,6 +162,17 @@ register_ui_action(
 )
 
 
+def _refusal_status(exc: Exception) -> int:
+    """The status a create or reset form page answers with when the JSON handler refused (BACKLOG
+    #2359). A server-side status passes through: the 503 these routes raise means no generated
+    credential cleared the site's own policy (ADR 0197 Amendment A), a setting the administrator
+    cannot fix by editing the form. Every other refusal is about the request, and keeps the
+    console's 400."""
+    if isinstance(exc, HTTPException) and exc.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+        return exc.status_code
+    return status.HTTP_400_BAD_REQUEST
+
+
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L4a admin surface (ADR 0065; #75 phase 4): user, role, and AD-group-mapping /ui pages + actions. Clients of the injected JSON handlers (called directly, re-asserting each gate via require_ui*)."""
     admin = deps.admin
@@ -277,7 +288,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     checked=roles,
                     credential_window_hours=initial_credential_window_hours(service),
                 ),
-                status_code=400,
+                status_code=_refusal_status(exc),
             )
         # ADR 0197 Amendment A, AC-A2: the engine-generated credential is rendered ONCE, for
         # out-of-band delivery, with its deadline -- never logged or stored.
@@ -527,7 +538,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
             return await _user_detail(
-                user_id, service, identity, error=str(exc.detail), status_code=400
+                user_id, service, identity, error=str(exc.detail), status_code=_refusal_status(exc)
             )
         user = await service.store.get_user(user_id)
         username = user.username if user is not None else user_id
@@ -558,7 +569,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
             return await _user_detail(
-                user_id, service, identity, error=str(exc.detail), status_code=400
+                user_id, service, identity, error=str(exc.detail), status_code=_refusal_status(exc)
             )
         if reset.temp_password is None:
             return RedirectResponse(f"/ui/users/{user_id}", status_code=303)

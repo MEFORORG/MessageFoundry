@@ -53,7 +53,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from functools import partial
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -130,10 +130,12 @@ from messagefoundry.store.sealed_cache import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _IDP_AUTH_TIME_FORWARD_SQL,
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
+    _SQL_ADMIN_GUARD_COUNTS,
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
@@ -144,6 +146,7 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AdminRemoval,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -210,6 +213,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    tee_audits,
     totp_enable_term,
     verify_audit_rows,
 )
@@ -246,13 +250,14 @@ _DIRTY_CLOSE_TIMEOUT = 5.0
 def _drain_detached_close(fut: asyncio.Future[None]) -> None:
     """Retrieve a detached raw close's outcome, so asyncio never logs it as never-retrieved.
 
-    A failure is a WARNING, not DEBUG: the connection it belongs to may still hold an open audit
-    INSERT and the audit applock on the server, and an operator whose audit appends are timing out
-    needs a line that points at it (BACKLOG #1940)."""
+    A failure is a WARNING, not DEBUG: the connection it belongs to may still hold an open
+    transaction and its locks on the server -- after a failed audit rollback, an open audit INSERT
+    and the audit applock -- and an operator whose writes are timing out needs a line that points
+    at it (BACKLOG #1940)."""
     if not fut.cancelled() and fut.exception() is not None:
         log.warning(
             "sqlserver: detached close of a discarded connection failed; the server may hold its"
-            " transaction and audit applock until the session ends: %s",
+            " transaction and locks until the session ends: %s",
             fut.exception(),
         )
 
@@ -370,6 +375,47 @@ def _raw_closer(conn: Any, raw: Any) -> Callable[[], None]:
     so the close runs only between pyodbc calls (BACKLOG #2049)."""
     gate = _call_gate(conn)
     return raw.close if gate is None else partial(gate.close, raw)
+
+
+def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
+    """Take ``conn`` out of the pool for good, and start closing its raw handle off the event loop.
+
+    The one detach sequence both discards use (BACKLOG #1940, engine PR 1722 defect 5): the
+    quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159) and the
+    discard after a failed audit rollback (:meth:`SqlServerStore._rollback_or_discard`).
+
+    **The first write is the guarantee, and nothing here awaits.** aioodbc derives
+    ``Connection.closed`` from ``_conn``, and its pool re-lends a connection only when it is not
+    closed, so dropping the handle makes the connection unlendable at once. A second cancellation
+    cannot get in front of a plain attribute write.
+
+    It returns the close's future, or ``None`` when there is nothing to wait for:
+
+    * the connection was already detached;
+    * a pyodbc call is still running on it, so the close is handed to that call (BACKLOG #2049);
+    * the executor refused the work, at loop teardown. That is logged, and pyodbc closes the handle
+      when it is collected.
+
+    The future's outcome is always retrieved by :func:`_drain_detached_close`, so a caller may wait on
+    it or leave it."""
+    raw = getattr(conn, "_conn", None)
+    if raw is None:
+        return None
+    conn._conn = None  # MUST stay first, and MUST stay await-free
+    gate = _call_gate(conn)
+    if gate is not None and gate.close_after_running_call(raw):
+        return None
+    try:
+        closer = asyncio.get_running_loop().run_in_executor(None, _raw_closer(conn, raw))
+    except RuntimeError:  # the executor is shut down; see the docstring
+        log.warning(
+            "sqlserver: could not schedule the close of a discarded connection; it is out of the"
+            " pool and closes when collected",
+            exc_info=True,
+        )
+        return None
+    closer.add_done_callback(_drain_detached_close)
+    return closer
 
 
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
@@ -1507,6 +1553,9 @@ _SCHEMA_LOCK = "mefor:schema_init"
 # read-tail-then-INSERT in record_audit is only atomic if EVERY appender, in EVERY engine-shard
 # process, queues on the same name.
 _AUDIT_APPEND_LOCK = "mefor:audit_append"
+# Vault BACKLOG #2779: the last-administrator guard's lock, the T-SQL analog of the Postgres
+# store's. Every guarded removal in every engine-shard process queues on this one name.
+_ADMIN_GUARD_LOCK = "mefor:last_admin"
 #: The cluster coordinator's own tables (``nodes``, ``leader_lease``, ``cluster_config``), stated ONCE
 #: here and run from two places: the store's ``_SCHEMA`` batch below (ahead of the claim procs, whose
 #: bodies name ``leader_lease``), and
@@ -1994,7 +2043,8 @@ _SCHEMA: list[str] = [
         token_hash NVARCHAR(64) NOT NULL PRIMARY KEY, user_id NVARCHAR(64) NOT NULL,
         created_at FLOAT NOT NULL, expires_at FLOAT NOT NULL, last_used_at FLOAT NOT NULL,
         revoked_at FLOAT NULL, client NVARCHAR(256) NULL, reauth_at FLOAT NULL,
-        mfa_verified_at FLOAT NULL, auth_mechanism NVARCHAR(32) NULL)""",
+        mfa_verified_at FLOAT NULL, auth_mechanism NVARCHAR(32) NULL,
+        idp_auth_time FLOAT NULL)""",
     """IF COL_LENGTH('sessions','reauth_at') IS NULL
         ALTER TABLE sessions ADD reauth_at FLOAT NULL""",
     """IF COL_LENGTH('sessions','mfa_verified_at') IS NULL
@@ -2003,6 +2053,11 @@ _SCHEMA: list[str] = [
     # written before the column existed, which takes the non-federated step-up.
     """IF COL_LENGTH('sessions','auth_mechanism') IS NULL
         ALTER TABLE sessions ADD auth_mechanism NVARCHAR(32) NULL""",
+    # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with. NULL on a row
+    # written before the column existed, which the IdP step-up refuses as
+    # step_up_idp_auth_time_missing.
+    """IF COL_LENGTH('sessions','idp_auth_time') IS NULL
+        ALTER TABLE sessions ADD idp_auth_time FLOAT NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
@@ -3798,8 +3853,8 @@ class SqlServerStore:
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
-                    "runtime (schema_management=external: no db_ddladmin, and no UPDATE, DELETE, "
-                    "ALTER, CONTROL or take ownership on audit_log)"
+                    "runtime (schema_management=external: no db_ddladmin, and no UPDATE/DELETE/"
+                    "ALTER/CONTROL or take ownership on audit_log)"
                     if external
                     else "auto-mode"
                 )
@@ -4325,15 +4380,12 @@ class SqlServerStore:
         When a call is running, this method hands it the close and does not wait at all: the close
         could only land when the statement returns, and waiting here would stall a shutdown or
         demotion for as long as the statement runs, which ADR 0159 rejected.
+
+        The detach itself is :func:`_detach_connection`, shared with :meth:`_rollback_or_discard`.
         """
-        raw = getattr(conn, "_conn", None)
-        if raw is None:  # already closed/quarantined — nothing lendable to contain
+        closer = _detach_connection(conn)  # first: no await may come before the detach
+        if closer is None:  # already detached, handed to a running call, or the executor refused
             return
-        conn._conn = None  # ← MUST stay first, and MUST stay await-free
-        gate = _call_gate(conn)
-        if gate is not None and gate.close_after_running_call(raw):
-            return
-        closer = asyncio.ensure_future(asyncio.to_thread(_raw_closer(conn, raw)))
         try:
             await asyncio.wait_for(asyncio.shield(closer), _DIRTY_CLOSE_TIMEOUT)
         except (TimeoutError, asyncio.CancelledError):
@@ -4346,7 +4398,8 @@ class SqlServerStore:
                 _DIRTY_CLOSE_TIMEOUT,
             )
         except Exception:  # noqa: BLE001 - a close failure must not mask the cancellation
-            log.debug("sqlserver: quarantined connection close failed", exc_info=True)
+            # Not logged here: _drain_detached_close, on the closer, already logged it at WARNING.
+            return
 
     async def _rollback_or_discard(self, conn: Any) -> None:
         """Roll back a failed audit append; if that rollback fails too, discard the connection.
@@ -4356,7 +4409,8 @@ class SqlServerStore:
         connection on an ordinary error, so the next borrower's COMMIT would make the row durable.
         The rollback's own error is logged, not raised: the caller re-raises its original error.
 
-        The discard takes :meth:`_release_dirty`'s synchronous step and does NOT wait for the close.
+        The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
+        unlike that method it does NOT wait for the close.
         ``_release_dirty`` swallows a cancellation while it waits, which is safe only where the
         original error IS that cancellation. Not waiting also releases the in-process
         ``_audit_lock`` sooner. **It does not end the stall, only moves it.** The open transaction
@@ -4377,20 +4431,8 @@ class SqlServerStore:
                 "sqlserver: rollback after a failed audit append failed; discarding the connection",
                 exc_info=True,
             )
-            raw = getattr(conn, "_conn", None)
-            if raw is None:
-                return
-            conn._conn = None  # unlendable at once, with no await in front; see _release_dirty
-            try:
-                closer = asyncio.get_running_loop().run_in_executor(None, _raw_closer(conn, raw))
-            except RuntimeError:  # the executor is shut down; see the docstring
-                log.warning(
-                    "sqlserver: could not schedule the close of a discarded connection; it is out"
-                    " of the pool and closes when collected",
-                    exc_info=True,
-                )
-                return
-            closer.add_done_callback(_drain_detached_close)
+            # Its future is deliberately not awaited; see the docstring.
+            _detach_connection(conn)
 
     def pool_status(self) -> PoolStatus | None:
         """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
@@ -4709,10 +4751,10 @@ class SqlServerStore:
         caller's open transaction** (SQL Server twin of :meth:`MessageStore._record_delivered_key`).
 
         Only outbound rows deliver; ingress/routed completions (``destination_name`` NULL) are skipped.
-        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (replay-stable, like
-        ``response_seq``). Stored row carries hashes + ids only — never a body/PHI. One row per outbox
-        row INSTANCE (a double mark_done must not accumulate a second entry); the ``NOT EXISTS`` insert
-        is the belt-and-suspenders backstop on the content hash."""
+        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (a counter, not a unique
+        id; :func:`delivery_key` takes its uniqueness from the ids). Stored row carries hashes + ids
+        only — never a body/PHI. One row per outbox row INSTANCE (a double mark_done must not
+        accumulate a second entry); the ``NOT EXISTS`` insert is the backstop on the key."""
         if destination_name is None:
             return
         await cur.execute("SELECT 1 FROM delivered_keys WHERE outbox_id=?", (outbox_id,))
@@ -4729,6 +4771,7 @@ class SqlServerStore:
         key = delivery_key(
             control_id=control_id,
             message_id=message_id,
+            outbox_id=outbox_id,
             destination_name=destination_name,
             handler_name=handler_name,
             delivery_seq=seq,
@@ -6406,7 +6449,7 @@ class SqlServerStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where: list[str] = []
@@ -6511,7 +6554,7 @@ class SqlServerStore:
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where = [_ACTIVE_ALERT_STATUS_SQL]
@@ -6529,7 +6572,7 @@ class SqlServerStore:
         return [self._alert_instance_row(r) for r in rows]
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         # BACKLOG #1564 — see the SQLite twin: same active predicate, same RBAC scope, aggregate over
         # every row in scope rather than over a page. The rank CASE is shared so it cannot drift.
@@ -6546,7 +6589,7 @@ class SqlServerStore:
         return _alert_summary(row)
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         where = ["id=?"]
         params: list[Any] = [alert_id]
@@ -6652,7 +6695,7 @@ class SqlServerStore:
                 raise
         if int(changed) == 0:
             return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
         self, alert_id: int, *, now: float | None = None
@@ -6672,7 +6715,7 @@ class SqlServerStore:
                 raise
         if int(changed) == 0:
             return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         rows = await self._fetchall(
@@ -9106,10 +9149,8 @@ class SqlServerStore:
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
-                    )
+                    # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                    backoff = retry.backoff_for(attempts)
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1: the epoch fence guards the DEAD branch ONLY. The retry branch returns
                 # the row to PENDING; fencing THAT would leave it INFLIGHT, turning a permitted
@@ -9207,11 +9248,8 @@ class SqlServerStore:
                 if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds
-                        * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
-                    )
+                    # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                    backoff = retry.backoff_for(head_attempts)
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1: the same DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the loop: a fence on any member raises out and
@@ -9412,23 +9450,31 @@ class SqlServerStore:
         sha256 of the VERBATIM concatenated plaintext). Each chunk is AES-GCM-sealed independently (a
         bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
-        hasher = hashlib.sha256()
-        total = 0
-        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the attachment_id is
-        # the content hash — known only after the full plaintext is hashed. Buffer the verbatim slices,
-        # hash, then seal each under (ref, seq); the source is an already-materialized OBX-5.5 value, so
-        # this adds no order-of-magnitude memory and each seal still consumes one chunk. Mirrors SQLite.
-        plaintext_chunks: list[str] = []
-        for chunk in chunks:
-            data = chunk.encode("utf-8")
-            hasher.update(data)
-            total += len(data)
-            plaintext_chunks.append(chunk)
-        ref = hasher.hexdigest()
-        sealed: list[str] = [
-            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
-            for seq, c in enumerate(plaintext_chunks)
-        ]
+
+        def _seal() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
+            # work in proportion to its size, and nothing else would run meanwhile.
+            hasher = hashlib.sha256()
+            total = 0
+            # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the
+            # attachment_id is the content hash — known only after the full plaintext is hashed.
+            # Buffer the verbatim slices, hash, then seal each under (ref, seq); the source is an
+            # already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory and each
+            # seal still consumes one chunk. Mirrors SQLite.
+            plaintext_chunks: list[str] = []
+            for chunk in chunks:
+                data = chunk.encode("utf-8")
+                hasher.update(data)
+                total += len(data)
+                plaintext_chunks.append(chunk)
+            ref = hasher.hexdigest()
+            sealed: list[str] = [
+                self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+                for seq, c in enumerate(plaintext_chunks)
+            ]
+            return ref, total, sealed
+
+        ref, total, sealed = await asyncio.to_thread(_seal)
         now = time.time()
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -10378,7 +10424,7 @@ class SqlServerStore:
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -10415,7 +10461,7 @@ class SqlServerStore:
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int:
@@ -10440,7 +10486,7 @@ class SqlServerStore:
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51) — see ``MessageStore.search_messages``.
         Pre-filter on the indexed metadata, then decrypt + match each candidate body in memory off the
@@ -10499,7 +10545,7 @@ class SqlServerStore:
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[dict[str, Any]]:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         rows = await self._fetchall(
@@ -10526,7 +10572,7 @@ class SqlServerStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM queue o{where}", params)
@@ -10537,7 +10583,7 @@ class SqlServerStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
         narrowed by the two clauses :meth:`replay_dead` applies. The database collation decides
@@ -11016,23 +11062,23 @@ class SqlServerStore:
 
     # --- auth: users / roles / sessions --------------------------------------
 
-    async def list_audit(
-        self,
+    @staticmethod
+    def _audit_where(
         *,
-        limit: int = 50,
-        actor: str | None = None,
-        action: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        exclude: AuditExclusion | None = None,
-    ) -> list[dict[str, Any]]:
-        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        exclude: AuditExclusion | None,
+        before_id: int | None,
+    ) -> tuple[str, list[Any]]:
+        """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
-        Filters are ANDed as bound ``?`` parameters (the ``TOP (?)`` limit is the first ``?``, so its
-        value leads the tuple) — only the fixed column/operator template is formatted into the SQL,
-        never a value — so a filter value cannot inject."""
+        Filters are ANDed as bound ``?`` parameters — only the fixed column/operator template is
+        formatted into the SQL, never a value — so a filter value cannot inject. Each caller's
+        ``TOP (?)`` placeholder comes BEFORE this text, so it binds that value ahead of these."""
         clauses: list[str] = []
-        params: list[Any] = [limit]
+        params: list[Any] = []
         if actor is not None:
             clauses.append("actor = ?")
             params.append(actor)
@@ -11046,16 +11092,69 @@ class SqlServerStore:
             clauses.append("ts <= ?")
             params.append(until)
         if exclude is not None:
-            # After TOP (?)'s value in ``params``, which is the order the placeholders appear in.
 
             def bind(value: str) -> str:
                 params.append(value)
                 return "?"
 
             clauses.extend(exclude.clauses(bind))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
+        Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
         sql = f"SELECT TOP (?) * FROM audit_log{where} ORDER BY id DESC"
-        return await self._fetchall(sql, tuple(params))
+        return await self._fetchall(sql, (limit, *params))
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, without reading
+        them (vault BACKLOG #2776). Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
+        sql = (
+            f"SELECT COUNT(*) AS n FROM (SELECT TOP (?) id FROM audit_log{where}"
+            " ORDER BY id DESC) t"
+        )
+        row = await self._fetchone(sql, (limit, *params))
+        return int(row["n"]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
         """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault
@@ -11176,6 +11275,47 @@ class SqlServerStore:
                 raise
         return int(count) > 0
 
+    async def _execute_with_audits(
+        self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float
+    ) -> None:
+        """Run one account write and append its ``audits`` in the same transaction.
+
+        The contract is ``AuthStore.create_user``'s. With no audits it is a plain :meth:`_execute`.
+        The write opens the transaction, which the applock inside the append needs. Same lock order
+        as `record_audit`: the in-process gate, then the connection.
+
+        THE IN-PROCESS ``_audit_lock`` IS HELD ACROSS THE WRITE, so every ``record_audit`` in this
+        process waits behind it. BACKLOG #2222 reviews that scope for a first sign-in's INSERT
+        only; the directory repoint's UPDATE and the administrator's create (BACKLOG #2221) widen
+        it and are not yet in that item."""
+        if not audits:
+            await self._execute(sql, params)
+            return
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(sql, params)
+                        appended = [
+                            await self._append_audit_row(
+                                cur,
+                                a.action,
+                                actor=a.actor,
+                                channel_id=None,
+                                detail=a.detail,
+                                client=a.client,
+                                now=now,
+                            )
+                            for a in audits
+                        ]
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits(audits, appended, ts=now)
+
     async def create_user(
         self,
         *,
@@ -11191,7 +11331,7 @@ class SqlServerStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -11217,33 +11357,7 @@ class SqlServerStore:
             directory_object_id,
             1 if password_generated else 0,
         )
-        if audit is None:
-            await self._execute(sql, params)
-            return
-        # BACKLOG #2100. The audit row joins the INSERT's transaction, so a failed append rolls the
-        # account back. The INSERT opens that transaction, which the applock inside the append
-        # needs. Same lock order as `record_audit`: the in-process gate, then the connection.
-        async with self._audit_lock:  # noqa: SIM117
-            async with self._acquire() as conn:
-                try:
-                    async with self._cursor(conn) as cur:
-                        await cur.execute(sql, params)
-                        appended = await self._append_audit_row(
-                            cur,
-                            audit.action,
-                            actor=audit.actor,
-                            channel_id=None,
-                            detail=audit.detail,
-                            client=audit.client,
-                            now=now,
-                        )
-                        await self._commit(conn)
-                except Exception:
-                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
-                    # detached close of the raw connection cannot race the cursor's own close.
-                    await self._rollback_or_discard(conn)
-                    raise
-        audit.tee(ts=now, row=appended)
+        await self._execute_with_audits(sql, params, audits, now=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=?", (user_id,))
@@ -11366,6 +11480,82 @@ class SqlServerStore:
             (now, json.dumps(recovery_code_hashes), now, user_id),
         )
         return bool(rows)
+
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> int | None:
+        """See the SQLite twin (ADR 0171 Amendment B). The swap, the session sweep and the audit row
+        share one transaction. This leg is CI-only, so a divergence from the SQLite and Postgres
+        bodies surfaces first in CI.
+
+        Both counts come from ``OUTPUT`` rowsets, as :meth:`revoke_user_sessions` counts (BACKLOG
+        #2283): ``cursor.rowcount`` under a session-wide ``SET NOCOUNT ON`` reports ``-1``. The
+        compare-and-set is spelled per case rather than with ``IS NOT DISTINCT FROM``, which
+        arrived only in SQL Server 2022. Same lock order as ``record_audit``: the in-process gate,
+        then the connection."""
+        now = time.time() if now is None else now
+        enrolled_term = (
+            " AND totp_enrolled_at IS NULL"
+            if expected_enrolled_at is None
+            else " AND totp_enrolled_at = ?"
+        )
+        params: tuple[Any, ...] = (
+            self._cipher.encrypt(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            now,
+            json.dumps(recovery_code_hashes),
+            step,
+            now,
+            user_id,
+            *(() if expected_enrolled_at is None else (expected_enrolled_at,)),
+        )
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(
+                            "UPDATE users SET totp_secret=?, totp_enrolled_at=?,"
+                            " totp_recovery_codes=?, last_totp_step=?, updated_at=?"
+                            " OUTPUT inserted.id"
+                            " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
+                            + enrolled_term,
+                            params,
+                        )
+                        swapped = await cur.fetchall()  # drain, so the next execute is clean
+                        if not swapped:
+                            # Nothing written, so nothing is revoked or audited.
+                            await conn.rollback()
+                            return None
+                        await cur.execute(
+                            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
+                            " WHERE user_id=? AND revoked_at IS NULL",
+                            (now, user_id),
+                        )
+                        revoked = len(await cur.fetchall())
+                        appended = await self._append_audit_row(
+                            cur,
+                            audit.action,
+                            actor=audit.actor,
+                            channel_id=None,
+                            detail=audit.detail,
+                            client=audit.client,
+                            now=now,
+                        )
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
+                    raise
+        audit.tee(ts=now, row=appended)
+        return revoked
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -11581,15 +11771,19 @@ class SqlServerStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits``: see
+        ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
-        await self._execute(
+        await self._execute_with_audits(
             "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
             (display_name, email, now, user_id),
+            audits,
+            now=now,
         )
 
     async def set_user_notify_email(
@@ -11646,22 +11840,77 @@ class SqlServerStore:
     async def delete_user(self, user_id: str) -> None:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-                await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-                await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
-                # vault BACKLOG #2145: the account's known sign-in addresses go with it.
-                await cur.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
-                # BACKLOG #1233, verbatim with the SQLite and Postgres bodies: presets are
-                # owner-scoped by Identity.user_id (#1225) with no FK cascade, so without this the
-                # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can
-                # reach or purge. This leg is CI-only, so an asymmetry between the three backends
-                # surfaces first in CI rather than here.
-                await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
-                await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
+                await self._delete_user_rows(cur, user_id)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
+        ``AuthStore``. Takes ``_ADMIN_GUARD_LOCK`` before the read, so under RCSI the read sees
+        whatever an earlier holder committed before releasing it."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    if change.takes_role(admin_role_id, role_ids):
+                        # Only a change that can empty the set queues on the lock. This read OPENS
+                        # THE TRANSACTION the applock attaches to, as in record_audit: the
+                        # autocommit=False pool begins one only on a statement that touches a
+                        # table, and `@LockOwner='Transaction'` needs one open. Value discarded.
+                        await cur.execute("SELECT TOP (1) id FROM users WHERE id=?", (user_id,))
+                        await cur.fetchall()
+                        await self._applock(cur, _ADMIN_GUARD_LOCK)
+                        await cur.execute(
+                            _SQL_ADMIN_GUARD_COUNTS, (user_id, user_id, admin_role_id)
+                        )
+                        target, others = await cur.fetchone() or (0, 0)
+                        if target and not others:
+                            await conn.rollback()  # nothing written; releases the applock
+                            return False
+                    if change is AdminRemoval.DISABLE:
+                        await cur.execute(
+                            "UPDATE users SET disabled=1, updated_at=? WHERE id=?", (now, user_id)
+                        )
+                    elif change is AdminRemoval.DELETE:
+                        await self._delete_user_rows(cur, user_id)
+                    elif change is AdminRemoval.SET_ROLES:
+                        await self._replace_user_roles(cur, user_id, role_ids, assigned_by, now)
+                    else:
+                        assert_never(change)
+                    await self._commit(conn)
+            except Exception:
+                # BACKLOG #1940: a failed rollback must not hand the open transaction, and the
+                # applock it owns, to the next borrower of this pooled connection.
+                await self._rollback_or_discard(conn)
+                raise
+        return True
+
+    @staticmethod
+    async def _delete_user_rows(cur: Any, user_id: str) -> None:
+        """Delete the account and every row keyed to it, inside the caller's transaction."""
+        await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+        # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+        await cur.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+        # BACKLOG #1233, verbatim with the SQLite and Postgres bodies: presets are
+        # owner-scoped by Identity.user_id (#1225) with no FK cascade, so without this the
+        # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can
+        # reach or purge. This leg is CI-only, so an asymmetry between the three backends
+        # surfaces first in CI rather than here.
+        await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
+        await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -11818,17 +12067,24 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-                for role_id in role_ids:
-                    await cur.execute(
-                        "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                        " VALUES (?,?,?,?)",
-                        (user_id, role_id, now, assigned_by),
-                    )
+                await self._replace_user_roles(cur, user_id, role_ids, assigned_by, now)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+
+    @staticmethod
+    async def _replace_user_roles(
+        cur: Any, user_id: str, role_ids: Sequence[str], assigned_by: str | None, now: float
+    ) -> None:
+        """Replace the account's role rows, inside the caller's transaction."""
+        await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        for role_id in role_ids:
+            await cur.execute(
+                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
+                " VALUES (?,?,?,?)",
+                (user_id, role_id, now, assigned_by),
+            )
 
     async def set_user_channel_scope(
         self,
@@ -12134,13 +12390,15 @@ class SqlServerStore:
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves it
         # NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
         insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at, auth_mechanism) VALUES (?,?,?,?,?,NULL,?,?,?)"
+            " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
+            " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
         )
         params = (
             token_hash,
@@ -12151,6 +12409,7 @@ class SqlServerStore:
             client,
             now if seed_reauth else None,
             auth_mechanism,
+            idp_auth_time,
         )
         if require_federated_subject is None:
             await self._execute(insert, params)
@@ -12213,14 +12472,22 @@ class SqlServerStore:
         )
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
+        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up). The IdP auth_time
+        # only moves forward, and a NULL leaves it (BACKLOG #2143): the clause is store.py's, which
+        # says why.
         await self._execute(
-            "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client) WHERE token_hash=?",
-            (now, client, token_hash),
+            "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
+            f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
+            (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
         )
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:

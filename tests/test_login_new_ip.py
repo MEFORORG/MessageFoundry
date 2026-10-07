@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, DirectoryProbe
 from messagefoundry.auth.notifications import LOGIN_NEW_IP, SecurityEvent
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.auth.tokens import hash_token
@@ -288,8 +288,8 @@ async def test_a_wrong_password_from_a_new_address_writes_no_signal_row() -> Non
 
 
 class _FakeLdap:
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return None
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+        return DirectoryBind(DirectoryAnswer.NOT_FOUND)
 
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return None
@@ -612,7 +612,13 @@ async def test_a_sign_in_that_still_owed_a_factor_marks_nothing_known() -> None:
         await _operator(baseline)
         assert (await baseline.login("oper", PW, client="10.1.1.1")).ok
         notifier = _FakeNotifier()
-        owed = AuthService(store, AuthSettings(require_mfa=True), security_notifier=notifier)
+        # The floor is off: the enrolment below runs at once on the session it signed in, which the
+        # login-to-MFA floor covers (BACKLOG #2389).
+        owed = AuthService(
+            store,
+            AuthSettings(require_mfa=True, mfa_verify_min_elapsed_seconds=0),
+            security_notifier=notifier,
+        )
         await owed.initialize()
         first = await owed.login("oper", PW, client="203.0.113.5")
         assert first.ok and first.mfa_required
@@ -902,9 +908,13 @@ async def test_an_enrolment_baseline_outlives_the_lookback(monkeypatch: pytest.M
     another address is judged NEW, not failed open as a first sign-in."""
     store = await MessageStore.open(":memory:")
     try:
+        # The floor is off: the enrolment below runs at once on the session it signed in, which the
+        # login-to-MFA floor covers (BACKLOG #2389).
         owed = AuthService(
             store,
-            AuthSettings(require_mfa=True, mfa_recovery_code_count=1),
+            AuthSettings(
+                require_mfa=True, mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1
+            ),
             security_notifier=_FakeNotifier(),
         )
         await owed.initialize()

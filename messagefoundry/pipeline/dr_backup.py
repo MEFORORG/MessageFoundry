@@ -55,6 +55,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -940,11 +941,17 @@ class BackupRunner:
     def _add_config_dir(self, tar: tarfile.TarFile) -> None:
         """Add the loaded config dir under ``config/`` — every regular file (incl. ``_*.py``,
         ``connections.toml``, ``codesets/``, fixtures). Symlinks are NOT followed (a symlink out of the
-        bundle would smuggle an arbitrary host file into the archive); only regular files are added."""
+        bundle would smuggle an arbitrary host file into the archive); only regular files are added.
+
+        A config editor's lock file and candidate directories are skipped (vault BACKLOG #2782): a
+        candidate lives only for one validation, so one listed here may be gone by the add, and a
+        killed editor's leftover is not config."""
         base = self._config_dir
         assert base is not None
         for path in sorted(base.rglob("*")):
             if path.is_symlink() or not path.is_file():
+                continue
+            if _is_config_edit_artifact(path.relative_to(base)):
                 continue
             if any(
                 _is_staging_dir(base / parent)
@@ -1740,11 +1747,21 @@ def _file_size(path: Path) -> int:
         return 0
 
 
+def _is_config_edit_artifact(rel: Path) -> bool:
+    """Whether ``rel`` (relative to the config dir) is a config editor's lock file, or sits in one
+    of its candidate directories (:mod:`messagefoundry.config.atomic_edit`)."""
+    return rel.name == atomic_edit.LOCK_FILE_NAME or any(
+        atomic_edit.is_candidate_dir_name(part) for part in rel.parts[:-1]
+    )
+
+
 def _tree_size(root: Path) -> int:
     """The total size of the regular files under ``root``, never following a link, which is also
     what ``_add_config_dir`` puts in the archive. 0 when ``root`` cannot be walked."""
     total = 0
-    for dirpath, _dirs, files in os.walk(root, followlinks=False):
+    for dirpath, dirs, files in os.walk(root, followlinks=False):
+        # Candidate directories are pruned, as _add_config_dir skips their files.
+        dirs[:] = [d for d in dirs if not atomic_edit.is_candidate_dir_name(d)]
         for name in files:
             try:
                 st = os.lstat(os.path.join(dirpath, name))
@@ -1855,7 +1872,7 @@ def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
             + ("" if removed else " (empty, could not be removed; delete it)")
             + "; the engine stages no plaintext there. Use a volume that keeps a directory's mode "
             "or ACL: move the SQLite store's data directory, [backup].destination for a server-DB "
-            "store, or TMP, TEMP or TMPDIR for a standalone restore-verify"
+            "store, or TMP/TEMP/TMPDIR for a standalone restore-verify"
         )
     try:
         fd = os.open(

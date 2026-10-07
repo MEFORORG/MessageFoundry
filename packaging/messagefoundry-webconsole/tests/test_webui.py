@@ -916,7 +916,20 @@ async def test_reauth_rejects_unsafe_next(engine: Engine) -> None:
     async with _client(engine, service) as c:
         # "/ui/audit" stands for an unregistered /ui page. This used "/ui/messages" until vault
         # BACKLOG #2620 registered the PHI pages as unlock continuations.
-        for bad in ("https://evil.example/x", "//evil.example", "/ui/audit", "/etc/passwd"):
+        # The backslash, whitespace and encoded forms are what a browser, or a decoding router, takes
+        # off-origin (vault BACKLOG #2790); the anchored registry must refuse them like "//".
+        for bad in (
+            "https://evil.example/x",
+            "//evil.example",
+            "/\\evil.example",
+            "\\\\evil.example",
+            " //evil.example",
+            "/\t/evil.example",
+            "/%2F%2Fevil.example",
+            "/ui\\..\\..\\evil.example",
+            "/ui/audit",
+            "/etc/passwd",
+        ):
             r = await c.get("/ui/reauth", params={"next": bad})
             assert r.status_code == 303 and r.headers["location"] == "/ui"
 
@@ -1028,7 +1041,7 @@ async def test_edit_editor_refused_to_a_custom_role_without_view_raw(engine: Eng
     )
     await _add_with_role_ids(service, "resubmitter", [role.id])
     mid = await _seed(engine)
-    before = len(await engine.store.list_messages(limit=50))
+    before = len(await engine.store.list_messages(limit=50, allowed_channels=None))
     async with _client(engine, service) as c:
         await _cookie_login(c, "resubmitter")  # a fresh login counts as a recent step-up
         r = await c.get(f"/ui/messages/{mid}/edit")
@@ -1047,7 +1060,9 @@ async def test_edit_editor_refused_to_a_custom_role_without_view_raw(engine: Eng
         assert r.status_code == 403
         assert "DOE^JANE" not in r.text
         assert "data-original" not in r.text
-    assert len(await engine.store.list_messages(limit=50)) == before  # no child was minted
+    assert (
+        len(await engine.store.list_messages(limit=50, allowed_channels=None)) == before
+    )  # no child was minted
 
 
 async def test_edit_editor_opens_for_a_custom_role_holding_both(engine: Engine) -> None:
@@ -1272,7 +1287,7 @@ async def test_edit_stale_stepup_redirects_get_and_post_to_edit_form(engine: Eng
         # The reauth_next maps the POST to the /edit FORM, never the /edit-resend POST path.
         assert r.headers["location"] == f"/ui/reauth?next=/ui/messages/{mid}/edit"
     # The body never outlived the bounced request — only the origin exists.
-    assert await engine.store.count_messages() == 1
+    assert await engine.store.count_messages(allowed_channels=None) == 1
 
 
 async def test_edit_resend_cross_site_and_cookie_on_json(engine: Engine) -> None:
@@ -3634,6 +3649,41 @@ async def test_create_user_duplicate_rerenders_without_password(engine: Engine) 
         assert PW not in r.text  # ...the password is NEVER echoed back
 
 
+async def test_a_refused_create_on_the_console_answers_503(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2359: when no credential can be generated, the create form re-renders with the
+    refusal and a 503, as the JSON API answers, and no account is written."""
+    from types import SimpleNamespace
+
+    from messagefoundry.auth import service as service_module
+
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            admin_write_min_interval_seconds=0,
+            password_extra_context_words=["globex"],
+        ),
+    )
+    await service.initialize()
+    async with _boss_client(engine, service) as c:
+        monkeypatch.setattr(
+            service_module,
+            "secrets",
+            SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40),
+        )
+        r = await _post_pairs(
+            c,
+            "/ui/users",
+            [("username", "newop"), ("email", "newop@example.test"), ("roles", "viewer")],
+        )
+        assert r.status_code == 503 and "password_extra_context_words" in r.text
+        assert await service.store.get_user_by_username("newop") is None
+        refused = await service.store.list_audit(action="auth.credential_issue_refused", limit=10)
+        assert [json.loads(row["detail"])["op"] for row in refused] == ["create"]
+
+
 async def test_create_user_a_posted_password_is_never_the_credential(engine: Engine) -> None:
     """ADR 0197 Amendment A, AC-A2: the create form has no password field, and a ``password`` a
     caller posts anyway is ignored. The account gets a generated credential; the posted one does not
@@ -4572,7 +4622,13 @@ async def test_a_refused_issue_on_the_console_keeps_the_account_and_the_grant(
             SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40),
         )
         r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
-        assert r.status_code == 400 and "password_extra_context_words" in r.text
+        # BACKLOG #2359: a server-side refusal stays a 503 on the console, as on the JSON API, and
+        # the service's one audit row is the console's too.
+        assert r.status_code == 503 and "password_extra_context_words" in r.text
+        refused = await service.store.list_audit(action="auth.credential_issue_refused", limit=10)
+        assert len(refused) == 1, "one refusal, one audit row"
+        expected_op = {"reset-mfa": "mfa_reset", "reset-password": "password_reset"}[action]
+        assert json.loads(refused[0]["detail"])["op"] == expected_op
         after = await service.store.get_user(uid)
         assert after == before, "a refused issue changed the account"
         monkeypatch.undo()
@@ -6278,7 +6334,7 @@ async def test_reauth_extra_less_with_credentials_renders_notice(
 
 def _ad_service(engine: Engine) -> AuthService:
     """An AuthService with a duck-typed fake directory (the _FakeLdap pattern)."""
-    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 
     principal = AdPrincipal(
         username="jdoe",
@@ -6290,8 +6346,10 @@ def _ad_service(engine: Engine) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
@@ -6474,7 +6532,7 @@ async def test_proxy_headers_middleware_rewrites_scheme_and_client() -> None:
 
 
 def _sso_service(engine: Engine) -> AuthService:
-    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 
     principal = AdPrincipal(
         username="jdoe",
@@ -6486,8 +6544,10 @@ def _sso_service(engine: Engine) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
@@ -7814,7 +7874,7 @@ def _oidc_settings(**over: object) -> AuthSettings:
 
 
 def _oidc_service(engine: Engine, **over: object) -> AuthService:
-    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 
     principal = AdPrincipal(
         username="jdoe",
@@ -7827,8 +7887,10 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if username == "jdoe" else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal)
 
         def resolve_principal(
             self, username: str, *, object_id: str | None = None
@@ -7838,10 +7900,13 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
     return AuthService(engine.store, _oidc_settings(**over), ldap=_FakeLdap())  # type: ignore[arg-type]
 
 
-def _oidc_client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
+def _oidc_client(
+    engine: Engine, service: AuthService, *, peer: str = "127.0.0.1"
+) -> httpx.AsyncClient:
     # public_origin is required: the redirect_uri derives from it, never from the Host header.
     app = create_app(engine, auth=service, serve_ui=True, public_origin="https://ops.example")
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    transport = httpx.ASGITransport(app=app, client=(peer, 123))
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
 async def _oidc_audits(engine: Engine) -> list[str]:
@@ -7960,15 +8025,24 @@ async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: 
 
 async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) -> None:
     """AC-7: a valid (state, code) pair with no browser binding must not mint a session - otherwise
-    whoever presents the pair gets the session minted into THEIR browser."""
+    whoever presents the pair gets the session minted into THEIR browser.
+
+    The reject row records the caller's address (vault BACKLOG #2132): a spray of cookie-less
+    callbacks is the cheapest one to send, and the operator needs its source."""
     service = _oidc_service(engine)
     await service.initialize()
-    async with _oidc_client(engine, service) as c:
+    async with _oidc_client(engine, service, peer="192.0.2.46") as c:
         r = await c.get("/ui/oidc/callback?code=abc&state=xyz", follow_redirects=False)
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/login?e=flow_binding_missing"
         assert "mf_session" not in r.headers.get("set-cookie", "")
         assert any("flow_binding_missing" in d for d in await _oidc_audits(engine))
+    [row] = [
+        a
+        for a in await engine.store.list_audit(action="auth.login_failed")
+        if "flow_binding_missing" in (a["detail"] or "")
+    ]
+    assert row["client"] == "192.0.2.46"
 
 
 async def test_oidc_callback_survives_a_cross_site_navigation(engine: Engine) -> None:

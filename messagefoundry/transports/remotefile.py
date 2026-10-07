@@ -9,11 +9,12 @@ A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting t
   unless the explicit dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and logged loudly when it is),
   mirroring the SQL Server backend's weakened-TLS posture.
 - ``ftp`` — plain FTP (stdlib ``ftplib``). Cleartext: credentials over plain ``ftp`` are **refused**
-  unless the escape is set (use ``ftps``/``sftp``), mirroring :func:`refuse_cleartext_credentials`.
+  outright, with no escape (use ``ftps``/``sftp``; vault BACKLOG #2636).
 - ``ftps`` — FTP over explicit TLS (``ftplib.FTP_TLS`` + ``PROT P``), credentials encrypted. **The
   server certificate and hostname are verified by default** (a verifying :class:`ssl.SSLContext`, not
   ftplib's no-verify stdlib fallback); ``tls_verify=false`` drops verification only when the explicit
-  escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and is logged loudly), mirroring the MLLP outbound posture.
+  escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and is logged loudly), mirroring the MLLP outbound posture,
+  and only on an anonymous hop: with a credential it is refused outright (vault BACKLOG #2636).
 
 **Destination** uploads each payload to ``remote_dir``/``filename`` (``{HL7-path}`` placeholders
 resolved via :func:`render_filename`). The write goes to a temp name then a **rename** to the final
@@ -77,6 +78,7 @@ from messagefoundry.config.models import (
     ContentType,
     Destination,
     Source,
+    flag_from_settings,
     remote_file_protocol,
 )
 from messagefoundry.config.settings import (
@@ -201,8 +203,10 @@ def _is_contained_name(name: object) -> bool:
     return not (len(name) >= 2 and name[0].isascii() and name[0].isalpha() and name[1] == ":")
 
 
-def _redact(host: str, path: str) -> str:
-    """``host:path`` only — never credentials, for a log line."""
+def _where(host: str, path: str) -> str:
+    """``host:path`` for a log line or an error. Pass only configured values: the connection's
+    ``host`` and ``remote_dir``. It redacts nothing, so a file name, from the message or the partner,
+    goes through ``safe_name`` instead (vault BACKLOG #3044; this was ``_redact``)."""
     return f"{host}:{path}"
 
 
@@ -534,12 +538,43 @@ def _ftps_ssl_context(
 
     ``name`` is the connection's, for the ``tls_check_hostname=false`` warning (ASVS 12.3.2). ``Ftp()``
     does not take that key, so ``connections.toml`` cannot set it either, but a hand-built
-    ``ConnectionSpec`` can, and this context honours it, so the warning lives here."""
+    ``ConnectionSpec`` can, and this context honours it, so the warning lives here.
+
+    With a ``username`` or ``password`` set, both ``tls_verify=false`` and ``tls_check_hostname=false``
+    are refused outright, with no escape (vault BACKLOG #2636, mirroring the SMTP credential arms of
+    #323 and #1314). The escape governs only an anonymous hop."""
+    verify = bool(settings.get("tls_verify", True))
+    # Vault BACKLOG #2636: the FTPS twin of the two SMTP credential arms (#323 and #1314, in email.py
+    # and direct.py). ABSOLUTE and keyed on no escape: the escape below may govern the BODY posture
+    # of an anonymous hop, never the CREDENTIAL, because login() hands the credential to whichever
+    # peer the session reached. Keyed on either half, as the plain-ftp credential guard is. Checked
+    # BEFORE the escape arm, unlike SMTP, so a credentialed hop is never told to set an escape that
+    # cannot unlock it.
+    has_credential = bool(settings.get("username") or settings.get("password"))
+    if not verify and has_credential:
+        # No chain and no name: an on-path peer presenting any certificate captures the login.
+        raise ValueError(
+            f"{hop_name_prefix(name)}REMOTEFILE ftps sends FTP login credentials over an unverified "
+            "TLS session (tls_verify=false); refused -- credentials require a verified TLS session. "
+            "Leave tls_verify on (the default) with a trusted CA (tls_ca_file), or use sftp."
+        )
+    check_hostname = bool(settings.get("tls_check_hostname", True))
+    if not check_hostname and has_credential:
+        # The chain IS verified (the arm above refused the rest), but with the name check off any
+        # certificate chaining to the anchor is accepted whatever host it names -- on the system
+        # trust store, any certificate any public CA issued to anyone. The credential-less hop keeps
+        # the warning below.
+        raise ValueError(
+            f"{hop_name_prefix(name)}REMOTEFILE ftps sends FTP login credentials over a TLS session "
+            "whose peer NAME is unverified (tls_check_hostname=false); refused -- credentials "
+            "require a session bound to the host, not merely to the trust anchor. Leave "
+            "tls_check_hostname on (the default) and have the partner's certificate name the host "
+            "you dial, or use sftp."
+        )
     # #200 (ADR 0092 decision 2): the escape is CLAMPED to non production-PHI, so tls_verify=false can no
     # longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance (mirrors the MLLP verify-off
     # arm). Off the construction gate (posture unstamped) the escape is refused since vault BACKLOG
-    # #2354; it used to be honoured there unclamped.
-    verify = bool(settings.get("tls_verify", True))
+    # #2354; it used to be honoured there unclamped. Only an anonymous hop reaches here.
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
             "REMOTEFILE ftps tls_verify=false disables server-certificate verification (MITM risk). "
@@ -562,8 +597,8 @@ def _ftps_ssl_context(
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
-        ctx.check_hostname = bool(settings.get("tls_check_hostname", True))
-        if not ctx.check_hostname:  # ASVS 12.3.2: a recorded loosening, never a silent one
+        ctx.check_hostname = check_hostname
+        if not check_hostname:  # ASVS 12.3.2: a recorded loosening, never a silent one
             warn_hostname_check_off(
                 connector="remote-file (FTPS) connection",
                 name=name,
@@ -819,8 +854,8 @@ class _FtpClient(_RemoteClient):
         raise a classified :class:`_RemoteError`. Each step is named, because the step a 5xx reply
         answers decides its class (BACKLOG #2083); see :func:`_ftp_connect_refusal`. The connection
         is closed on every failure."""
-        # B321: plain FTP only when explicitly selected; credentials over it are refused unless
-        # MEFOR_ALLOW_INSECURE_TLS is set (see _validate_common). FTPS/SFTP are the encrypted defaults.
+        # B321: plain FTP only when explicitly selected, and only anonymously: credentials over it
+        # are refused outright (see _validate_common). FTPS/SFTP are the encrypted defaults.
         if self._tls:
             ftp: ftplib.FTP = ftplib.FTP_TLS(context=self._context, timeout=self._timeout)
         else:
@@ -1815,8 +1850,15 @@ def _anon_ftp_guard(
     """An :class:`~messagefoundry.transports.mllp.InsecureHopGuard` for an ANONYMOUS plain-``ftp`` hop
     (protocol ``ftp`` with no credentials), or ``None`` for any other protocol / a credentialed ftp.
 
-    Credentialed plain-ftp is already refused by :func:`_validate_common` (it puts the credential itself
-    on the wire in the clear); ``ftps``/``sftp`` are encrypted. The remaining gap #200 closes is an
+    Credentialed plain-ftp is refused outright by :func:`_validate_common` (it puts the credential
+    itself on the wire in the clear; vault BACKLOG #2636). Every non-test caller reaches this helper
+    only after that refusal has run (``_validate_common`` calls it below the refusal, and
+    ``RemoteFileDestination`` after calling ``_validate_common``), so the credentialed ``None`` arm
+    below is unreachable from them. The arm stays so the helper never labels a credentialed hop
+    "anonymous" and hands it a body-PHI guard; ``test_anon_guard_none_for_credentialed_ftp`` calls it
+    directly and pins the ``username`` half. ``None`` is not a refusal, so the arm does not fail
+    closed on its own: a new caller must have the ``_validate_common`` refusal run first.
+    ``ftps``/``sftp`` are encrypted. The remaining gap #200 closes is an
     ANONYMOUS plain-ftp hop — no credential, but the message BODY is still PHI over a cleartext channel.
     Keyed on the shared gradient off-loopback: loopback / per-connection-attested ALLOW, an ADR 0153
     ``cleartext_accepted`` declaration WARNs (loudly, audited), everything else REFUSES under ENFORCE.
@@ -1827,14 +1869,14 @@ def _anon_ftp_guard(
     if remote_file_protocol(s) != "ftp":
         return None
     if s.get("username") or s.get("password"):
-        return None  # credentialed ftp — covered by _validate_common's cleartext-credential refusal
+        return None  # credentialed ftp: _validate_common refused it outright before any caller
     reason = s.get("tls_hop_attested_reason")
     return InsecureHopGuard.capture(
         host=str(s["host"]),
         port=int(s.get("port", 21)),
         cell="REMOTEFILE ftp",
         description="cleartext anonymous FTP egress",
-        attested=bool(s.get("tls_hop_attested", False)),
+        attested=flag_from_settings(s, "tls_hop_attested"),
         attested_reason=None if reason is None else str(reason),
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
@@ -1863,28 +1905,22 @@ def _validate_common(
     if protocol not in _PROTOCOLS:
         raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
     if protocol == "ftp" and (s.get("username") or s.get("password")):
-        # Plain FTP sends the credential in cleartext (and the body is PHI). Refuse unless the explicit
-        # dev/trusted-network escape is set, mirroring refuse_cleartext_credentials. #200 (ADR 0092
-        # decision 2): the escape is CLAMPED to non production-PHI — the credential-on-the-wire hop (the
-        # strictly-worse case) now gets the same clamp the sibling anonymous-ftp guard already applies, so
-        # MEFOR_ALLOW_INSECURE_TLS can no longer cross a prod-PHI credentialed-ftp hop.
-        if not weakened_tls_escape_permitted_here():
-            raise ValueError(
-                f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in "
-                "CLEARTEXT; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
-                "(the escape has no effect while enforcing, the default, or with no posture) — use "
-                "ftps (tls=True) or sftp"
-            )
-        logger.warning(
-            "%sREMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",
-            hop_name_prefix(connection),
-            _redact(str(s["host"]), str(s.get("remote_dir", ""))),
+        # Plain FTP puts the credential itself on the wire in the clear. Vault BACKLOG #2636: ABSOLUTE,
+        # keyed on no escape and no posture, as the SMTP cleartext-credential arm is (email.py,
+        # direct.py) and as the two FTPS credential arms in _ftps_ssl_context are. This was clamped
+        # (#200, ADR 0092 decision 2) and the escape released it on a non-enforcing instance, which
+        # left the cleartext rung weaker than the verify-off FTPS rung above it. Keyed on either half.
+        # The anonymous plain-ftp hop is governed by the hop guard below and is unchanged.
+        raise ValueError(
+            f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in CLEARTEXT; "
+            "refused -- credentials require an encrypted, verified session. Use ftps (tls=True) or "
+            "sftp."
         )
     # #200 (ADR 0092): an ANONYMOUS plain-ftp hop carries no credential but still ships the PHI body over
     # cleartext. Refuse a production-PHI hop off-loopback at the ENFORCED construction gate (the
-    # credentialed case above is the orthogonal credential-on-the-wire guard). No-op for ftps/sftp/
-    # credentialed-ftp, and byte-identical off the enforced gate (posture unstamped).
+    # credentialed case above is the orthogonal credential-on-the-wire guard, and has already
+    # raised, so only an anonymous ftp hop gets here with protocol ftp). No-op for ftps/sftp, and
+    # byte-identical off the enforced gate (posture unstamped).
     guard = _anon_ftp_guard(
         s,
         cleartext_accepted=cleartext_accepted,
@@ -1908,7 +1944,8 @@ class RemoteFileDestination(DestinationConnector):
             connection=config.name,
         )
         # #200 send-time backstop for an anonymous plain-ftp hop (the enforced refusal already fired in
-        # _validate_common at the construction gate). None for ftps/sftp/credentialed-ftp.
+        # _validate_common at the construction gate). None for ftps/sftp; a credentialed ftp hop
+        # never gets here, because _validate_common above refused it outright (vault BACKLOG #2636).
         self._hop_guard = _anon_ftp_guard(
             s,
             cleartext_accepted=config.cleartext_accepted,
@@ -1947,7 +1984,10 @@ class RemoteFileDestination(DestinationConnector):
         # the fallback, so it is refused here.
         _check_template_fits(self._filename_template, "", FILENAME_MAX_BYTES)
         self._overwrite = bool(s.get("overwrite", False))
-        self._encoding: str = s.get("encoding", "utf-8")
+        # An explicit None is "not declared": utf-8, as the source's batch split reads it. Left
+        # None, .encode(None) raised a TypeError that reached the internal-error arm (vault
+        # BACKLOG #3044).
+        self._encoding: str = s.get("encoding") or "utf-8"
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (ensure_dir creates the upload dir on the first send). When on, remote_dir
         # must be listable at start AND _upload never creates it.
@@ -1980,7 +2020,7 @@ class RemoteFileDestination(DestinationConnector):
             await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         except _RemoteError as exc:
             raise DestinationStartupError(
-                f"REMOTEFILE destination directory {_redact(self._host, self._remote_dir)} failed "
+                f"REMOTEFILE destination directory {_where(self._host, self._remote_dir)} failed "
                 f"startup validation: {exc}"
             ) from exc
 
@@ -2009,7 +2049,7 @@ class RemoteFileDestination(DestinationConnector):
             logger.warning(
                 "REMOTEFILE destination CREATED missing directory %s — this delivery is landing in a "
                 "directory the engine just made; verify the configured remote_dir is the intended one",
-                _redact(self._host, self._remote_dir),
+                _where(self._host, self._remote_dir),
             )
 
     def _list_or_retry(self, lister: Callable[[str], _T], why: str) -> _T:
@@ -2029,7 +2069,7 @@ class RemoteFileDestination(DestinationConnector):
             if exc.connection_fault:
                 raise
             raise _RemoteError(
-                f"REMOTEFILE upload directory {_redact(self._host, self._remote_dir)} {why}: {exc}",
+                f"REMOTEFILE upload directory {_where(self._host, self._remote_dir)} {why}: {exc}",
                 permanent=False,
             ) from exc
 
@@ -2037,16 +2077,13 @@ class RemoteFileDestination(DestinationConnector):
         # The default byte cap applies (ADR 0204): a long field falls back rather than reaching the
         # server. The remote path limit is the partner's and is not known here, so there is no
         # directory budget; a server refusal is classified by its own reply.
-        name = render_filename(self._filename_template, payload, fallback=_FALLBACK_NAME)
         # The shared helper, not a bare .encode(): a UnicodeEncodeError names a character of the
-        # message and carries the WHOLE payload on `.object`. The helper raises a permanent,
-        # content-free NegativeAckError with the chain severed (#1920), before any I/O. It is not a
-        # _RemoteError, so send() lets it through unchanged and the row dead-letters.
-        data = encode_wire_body(
-            payload,
-            self._encoding,
-            transport=f"REMOTEFILE upload to {_redact(self._host, self._remote_dir)}",
-        )
+        # message and holds the WHOLE payload on `.object` (#1920). It runs first, before any I/O.
+        # Not a _RemoteError, so send() lets it through and the row dead-letters under either
+        # internal_error policy. The label is fixed: the stored error is cut short, and a label
+        # carrying host:remote_dir as one long token was dropped whole (vault BACKLOG #3044).
+        data = encode_wire_body(payload, self._encoding, transport="REMOTEFILE upload")
+        name = render_filename(self._filename_template, payload, fallback=_FALLBACK_NAME)
         self._prepare_remote_dir()
         # With overwrite off, list for free names BEFORE anything is written (the #1936 rule).
         candidates = [] if self._overwrite else self._unique(name)
@@ -2088,7 +2125,7 @@ class RemoteFileDestination(DestinationConnector):
         published = self._client.publish(tmp, candidates)
         if published is None:
             raise _RemoteError(
-                f"REMOTEFILE upload to {_redact(self._host, self._remote_dir)} found all "
+                f"REMOTEFILE upload to {_where(self._host, self._remote_dir)} found all "
                 f"{len(candidates)} names it tried taken after the listing, and overwrite is off, "
                 "so it published nothing; the retry lists again",
                 permanent=False,
@@ -2277,7 +2314,7 @@ class RemoteFileSource(SourceConnector):
             await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         except _RemoteError as exc:
             raise SourceStartupError(
-                f"REMOTEFILE source directory {_redact(self._host, self._remote_dir)} failed startup "
+                f"REMOTEFILE source directory {_where(self._host, self._remote_dir)} failed startup "
                 f"validation: {exc}"
             ) from exc
 
@@ -2296,7 +2333,7 @@ class RemoteFileSource(SourceConnector):
                 # reports running. Log and retry next interval (mirrors the File / DATABASE sources).
                 logger.exception(
                     "REMOTEFILE source poll failed for %s; retrying next interval",
-                    _redact(self._host, self._remote_dir),
+                    _where(self._host, self._remote_dir),
                 )
             try:  # noqa: SIM105
                 await asyncio.wait_for(self._stop.wait(), self._poll_seconds)
@@ -2315,14 +2352,14 @@ class RemoteFileSource(SourceConnector):
                 self._skipping = False
                 logger.debug(
                     "REMOTEFILE source resuming polling of %s (now leader)",
-                    _redact(self._host, self._remote_dir),
+                    _where(self._host, self._remote_dir),
                 )
             return True
         if not self._skipping:
             self._skipping = True
             logger.debug(
                 "REMOTEFILE source skipping polling of %s (not leader; another node ingests it)",
-                _redact(self._host, self._remote_dir),
+                _where(self._host, self._remote_dir),
             )
         return False
 
@@ -2363,7 +2400,7 @@ class RemoteFileSource(SourceConnector):
                 logger.warning(
                     "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
                     "(not a single safe name); left in place, not retrieved",
-                    _redact(self._host, self._remote_dir),
+                    _where(self._host, self._remote_dir),
                 )
                 continue
             if not fnmatch.fnmatch(name, self._pattern):
@@ -2422,7 +2459,7 @@ class RemoteFileSource(SourceConnector):
                 logger.warning(
                     "REMOTEFILE %s: %s changed while it was retrieved (%s bytes before, %d read, %s "
                     "after); not emitted, left in place for the next poll",
-                    _redact(self._host, self._remote_dir),
+                    _where(self._host, self._remote_dir),
                     safe_name(name),
                     exc.before,
                     exc.read,
@@ -2570,7 +2607,7 @@ class RemoteFileSource(SourceConnector):
         logger.info(
             "REMOTEFILE source %s reached poll_max_files (%s) this poll; %d listing entr(ies) left for "
             "the next poll (deferred, not dropped)",
-            _redact(self._host, self._remote_dir),
+            _where(self._host, self._remote_dir),
             self._poll_max_files,
             remaining,
         )
@@ -2609,7 +2646,7 @@ class RemoteFileSource(SourceConnector):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "REMOTEFILE %s: %s not yet settled (listed at %d bytes); %s",
-                _redact(self._host, self._remote_dir),
+                _where(self._host, self._remote_dir),
                 safe_name(name),
                 size,
                 "waiting for the next poll to agree"
@@ -2699,7 +2736,7 @@ class RemoteFileSource(SourceConnector):
             "REMOTEFILE %s: %s skipped as already ingested (leave mode); the server listed no "
             "modification time%s for it, so a new version under the same name%s is not told apart "
             "from the one already read",
-            _redact(self._host, self._remote_dir),
+            _where(self._host, self._remote_dir),
             safe_name(name),
             " and a size of 0" if size == 0 else "",
             "" if size == 0 else " and size",
@@ -2767,7 +2804,7 @@ class RemoteFileSource(SourceConnector):
                 "REMOTEFILE %s: %s changed after it was read (%d bytes read, %d now); the message "
                 "emitted from it may be incomplete, so the file is left in place for the next poll to "
                 "read whole",
-                _redact(self._host, self._remote_dir),
+                _where(self._host, self._remote_dir),
                 safe_name(name),
                 read_size,
                 now,

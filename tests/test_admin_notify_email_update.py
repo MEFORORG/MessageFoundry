@@ -287,7 +287,8 @@ async def test_a_move_is_audited_and_announced_even_when_a_later_step_fails(
         async def boom(*_a: object, **_k: object) -> None:
             raise RuntimeError("store refused the disable")
 
-        monkeypatch.setattr(store, "set_user_disabled", boom)
+        # A disable is the guarded write since vault BACKLOG #2779.
+        monkeypatch.setattr(store, "remove_unless_last_admin", boom)
         with pytest.raises(RuntimeError):
             await service.update_user(
                 "u1",

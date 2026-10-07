@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from messagefoundry.auth.trust_anchors import LaneAnchorCheck
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -160,12 +160,18 @@ class ReloadOutcome:
     A dry run applies nothing, so it reports ``applied`` False with no failures.
 
     ``directory`` is the resolved directory this call loaded, applied or not. A dry run's audit row
-    reads it here, because :attr:`Engine.last_reload_dir` moves only on an applied reload."""
+    reads it here, because :attr:`Engine.last_reload_dir` moves only on an applied reload.
+
+    ``fingerprint`` is the ADR 0041 D1 digest an applied reload took of ``directory`` before its
+    swap, or ``None`` when it could not take one (and always for a dry run). The reload's audit row
+    reads it here rather than off :attr:`Engine.loaded_config_fingerprint`: a second reload can swap
+    the graph again before the first one's row is written (vault BACKLOG #2257)."""
 
     registry: Registry
     applied: bool
     directory: Path
     failures: tuple[ReloadStepFailure, ...] = ()
+    fingerprint: Mapping[str, object] | None = None
 
     @property
     def degraded(self) -> bool:
@@ -261,6 +267,7 @@ class Engine:
         log_dir: str | None = None,
         registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
         settings_preflight: Callable[[], Awaitable[None]] | None = None,
+        lane_anchor_check: LaneAnchorCheck | None = None,
     ) -> None:
         self.store = store
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
@@ -284,6 +291,10 @@ class Engine:
         # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
         # (BACKLOG #1142, slice 3); None = no preflight.
         self._registry_preflight = registry_preflight
+        # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check the runner
+        # awaits for each lane it builds, at start, at an operator start and before a reload. `serve`
+        # passes it; None = no check. Not handed to a dry-run checker, which builds nothing live.
+        self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
         # Dry runs skip it, because it writes audit rows. It raises WiringError to refuse. `serve`
@@ -493,7 +504,8 @@ class Engine:
         # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
         # [dr].enabled AND [dr].activate at construction; flipped True by the DR coordinator on a
         # successful POST /dr/activate (which then reloads the graph so the run-profile filter applies)
-        # and back False on POST /dr/release. The runner reads dr_threshold from _dr_run_threshold().
+        # and back False on POST /dr/release. A runner takes dr_threshold from _dr_run_threshold() when
+        # it is built, and _set_dr_active hands a running one the new value on each flip (#3067).
         self._dr_active = bool(self._dr_settings.enabled and self._dr_settings.activate)
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
@@ -524,8 +536,9 @@ class Engine:
         # Serializes ALL console→connections.toml writes (#131/#136 review): the read-modify-write of the
         # config file is not atomic on its own, so two concurrent config:deploy writers could lose an
         # update. A single engine-level lock guarding every such write (a future console→TOML writer must
-        # take it too) keeps them serial; the writer's unique-temp + os.replace (connections_edit) guards
-        # against a DIFFERENT process (the `connection` CLI) writing concurrently.
+        # take it too) keeps them serial. It is in-process only, so the write also holds
+        # `connections_edit.locked`, an OS file lock the `connection` CLI in another process takes too
+        # (vault BACKLOG #2782); that one is blocking and is only ever taken in a worker thread.
         self._toml_write_lock = asyncio.Lock()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
@@ -738,139 +751,223 @@ class Engine:
                 store_settings=self._store_settings,
                 activate_profile=self._dr_activate_profile,
                 deactivate_profile=self._dr_release_drain,
+                profile_provenance=self._dr_config_drift,
                 config_fingerprint_provider=self._dr_config_fingerprint,
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
-                profile_preflight=self._dr_profile_preflight,
             )
         return self._dr_coordinator
-
-    async def _dr_profile_preflight(self) -> None:
-        """Raise OSError when :meth:`_dr_activate_profile` would fail to reload because its
-        directory has gone or cannot be listed. The coordinator runs this before the VIP takeover
-        hook, so such an activation aborts with the VIP never moved (vault BACKLOG #2840). It checks
-        :attr:`running_config_dir`, and only when the profile step will reload it. It checks that
-        one cause and no other: the profile step can still refuse after the hook, such as on a
-        config that no longer loads, or a directory that goes in between."""
-        directory = self.running_config_dir
-        if self._registry_runner is None or directory is None:
-            return
-        await asyncio.to_thread(self._open_dir_listing, directory)
-
-    @staticmethod
-    def _open_dir_listing(directory: Path) -> None:
-        """Open ``directory`` for listing: FileNotFoundError when it has gone, NotADirectoryError
-        when it is a file, PermissionError when it cannot be read."""
-        with os.scandir(directory) as entries:
-            next(entries, None)
 
     async def _dr_config_fingerprint(self) -> str | None:
         """The config digest a DR activation's seed marker records, or ``None`` when there is none.
 
-        The coordinator awaits it when it writes the marker, so building the coordinator reads no
-        file. It fingerprints :attr:`running_config_dir`, the directory :meth:`_dr_activate_profile`
-        then reloads when a graph is running. The marker is written a step before that reload, and
-        the VIP takeover hook runs between them, so an edit to the directory, or an operator
-        reload from another root, in that window makes the two differ. It goes through
-        :meth:`fingerprint_bundle`, the one best-effort rule, off the event loop. Where that rule
-        takes no digest, such as for a file name that is not UTF-8, this gives ``None`` rather than
-        failing the activation (vault BACKLOG #2839). A directory that has gone also gives
-        ``None``, where the rule would digest an empty bundle. The rule skips an unreadable file,
-        so a digest here is not proof that every file was read."""
-        directory = self.running_config_dir
-        if directory is None or not await asyncio.to_thread(directory.is_dir):
-            return None
-        bundle, _reason = await self.fingerprint_bundle(directory)
-        digest = (bundle or {}).get("fingerprint")
+        It is :attr:`loaded_config_fingerprint`, the digest of the graph the engine is running,
+        because that is the graph :meth:`_dr_activate_profile` applies (vault BACKLOG #3067). It
+        reads no file, so building the coordinator reads none either, and a config dir that has
+        gone or holds a file name that is not UTF-8 cannot fail the marker (vault BACKLOG #2839).
+        ``None`` when the running graph took no digest, such as when its bundle could not be
+        read."""
+        loaded = self.loaded_config_fingerprint
+        digest = loaded.get("fingerprint") if loaded else None
         return digest if isinstance(digest, str) else None
+
+    def _set_dr_active(self, active: bool) -> None:
+        """Latch the DR run-profile and hand the running runner the matching threshold.
+
+        The runner takes its threshold at construction and reads it on every start and reload, so
+        a flip of the latch alone parked nothing on a running box (vault BACKLOG #3067). Every
+        runtime flip goes through here, so the two cannot disagree. It binds and unbinds nothing:
+        the next reload does."""
+        self._dr_active = active
+        if self._registry_runner is not None:
+            self._registry_runner.set_dr_threshold(self._dr_run_threshold())
 
     async def _dr_activate_profile(self) -> None:
         """Engine callback the DR coordinator runs to BEGIN serving under the DR run-profile (#61, ADR
-        0048 step 4): latch the run-profile ON and reload the graph so the runner binds only connections
-        at/above ``[dr].priority_threshold`` (the rest report ``status:"filtered"``). A reload (not a
-        cold start) so a box already serving its full graph drops to the critical set in place, with
-        in-flight rows preserved (the reload is quiesce-and-swap)."""
+        0048 step 4): latch the run-profile ON, hand the runner the threshold, and re-apply the
+        running graph so the runner binds only connections at/above ``[dr].priority_threshold`` (the
+        rest report ``status:"filtered"``). A reload (not a cold start) so a box already serving its
+        full graph drops to the critical set in place, with in-flight rows preserved (the reload is
+        quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
+        from :meth:`_dr_config_drift`.
+
+        It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
+        (vault BACKLOG #2184, engine PR 2070). The preflight reads anchor files, which can change
+        after the graph loaded. The guard ``serve`` wires, the static-credential guard, judges only
+        the graph and the startup settings, and neither has changed. It already judged this graph
+        when it loaded, through :meth:`reload_detail` or the managed app's first load, over the
+        whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
+        filtered graph, so a guard here would judge less than that load did. A graph an embedder
+        hands to :meth:`add_registry` meets neither check at load. That is a fact about embedding,
+        and an activation is not where it changes."""
         was_active = self._dr_active
-        self._dr_active = True
         rr = self._registry_runner
-        if rr is None:
-            return
-        # Re-apply the (now-active) threshold over the SAME graph so the runner parks the below-threshold
-        # feeds. Prefer a full engine reload (re-reads the config dir, picks up any priority edits) when
-        # running_config_dir names one; otherwise (embedding, never reloaded from a dir) re-run the
-        # runner over its current registry, which re-evaluates the DR filter in place. propagate=False
-        # — a local DR decision, never a cluster-wide config bump.
-        # The directory is running_config_dir, the one the running graph came from, and not the
-        # startup dir: an operator who reloaded from another allowed root chose that graph, and a DR
-        # activation must not swap the older one back in without telling anyone (vault BACKLOG
-        # #2840). If that directory has gone, the reload raises and the activation aborts with the
-        # reason, rather than falling back to the startup dir. _converge_reload keeps the startup dir
-        # on purpose: each node converges on its own, identically deployed, config dir.
-        cfg_dir = self.running_config_dir
+        # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
+        # graph is what the operator last applied, through whatever approval that reload needed, so
+        # an activation must not swap in bytes edited since then with no second person, nor the
+        # startup dir's older graph (vault BACKLOG #2840). It also applies nothing from the config
+        # dir, so a dir on a share at the failed site cannot refuse it after the takeover hook moved
+        # the VIP. The settings and registry preflights are the trust-anchor checks reload_detail
+        # runs before a swap; they read anchor files and write audit rows, and they refuse before
+        # anything changes. The graph guard is not repeated; the docstring says why. Nor is the
+        # env-values re-read: the values are the ones the runner holds. rr.reload still runs
+        # build_check, so the egress and exposure gates still run. The threshold goes to the runner
+        # after the preflights and before the reload, which is where the runner re-evaluates every
+        # connection. rr.reload() re-applies whichever graph is current once it holds the reload
+        # lock, so an operator reload that lands first is re-evaluated rather than reverted. A local
+        # DR decision is never a cluster-wide config bump.
         try:
-            if cfg_dir is not None:
-                await self.reload(cfg_dir, propagate=False)
-            else:
-                await self.preflight_settings()  # reload_detail runs it on the branch above (#2034)
-                await rr.reload(rr.registry)
+            if rr is not None:
+                await self.preflight_settings()
+                await self.preflight_registry(rr.registry)
+            self._set_dr_active(True)
+            if rr is not None:
+                await rr.reload()
         except BaseException:
-            # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile, so
-            # the latch goes back too. Left set, the next operator reload would park the feeds below
-            # the threshold on a box the DR coordinator reports as not active. BaseException, not
-            # Exception (vault BACKLOG #2751): a cancelled reload rolls its intake back to the
-            # previous graph (RegistryRunner.reload), so the latch has to follow it there too.
-            self._dr_active = was_active
+            # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
+            # so the latch and the runner's threshold go back too. Left set, the next operator
+            # reload would park the feeds below the threshold on a box the DR coordinator reports
+            # as not active. BaseException, not Exception (vault BACKLOG #2751): a cancelled reload
+            # rolls its intake back to the previous graph (RegistryRunner.reload), so the latch has
+            # to follow it there too.
+            self._set_dr_active(was_active)
             raise
 
-    async def _dr_release_drain(self) -> int | None:
-        """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
-        listeners (stop accepting new intake), drain the staged queue to completion (every NOT-DONE row
-        delivered or dead-lettered), then latch the run-profile OFF. Within the DR store at-least-once +
-        idempotency make the drain safe; cross-store reconciliation is operator-verified per the runbook.
-        Returns only once intake is unbound and the drain has ended (no dual-accept window).
+    async def _dr_config_drift(self) -> dict[str, object]:
+        """The provenance fields a DR activation records: the activated graph's digest, and whether
+        :attr:`running_config_dir` on disk still matches it.
 
-        Returns the staged-queue depth left when the drain ended: ``0`` when it drained, more when
-        it gave up at its bound with rows still queued (vault BACKLOG #2752, finding D-V1). The
-        coordinator records that number on the ``dr.release`` row rather than claiming a drain."""
+        An activation applies the running graph and not the disk (:meth:`_dr_activate_profile`), so
+        a difference is recorded and logged at WARNING rather than applied. ``POST /config/reload``
+        applies it, under that route's own approval gate. This is deliberately not a
+        ``config_changed`` alert, whose contract is a START loading different bytes. The digest is
+        taken off the event loop and bounded by ``[dr].takeover_timeout_seconds``. A directory that
+        has gone, cannot be read or does not answer in time is recorded as ``unreadable``. It runs
+        after the graph is live, so nothing it raises may fail the activation: the coordinator
+        would then record an abort, and report the box as not active, while it serves the profile.
+        With no digest of the running graph there is nothing to compare, and the verdict is
+        ``unknown``. The log line carries digests and the directory path, never config content."""
+        from messagefoundry.config.fingerprint import fingerprint_matches
+
+        activated = await self._dr_config_fingerprint()
+        fields: dict[str, object] = {"config_fingerprint": activated}
+        directory = self.running_config_dir
+        if directory is None:
+            return fields
+        reason: str | None
+        disk: object = None
+        try:
+            async with asyncio.timeout(self._dr_settings.takeover_timeout_seconds):
+                if not await asyncio.to_thread(directory.is_dir):
+                    reason = "the directory is not there"
+                else:
+                    bundle, reason = await self.fingerprint_bundle(directory)
+                    disk = (bundle or {}).get("fingerprint")
+        except TimeoutError:
+            reason = f"no answer within {self._dr_settings.takeover_timeout_seconds:g}s"
+        except Exception as exc:
+            # Broad on purpose, and logged below: fingerprint_bundle lets anything but OSError and
+            # ValueError through, and this record must not undo an activation that has applied.
+            reason = safe_exc(exc)
+        if not isinstance(disk, str):
+            fields["disk_config"] = "unreadable"
+            fields["disk_config_error"] = reason or "no digest was taken"
+            log.warning(
+                "DR activation applied the running graph; its config dir %s could not be read to "
+                "compare with it: %s",
+                directory,
+                fields["disk_config_error"],
+            )
+            return fields
+        if activated is None:
+            fields["disk_config"] = "unknown"
+            fields["disk_config_fingerprint"] = disk
+            return fields
+        if fingerprint_matches(disk, activated):
+            fields["disk_config"] = "matches"
+            return fields
+        fields["disk_config"] = "differs"
+        fields["disk_config_fingerprint"] = disk
+        log.warning(
+            "DR activation applied the running graph (config fingerprint %s), and did not apply the "
+            "config dir %s, which now differs on disk (fingerprint %s). POST /config/reload applies "
+            "it, under that route's approval gate.",
+            activated,
+            directory,
+            disk,
+        )
+        return fields
+
+    async def _dr_release_drain(self) -> dict[str, object]:
+        """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
+        listeners (stop accepting new intake), drain the staged queue (every drainable NOT-DONE row
+        delivered or dead-lettered), then latch the run-profile OFF and clear the runner's threshold,
+        so a later operator reload stops parking feeds (vault BACKLOG #3067). Within the DR store
+        at-least-once + idempotency make the drain safe; cross-store reconciliation is
+        operator-verified per the runbook. Returns only once intake is unbound and the drain has
+        ended (no dual-accept window).
+
+        Returns the fields for the ``dr.release`` row: ``depth_left``, the staged-queue depth left
+        when the drain ended (vault BACKLOG #2752, finding D-V1); ``held_on_parked_outbounds``, the
+        part of it held on outbounds the engine parks; and ``drained``, whether every OTHER row
+        drained (vault BACKLOG #3067). The coordinator records them rather than claiming a drain."""
         rr = self._registry_runner
         if rr is None:
-            # No graph, so nothing to unbind and no worker to drain with. Report what is queued.
-            depth: int | None = await self.store.in_pipeline_depth()
-        else:
-            for name in list(rr.registry.inbound):
-                await rr.stop_inbound(
-                    name
-                )  # unbind every listener — no new intake during fail-back
-            rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
-            depth = await self._drain_pipeline()
-        self._dr_active = False
-        return depth
+            # No graph, so nothing to unbind, no worker to drain with and no parked outbound.
+            depth = await self.store.in_pipeline_depth()
+            self._set_dr_active(False)
+            return {"depth_left": depth, "drained": depth == 0, "held_on_parked_outbounds": 0}
+        for name in list(rr.registry.inbound):
+            await rr.stop_inbound(name)  # unbind every listener — no new intake during fail-back
+        rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
+        depth, held = await self._drain_pipeline()
+        self._set_dr_active(False)
+        return {"depth_left": depth, "drained": depth <= held, "held_on_parked_outbounds": held}
 
-    async def _drain_pipeline(self, *, timeout: float | None = None, poll: float = 0.1) -> int:
-        """Wait until the staged queue is fully drained (no NOT-DONE rows across ingress/routed/outbound)
-        — the fail-back hand-back gate (#61, ADR 0048). Bounded by ``timeout`` (default
-        :data:`DR_RELEASE_DRAIN_TIMEOUT_SECONDS`, read at call time) so a permanently-stuck row (a
-        retry-forever head against a dead peer) doesn't hang the release forever; on timeout it returns
-        (the remaining rows stay queued + replayable, and the runbook reconciliation accounts for them).
+    async def _drain_pipeline(
+        self, *, timeout: float | None = None, poll: float = 0.1
+    ) -> tuple[int, int]:
+        """Wait until the staged queue is drained — the fail-back hand-back gate (#61, ADR 0048).
 
-        Returns the depth left, ``0`` when drained. The bound is wall-clock time, measured on the
-        monotonic clock: it used to count only sleep ticks, so each depth query's own time ran past
-        it (vault BACKLOG #2752)."""
+        Returns ``(depth, held)``: the NOT-DONE rows left across ingress/routed/outbound when the
+        wait ended, and how many of them are PENDING on outbounds the engine parks
+        (:meth:`RegistryRunner.engine_parked_outbounds`, the DR run-profile's among them). Held
+        rows cannot drain here, so the wait ends once ``depth <= held`` rather than sitting out its
+        whole bound on them (vault BACKLOG #3067). Bounded by ``timeout`` (default
+        :data:`DR_RELEASE_DRAIN_TIMEOUT_SECONDS`, read at call time) of wall time on the monotonic
+        clock, the queries included (vault BACKLOG #2752), so a permanently-stuck row (a
+        retry-forever head against a dead peer) doesn't hang the release forever; on timeout the
+        remaining rows stay queued + replayable, and the runbook reconciliation accounts for them."""
         bound = DR_RELEASE_DRAIN_TIMEOUT_SECONDS if timeout is None else timeout
         deadline = time.monotonic() + bound
         while True:
+            # The held count is read on both sides of the depth and the smaller one is used. A row
+            # that becomes held between the reads (a fan-out to parked outbounds) or stops being
+            # held (a purge) then reads as not drained for one more poll, never as drained early.
+            held_before = await self._held_on_parked_outbounds()
             depth = await self.store.in_pipeline_depth()
-            if depth == 0 or time.monotonic() >= deadline:
+            held = await self._held_on_parked_outbounds()
+            if depth <= min(held_before, held) or time.monotonic() >= deadline:
                 break
             await asyncio.sleep(poll)
-        if depth:
+        if depth > held:
             log.warning(
                 "DR release: staged queue not fully drained within %.0fs; %d row(s) stay queued + "
                 "replayable (the fail-back reconciliation runbook accounts for them)",
                 bound,
-                depth,
+                depth - held,
             )
-        return depth
+        return depth, held
+
+    async def _held_on_parked_outbounds(self) -> int:
+        """The PENDING rows on outbounds the engine parks (vault BACKLOG #3067)."""
+        rr = self._registry_runner
+        if rr is None:
+            return 0
+        held = 0
+        for name in rr.engine_parked_outbounds():
+            held += (await self.store.pending_depth(name))[0]
+        return held
 
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
@@ -886,7 +983,6 @@ class Engine:
         sandbox_policy = SandboxPolicy(
             mode=SandboxMode(_sb.mode),
             wall_seconds=_sb.wall_seconds,
-            cpu_seconds=_sb.cpu_seconds,
             mem_mb=_sb.mem_mb,
             startup_seconds=_sb.startup_seconds,
             pass_environment=_sb.pass_environment,
@@ -918,6 +1014,7 @@ class Engine:
             egress=self._egress_settings,
             hop_posture=self._hop_posture,
             trust_anchor_policy=self._trust_anchor_policy,
+            lane_anchor_check=self._lane_anchor_check,
             simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             active_environment=self._active_environment,
@@ -1995,23 +2092,58 @@ class Engine:
 
             connections_edit.upsert_connection(cfg_dir, match, validate=validate)
 
+        def _digest() -> dict[str, object] | None:
+            # Already on a worker thread and holding the lock, so the blocking twin of
+            # `fingerprint_bundle`: the same best-effort rule, with no hop back through the loop
+            # or a second executor thread while the lock is held.
+            digest, _reason = self.fingerprint_bundle_blocking(cfg_dir)
+            return digest
+
+        def _locked_write(loaded_fp: object) -> tuple[dict[str, object] | None, bool]:
+            """The write and both digests, all under the cross-process lock (vault BACKLOG #2782).
+
+            The lock spans the list as well as the upsert: the entry is read and written back whole,
+            so a `connection` CLI edit of the same entry landing between the two would otherwise be
+            overwritten. It spans the digests too, so neither can take in a CLI edit this engine
+            never loaded. Re-entrant, so the upsert's own acquisition nests. Returns ``(after,
+            vouched)``; ``vouched`` is False when the toggle was not the one change."""
+            with connections_edit.locked(cfg_dir):
+                # vault BACKLOG #2597: whether the directory still holds the bytes the running
+                # graph loaded, read before this write changes it. With no loaded digest there is
+                # nothing to vouch against, so the two reads are skipped.
+                before = _digest() if isinstance(loaded_fp, str) else None
+                _write()
+                # The digest covers the whole directory, so it may vouch for this toggle only when
+                # the toggle is the one change since the load. Otherwise another edit is on disk
+                # that the running graph never loaded, and the row keeps the loaded digest, so the
+                # next start reports it.
+                if (
+                    before is None
+                    or not isinstance(loaded_fp, str)
+                    or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
+                ):
+                    return None, False
+                # The write has landed, so an unexpected failure here is logged and costs the
+                # digest, never the answer: a raise would report a landed write as failed, with
+                # no audit row.
+                try:
+                    after = _digest()
+                except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
+                    log.exception("connection flag written; its config fingerprint was not taken")
+                    after = None
+                return after, True
+
         # Serialize the whole read-modify-write + live reflect under the engine-level TOML-write lock so
         # two concurrent config:deploy flag toggles can't interleave (lost update / racing temp files);
         # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
         async with self._toml_write_lock:
-            # vault BACKLOG #2597: whether the directory still holds the bytes the running graph
-            # loaded, read before this write changes it. See the return below. With no loaded
-            # digest there is nothing to vouch against, so the two reads are skipped.
             loaded = self.loaded_config_fingerprint
             loaded_fp = loaded.get("fingerprint") if loaded is not None else None
-            before = None
-            if isinstance(loaded_fp, str):
-                before, _reason = await self.fingerprint_bundle(cfg_dir)
             # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so
             # the runner's listening set is snapshotted here, on the loop. None = the offline test.
             live = self._registry_runner
             binds_listener = live.listener_bind_predicate() if live is not None else None
-            await asyncio.to_thread(_write)
+            after, vouched = await asyncio.to_thread(_locked_write, loaded_fp)
 
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
             # Best-effort: the durable connections.toml is the source of truth, so a concurrent reload
@@ -2024,23 +2156,8 @@ class Engine:
                     rr.registry.outbound[name] = replace(
                         rr.registry.outbound[name], flagged=flagged
                     )
-            # Still under the lock, so no second toggle lands between the write and its digest. The
-            # digest covers the whole directory, so it may vouch for this toggle only when the toggle
-            # is the one change since the load. Otherwise another edit is on disk that the running
-            # graph never loaded, and the row keeps the loaded digest, so the next start reports it.
-            if (
-                before is None
-                or not isinstance(loaded_fp, str)
-                or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
-            ):
+            if not vouched:
                 return loaded
-            # The write has landed, so an unexpected failure here is logged and costs the digest,
-            # never the answer: a raise would report a landed write as failed, with no audit row.
-            try:
-                after, _reason = await self.fingerprint_bundle(cfg_dir)
-            except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
-                log.exception("connection flag written; its config fingerprint was not taken")
-                after = None
             if after is None:
                 # No digest of what is on disk now. The loaded one would read as a change at the
                 # next start, so the row records none and that start compares nothing.
@@ -2054,8 +2171,8 @@ class Engine:
     def running_config_dir(self) -> Path | None:
         """The directory the running graph came from: the last applied reload's, else the startup
         ``--config`` dir. Readers include at least the provenance drift check,
-        :meth:`set_connection_flag` and a DR activation's reload and seed marker (vault BACKLOG
-        #2840, #2839)."""
+        :meth:`set_connection_flag` and a DR activation's disk drift check (vault BACKLOG #3067).
+        A DR activation does not reload it: it re-applies the running graph."""
         return self.last_reload_dir or self.config_dir
 
     async def fingerprint_bundle(self, path: Path) -> tuple[dict[str, object] | None, str | None]:
@@ -2066,12 +2183,21 @@ class Engine:
         OSError is an unreadable file; ValueError is a VCS head that is not UTF-8
         (UnicodeDecodeError). Anything else, such as an ImportError of the fingerprint module, still
         raises. The reason is a :func:`safe_exc` rendering, logged here at WARNING."""
+        return await asyncio.to_thread(self.fingerprint_bundle_blocking, path)
+
+    def fingerprint_bundle_blocking(
+        self, path: Path
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """:meth:`fingerprint_bundle` for a caller already on a worker thread, under the same rule.
+
+        :meth:`set_connection_flag` takes its digests here while it holds the cross-process
+        config edit lock (vault BACKLOG #2782)."""
         from messagefoundry.config.fingerprint import config_fingerprint_detail
 
         try:
-            # A lambda, and not the bare function: the crypto inventory scanner follows a call it
-            # can see and not a function passed as a value, so this keeps the hash on its record.
-            return await asyncio.to_thread(lambda: config_fingerprint_detail(path)), None
+            # A direct call, so the crypto inventory scanner, which follows a call it can see,
+            # keeps the hash on its record.
+            return config_fingerprint_detail(path), None
         except (OSError, ValueError) as exc:
             reason = safe_exc(exc)
             log.warning("config fingerprint failed for %s: %s", path, reason)
@@ -2109,8 +2235,8 @@ class Engine:
 
     async def preflight_settings(self) -> None:
         """Run the engine's settings preflight; raises ``WiringError`` to refuse. A no-op when none
-        was configured. :meth:`reload_detail` runs it on every real reload, and the DR profile reload
-        runs it when it re-applies the running graph without a config dir (BACKLOG #2034)."""
+        was configured. :meth:`reload_detail` runs it on every real reload, and a DR activation
+        runs it before it re-applies the running graph (BACKLOG #2034, vault BACKLOG #3067)."""
         if self._settings_preflight is not None:
             await self._settings_preflight()
 
@@ -2203,7 +2329,8 @@ class Engine:
             # config. This runs BEFORE the swap either way, so the live graph is untouched. The CLI
             # provider wraps its own read and names the value file; this covers an embedder-supplied
             # provider, and it covers every caller that reaches reload_detail (the route, the
-            # dual-control release executor, the cluster convergence loop, the DR-threshold re-apply).
+            # dual-control release executor, the cluster convergence loop). A DR activation does not
+            # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
             try:
                 self._env_values = dict(self._env_values_provider())
@@ -2395,7 +2522,11 @@ class Engine:
                 ", ".join(f.step for f in failures),
             )
         return ReloadOutcome(
-            registry=registry, applied=True, directory=path, failures=tuple(failures)
+            registry=registry,
+            applied=True,
+            directory=path,
+            failures=tuple(failures),
+            fingerprint=fingerprint,
         )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:

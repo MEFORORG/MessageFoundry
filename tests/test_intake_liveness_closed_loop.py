@@ -293,12 +293,12 @@ async def _assert_closed_loop(run: _Run, deadline: float) -> None:
     # Every answered message has its ingress row: the exact bound `read_short` carries in the load
     # harness. It does not prove the ACK FOLLOWED the commit; tests/test_ack_after_commit_invariant.py
     # does that.
-    assert await run.store.count_messages(channel_id=_INBOUND) == _N
+    assert await run.store.count_messages(channel_id=_INBOUND, allowed_channels=None) == _N
 
     # Close the loop through routing, transform and delivery, under what remains of the bound.
     async def delivered() -> bool:
         processed = await run.store.count_messages(
-            channel_id=_INBOUND, status=MessageStatus.PROCESSED.value
+            channel_id=_INBOUND, status=MessageStatus.PROCESSED.value, allowed_channels=None
         )
         return processed == _N and await run.store.in_pipeline_depth() == 0
 

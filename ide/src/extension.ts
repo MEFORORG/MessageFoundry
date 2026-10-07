@@ -467,8 +467,13 @@ export function activate(context: vscode.ExtensionContext): void {
     void codeSets.refresh();
   }
 
-  // One-time nudge to put a MessageFoundry project under version control + commit-time checks.
+  // One-time nudge to put a MessageFoundry project under version control + commit-time checks. It
+  // stays silent in an untrusted workspace (vault BACKLOG #2791), and VS Code does not re-activate a
+  // "limited" extension when trust is granted, so the grant re-offers it.
   void maybeSuggestSourceControl(context);
+  context.subscriptions.push(
+    vscode.workspace.onDidGrantWorkspaceTrust(() => void maybeSuggestSourceControl(context)),
+  );
 }
 
 export function deactivate(): void {

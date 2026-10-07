@@ -43,6 +43,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.redaction import safe_name
 
 if TYPE_CHECKING:
     from messagefoundry.auth.ldap_tls import NarrowedTls
@@ -106,10 +107,11 @@ class LdapReferralError(LdapError):
 class DirectoryAnswer(Enum):
     """What one password-free lookup of one account established (ADR 0195 rule item 2).
 
-    Two callers read this: the session reconciler, and ``verify_mfa``'s directory check (BACKLOG
-    #2023), which fails closed on anything but :attr:`FOUND` and writes the answer only to the audit
-    row. Every sign-in caller keeps its plain ``None`` for anything but :attr:`FOUND`, so the reason
-    an account was refused never reaches a client.
+    At least three callers read this: the session reconciler, ``verify_mfa``'s directory check
+    (BACKLOG #2023), which fails closed on anything but :attr:`FOUND`, and the step-up re-bind
+    through :class:`DirectoryBind` (BACKLOG #2434). Each writes the answer only to the audit row, and
+    every sign-in caller keeps its plain ``None`` for anything but :attr:`FOUND`, so the reason an
+    account was refused never reaches a client.
     """
 
     #: The entry was found and ``userAccountControl`` proved it enabled.
@@ -123,6 +125,31 @@ class DirectoryAnswer(Enum):
     #: like a disabled account on every sign-in path (BACKLOG #1639); told apart here so the
     #: reconciler can hold a wave of them (ADR 0195) instead of revoking it.
     UNDETERMINED = "undetermined"
+    #: The search matched more than one entry, so none is provably the account asked about (vault
+    #: BACKLOG #2778). Refused on every sign-in path; the reconciler reads it as absent, and the
+    #: step-up re-bind audits it as ``not_in_directory`` and does not count it.
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True)
+class DirectoryBind:
+    """One password bind: what its lookup found, and the principal when the bind succeeded.
+
+    :meth:`LdapAuthenticator.authenticate` returns this (BACKLOG #2434), so the step-up re-bind can
+    tell a refused password from an absent or disabled account without a second directory read.
+    ``answer`` is ``None`` when no lookup ran, which only an empty password causes. ``FOUND`` with
+    no principal means the entry was found enabled and the directory refused the bind, so the
+    password was judged against that account. Any other answer means no bind was judged. None of
+    this may reach a client: a sign-in caller must refuse every answer alike.
+    """
+
+    answer: DirectoryAnswer | None
+    principal: AdPrincipal | None = None
+
+    def __post_init__(self) -> None:
+        # A principal only for FOUND: a bind that succeeded found its entry first.
+        if self.principal is not None and self.answer is not DirectoryAnswer.FOUND:
+            raise ValueError(f"DirectoryBind({self.answer}) with principal={self.principal!r}")
 
 
 @dataclass(frozen=True)
@@ -293,7 +320,8 @@ def _principal_from(info: dict[str, Any], user_dn: str, groups: frozenset[str]) 
 #: session reconciler probes it once per user per pass (``ad_session_recheck_seconds``, 300 by
 #: default), so an unreadable attribute would otherwise emit one identical line per user every five
 #: minutes. ``_probe_principal`` logs its own failure at DEBUG for exactly that reason; this keeps the
-#: louder level and pays for it by saying each thing once.
+#: louder level and pays for it by saying each thing once. Since vault BACKLOG #2778 it also holds
+#: ``ambiguous:<label>`` keys, one per name that matched more than one entry.
 _object_guid_shapes_warned: set[str] = set()
 
 
@@ -975,8 +1003,9 @@ class LdapAuthenticator:
         fallback_username: str,
         expected_object_id: str | None = None,
     ) -> _Lookup:
-        """Run one user search and extract the entry. ``info`` is ``None`` for no match, a disabled
-        account or an undetermined one, and ``answer`` says which (ADR 0195 rule item 2).
+        """Run one user search and extract the entry. ``info`` is ``None`` for no match, more than
+        one match (``AMBIGUOUS``, vault BACKLOG #2778), a disabled account or an undetermined one,
+        and ``answer`` says which (ADR 0195 rule item 2).
 
         ``expected_object_id``, the canonical id an id-keyed search asked for, makes an entry that
         does not read it back a no-match, before its account state is read (BACKLOG #2027). See
@@ -1012,6 +1041,22 @@ class LdapAuthenticator:
         )
         if not conn.entries:
             return _Lookup(DirectoryAnswer.NOT_FOUND)
+        if len(conn.entries) > 1:
+            # Vault BACKLOG #2778. The name filter matches sAMAccountName OR userPrincipalName, and
+            # a directory may legally give one account a UPN prefix equal to another's
+            # sAMAccountName. Taking entries[0] would let the server's result order pick which
+            # account signs in. No entry is provably the one asked about, so none is. Logged with
+            # a label for the name and the count only, once per name: the attempts repeat at
+            # sign-in rate, and the set of names stays bounded by the collisions the directory holds.
+            label = safe_name(fallback_username)
+            _warn_once(
+                f"ambiguous:{label}",
+                "AD user search for %s matched %d directory entries; refusing it as ambiguous "
+                "(logged once per name)",
+                label,
+                len(conn.entries),
+            )
+            return _Lookup(DirectoryAnswer.AMBIGUOUS)
         e = conn.entries[0]
         own: str | None = None
         if expected_object_id is not None:
@@ -1139,9 +1184,14 @@ class LdapAuthenticator:
 
     def authenticate(
         self, username: str, password: str, *, object_id: str | None = None
-    ) -> AdPrincipal | None:
-        """Verify ``username``/``password`` against AD and return the principal, or ``None`` if the
-        credentials are rejected. Raises :class:`LdapError` on a connectivity/config failure.
+    ) -> DirectoryBind:
+        """Verify ``username``/``password`` against AD. Raises :class:`LdapError` on a
+        connectivity/config failure.
+
+        The answer carries the principal on success, and otherwise says what the lookup found
+        (:class:`DirectoryBind`, BACKLOG #2434). Before that it returned ``None`` for a wrong
+        password and for an absent or disabled account alike, so the step-up re-bind made a second
+        lookup to tell them apart and still could not tell absent from disabled.
 
         ``object_id`` picks the entry to bind as by its ``objectGUID`` rather than by the name, the
         same key rule as :meth:`resolve_principal` (BACKLOG #2027). The step-up re-bind passes the
@@ -1150,14 +1200,15 @@ class LdapAuthenticator:
         import ldap3
 
         if not password:  # never allow an empty password (it triggers an anonymous bind)
-            return None
+            return DirectoryBind(None)
         try:
             with self._service_conn() as svc:
-                info = (
-                    self._lookup_by_object_id(svc, object_id, fallback_username=username).info
+                found = (
+                    self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None
-                    else self._find_user(svc, username)
+                    else self._lookup_by_name(svc, username)
                 )
+                info = found.info
                 if info is None:
                     # ASVS 6.3.8 (BACKLOG #1140): an absent or disabled principal used to return
                     # HERE, skipping the whole second Server build, TCP connect and bind round trip
@@ -1165,10 +1216,10 @@ class LdapAuthenticator:
                     # identical response. Do that work anyway and discard it. This is the AD leg's
                     # analogue of _DUMMY_PASSWORD_HASH on the local leg (auth/service.py).
                     #
-                    # DELIBERATELY NOT THE OBVIOUS FIX: the disabled-bit check stays inside
-                    # _find_user. It has TWO callers — this one binds, the Kerberos/SSO one below
-                    # does not — so relocating it into the bind path alone would let a DISABLED
-                    # ACCOUNT AUTHENTICATE OVER SSO. Equalize the CALLER, never move the check.
+                    # DELIBERATELY NOT THE OBVIOUS FIX: the disabled-bit check stays inside the
+                    # shared lookup (_search_user). It has more than one caller -- this one binds,
+                    # the Kerberos/SSO one below does not -- so relocating it into the bind path
+                    # alone would let a DISABLED ACCOUNT AUTHENTICATE OVER SSO. Equalize the CALLER, never move the check.
                     #
                     # A _SOCKET_FAULTS error in the decoy is mapped HERE, the same way the real
                     # bind's is below, so for those types an absent and a present account fail
@@ -1176,7 +1227,7 @@ class LdapAuthenticator:
                     # apart. That method's docstring says what this does not settle.
                     with _socket_faults_as_ldap_error():
                         self._equalizing_bind(password)
-                    return None
+                    return DirectoryBind(found.answer)
                 user_dn = str(info["dn"])
                 # The password-verifying bind — a SECOND connection (and a second Server, built by
                 # _server() with its own connect_timeout). It carries the same finite receive_timeout
@@ -1200,13 +1251,14 @@ class LdapAuthenticator:
                         bound = user_conn.bind()
                     if not bound:
                         _refuse_referral(user_conn, "user bind")
-                        return None
+                        # The entry was found enabled, so the refusal judged this account.
+                        return DirectoryBind(DirectoryAnswer.FOUND)
                 finally:
                     user_conn.unbind()
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
         except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
-        return _principal_from(info, user_dn, groups)
+        return DirectoryBind(DirectoryAnswer.FOUND, _principal_from(info, user_dn, groups))
 
     def resolve_principal(
         self, username: str, *, object_id: str | None = None

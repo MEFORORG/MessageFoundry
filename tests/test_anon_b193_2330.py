@@ -511,12 +511,13 @@ def test_a_six_digit_date_with_two_readings_is_emptied(
 
 # --- found by the QA pass on this branch ----------------------------------------------------------
 
-# GT1-8 value -> what must NOT survive, and whether the time after the date is kept.
+# GT1-8 value -> what must NOT survive, and what follows the fabricated date. A time keeps its
+# shape only: zero digits and a +0000 offset (vault BACKLOG #2767).
 _DOB_TAILS = {
     "an SSN after the date": ("19570412 123-45-6789", "123-45-6789", ""),
     "a name after the date": ("19570412^ROE^JANE", "ROE", ""),
     "a US date": ("03/15/1957", "57", ""),
-    "a time and an offset": ("19570412083000-0500", "19570412", "083000-0500"),
+    "a time and an offset": ("19570412083000-0500", "083000-0500", "000000+0000"),
 }
 
 
@@ -529,7 +530,7 @@ def test_a_date_of_birth_keeps_only_a_time_after_the_date(
     DOB kind must not carry text through."""
     value, gone, kept_tail = _DOB_TAILS[case]
     out = _field_of(adapter(_site_message(_seg("GT1", f1="1", f8=value)), salt=_SALT), "GT1-8")
-    assert len(out) == 8 + len(kept_tail) and out[:8].isdigit() and out.endswith(kept_tail)
+    assert len(out) == 8 + len(kept_tail) and out[:8].isdigit() and out[8:] == kept_tail
     assert gone not in out[:8] and (kept_tail or gone not in out)
 
 

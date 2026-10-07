@@ -22,11 +22,14 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
+from messagefoundry.api.auth_models import ExpectedFederatedPair
 from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal, LdapError
 from messagefoundry.auth.service import (
@@ -34,14 +37,16 @@ from messagefoundry.auth.service import (
     FEDERATED_BINDING_CHANGED,
     AuthService,
     DirectoryObjectIdMissing,
+    FederatedBindingChanged,
 )
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.config.settings import _OIDC_ISSUER_MAX, AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
 from tests.test_api_auth import (
     ABSENT_USER_ID,
     _add,
+    _add_custom,
     _auth,
     _client,
     _login,
@@ -131,6 +136,28 @@ async def _federated_rows_since(engine: Engine, mark: int) -> list[dict[str, obj
         dict(a)
         for a in rows
         if int(a["id"]) > mark and str(a["action"]).startswith("auth.federated_subject_")
+    ]
+
+
+async def _refusals_since(engine: Engine, mark: int) -> list[tuple[str, str, dict[str, object]]]:
+    """``(action, actor, detail)`` for every federated bind or unbind REFUSAL row after ``mark``,
+    oldest first (BACKLOG #2331). By id, for the reasons :func:`_federated_rows_since` gives."""
+    rows = await engine.store.list_audit(limit=100_000)
+    return [
+        (str(a["action"]), str(a["actor"]), json.loads(str(a["detail"])))
+        for a in reversed(rows)
+        if int(a["id"]) > mark
+        and str(a["action"]) in ("auth.federated_bind_refused", "auth.federated_unbind_refused")
+    ]
+
+
+async def _rows_since(engine: Engine, mark: int) -> list[tuple[str, object]]:
+    """``(action, path)`` for every audit row after ``mark``; ``path`` from the detail, or None."""
+    rows = await engine.store.list_audit(limit=100_000)
+    return [
+        (str(a["action"]), json.loads(str(a["detail"] or "{}")).get("path"))
+        for a in reversed(rows)
+        if int(a["id"]) > mark
     ]
 
 
@@ -706,7 +733,24 @@ async def test_a_second_administrator_acting_on_a_stale_read_is_refused(
         )
         live = await engine.store.get_session("t-after-first")
         assert live is not None and live.revoked_at is None, "a refused call signed the account out"
-        assert await _federated_rows_since(engine, mark) == [], "a refused call wrote an audit row"
+        assert await _federated_rows_since(engine, mark) == [], "a refused call wrote a binding row"
+        # BACKLOG #2331: the refusal itself is audited, naming the actor and the stale pair.
+        requested = {"issuer": ISSUER, "subject": "S-1-c"} if second_act == "relink" else {}
+        assert await _refusals_since(engine, mark) == [
+            (
+                "auth.federated_bind_refused"
+                if second_act == "relink"
+                else "auth.federated_unbind_refused",
+                "second",
+                {
+                    "user_id": target,
+                    "username": "jdoe",
+                    **requested,
+                    **seen_by_second,
+                    "reason": FEDERATED_BINDING_CHANGED,
+                },
+            )
+        ]
 
         # CONTROL: the same administrator, acting on what the account holds now.
         _r, second = await _reauth(c, second, purpose=ACTION)
@@ -749,6 +793,10 @@ async def test_a_bind_expecting_no_binding_does_not_replace_one(engine: Engine) 
     assert r.status_code == 409, r.text
     assert r.json()["detail"].startswith(FEDERATED_BINDING_CHANGED)
     assert await _pairs(engine, target) == {target: (ISSUER, "S-1-a")}
+    [(action, actor, detail)] = await _refusals_since(engine, 0)
+    assert (action, actor) == ("auth.federated_bind_refused", "root")
+    assert detail["reason"] == FEDERATED_BINDING_CHANGED
+    assert (detail["expected_issuer"], detail["expected_subject"]) == (None, None)
 
 
 async def test_the_expected_pair_is_required_on_both_routes(engine: Engine) -> None:
@@ -938,3 +986,192 @@ async def test_the_directory_create_refusals_and_their_codes(engine: Engine) -> 
         assert "dc01" not in down.text
     names = {u.username for u in await engine.store.list_users()}
     assert names == {"root", "nomail"}
+
+
+# --- BACKLOG #2331: a JSON read of the pair, and the deleted-mid-bind answer -------------------------
+
+
+async def test_the_pair_reads_back_over_json_and_the_read_spends_no_grant(engine: Engine) -> None:
+    """A JSON caller reads the pair it must send back, so it no longer guesses and spends a grant on
+    each wrong guess. The read takes no step-up and is audited as the channel-scope read is.
+    CONTROL for "spends no grant": a bind using the pair the read returned succeeds on the grant
+    minted BEFORE the read."""
+    service = await _service(engine)
+    target = await _ad_account(engine)
+    await service.bind_federated_subject(
+        target, "S-1-a", expected_issuer=None, expected_subject=None, actor="setup"
+    )
+    async with _client(engine, service) as c:
+        tok = await _admin(c, service)
+        _r, tok = await _reauth(c, tok, purpose=ACTION)
+        # The read is audited as the channel-scope read is: the gate's own permission row, and
+        # nothing else. That read is the CONTROL for what "audited the same way" means.
+        mark = await _audit_mark(engine)
+        scope = await c.get(f"/users/{target}/channel-scope", headers=_auth(tok))
+        assert scope.status_code == 200, scope.text
+        assert await _rows_since(engine, mark) == [
+            ("auth.permission_granted", f"/users/{target}/channel-scope")
+        ]
+        mark = await _audit_mark(engine)
+        r = await c.get(f"/users/{target}/federated-identity", headers=_auth(tok))
+        assert r.status_code == 200, r.text
+        assert r.json() == {
+            "user_id": target,
+            "username": "jdoe",
+            "auth_provider": "ad",
+            "issuer": ISSUER,
+            "subject": "S-1-a",
+            "bind_issuer": ISSUER,
+            "has_directory_object_id": True,
+        }
+        assert await _rows_since(engine, mark) == [
+            ("auth.permission_granted", f"/users/{target}/federated-identity")
+        ], "the read is not audited as the channel-scope read is"
+        seen = r.json()
+        ok = await c.put(
+            f"/users/{target}/federated-identity",
+            json={
+                "subject": "S-1-b",
+                "expected_issuer": seen["issuer"],
+                "expected_subject": seen["subject"],
+            },
+            headers=_auth(tok),
+        )
+        assert ok.status_code == 200, ok.text
+    assert await _pairs(engine, target) == {target: (ISSUER, "S-1-b")}
+
+
+async def test_the_pair_read_needs_users_manage_and_404s_an_unknown_user(engine: Engine) -> None:
+    """``users:read`` is not enough: the pair says which IdP identity may sign in as the account,
+    and it is gated like the channel-scope read. CONTROL: an administrator reads the same account."""
+    service = await _service(engine)
+    target = await _ad_account(engine)
+    await _add_custom(service, "reader", ["users:read"])
+    async with _client(engine, service) as c:
+        reader = (await _login(c, "reader")).json()["token"]
+        refused = await c.get(f"/users/{target}/federated-identity", headers=_auth(reader))
+        assert refused.status_code == 403, refused.text
+        # The permission refused it, not a step-up or second-factor gate.
+        assert refused.json()["detail"] == "missing permission: users:manage", refused.text
+        tok = await _admin(c, service)
+        ok = await c.get(f"/users/{target}/federated-identity", headers=_auth(tok))
+        assert ok.status_code == 200, ok.text
+        assert (ok.json()["issuer"], ok.json()["subject"]) == (None, None)
+        missing = await c.get(f"/users/{ABSENT_USER_ID}/federated-identity", headers=_auth(tok))
+        assert missing.status_code == 404, missing.text
+
+
+@pytest.mark.parametrize("shape", ["first bind", "rebind"])
+async def test_an_account_deleted_while_a_bind_runs_is_a_404_not_a_conflict(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """The account is deleted between the bind's clear and its set, so the set matches no row.
+    That used to answer 409, which tells the caller to read and retry an account that is gone. It
+    is 404 now. A rebind's clear still removed the old binding first, and that stays recorded.
+    CONTROL: the first-bind shape with ANOTHER bind wedged in instead keeps its 409 (pinned by
+    ``test_a_first_bind_losing_to_another_bind_is_the_changed_pair_refusal``)."""
+    service = await _service(engine)
+    target = await _ad_account(engine)
+    seen = UNBOUND
+    if shape == "rebind":
+        await service.bind_federated_subject(
+            target, "S-1-a", expected_issuer=None, expected_subject=None, actor="setup"
+        )
+        seen = _seen("S-1-a")
+    real_clear = engine.store.clear_user_federated_subject
+
+    async def clear_then_delete(user_id: str, **kw: Any) -> Any:
+        outcome = await real_clear(user_id, **kw)
+        await engine.store.delete_user(user_id)
+        return outcome
+
+    async with _client(engine, service) as c:
+        tok = await _admin(c, service)
+        _r, tok = await _reauth(c, tok, purpose=ACTION)
+        mark = await _audit_mark(engine)
+        monkeypatch.setattr(engine.store, "clear_user_federated_subject", clear_then_delete)
+        r = await c.put(
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-b", **seen},
+            headers=_auth(tok),
+        )
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "no such user"
+    written = [a["action"] for a in await _federated_rows_since(engine, mark)]
+    assert written == (["auth.federated_subject_unbound"] if shape == "rebind" else [])
+    assert await _refusals_since(engine, mark) == [], "a deleted account was audited as a conflict"
+
+
+async def test_a_bind_raced_between_its_read_and_its_clear_is_audited(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The third changed-pair arm: the bind's own read saw the account unbound, as its caller did,
+    and another bind lands before the clear. The clear's locked compare refuses it. That arm writes
+    the same refusal row as the other two, naming the account as the clear read it."""
+    service = await _service(engine)
+    target = await _ad_account(engine)
+    real_clear = engine.store.clear_user_federated_subject
+
+    async def another_bind_then_clear(user_id: str, **kw: Any) -> Any:
+        await engine.store.set_user_federated_subject(user_id, ISSUER, "S-1-other")
+        return await real_clear(user_id, **kw)
+
+    mark = await _audit_mark(engine)
+    monkeypatch.setattr(engine.store, "clear_user_federated_subject", another_bind_then_clear)
+    with pytest.raises(FederatedBindingChanged):
+        await service.bind_federated_subject(
+            target, "S-1-mine", expected_issuer=None, expected_subject=None, actor="admin"
+        )
+    monkeypatch.undo()
+    assert await _pairs(engine, target) == {target: (ISSUER, "S-1-other")}
+    assert await _refusals_since(engine, mark) == [
+        (
+            "auth.federated_bind_refused",
+            "admin",
+            {
+                "user_id": target,
+                "username": "jdoe",
+                "issuer": ISSUER,
+                "subject": "S-1-mine",
+                **UNBOUND,
+                "reason": FEDERATED_BINDING_CHANGED,
+            },
+        )
+    ]
+
+
+def test_an_issuer_is_measured_in_the_columns_units() -> None:
+    """SQL Server's ``NVARCHAR(256)`` counts UTF-16 units, and a character outside the Basic
+    Multilingual Plane takes two. So 129 such characters, 258 units, are refused although they are
+    under 256 code points. CONTROL: 128 of them, exactly 256 units, load."""
+    astral = "\U0001d51e"
+    assert len(astral.encode("utf-16-le")) // 2 == 2
+    AuthSettings(oidc_issuer=astral * 128)
+    with pytest.raises(ValidationError, match="UTF-16"):
+        AuthSettings(oidc_issuer=astral * 129)
+    # A lone surrogate, which an environment variable can carry on Windows, is counted, not raised
+    # as an encoding error that would quote it.
+    with pytest.raises(ValidationError, match="UTF-16") as refused:
+        AuthSettings(oidc_issuer="\ud800" * 257)
+    assert "surrogates not allowed" not in str(refused.value)
+
+
+def test_every_issuer_the_setting_accepts_fits_the_expected_pair() -> None:
+    """``[auth].oidc_issuer`` and the body's ``expected_issuer`` share one cap, 256, the narrowest
+    issuer column (BACKLOG #2331). Before, the body took 2048 against an unbounded setting, so an
+    issuer longer than 2048 could be bound and never named back to remove it. Both edges, both
+    sides. The setting's refusal does not echo the value it refused."""
+    # One cap, written twice: auth_models is imported by the API client, which may not load
+    # config/, so the body bound cannot import the setting's constant. This pins the two together.
+    assert _OIDC_ISSUER_MAX == 256
+    at_cap = "https://idp.example/" + "a" * (256 - len("https://idp.example/"))
+    assert len(at_cap) == 256
+    assert AuthSettings(oidc_issuer=at_cap).oidc_issuer == at_cap
+    pair = ExpectedFederatedPair(expected_issuer=at_cap, expected_subject="S")
+    assert pair.expected_issuer == at_cap
+    over = at_cap + "Z"
+    with pytest.raises(ValidationError) as refused:
+        AuthSettings(oidc_issuer=over)
+    assert "aaaaZ" not in str(refused.value), "the refusal echoed the issuer it refused"
+    with pytest.raises(ValidationError):
+        ExpectedFederatedPair(expected_issuer=over, expected_subject="S")

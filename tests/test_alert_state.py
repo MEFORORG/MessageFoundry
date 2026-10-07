@@ -36,7 +36,7 @@ async def test_first_fire_opens_instance(tmp_path: Path) -> None:
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="critical", now=100.0
         )
-        rows = await store.list_active_alert_instances()
+        rows = await store.list_active_alert_instances(allowed_channels=None)
         assert len(rows) == 1
         a = rows[0]
         assert a.event_type == "connection_error" and a.connection == "OB_X"
@@ -57,7 +57,7 @@ async def test_refire_dedupes_on_throttle_key(tmp_path: Path) -> None:
         await store.upsert_alert_instance(
             event_type="queue_buildup", connection="OB_X", severity="critical", now=150.0
         )
-        rows = await store.list_active_alert_instances()
+        rows = await store.list_active_alert_instances(allowed_channels=None)
         assert len(rows) == 1
         a = rows[0]
         assert a.count == 2
@@ -67,7 +67,7 @@ async def test_refire_dedupes_on_throttle_key(tmp_path: Path) -> None:
         await store.upsert_alert_instance(
             event_type="queue_buildup", connection="OB_Y", severity="warning", now=160.0
         )
-        assert len(await store.list_active_alert_instances()) == 2
+        assert len(await store.list_active_alert_instances(allowed_channels=None)) == 2
     finally:
         await store.close()
 
@@ -79,13 +79,15 @@ async def test_ack_transitions_and_excludes_from_open_count(tmp_path: Path) -> N
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="critical", now=100.0
         )
-        (a,) = await store.list_active_alert_instances()
+        (a,) = await store.list_active_alert_instances(allowed_channels=None)
         assert await store.ack_alert_instance(a.id, actor="scott", now=200.0) is True
-        got = await store.get_alert_instance(a.id)
+        got = await store.get_alert_instance(a.id, allowed_channels=None)
         assert got is not None
         assert got.status == "acknowledged" and got.acked_by == "scott" and got.acked_at == 200.0
         # acknowledged stays VISIBLE on the active list but is EXCLUDED from alerts_active (open count).
-        assert {r.id for r in await store.list_active_alert_instances()} == {a.id}
+        assert {r.id for r in await store.list_active_alert_instances(allowed_channels=None)} == {
+            a.id
+        }
         assert await store.count_open_alerts_by_connection() == {}
         # an unknown / already-resolved id returns False
         assert await store.ack_alert_instance(99999, actor="scott") is False
@@ -100,12 +102,12 @@ async def test_acknowledged_refire_stays_acknowledged(tmp_path: Path) -> None:
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="critical", now=100.0
         )
-        (a,) = await store.list_active_alert_instances()
+        (a,) = await store.list_active_alert_instances(allowed_channels=None)
         await store.ack_alert_instance(a.id, actor="scott", now=120.0)
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="critical", now=130.0
         )
-        got = await store.get_alert_instance(a.id)
+        got = await store.get_alert_instance(a.id, allowed_channels=None)
         assert got is not None
         assert got.status == "acknowledged" and got.count == 2 and got.last_seen == 130.0
         assert await store.count_open_alerts_by_connection() == {}  # still not "open"
@@ -120,15 +122,15 @@ async def test_resolve_and_reopen(tmp_path: Path) -> None:
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="critical", now=100.0
         )
-        (a,) = await store.list_active_alert_instances()
+        (a,) = await store.list_active_alert_instances(allowed_channels=None)
         assert await store.resolve_alert_instance(a.id, now=200.0) is True
-        assert await store.list_active_alert_instances() == []
+        assert await store.list_active_alert_instances(allowed_channels=None) == []
         assert await store.resolve_alert_instance(a.id) is False  # already resolved
         # the key is now free — a new fire opens a brand-new (distinct id) open instance
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="warning", now=300.0
         )
-        (b,) = await store.list_active_alert_instances()
+        (b,) = await store.list_active_alert_instances(allowed_channels=None)
         assert b.id != a.id and b.status == "open" and b.count == 1
     finally:
         await store.close()
@@ -148,7 +150,9 @@ async def test_auto_resolves_on_inverse_signal(tmp_path: Path) -> None:
             event_type="connection_error", connection="OB_X", now=200.0
         )
         assert n == 1
-        assert {r.connection for r in await store.list_active_alert_instances()} == {"OB_Y"}
+        assert {
+            r.connection for r in await store.list_active_alert_instances(allowed_channels=None)
+        } == {"OB_Y"}
         # a no-match resolve is a no-op (0)
         assert (
             await store.resolve_alert_instances_for(event_type="connection_error", connection="ZZ")
@@ -171,7 +175,11 @@ async def test_count_open_by_connection(tmp_path: Path) -> None:
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_Y", severity="critical", now=102.0
         )
-        (acked,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_Y"]
+        (acked,) = [
+            r
+            for r in await store.list_active_alert_instances(allowed_channels=None)
+            if r.connection == "OB_Y"
+        ]
         await store.ack_alert_instance(acked.id, actor="scott")  # ack drops OB_Y to 0 open
         assert await store.count_open_alerts_by_connection() == {"OB_X": 2}
     finally:
@@ -195,10 +203,10 @@ async def test_summary_counts_past_any_page_and_ranks_by_severity(tmp_path: Path
                 now=100.0 + i,
             )
         # The page the bell used to count: full, and the older critical is not on it.
-        page = await store.list_active_alert_instances(limit=200)
+        page = await store.list_active_alert_instances(limit=200, allowed_channels=None)
         assert len(page) == 200 and all(a.severity == "warning" for a in page)
 
-        summary = await store.summarize_active_alert_instances()
+        summary = await store.summarize_active_alert_instances(allowed_channels=None)
         assert summary.total == 201
         assert summary.worst_severity == "critical"
     finally:
@@ -220,7 +228,9 @@ async def test_summary_is_scoped_and_counts_acknowledged(tmp_path: Path) -> None
             event_type="connection_error", connection="IN_THEIRS", severity="critical", now=101.0
         )
         (mine,) = [
-            r for r in await store.list_active_alert_instances() if r.connection == "IN_MINE"
+            r
+            for r in await store.list_active_alert_instances(allowed_channels=None)
+            if r.connection == "IN_MINE"
         ]
         await store.ack_alert_instance(mine.id, actor="scott")
 
@@ -233,7 +243,7 @@ async def test_summary_is_scoped_and_counts_acknowledged(tmp_path: Path) -> None
         assert await store.summarize_active_alert_instances(allowed_channels=[]) == AlertSummary(
             total=0, worst_severity=None
         )
-        unscoped = await store.summarize_active_alert_instances()
+        unscoped = await store.summarize_active_alert_instances(allowed_channels=None)
         assert unscoped == AlertSummary(total=2, worst_severity="critical")
     finally:
         await store.close()
@@ -251,18 +261,22 @@ async def test_summary_ignores_resolved_and_unrankable_severities(tmp_path: Path
         await store.upsert_alert_instance(
             event_type="queue_buildup", connection="OB_X", severity="nonsense", now=101.0
         )
-        assert await store.summarize_active_alert_instances() == AlertSummary(
+        assert await store.summarize_active_alert_instances(allowed_channels=None) == AlertSummary(
             total=2, worst_severity="critical"
         )
 
-        (crit,) = [r for r in await store.list_active_alert_instances() if r.severity == "critical"]
+        (crit,) = [
+            r
+            for r in await store.list_active_alert_instances(allowed_channels=None)
+            if r.severity == "critical"
+        ]
         await store.resolve_alert_instance(crit.id)
-        assert await store.summarize_active_alert_instances() == AlertSummary(
+        assert await store.summarize_active_alert_instances(allowed_channels=None) == AlertSummary(
             total=1, worst_severity=None
         )
 
         await store.resolve_alert_instances_for(event_type="queue_buildup", connection="OB_X")
-        assert await store.summarize_active_alert_instances() == AlertSummary(
+        assert await store.summarize_active_alert_instances(allowed_channels=None) == AlertSummary(
             total=0, worst_severity=None
         )
     finally:
@@ -302,7 +316,7 @@ async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
             reason="connect refused to 10.0.0.9",
             now=100.0,
         )
-        (a,) = await store.list_active_alert_instances()
+        (a,) = await store.list_active_alert_instances(allowed_channels=None)
         assert a.reason == "connect refused to 10.0.0.9"  # decrypted at the boundary
     finally:
         await store.close()
@@ -329,18 +343,24 @@ async def test_purge_resolved_only(tmp_path: Path) -> None:
             event_type="connection_error", connection="OB_RESOLVED", severity="critical", now=100.0
         )
         (r,) = [
-            x for x in await store.list_active_alert_instances() if x.connection == "OB_RESOLVED"
+            x
+            for x in await store.list_active_alert_instances(allowed_channels=None)
+            if x.connection == "OB_RESOLVED"
         ]
         await store.resolve_alert_instance(r.id, now=100.0)
         purged = await store.purge_alert_instances(older_than=200.0)
         assert purged == 1  # the resolved one
-        assert {x.connection for x in await store.list_active_alert_instances()} == {"OB_OPEN"}
+        assert {
+            x.connection for x in await store.list_active_alert_instances(allowed_channels=None)
+        } == {"OB_OPEN"}
         # a too-recent resolved row is NOT purged
         await store.upsert_alert_instance(
             event_type="queue_buildup", connection="OB_RECENT", severity="warning", now=500.0
         )
         (rec,) = [
-            x for x in await store.list_active_alert_instances() if x.connection == "OB_RECENT"
+            x
+            for x in await store.list_active_alert_instances(allowed_channels=None)
+            if x.connection == "OB_RECENT"
         ]
         await store.resolve_alert_instance(rec.id, now=500.0)
         assert await store.purge_alert_instances(older_than=200.0) == 0
@@ -356,7 +376,7 @@ async def test_escalation_tier_persisted_monotonic(tmp_path: Path) -> None:
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="warning", now=100.0
         )
-        (a,) = await store.list_active_alert_instances()
+        (a,) = await store.list_active_alert_instances(allowed_channels=None)
         assert a.escalation_tier == 0
         await store.upsert_alert_instance(
             event_type="connection_error",
@@ -365,7 +385,7 @@ async def test_escalation_tier_persisted_monotonic(tmp_path: Path) -> None:
             escalation_tier=2,
             now=110.0,
         )
-        (a,) = await store.list_active_alert_instances()
+        (a,) = await store.list_active_alert_instances(allowed_channels=None)
         assert a.escalation_tier == 2 and a.count == 2
         # a later fire at a LOWER tier does not lower it (monotonic MAX/GREATEST/CASE)
         await store.upsert_alert_instance(
@@ -375,14 +395,14 @@ async def test_escalation_tier_persisted_monotonic(tmp_path: Path) -> None:
             escalation_tier=1,
             now=120.0,
         )
-        (a,) = await store.list_active_alert_instances()
+        (a,) = await store.list_active_alert_instances(allowed_channels=None)
         assert a.escalation_tier == 2
         # resolve + reopen starts a fresh instance at the fresh tier
         await store.resolve_alert_instance(a.id, now=130.0)
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="warning", now=140.0
         )
-        (b,) = await store.list_active_alert_instances()
+        (b,) = await store.list_active_alert_instances(allowed_channels=None)
         assert b.id != a.id and b.escalation_tier == 0
     finally:
         await store.close()
@@ -396,14 +416,14 @@ async def test_suspend_and_resume_instance(tmp_path: Path) -> None:
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="critical", now=100.0
         )
-        (a,) = await store.list_active_alert_instances()
+        (a,) = await store.list_active_alert_instances(allowed_channels=None)
         assert a.suspended_until is None
         got = await store.suspend_alert_instance(a.id, until=500.0, now=100.0)
         assert got is not None and got.suspended_until == 500.0
         # AC-3: still open, still counted, still visible — suspend gates NOTIFICATION only.
         assert got.status == "open"
         assert await store.count_open_alerts_by_connection() == {"OB_X": 1}
-        (still,) = await store.list_active_alert_instances()
+        (still,) = await store.list_active_alert_instances(allowed_channels=None)
         assert still.suspended_until == 500.0
         # resume clears the window
         resumed = await store.resume_alert_instance(a.id)
@@ -472,7 +492,9 @@ class _RecordingStore:
         self.resolves.append({"event_type": event_type, "connection": connection})
         return 1
 
-    async def list_active_alert_instances(self, *, limit: int = 1000) -> list[Any]:
+    async def list_active_alert_instances(
+        self, *, limit: int = 1000, allowed_channels: object
+    ) -> list[Any]:
         return []
 
 

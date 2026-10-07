@@ -11,8 +11,9 @@ kept.
 
 This is a conservative *redaction* of HL7-shaped content — **not** de-identification (that is a
 separate, centralized framework; see PHI.md §9). It errs toward over-redaction. Beyond HL7-shaped
-spans it also applies a **conservative free-text heuristic** (date/DOB runs, multi-token name runs and
-a number after an ``MRN`` label; see :func:`redact`), so a delimiter-free leak like ``raise ValueError("patient DOE JANE dob 1980-05-05
+spans it also applies a **conservative free-text heuristic** (date/DOB runs with any time glued to
+them, dashed SSNs, multi-token and comma-separated name runs, and a number after an ``MRN`` label; see
+:func:`redact`), so a delimiter-free leak like ``raise ValueError("patient DOE JANE dob 1980-05-05
 not found")`` is narrowed too. The delimiters are **read from MSH** rather than assumed, so a feed
 declaring ``*`` and ``$`` is covered too (:func:`_sniff_delimiters`, BACKLOG #1572), and a
 percent-encoded default separator in a URL counts like the literal one (:data:`_HL7_ENCODED_FIELD_RUN`,
@@ -62,9 +63,14 @@ Pure stdlib, so it can be used from any engine package.
 
 from __future__ import annotations
 
+import encodings
+import encodings.aliases
 import hashlib
 import json
+import pkgutil
 import re
+from collections.abc import Callable
+from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
 from typing import Any
@@ -72,6 +78,7 @@ from typing import Any
 __all__ = [
     "clamp_untrusted",
     "json_loads_or_refusal",
+    "log_timestamp",
     "redact",
     "redact_untrusted",
     "safe_error",
@@ -223,9 +230,71 @@ _CREDENTIAL_AHEAD = re.compile(
 #: separator) or a bare HL7 8-digit ``YYYYMMDD``. A DOB is a direct identifier, and a free-text leak like
 #: ``"... dob 1980-05-05 ..."`` carries no HL7 delimiter, so :func:`_HL7_FIELD_RUN` misses it. The
 #: alternatives use fixed-width digit runs (no unbounded repetition), so the scan stays linear.
+#:
+#: **The date takes its time with it (vault BACKLOG #2784).** Each arm used to END in ``\b``, and a
+#: time glued to the date removes that boundary, so the whole value walked through: an HL7 DTM such as
+#: ``19800505123000-0500`` (``\b`` fails inside a longer digit run) and an ISO ``1980-05-05T12:30``
+#: (``T`` is a word character). Now the eight-digit arm takes an optional HL7 time, fraction and offset
+#: before its ``\b``, and the ``YYYY-MM-DD`` arm takes an optional ISO ``T`` time with a ``Z`` or
+#: numeric offset. A time digit is not range-checked: an impossible hour after a real date must still
+#: take the date with it. The cost is over-redaction of a 10-, 12- or 14-digit number that opens ``19``
+#: or ``20``. A log FILE line's own leading timestamp is carved off before this pass, by
+#: ``support.redact`` for both log formats.
+#:
+#: The eight-digit arm also takes an ISO BASIC time glued by ``T`` (``19800505T123000``). **One
+#: engine-owned shape is carved out of it, by its exact form:** a backup archive's stamp, written by
+#: ``dr_backup._utc_stamp`` after a ``-`` and followed by ``.mfbak`` (``mefor-backup-dev-
+#: 20261006T123000Z.mfbak``, or ``.corrupt.mfbak``), so an operator still reads which archive a
+#: message is about. The carve is tested once, right after the ``T``, so no shorter match can slip
+#: past it. A content value of exactly that shape (a ``-``, a basic stamp with seconds and ``Z``,
+#: then ``.mfbak``) passes too, which is the price of naming the archive. Every other time the ENGINE puts in a message is rendered by
+#: :func:`log_timestamp` in a form no arm here reads, and ``isoformat()`` in engine text fails
+#: ``tests/test_engine_text_survives_the_name_run.py``. Residual, at least: the US ``MM/DD/YYYY`` arm
+#: takes no time, so ``05/05/1980T12:30`` passes; the "never put PHI in an exception message"
+#: convention remains the control.
 _DATE_RUN = re.compile(
-    r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b|\b(?:19|20)\d{6}\b"
+    r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+    r"(?:[Tt]\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d{1,9})?)?)?(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?|\b)"
+    r"|\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b"
+    r"|\b(?:19|20)\d{6}"
+    r"(?:(?:\d{2}(?:\d{2}(?:\d{2}(?:\.\d{1,4})?)?)?)?(?:[+-]\d{4})?\b"
+    r"|[Tt](?!(?<=-\d{8}T)\d{6}Z\.(?:corrupt\.)?mfbak)"
+    r"\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d{1,9})?)?)?(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?)"
 )
+
+
+#: English month abbreviations for :func:`log_timestamp`, spelled out so a locale cannot change them.
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def log_timestamp(when: datetime | str) -> str:
+    """``when`` in UTC as ``06 Oct 2026 12:30:00 +0000``, for a time the ENGINE puts in message text.
+
+    **Use this, never ``isoformat()`` or an ``*_iso`` string, in a log line or an error (vault
+    BACKLOG #2784).** :data:`_DATE_RUN` reads an ISO date-time as a possible date of birth, so
+    ``2026-10-06T12:30:00+00:00`` reaches the log as ``[redacted]`` and an operator loses the time a
+    CRL takes effect or a certificate expires. This form is one no pattern here reads: the month is a
+    word, so no date arm matches, and its only capital is the month's, so no name run can join it to
+    what follows (a zone word such as ``UTC`` would). ``when`` may be an ISO string, which is parsed
+    first; one that does not parse is returned as given. A naive time is read as UTC."""
+    if isinstance(when, str):
+        try:
+            moment = datetime.fromisoformat(when)
+        except ValueError:
+            return when  # not a time this can read: shown as given, never a crash in a log call
+    else:
+        moment = when
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    moment = moment.astimezone(UTC)
+    return f"{moment.day:02d} {_MONTHS[moment.month - 1]} {moment.year} {moment:%H:%M:%S} +0000"
+
+
+#: A **dashed US SSN**, ``NNN-NN-NNNN`` (vault BACKLOG #2784). No other pass reads one: it holds no
+#: HL7 delimiter and no date shape. Only the dashed form: an undashed nine-digit run is any number, and
+#: a spaced one is three tokens (:func:`_whole_token_prefix` names that residual). Fixed width, so
+#: linear, and no whitespace, so a cut at a space keeps or drops it whole.
+_SSN_RUN = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
 #: A **multi-token name run**: 2–4 adjacent ``Capitalized`` (a capital then lowercase) *or* ``ALLCAPS``
 #: tokens — e.g. ``DOE JANE`` / ``Doe Jane``. Requiring **≥2** adjacent tokens is deliberate: a single
 #: capitalized operational word (``Connection``, ``Timeout``, ``ValueError``, a logger/class name) is
@@ -245,6 +314,24 @@ _DATE_RUN = re.compile(
 #: and ``Else If``. ``tests/test_engine_text_survives_the_name_run.py`` fails on a new run of either
 #: arm in at least the message shapes it scans; its docstring names the ones it does not.
 _NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
+#: A **name written family-comma-given**: ``Doe, Jane`` or ``DOE, JANE`` (vault BACKLOG #2784).
+#: :data:`_NAME_RUN` joins its tokens with whitespace alone, so the comma split this into two single
+#: tokens and both walked through. Each side is one to four tokens of the same shape as that pattern's
+#: arm, so ``Van Doe, Jane Marie`` goes whole: a family name of several words would otherwise leave
+#: its first word behind.
+#:
+#: It runs BEFORE :data:`_NAME_RUN`, which would otherwise take ``Jane Marie`` and leave ``Doe,``.
+#: Kept as its own pattern so that one stays the shape ``tests/test_engine_text_survives_the_name_run.py``
+#: pins; that file scans this arm too, and engine text that it would eat (a list such as ``AA, AE or
+#: AR``) is reworded at its source, for the reason :data:`_NAME_RUN` gives. A cut at a space can fall
+#: after the comma, so :func:`_ends_with_name_token` reads a trailing comma as name-shaped.
+#:
+#: Linear for the reason :data:`_NAME_RUN` is: bounded repetition over disjoint classes, and the
+#: possessive ``\s*+`` before a capital cannot change what matches.
+_COMMA_NAME_RUN = re.compile(
+    r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3},\s*+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b"
+    r"|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){0,3},\s*+[A-Z]{2,}(?:\s+[A-Z]{2,}){0,3}\b"
+)
 #: The one name-run token that is kept: an ``MRN`` label that ENDS a run. ``INVALID MRN 12345678`` is
 #: ordinary partner negative-acknowledgment text, the run takes ``INVALID MRN``, and without its label
 #: the number is left for no pass to read. The label is not PHI; every other token of the run goes.
@@ -254,7 +341,7 @@ _MRN_LABEL_SPELLINGS = frozenset({"MRN", "Mrn"})
 def _name_run_replacement(match: re.Match[str]) -> str:
     """:data:`_REDACTED` for a :data:`_NAME_RUN` match, keeping an ``MRN`` label that ends it."""
     run = match.group()
-    last = run.rsplit(maxsplit=1)[-1]
+    last = re.split(r"[\s,]", run)[-1]
     if last not in _MRN_LABEL_SPELLINGS:
         return _REDACTED
     stem = run[: -len(last)]
@@ -555,11 +642,12 @@ _REDACT_WINDOW = 64 * 1024
 
 #: The characters :func:`_clamp` may cut at. Whitespace is the boundary because a pattern survives a
 #: cut when it either cannot contain whitespace at all or still matches with its tail gone:
-#: :data:`_HL7_FIELD_RUN`, :data:`_HL7_ENCODED_FIELD_RUN` and :data:`_DATE_RUN` are built from classes
-#: that exclude ``\s`` outright, and :data:`_HL7_SEGMENT` goes on matching from its own header whatever
-#: is cut off its tail. So a cut cannot fall inside an encoded run, which is kept or dropped whole
-#: (BACKLOG #2171, pinned in ``tests/test_redaction.py``).
-#: :data:`_NAME_RUN` has neither property, and the token walk in :func:`_clamp` is there for it.
+#: :data:`_HL7_FIELD_RUN`, :data:`_HL7_ENCODED_FIELD_RUN`, :data:`_DATE_RUN` and :data:`_SSN_RUN` are
+#: built from classes that exclude ``\s`` outright, and :data:`_HL7_SEGMENT` goes on matching from its
+#: own header whatever is cut off its tail. So a cut cannot fall inside an encoded run, which is kept or
+#: dropped whole (BACKLOG #2171, pinned in ``tests/test_redaction.py``).
+#: :data:`_NAME_RUN` and :data:`_COMMA_NAME_RUN` have neither property, and the token walk in
+#: :func:`_clamp` is there for them.
 #:
 #: **A pattern with a REQUIRED tail past a space has neither property, and this module has one.**
 #: :data:`_INVALID_URL_USERINFO` (BACKLOG #1793) landed after this cut was designed. It is head-anchored
@@ -670,7 +758,13 @@ def _ends_with_name_token(token: str) -> bool:
     **Not the one-line regex that says the same thing.** Anchored
     ``(?:[A-Z][a-z]+|[A-Z]{2,})\\Z`` is retried at every offset in the token, which is quadratic in the
     token length — the exact cost this whole change exists to bound, reintroduced inside the fix for
-    it. :meth:`str.rstrip` is the right-to-left scan this wants and it reads each character once."""
+    it. :meth:`str.rstrip` is the right-to-left scan this wants and it reads each character once.
+
+    **A trailing comma counts, for :data:`_COMMA_NAME_RUN` (vault BACKLOG #2784).** A cut at the
+    space in ``DOE, JANE`` keeps ``DOE,``, which no pattern reads alone, where the unclamped scan
+    scrubs the pair. So the comma is set aside and the token before it is judged."""
+    if token.endswith(","):
+        token = token[:-1]
     stem = token.rstrip(ascii_lowercase)
     if len(stem) < len(token):  # a trailing [a-z]+ run, so the shape can only be [A-Z][a-z]+
         return bool(stem) and stem[-1] in ascii_uppercase
@@ -1564,7 +1658,8 @@ def redact(text: str) -> str:
 
     Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN`, then the
     separator-aware pass for a message that declares delimiters outside the defaults) is handled first,
-    so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, then :data:`_NAME_RUN`) only
+    so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, :data:`_SSN_RUN`,
+    :data:`_COMMA_NAME_RUN`, then :data:`_NAME_RUN`) only
     see delimiter-free text. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
     XML elements) run after those within each round, so they can only add redaction to what the others left (the section
     comment above them says what running them first cost). The free-text heuristic narrows the prior
@@ -1754,9 +1849,15 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     if widened:
         scrubbed = _MRN_LABELLED.sub(rf"\g<1>{_REDACTED}", scrubbed)
     scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
+    scrubbed = _SSN_RUN.sub(_REDACTED, scrubbed)
     # The callback only where a label could end a run, so ordinary text keeps the C-speed constant.
     has_label = "MRN" in scrubbed or "Mrn" in scrubbed
-    return _NAME_RUN.sub(_name_run_replacement if has_label else _REDACTED, scrubbed)
+    name_replacement: Callable[[re.Match[str]], str] | str = (
+        _name_run_replacement if has_label else _REDACTED
+    )
+    if "," in scrubbed:
+        scrubbed = _COMMA_NAME_RUN.sub(name_replacement, scrubbed)
+    return _NAME_RUN.sub(name_replacement, scrubbed)
 
 
 def _whole_token_prefix(text: str, limit: int) -> int:
@@ -1939,13 +2040,121 @@ def safe_exc(
     it, routing a file source's error arm through this function would keep the OS diagnostic and leak
     the name anyway: a control that reports success while the hole stays open. The basename is
     replaced wherever it appears, so a full path is covered; the directory part is operator
-    configuration, not partner-chosen, and stays."""
+    configuration, not partner-chosen, and stays.
+
+    A ``UnicodeError`` never reaches :func:`redact` as text (vault BACKLOG #3033). Its ``str()`` quotes
+    the character or byte it failed on, which is a character of the message, and no pattern can tell
+    that apart from prose. :func:`_unicode_error_text` builds the text from the attributes instead.
+    That covers only the error itself: one rendered INTO another exception's message, as
+    ``f"bad frame: {exc}"``, still arrives here as text."""
+    if isinstance(exc, UnicodeError):
+        return safe_text(_unicode_error_text(exc), limit=limit)
     name = type(exc).__name__
     raw = str(exc)
     if file_name and (base := _basename(file_name)):
         raw = raw.replace(base, safe_name(file_name))
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
+
+
+#: A codec name as the codecs module spells one: the shape test runs before the set lookup.
+_CODEC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
+
+
+def _codec_key(name: str) -> str:
+    return name.replace("-", "").replace("_", "").lower()
+
+
+#: Every stdlib codec name and alias, normalized. Built from the ``encodings`` package rather than by
+#: ``codecs.lookup``, which runs third-party search functions and caches each name it misses: the very
+#: value this check declines to echo would stay in process memory. A third-party codec is not named.
+_KNOWN_CODECS = frozenset(
+    _codec_key(n)
+    for n in (
+        *encodings.aliases.aliases,
+        *encodings.aliases.aliases.values(),
+        *(m.name for m in pkgutil.iter_modules(encodings.__path__)),
+    )
+)
+
+#: ``.reason`` phrases known to be fixed text. At least the stdlib idna and punycode codecs put the
+#: offending label INTO ``.reason``, so a reason is rendered only from this list, never on trust.
+_FIXED_UNICODE_REASONS = frozenset(
+    {
+        "character maps to <undefined>",
+        "code pairs are not supported",
+        "code point in surrogate code point range(0xd800, 0xe000)",
+        "code point not in range(0x110000)",
+        "ill-formed sequence",
+        "illegal encoding",
+        "illegal multibyte sequence",
+        "illegal UTF-16 surrogate",
+        "incomplete multibyte sequence",
+        "invalid character",
+        "invalid continuation byte",
+        "invalid start byte",
+        "label empty or too long",
+        "label too long",
+        "non-zero padding bits in shift sequence",
+        "ordinal not in range(128)",
+        "ordinal not in range(256)",
+        "partial character in shift sequence",
+        "surrogates not allowed",
+        "truncated data",
+        "unexpected end of data",
+        "unexpected special character",
+        "unknown Unicode character name",
+        "unterminated shift sequence",
+    }
+)
+
+
+def _unicode_error_text(exc: UnicodeError) -> str:
+    """``exc`` as its class, codec, position and reason, and never the text it failed on.
+
+    ``str(UnicodeEncodeError)`` reads ``'ascii' codec can't encode character '\\xe9' in position 5``,
+    and a decode error names the byte the same way. Both are message content. ``.object`` holds the
+    whole input, so it is never read here. The position is an index, the same detail
+    ``encode_wire_body`` in transports/base.py already keeps.
+
+    The class name alone is the fallback: a bare ``UnicodeError``, or one whose attributes are missing,
+    not the standard types, or raise when read. A bare one's message is free text this function cannot
+    vouch for. ``.encoding`` is rendered only when it names a stdlib codec, so a value someone else set
+    there is not echoed. ``.reason`` is rendered only from a fixed list. Windows ``mbcs`` raises with
+    ``start == end``, so an empty span still names its position."""
+    name = type(exc).__name__
+    if isinstance(exc, UnicodeEncodeError):
+        verb = "encode"
+    elif isinstance(exc, UnicodeDecodeError):
+        verb = "decode"
+    elif isinstance(exc, UnicodeTranslateError):
+        verb = "translate"
+    else:
+        return name
+    # A subclass can make any of these a property that raises. This renderer runs inside other
+    # handlers' except arms, so it must not raise in their place. The class name still says what
+    # failed, and the caller's own arm is what logs it, so nothing is lost silently.
+    try:
+        start, end = exc.start, exc.end
+        reason = exc.reason
+        encoding = getattr(exc, "encoding", None)
+    except Exception:  # noqa: BLE001 - see above
+        return name
+    if type(start) is not int or type(end) is not int or not 0 <= start <= end:
+        return name
+    where = f"position {start}" if end <= start + 1 else f"positions {start}-{end - 1}"
+    codec = (
+        f"{encoding!r} codec "
+        if type(encoding) is str
+        and _CODEC_NAME.fullmatch(encoding)
+        and _codec_key(encoding) in _KNOWN_CODECS
+        else ""
+    )
+    text = f"{name}: {codec}cannot {verb} at {where}"
+    # `type(...) is str`, not isinstance: a str subclass can compare equal to a listed phrase.
+    if type(reason) is str and reason in _FIXED_UNICODE_REASONS:
+        text = f"{text}: {reason}"
+    return text
 
 
 def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:

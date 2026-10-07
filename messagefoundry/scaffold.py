@@ -286,6 +286,9 @@ api-generated.lock
 # ...and the new pair a startup renewal stages beside the live one before replacing it
 api-generated-key.pem.renewing
 api-generated-cert.pem.renewing
+# the config editors' cross-process lock file, and a candidate directory a killed edit left
+.mefor-edit.lock
+.*.????????.edit/
 .env
 .env.*
 /out/

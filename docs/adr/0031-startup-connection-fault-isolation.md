@@ -283,3 +283,61 @@ before apart from the create-on-write WARNING. The FILE default path's syscall c
 is the common one). `_RemoteClient.ensure_dir` now reports whether it created — a module-private
 contract with two implementations. No new schema and no new dependency; a refusal rides the existing
 `_failed`/`failed` surfacing and the `connection_stopped` alert.
+
+## Amendment (2026-10-06, vault BACKLOG #2371) — where a refused trust anchor lands
+
+**Status:** Accepted (Manager decision for #2371, which keeps this ADR). Built in the same change.
+
+**Context.** Vault BACKLOG #2371 checks the `tls_ca_file` of each connection that dials out: an
+optional `tls_ca_pin`, a refusal under `[security].enforcement = enforce` for a file another
+account could replace, and an `auth.trust_anchor` audit row. Its first build ran those checks in
+the start preflight, so one refused outbound CA refused the whole start. That is the case the
+Context above names: feed #21's downstream cert should not stop the other 20.
+
+**Decision.** Three rules. The checks themselves are stated once, in
+[`auth/trust_anchors.py`](../../messagefoundry/auth/trust_anchors.py), module item 9.
+
+1. **At start, a refused outbound, `Ftp` poller or `FhirLookup` CA is a lane degrade under §1,
+   with one exception.** The runner checks an outbound's CA inside `_start_outbound`'s isolation
+   `try`, and an `Ftp` poller's before it binds. A refusal fails that lane only, with the
+   `auth.trust_anchor` row, and §2 and §3 apply. The operator start path checks it too:
+   `_ensure_destination_built` for an outbound, and `start_inbound` for a poller. The exception is
+   a **`FhirLookup`**. Its executor is built graph-wide, which §1 leaves to the backstop, so its
+   refused CA still refuses the start.
+2. **At reload, a refused CA refuses the reload, but only on a lane the reload builds or keeps
+   running** (Manager decision, 2026-10-06). That keeps §4's fail-fast rule for what the reload
+   touches. Before it quiesces, the runner checks each lane it will build or keep running, and
+   the engine's preflight checks each `FhirLookup` and inbound listener CA. The reload does not
+   read an idle lane's CA:
+   - a lane below the DR threshold, which the reload parks;
+   - an `auto_start = false` lane that is not running;
+   - an `Ftp` poller outside its schedule window;
+   - a lane its CA refused, whose config has not changed since. The reload leaves it failed, so
+     §4's reload self-heal does not apply to it. A config change rebuilds it, and the reload
+     checks it then. An operator start, or a restart, checks and builds it too.
+
+   So the pin, permission and path checks of an idle lane never refuse a reload, a DR activation
+   or a follower convergence. Each idle lane is checked when it is built, under rule 1. **One
+   limit:** a reload's build check builds every deployed connection, and `MLLP()`, `Ftp()`,
+   `Email()` and `Direct()` read their CA file as they are built. So a CA file one of those
+   cannot read or load still refuses the reload, audited as `invalid_config`, on any deployed
+   lane, idle or not.
+3. **An inbound listener CA refused at start refuses the start. This records existing behaviour;
+   it is not a new decision.** BACKLOG #1142 slice 3 shipped it (engine PR 1535, `29ab2e60b8`):
+   the start preflight checks every inbound CA that requires a peer certificate, before any
+   listener binds. Nothing recorded it here until now.
+
+**Engine-refusal, not an ADR 0031 lane degrade, for rule 3.** It is recorded rather than changed
+because #2371 did not set out to move it. Whether an inbound listener's CA should degrade its lane
+instead is a separate question, not asked here.
+
+**Consequences.** A start with a broken outbound CA comes up degraded, and the lane reads `failed`
+with a fixed `TrustAnchorError` line that names the connection. The refusal text names the CA's
+path and its SHA-256, so it goes to the server log and the `auth.trust_anchor` rows only, as the
+connection-test route keeps it from API callers (BACKLOG #1142). A reload that leaves that lane's
+config alone goes through and leaves it failed. "Its config" includes `deployed`, `auto_start` and
+the resolved `tls_ca_file` and `tls_ca_pin`, so a fixed `env()` value counts as a change. Fixing
+the file alone does not heal it on a reload; an operator start or a restart does. A lane DR-parked
+or left down by `auto_start = false` is not checked at start or at a reload; it is checked when it
+is built. A DR park clears a lane's failed record, so the first reload after a DR release builds
+that lane and checks it.

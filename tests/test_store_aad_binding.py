@@ -181,7 +181,7 @@ async def test_totp_connection_event_alert_roundtrip(tmp_path: Path) -> None:
             kind="framing_error",
             reason="bad MLLP frame",
         )
-        evs = await store.list_connection_events(connection="IB")
+        evs = await store.list_connection_events(connection="IB", allowed_channels=None)
         assert evs and evs[0].reason == "bad MLLP frame"
         await store.upsert_alert_instance(
             event_type="connection_error",
@@ -189,7 +189,7 @@ async def test_totp_connection_event_alert_roundtrip(tmp_path: Path) -> None:
             severity="warning",
             reason="connect refused",
         )
-        alerts = await store.list_active_alert_instances()
+        alerts = await store.list_active_alert_instances(allowed_channels=None)
         assert alerts and alerts[0].reason == "connect refused"
     finally:
         await store.close()

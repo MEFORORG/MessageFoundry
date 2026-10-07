@@ -17,13 +17,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from messagefoundry.config.wiring import Registry
 from messagefoundry.mllpcodec import frame
+from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT, MLLPSource
 from scripts.security.dast_ingress_sweep import (
     KNOWN_DEFECT_DISCRIMINATORS,
@@ -47,6 +51,7 @@ from scripts.security.dast_ingress_target import (
     CANARIES,
     CANARY_DETECTOR,
     MLLP_INBOUND,
+    PLANES,
     ingress_target,
 )
 
@@ -312,6 +317,39 @@ async def test_the_connection_task_count_sees_a_live_connection() -> None:
                 break
             await asyncio.sleep(0.01)
         assert target.connection_tasks() == 0
+
+
+async def test_the_target_survives_another_process_taking_a_port_before_the_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Merge-queue intermittent, DAST ingress port race, 2026-10-07: a port picked BEFORE the engine
+    binds it can be taken in between by another process or xdist worker, and the target then came up
+    without that listener (``IngressTargetUnusable``). Reproduced deterministically by playing the
+    other process: every concrete port the graph names is bound here, after the graph is built and
+    before the engine binds it. Only a target that leaves every port choice to the bind survives."""
+    real_add_registry = Engine.add_registry
+    squatters: list[socket.socket] = []
+
+    def add_registry_after_a_squatter(self: Engine, registry: Registry) -> RegistryRunner:
+        for conn in registry.inbound.values():
+            port = conn.spec.settings["port"]
+            assert isinstance(port, int), port  # an env() port would need resolving first
+            if port:
+                squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                squatters.append(squatter)
+                squatter.bind(("127.0.0.1", port))
+        return real_add_registry(self, registry)
+
+    monkeypatch.setattr(Engine, "add_registry", add_registry_after_a_squatter)
+    settings = dict(_policy()["posture"], canary_stall_seconds=1.0)
+    try:
+        async with ingress_target(settings) as target:
+            assert set(target.ports) == set(PLANES)
+            assert all(target.ports.values()), target.ports
+            assert len(set(target.ports.values())) == len(PLANES), target.ports
+    finally:
+        for squatter in squatters:
+            squatter.close()
 
 
 def test_an_unknown_profile_fails_closed() -> None:

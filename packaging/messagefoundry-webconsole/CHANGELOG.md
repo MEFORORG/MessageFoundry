@@ -29,6 +29,12 @@ this line.**
 
 ### Security
 
+- **A route-level sign-in reject records where it came from.** The `/ui/oidc` start and callback
+  legs and `GET /ui/sso` refuse some sign-ins themselves. Examples are a missing flow cookie, an
+  IdP error, a malformed callback or Negotiate token, a failed start, and a non-navigation fetch.
+  The engine audits each one, and its `auth.login_failed` row used to carry no `client`. The
+  routes now pass the caller's address. Seam change: `audit_oidc_reject` and
+  `audit_kerberos_reject` take a required keyword `client`. (vault BACKLOG #2132)
 - **The step-up re-auth page names the action, and auto-submits only a continuation the server
   issued to this session.** `/ui/reauth` used to auto-submit whichever registered action its `next`
   named, so a typed, bookmarked or clicked link to it could turn a routine re-authentication into a
@@ -38,11 +44,27 @@ this line.**
   continuation; its re-auth returns to the purge confirm page. No seam change. (vault BACKLOG
   #2764, ADR 0065 amendment of 2026-10-06)
 
+- **A directory sign-in that newly grants Administrator pages the operators.** `GET /ui/sso` and the
+  `/ui/oidc` callback now raise the engine's `administrator_granted` alert when the sign-in's
+  directory role sync gave the account the Administrator role it did not hold before. The alert is
+  keyed `user:<username>`, with `via` set to `directory_sign_in_sso` or `directory_sign_in_oidc` and
+  `granted_by` set to `<directory>`. An account that already held the role raises nothing. Seam
+  change: the console imports `alert_directory_administrator_granted` from `api.security`. (vault
+  BACKLOG #2610)
+
 - **An IPv4 entry in `organization_domains` or `external_link_allowlist` matches only that
   address.** The interstitial check matched every entry on a label boundary. So a host that merely
   ended in a listed address would have counted as covered. The engine still accepts a canonical
   dotted-quad address in either list. It now refuses a partial or non-canonical one, and any other
   entry not shaped like a host name. No seam change. (vault BACKLOG #2843)
+- **The interstitial check reads a link the way a browser does.** It called anything starting
+  with `/` local, so `//evil.example` and `/\evil.example` would have skipped the "you are
+  leaving" page although a browser takes both to another host. Only a path on this origin is now
+  local, after the clean-up a browser applies, every percent-decoding of the path, and with no
+  `.` or `..` segment. The host check reads `https://evil.example\@hospital.example/` as
+  `evil.example`, refuses a host a browser would read differently, and the allowlist never exempts
+  a scheme other than http(s). The OIDC interstitial shows the host it judged, an IPv6 one
+  included. No seam change. (vault BACKLOG #2790)
 
 - **A cookie replayed from a second address is sent to re-authenticate before a PHI page or a
   write.** The message pages, the dead-letter list and the three reason reveals (every

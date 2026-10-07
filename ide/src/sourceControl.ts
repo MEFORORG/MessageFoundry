@@ -71,11 +71,20 @@ function out(): vscode.OutputChannel {
   return channel;
 }
 
+// Setup writes a commit hook that runs the folder's own `.venv` interpreter on every later commit,
+// and runs git inside the folder. That is the workspace-supplied-interpreter hazard cli.ts refuses in
+// an untrusted workspace (SEC-004, CWE-426), reached through `git()` and the file writes rather than
+// `run()`, so `isExecGated` does not cover it. Every entry point in this file that runs git refuses
+// until the folder is trusted; extension.ts re-offers the nudge when trust is granted.
+const UNTRUSTED_SETUP_MESSAGE =
+  "MessageFoundry: trust this workspace to set up version control and checks. The commit hook it " +
+  "installs runs this folder's own Python environment.";
+
 /** One-time, dismissible nudge: offer setup when there are config modules but no repo yet. */
 export async function maybeSuggestSourceControl(context: vscode.ExtensionContext): Promise<void> {
   const ws = workspaceDir();
-  if (!ws) {
-    return;
+  if (!ws || !vscode.workspace.isTrusted) {
+    return; // no nudge in an untrusted workspace: setup would refuse there anyway
   }
   if (!vscode.workspace.getConfiguration("messagefoundry").get<boolean>("sourceControl.autoPrompt", true)) {
     return;
@@ -133,6 +142,10 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   const ws = workspaceDir();
   if (!ws) {
     void vscode.window.showErrorMessage("MessageFoundry: open a workspace folder first.");
+    return;
+  }
+  if (!vscode.workspace.isTrusted) {
+    void vscode.window.showWarningMessage(UNTRUSTED_SETUP_MESSAGE);
     return;
   }
 
@@ -360,6 +373,11 @@ export async function setRepoStorage(): Promise<void> {
   const ws = workspaceDir();
   if (!ws) {
     void vscode.window.showErrorMessage("MessageFoundry: open a workspace folder first.");
+    return;
+  }
+  if (!vscode.workspace.isTrusted) {
+    // It runs git in the folder and rewrites its remote, and it hands off to setup.
+    void vscode.window.showWarningMessage(UNTRUSTED_SETUP_MESSAGE);
     return;
   }
   const bin = await findGit();

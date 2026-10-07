@@ -23,89 +23,23 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
-
-#: A payload whose non-ASCII characters are the thing that must never be echoed. Distinctive enough
-#: that a substring scan cannot miss it, and each is un-encodable in ASCII/latin-1 respectively.
-SECRET_CHAR = "é"  # é — un-encodable as ASCII
-CJK_CHAR = "病"  # 病 — un-encodable as ASCII *and* latin-1
-PAYLOAD = f"MSH|^~\\&|SENDER|FAC|RECV|FAC|20260714||ADT^A01|1|P|2.5\rPID|1||42||Zaf{SECRET_CHAR}r^{CJK_CHAR}\r"
-
-
-def _escapes(ch: str) -> list[str]:
-    """Every rendering of ``ch`` that could betray it in an error string.
-
-    Asserting only ``ch not in text`` is NOT enough, and getting this wrong would have made this whole
-    test file worthless: ``str(UnicodeEncodeError)`` does not print the literal character, it prints
-    the **escaped codepoint** — ``'ascii' codec can't encode character '\\xe9' in position 69``. A test
-    that scanned for a literal ``é`` would therefore have passed against the very bug it was written
-    to catch. ``\\xe9`` identifies the character exactly; it is a disclosure, not a redaction."""
-    return [
-        ch,
-        ch.encode("unicode_escape").decode("ascii"),  # '\xe9' / '病'
-        f"{ord(ch):x}",  # 'e9' / '75c5'
-        repr(ch),
-    ]
-
-
-def _assert_content_free(exc: BaseException, *, encoding: str) -> None:
-    """The raised error, and everything the engine derives from it, is free of message content —
-    in EVERY representation of the offending character, not just the literal one."""
-    rendered = f"{exc} | {exc!r} | {safe_exc(exc)}"
-    for ch in (SECRET_CHAR, CJK_CHAR):
-        for form in _escapes(ch):
-            assert form not in rendered, (
-                f"the offending character leaked into the error as {form!r} — "
-                "str(UnicodeEncodeError) escapes it rather than printing it, so this is the "
-                "representation that actually leaks"
-            )
-    assert "Zaf" not in rendered and "MSH" not in rendered, "payload content leaked into the error"
-    assert encoding in rendered, "the error should name the codec (it is actionable and safe)"
-    _assert_chain_severed(exc)
-
-
-def _walk_chain(exc: BaseException) -> list[BaseException]:
-    """Every exception reachable from ``exc`` by ATTRIBUTE, ignoring ``__suppress_context__``.
-
-    This is the instrument, and its indifference to the flag is the whole point. A structured-logging
-    serializer, a crash reporter, a debugger or any custom formatter reads ``__cause__``/``__context__``
-    directly; only the *default* traceback printer consults ``__suppress_context__``. Asserting against
-    the default rendering would pass against the very bug this exists to catch."""
-    seen: list[BaseException] = []
-    node: BaseException | None = exc.__cause__ or exc.__context__
-    while node is not None and node not in seen:
-        seen.append(node)
-        node = node.__cause__ or node.__context__
-    return seen
-
-
-def _assert_chain_severed(exc: BaseException) -> None:
-    """BOTH chains must be empty, not merely suppressed.
-
-    ``raise ... from None`` clears ``__cause__`` and sets ``__suppress_context__`` — but it LEAVES
-    ``__context__`` populated, and a ``UnicodeEncodeError``'s ``.object`` is the *entire payload*. The
-    flag only stops the default printer walking; it does not detach the exception. So the refusal must
-    be raised from OUTSIDE the ``except`` block, which is the only thing that leaves ``__context__``
-    empty (CPython sets it only when the raise happens while an exception is being handled)."""
-    assert exc.__cause__ is None, "the UnicodeEncodeError must not be chained on __cause__"
-    assert exc.__context__ is None, (
-        "the UnicodeEncodeError is still on __context__ — `from None` does NOT remove it, it only "
-        "sets __suppress_context__, and `.object` is the WHOLE payload. Raise outside the handler."
-    )
-    for link in _walk_chain(exc):
-        assert not isinstance(link, UnicodeEncodeError), (
-            f"a UnicodeEncodeError is reachable on the chain via {type(link).__name__}; "
-            "its `.object` is the entire payload"
-        )
+from tests._content_free import (
+    CJK_CHAR,
+    PAYLOAD,
+    SECRET_CHAR,
+    assert_content_free,
+    escapes,
+    walk_chain,
+)
 
 
 def test_encode_wire_body_is_content_free_and_permanent() -> None:
     with pytest.raises(NegativeAckError) as ei:
         encode_wire_body(PAYLOAD, "ascii", transport="SOAP")
     exc = ei.value
-    _assert_content_free(exc, encoding="ascii")
+    assert_content_free(exc, encoding="ascii")
     assert exc.permanent is True, "an un-encodable body will never encode on a retry"
     assert exc.code == "encoding"
     assert "SOAP" in str(exc)
@@ -131,19 +65,17 @@ def test_encode_wire_body_leaves_no_payload_on_the_context_chain() -> None:
     assert getattr(exc.__context__, "object", None) != PAYLOAD
 
     # And nothing anywhere on the chain carries the body, in any representation of the characters.
-    chain_text = " | ".join(
-        f"{link!r} {getattr(link, 'object', '')!r}" for link in _walk_chain(exc)
-    )
+    chain_text = " | ".join(f"{link!r} {getattr(link, 'object', '')!r}" for link in walk_chain(exc))
     assert "Zaf" not in chain_text and "MSH" not in chain_text
     for ch in (SECRET_CHAR, CJK_CHAR):
-        for form in _escapes(ch):
+        for form in escapes(ch):
             assert form not in chain_text, f"the offending character is reachable as {form!r}"
 
     # A chain-walking formatter renders nothing of the message either. (The DEFAULT printer already
     # honoured __suppress_context__ before the fix, so asserting on it alone would prove nothing.)
     walked = "".join(
         "".join(traceback.TracebackException.from_exception(link).format())
-        for link in [exc, *_walk_chain(exc)]
+        for link in [exc, *walk_chain(exc)]
     )
     assert "Zaf" not in walked and "\\xe9" not in walked
 
@@ -161,7 +93,7 @@ def test_latin1_catches_what_ascii_would_miss() -> None:
     assert encode_wire_body(f"ok{SECRET_CHAR}", "latin-1", transport="T") == b"ok\xe9"
     with pytest.raises(NegativeAckError) as ei:
         encode_wire_body(f"ok{CJK_CHAR}", "latin-1", transport="T")
-    _assert_content_free(ei.value, encoding="latin-1")
+    assert_content_free(ei.value, encoding="latin-1")
 
 
 # --- the connectors that used to leak ----------------------------------------
@@ -188,7 +120,7 @@ async def test_destination_send_fails_content_free(
     )
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(PAYLOAD)
-    _assert_content_free(ei.value, encoding="ascii")
+    assert_content_free(ei.value, encoding="ascii")
     assert ei.value.permanent is True
 
 
@@ -206,7 +138,7 @@ async def test_fhir_send_fails_content_free() -> None:
     )
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(body)
-    _assert_content_free(ei.value, encoding="ascii")
+    assert_content_free(ei.value, encoding="ascii")
     assert "Patient" not in str(ei.value)
     assert ei.value.permanent is True
 
@@ -228,7 +160,7 @@ async def test_x12_send_fails_content_free() -> None:
         )
         with pytest.raises(NegativeAckError) as ei:
             await dest.send(PAYLOAD)
-        _assert_content_free(ei.value, encoding="ascii")
+        assert_content_free(ei.value, encoding="ascii")
         assert ei.value.permanent is True
     finally:
         server.close()
@@ -248,7 +180,7 @@ async def test_file_destination_send_fails_content_free_and_writes_nothing(tmp_p
     )
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(PAYLOAD)
-    _assert_content_free(ei.value, encoding="ascii")
+    assert_content_free(ei.value, encoding="ascii")
     assert list(tmp_path.iterdir()) == [], "nothing may be written when the body cannot be encoded"
 
 

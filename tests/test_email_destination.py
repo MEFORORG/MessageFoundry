@@ -36,14 +36,14 @@ from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.email import EmailDestination, envelope_address_problem
 from messagefoundry.transports.mllp import InsecureHopGuard
-from tests._egress_policy import permitting
-from tests.test_encode_wire_body import (
+from tests._content_free import (
     CJK_CHAR,
     PAYLOAD,
     SECRET_CHAR,
-    _assert_content_free,
-    _escapes,
+    assert_content_free,
+    escapes,
 )
+from tests._egress_policy import permitting
 
 
 class _FakeSMTP:
@@ -1418,7 +1418,7 @@ class _Py315SetContent(EmailMessage):
 
 def _assert_refused_content_free(exc: BaseException, *, codec_named: str) -> None:
     assert _BODY_MARKER not in str(getattr(exc, "object", "")), "the error carries the payload"
-    _assert_content_free(exc, encoding=codec_named)
+    assert_content_free(exc, encoding=codec_named)
     # One line at a time, minus the File lines: a checkout path may itself hold "e9" or an accent.
     frames = "".join(traceback.format_exception(exc)).splitlines()
     surfaces = {
@@ -1430,7 +1430,7 @@ def _assert_refused_content_free(exc: BaseException, *, codec_named: str) -> Non
     for where, text in surfaces.items():
         assert _BODY_MARKER not in text, f"message content reached the {where}"
         for ch in (SECRET_CHAR, CJK_CHAR, _LONE_SURROGATE):
-            for form in _escapes(ch):
+            for form in escapes(ch):
                 assert form not in text, f"a message character reached the {where} as {form!r}"
     # The same bytes never encode on a retry, so the row dead-letters on the first attempt. A bad
     # MESSAGE, so neither flag may stop the whole lane.
@@ -1476,6 +1476,64 @@ async def test_a_body_set_content_cannot_encode_is_refused_content_free(
         await _body_dest(wire.port, "euc-jp").send(_NON_ASCII_BODY)
     _assert_refused_content_free(ei.value, codec_named="euc-jp")
     assert "UnicodeEncodeError" in str(ei.value), "the type name is the one safe detail kept"
+    assert wire.connections == 0
+
+
+def _first_unencodable(payload: str, encoding: str) -> int:
+    return next(i for i, ch in enumerate(payload) if not _encodes(ch, encoding))
+
+
+def _encodes(ch: str, encoding: str) -> bool:
+    try:
+        ch.encode(encoding)
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    ("encoding", "payload"),
+    [
+        ("us-ascii", _NON_ASCII_BODY),
+        ("latin-1", _NON_ASCII_BODY),
+        ("utf-8", _NON_ASCII_BODY + _LONE_SURROGATE),
+    ],
+    ids=["us-ascii", "latin-1", "utf-8-lone-surrogate"],
+)
+async def test_the_guard_refuses_before_the_backstop_and_names_the_position(
+    wire: _WireCapture, encoding: str, payload: str
+) -> None:
+    """Pins the guard itself (vault BACKLOG #3033). Only ``encode_wire_body`` names a position; the
+    backstop keeps the type name alone. So the tests above pass with the guard call removed, or
+    pointed at the wrong codec, because the backstop alone meets them. This one does not: each
+    case must name the first character THIS codec cannot encode."""
+    with pytest.raises(NegativeAckError) as ei:
+        await _body_dest(wire.port, encoding).send(payload)
+    position = _first_unencodable(payload, encoding)
+    assert f"first offending character at position {position})" in str(ei.value)
+    assert repr(encoding) in str(ei.value)
+    assert wire.connections == 0
+
+
+async def test_a_subject_fault_is_not_reported_as_the_body(wire: _WireCapture) -> None:
+    """The body backstop wraps ``set_content()`` alone (vault BACKLOG #3033). It used to wrap the
+    whole build, subject included, and blame the body for a subject fault.
+
+    Load refuses every subject a header cannot encode, so the subject is set after construction
+    here, as a build path that skipped the load check would leave it. Every row would fail the same
+    way, so it is a configuration fault, which stops the lane rather than dead-lettering each row."""
+    dest = _body_dest(wire.port, "utf-8")
+    dest.subject = f"Referral {_LONE_SURROGATE} note"
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(PAYLOAD)
+    exc = ei.value
+    assert "a configured header (subject, sender or recipients)" in str(exc)
+    assert "the message could not be encoded" not in str(exc)
+    assert exc.config_fault is True and exc.permanent is True
+    assert exc.__cause__ is None and exc.__context__ is None
+    stored = safe_exc(exc)
+    for form in escapes(_LONE_SURROGATE):
+        assert form not in stored, f"the subject character reached the stored error as {form!r}"
     assert wire.connections == 0
 
 

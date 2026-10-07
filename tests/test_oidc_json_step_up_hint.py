@@ -11,6 +11,10 @@ The five raise sites are the dependencies built by ``require_step_up``, ``requir
 ``require_reauth_only``, ``require_reauth_only_action`` and ``refuse_from_new_address``. No live
 route uses ``require_reauth_only`` today, so this file mounts one probe route on it.
 
+``POST /me/reauth``'s own refusal of an ``oidc`` session sends the header too, without
+``X-Step-Up-Required``, and the client's ``reauth()`` raises ``IdpStepUpRequired`` on it. That is
+pinned here as well, against the real reply.
+
 The ``oidc`` session here is minted straight into the store with ``auth_mechanism="oidc"``. The
 gates read only that column (``AuthService.session_steps_up_at_idp``), so the full federated
 sign-in, which ``tests/test_oidc_step_up.py`` drives, adds nothing to what this file pins.
@@ -27,7 +31,7 @@ import pytest
 from fastapi import Depends, FastAPI
 
 from messagefoundry.api import create_app
-from messagefoundry.api.security import require_reauth_only
+from messagefoundry.api.security import _STEP_UP_VIA_HEADER, require_reauth_only
 from messagefoundry.apiclient import ApiError, EngineClient, IdpStepUpRequired
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
@@ -249,10 +253,64 @@ async def test_the_hint_is_true_because_post_me_reauth_refuses_the_oidc_session(
         refused = await c.post("/me/reauth", headers=_auth(oidc_token), json={"password": PW})
         assert refused.status_code == 403
         assert "/ui/reauth" in refused.json()["detail"]
-        # docs/SECURITY.md says this refusal carries no X-Step-Up-Via; only the gates send it.
-        assert "X-Step-Up-Via" not in refused.headers
+        # The refusal carries the gates' header too, so a client need not parse the detail. The
+        # name is the gates' own constant, and the value is what a gate sent this same session.
+        gate = await c.post("/me/mfa/enroll", headers=_auth(oidc_token))
+        assert gate.status_code == 403, gate.text
+        assert gate.headers.get(_STEP_UP_VIA_HEADER), dict(gate.headers)
+        assert refused.headers.get(_STEP_UP_VIA_HEADER) == gate.headers[_STEP_UP_VIA_HEADER]
+        # Not a step-up demand: this route IS the step-up, so it asks for none.
+        assert "X-Step-Up-Required" not in refused.headers
         control = await c.post("/me/reauth", headers=_auth(password_token), json={"password": PW})
         assert control.status_code == 200, control.text
+        assert _STEP_UP_VIA_HEADER not in control.headers
+
+
+async def test_the_client_reauth_raises_on_the_engines_own_refusal(
+    engine: Engine, service: AuthService
+) -> None:
+    """``EngineClient.reauth()`` meets ``POST /me/reauth``'s refusal of an ``oidc`` session, the
+    real reply replayed into the real client, and raises ``IdpStepUpRequired`` (BACKLOG #2158).
+    CONTROL: the same reply with the header stripped raises a plain ``ApiError``, so the header,
+    not the status or the detail, is what the client branched on."""
+    uid = await _add_admin(service)
+    token = await _session(service, uid, "tok-client-oidc", mechanism="oidc")
+    async with _client_at(engine, service, HOME) as c:
+        real = await c.post("/me/reauth", headers=_auth(token), json={"password": PW})
+    assert real.status_code == 403, real.text
+
+    seen: list[str] = []
+
+    def _replay(headers: dict[str, str]) -> EngineClient:
+        def _answer(request: httpx.Request) -> httpx.Response:
+            seen.append(f"{request.method} {request.url.path}")
+            return httpx.Response(403, content=real.content, headers=headers, request=request)
+
+        return _client_answering(_answer)
+
+    with_header = dict(real.headers)
+    client = _replay(with_header)
+    try:
+        with pytest.raises(IdpStepUpRequired) as raised:
+            client.reauth(PW)
+    finally:
+        client.close()
+    assert raised.value.status == 403
+    assert "/ui/reauth" in str(raised.value)
+    assert seen == ["POST /me/reauth"], "the client retried"
+
+    without = {k: v for k, v in with_header.items() if k.lower() != _STEP_UP_VIA_HEADER.lower()}
+    seen.clear()
+    control = _replay(without)
+    try:
+        with pytest.raises(ApiError) as plain:
+            control.reauth(PW)
+    finally:
+        control.close()
+    assert not isinstance(plain.value, IdpStepUpRequired)
+    # The same reply, reaching the client the same way: only the header differs.
+    assert plain.value.status == 403
+    assert seen == ["POST /me/reauth"]
 
 
 # --- the client half --------------------------------------------------------------------------

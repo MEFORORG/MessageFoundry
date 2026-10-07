@@ -321,7 +321,7 @@ async def test_an_enrolled_account_cannot_self_promote_by_binding_a_second_facto
     enrollment = await service.begin_mfa_enrollment(identity)
     assert (
         await service.confirm_mfa_enrollment(
-            identity, totp.totp(enrollment.secret), token=setup.token
+            identity, fresh_totp(enrollment.secret), token=setup.token
         )
     ).ok
 
@@ -493,7 +493,13 @@ async def test_a_pending_session_cannot_end_an_enrolled_accounts_sessions(
     """
     service = await _service(
         engine,
-        AuthSettings(login_rate_limit_enabled=False, require_action_step_up=action_step_up),
+        # The floor is off: _enroll_totp_out_of_band confirms at once on the session it signed
+        # in, and the login-to-MFA floor covers that confirm (BACKLOG #2389).
+        AuthSettings(
+            login_rate_limit_enabled=False,
+            mfa_verify_min_elapsed_seconds=0,
+            require_action_step_up=action_step_up,
+        ),
     )
     await _add(service, "vic", Role.VIEWER)
     _secret, victim_token = await _enroll_totp_out_of_band(service, "vic")
@@ -759,7 +765,10 @@ async def test_a_must_change_account_with_no_factor_enrols_before_it_rotates(
     is refused ``POST /me/password`` with the fixed detail, may reach the TOTP enrolment from its
     pending session, and rotates once TOTP is on. RED against the old gate: the first rotation
     returned 200 and the enrolment returned "password change required"."""
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    # The floor is off: the confirm below runs at once on the signed-in session (BACKLOG #2389).
+    service = AuthService(
+        engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     admin = await create_admin(service)
     created = await service.create_local_user(
         username="newbie",
@@ -1211,7 +1220,7 @@ async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_en
     # The confinement is survivable: the ceremony accepts the directory account.
     enroll = await service.begin_mfa_enrollment(out.identity)
     confirmed = await service.confirm_mfa_enrollment(
-        out.identity, totp.totp(enroll.secret), token=out.token
+        out.identity, fresh_totp(enroll.secret), token=out.token
     )
     assert confirmed.recovery_codes
     # Confirming ROTATES the session (ASVS 7.2.4, BACKLOG #1146): the gate lifts on the NEW token,

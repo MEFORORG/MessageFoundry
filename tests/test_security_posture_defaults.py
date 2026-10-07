@@ -30,6 +30,7 @@ from messagefoundry.config.settings import (
     LOCKOUT_THRESHOLD_CEILING,
     AlertsSettings,
     ApiSettings,
+    ApprovalsSettings,
     AuthSettings,
     EgressSettings,
     SecretRotationSettings,
@@ -71,6 +72,7 @@ def _pairs(
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
     api: ApiSettings | None = None,
+    approvals: ApprovalsSettings | None = None,
 ) -> list[tuple[str, str]]:
     """The loosening ``(switch, risk)`` pairs for a settings combination (defaults where not
     overridden)."""
@@ -88,6 +90,7 @@ def _pairs(
         attested_hops=attested_hops,
         revocation_attested_hops=revocation_hops,
         api=api or ApiSettings(),
+        approvals=approvals or ApprovalsSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
@@ -140,6 +143,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -172,6 +176,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -201,6 +206,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -251,6 +257,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -392,6 +399,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -796,6 +804,92 @@ def test_the_oidc_flow_cache_cap_is_not_named_without_oidc() -> None:
     assert _names(auth=AuthSettings(oidc_flow_cache_max=1_000_000_000)) == []
 
 
+# --- [approvals]: the dual-control dwell floor and expiry ceiling (BACKLOG #2489) -------------------
+
+_HELD = ["dead_letter_replay"]
+
+
+def _approvals(**over: float) -> ApprovalsSettings:
+    """Dual control ON with one held operation, so its limits are live."""
+    return ApprovalsSettings(enabled=True, operations=_HELD, **over)
+
+
+@pytest.mark.parametrize(
+    ("floor", "named"),
+    [
+        (2.0, False),  # the default
+        (5.0, False),  # stricter
+        (1.9, True),
+        (1e-6, True),
+        (0.0, True),  # off
+    ],
+)
+def test_the_approval_dwell_is_named_only_below_its_default(floor: float, named: bool) -> None:
+    got = _names(approvals=_approvals(min_dwell_seconds=floor))
+    assert got == (["min_dwell_seconds"] if named else [])
+
+
+@pytest.mark.parametrize(
+    ("hours", "named"),
+    [
+        (72.0, False),  # the default
+        (1.0, False),  # stricter
+        (72.5, True),
+        (0.0, True),  # never expires
+    ],
+)
+def test_the_approval_expiry_is_named_only_above_its_default(hours: float, named: bool) -> None:
+    got = _names(approvals=_approvals(expiry_hours=hours))
+    assert got == (["expiry_hours"] if named else [])
+
+
+def test_the_approval_limits_are_not_named_while_dual_control_holds_nothing() -> None:
+    """Dual control ships OFF, so off is the shipped posture and its limits change nothing. The
+    third call is the control: the same values with an operation held are named."""
+    off = ApprovalsSettings(min_dwell_seconds=0.0, expiry_hours=0.0)
+    assert _names(approvals=off) == []
+    no_ops = ApprovalsSettings(enabled=True, operations=[], min_dwell_seconds=0.0, expiry_hours=0.0)
+    assert _names(approvals=no_ops) == []
+    held = _approvals(min_dwell_seconds=0.0, expiry_hours=0.0)
+    assert _names(approvals=held) == ["min_dwell_seconds", "expiry_hours"]
+
+
+def test_the_approval_entries_say_off_at_zero_and_quote_a_looser_value() -> None:
+    def risks(approvals: ApprovalsSettings) -> dict[str, str]:
+        return dict(_pairs(approvals=approvals))
+
+    off = risks(_approvals(min_dwell_seconds=0.0, expiry_hours=0.0))
+    assert "the moment it is made" in off["min_dwell_seconds"]
+    assert "never expires" in off["expiry_hours"]
+    weak = risks(_approvals(min_dwell_seconds=0.5, expiry_hours=96.0))
+    assert "0.5 s after it is made, sooner than the default of 2 s" in weak["min_dwell_seconds"]
+    assert "96 h, longer than the default of 72 h" in weak["expiry_hours"]
+    # A value just past the default must not print as the default.
+    near = risks(_approvals(min_dwell_seconds=1.9999999, expiry_hours=72.0000001))
+    assert "1.9999999 s" in near["min_dwell_seconds"]
+    assert "72.0000001 h" in near["expiry_hours"]
+
+
+async def test_posture_route_reports_the_approval_dwell_the_app_was_built_with(
+    engine: Engine,
+) -> None:
+    """The route reads the [approvals] the app's approval gate enforces, not a default. The
+    default app is the control."""
+
+    async def switches(approvals: ApprovalsSettings | None = None) -> list[str]:
+        app = create_app(engine, allow_no_auth=True, approvals=approvals)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            resp = await client.get("/security/posture")
+        assert resp.status_code == 200
+        return [entry["switch"] for entry in resp.json()["loosenings"]]
+
+    loose = await switches(_approvals(min_dwell_seconds=0.0, expiry_hours=0.0))
+    assert {"min_dwell_seconds", "expiry_hours"} <= set(loose)
+    default = await switches()
+    assert "min_dwell_seconds" not in default and "expiry_hours" not in default
+
+
 def test_a_zero_flow_cache_cap_refuses_every_flow() -> None:
     """Ground the direction in FlowCache: 0 is stricter, which is why it is not named."""
     from messagefoundry.auth.oidc.flow import FlowCache, FlowCacheFullError, PendingFlow
@@ -931,6 +1025,7 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             attested_hops=(),
             revocation_attested_hops=(),
             api=_proxied(*entries),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -962,6 +1057,7 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=_proxied("::/0", "::/0"),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1025,6 +1121,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=_terminated(ack=True),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1122,7 +1219,16 @@ def test_plain_ldap_with_the_opt_in_loads_under_warn_and_is_named(tmp_path: Path
     """The control arm: the same config, with only the dial moved, loads and is reported."""
     settings = _load_plain_ldap(tmp_path, "warn")
     assert settings.auth.plain_ldap_bind is True
-    assert "cleartext" in _risks(settings.security, settings.auth)["ad_allow_insecure_ldap"]
+    risk = _risks(settings.security, settings.auth)["ad_allow_insecure_ldap"]
+    assert "cleartext" in risk
+    # Directory password sign-in is retired, so the only user bind left is the step-up re-bind, and
+    # only a Kerberos session reaches it: an OIDC session steps up at the identity provider. The
+    # posture text said "every signing-in user's password"; it must name that step-up instead.
+    from tests._sign_in_claim import SIGN_IN_ANY_TENSE
+
+    assert not SIGN_IN_ANY_TENSE.search(risk), risk
+    assert "step up a Windows SSO (Kerberos) session" in risk, risk
+    assert "OIDC session steps up at the identity provider" in risk, risk
 
 
 def test_a_bare_host_with_no_scheme_is_a_plain_bind(tmp_path: Path) -> None:
@@ -1700,6 +1806,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1744,6 +1851,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1779,6 +1887,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1811,6 +1920,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
