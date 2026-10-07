@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import ast
 import json
+import keyword
 import math
 import re
 import unicodedata
@@ -2344,7 +2345,9 @@ def rewrite_source(
       gate in :func:`_render_parts`.
 
     On a ``send`` row a value is a JSON scalar (only when the current argument is a literal) or
-    ``{"expr": ...}`` spliced verbatim, as before Amendment E. A ``route`` row takes ``{"handlers":
+    ``{"expr": ...}`` spliced verbatim, but only when it runs no code (:func:`_is_inert_value`, Theia
+    review finding R1). The same holds for every ``{"expr": ...}`` an ``insert_row`` or
+    ``insert_code_lookup`` takes. A ``route`` row takes ``{"handlers":
     [names]}`` and a ``note`` row ``{"text": str}``. ``contract`` must match the version the caller
     PROJECTED with
     (:data:`CONTRACT_V1` default): the row is located through the same grammar the client saw, so a v1
@@ -3084,6 +3087,11 @@ def _splice_slots(
             )
         else:
             rendered = _render_new_value(params[pname], isinstance(node, ast.Constant), pname)
+            if isinstance(params[pname], dict):
+                # A send row's destination, or the route list this module renders itself: an ``expr``
+                # here must run no code either (Theia review finding R1). The moded branch above is
+                # stricter already -- it takes a literal only.
+                _refuse_active_expr(rendered, pname)
         if rendered is None:
             continue  # unchanged template: leave the argument's bytes exactly as they are
         start, end = _byte_span(
@@ -3110,7 +3118,8 @@ def _render_new_value(value: Any, original_is_literal: bool, pname: str) -> str:
     A JSON scalar renders to a Python **literal** — but only when the argument it replaces was itself a
     literal, so the lens never silently turns an expression slot into a literal (or the reverse). An
     ``{"expr": "<source>"}`` object splices verbatim (validated to parse as a single expression). On a
-    send row that is how a non-literal destination is edited. On an action, lookup or diagnostic row
+    send row that is how a non-literal destination is edited, and :func:`_splice_slots` then refuses
+    one that runs code (Theia review finding R1). On an action, lookup or diagnostic row
     :func:`_render_moded_value` calls this and then refuses any ``expr`` that is not a literal."""
     if isinstance(value, dict):
         expr = value.get("expr")
@@ -3341,6 +3350,80 @@ def _validated_expr(expr: str, pname: str) -> str:
             "tuple / extra comma (or a keyword/`*` splat) would inject additional call arguments"
         )
     return expr
+
+
+def _is_inert_value(node: ast.expr, *, reads_ok: bool) -> bool:
+    """Whether ``node`` is a value a typed Steps edit may write as ``{"expr": ...}``: it runs no code.
+
+    Theia review finding R1: an ``{"expr": ...}`` on ``insert_row`` (and its occurrence kwargs and the
+    code-lookup ``default``) or on a send row's destination was spliced verbatim, so a typed edit could
+    write ``__import__("os").system(...)`` into a handler. A ``set_params`` on an action, lookup or
+    diagnostic row was already closed by ADR 0076 Amendment E (only a literal); this closes the rest.
+
+    A CLOSED set, built on the existing classifiers rather than beside them. Always admitted:
+
+    * a ``static`` value (:func:`_param_mode`), a literal;
+    * a plain name (a For-Each loop index, a code-set binding), never a dunder name;
+    * a sign on a number (``-1``);
+    * a list, tuple, set or dict built only from admitted values (a ``split_field`` dests list, a
+      ``db_lookup`` params dict), with no ``*``/``**`` splat.
+
+    Admitted only where ``reads_ok`` (:func:`_insert_reads_ok`), because message content anywhere else
+    is the injection or PHI path :func:`_refuse_templated_write` names:
+
+    * a ``templated`` value, the bounded interpolation E.5 admits;
+    * a bounded message read, ``msg["LIT"]`` / ``msg.field(LIT, ...)`` (:func:`_is_bounded_message_read`),
+      or its ``or ""`` fallback form (:func:`_is_empty_fallback_read`).
+
+    Everything else is refused: any other call, any attribute access, a subscript of anything but
+    ``msg``, an operator, a lambda, a comprehension. A name or a message read can only be READ when the
+    argument is evaluated; nothing here can call, so nothing here can carry a side effect."""
+    mode = _param_mode(node)
+    if mode == MODE_STATIC:
+        return True
+    if mode == MODE_TEMPLATED or _is_bounded_message_read(node) or _is_empty_fallback_read(node):
+        return reads_ok
+    if isinstance(node, ast.Name):
+        return not (node.id.startswith("__") and node.id.endswith("__"))
+    if isinstance(node, ast.UnaryOp):
+        return (
+            isinstance(node.op, ast.USub | ast.UAdd)
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, int | float)
+            and not isinstance(node.operand.value, bool)
+        )
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
+        return all(_is_inert_value(e, reads_ok=reads_ok) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            k is not None
+            and _is_inert_value(k, reads_ok=reads_ok)
+            and _is_inert_value(v, reads_ok=reads_ok)
+            for k, v in zip(node.keys, node.values, strict=True)
+        )
+    return False
+
+
+def _insert_reads_ok(call: str, pname: str) -> bool:
+    """Whether an inserted ``call``'s ``pname`` may carry message content (a read or a template).
+
+    The value parameters :data:`_TEMPLATE_PARAMS` lists, and a live lookup's ``params`` mapping, whose
+    values are bound as query parameters rather than spliced into the statement or query text."""
+    return (call, pname) in _TEMPLATE_PARAMS or (pname == "params" and call in _ASSIGNABLE_LOOKUPS)
+
+
+def _refuse_active_expr(rendered: str, pname: str, *, reads_ok: bool = False) -> None:
+    """Refuse an ``{"expr": ...}`` value that is not :func:`_is_inert_value` (Theia review finding R1).
+
+    ``rendered`` has already passed :func:`_validated_expr`, so it parses as one expression."""
+    if not _is_inert_value(ast.parse(rendered, mode="eval").body, reads_ok=reads_ok):
+        raise LensRewriteError(
+            f"parameter {pname!r}: the expression is not a value a Steps edit may write - only a "
+            "literal, a plain name, or a list or dict of those"
+            + (", or a message read," if reads_ok else ",")
+            + " is accepted (a call, an attribute access, an operator or message content here "
+            "would run code or route message content where it must not go); edit it as text"
+        )
 
 
 # --- structural rewrites: delete / insert / move (ADR 0076 §2 phase 3 v2) ----
@@ -4260,6 +4343,40 @@ def _str_lit(value: object) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _validated_raw_test(test: str) -> str:
+    """Validate the raw ``test`` escape hatch of an ``if``/``elif`` insert: ONE expression on ONE line.
+
+    Theia review finding R1, the part ADR 0106 already implies. The escape hatch is specified as an
+    expression (``test:{expr}``), but it was spliced unchecked into ``if <test>:``, so a value carrying
+    line breaks could close the header and add statements of its own -- for ``elif``, a whole new
+    clause body. The re-parse gate cannot see that, because the result is valid Python. A single-line
+    value that parses as one expression can only ever be the condition.
+
+    This does NOT bound what the expression does: the escape hatch still takes any expression, which
+    is what ADR 0106 licenses it for (a regex condition)."""
+    if "\n" in test or "\r" in test:
+        raise LensRewriteError(
+            "the raw 'test' must be a single line - a line break would add statements to the handler"
+        )
+    try:
+        tree = ast.parse(test, mode="eval")
+    except SyntaxError as exc:
+        raise LensRewriteError(
+            f"the raw 'test' is not a single Python expression ({exc.msg})"
+        ) from exc
+    except _PARSER_REFUSALS as exc:
+        raise LensRewriteError(
+            f"the raw 'test' is not a single Python expression ({_refusal_reason(exc)})"
+        ) from exc
+    # A ``yield`` or ``await`` is an expression too, but it turns the whole handler into a generator or
+    # coroutine, which changes the function rather than the condition.
+    if any(isinstance(n, ast.Yield | ast.YieldFrom | ast.Await) for n in ast.walk(tree)):
+        raise LensRewriteError(
+            "the raw 'test' cannot yield or await - that would change the whole handler, not the condition"
+        )
+    return test
+
+
 def _render_if_test(edit: dict[str, Any]) -> str:
     """The bounded test for an ``if`` template — a structured field/operator/value, or a raw ``test`` escape.
 
@@ -4268,7 +4385,7 @@ def _render_if_test(edit: dict[str, Any]) -> str:
     same no-mini-language line ``replace_literal`` holds (ADR 0106 §7)."""
     test = edit.get("test")
     if isinstance(test, str) and test:
-        return test
+        return _validated_raw_test(test)
     field = edit.get("field")
     if not isinstance(field, str) or not field:
         raise LensRewriteError("template 'if' requires a 'field' or a raw 'test'")
@@ -4780,7 +4897,9 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
     suffix = _native_occurrence_suffix(name, params)
     if name == "set_field":
         path = _render_insert_value(params.get("path", ""), "path")
-        value = _render_insert_value(params.get("value", ""), "value")
+        value = _render_insert_value(
+            params.get("value", ""), "value", reads_ok=_insert_reads_ok(name, "value")
+        )
         write = _native_write_method(
             ast.parse(value, mode="eval").body, ast.parse(path, mode="eval").body
         )
@@ -4797,7 +4916,9 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
         return f"msg.add_segment({line})"
     if name == "add_repetition":
         path = _render_insert_value(params.get("path", ""), "path")
-        value = _render_insert_value(params.get("value", ""), "value")
+        value = _render_insert_value(
+            params.get("value", ""), "value", reads_ok=_insert_reads_ok(name, "value")
+        )
         return f"msg.add_repetition({path}, {value}{suffix})"
     # delete_segment — the recognizer reads back both ``delete_segments`` and ``delete_segment``.
     segment_id = _render_insert_value(params.get("segment_id", ""), "segment_id")
@@ -4911,7 +5032,7 @@ def _render_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> st
     Positional arguments are emitted in the helper's signature order (the leading ``msg`` verbatim where
     the helper takes one); a parameter not in the positional signature is emitted as a keyword argument
     (e.g. a keyword-only ``default=`` / ``in_fmt=``). A scalar value renders as a Python literal, an
-    ``{"expr": <source>}`` object verbatim. Refuses an unknown vocabulary name, a missing required
+    ``{"expr": <source>}`` object verbatim when it runs no code. Refuses an unknown vocabulary name, a missing required
     positional parameter, a ``msg`` parameter (it is supplied automatically — passing it would emit a
     duplicate ``msg=`` kwarg), ``assign_to`` on a mutating action/lookup (only db_lookup/fhir_lookup
     return a value — assigning an action's ``None`` reclassifies the row as ``code``), or a non-identifier
@@ -4940,14 +5061,14 @@ def _render_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> st
             continue
         if pn not in params:
             raise LensRewriteError(f"insert_row: {name!r} requires parameter {pn!r}")
-        args.append(_render_insert_value(params[pn], pn))
+        args.append(_render_insert_value(params[pn], pn, reads_ok=_insert_reads_ok(name, pn)))
         used.add(pn)
     for pn, val in params.items():
         if pn in used:
             continue
         if not (isinstance(pn, str) and pn.isidentifier()):
             raise LensRewriteError(f"insert_row: {pn!r} is not a valid keyword parameter name")
-        args.append(f"{pn}={_render_insert_value(val, pn)}")
+        args.append(f"{pn}={_render_insert_value(val, pn, reads_ok=_insert_reads_ok(name, pn))}")
     call = f"{name}({', '.join(args)})"
     if assign_to is not None:
         if name not in _ASSIGNABLE_LOOKUPS:
@@ -4960,17 +5081,28 @@ def _render_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> st
             )
         if not (isinstance(assign_to, str) and assign_to.isidentifier()):
             raise LensRewriteError("insert_row 'assign_to' must be a simple identifier")
+        if (
+            assign_to == "msg"
+            or keyword.iskeyword(assign_to)
+            or (assign_to.startswith("__") and assign_to.endswith("__"))
+        ):
+            # Rebinding ``msg`` would turn every later message read in the handler into a read of the
+            # lookup's result (Theia review finding R1); a keyword or dunder name is never a result name.
+            raise LensRewriteError(
+                f"insert_row 'assign_to' cannot be {assign_to!r} - choose a new variable name"
+            )
         call = f"{assign_to} = {call}"
     return call
 
 
-def _render_insert_value(value: Any, pname: str) -> str:
+def _render_insert_value(value: Any, pname: str, *, reads_ok: bool = False) -> str:
     """Render a NEW call argument value: a scalar as a Python literal, an ``{"expr": …}`` verbatim.
 
     Unlike :func:`_render_new_value` (which guards an existing literal-vs-expression slot), an inserted
     call has no existing argument, so a scalar always renders as a literal and an object must be
-    ``{"expr": <source>}`` (validated to parse as one expression). The rendered value must stay on a
-    single physical line (a newline would change the file's line count)."""
+    ``{"expr": <source>}`` (validated to parse as one expression, and refused unless it runs no code,
+    :func:`_is_inert_value`). The rendered value must stay on a single physical line (a newline would
+    change the file's line count)."""
     if isinstance(value, dict):
         expr = value.get("expr")
         if set(value) != {"expr"} or not isinstance(expr, str):
@@ -4985,6 +5117,8 @@ def _render_insert_value(value: Any, pname: str) -> str:
             f"parameter {pname!r}: the value must stay on a single line (a line break would change the "
             "file's line count)"
         )
+    if isinstance(value, dict):
+        _refuse_active_expr(rendered, pname, reads_ok=reads_ok)
     return rendered
 
 
