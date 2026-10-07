@@ -14,6 +14,7 @@ when not gated).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -398,6 +399,83 @@ async def test_a_dry_run_and_a_released_reload_write_no_attempt_row(engine: Engi
         assert ok.status_code == 200, ok.text
     assert await engine.store.list_audit(action="config_reload_attempted") == []
     assert len(await engine.store.list_audit(action="approval.release_attempted")) == 1
+
+
+# --- vault BACKLOG #2257: each reload's row names its own config ---------------
+
+
+async def test_two_overlapping_reloads_each_record_their_own_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reload's row is written after its swap, outside the swap lock. Pre-fix the row read the
+    engine's live state then, so a second reload that swapped in between put its own directory,
+    counts and digest on the first reload's row. Here reload A is held in its post-swap reference
+    sync until reload B has swapped."""
+    cfg_a, cfg_b = tmp_path / "cfg_a", tmp_path / "cfg_b"
+    _write_valid_config(cfg_a, tmp_path / "in_a", tmp_path / "out_a")
+    _write_valid_config(cfg_b, tmp_path / "in_b", tmp_path / "out_b")
+    # B differs from A by a second inbound, so its counts and digest both differ.
+    (cfg_b / "cfg2.py").write_text(
+        "from messagefoundry import inbound, File\n"
+        f"inbound('IB_T_ORU', File(directory={str(tmp_path / 'in_b2')!r}, pattern='*.hl7', "
+        "poll_seconds=1.0), router='r')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "in_b2").mkdir()
+    engine = await Engine.create(
+        tmp_path / "overlap.db",
+        poll_interval=0.02,
+        config_dir=cfg_a,
+        config_reload_roots=[cfg_b],
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await _service(engine)
+        await _add(service, "alice", Role.ADMINISTRATOR)
+        await _add(service, "bob", Role.ADMINISTRATOR)
+        a_held, b_swapped = asyncio.Event(), asyncio.Event()
+        real_sync = engine._reconcile_reference_sync
+        calls = 0
+
+        async def _hold_a(*, startup: bool) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:  # A, after its swap: wait until B has swapped too
+                a_held.set()
+                await b_swapped.wait()
+            else:  # B, after its swap
+                b_swapped.set()
+            await real_sync(startup=startup)
+
+        async with _client(engine, service, NOT_GATED) as c:
+            alice, bob = await _token(c, "alice"), await _token(c, "bob")
+            monkeypatch.setattr(engine, "_reconcile_reference_sync", _hold_a)
+            reload_a = asyncio.ensure_future(c.post("/config/reload", json={}, headers=alice))
+            await asyncio.wait_for(a_held.wait(), timeout=30)
+            r_b = await c.post("/config/reload", json={"config_dir": str(cfg_b)}, headers=bob)
+            r_a = await asyncio.wait_for(reload_a, timeout=30)
+        assert r_a.status_code == 200 and r_b.status_code == 200, (r_a.text, r_b.text)
+        assert (r_a.json()["inbound"], r_b.json()["inbound"]) == (1, 2)
+
+        rows = {
+            r["actor"]: json.loads(r["detail"])
+            for r in await engine.store.list_audit(action="config_reload")
+        }
+        assert set(rows) == {"alice", "bob"}
+        digest_a, _ = await engine.fingerprint_bundle(cfg_a.resolve())
+        digest_b, _ = await engine.fingerprint_bundle(cfg_b.resolve())
+        assert digest_a is not None and digest_b is not None
+        assert digest_a["fingerprint"] != digest_b["fingerprint"]
+        for actor, cfg, inbound, digest in (
+            ("alice", cfg_a, 1, digest_a),
+            ("bob", cfg_b, 2, digest_b),
+        ):
+            row = rows[actor]
+            assert row["dir"] == str(cfg.resolve()), actor
+            assert row["inbound"] == inbound, actor
+            assert row["fingerprint"] == digest["fingerprint"], actor
+    finally:
+        await engine.stop()
 
 
 # --- a dry-run is never held (it swaps nothing) -------------------------------

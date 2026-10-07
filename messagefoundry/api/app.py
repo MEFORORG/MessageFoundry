@@ -924,7 +924,10 @@ def _build_approval_gate(
             registry = outcome.registry
             # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
             failures = await _record_reload_audit(
-                engine, actor=actor, failed_steps=[f.step for f in outcome.failures]
+                engine,
+                actor=actor,
+                failed_steps=[f.step for f in outcome.failures],
+                loaded=_LoadedConfig.of(outcome),
             )
             return {
                 "inbound": len(registry.inbound),
@@ -1121,6 +1124,23 @@ class _LoadedConfig:
             registry=rr.registry if rr else None,
         )
 
+    @classmethod
+    def of(cls, outcome: ReloadOutcome) -> _LoadedConfig:
+        """What an applied reload itself loaded, read off its own outcome (vault BACKLOG #2257).
+
+        A reload's row is written after its swap, and the swap lock is released by then. A second
+        reload can swap again in between, so a live :meth:`read` at the write could name the second
+        reload's graph on the first one's row."""
+        registry = outcome.registry
+        return cls(
+            directory=str(outcome.directory),
+            shard=registry.shard_id,
+            inbound=len(registry.inbound),
+            outbound=len(registry.outbound),
+            fingerprint=dict(outcome.fingerprint) if outcome.fingerprint is not None else None,
+            registry=registry,
+        )
+
     def swapped(self, engine: Engine) -> bool:
         """Whether the engine's graph is no longer the one this snapshot read: a reload has
         swapped it, or is part way through doing so."""
@@ -1185,15 +1205,20 @@ async def _record_reload_audit(
     records the same fingerprint-bearing row as an ungated one. A cluster convergence reload writes
     its row through here too, as :data:`_CONVERGENCE_ACTOR` (vault BACKLOG #3076).
 
-    The fingerprint is the engine's :attr:`~Engine.loaded_config_fingerprint`, the digest it took
-    of the bytes it loaded, so a reload's row and ``GET /config/provenance`` name one digest. A start row a reload superseded names the
+    The fingerprint is the digest the engine took of the bytes it loaded. A reload's is its own
+    :attr:`~messagefoundry.pipeline.ReloadOutcome.fingerprint`, the value it set as
+    :attr:`~Engine.loaded_config_fingerprint`, so its row and ``GET /config/provenance`` name one
+    digest until a later reload moves the engine on. A start row a reload superseded names the
     start's digest instead (vault BACKLOG #2838). When the engine could not take one, the row is
     written without it.
 
-    ``loaded`` is what the row names as loaded: the directory, shard, counts and fingerprint. A
-    reload leaves it ``None``, and the row reads them live, at the write. The start always passes
-    one: the snapshot it took at its first load, or :data:`_UNKNOWN_LOADED` when it could not take
-    one (vault BACKLOG #2838); see :class:`_LoadedConfig`.
+    ``loaded`` is what the row names as loaded: the directory, shard, counts and fingerprint. The
+    inline route and the released executor pass :meth:`_LoadedConfig.of` their own outcome, so a
+    second reload that swaps before this row is written cannot put its graph on it (vault BACKLOG
+    #2257). Left ``None``, the row reads them live, at the write, which the cluster convergence
+    reload still does. The start always passes one: the snapshot it took at its first load, or
+    :data:`_UNKNOWN_LOADED` when it could not take one (vault BACKLOG #2838); see
+    :class:`_LoadedConfig`.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -4760,6 +4785,7 @@ def create_app(
                 actor=user.username,
                 client=client_ip(request),
                 failed_steps=failures,
+                loaded=_LoadedConfig.of(outcome),
             )
         rr = engine.registry_runner
         return ReloadResult(
