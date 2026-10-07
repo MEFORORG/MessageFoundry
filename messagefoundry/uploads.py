@@ -98,10 +98,15 @@ _LEDGER_CANCEL_WAIT_SECONDS = 5.0
 
 # How often a save that holds a cross-shard reservation touches the ledger row, so a slow save keeps
 # its slot past ``store.base.UPLOAD_RESERVATION_STALE_AFTER`` (300 s) instead of having it reclaimed
-# by a sibling shard's reserve (BACKLOG #2648). A third of that window, so the row goes stale only
-# after two touches in a row are missed. Written out rather than imported to keep this module a
+# by a sibling shard's reserve (BACKLOG #2648). A third of that window, which leaves room for touches
+# that are slow as well as one that fails. Written out rather than imported to keep this module a
 # leaf; a test pins the ratio.
 _RESERVATION_HEARTBEAT_SECONDS = 100.0
+# How long a save keeps touching its row at most. A write that never finishes would otherwise pin
+# the row, and any leaked slot in it, for as long as the process lives. Past this the heartbeat
+# stops with a WARNING and the row goes stale as it did before #2648. A write is bounded by
+# ``max_upload_bytes`` (512 MiB at most), so an hour is far past any healthy save.
+_RESERVATION_HEARTBEAT_MAX_SECONDS = 3600.0
 
 # How much of a refused plaintext sidecar the quota reads to find the uploader it bills (BACKLOG
 # #2322). A sidecar the engine wrote is a few hundred bytes. Past this the owner counts as unknown.
@@ -217,22 +222,26 @@ class UploadQuotaError(UploadError):
       waits for, and the late release that pays back a reserve left running. A cancelled reserve
       is logged whether or not a save was still waiting for it.
       **IT DOES NOT SELF-HEAL UNCONDITIONALLY, and an earlier version of this line said it did.**
-      The release statement sets ``since = <now>`` **unconditionally** (its own comment: "Never
-      conditional: refusing a release would strand the reservation it is paying back"), so every
-      *subsequent* release by the same uploader pushes the staleness clock forward. **It self-heals
-      only while that uploader is otherwise IDLE.** A uploader who keeps uploading successfully can
-      hold a leaked slot indefinitely, and the reserve path's own staleness reset never fires for it.
+      Every release, every applied reserve and every live save's heartbeat sets the row's
+      ``since`` to now (BACKLOG #2648), and the row holds one clock for all of its slots. **So a
+      leaked slot self-heals only once that uploader is otherwise IDLE** for the whole window. An
+      uploader who keeps uploading, or one save that runs a long time, can hold a leaked slot
+      indefinitely, up to the heartbeat's own cap, ``_RESERVATION_HEARTBEAT_MAX_SECONDS``.
     * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a row with no activity
       for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow one.
       Every applied reserve moves the row's clock, and a live save touches it every
       ``_RESERVATION_HEARTBEAT_SECONDS`` (:meth:`UploadStore._start_heartbeat`), so a slow save
-      keeps its slot. A live slot is still reclaimed when its holder lands no touch for the whole
-      window while it is alive: a suspended process or VM, an event loop starved for minutes, or
-      a store this shard cannot reach while a sibling can. A sibling then counts neither that file
-      nor its slot, and the holder's later release erases a sibling's slot, so the undercount
-      lasts until the ledger next drains to zero. That restores the N-1 bound above while it
-      lasts, never worse than the pre-#1112 behaviour. The window is accepted: closing it needs
-      one ledger row per reservation, a store-contract change across three backends.
+      keeps its slot. A live slot is still reclaimed in at least these cases: its holder lands no
+      touch for the whole window while it is alive (a suspended process or VM, an event loop
+      starved for minutes, or a store this shard cannot reach while a sibling can); its save
+      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; or the hosts' wall clocks disagree by a
+      large part of the window, since ``since`` is stamped from the writer's ``time.time()`` and
+      compared against the reader's. A sibling then counts neither that file nor its slot, and the
+      holder's later release erases a sibling's slot, so the undercount lasts until the ledger next
+      drains to zero. That restores the N-1 bound above while it lasts, never worse than the
+      pre-#1112 behaviour. The window is accepted: closing it needs one ledger row per
+      reservation, stamped by the store's own clock, a store-contract change across three
+      backends.
 
     The ledger is checked and paid back around the write, not in the same transaction as it, because
     the body lives on the filesystem rather than in the store. The ordering above is what stands in
@@ -990,9 +999,9 @@ class UploadStore:
                     uploader_id=uploader_id, uploader=uploader, size=len(data)
                 )
                 stop_heartbeat = asyncio.Event()
-                if reserved:
-                    self._start_heartbeat(uploader_id, stop_heartbeat)
                 try:
+                    if reserved:
+                        self._start_heartbeat(uploader_id, stop_heartbeat)
                     in_flight = (
                         await self._ledger.upload_quota_in_flight(uploader_id)
                         if self._ledger is not None
@@ -1132,7 +1141,16 @@ class UploadStore:
             return
 
         async def _beat() -> None:
+            deadline = time.monotonic() + _RESERVATION_HEARTBEAT_MAX_SECONDS
             while not stop.is_set():
+                if time.monotonic() >= deadline:
+                    _log.warning(
+                        "an upload by %s is still writing after %gs; its cross-shard reservation "
+                        "is no longer refreshed and will be reclaimed when it goes stale",
+                        uploader_id,
+                        _RESERVATION_HEARTBEAT_MAX_SECONDS,
+                    )
+                    return
                 try:
                     await asyncio.wait_for(stop.wait(), _RESERVATION_HEARTBEAT_SECONDS)
                 except TimeoutError:
@@ -1233,11 +1251,9 @@ class UploadStore:
         an earlier wait already absorbed. A release still running at the bound is logged and left
         to finish on its own, which pays the slot back if it succeeds.
 
-        A reservation that is never released is reclaimed once the row goes stale — **but only while
-        that uploader is otherwise IDLE.** This statement sets ``since = <now>`` unconditionally, so
-        each later release by the same uploader restarts the staleness clock and a leaked slot can
-        survive indefinitely under continued activity. See
-        :meth:`messagefoundry.store.base.Store.reserve_upload_quota`."""
+        A reservation that is never released is reclaimed once the row goes stale, **but only once
+        that uploader is otherwise IDLE**: this release, like every applied reserve and heartbeat,
+        restarts the row's staleness clock. :class:`UploadQuotaError` states the residual."""
         ledger = self._ledger
         if ledger is None:
             return
