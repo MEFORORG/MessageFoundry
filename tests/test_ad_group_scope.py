@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -702,7 +703,12 @@ async def test_a_sign_in_that_takes_over_a_legacy_scope_mid_save_is_a_conflict(
     assert await _scope_row(engine, ada_id) == ('["IB_B"]', SCOPE_SOURCE_AD)  # the sign-in's
     # BACKLOG #2271: one row, whose owner is the one read after the failed write.
     [row] = await _audit_rows(engine)
-    assert (row["reason"], row["expected_source"], row["owner"]) == ("source_changed", "ad", "ad")
+    assert (row["reason"], row["expected_source"], row["read_source"], row["owner"]) == (
+        "source_changed",
+        "ad",
+        None,  # the legacy NULL the compare-and-set expected
+        "ad",
+    )
 
 
 @pytest.mark.parametrize(
@@ -769,6 +775,7 @@ async def test_a_sign_in_between_the_read_and_the_write_is_a_conflict(
         "username": "ada",
         "reason": "source_changed",
         "expected_source": expected_source,
+        "read_source": SCOPE_SOURCE_MANUAL,
         "owner": SCOPE_SOURCE_AD,  # who took it, read after the write failed
     }
 
@@ -799,7 +806,13 @@ async def test_each_refused_save_writes_one_audit_row(engine: Engine) -> None:
         assert r.status_code == 409
         r = await c.put(url, json={"channels": ["IB_Z"], "expected_source": "manual"}, headers=h)
         assert r.status_code == 409
-        expected = {"actor": "boss", "user_id": ada_id, "username": "ada", "owner": SCOPE_SOURCE_AD}
+        expected = {
+            "actor": "boss",
+            "user_id": ada_id,
+            "username": "ada",
+            "read_source": SCOPE_SOURCE_AD,
+            "owner": SCOPE_SOURCE_AD,
+        }
         assert await _audit_rows(engine) == [
             {**expected, "reason": "directory_owned", "expected_source": None},
             {**expected, "reason": "expected_source_mismatch", "expected_source": "manual"},
@@ -814,7 +827,7 @@ async def test_each_refused_save_writes_one_audit_row(engine: Engine) -> None:
 
 
 async def test_a_refusal_whose_audit_row_fails_still_answers_409(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #2271: a store that refuses the refusal's audit row does not turn the 409 into a
     500, so the console still shows a refused save with the edits kept."""
@@ -838,6 +851,29 @@ async def test_a_refusal_whose_audit_row_fails_still_answers_409(
     assert r.status_code == 409
     assert attempts == [CHANNEL_SCOPE_CHANGE_REFUSED_ACTION]  # the row was tried, then refused
     assert await _scope_row(engine, ada_id) == ('["IB_A"]', SCOPE_SOURCE_AD)
+    # The ERROR line is the only record left, so it must be there and name the action.
+    [logged] = [
+        rec
+        for rec in caplog.records
+        if rec.levelno == logging.ERROR and CHANNEL_SCOPE_CHANGE_REFUSED_ACTION in rec.getMessage()
+    ]
+    assert "boss" in logged.getMessage()
+
+
+async def test_a_defect_in_the_refusal_row_is_raised(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2271: a defect in the audit write is raised, not logged and passed over, so a
+    broken backend cannot leave every refusal silently rowless."""
+    service = await _admin_service(engine)
+    ada_id = await _directory_scoped_user(engine, service)
+
+    async def not_built(action: str, **kwargs: object) -> None:
+        raise NotImplementedError("record_audit")
+
+    monkeypatch.setattr(engine.store, "record_audit", not_built)
+    with pytest.raises(NotImplementedError):
+        await service.set_channel_scope(ada_id, ["IB_Z"], actor="boss")
 
 
 async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:
