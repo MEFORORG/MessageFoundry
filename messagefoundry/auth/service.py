@@ -128,6 +128,7 @@ from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AdminRemoval,
     AuditAppend,
     ChannelScopeSource,
     FederatedUnbind,
@@ -631,13 +632,21 @@ EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a c
 
 #: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
 #: account whose stored roles are not all among the roles its current groups map to (BACKLOG #2240).
-#: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes.
+#: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes. The federated
+#: step-up leg refuses with it too, as its own closed-set reason (BACKLOG #2154).
 DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 
 #: The closed-set reasons the federated step-up leg refuses with (BACKLOG #296), on the
 #: ``auth.reauth`` audit row and on :class:`OidcStepUp`. A claims-ladder slug can also appear there.
 STEP_UP_NOT_FRESH = "step_up_not_fresh"
 STEP_UP_SUBJECT_MISMATCH = "step_up_subject_mismatch"
+#: The IdP-clock freshness test's two refusals (BACKLOG #2143), kept apart from the engine-clock
+#: :data:`STEP_UP_NOT_FRESH`. MISSING never clears on a retry against the same session, which holds
+#: no IdP ``auth_time`` to compare. NOT_LATER clears once the IdP answers with a later one, for
+#: example after a stepped-back IdP clock passes the held value. It does not clear while the IdP
+#: keeps answering from an earlier sign-in, or while a slower IdP node answers.
+STEP_UP_IDP_AUTH_TIME_MISSING = "step_up_idp_auth_time_missing"
+STEP_UP_IDP_AUTH_TIME_NOT_LATER = "step_up_idp_auth_time_not_later"
 FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
 
 #: The audit reason for a second step refused under its ASVS 2.4.2 minimum-elapsed floor (BACKLOG
@@ -657,6 +666,19 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
             "The identity provider signed in a different account from the one this session belongs"
             " to. Sign in at the provider as yourself, then try again."
         ),
+        # A new sign-in stores a new IdP auth_time, which is what the next step-up is compared
+        # with. MISSING says only that, because a retry on this session cannot pass. NOT_LATER
+        # offers a retry first, because a later IdP answer can pass it (see the reasons above).
+        STEP_UP_IDP_AUTH_TIME_MISSING: (
+            "This session holds no sign-in time from the identity provider, so the provider cannot"
+            " confirm it's you here. Sign out, then sign in again."
+        ),
+        STEP_UP_IDP_AUTH_TIME_NOT_LATER: (
+            "The identity provider's answer is no newer than this session's last confirmation, so"
+            " it could not confirm it's you. Try again. If it repeats, sign out, then sign in again."
+            " If it still repeats, the provider may be ignoring max_age=0 and prompt=login, or its"
+            " clocks may disagree."
+        ),
         "session_gone": "Your session ended. Sign in again.",
         "state_unknown": "The confirmation expired. Try again.",
         "state_mismatch": "The confirmation could not be matched to this browser. Try again.",
@@ -668,6 +690,12 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
             "Your directory account could not be found or is disabled. Ask an administrator."
         ),
         "directory_unavailable": "The directory is unavailable. Try again later.",
+        # The documented fix is a new sign-in, which takes its roles from the current groups
+        # (BACKLOG #2154). An administrator has nothing to change.
+        DIRECTORY_ROLES_DEMOTED: (
+            "Your directory groups no longer grant the roles this session holds. Sign out, then"
+            " sign in again to take the roles your groups grant now."
+        ),
     }
 )
 
@@ -856,6 +884,11 @@ class MfaStatus:
 
 class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
+
+
+class LastAdministratorRefused(RuntimeError):
+    """An administrator's change would have left no enabled administrator (vault BACKLOG #2779).
+    Raised before anything is written. The message is the operator-facing refusal."""
 
 
 class TemporaryPasswordUnavailable(RuntimeError):
@@ -1444,6 +1477,9 @@ _REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
     DirectoryAnswer.NOT_FOUND: reconcile.ProbeOutcome.ABSENT,
     DirectoryAnswer.DISABLED: reconcile.ProbeOutcome.DISABLED,
     DirectoryAnswer.UNDETERMINED: reconcile.ProbeOutcome.UNDETERMINED,
+    # Vault BACKLOG #2778. Fail closed: no entry is provably this account, so its sessions end
+    # after the strikes, as for a missing one. A wave of these is not held the way UNDETERMINED is.
+    DirectoryAnswer.AMBIGUOUS: reconcile.ProbeOutcome.ABSENT,
 }
 
 #: The ``auth.reauth`` reason for each step-up re-bind whose lookup judged no password (BACKLOG
@@ -1456,6 +1492,11 @@ _REBIND_REFUSALS: Final[Mapping[DirectoryAnswer | None, str]] = MappingProxyType
         DirectoryAnswer.NOT_FOUND: "not_in_directory",
         DirectoryAnswer.DISABLED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED],
         DirectoryAnswer.UNDETERMINED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.UNDETERMINED],
+        # Vault BACKLOG #2778. The id-keyed search shares `_search_user`, so a directory that
+        # answers two entries for one objectGUID is refused as AMBIGUOUS there too. No entry is
+        # provably the row's own, which is what `not_in_directory` already means, and the
+        # reconciler reads the same answer as ABSENT. Without this arm the lookup raised KeyError.
+        DirectoryAnswer.AMBIGUOUS: "not_in_directory",
     }
 )
 
@@ -1572,9 +1613,9 @@ class _DirectoryRebind:
     ``not_in_directory``, ``directory_disabled`` or ``directory_undetermined``, and, from a
     directory implementation that does not check the id itself, ``directory_object_id_missing`` or
     ``directory_identity_conflict`` (``None`` whether or not the bind succeeded).
-    ``not_in_directory`` means no entry for the row's id, or an entry that does not read the id
-    back. Since BACKLOG #2434 a disabled entry and an unreadable account state have their own
-    slugs, read from the bind's own lookup."""
+    ``not_in_directory`` means no entry for the row's id, an entry that does not read the id
+    back, or more than one entry for it (vault BACKLOG #2778). Since BACKLOG #2434 a disabled entry
+    and an unreadable account state have their own slugs, read from the bind's own lookup."""
 
     verdict: bool | None
     reason: str | None = None
@@ -2573,11 +2614,12 @@ class AuthService:
         """Record a failed boot-time SPNEGO acceptor preflight (app lifespan, ADR 0068 §9)."""
         self._kerberos_unavailable_reason = reason
 
-    async def audit_kerberos_reject(self, reason: str) -> None:
-        """AUTH-K-AUDIT for route-level SSO rejects that never reach ``authenticate_kerberos``
-        (cross-site hygiene, rate-limit exhaustion, malformed base64) — every reject path of a
-        Windows-SSO attempt must be visible to a defender."""
-        await self._directory_reject_audit("<kerberos>", "kerberos", reason)
+    async def audit_kerberos_reject(self, reason: str, *, client: str | None) -> None:
+        """AUTH-K-AUDIT for route-level SSO rejects that never reach ``authenticate_kerberos``, such
+        as cross-site hygiene and malformed base64, so a defender sees them. Rate-limit exhaustion
+        is a log line at the route, never a row. ``client`` is the route's address for the caller
+        (BACKLOG #2132)."""
+        await self._directory_reject_audit("<kerberos>", "kerberos", reason, client=client)
 
     @property
     def oidc_enabled(self) -> bool:
@@ -2621,11 +2663,13 @@ class AuthService:
         """Record that the IdP answered. This is the half that makes recovery restart-free (AC-8)."""
         self._oidc_unavailable_reason = None
 
-    async def audit_oidc_reject(self, reason: str) -> None:
-        """Route-level federated-login rejects that never reach :meth:`authenticate_oidc` (flow-cookie
-        binding failures, rate-limit exhaustion, a non-navigation fetch). ``reason`` must be a
-        closed-set slug chosen by the route — never IdP-supplied text."""
-        await self._directory_reject_audit("<oidc>", "oidc", reason)
+    async def audit_oidc_reject(self, reason: str, *, client: str | None) -> None:
+        """Route-level federated-login rejects that never reach :meth:`authenticate_oidc`, such as
+        flow-cookie binding failures, a malformed callback and a non-navigation fetch. Rate-limit
+        exhaustion is a log line at the route, never a row. ``reason`` must be a closed-set slug
+        chosen by the route — never IdP-supplied text. ``client`` is the route's address for the
+        caller (BACKLOG #2132)."""
+        await self._directory_reject_audit("<oidc>", "oidc", reason, client=client)
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -3342,7 +3386,9 @@ class AuthService:
             # path any AD-stamped identity has -- Kerberos and OIDC logins are stamped AD too -- so
             # removing it in the same change would lock every AD operator out of factor enrolment
             # and MFA-disable. See docs/research/ad-step-up-after-simple-bind-retirement.md.
-            await self._directory_reject_audit(username, "simple_bind", "pathway_retired")
+            await self._directory_reject_audit(
+                username, "simple_bind", "pathway_retired", client=client
+            )
             return LoginOutcome(
                 ok=False,
                 error="Directory password sign-in has been retired; use Windows SSO or OIDC",
@@ -3558,6 +3604,7 @@ class AuthService:
             # session re-authenticated once the code is proved whatever the address (ADR 0197).
             seed_reauth=combined or (not mfa_required and address is not _LoginAddress.NEW),
             mechanism=SessionMechanism.PASSWORD,
+            idp_auth_time=None,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
         await self._record_login_address(
@@ -3755,12 +3802,16 @@ class AuthService:
         # Audit every reject path so blocked/failed Windows-SSO attempts are not invisible to a
         # defender (AUTH-K-AUDIT). A sentinel actor is used until the principal is known.
         if self._ldap is None or not self._settings.kerberos_enabled:
-            await self._directory_reject_audit("<kerberos>", "kerberos", "not_configured")
+            await self._directory_reject_audit(
+                "<kerberos>", "kerberos", "not_configured", client=client
+            )
             return LoginOutcome(ok=False, error="Windows SSO is not configured")
         try:
             username = await asyncio.to_thread(kerberos_principal, token, self._settings)
             if username is None:
-                await self._directory_reject_audit("<kerberos>", "kerberos", "no_principal")
+                await self._directory_reject_audit(
+                    "<kerberos>", "kerberos", "no_principal", client=client
+                )
                 return LoginOutcome(ok=False, error="SSO authentication failed")
             principal = await asyncio.to_thread(self._ldap.resolve_principal, username)
         except LdapError as exc:
@@ -3772,7 +3823,9 @@ class AuthService:
             )
             return LoginOutcome(ok=False, error="directory unavailable")
         if principal is None:
-            await self._directory_reject_audit(username, "kerberos", "not_in_directory")
+            await self._directory_reject_audit(
+                username, "kerberos", "not_in_directory", client=client
+            )
             return LoginOutcome(ok=False, error="user not found in directory")
         # MINT AT THE MINIMUM (BACKLOG #1144, ASVS 6.8.4). A Kerberos service ticket carries no
         # factor-strength assertion that pyspnego surfaces, so the engine learns NOTHING about what
@@ -3934,18 +3987,18 @@ class AuthService:
         clock: _PadClock,
     ) -> LoginOutcome:
         if not self.oidc_enabled or self._oidc_flows is None:
-            await self._directory_reject_audit("<oidc>", "oidc", "not_configured")
+            await self._directory_reject_audit("<oidc>", "oidc", "not_configured", client=client)
             return LoginOutcome(
                 ok=False, error="federated sign-in is not configured", reason="not_configured"
             )
         flow = self._oidc_flows.pop(flow_id)
         if flow is None:
-            await self._directory_reject_audit("<oidc>", "oidc", "state_unknown")
+            await self._directory_reject_audit("<oidc>", "oidc", "state_unknown", client=client)
             return LoginOutcome(
                 ok=False, error="federated sign-in expired; start again", reason="state_unknown"
             )
         if not oidc.state_matches(flow.state, state):
-            await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch")
+            await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch", client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
         # The INNER leg: the public wrapper would pad a second time inside this challenge's pad.
         return await self._authenticate_oidc(
@@ -3999,7 +4052,7 @@ class AuthService:
         than privilege escalation.
         """
         if not self.oidc_enabled or self._ldap is None:
-            await self._directory_reject_audit("<oidc>", "oidc", "not_configured")
+            await self._directory_reject_audit("<oidc>", "oidc", "not_configured", client=client)
             return LoginOutcome(
                 ok=False, error="federated sign-in is not configured", reason="not_configured"
             )
@@ -4007,7 +4060,9 @@ class AuthService:
             # BACKLOG #296. A STEP-UP flow never mints a session. It was staged to elevate one live
             # session, and signing in on it would hand the browser a second, fresh session instead.
             # Refused before the code is redeemed, so the IdP proof is spent on nothing.
-            await self._directory_reject_audit("<oidc>", "oidc", FLOW_PURPOSE_MISMATCH)
+            await self._directory_reject_audit(
+                "<oidc>", "oidc", FLOW_PURPOSE_MISMATCH, client=client
+            )
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason=FLOW_PURPOSE_MISMATCH
             )
@@ -4027,7 +4082,7 @@ class AuthService:
         except oidc.ClaimsError as exc:
             # A verification-rung failure: the token was reachable but did not satisfy the ladder.
             # exc.reason is closed-set, so nothing IdP-influenced reaches the audit row.
-            await self._directory_reject_audit("<oidc>", "oidc", exc.reason)
+            await self._directory_reject_audit("<oidc>", "oidc", exc.reason, client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=exc.reason)
         except oidc.TokenRefusedError as exc:
             # BACKLOG #1948. The token endpoint ANSWERED with a 4xx, which a signed-out caller
@@ -4158,7 +4213,9 @@ class AuthService:
             # ADR 0184 part 3 and AC-3. The bind route refuses a LOCAL row, so this is the second
             # layer: a binding placed on one by any other means still never signs a LOCAL account in
             # through the directory path.
-            await self._directory_reject_audit(username, "oidc", "local_account_conflict")
+            await self._directory_reject_audit(
+                username, "oidc", "local_account_conflict", client=client
+            )
             return LoginOutcome(ok=False, error="account conflict", reason="local_account_conflict")
         if not bound.directory_object_id:
             # BACKLOG #2027 (ADR 0184 AC-5). A BOUND ROW WITH NO IMMUTABLE ID IS REFUSED, NOT
@@ -4175,7 +4232,9 @@ class AuthService:
             #
             # The error is the generic one, and the web console collapses this slug to
             # `oidc_failed`. The precise reason is on the audit row, for the operator.
-            await self._directory_reject_audit(username, "oidc", DIRECTORY_OBJECT_ID_MISSING)
+            await self._directory_reject_audit(
+                username, "oidc", DIRECTORY_OBJECT_ID_MISSING, client=client
+            )
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
             )
@@ -4203,7 +4262,7 @@ class AuthService:
             )
         if principal is None:
             # Hybrid-only by design: a bound account with no on-prem AD object is refused.
-            await self._directory_reject_audit(username, "oidc", "not_in_directory")
+            await self._directory_reject_audit(username, "oidc", "not_in_directory", client=client)
             return LoginOutcome(
                 ok=False, error="user not found in directory", reason="not_in_directory"
             )
@@ -4216,7 +4275,7 @@ class AuthService:
             # The ladder accepts an exp up to clock_skew_seconds in the PAST, so a token inside the
             # grace window would otherwise mint an already-dead session: the user "logs in" and is
             # revoked on their first request, with no audited reason. Refuse loudly instead.
-            await self._directory_reject_audit(username, "oidc", "expired")
+            await self._directory_reject_audit(username, "oidc", "expired", client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="expired")
         # BACKLOG #1150 (ASVS 6.8.4 / 7.6.1): the session also ends max_age after the user last
         # authenticated AT THE IdP. The ladder checks recency only at login. The IdP step-up leg
@@ -4232,7 +4291,7 @@ class AuthService:
             min(principal_claims.auth_time, now) + self._settings.oidc_max_age_seconds
         )
         if recency_deadline <= now:
-            await self._directory_reject_audit(username, "oidc", "auth_time_stale")
+            await self._directory_reject_audit(username, "oidc", "auth_time_stale", client=client)
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason="auth_time_stale"
             )
@@ -4261,6 +4320,9 @@ class AuthService:
             },
             max_expires_at=max_expires_at,
             federated_subject=(principal_claims.issuer, principal_claims.subject),
+            # BACKLOG #2143: the RAW verified auth_time, not the clamped value the cap above uses.
+            # The step-up compares the IdP's next auth_time with it, IdP clock against IdP clock.
+            idp_auth_time=principal_claims.auth_time,
             # ASVS 7.2.4: the session the START leg saw (see PendingFlow.prior_session_hash).
             supersedes_hash=flow.prior_session_hash,
         )
@@ -4401,14 +4463,16 @@ class AuthService:
         """Redeem a step-up flow and, when the IdP proof holds, elevate the staged session.
 
         Checks, in order, each failing CLOSED with nothing elevated: the flow exists and ``state``
-        matches; it is a step-up flow; the code exchange and the whole claims ladder pass (the nonce,
-        the pinned issuer, ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA
-        claim when that gate is on); the session is still live by every test
-        :meth:`identity_for_token` applies, and still an OIDC session; ``auth_time`` is fresh (see
-        the inline note); the account is enabled, still a directory account, and still in the
-        directory; and the token's verified ``(issuer, sub)`` is byte-for-byte the pair bound to the
-        account. Then it elevates through :meth:`_elevated_hash`, so rotation, the MFA carry and the
-        single-use grant follow the password leg's rules exactly.
+        matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG
+        #2301); the code exchange and the whole claims ladder pass (the nonce, the pinned issuer,
+        ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA claim when that gate
+        is on); the session is still live by every test :meth:`identity_for_token` applies, and
+        still an OIDC session; the account is enabled and still a directory account; the token's
+        verified ``(issuer, sub)`` is byte-for-byte the pair bound to the account; ``auth_time`` is
+        fresh by our clock (see the inline note); the session holds an IdP ``auth_time``, and the
+        new one is later; the directory still has the account; and every role stored on the
+        account is among the roles its current groups map to (BACKLOG #2154). Then it elevates through :meth:`_elevated_hash`, so
+        rotation, the MFA carry and the single-use grant follow the password leg's rules exactly.
 
         Refusals are audited under the staged session's account wherever the flow names one, so they
         appear in that person's security events rather than under an anonymous actor.
@@ -4481,18 +4545,6 @@ class AuthService:
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
             )
-        # FRESHNESS. max_age=0 and prompt=login ask the IdP to authenticate the user afresh, so a
-        # conforming IdP's auth_time postdates this request. auth_time is IdP clock and issued_at
-        # is ours, so the floor allows the configured skew for an IdP clock that runs behind.
-        # RESIDUAL, stated exactly: an IdP that ignores max_age=0 still passes when its last
-        # sign-in for this user is within oidc_clock_skew_seconds of this request. Closing that
-        # needs the sign-in's own IdP auth_time stored on the session, so the comparison is IdP
-        # clock against IdP clock; engine timestamps such as created_at would mix the two clocks.
-        skew = self._settings.oidc_clock_skew_seconds
-        if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
-            return await self._step_up_refused(
-                STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
-            )
         user = await self._store.get_user(session.user_id)
         if user is None or user.disabled or user.auth_provider != AuthProvider.AD.value:
             return await self._step_up_refused(
@@ -4507,8 +4559,40 @@ class AuthService:
             # shared browser, or another person's IdP session. Nothing is elevated. The session is
             # left as it was rather than revoked, because whoever holds this flow cookie already
             # holds the session cookie in the same browser.
+            # BEFORE both freshness tests (BACKLOG #2143), so another person's answer that passed
+            # the claims ladder is filed as a subject mismatch whatever its auth_time. Both tests
+            # below judge this session's identity, so neither is the right name for someone else.
             return await self._step_up_refused(
                 STEP_UP_SUBJECT_MISMATCH, actor=actor, client=client, return_to=return_to
+            )
+        # FRESHNESS, two tests, and both must pass. max_age=0 and prompt=login ask the IdP to
+        # authenticate the user afresh, so a conforming IdP's auth_time postdates this request.
+        # (a) Against our clock: auth_time is IdP clock and issued_at is ours, so the floor allows
+        # the configured skew for an IdP clock that runs behind.
+        skew = self._settings.oidc_clock_skew_seconds
+        if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
+            return await self._step_up_refused(
+                STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
+            )
+        # (b) Against the IdP's own clock (BACKLOG #2143): auth_time must be LATER than the one the
+        # session holds, which is the sign-in's or the last step-up's. No skew applies, because
+        # both values come from the IdP. This closes most of what (a) alone left: an IdP that
+        # ignores max_age=0 and answers from the sign-in, or from the last step-up, within the skew.
+        # A NULL (an oidc row written before the column existed) cannot be compared, so it refuses.
+        # RESIDUAL, stated exactly: an IdP that ignores max_age=0 still passes when its last
+        # sign-in for this user is later than the value the session holds and within
+        # oidc_clock_skew_seconds of this request. The cost of (b): an IdP clock that steps back, or
+        # IdP nodes whose clocks disagree, refuse a real re-authentication until it passes the value.
+        # Each arm has its own closed-set reason, apart from (a)'s STEP_UP_NOT_FRESH, so the audit
+        # row and the operator's text say which one refused.
+        held_auth_time = session.idp_auth_time
+        if held_auth_time is None:
+            return await self._step_up_refused(
+                STEP_UP_IDP_AUTH_TIME_MISSING, actor=actor, client=client, return_to=return_to
+            )
+        if principal_claims.auth_time <= held_auth_time:
+            return await self._step_up_refused(
+                STEP_UP_IDP_AUTH_TIME_NOT_LATER, actor=actor, client=client, return_to=return_to
             )
         # The DIRECTORY still has the account. The password re-bind this leg replaces failed for a
         # disabled or deleted AD object, and the sign-in leg refuses one as not_in_directory. An IdP
@@ -4539,10 +4623,24 @@ class AuthService:
             return await self._step_up_refused(
                 "not_in_directory", actor=actor, client=client, return_to=return_to
             )
+        # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
+        # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
+        # (#2240). Inline rather than through that helper, because its probe would change this
+        # leg's not_in_directory reason. Only a LOST role refuses; refusing writes nothing, and the
+        # reconciler or the next sign-in re-syncs the roles.
+        held = set(await self._store.get_user_role_ids(user.id))
+        if not held <= await self._store.roles_for_ad_groups(principal.groups):
+            return await self._step_up_refused(
+                DIRECTORY_ROLES_DEMOTED, actor=actor, client=client, return_to=return_to
+            )
         purpose = flow.step_up_purpose
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
-        await self._store.mark_session_reauthed(token_hash, client=client)
+        # The accepted auth_time is written in the same statement (BACKLOG #2143), so the next
+        # step-up must show a later one: this answer replayed by the IdP is then refused.
+        await self._store.mark_session_reauthed(
+            token_hash, client=client, idp_auth_time=principal_claims.auth_time
+        )
         self._restart_new_ip_dedupe(token_hash)
         grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
             token_hash, purpose
@@ -4645,13 +4743,20 @@ class AuthService:
         )
         return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
 
-    async def _directory_reject_audit(self, actor: str, mech: str, reason: str) -> None:
+    async def _directory_reject_audit(
+        self, actor: str, mech: str, reason: str, *, client: str | None
+    ) -> None:
         """Audit a rejected directory-SSO attempt. ``mech`` is the mechanism slug ("kerberos" /
-        "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored."""
+        "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored.
+
+        ``client`` is keyword-only with no default, so every caller must name it (BACKLOG #2132).
+        The type still accepts ``None``, so this forces a decision and does not enforce an address.
+        A run of refusals is how a spray shows, and the operator needs to see its source."""
         await self._audit(
             "auth.login_failed",
             actor=actor,
             detail=_json({"provider": "ad", "mech": mech, "reason": reason}),
+            client=client,
         )
 
     async def _complete_ad_login(
@@ -4670,6 +4775,9 @@ class AuthService:
         max_expires_at: float | None = None,
         federated_subject: tuple[str, str] | None = None,
         supersedes_hash: str | None = None,
+        # BACKLOG #2143: the federated sign-in's verified auth_time, stored on the session. Only the
+        # federated caller passes it; a Kerberos session has no IdP clock to compare.
+        idp_auth_time: float | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
         # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller's audit row is
@@ -4685,6 +4793,10 @@ class AuthService:
                 "a federated login (federated_subject or mech='oidc') needs the OIDC session"
                 " mechanism, and only a federated login may use it"
             )
+        if federated and idp_auth_time is None:
+            # BACKLOG #2143, also a programming error. An OIDC session minted with no IdP auth_time
+            # stores NULL, and every IdP step-up on it is then refused. Fail at the mint instead.
+            raise ValueError("a federated login needs the verified IdP auth_time")
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
             # Never let an AD login adopt/overwrite a like-named LOCAL account (provider confusion).
@@ -4719,7 +4831,7 @@ class AuthService:
             # below is reached only through a directory implementation that does not check it.
             if federated:
                 await self._directory_reject_audit(
-                    principal.username, "oidc", DIRECTORY_OBJECT_ID_MISSING
+                    principal.username, "oidc", DIRECTORY_OBJECT_ID_MISSING, client=client
                 )
                 return LoginOutcome(
                     ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
@@ -4844,7 +4956,7 @@ class AuthService:
             reason = (
                 FEDERATED_SUBJECT_NOT_BOUND if holder is None else "federated_subject_already_bound"
             )
-            await self._directory_reject_audit(principal.username, "oidc", reason)
+            await self._directory_reject_audit(principal.username, "oidc", reason, client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
@@ -4931,6 +5043,7 @@ class AuthService:
                 # takes. That also covers a rebind's gap, where the row is unbound between the
                 # clear and the write.
                 require_federated_subject=federated_subject if federated else _UNBOUND,
+                idp_auth_time=idp_auth_time,
                 supersedes_hash=supersedes_hash,
             )
         except _BindingChangedMidLogin:
@@ -4947,7 +5060,7 @@ class AuthService:
                 )
                 return replace(refused, roles_gained=roles_gained)
             await self._directory_reject_audit(
-                principal.username, "oidc", "federated_subject_unbound"
+                principal.username, "oidc", "federated_subject_unbound", client=client
             )
             return LoginOutcome(
                 ok=False,
@@ -5633,9 +5746,10 @@ class AuthService:
             # ONLY AN ID-KEYED PROBE MAY REPORT A RENAME. A rename is evidence of a rename only when
             # the question asked cannot be answered by a different principal, and the name-keyed
             # fallback's question can be: `_find_user` searches
-            # `(|(sAMAccountName=<name>)(userPrincipalName=<name>@<domain>))` and takes entries[0], so
-            # an account that sets its own UPN to the victim's `<name>@<domain>` matches the same
-            # filter. On a pass where the directory returns that entry first, the probe would report
+            # `(|(sAMAccountName=<name>)(userPrincipalName=<name>@<domain>))`, so an account that
+            # sets its own UPN to the victim's `<name>@<domain>` matches the same filter. Since vault
+            # BACKLOG #2778 two matches are refused as AMBIGUOUS, but a directory where the victim's
+            # own entry is gone answers with the attacker's entry alone. Then the probe would report
             # the attacker's `sAMAccountName` as this row's new name -- and the refresh would write it
             # onto the victim's row, moving the ONLY key an unbound login path has onto the attacker's
             # label. Their next sign-in then resolves to the victim's `user_id` (both ids are NULL, so
@@ -6798,6 +6912,7 @@ class AuthService:
         mfa_verified: bool,
         seed_reauth: bool,
         mechanism: SessionMechanism,
+        idp_auth_time: float | None,
         max_expires_at: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         supersedes_hash: str | None = None,
@@ -6839,6 +6954,11 @@ class AuthService:
             # ADR 0184 item (iv): REQUIRED, with no default, so a new mint path cannot forget it. The
             # step-up leg reads it (ADR 0142 Amendment B), and rotation carries it forward.
             auth_mechanism=mechanism.value,
+            # BACKLOG #2143: REQUIRED here, with no default, like the mechanism. The IdP step-up
+            # compares the next auth_time with it, and a NULL on an oidc session refuses that
+            # step-up. _complete_ad_login defaults it to None for its Kerberos callers, and raises
+            # ValueError when a federated mint arrives without one.
+            idp_auth_time=idp_auth_time,
         )
         if not issued:
             # Only reachable with a guard requested: an unbind or a bind revoked this account's
@@ -8255,8 +8375,9 @@ class AuthService:
 
         **``authenticate`` says what its lookup found (BACKLOG #2434).** Its :class:`DirectoryBind`
         tells a refused bind on an enabled entry (``False``, counted) from an absent entry
-        (``not_in_directory``), a disabled one (``directory_disabled``) and an unreadable account
-        state (``directory_undetermined``), none of them counted. Counting those would lock the
+        or an ambiguous one (``not_in_directory``, vault BACKLOG #2778), a disabled one
+        (``directory_disabled``) and an unreadable account state (``directory_undetermined``),
+        none of them counted. Counting those would lock the
         engine row of a user whose every re-bind fails whatever they type, and the lock is then
         enforced at their Kerberos and OIDC sign-in. Before #2434 a second lookup after every
         refusal told absent from present, and could not tell absent from disabled. A correct
@@ -10282,14 +10403,30 @@ class AuthService:
         writer stored cannot block an unrelated save. Any other value is checked before anything is
         written (:func:`_require_single_mailbox`), so a refusal leaves the whole save undone. Raises
         :class:`InvalidNotifyEmail` for it.
+
+        **Disabling the last enabled administrator is refused (vault BACKLOG #2779)**, with
+        :class:`LastAdministratorRefused`. The guard is the disable write itself: the store checks
+        and writes in one transaction (``remove_unless_last_admin``). That write stays after the
+        profile write and before its audit row, so a later failure cannot leave an unaudited
+        lock-out. A read up front refuses the ordinary case before anything is written. Only a
+        removal racing this one gets past that read; then the profile edit has landed, so it is
+        still audited and announced, with ``disable_refused`` on the audit row, and the refusal is
+        raised after that.
         """
         before = await self._store.get_user(user_id)  # capture old email/disabled for notifications
+        if before is not None:
+            # The stored spelling of the id. A store whose id column compares case-insensitively
+            # (SQL Server) finds the row from a different spelling, and the early read below
+            # compares ids in Python, so it must be given the one the store holds.
+            user_id = before.id
         stored_notify = ((before.notify_email if before is not None else None) or "").strip()
         new_notify: str | None = None
         if notify_email is not None and (
             not notify_email.strip() or notify_email.strip() != stored_notify
         ):
             new_notify = _require_single_mailbox(notify_email)
+        if disabled and await self.is_last_enabled_admin(user_id):
+            raise LastAdministratorRefused("cannot disable the last administrator")
         await self._store.update_user_profile(user_id, display_name=display_name, email=email)
         # The profile write above never names `notify_email`: it is the same call `_upsert_ad_user`
         # makes, and on a directory account `email` is the directory's.
@@ -10321,11 +10458,19 @@ class AuthService:
                     email=new_notify,
                     detail={"set_by": "administrator"},
                 )
-        if disabled is not None:
-            await self._store.set_user_disabled(user_id, disabled=disabled)
-            if disabled:
+        refused = False
+        if disabled:
+            refused = not await self._store.remove_unless_last_admin(
+                user_id, AdminRemoval.DISABLE, admin_role_id=Role.ADMINISTRATOR.value
+            )
+            if not refused:
                 await self._store.revoke_user_sessions(user_id)
-        await self._audit("user.updated", actor=actor, detail=_json({"user_id": user_id}))
+        elif disabled is not None:
+            await self._store.set_user_disabled(user_id, disabled=False)
+        updated: dict[str, Any] = {"user_id": user_id}
+        if refused:
+            updated["disable_refused"] = True
+        await self._audit("user.updated", actor=actor, detail=_json(updated))
         # The rest of this save's notices go where the account's notices went before it, so a move
         # in the same save cannot take them away from the previous holder. An account that had no
         # address is the exception: the one this save set is then the only one reachable.
@@ -10355,18 +10500,36 @@ class AuthService:
                     email=notice_to,
                     detail={"new_email": email},
                 )
-            if disabled and not before.disabled:
+            if disabled and not refused and not before.disabled:
                 await self._notify_security(
                     ACCOUNT_DISABLED, username=before.username, email=notice_to
                 )
+        if refused:
+            raise LastAdministratorRefused("cannot disable the last administrator")
 
     async def delete_user(self, user_id: str, *, actor: str) -> None:
-        await self._store.delete_user(user_id)
+        """Delete an account. Raises :class:`LastAdministratorRefused`, having written nothing, when
+        it is the last enabled administrator; the check and the delete are one store transaction
+        (vault BACKLOG #2779)."""
+        if not await self._store.remove_unless_last_admin(
+            user_id, AdminRemoval.DELETE, admin_role_id=Role.ADMINISTRATOR.value
+        ):
+            raise LastAdministratorRefused("cannot delete the last administrator")
         await self._audit("user.deleted", actor=actor, detail=_json({"user_id": user_id}))
 
     async def set_roles(self, user_id: str, roles: Sequence[str], *, actor: str) -> None:
+        """Replace an account's roles. Raises :class:`LastAdministratorRefused`, having written
+        nothing, when that would take Administrator from the last enabled administrator; the check
+        and the write are one store transaction (vault BACKLOG #2779). Self-target is allowed."""
         user = await self._store.get_user(user_id)  # for the notification address
-        await self._store.set_user_roles(user_id, roles, assigned_by=actor)
+        if not await self._store.remove_unless_last_admin(
+            user_id,
+            AdminRemoval.SET_ROLES,
+            admin_role_id=Role.ADMINISTRATOR.value,
+            role_ids=list(roles),
+            assigned_by=actor,
+        ):
+            raise LastAdministratorRefused("cannot remove the last administrator")
         await self._store.revoke_user_sessions(user_id)  # re-resolve permissions on next login
         await self._audit(
             "user.roles_changed",
@@ -10729,6 +10892,9 @@ class AuthService:
         Raises :class:`ValueError` for an unknown user, and for an account with no binding: an
         unbind of nothing would still revoke sessions, and a no-op should not sign anybody out. The
         store decides both, inside the transaction, and writes nothing in either case.
+
+        A :class:`FederatedBindingChanged` refusal changes nothing but is still audited, as
+        ``auth.federated_unbind_refused`` naming the actor and the pair it expected (BACKLOG #2331).
         """
         outcome = await self._store.clear_user_federated_subject(
             user_id, expected_issuer=expected_issuer, expected_subject=expected_subject
@@ -10736,7 +10902,13 @@ class AuthService:
         if outcome is None:
             raise ValueError("no such user")
         if outcome.changed:
-            raise FederatedBindingChanged()
+            raise await self._audit_binding_changed(
+                "auth.federated_unbind_refused",
+                {"user_id": user_id, "username": outcome.username},
+                actor=actor,
+                expected_issuer=expected_issuer,
+                expected_subject=expected_subject,
+            )
         # BOTH halves, matching the store's own predicate: either one set means the row had
         # something to clear and the store cleared it, so raising here would report "nothing to
         # remove" about a write that just happened.
@@ -10744,6 +10916,38 @@ class AuthService:
             raise ValueError("the account has no federated binding to remove")
         await self._record_federated_unbind(user_id, outcome, actor=actor)
         return outcome.sessions_revoked
+
+    async def _audit_binding_changed(
+        self,
+        action: str,
+        detail: dict[str, object],
+        *,
+        actor: str,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+    ) -> FederatedBindingChanged:
+        """Audit a :class:`FederatedBindingChanged` refusal, and return the exception to raise
+        (BACKLOG #2331).
+
+        Nothing was written, but an attempt to change who may sign in as an account is worth a row
+        even when it is refused. The row records what the caller expected, and says nothing about
+        why the pair differed: another administrator's change, or a retry of the caller's own call
+        that had already landed, look the same here. It does not carry the pair the row holds,
+        because one refusal arm finds it changed without reading it.
+        """
+        await self._audit(
+            action,
+            actor=actor,
+            detail=_json(
+                {
+                    **detail,
+                    "expected_issuer": expected_issuer,
+                    "expected_subject": expected_subject,
+                    "reason": FEDERATED_BINDING_CHANGED,
+                }
+            ),
+        )
+        return FederatedBindingChanged()
 
     async def _record_federated_unbind(
         self, user_id: str, outcome: FederatedUnbind, *, actor: str
@@ -10803,8 +11007,11 @@ class AuthService:
 
         Refuses, as :class:`ValueError` with an operator-facing message: no configured issuer, an
         unknown user, a non-directory account (ADR 0184 part 3), and a pair the account already
-        holds -- a no-op should not sign anybody out. Refuses as :class:`FederatedSubjectHeld` when a
-        different account holds the pair.
+        holds -- a no-op should not sign anybody out. An account deleted while the bind runs is the
+        unknown user too, not a conflict (BACKLOG #2331). Refuses as :class:`FederatedSubjectHeld`
+        when a different account holds the pair. A :class:`FederatedBindingChanged` refusal writes
+        an ``auth.federated_bind_refused`` row with reason ``federated_binding_changed`` and the pair
+        the caller expected (BACKLOG #2331).
 
         **Refuses as :class:`DirectoryObjectIdMissing` an account with no ``directory_object_id``**,
         and writes an ``auth.federated_bind_refused`` audit row naming the actor (BACKLOG #1143
@@ -10856,10 +11063,21 @@ class AuthService:
         # changes nothing, and must not be told that a competing change happened.
         if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
             raise ValueError("the account already holds that identity")
+
+        async def audit_changed(username: str) -> FederatedBindingChanged:
+            # BACKLOG #2331: each of the three changed-pair refusals below writes this one row.
+            return await self._audit_binding_changed(
+                "auth.federated_bind_refused",
+                {"user_id": user_id, "username": username, "issuer": issuer, "subject": subject},
+                actor=actor,
+                expected_issuer=expected_issuer,
+                expected_subject=expected_subject,
+            )
+
         # A caller whose pair is already stale gets the stale answer, not whichever refusal below
         # this read happens to trip. The locked compare in the clear is still the authority.
         if (user.oidc_issuer, user.oidc_subject) != (expected_issuer, expected_subject):
-            raise FederatedBindingChanged()
+            raise await audit_changed(user.username)
         if user.auth_provider != AuthProvider.AD.value:
             raise ValueError("only a directory (AD) account can take a federated binding")
         if not user.directory_object_id:
@@ -10905,7 +11123,7 @@ class AuthService:
         if cleared is None:
             raise ValueError("no such user")
         if cleared.changed:
-            raise FederatedBindingChanged()
+            raise await audit_changed(cleared.username)
         previous_issuer, previous_subject = cleared.issuer, cleared.subject
         revoked = cleared.sessions_revoked
         rebind = previous_issuer is not None or previous_subject is not None
@@ -10935,10 +11153,17 @@ class AuthService:
                 )
             ) from exc
         if swept is None:
+            # The set also matches no row when the account was deleted after the clear. That is the
+            # unknown-user answer, 404 at the route, not a conflict to retry (BACKLOG #2331). The
+            # clear's own removal of a previous binding is still recorded first.
+            if await self._store.get_user(user_id) is None:
+                if rebind:
+                    await self._record_federated_unbind(user_id, cleared, actor=actor)
+                raise ValueError("no such user")
             if not rebind:
                 # Nothing was written: the caller saw the account unbound and another bind landed
                 # first. That is the changed-pair refusal, with its code (BACKLOG #2026).
-                raise FederatedBindingChanged()
+                raise await audit_changed(cleared.username)
             await self._record_federated_unbind(user_id, cleared, actor=actor)
             # This request DID write: its clear removed the pair it expected. So not the
             # changed-pair refusal, whose promise is that nothing changed.
@@ -11055,9 +11280,14 @@ class AuthService:
     async def is_last_enabled_admin(self, user_id: str) -> bool:
         """True iff ``user_id`` is an enabled administrator and the only one remaining.
 
-        Guards the role-removal path so the deployment can never be left with no usable admin
-        account. Nothing regenerates one: since ADR 0183 the way back is ``provision-admin`` at the
-        host.
+        Nothing regenerates a lost administrator: since ADR 0183 the way back is ``provision-admin``
+        at the host.
+
+        **A READ, NOT THE GUARD (vault BACKLOG #2779).** Asked in one await and acted on in the next,
+        it let two concurrent removals each see two administrators and both pass. The guard is now
+        the store's ``remove_unless_last_admin``, which :meth:`update_user`, :meth:`delete_user` and
+        :meth:`set_roles` call. :meth:`update_user` also asks this first, only so the ordinary
+        refusal comes before its profile write; never let it stand in for the guarded write.
         """
         admins: set[str] = set()
         for user in await self._store.list_users():

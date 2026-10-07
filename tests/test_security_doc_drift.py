@@ -93,9 +93,10 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # /ui/connection/{name}/events/{event_id}/reason. The JSON reveal is a query parameter.
 # BACKLOG #2460 added one /ui route and no JSON route: POST /ui/approvals/{approval_id}/resolve/
 # {outcome}, the console's resolve of an interrupted release.
-_ROUTES_DEFAULT = 115
-_ROUTES_WITH_DOCS = 119
-_ROUTES_WITH_UI = 240
+# BACKLOG #2331 added one JSON route: GET /users/{user_id}/federated-identity, users:manage.
+_ROUTES_DEFAULT = 116
+_ROUTES_WITH_DOCS = 120
+_ROUTES_WITH_UI = 241
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -1817,8 +1818,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     # 93 -> 94: BACKLOG #1562 part B's POST /approvals/{approval_id}/resolve, approvals:approve.
     # 94 -> 95: BACKLOG #2021's POST /users/directory, users:manage.
     # 95 -> 96: BACKLOG #2345's GET /messages/{message_id}/raw, messages:view_raw.
-    assert len(gated) == 96, (
-        f"{len(gated)} permission-gated routes, not 96 — update the doc's totals."
+    # 96 -> 97: BACKLOG #2331's GET /users/{user_id}/federated-identity, users:manage.
+    assert len(gated) == 97, (
+        f"{len(gated)} permission-gated routes, not 97 — update the doc's totals."
     )
 
 

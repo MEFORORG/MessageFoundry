@@ -1209,8 +1209,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #2597: set_connection_flag compares two public config digests with
             # fingerprint_matches (constant time), as the provenance route in api/app.py does.
             "compare:via messagefoundry.config.fingerprint",
-            # Vault BACKLOG #2839: fingerprint_bundle calls config_fingerprint_detail inside a
-            # lambda handed to asyncio.to_thread, so this scanner still sees the fold.
+            # Vault BACKLOG #2839: fingerprint_bundle_blocking calls config_fingerprint_detail
+            # directly (fingerprint_bundle runs it in asyncio.to_thread), so this scanner sees the fold.
             "hash:via messagefoundry.config.fingerprint",
             "mac:via messagefoundry.pipeline.secret_rotation",
         }

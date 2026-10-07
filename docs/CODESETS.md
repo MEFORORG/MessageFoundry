@@ -69,7 +69,7 @@ loader's own wording inline.
 |---|---|
 | `messagefoundry codeset list --config DIR` | Summarize every set under `codesets/` (`.csv` **and** `.toml`), sorted by name. |
 | `messagefoundry codeset show --config DIR --name N` | The grid for set `N` (headers + rows); `format:"toml"` ⇒ read-only. |
-| `messagefoundry codeset upsert --config DIR [--data JSON]` | Validate → write `codesets/N.csv` atomically (temp + replace, owner-only perms) → **re-load the written file as the final check**; a bad save rolls back. DETAIL JSON comes from `--data` or stdin. |
+| `messagefoundry codeset upsert --config DIR [--data JSON]` | Validate → write an owner-only candidate of `codesets/N.csv` → **load the candidate as the final check** → replace the live file with it; a bad save never touches the live file. DETAIL JSON comes from `--data` or stdin. |
 | `messagefoundry codeset rename --config DIR --name N --to M` | Name-safety on **both** `N` and `M` (a bare stem, no separator, `..`, drive or extension) → atomic `os.replace` of `codesets/N.<ext>` → `codesets/M.<ext>`; rejects a stem collision. |
 | `messagefoundry codeset remove --config DIR --name N` | Delete `codesets/N.csv` (else `.toml`). |
 

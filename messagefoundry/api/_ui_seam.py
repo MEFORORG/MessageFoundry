@@ -292,12 +292,20 @@ from typing import Any
 #: ``api.security``. ``GET /ui/sso`` and the ``/ui/oidc`` callback raise ``administrator_granted``
 #: when a directory sign-in's role sync newly grants Administrator, as ``POST /auth/negotiate`` does.
 #:
+#: Vault BACKLOG #2132: ``AuthService.audit_oidc_reject`` and ``audit_kerberos_reject`` take a
+#: required keyword ``client``, and the ``/ui/oidc`` and ``/ui/sso`` routes pass the caller's
+#: address, so their ``auth.login_failed`` rows record where a reject came from. A breaking change
+#: in both directions: an older console calls both with the reason alone, and a newer console
+#: passes ``client=`` to an engine that takes none. Either way every route-level reject would raise
+#: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
+#: signatures changed.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "e10381f0c98a5ea1"
+ENGINE_UI_SEAM: str = "90ecacf8dcf22a10"
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,12 +396,11 @@ class CoreHandlers:
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
     # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on approve
     # and reject, so each /ui route asserts approvals:approve through require_ui, which paces a /ui
-    # write the same way. The resolve of an interrupted release (BACKLOG #2460) has the JSON gate
-    # require_step_up, so its /ui route takes require_ui_step_up for the same fresh re-proof.
+    # write the same way. The resolve of an interrupted release is not on the seam: its JSON gate is
+    # require_step_up and the console renders those rows read-only.
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]
-    resolve_action: Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)

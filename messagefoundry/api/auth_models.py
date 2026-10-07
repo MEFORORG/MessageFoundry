@@ -272,13 +272,16 @@ class ExpectedFederatedPair(RequestModel):
     only if the account still holds exactly this pair, and otherwise answers 409 with nothing
     changed. So an administrator working from a stale read cannot remove a binding another
     administrator wrote after that read. The console's federated-identity screen shows the pair and
-    posts it back; the JSON API has no read of it yet, so a JSON caller sends the pair it bound.
+    posts it back; a JSON caller reads it from ``GET /users/{user_id}/federated-identity``
+    (BACKLOG #2331).
 
-    The issuer bound is generous because the configured issuer has no length rule of its own; the
+    The issuer bound is 256 characters. ``[auth].oidc_issuer`` is refused at load beyond 256 UTF-16
+    units, the width of the narrowest issuer column (SQL Server ``NVARCHAR(256)``), and no character
+    takes fewer than one unit, so every issuer a bind can store fits this bound (BACKLOG #2331). The
     subject bound is the one :class:`FederatedIdentityRequest` puts on ``sub``.
     """
 
-    expected_issuer: str | None = Field(max_length=2048)
+    expected_issuer: str | None = Field(max_length=256)
     expected_subject: str | None = Field(max_length=255)
 
 

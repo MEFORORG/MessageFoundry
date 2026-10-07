@@ -901,6 +901,76 @@ async def test_mark_done_writes_one_ledger_row(store: MessageStore) -> None:
     assert len(rows[0]["delivery_key"]) == 64  # sha256 hex
 
 
+def test_delivery_key_is_keyed_on_the_message_and_outbox_ids() -> None:
+    # vault BACKLOG #2768: the key used to hash the MSH-10 control id IN PLACE OF the message id, so two
+    # messages sharing a control id (a retransmit recorded as a new message, a restarted counter)
+    # collided at the same destination, handler and seq. Both ids are now always components.
+    from messagefoundry.store.store import delivery_key
+
+    def key(message_id: str, outbox_id: str) -> str:
+        return delivery_key(
+            control_id="CTRL1",
+            message_id=message_id,
+            outbox_id=outbox_id,
+            destination_name="d1",
+            handler_name="h",
+            delivery_seq=1,
+        )
+
+    assert key("m-1", "q-1") != key("m-2", "q-1")  # one control id, two messages: two keys
+    assert key("m-1", "q-1") != key("m-1", "q-2")  # one message, two outbound rows, same seq
+
+
+async def test_two_messages_sharing_a_control_id_each_get_a_ledger_row(store: MessageStore) -> None:
+    # vault BACKLOG #2768: both messages compute delivery_seq=1 (the count is per message id), so a
+    # key that ignored the message id made the second INSERT OR IGNORE a silent no-op.
+    mids = [
+        await store.enqueue_message(
+            channel_id="c1",
+            raw="MSH|x",
+            deliveries=[("d1", f"p{i}")],
+            control_id="CTRL1",
+            now=100.0,
+        )
+        for i in range(2)
+    ]
+    for t in (101.0, 102.0):
+        item = await store.claim_next_fifo("d1", now=t)
+        assert item is not None
+        await store.mark_done(item.id, now=t)
+    rows = await _ledger_rows(store)
+    assert sorted(r["message_id"] for r in rows) == sorted(mids)
+    assert [r["delivery_seq"] for r in rows] == [1, 1]
+    assert rows[0]["delivery_key"] != rows[1]["delivery_key"]
+
+
+async def test_a_seq_gap_does_not_collide_two_rows_of_one_message(store: MessageStore) -> None:
+    # Two outbound rows of ONE message to ONE destination take seq 1 and 2. Dropping only the seq-1
+    # row's ledger entry leaves COUNT=1, so its re-delivery recomputes seq 2 -- the sibling's seq. The
+    # state is built directly (DELETE + re-pend) to pin the KEY property, not a replay path; the outbox
+    # id in the key keeps the two keys apart, so the ledger row is written instead of silently ignored.
+    await store.enqueue_message(
+        channel_id="c1", raw="MSH|x", deliveries=[("d1", "p1"), ("d1", "p2")], now=100.0
+    )
+    first = await store.claim_next_fifo("d1", now=101.0)
+    assert first is not None
+    await store.mark_done(first.id, now=101.0)
+    second = await store.claim_next_fifo("d1", now=102.0)
+    assert second is not None
+    await store.mark_done(second.id, now=102.0)
+    await store._db.execute("DELETE FROM delivered_keys WHERE outbox_id=?", (first.id,))
+    await store._db.execute(
+        "UPDATE queue SET status=? WHERE id=?", (OutboxStatus.PENDING.value, first.id)
+    )
+    await store._db.commit()
+    again = await store.claim_next_fifo("d1", now=200.0)
+    assert again is not None and again.id == first.id
+    await store.mark_done(again.id, now=201.0)
+    rows = await _ledger_rows(store)
+    assert sorted(r["outbox_id"] for r in rows) == sorted([first.id, second.id])
+    assert len({r["delivery_key"] for r in rows}) == 2
+
+
 async def test_ledger_at_rest_carries_no_phi(tmp_path) -> None:
     # At-rest no-PHI assertion: read the delivered_keys table's RAW on-disk bytes (not the live row
     # mapping) and confirm neither the body NOR the control_id appears in the clear — the control_id is

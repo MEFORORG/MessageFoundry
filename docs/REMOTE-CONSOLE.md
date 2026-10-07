@@ -200,14 +200,18 @@ account is not exempt from the engine's second factor
   ([`__main__.py`](../messagefoundry/__main__.py), the `admin_exposed` block). Either switch turns the
   refusal into a loud warning that starts, and under `enforce` the allow flag also writes an audit line. No instance
   is exempt: the engine treats every instance as carrying PHI (BACKLOG #1279).
-  **"Exposed" here is the bind-and-proxy posture, not the console**: an off-loopback bind, **or**
-  `[api].tls_terminated_upstream` — whether or not `/ui` ends up mounted. So the recommended
+  **"Exposed" here is the bind-and-proxy posture, not the console**: an off-loopback bind,
+  `[api].tls_terminated_upstream`, **or** a set `[api].trusted_proxies` — whether or not `/ui` ends up
+  mounted. The last covers a loopback bind with an operator `tls_cert_file` behind a re-encrypting
+  proxy, which declares no terminator (vault BACKLOG #2251; before it, that topology did not trip
+  the gate). So the recommended
   loopback-behind-a-terminator topology in §3 **does** trip it, including when the default-on console
   auto-degrades to JSON-only, and when `serve_web_console = false` disables the console outright: the
   single-factor surface being protected is the JSON operator API. (This is a correction —
   [BACKLOG #326](BACKLOG.md); the arm used to read the console flag, which the §3 auto-degrade clears
   first, and would have missed exactly that topology on first deployment.) An **undeclared** proxy —
-  a set `[security].web_console_public_address` with no `tls_terminated_upstream` — is outside the
+  a set `[security].web_console_public_address` with neither `tls_terminated_upstream` nor
+  `trusted_proxies` — is outside the
   predicate and does **not** refuse: nothing was declared, so exposure would be an inference. It gets
   its own **warning** instead, naming single-factor sign-in explicitly, whenever
   `require_mfa` is off. That is a distinct arm — **not** the ADR 0068 §8 undeclared-proxy warning, which

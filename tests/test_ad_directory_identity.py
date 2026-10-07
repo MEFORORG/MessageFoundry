@@ -1744,10 +1744,12 @@ async def test_the_reauth_route_says_the_directory_could_not_confirm_the_account
         (DirectoryAnswer.NOT_FOUND, "not_in_directory"),
         (DirectoryAnswer.DISABLED, "directory_disabled"),
         (DirectoryAnswer.UNDETERMINED, "directory_undetermined"),
+        # Vault BACKLOG #2778: two entries for one id is no entry provably this row's own.
+        (DirectoryAnswer.AMBIGUOUS, "not_in_directory"),
         # No lookup ran for a non-empty password: never read as empty_password, never counted.
         (None, "directory_unavailable"),
     ],
-    ids=["absent", "disabled", "undetermined", "no-lookup"],
+    ids=["absent", "disabled", "undetermined", "ambiguous", "no-lookup"],
 )
 async def test_an_unjudged_re_bind_names_its_cause_on_the_audit_row(
     answer: DirectoryAnswer | None, reason: str

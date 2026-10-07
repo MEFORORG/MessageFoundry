@@ -10,9 +10,14 @@ admin and erase the dual-admin separation-of-duties safeguard. These tests pin t
 
 * disabling/deleting a NON-last admin still succeeds, and a non-admin is always disable-able/deletable
   (the guard only fires on the sole enabled admin); and
-* the guard predicate ``is_last_enabled_admin`` is wired into BOTH the disable and delete routes, and
-  the roles path (which permits self-target, unlike disable/delete) still refuses to strip the last
+* the roles path (which permits self-target, unlike disable/delete) still refuses to strip the last
   admin — the invariant the disable/delete paths now share.
+
+**Where the guard lives now (vault BACKLOG #2779).** The routes no longer call
+``is_last_enabled_admin``; the guard is the store write ``remove_unless_last_admin``, reached through
+``AuthService.update_user`` / ``delete_user`` / ``set_roles``. The disable and delete refusals of a
+non-self last administrator, and the concurrent cases, are pinned in
+``tests/test_last_admin_atomic.py``. The predicate assertions below test the read alone.
 """
 
 from __future__ import annotations
@@ -158,9 +163,10 @@ async def test_roles_path_still_refuses_to_strip_last_admin(engine: Engine) -> N
 
 
 async def test_disable_and_delete_routes_carry_last_admin_guard(engine: Engine) -> None:
-    # The disable/delete routes call is_last_enabled_admin AFTER the self-guard. Self-target on those
-    # paths is rejected first ("cannot disable/delete your own account"), so the last-admin guard is
-    # the second line that protects the sole enabled admin from a (future) non-self lock-out path.
+    # The disable/delete routes reach the last-admin guard (in the service and store since vault
+    # BACKLOG #2779) AFTER the self-guard. Self-target on those paths is rejected first ("cannot
+    # disable/delete your own account"), so the last-admin guard is the second line that protects
+    # the sole enabled admin from a (future) non-self lock-out path.
     # Pin both: (a) the predicate is True exactly for the sole enabled admin, and (b) the self-guard
     # fires for the acting admin on both routes (the message order the new guard must sit behind).
     # Last-admin guard is a step-up admin-CRUD flow, not an MFA test: pin require_mfa=False so the
@@ -193,3 +199,30 @@ async def test_disable_and_delete_routes_carry_last_admin_guard(engine: Engine) 
             await c.patch(f"/users/{root2}", headers=h, json={"disabled": True})
         ).status_code == 200
         assert await service.is_last_enabled_admin(my_id) is True
+
+
+async def test_each_route_maps_a_store_refusal_to_400(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #2779: the refusal now comes from the store's guarded write, so the routes map
+    # LastAdministratorRefused to 400 rather than checking first. The guard is made to refuse here,
+    # on a viewer, so all three routes reach it without the self-target refusal in the way; dropping
+    # an except clause would turn its answer into a 500.
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
+    async with _client(engine, service) as c:
+        h, _ = await _admin_session(c, service)
+        viewer = await _create_user(c, h, "viewer1", "viewer")
+
+        async def refuse(*_a: object, **_k: object) -> bool:
+            return False
+
+        monkeypatch.setattr(service.store, "remove_unless_last_admin", refuse)
+        h = await _reauth_update(c, h)
+        r = await c.patch(f"/users/{viewer}", headers=h, json={"disabled": True})
+        assert (r.status_code, r.json()["detail"]) == (400, "cannot disable the last administrator")
+        r = await c.delete(f"/users/{viewer}", headers=h)
+        assert (r.status_code, r.json()["detail"]) == (400, "cannot delete the last administrator")
+        r = await c.put(f"/users/{viewer}/roles", headers=h, json={"roles": ["operator"]})
+        assert (r.status_code, r.json()["detail"]) == (400, "cannot remove the last administrator")

@@ -37,11 +37,22 @@ _CALLS: dict[str, Callable[[Any], Awaitable[Any]]] = {
     "create_session": lambda s: s.create_session(
         token_hash=_HASH, user_id="u", expires_at=_NOW + 60, now=_NOW, auth_mechanism="password"
     ),
+    "create_session_oidc": lambda s: s.create_session(
+        token_hash=_HASH,
+        user_id="u",
+        expires_at=_NOW + 60,
+        now=_NOW,
+        auth_mechanism="oidc",
+        idp_auth_time=_NOW - 5,
+    ),
     "get_session": lambda s: s.get_session(_HASH),
     "list_sessions": lambda s: s.list_sessions("u", now=_NOW),
     "list_sessions_idle": lambda s: s.list_sessions("u", now=_NOW, idle_seconds=1800),
     "touch_session": lambda s: s.touch_session(_HASH, now=_NOW),
     "mark_session_reauthed": lambda s: s.mark_session_reauthed(_HASH, now=_NOW, client="c"),
+    "mark_session_reauthed_idp": lambda s: s.mark_session_reauthed(
+        _HASH, now=_NOW, client="c", idp_auth_time=_NOW - 5
+    ),
     "mark_session_mfa_verified": lambda s: s.mark_session_mfa_verified(_HASH, now=_NOW),
     "rotate_session": lambda s: s.rotate_session(_HASH, new_token_hash=_OTHER),
     "revoke_session": lambda s: s.revoke_session(_HASH, now=_NOW),

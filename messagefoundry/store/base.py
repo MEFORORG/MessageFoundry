@@ -65,6 +65,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
+    AdminRemoval,
     AlertInstance,
     AlertSummary,
     AuditAppend,
@@ -2099,7 +2100,12 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     # Also deletes the account's ``known_login_addresses`` rows (vault BACKLOG #2145).
-    async def delete_user(self, user_id: str) -> None: ...
+    async def delete_user(self, user_id: str) -> None:
+        """Delete an account and every row keyed to it. **Unguarded:** it does not refuse the last
+        enabled administrator. An administrator's delete goes through
+        :meth:`remove_unless_last_admin` with ``DELETE`` (vault BACKLOG #2779); use this only where
+        the account cannot hold Administrator."""
+        ...
 
     # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
     # One row per (account id, host key). The caller folds the address to its host key; the store
@@ -2280,6 +2286,37 @@ class AuthStore(Protocol):
         now: float | None = None,
     ) -> None: ...
 
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Apply ``change`` to ``user_id`` unless it would leave no enabled administrator (vault
+        BACKLOG #2779).
+
+        One transaction re-reads the enabled accounts holding ``admin_role_id`` and refuses, writing
+        nothing and returning ``False``, when ``user_id`` is one of them, no other is, and the
+        change takes the role away (:meth:`AdminRemoval.takes_role`). The ids are compared in SQL,
+        so the guard matches an id exactly as the write does. Otherwise it writes and returns ``True``:
+        ``DISABLE`` sets ``disabled``, ``DELETE`` is :meth:`delete_user`, ``SET_ROLES`` is
+        :meth:`set_user_roles` with ``role_ids`` and ``assigned_by``.
+
+        **Every call is serialized against every other call on the same database**, not only in
+        this process: the server backends take a transaction-scoped lock before the read, because
+        each engine shard serves its own API over one unified store (ADR 0063). So two removals
+        that each see two administrators cannot both pass, which a check in one await and a write
+        in the next allowed. Writes that only ADD administrators need no lock: they cannot empty
+        the set. The directory-driven role writes (the AD sign-in sync and the session reconciler)
+        do not come through here and were never guarded: they take roles on the directory's word.
+        ``DISABLE`` and ``SET_ROLES`` leave the account's sessions for the caller to revoke after;
+        ``DELETE``, like :meth:`delete_user`, removes them with the account."""
+        ...
+
     async def set_user_channel_scope(
         self,
         user_id: str,
@@ -2450,6 +2487,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         """Insert a session row. Returns ``True`` when one was written.
 
@@ -2457,6 +2495,11 @@ class AuthStore(Protocol):
         ``oidc``; ADR 0184 item (iv)). It is written once here and never updated, and
         ``rotate_session`` carries it forward with the rest of the row. It decides which step-up leg
         the session takes (ADR 0142 Amendment B), so a caller that mints a session states it.
+
+        ``idp_auth_time`` is the federated sign-in's verified ``auth_time``, as the IdP stated it
+        (BACKLOG #2143). Only an ``oidc`` mint passes one. The IdP step-up compares its own
+        ``auth_time`` with it, IdP clock against IdP clock, and :meth:`mark_session_reauthed` moves
+        it forward when a step-up succeeds. ``rotate_session`` carries it.
 
         ``require_federated_subject`` makes the insert CONDITIONAL on the account still carrying
         that verified ``(issuer, sub)``, checked in the same transaction (BACKLOG #1474): the row is
@@ -2507,7 +2550,8 @@ class AuthStore(Protocol):
         """Re-key a live session to ``new_token_hash``, in place (ASVS 7.2.4).
 
         A pure re-key: every other column — ``user_id``, ``created_at``, ``expires_at``, ``client``,
-        ``reauth_at``, ``mfa_verified_at``, ``auth_mechanism`` — is carried forward byte-identical.
+        ``reauth_at``, ``mfa_verified_at``, ``auth_mechanism``, ``idp_auth_time`` — is carried
+        forward byte-identical.
         It stamps **nothing**, deliberately, so "the session is the same session, under a new name"
         is the whole contract. In particular ``expires_at`` is untouched, so no amount of rotation
         can extend the absolute session lifetime, and ``mfa_verified_at`` survives, so a rotation
@@ -2526,12 +2570,23 @@ class AuthStore(Protocol):
         ...
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         """Refresh the session's step-up freshness (``reauth_at``). When ``client`` is given, also
         re-anchor the session's last-verified client address to it (the new-client-IP risk signal in
         WP-L3-13 uses this so a re-verify from a roamed address clears the forced step-up); a ``None``
-        ``client`` leaves the stored address unchanged."""
+        ``client`` leaves the stored address unchanged.
+
+        ``idp_auth_time``, when given, moves the session's stored IdP ``auth_time`` FORWARD to it in
+        the SAME statement (BACKLOG #2143), and never backwards: a value older than the stored one
+        leaves it. The IdP step-up passes the ``auth_time`` it just accepted, so the next step-up
+        must show a later one, and an IdP that answers again from the same sign-in is refused.
+        ``None`` leaves the stored value unchanged, as the password legs need."""
         ...
 
     async def mark_session_mfa_verified(

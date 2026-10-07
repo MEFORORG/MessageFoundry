@@ -69,7 +69,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any
+from typing import Any, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -162,6 +162,7 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AdminRemoval,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -261,7 +262,11 @@ _LOCK_CLASS_FINALIZE = 3
 # per-message finalize lock (lane < finalize is a total order; methods that take only finalize never take
 # a lane lock, so no cycle). Multi-destination writers lock in SORTED order (deadlock-free).
 _LOCK_CLASS_OUTBOUND_LANE = 4
+# Vault BACKLOG #2779: one lock for every last-administrator guarded write, so two of them, from any
+# shard, cannot both read the same two administrators and both remove one.
+_LOCK_CLASS_ADMIN_GUARD = 5
 _AUDIT_LOCK = "mefor_audit_chain"
+_ADMIN_GUARD_LOCK = "mefor_last_admin"
 
 
 def _audit_write_probe(table: str, privilege: str) -> str:
@@ -756,7 +761,8 @@ _SCHEMA: list[str] = [
         client       TEXT,
         reauth_at    DOUBLE PRECISION,
         mfa_verified_at DOUBLE PRECISION,
-        auth_mechanism TEXT
+        auth_mechanism TEXT,
+        idp_auth_time DOUBLE PRECISION
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
@@ -922,6 +928,11 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     _gated_add_column("leader_lease", "leader_epoch", "BIGINT NOT NULL DEFAULT 0"),
 )
 _SCHEMA.extend(CLUSTER_SCHEMA)
+# BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with, for a sessions table
+# created before the column. In _SCHEMA rather than _migrate_lease_columns, so it moves the schema
+# hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
+# the IdP step-up refuses as step_up_idp_auth_time_missing.
+_SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"))
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
@@ -2858,10 +2869,10 @@ class PostgresStore:
         caller's open transaction** (Postgres twin of :meth:`MessageStore._record_delivered_key`).
 
         Only outbound rows deliver; ingress/routed completions (``destination_name`` NULL) are skipped.
-        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (replay-stable, like
-        ``response_seq``). Stored row carries hashes + ids only — never a body/PHI. One row per outbox
-        row INSTANCE (a double mark_done must not accumulate a second entry); ``ON CONFLICT DO NOTHING``
-        is the belt-and-suspenders backstop on the content hash."""
+        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (a counter, not a unique
+        id; :func:`delivery_key` takes its uniqueness from the ids). Stored row carries hashes + ids
+        only — never a body/PHI. One row per outbox row INSTANCE (a double mark_done must not
+        accumulate a second entry); ``ON CONFLICT DO NOTHING`` is the backstop on the key."""
         if destination_name is None:
             return
         already = await conn.fetchval(
@@ -2878,6 +2889,7 @@ class PostgresStore:
         key = delivery_key(
             control_id=control_id,
             message_id=message_id,
+            outbox_id=outbox_id,
             destination_name=destination_name,
             handler_name=handler_name,
             delivery_seq=int(seq),
@@ -8026,17 +8038,63 @@ class PostgresStore:
 
     async def delete_user(self, user_id: str) -> None:
         async with self._timed_acquire() as conn, conn.transaction():
-            await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
-            await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
-            await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)
-            # vault BACKLOG #2145: the account's known sign-in addresses go with it.
-            await conn.execute("DELETE FROM known_login_addresses WHERE user_id=$1", user_id)
-            # BACKLOG #1233, verbatim with the SQLite and SQL Server bodies: presets are owner-scoped
-            # by Identity.user_id (#1225) with no FK cascade, so without this the rows outlive the
-            # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
-            # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
-            await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
-            await conn.execute("DELETE FROM users WHERE id=$1", user_id)
+            await self._delete_user_rows(conn, user_id)
+
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
+        ``AuthStore``. The advisory lock comes first, so at the default READ COMMITTED the read after
+        it sees whatever an earlier holder committed before releasing it."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            if change.takes_role(admin_role_id, role_ids):
+                # Only a change that can empty the set queues on the lock.
+                await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
+                # The ``$n`` twin of the SQLite store's _SQL_ADMIN_GUARD_COUNTS.
+                target, others = await conn.fetchrow(
+                    "SELECT COALESCE(SUM(CASE WHEN u.id = $1 THEN 1 ELSE 0 END), 0),"
+                    " COALESCE(SUM(CASE WHEN u.id <> $1 THEN 1 ELSE 0 END), 0)"
+                    " FROM users u JOIN user_roles r ON r.user_id = u.id"
+                    " WHERE r.role_id = $2 AND NOT u.disabled",
+                    user_id,
+                    admin_role_id,
+                )
+                if target and not others:
+                    return False  # nothing written; the commit releases the lock
+            if change is AdminRemoval.DISABLE:
+                await conn.execute(
+                    "UPDATE users SET disabled=TRUE, updated_at=$1 WHERE id=$2", now, user_id
+                )
+            elif change is AdminRemoval.DELETE:
+                await self._delete_user_rows(conn, user_id)
+            elif change is AdminRemoval.SET_ROLES:
+                await self._replace_user_roles(conn, user_id, role_ids, assigned_by, now)
+            else:
+                assert_never(change)
+        return True
+
+    @staticmethod
+    async def _delete_user_rows(conn: Any, user_id: str) -> None:
+        """Delete the account and every row keyed to it, inside the caller's transaction."""
+        await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
+        await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
+        await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)
+        # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+        await conn.execute("DELETE FROM known_login_addresses WHERE user_id=$1", user_id)
+        # BACKLOG #1233, verbatim with the SQLite and SQL Server bodies: presets are owner-scoped
+        # by Identity.user_id (#1225) with no FK cascade, so without this the rows outlive the
+        # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
+        # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
+        await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
+        await conn.execute("DELETE FROM users WHERE id=$1", user_id)
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -8187,16 +8245,23 @@ class PostgresStore:
     ) -> None:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
-            await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
-            for role_id in role_ids:
-                await conn.execute(
-                    "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                    " VALUES ($1,$2,$3,$4)",
-                    user_id,
-                    role_id,
-                    now,
-                    assigned_by,
-                )
+            await self._replace_user_roles(conn, user_id, role_ids, assigned_by, now)
+
+    @staticmethod
+    async def _replace_user_roles(
+        conn: Any, user_id: str, role_ids: Sequence[str], assigned_by: str | None, now: float
+    ) -> None:
+        """Replace the account's role rows, inside the caller's transaction."""
+        await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
+        for role_id in role_ids:
+            await conn.execute(
+                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
+                " VALUES ($1,$2,$3,$4)",
+                user_id,
+                role_id,
+                now,
+                assigned_by,
+            )
 
     async def set_user_channel_scope(
         self,
@@ -8423,14 +8488,15 @@ class PostgresStore:
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
         # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
         insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at, auth_mechanism)"
-            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7)"
+            " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
+            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7,$8)"
         )
         params = (
             token_hash,
@@ -8440,6 +8506,7 @@ class PostgresStore:
             client,
             now if seed_reauth else None,
             auth_mechanism,
+            None if idp_auth_time is None else float(idp_auth_time),
         )
         if require_federated_subject is None:
             await self._execute(insert, *params)
@@ -8497,15 +8564,24 @@ class PostgresStore:
         )
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
+        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up). The IdP auth_time
+        # only moves forward, and a NULL leaves it (BACKLOG #2143; store.py's
+        # _IDP_AUTH_TIME_FORWARD_SQL says why). GREATEST ignores a NULL argument on Postgres.
         await self._execute(
-            "UPDATE sessions SET reauth_at=$1, client=COALESCE($2, client) WHERE token_hash=$3",
+            "UPDATE sessions SET reauth_at=$1, client=COALESCE($2, client),"
+            " idp_auth_time=GREATEST($3::double precision, idp_auth_time) WHERE token_hash=$4",
             now,
             client,
+            None if idp_auth_time is None else float(idp_auth_time),
             token_hash,
         )
 
