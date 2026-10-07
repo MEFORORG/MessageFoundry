@@ -20,6 +20,7 @@ import { openChannel, postToWebview } from "./webviewMessaging";
 import {
   judgeCollectionRun,
   pickCaseDetail,
+  releaseRun,
   type CaseRerun,
   type CaseRunDetail,
   type TestCase,
@@ -59,6 +60,7 @@ type Incoming =
   | { command: "saveCollection" }
   | { command: "runCollection"; name: string }
   | { command: "caseDetail"; run: number; index: number }
+  | { command: "leaveRun"; run: number }
   | { command: "deleteCollection"; name: string };
 
 function esc(s: string): string {
@@ -139,6 +141,11 @@ export class TestBench {
       await this.withCollections(() => this.runCollection(m.name));
     } else if (m.command === "caseDetail") {
       await this.showCaseDetail(m.run, m.index);
+    } else if (m.command === "leaveRun") {
+      // The webview left the run view, so no Details button for that run is on screen any more and
+      // its per-case values must not stay answerable (BACKLOG #2441). viewGen is NOT bumped: a newer
+      // run still in flight belongs to the view the developer moved to, and must still land.
+      this.lastRun = releaseRun(this.lastRun, m.run);
     } else if (m.command === "deleteCollection") {
       await this.withCollections(() => this.deleteCollection(m.name));
     }

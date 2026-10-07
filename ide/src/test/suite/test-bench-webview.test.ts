@@ -5,7 +5,7 @@ import * as assert from "assert";
 import { hexdump } from "../../hexdump";
 import { diffMessages } from "../../hl7diff";
 import { testBenchScript } from "../../testBenchWebview";
-import { judgeCollectionRun } from "../../testCollections";
+import { judgeCollectionRun, pickCaseDetail, releaseRun } from "../../testCollections";
 import { buildTraceDetail, type TraceEntry } from "../../traceView";
 import { CHANNEL_FIELD } from "../../webviewMessaging";
 
@@ -623,5 +623,84 @@ suite("Test Bench webview — a collection run reveals values one case at a time
     b.deliver(p);
     assert.strictEqual(b.detail.querySelector("img"), null, "a difference value became an element");
     assert.ok(b.detail.textContent.includes("<img"), "the value was dropped rather than escaped");
+  });
+});
+
+// BACKLOG #2441: leaving the run view tells the host, and the host then answers no caseDetail for it.
+suite("Test Bench webview — leaving the run view releases the run the host holds", () => {
+  teardown(closeWindows);
+
+  type Held = { id: number; details: typeof JUDGED.details } | null;
+  const leave = { command: "leaveRun", run: RUN_ID };
+  function leaves(b: Bench): Payload[] {
+    return b.posted.filter((m) => m.command === "leaveRun");
+  }
+  /** Play the host's half: apply each posted leaveRun to the held run, as testBench.ts does. */
+  function hostAfter(b: Bench): Held {
+    let held: Held = { id: RUN_ID, details: JUDGED.details };
+    for (const m of b.posted) {
+      if (m.command === "leaveRun") {
+        held = releaseRun(held, m.run);
+      }
+    }
+    return held;
+  }
+
+  test("on the run view the host still answers a caseDetail (control)", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.detail.querySelector('button[data-case-detail="0"]').click();
+    assert.deepStrictEqual(leaves(b), [], "the run view posted leaveRun while still on screen");
+    assert.strictEqual(pickCaseDetail(hostAfter(b), RUN_ID, 0), JUDGED.details[0]);
+  });
+
+  test("Back posts leaveRun once, and the host then answers no caseDetail for that run", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.window.document.getElementById("back").click();
+    assert.deepStrictEqual(leaves(b), [leave]);
+    assert.strictEqual(pickCaseDetail(hostAfter(b), RUN_ID, 0), null, "a released run was answered");
+    b.deliver(clone(COLLECTIONS)); // the run view is already gone, so nothing is left again
+    assert.deepStrictEqual(leaves(b), [leave], "a second leave was posted");
+  });
+
+  test("another view replacing the run view posts leaveRun, and the host answers nothing after", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.deliver(clone(COLLECTIONS));
+    assert.deepStrictEqual(leaves(b), [leave]);
+    assert.strictEqual(pickCaseDetail(hostAfter(b), RUN_ID, 1), null, "a released run was answered");
+  });
+
+  test("each other view type replacing the run view posts leaveRun", () => {
+    for (const [why, payload] of [
+      ["detail", DETAIL],
+      ["trace", TRACE],
+      ["hex", HEX],
+    ] as [string, Payload][]) {
+      const b = assertRendered(RUN, "collectionRun");
+      b.deliver(clone(payload));
+      assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw`);
+      assert.deepStrictEqual(leaves(b), [leave], why);
+    }
+  });
+
+  test("a caseDetail reply does not count as leaving the run view", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.detail.querySelector('button[data-case-detail="0"]').click();
+    b.deliver(caseDetail(0));
+    assert.deepStrictEqual(leaves(b), []);
+  });
+
+  test("a newer run replacing the view releases only the old run id", () => {
+    const b = assertRendered(RUN, "collectionRun");
+    b.deliver({ ...clone(RUN), run: RUN_ID + 1 });
+    assert.deepStrictEqual(leaves(b), [leave]);
+    const newer = { id: RUN_ID + 1, details: JUDGED.details };
+    assert.strictEqual(releaseRun(newer, RUN_ID), newer, "the old run's leave dropped the newer run");
+  });
+
+  test("no run view on screen means nothing to leave", () => {
+    const b = bench();
+    b.deliver(clone(COLLECTIONS));
+    b.window.document.getElementById("back").click();
+    assert.deepStrictEqual(leaves(b), []);
   });
 });

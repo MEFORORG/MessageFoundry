@@ -255,3 +255,13 @@ export function pickCaseDetail(
   }
   return index >= 0 && index < held.details.length ? held.details[index] : null;
 }
+
+/**
+ * The held run after the webview says it left the view for `run` (BACKLOG #2441), so a later
+ * `caseDetail` for that run gets no answer. `run` comes from the webview and is untrusted: only an
+ * exact match on the held id releases it. Any other value, including a newer run's id, keeps what is
+ * held, so a stale or duplicate message cannot drop the run now on screen.
+ */
+export function releaseRun<T extends { id: number }>(held: T | null, run: unknown): T | null {
+  return held && run === held.id ? null : held;
+}

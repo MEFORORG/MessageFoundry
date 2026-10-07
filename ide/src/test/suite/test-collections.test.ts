@@ -9,6 +9,7 @@ import {
   isVolatile,
   judgeCollectionRun,
   pickCaseDetail,
+  releaseRun,
   type ExpectedDelivery,
 } from "../../testCollections";
 
@@ -203,5 +204,35 @@ suite("testCollections.pickCaseDetail — the host answers only a request for a 
     for (const [why, run, index, h] of refused) {
       assert.strictEqual(pickCaseDetail(h, run, index), null, why);
     }
+  });
+});
+
+// BACKLOG #2441: the webview's leaveRun releases the held run, and only on an exact id match.
+suite("testCollections.releaseRun — leaving the run view stops the host answering for it", () => {
+  const details = [{ error: null, deliveries: [] }];
+  const held = { id: 4, details };
+
+  test("the held run's id releases it, so its caseDetail gets no answer", () => {
+    assert.strictEqual(pickCaseDetail(held, 4, 0), details[0], "control: answered before the leave");
+    assert.strictEqual(pickCaseDetail(releaseRun(held, 4), 4, 0), null);
+  });
+
+  test("any other value keeps the held run answerable", () => {
+    const kept: [string, unknown][] = [
+      ["an older run", 3],
+      ["a newer run", 5],
+      ["a string run id", "4"],
+      ["no run id", undefined],
+      ["null", null],
+      ["an object", { id: 4 }],
+    ];
+    for (const [why, run] of kept) {
+      assert.strictEqual(releaseRun(held, run), held, why);
+      assert.strictEqual(pickCaseDetail(releaseRun(held, run), 4, 0), details[0], why);
+    }
+  });
+
+  test("nothing held stays nothing held", () => {
+    assert.strictEqual(releaseRun(null, 4), null);
   });
 });
