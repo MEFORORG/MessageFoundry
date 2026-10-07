@@ -2063,8 +2063,8 @@ class SandboxSettings(_Section):
       stderr relay), three parent pipe fds, and on Windows a job-object handle.
     * **The pre-deploy gate does not learn this setting.** ``messagefoundry check`` and ``dryrun``
       always run in-process (:func:`messagefoundry.pipeline.dryrun.dry_run` takes no ``sandbox``
-      argument), so a Handler calling ``db_lookup``/``fhir_lookup`` passes the gate green and then
-      fails closed at ``serve``.
+      argument). ``docs/CONFIGURATION.md``, section ``[sandbox]``, lists where the preview and
+      ``serve`` then differ, and why a ``db_lookup``/``fhir_lookup`` Handler is not one of them.
 
     Reliability-core + read ONCE at engine construction (a ``/config/reload`` does NOT re-read it —
     **restart to change**, exactly like ``claim_mode``)."""
