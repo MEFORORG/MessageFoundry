@@ -20,6 +20,7 @@ import ast
 import collections
 import collections.abc
 import configparser
+import functools
 import io
 import itertools
 import logging
@@ -805,24 +806,23 @@ class _Set(set[object]):
     pass
 
 
-class _IterDeque(collections.deque[object]):
-    """Its repr lists it through this __iter__, not its storage, as the stdlib's deque repr does."""
-
-    shown: list[object]
+class _ReversedDeque(collections.deque[object]):
+    """The stdlib's deque repr lists a deque through its own __iter__, so this prints reversed."""
 
     def __iter__(self) -> Iterator[object]:
-        return iter(self.shown)
+        return reversed(list(collections.deque.__iter__(self)))
+
+
+def _cycle_through_namedtuple(err: UnicodeEncodeError) -> object:
+    loop: list[object] = [err]
+    point = _POINT(loop, 1)
+    loop.append(point)
+    return point
 
 
 class _Labelled(dict[str, object]):
     def __repr__(self) -> str:
         return f"_Labelled{dict.__repr__(self)}"
-
-
-def _shown_through_iter(kind: type[Any], err: UnicodeEncodeError) -> object:
-    held = kind([1])
-    held.shown = [err, 2]  # the storage holds no error; what the repr reads does
-    return held
 
 
 def _cycle_list(err: UnicodeEncodeError) -> list[object]:
@@ -845,7 +845,8 @@ def _holders(err: UnicodeEncodeError) -> list[object]:
         _cycle_mapping(dict, err),
         _cycle_mapping(collections.OrderedDict, err),
         _cycle_mapping(lambda: collections.defaultdict(None), err),
-        _shown_through_iter(_IterDeque, err),
+        _ReversedDeque([1, err, 2]),
+        _cycle_through_namedtuple(err),
         collections.Counter({err: 1, "ok": 3}),
         _Labelled(e=err, n=1),
         [err, clean_loop],
@@ -871,6 +872,7 @@ _HOLDER_IDS = [
     "cyclic-ordereddict",
     "cyclic-defaultdict",
     "deque-printed-through-its-iter",
+    "cycle-through-a-namedtuple",
     "counter",
     "dict-subclass-with-its-own-repr",
     "list-beside-a-clean-cycle",
@@ -935,6 +937,44 @@ def test_a_mapping_argument_holding_a_unicode_error_is_still_a_safe_mapping() ->
     _assert_encode_safe(str(args.get("e")))
     _assert_encode_safe(repr(list(args.items())))
     _assert_encode_safe(record.getMessage())
+
+
+class _Drain(collections.deque[object]):
+    """Its own iteration empties it, so a filter that read it that way would change it."""
+
+    def __iter__(self) -> Iterator[object]:
+        while self:
+            yield self.popleft()
+
+
+def test_a_deque_whose_iteration_consumes_it_is_not_consumed_by_the_filter() -> None:
+    arg = _Drain([1, 2])
+    expected = _record("%s %s", (_Drain([1, 2]), 0)).getMessage()
+    record = _record("%s %s", (arg, 0))
+    TrayLogScrubFilter().filter(record)
+    assert record.getMessage() == expected
+
+
+def test_a_namedtuple_given_as_the_args_formats_field_by_field() -> None:
+    record = _record("%s %s", _POINT(_encode_error(), 2))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    _assert_encode_safe(out)
+    assert out.endswith(" 2")
+
+
+def test_a_default_factory_that_could_print_data_is_not_printed() -> None:
+    err = _encode_error()
+    factory: Any = functools.partial(list, [err])
+    record = _record("%s %s", (collections.defaultdict(factory, k=err), 0))
+    prepare_log_record(record)
+    out = record.getMessage()
+    assert "caf" not in out
+    assert out.startswith("defaultdict([a default factory, not rendered], {'k': ")
+    clean = collections.defaultdict(factory, k=1)  # no error: untouched, factory and all
+    record = _record("%s", (clean,))
+    prepare_log_record(record)
+    assert record.getMessage() == str(clean)
 
 
 # --- path 3: an error rendered into another error's message -----------------------------------------

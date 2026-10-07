@@ -76,7 +76,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
-from types import TracebackType
+from types import BuiltinFunctionType, FunctionType, TracebackType
 from typing import Any
 
 __all__ = [
@@ -2244,9 +2244,8 @@ def codec_safe_str(exc: BaseException) -> str:
 #: code to be read: ``ConfigParser.items()`` interpolates and can raise, and the engine's
 #: ``CodeSet`` would be walked whole on every record. Those, a ``ChainMap``, a ``MappingProxyType``,
 #: a ``SimpleNamespace``, a dataclass and every other object are left as they are. The caller's code
-#: still runs in at least these places: a ``UserDict``'s ``.data`` and a deque subclass's own
-#: ``__iter__`` (each what its ``repr`` reads), the ``repr()`` of an element beside an error, and a
-#: container subclass's own ``__repr__``.
+#: still runs in at least these places: a ``UserDict``'s ``.data``, the ``repr()`` of an element
+#: beside an error, and a container subclass's own ``__repr__`` over a bare copy (:func:`_own_render`).
 #: :func:`prepare_log_record` catches what they raise.
 _ARG_SEQUENCES: tuple[type[Any], ...] = (tuple, list, set, frozenset, deque)
 _ARG_VIEWS: tuple[type[Any], ...] = (type({}.keys()), type({}.values()), type({}.items()))
@@ -2322,16 +2321,21 @@ class _RenderedMapping(dict[Any, Any]):
     the rebuilt keys and values, so a later handler that reads ``.get()`` or ``.items()`` gets the
     safe text too. It writes nothing to the caller's mapping."""
 
-    __slots__ = ("_original", "_repr", "_str")
+    __slots__ = ("_original", "_rebuild", "_repr", "_str")
 
-    def __init__(self, original: Any, rendered: _Rendered, pairs: list[tuple[Any, Any]]) -> None:
-        super().__init__(pairs)
+    def __init__(self, original: Any, rebuild: _Rebuild) -> None:
+        rendered = rebuild.arg(original, 0)
+        super().__init__(rebuild.pairs(original))
         self._original = original
-        self._repr, self._str = rendered._repr, rendered._str
+        self._rebuild = rebuild
+        self._repr, self._str = repr(rendered), str(rendered)
 
     def __getitem__(self, key: Any) -> Any:
         value = self._original[key]  # the caller's own lookup, as "%(key)s" makes it with no filter
         try:
+            node = self._rebuild.scan.nodes.get(id(value))
+            if node is not None and node[0] is value:  # walked already: reuse that scan
+                return self._rebuild.arg(value, 1)
             return _safe_arg(value, 1)
         except Exception as exc:  # noqa: BLE001 -- fail closed, see prepare_log_record
             return _withheld(type(exc).__name__)
@@ -2347,13 +2351,18 @@ class _RenderedMapping(dict[Any, Any]):
 
 
 def _children(arg: Any, kind: type[Any]) -> list[Any]:
-    """The objects a render of ``arg`` prints, read the way its own ``repr`` reads them. A mapping's
-    are its keys and values, flattened in order.
+    """The objects a render of ``arg`` prints, read from its storage through the builtin's own
+    methods. A mapping's are its keys and values, flattened in order.
 
-    A builtin's own method can raise here only when another thread changes the container mid-read,
-    and that propagates, so the scan fails closed. Where the ``repr`` reads through the caller's own
-    code instead, so does this, and an error from it leaves the argument untouched: the formatter
-    runs the same code and fails the same way, as it would with no filter."""
+    Each read is one ``list()`` over a C iterator, which another thread cannot interleave with, so it
+    fails only on a container changed mid-read in a free-threaded build. That propagates and the
+    scan fails closed. A ``UserDict``'s ``.data`` is the one read that can run the caller's code; an
+    error from it leaves the argument untouched, since its ``repr`` reads the same attribute and
+    fails the same way, as it would with no filter.
+
+    It never iterates through a subclass's own ``__iter__``, which may consume what it reads. A
+    deque subclass's ``repr`` does, so one that overrides it and fabricates an error that is not in
+    its storage is not caught, as a mapping whose own lookup returns one is not."""
     if issubclass(kind, BaseExceptionGroup):
         # Both: a subclass may print its .args, and the caller's list in .args can differ from them.
         return [*_GROUP_MEMBERS.__get__(arg), *_EXC_ARGS.__get__(arg)]
@@ -2361,20 +2370,15 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
         return list(_EXC_ARGS.__get__(arg))  # str() and repr() print .args
     if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
         return list(arg)
-    try:
-        if issubclass(kind, UserDict):
+    if issubclass(kind, UserDict):
+        try:
             return [arg.data]  # UserDict prints repr(self.data)
-        own_iter: Any = getattr(kind, "__iter__", None)
-        if issubclass(kind, deque) and own_iter is not deque.__iter__:
-            # The deque repr alone lists it through the subclass's own __iter__ (measured on 3.14;
-            # a list, set, dict or OrderedDict subclass is printed from its storage).
-            return list(arg)
-    except Exception:  # noqa: BLE001 -- the formatter meets the same code; see the docstring
-        return []
+        except Exception:  # noqa: BLE001 -- the formatter meets the same code; see the docstring
+            return []
     if issubclass(kind, dict):
         # An OrderedDict keeps its own order apart from the dict's storage.
         items = OrderedDict.items if issubclass(kind, OrderedDict) else dict.items
-        return [part for pair in items(arg) for part in pair]
+        return [part for pair in list(items(arg)) for part in pair]
     for base in _ARG_SEQUENCES:
         if issubclass(kind, base):
             return list(base.__iter__(arg))
@@ -2442,6 +2446,19 @@ def _pairs(fresh: list[Any]) -> list[tuple[Any, Any]]:
     return list(zip(fresh[0::2], fresh[1::2], strict=True))
 
 
+_FACTORY_NOTE = "[a default factory, not rendered]"
+
+
+def _factory_repr(arg: Any) -> str:
+    """A `defaultdict`'s factory as its `repr` prints it, when that is a class or a function and so
+    names code, never data. Any other callable, as a `partial`, may print what it holds, and it is
+    not walked, so it is a fixed note."""
+    factory = _DEFAULT_FACTORY.__get__(arg)
+    if factory is None or type(factory) in (type, BuiltinFunctionType, FunctionType):
+        return repr(factory)
+    return _FACTORY_NOTE
+
+
 def _builtin_render(arg: Any, kind: type[Any], fresh: list[Any]) -> str | None:
     """What the builtin ``repr`` of ``kind`` prints for these elements, or None when ``kind``
     prints itself its own way. Written out, so a dict or a set prints in the original's order and
@@ -2457,7 +2474,7 @@ def _builtin_render(arg: Any, kind: type[Any], fresh: list[Any]) -> str | None:
         if own is OrderedDict.__repr__:
             return f"{kind.__name__}({body})"
         if own is defaultdict.__repr__:
-            return f"{kind.__name__}({_DEFAULT_FACTORY.__get__(arg)!r}, {body})"
+            return f"{kind.__name__}({_factory_repr(arg)}, {body})"
         return None
     if issubclass(kind, _ARG_VIEWS):  # these types cannot be subclassed
         return f"{kind.__name__}([{_joined(fresh)}])"
@@ -2468,7 +2485,8 @@ def _builtin_render(arg: Any, kind: type[Any], fresh: list[Any]) -> str | None:
     if own is set.__repr__ or own is frozenset.__repr__:
         body = "{" + _joined(fresh) + "}"
         return body if kind is set else f"{kind.__name__}({body})"
-    if own is deque.__repr__:
+    own_iter: Any = kind.__iter__
+    if own is deque.__repr__ and own_iter is deque.__iter__:  # its repr lists it through __iter__
         maxlen = _DEQUE_MAXLEN.__get__(arg)
         bound = "" if maxlen is None else f", maxlen={maxlen}"
         return f"{kind.__name__}([{_joined(fresh)}]{bound})"
@@ -2503,6 +2521,8 @@ def _own_render(arg: Any, kind: type[Any], fresh: list[Any]) -> _Rendered | None
         elif issubclass(kind, dict):
             copy = dict.__new__(kind)
             if issubclass(kind, defaultdict):
+                if _factory_repr(arg) is _FACTORY_NOTE:  # its own repr may print the factory
+                    return None
                 defaultdict.__init__(copy, _DEFAULT_FACTORY.__get__(arg))
             for key, value in _pairs(fresh):
                 dict.__setitem__(copy, key, value)
@@ -2550,8 +2570,12 @@ class _Rebuild:
         if key not in self.scan.holds:
             return arg  # holds no error: untouched
         if key in self.active:
-            self.back_edges += 1
-            return self._back_edge(arg, kind)
+            mark = self._back_edge(arg, kind)
+            if mark is not None:
+                self.back_edges += 1
+                return mark
+            # A repr of its own has no guard, so the stdlib prints it again here, and the builtin
+            # container inside it on the same cycle prints the mark. The depth cutoff bounds this.
         if depth > _ARG_DEPTH:
             return _Rendered(_TOO_DEEP)
         cached = self.memo.get(key)
@@ -2570,8 +2594,9 @@ class _Rebuild:
             self.memo[key] = (depth, result)
         return result
 
-    def _back_edge(self, arg: Any, kind: type[Any]) -> _Rendered:
-        """What the builtin ``repr`` prints where a container meets itself again."""
+    def _back_edge(self, arg: Any, kind: type[Any]) -> _Rendered | None:
+        """What the builtin ``repr`` prints where a container meets itself again, or None for a
+        container whose own ``repr`` has no such guard."""
         own: Any = kind.__repr__
         if own is list.__repr__ or own is deque.__repr__:
             return _Rendered("[...]")
@@ -2580,14 +2605,15 @@ class _Rebuild:
         if own is dict.__repr__:
             return _Rendered("{...}")
         if own is defaultdict.__repr__:
-            return _Rendered(f"{kind.__name__}({_DEFAULT_FACTORY.__get__(arg)!r}, {{...}})")
+            return _Rendered(f"{kind.__name__}({_factory_repr(arg)}, {{...}})")
         if own is OrderedDict.__repr__ or issubclass(kind, _ARG_VIEWS):
             return _Rendered("...")
-        if own is UserDict.__repr__:  # it prints repr(self.data), and the data is a dict
+        if issubclass(kind, UserDict):
+            # UserDict prints repr(self.data) at the same level, so it must stop here.
             children = self.scan.nodes[id(arg)][1]
-            if children and type(children[0]) is dict:
-                return _Rendered("{...}")
-        return _Rendered(_CYCLE)  # its own repr would decide; the raw original must not print
+            data_is_dict = own is UserDict.__repr__ and children and type(children[0]) is dict
+            return _Rendered("{...}" if data_is_dict else _CYCLE)
+        return None
 
     def _render(self, arg: Any, kind: type[Any], children: list[Any], depth: int) -> _Rendered:
         if issubclass(kind, BaseException):
@@ -2639,11 +2665,7 @@ def _safe_mapping_args(args: Any) -> Any:
     scan = _Scan(args)
     if not scan.holds:
         return args
-    rebuild = _Rebuild(scan)
-    rendered = rebuild.arg(args, 0)
-    if not isinstance(rendered, _Rendered):  # pragma: no cover -- a mapping on a path renders
-        rendered = _Rendered(_CYCLE)
-    return _RenderedMapping(args, rendered, rebuild.pairs(args))
+    return _RenderedMapping(args, _Rebuild(scan))
 
 
 def _withheld(failure: str) -> _Rendered:
@@ -2682,15 +2704,16 @@ def prepare_log_record(record: logging.LogRecord) -> None:
         # The args went with the message they were for, or the formatter's % would raise.
         record.msg, record.args = _withheld(type(exc).__name__), ()
         return
-    args = record.args
-    if type(args) is tuple:
+    args: Any = record.args
+    if issubclass(type(args), tuple):  # a namedtuple formats as its fields, as a tuple does
+        items = list(tuple.__iter__(args))  # its storage, which % reads; never its own __iter__
         fresh: list[Any] = []
-        for arg in args:  # one at a time, so one bad argument withholds only itself
+        for arg in items:  # one at a time, so one bad argument withholds only itself
             try:
                 fresh.append(_safe_arg(arg, 1))
             except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
                 fresh.append(_withheld(type(exc).__name__))
-        if any(new is not old for new, old in zip(fresh, args, strict=True)):
+        if any(new is not old for new, old in zip(fresh, items, strict=True)):
             record.args = tuple(fresh)
         return
     try:
