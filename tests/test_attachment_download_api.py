@@ -845,7 +845,9 @@ async def _get_with_a_failing_refusal_audit(
 
     async def failing(action: str, **kwargs: Any) -> Any:
         if action == "attachment_download_refused":
-            exc = RuntimeError("synthetic audit store fault")
+            exc = RuntimeError(
+                f"synthetic audit store fault: {json.loads(kwargs['detail'])['reason']}"
+            )
             raised.append(exc)
             raise exc
         return await real(action, **kwargs)
@@ -886,7 +888,12 @@ async def test_a_failed_refusal_audit_carries_no_svg_text_onto_the_chain(
     # The ASGI stack's task groups may chain an ExceptionGroup on the way out; the parser's error
     # must not be anywhere on it. format_exception also walks the groups' members.
     chain = _chain(exc)
-    assert not [e for e in chain if isinstance(e, SvgRejected) or _SVG_PLANTED in repr(e)], chain
+    assert str(exc).endswith("svg_unsanitizable")
+    fields = [
+        (str(e), repr(e.args), repr(vars(e)), repr(getattr(e, "object", None))) for e in chain
+    ]
+    assert not [e for e in chain if isinstance(e, SvgRejected)], chain
+    assert not [f for f in fields if any(_SVG_PLANTED in x for x in f)]
     assert _SVG_PLANTED not in "".join(traceback.format_exception(exc, chain=True))
 
 
@@ -898,6 +905,7 @@ async def test_a_failed_undecodable_refusal_audit_chains_no_decode_error(
     mid = await engine.store.enqueue_ingress(channel_id="ch1", raw=ADT, attachment_refs=[ref])
     r, exc = await _get_with_a_failing_refusal_audit(engine, monkeypatch, mid, ref)
     assert r.status_code == 500
+    assert str(exc).endswith("undecodable")
     assert not [e for e in _chain(exc) if isinstance(e, (binascii.Error, ValueError))]
 
 
