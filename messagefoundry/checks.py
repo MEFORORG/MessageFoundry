@@ -3149,12 +3149,28 @@ def _check_oidc_auth_params(
         )
 
     asked_acr = set((auth.oidc_acr_values or "").split())
-    required_acr = {v for v in auth.oidc_required_acr_values if v.strip()}
-    if required_acr and not asked_acr:
+    # Load strips this list and drops blanks (BACKLOG #2325).
+    required_acr = set(auth.oidc_required_acr_values)
+    if required_acr and not auth.oidc_require_mfa_claim:
         notes.append(
-            f"[auth].oidc_required_acr_values refuses a login without {sorted(required_acr)} but "
+            f"[auth].oidc_required_acr_values lists {sorted(required_acr)}, but "
+            f"[auth].oidc_require_mfa_claim is false, so the claim gate reads no acr and accepts no "
+            f"token as MFA"
+        )
+    elif required_acr and not asked_acr:
+        # BACKLOG #2325: the gate passes on a matching amr OR a matching acr. While
+        # oidc_mfa_amr_values names a value, a token with no acr at all still signs in on its amr,
+        # so the list does not refuse a login without the class; with no amr value it does.
+        effect = (
+            "accepts that acr as MFA, and a token whose amr matches [auth].oidc_mfa_amr_values "
+            "signs in without one"
+            if auth.oidc_mfa_amr_values
+            else "refuses a login without that acr"
+        )
+        notes.append(
+            f"[auth].oidc_required_acr_values names {sorted(required_acr)} but "
             f"[auth].oidc_acr_values requests none — the identity provider is never asked for the "
-            f"assurance the engine then demands"
+            f"assurance that list names. The gate {effect}"
         )
     elif required_acr - asked_acr:
         notes.append(
@@ -3162,10 +3178,10 @@ def _check_oidc_auth_params(
             f"[auth].oidc_acr_values does not request"
         )
     # Requested with NOTHING required cannot reach this line: settings load refuses it (BACKLOG
-    # #2032), and a refused load is reported above as "settings did not load". What is left is a
-    # request naming a class the required list omits. The IdP may honour it, and while
-    # oidc_require_mfa_claim is on the gate does not accept that token's acr, so the login stands
-    # only on the amr arm. With the gate off nothing reads acr at all.
+    # #2032), and a refused load is reported above as "settings did not load". Nor can a request
+    # with the gate off, which load also refuses (BACKLOG #2325). What is left is a request naming
+    # a class the required list omits. The IdP may honour it, and the gate does not accept that
+    # token's acr, so the login stands only on the amr arm.
     if asked_acr - required_acr:
         notes.append(
             f"[auth].oidc_acr_values requests {sorted(asked_acr - required_acr)}, which "

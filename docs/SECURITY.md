@@ -574,7 +574,7 @@ step that follows the first faster than a person can:
 | Pair | Floor | Default | Refused with |
 |---|---|---|---|
 | Sign-in, then a TOTP or recovery code, or a passkey, on the MFA-pending session, including an enrolment that would satisfy it: `POST /me/mfa/confirm` or a passkey registration (BACKLOG #2389) | `[auth].mfa_verify_min_elapsed_seconds`, from the session's mint | 1 s | the leg's ordinary failure: `401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the console's `Invalid code.` page on its TOTP confirm, and `400 passkey verification failed` on the console's passkey registration; audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment |
-| A federated start, then its callback: the step-up always, the sign-in only when `auth_time` falls inside the flow | `[auth].oidc_callback_min_elapsed_seconds`, from the flow's start on the flow cache's clock | 1 s | `federated sign-in failed`, audited `auth.login_failed`, or the generic step-up refusal, audited `auth.reauth`; both with `reason=too_early` |
+| A federated start, then its callback: the step-up always, the sign-in only when `auth_time` falls inside the flow. A callback whose verified `amr` names a value in `oidc_callback_floor_exempt_amr` is exempt (BACKLOG #2388) | `[auth].oidc_callback_min_elapsed_seconds`, from the flow's start on the flow cache's clock | 1 s | `federated sign-in failed`, audited `auth.login_failed`, or the generic step-up refusal, audited `auth.reauth`; both with `reason=too_early` |
 
 Neither response says anything about timing, so by the answer alone a caller cannot tell it from a
 wrong code or a failed IdP proof. The MFA floor charges no lockout and spends no code or passkey
@@ -585,7 +585,8 @@ floored, and neither is an enrolment on a session that owes no factor. Under the
 `[auth].require_action_step_up`, a TOTP enrolment confirm costs one more step. Its route spends the
 single-use password step-up in front of it before the floor runs, as it does for a wrong code. So
 the person proves the password again before resubmitting. The federated step-up is refused before
-its code is redeemed.
+its code is redeemed, unless `oidc_callback_floor_exempt_amr` is set. Then the refusal waits for
+the exchange, and a failed exchange is refused with its own reason rather than `too_early`.
 
 **Why a sign-in callback is floored only sometimes.** An IdP that still holds a live single sign-on
 session answers the engine's redirect with no human step at all. A floor there would refuse that
@@ -618,7 +619,18 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   confirm, where a person scans the code and types it.
 - An IdP that re-authenticates with no human step, such as integrated Windows sign-in, answers a
   step-up faster than the floor on every try. The step-up is then refused each time. At such a site,
-  set `oidc_callback_min_elapsed_seconds` to `0`.
+  list the `amr` values that method sends in `oidc_callback_floor_exempt_amr` (BACKLOG #2388),
+  rather than setting `oidc_callback_min_elapsed_seconds` to `0`. A callback whose signature-verified
+  `amr` names a listed value skips the floor, and every other callback keeps it. The exemption proves
+  a device or a stored credential answered, not that a person acted, so it is a named loosening
+  ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)). A value `oidc_mfa_amr_values` also accepts is
+  refused at load while the claim gate is on. Each exempted pass records the matched values as
+  `callback_floor_exempt_amr`: under `evidence` on the `auth.login_success` row of a sign-in, and at
+  the top of the `auth.reauth` row of a step-up. With the list set, a too-early step-up's code is
+  redeemed before the refusal, because only the exchange yields the `amr`. The exemption lifts
+  only the floor. While `oidc_require_mfa_claim` is on, the token must still carry another `amr`
+  in `oidc_mfa_amr_values` or an `acr` in `oidc_required_acr_values`, so an IdP that sends only
+  the exempt value is refused as `mfa_claim_missing`.
 - The MFA floor compares two wall-clock readings, as the approval dwell does. A clock step backward
   refuses a good code until the clocks agree again. A step forward lets a code through early.
 - The response hides the reason, but the audit row names it. The account holder's own security
@@ -2851,7 +2863,7 @@ slack.
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, charged at **admission** before any store work. WARNING-logged on the JSON API; the `/ui` `phi=True` arm is not (see *The console's refusal differs from the JSON floor's*) | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
 | Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), or a write less than 0.15 s after the actor's last admitted one (`admin_write_min_interval_seconds`, BACKLOG #2301), both provisional human-timing defaults; no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
 | Time from sign-in to the second factor | `session.created_at` vs the service's wall clock, while `session.mfa_verified_at` is unset | a TOTP or recovery code (`verify_mfa`), a passkey assertion, or an enrolment (`confirm_mfa_enrollment`, `finish_webauthn_registration`, BACKLOG #2389) that completes an MFA-pending session less than 1 s after the session was minted (`mfa_verify_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a session whose factor is already satisfied, or that owes none, is not floored | **DENY** with the leg's ordinary failure, so nothing tells the caller about timing (`401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the gate's own error on `POST /ui/mfa`, `400 passkey verification failed` on the console's passkey registration); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment; no lockout count, no code or challenge spent, though under the default `require_action_step_up` a TOTP enrolment confirm's route has already spent its password step-up | on, 1 s | `[auth].mfa_verify_min_elapsed_seconds` (`0` = off) |
-| Time from a federated start to its callback | the flow cache's monotonic clock when the flow was staged vs at the callback | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start, because an IdP holding a live single sign-on session answers with no human step | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The step-up is refused before its code is redeemed | on, 1 s | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off) |
+| Time from a federated start to its callback | the flow cache's monotonic clock when the flow was staged vs at the callback | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start, because an IdP holding a live single sign-on session answers with no human step | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The step-up is refused before its code is redeemed, unless `oidc_callback_floor_exempt_amr` is set (BACKLOG #2388): a callback whose verified `amr` names a listed value is then exempt, and the refusal waits for the code exchange | on, 1 s | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off), `[auth].oidc_callback_floor_exempt_amr` |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
 | Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (an off-loopback bind, a declared terminator, **or** a set `trusted_proxies`, vault BACKLOG #2251) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | at least: `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179). `serve` has no arm for sign-in off: the settings loader and the settings model refuse `[auth].enabled`, and nothing reads that key (vault BACKLOG #2719, #2825) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind, a declared TLS terminator, **or** a set `trusted_proxies` (vault BACKLOG #2251) — never the console flag, BACKLOG #326) × `[approvals].enabled` | `admin_exposed` **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
@@ -3877,8 +3889,14 @@ client built against the older contract hides its AD password form instead of fa
 `kerberos_available` — enabled **and** the boot-once SPNEGO acceptor preflight having passed, sticky
 until restart (`AuthService.kerberos_available` in `auth/service.py`). `oidc` is `oidc_available` — `oidc_enabled` (which is
 `[auth].oidc_enabled` **and** a directory to resolve roles against, `AuthService.oidc_enabled`) **and** the last IdP
-interaction not having failed; that second term is deliberately **advisory and non-sticky**, set by an
-IdP outage (not by a token endpoint answering with a 4xx, which a caller's bad code causes) and cleared by the next success, and *no login path gates on it* (`AuthService.oidc_available`). Neither
+interaction not having failed. That second term is deliberately **advisory and non-sticky**, and
+*no login path gates on it* (`AuthService.oidc_available`). A transport failure, where no answer
+arrived, sets it, and the next success clears it. Any status the token endpoint answers with, a
+5xx included, leaves it alone, because a caller's bad code can draw one (BACKLOG #1948). So an IdP
+behind a proxy that answers its outage with a 503 keeps the link showing.
+[ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
+Amendment E is the source of record for which failures count and what each is audited as. It also
+names the residuals, at least a firewall reset a caller provokes and a misframed JWKS reply. Neither
 flag consults `settings.api.serve_ui`, so the route can still advertise `oidc: true` on a console-less
 engine that registers no OIDC route. The mTLS plane is deliberately absent from it, because it is not a
 sign-in offer.
@@ -4036,17 +4054,21 @@ non-blank value (`AuthSettings._require_oidc_fields` in `config/settings.py`). T
 matching `amr` **or** a matching `acr` (`_check_mfa_gate` in `auth/oidc/claims.py`). So a token whose
 `amr` matches `oidc_mfa_amr_values` (default `["mfa"]`) signs in MFA-verified whatever its `acr`. A
 deploying site that relies on `acr` alone would set `oidc_required_acr_values`, keep
-`oidc_require_mfa_claim` on, and empty `oidc_mfa_amr_values`. At least these requests load and are
-still not checked:
+`oidc_require_mfa_claim` on, and empty `oidc_mfa_amr_values`.
+
+Load also refuses a request while `oidc_require_mfa_claim` is off (BACKLOG #2325). The gate then
+reads no `acr` at all, so nothing would check the answer. A whitespace-only `oidc_acr_values` loads
+as no request, and the authorization request carries no `acr_values`. Both list settings,
+`oidc_mfa_amr_values` and `oidc_required_acr_values`, are stripped at load and lose blank entries,
+in the TOML list form as in the env string form. A list of blanks is then empty, so a gate left with
+nothing to match is refused. `_check_mfa_gate` also ignores a blank configured value, so an `acr` or
+`amr` of `""` never counts as MFA. At least this request loads and is still not checked:
 
 - A requested class that `oidc_required_acr_values` does not list. `messagefoundry check` notes it
   (`_check_oidc_auth_params` in `checks.py`).
-- Any request while `oidc_require_mfa_claim` is off. The `acr` that comes back is only recorded in the
-  sign-in's success audit row (`AuthService._authenticate_oidc`), and `check` does not flag this case.
-- A whitespace-only `oidc_acr_values`. Load counts it as blank, and the authorization request still
-  carries it.
 
-This paragraph was read against engine commit `df77028b45`. The key's row is in the `[auth]` table of
+This paragraph was read against engine commit `f1b813bce6` with the BACKLOG #2325 change applied.
+The key's row is in the `[auth]` table of
 [CONFIGURATION.md](CONFIGURATION.md#auth--authentication--rbac).
 
 **What this fallback does not cover.** An `amr` or `acr` value that does arrive is the identity

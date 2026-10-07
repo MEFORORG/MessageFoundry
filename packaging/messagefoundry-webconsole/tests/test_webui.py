@@ -7945,24 +7945,32 @@ async def test_oidc_login_link_tracks_availability(engine: Engine) -> None:
         assert r.headers["location"].startswith("https://idp.example/authorize?")
 
 
-@pytest.mark.parametrize(("status", "link_stays"), [(400, True), (401, True), (503, False)])
+@pytest.mark.parametrize(
+    ("status", "link_stays"),
+    [(400, True), (401, True), (503, True), (None, False)],
+    ids=["400", "401", "503", "transport-failure"],
+)
 async def test_a_bad_authorization_code_cannot_hide_the_oidc_link(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, status: int, link_stays: bool
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, status: int | None, link_stays: bool
 ) -> None:
     """BACKLOG #1948, driven as a signed-out caller would: start a flow, then call back with a code
     the token endpoint refuses. The real ``exchange_code`` runs against an opener that answers
     ``status``, so the sequence reaches the service the way it would live.
 
-    Any 4xx is the endpoint answering. A 400 is RFC 6749's ``invalid_grant``, the caller's own doing,
-    and the link and ``/auth/providers`` must survive it, or any visitor could switch federated
-    sign-in off. A 401 is the engine's own secret, and it is audited rather than hidden, so that no
-    body has to be read to tell the two apart. The 503 arm is the control: an IdP that is down must
-    still hide the link, so this test can fail."""
+    Any received status is the endpoint answering. A 400 is RFC 6749's ``invalid_grant``, the
+    caller's own doing, and the link and ``/auth/providers`` must survive it, or any visitor could
+    switch federated sign-in off. A 401 is the engine's own secret, and it is audited rather than
+    hidden, so that no body has to be read to tell the two apart. A 503 no longer hides the link
+    either (Manager decision 2026-10-06): a faulty IdP may answer a caller's bad code with one, and
+    this arm used to pin the opposite. The transport-failure arm is the control: an IdP no answer
+    arrives from must still hide the link, so this test can fail."""
     import io
     import urllib.error
 
     class _TokenEndpoint:
         def open(self, req: object, timeout: float = 0.0) -> object:
+            if status is None:
+                raise urllib.error.URLError(ConnectionRefusedError("connection refused"))
             raise urllib.error.HTTPError(
                 "https://idp.example/token",
                 status,
