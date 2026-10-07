@@ -588,9 +588,9 @@ class ApprovalGate:
         **The writes on this path answer a mapped status in a store outage (vault BACKLOG #2255).** A
         refusal's own audit row (``approval.too_early``, ``approval.stale_requester``,
         ``approval.no_longer_gated``) that fails to write is logged and the refusal still answers
-        409, since it runs nothing. The ``approval.approver_provenance`` row a release writes once
-        it has gone ahead, whether the operation succeeded, failed or was cut off, is soft the same
-        way, and pages. Many failed writes on this path also page
+        409, since it runs nothing. A release whose approver account changed after the request
+        writes ``approval.approver_provenance``. That row is soft too, and pages if it fails. It is
+        written whether the operation succeeded, failed or was cut off. Many failed writes on this path also page
         ``audit_write_failed``, but not all of them. docs/SECURITY.md, in its approvals section,
         names at least the ones that do and at least the ones that do not. That list is not closed,
         and the code is the authority. The store READS here (the request row, the

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from types import SimpleNamespace
 from typing import Any
@@ -103,35 +104,41 @@ async def _audit_rows_for(store: Any, action: str, approval_id: str) -> list[Any
     ]
 
 
-class _TeeTap:
-    """Record each :class:`AuditAppend` a store tees off-box, without the logging tee itself.
+class _TeeTap(logging.Handler):
+    """Read each row a store tees off-box, from the real tee's own log record.
 
-    Patched on the class, because a store holds no reference to the tee: each backend calls
-    ``tee_audits`` after its own commit. Only teed rows land here, so a row that rolled back must
-    not appear, and a committed one must appear exactly once."""
+    A handler on the ``messagefoundry.audit`` logger, so the real ``tee_audits`` path runs and
+    nothing is patched. Only teed rows land here, so a row that rolled back must not appear, and a
+    committed one must appear exactly once."""
 
     def __init__(self) -> None:
-        from messagefoundry.store.store import AppendedAuditRow, AuditAppend
+        super().__init__()
+        self.teed: list[dict[str, Any]] = []
+        logging.getLogger("messagefoundry.audit").addHandler(self)
 
-        self._cls = AuditAppend
-        self._real = AuditAppend.tee
-        self.teed: list[tuple[str, str | None, int]] = []
-        teed = self.teed
-
-        def tap(audit: AuditAppend, *, ts: float, row: AppendedAuditRow) -> None:
-            teed.append((audit.action, audit.detail, int(row.row_id)))
-
-        AuditAppend.tee = tap  # type: ignore[method-assign, assignment]
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            event = json.loads(record.getMessage())
+        except ValueError:
+            return
+        if isinstance(event, dict):
+            self.teed.append(event)
 
     def stop(self) -> None:
-        self._cls.tee = self._real  # type: ignore[method-assign]
+        logging.getLogger("messagefoundry.audit").removeHandler(self)
 
     def ids(self, action: str, approval_id: str) -> list[int]:
-        return [
-            row_id
-            for teed_action, detail, row_id in self.teed
-            if teed_action == action and json.loads(str(detail)).get("approval_id") == approval_id
-        ]
+        found = []
+        for event in self.teed:
+            if event.get("action") != action:
+                continue
+            try:
+                detail = json.loads(str(event.get("detail")))
+            except ValueError:
+                continue
+            if isinstance(detail, dict) and detail.get("approval_id") == approval_id:
+                found.append(int(event["row_id"]))
+        return found
 
 
 async def _assert_transition_audit_contract(store: Any) -> None:
@@ -212,8 +219,9 @@ async def _assert_transition_audit_contract(store: Any) -> None:
         rejected = await _audit_rows_for(store, "approval.rejected", approval_id)
         assert len(rejected) == 1 and str(rejected[0]["actor"]) == _APPROVER
 
-        # Each committed row is teed off-box once, after its commit, as the row the chain holds.
-        # A rolled-back row and a transition that matched nothing tee nothing.
+        # Each committed row is teed off-box once, as the row the chain holds. A refused append and
+        # a transition that matched nothing tee nothing. No arm here faults the COMMIT itself, so
+        # this does not show the tee waits for the commit; the backends' code order carries that.
         requested = await _audit_rows_for(store, "approval.requested", approval_id)
         assert tap.ids("approval.requested", approval_id) == [int(requested[0]["id"])]
         assert tap.ids("approval.requested", lost_id) == []
