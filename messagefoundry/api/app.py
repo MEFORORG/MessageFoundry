@@ -372,6 +372,7 @@ from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
+    DrParkedError,
     NotDeployedError,
     RegistryRunner,
     ShardLaneOwnershipError,
@@ -744,6 +745,36 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
     name one of its own channels, because replay is not channel-filtered at the engine level. Read
     by the route at request time and by the approval gate at release, so the two cannot diverge."""
     return identity.can_access_channel(channel_id)
+
+
+async def _alert_control_action(engine: Engine, action: str, target: str) -> None:
+    """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
+
+    Re-reads ``engine.registry_runner`` on each call, so it stays right across a reload that swaps
+    the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067); that
+    is the rule working as designed, not a failure, so it is logged once here at INFO and nothing
+    else happens. Any other error reaches the notifier, which logs it and never raises."""
+    rr = engine.registry_runner
+    if rr is None:
+        return
+    if action == "restart_inbound":
+        if rr.inbound_filtered(target) is not None:
+            # An operator start of a parked inbound overrides the profile; a rule is the engine,
+            # and must not (the scheduler's gate holds the same line, BACKLOG #2067).
+            _log.info(
+                "alert control_action restart_inbound for %r not run: the DR run-profile parks it",
+                target,
+            )
+            return
+        await rr.restart_inbound(target)
+    elif action == "restart_outbound":
+        try:
+            await rr.restart_outbound(target)
+        except DrParkedError:
+            _log.info(
+                "alert control_action restart_outbound for %r not run: the DR run-profile parks it",
+                target,
+            )
 
 
 def _purge_in_scope(identity: Identity) -> bool:
@@ -3456,6 +3487,10 @@ def create_app(
                 # #233 (ADR 0111): start/restart of a not-deployed outbound is refused — there is no
                 # connector to build and no worker to resume; deploying it is a config change, not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
+                raise HTTPException(409, str(exc)) from None
+            except DrParkedError as exc:
+                # vault BACKLOG #3067: start, stop and restart of an outbound the DR run-profile parks
+                # are refused, so the lane keeps the park until the reload after POST /dr/release.
                 raise HTTPException(409, str(exc)) from None
             running = rr.outbound_running(name)
             await _record_control_audit(
@@ -7626,6 +7661,8 @@ def create_app(
             active=result.active,
             threshold=result.threshold,
             vip_hook_ran=result.vip_hook_ran,
+            drained=result.drained,
+            held_on_parked_outbounds=result.held_on_parked_outbounds,
             depth_left=result.depth_left,
         )
 
@@ -9100,13 +9137,7 @@ def create_managed_app(
             if notifier is not None:
 
                 async def _alert_control(action: str, target: str) -> None:
-                    rr = engine.registry_runner
-                    if rr is None:
-                        return
-                    if action == "restart_inbound":
-                        await rr.restart_inbound(target)
-                    elif action == "restart_outbound":
-                        await rr.restart_outbound(target)
+                    await _alert_control_action(engine, action, target)
 
                 notifier.set_control_callback(_alert_control)
             app.state.engine = engine

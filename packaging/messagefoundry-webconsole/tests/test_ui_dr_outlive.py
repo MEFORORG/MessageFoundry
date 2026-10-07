@@ -51,10 +51,10 @@ async def test_a_console_release_cut_off_by_the_deadline_still_completes(
     coord._active = True
     dr_engine._dr_active = True
 
-    async def slow_drain() -> int:
+    async def slow_drain() -> dict[str, object]:
         await asyncio.sleep(0.6)  # outlasts the 0.2 s deadline below
         dr_engine._dr_active = False
-        return 0
+        return {"depth_left": 0}
 
     coord._deactivate_profile = slow_drain
 

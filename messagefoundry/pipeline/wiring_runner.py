@@ -212,7 +212,7 @@ from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
 
-__all__ = ["NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
+__all__ = ["DrParkedError", "NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
 
 type Direction = Literal["inbound", "outbound"]
 """Which table a connection name was declared in. A name may be in BOTH (``Registry._add``
@@ -347,6 +347,25 @@ class NotDeployedError(RuntimeError):
             f"connection {name!r} is present in the config but NOT deployed (deployed=false) — "
             "deploying it is a config change, not a runtime action: set deployed=true (and supply "
             "its env() values), then reload"
+        )
+        self.name = name
+
+
+class DrParkedError(RuntimeError):
+    """A run-state CONTROL (start, stop or restart) targeted an outbound the DR run-profile parks
+    (#61, ADR 0048; vault BACKLOG #3067).
+
+    Refused rather than deferred. The lane has no connector until the profile is off, so a start
+    could only charge its held rows failed attempts, and a stop or restart would turn the engine's
+    park into an operator pause or the reverse, which the release reload then reads wrongly. Each
+    such door was found one at a time while they were deferred. A refusal leaves the lane exactly as
+    the profile parked it, for the first reload or start after ``POST /dr/release`` to re-evaluate.
+    The API maps this to 409."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"outbound {name!r} is parked by the DR run-profile; release DR first "
+            "(POST /dr/release, then reload)"
         )
         self.name = name
 
@@ -2452,7 +2471,8 @@ class RegistryRunner:
 
         The listening set is snapshotted now, on the caller's thread, so the predicate can run on a
         worker thread (the flag toggle validates off the event loop). The DR threshold and default
-        tier are read through ``self`` when it runs; both are set only at construction."""
+        tier are read through ``self`` when it runs. The tier is set only at construction; the
+        threshold is set there and by :meth:`set_dr_threshold`."""
         listening = frozenset(self._sources)
 
         def binds(ic: InboundConnection) -> bool:
@@ -2463,6 +2483,24 @@ class RegistryRunner:
             return not self._below_dr_threshold(ic.priority)
 
         return binds
+
+    @property
+    def dr_threshold(self) -> Priority | None:
+        """The DR run-profile threshold this runner applies, or ``None`` when it parks nothing."""
+        return self._dr_threshold
+
+    def set_dr_threshold(self, threshold: Priority | None) -> None:
+        """Set the DR run-profile threshold (#61, ADR 0048) for the next :meth:`start` or
+        :meth:`reload`. It binds and unbinds nothing itself, so the caller follows it with a reload.
+
+        The engine calls it when ``POST /dr/activate`` or ``/dr/release`` flips the run-profile on
+        a running box. Without it the threshold stayed at its construction value, so an activation
+        reload parked nothing on a box built passive (vault BACKLOG #3067).
+
+        The ``filtered`` markers stay until that reload, which drops them when no threshold is set.
+        Until then a released box keeps a parked feed parked: the scheduler skips it, and its
+        status says why its outbound has no connector."""
+        self._dr_threshold = threshold
 
     def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
@@ -2655,9 +2693,13 @@ class RegistryRunner:
         operator-paused, so no reload resumes it (#115/#233). **It says nothing about the lane the
         halt never touched**: a lane the ENGINE parked is already in ``_outbound_paused`` when the
         halt runs, so the halt skips it and its marker survives, and the reload was lifting exactly
-        that marker unlogged. :meth:`_reconcile_outbounds` now asks the same gate before it does."""
+        that marker unlogged. :meth:`_reconcile_outbounds` now asks the same gate before it does.
+
+        Raises :class:`DrParkedError` for a lane the DR run-profile parks, before that gate, so a
+        refused start neither probes the log nor pages."""
         async with self._reload_lock:
             self._require_owned_destination(name)
+            self._refuse_dr_parked(name)
             if not self._outbound_start_permitted(name):
                 return
             await self._start_outbound_unsafe(name)
@@ -2668,9 +2710,14 @@ class RegistryRunner:
         draining; this halts delivery but keeps the queue). Requests a COOPERATIVE pause and RETURNS
         FAST — it does NOT await the in-flight head to drain, so a hung/slow destination can never hang
         the caller (the HTTP request). The lane only *counts as* 'stopped' once its quiescence Event
-        fires (:meth:`outbound_quiesced`); until then it is 'stopping'. Sharded: owner-only (ADR 0073)."""
+        fires (:meth:`outbound_quiesced`); until then it is 'stopping'. Sharded: owner-only (ADR 0073).
+
+        Raises :class:`DrParkedError` for a lane the DR run-profile parks: it is already paused and
+        holding its rows, and a stop would turn the engine's park into an operator pause that the
+        reload after a release could not lift (vault BACKLOG #3067)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
+            self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
 
     async def restart_outbound(self, name: str) -> None:
@@ -2684,9 +2731,13 @@ class RegistryRunner:
         here. The refusal happens AFTER the stop, deliberately: the fail-closed outcome is a lane
         left PAUSED, so the pause is taken first and then stands. And this door is reachable with no
         operator at all — an alert rule's ``control_action`` can auto-fire ``restart_outbound``
-        (#144) on ``connection_stopped``, the very signal a log-failure halt raises."""
+        (#144) on ``connection_stopped``, the very signal a log-failure halt raises.
+
+        Raises :class:`DrParkedError` for a lane the DR run-profile parks, before either half, so
+        neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
+            self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
             if not self._outbound_start_permitted(name):
                 return
@@ -2698,17 +2749,25 @@ class RegistryRunner:
         drain (cooperative). NEVER ``task.cancel`` a worker/serializer — a cancelled mid-delivery row
         strands INFLIGHT until the next start, promotion or (clustered Postgres) lease sweep -- a
         reload recovers only a worker that RETURNED, never a cancelled one (ADR 0157 Inc 2) --
-        defeating require-stopped."""
+        defeating require-stopped.
+
+        A lane that is ALREADY paused and quiesced stays quiesced. Its pause admits no new claim, so
+        nothing can be in flight, and the pooled dispatcher's ``pause_lane`` is a no-op on a PAUSED
+        lane that never fires again: clearing the Event there left the lane 'stopping' for good, and
+        purge refused (vault BACKLOG #3067)."""
         self._validate_outbound(name)
+        ev = self._outbound_quiesced.get(name)
+        already_quiet = name in self._outbound_paused and ev is not None and ev.is_set()
         self._outbound_paused.add(name)
         # The OPERATOR now owns this lane's down state — a reload must not resume it (#115/#233): drop any
         # engine-park marker so _unpark_outbound_lane leaves it alone even if the graph says it may run.
         self._gate_parked.discard(name)
         self._schedule_parked.discard(name)  # the scheduler's own park re-records it after this
+        if already_quiet:
+            return
         # (Re)create the quiescence Event CLEARED: the lane is not yet drained. The pooled dispatcher's
         # on_lane_paused (via _mark_outbound_quiesced) / the per_lane worker's loop-top gate SETs it once
         # in-flight hits zero.
-        ev = self._outbound_quiesced.get(name)
         if ev is None:
             self._outbound_quiesced[name] = asyncio.Event()
         else:
@@ -2734,11 +2793,11 @@ class RegistryRunner:
                 self._wake_lane(Stage.OUTBOUND, name)
 
     def _park_outbound_lane(self, name: str) -> None:
-        """Record ``name``'s delivery lane as DELIBERATELY DOWN — the state both the ``auto_start=False``
-        boot gate (#115) and the ``deployed=False`` gate (#233, ADR 0111) must leave behind (each also on
-        the reload that re-evaluates it). The two differ in what they do NEXT, not here: a start-disabled
-        lane still gets a delivery worker (parked at the pause gate, ready for an operator start), a
-        not-deployed lane gets none at all.
+        """Record ``name``'s delivery lane as DELIBERATELY DOWN — the state the ``auto_start=False``
+        boot gate (#115), the ``deployed=False`` gate (#233, ADR 0111) and a DR park of a never-started
+        lane (vault BACKLOG #3067) must leave behind (each also on the reload that re-evaluates it).
+        They differ in what they do NEXT, not here: a start-disabled or DR-parked lane still gets a
+        delivery worker (parked at the pause gate), a not-deployed lane gets none at all.
 
         Reuses the operator-pause state rather than inventing a parallel one, so every existing consumer
         is honest with no further change: ``outbound_status`` reports ``"stopped"`` (it was reporting
@@ -2766,6 +2825,46 @@ class RegistryRunner:
             # per_lane: the delivery worker blocks at its loop-top pause gate until start_outbound sets
             # this (a cleared Event is the gate; setdefault creates it cleared, clear() is for a re-park).
             self._outbound_resume.setdefault(name, asyncio.Event()).clear()
+
+    def _refuse_dr_parked(self, name: str) -> None:
+        """Raise :class:`DrParkedError` if the DR run-profile parks outbound ``name``. Asked by every
+        door that would change a parked lane's run state; the error's docstring says why."""
+        if self._dr_parked(name):
+            raise DrParkedError(name)
+
+    def _dr_parked(self, name: str) -> bool:
+        """Whether the DR run-profile parks outbound ``name`` this run (its ``filtered`` marker)."""
+        return ("outbound", name) in self._filtered
+
+    def engine_parked_outbounds(self) -> frozenset[str]:
+        """The outbounds the ENGINE holds down by design: those the DR run-profile parks, and those
+        an ``auto_start=False`` or ``deployed=False`` gate parks. Their PENDING rows cannot deliver
+        until a reload or an operator start lifts the park, so a drain that waits for the queue to
+        empty leaves them out (vault BACKLOG #3067). An OPERATOR pause is not included."""
+        dr_parked = {n for (kind, n) in self._filtered if kind == "outbound"}
+        return frozenset(self._gate_parked | dr_parked)
+
+    def _dr_park_outbound(self, name: str, *, live: bool) -> None:
+        """Park a lane the DR run-profile leaves without a connector (vault BACKLOG #3067).
+
+        It used to stay unpaused, so its worker claimed each row, found no connector and charged it
+        a failed attempt; under a finite ``max_attempts`` every row queued to a parked feed was
+        dead-lettered within a few backoffs. A park holds them PENDING instead. The reload that runs
+        with the profile off lifts it through :meth:`_unpark_outbound_lane`, and its reconcile then
+        builds the connector. A lane an OPERATOR paused is left alone: it already holds its rows,
+        and an engine park would let a later reload undo the operator's pause.
+
+        A ``live`` lane may have a row in flight, so it is paused the cooperative way
+        (:meth:`_stop_outbound_unsafe`), which reads quiesced only once that row resolves, and then
+        marked as an engine park. A lane never started has nothing in flight and takes
+        :meth:`_park_outbound_lane`, which reads quiesced at once."""
+        if name in self._outbound_paused:
+            return
+        if live:
+            self._stop_outbound_unsafe(name)
+            self._gate_parked.add(name)
+        else:
+            self._park_outbound_lane(name)
 
     def _unpark_outbound_lane(self, name: str) -> None:
         """Undo a :meth:`_park_outbound_lane` — but ONLY for a lane the ENGINE parked.
@@ -2854,10 +2953,13 @@ class RegistryRunner:
 
     async def _start_outbound_unsafe(self, name: str) -> None:
         """start_outbound body without the reload lock. RESUMES delivery for a paused outbound, BUILDING
-        its connector first if the lane has none (a start-disabled / DR-parked / failed lane is
-        connector-less — see :meth:`_ensure_destination_built`). A connector that IS live is kept WARM (a
-        pause never tore down ``_destinations``), so a plain resume/restart never rebuilds it. Idempotent
-        for a name that isn't paused.
+        its connector first if the lane has none (a start-disabled or failed lane is connector-less —
+        see :meth:`_ensure_destination_built`). A connector that IS live is kept WARM (a pause never
+        tore down ``_destinations``), so a plain resume/restart never rebuilds it. Idempotent for a
+        name that isn't paused.
+
+        REFUSES a DR-parked lane with :class:`DrParkedError`, which its public doors raise first;
+        this one is the backstop for an internal caller that forgot to ask.
 
         REFUSES a ``deployed=False`` outbound (#233, ADR 0111) with :class:`NotDeployedError`: unlike
         ``auto_start=False`` — a boot gate an operator is *meant* to override at runtime — deploying a
@@ -2865,6 +2967,9 @@ class RegistryRunner:
         self._validate_outbound(name)
         if not self._deployed(name, "outbound"):
             raise NotDeployedError(name)
+        # DR-parked (#61, ADR 0048): there is no connector to build, so resuming would charge every
+        # held row a failed attempt until a finite max_attempts dead-lettered it (vault BACKLOG #3067).
+        self._refuse_dr_parked(name)
         await self._ensure_destination_built(name)
         self._outbound_paused.discard(name)
         self._schedule_parked.discard(name)
@@ -2909,7 +3014,7 @@ class RegistryRunner:
         for (kind, name), schedule in self._declared_schedules().items():
             self._spawn_scheduler(name, kind, schedule)
 
-    async def _reconcile_schedulers(self, old: Registry) -> None:
+    async def _reconcile_schedulers(self) -> None:
         """Bring the scheduler tasks in line with a reloaded registry (BACKLOG #2069). Called by
         :meth:`reload` under the reload lock, once the swap has committed.
 
@@ -2927,22 +3032,19 @@ class RegistryRunner:
         The replacements are spawned BEFORE the first await, so a reload cancelled mid-way still
         leaves every declared schedule with a live task.
 
-        A kept outbound whose schedule this reload REMOVED is resumed if the calendar is what parked
-        it (:attr:`_schedule_parked`). The park reads as an operator pause, which no reload lifts,
-        so without this the lane would stay paused with no calendar left to resume it."""
+        A kept outbound with no schedule is resumed if the calendar is what parked it
+        (:attr:`_schedule_parked`). The park reads as an operator pause, which no reload lifts, so
+        without this the lane would stay paused with no calendar left to resume it. The test is the
+        current graph, not whether this reload removed the schedule: a resume refused earlier, such
+        as by the DR run-profile, leaves the lane in :attr:`_schedule_parked`, and a later reload
+        must retry it (vault BACKLOG #3067)."""
         retired = list(self._schedule_workers.values())
         self._schedule_workers.clear()
         for task in retired:
             task.cancel()
         self._start_schedulers()
         for name, oc in self.registry.outbound.items():
-            was = old.outbound.get(name)
-            if (
-                oc.schedule is None
-                and was is not None
-                and was.schedule is not None
-                and name in self._schedule_parked
-            ):
+            if oc.schedule is None and name in self._schedule_parked:
                 await self._resume_unscheduled_outbound(name)
         # A lane the new graph dropped has no calendar left to have parked it.
         self._schedule_parked.intersection_update(self.registry.outbound)
@@ -2959,6 +3061,16 @@ class RegistryRunner:
             or not self._deployed(name, "outbound")
             or not self._auto_start_enabled(name, "outbound")
         ):
+            return
+        if self._dr_parked(name):
+            # The DR run-profile parks it too, so this resume is refused and the lane stays the
+            # calendar's: it remains in _schedule_parked, and _reconcile_schedulers resumes it on
+            # the reload after POST /dr/release (vault BACKLOG #3067).
+            log.info(
+                "schedule: outbound connection %r no longer has a schedule, but the DR run-profile "
+                "parks it; it is resumed by the first reload after POST /dr/release",
+                name,
+            )
             return
         log.info(
             "schedule: outbound connection %r no longer has a schedule — resuming the lane its "
@@ -3019,7 +3131,7 @@ class RegistryRunner:
         # the #115 flaw class again: a scheduler tick is the ENGINE, and `start_inbound` treats its
         # caller as an operator overriding the profile, so an in-window tick bound the listener and
         # cleared the `filtered` marker (BACKLOG #2067). Gated above BOTH branches, as the deployed
-        # gate is: an outbound DR park is connector-less and unpaused, and pausing and resuming it on
+        # gate is: an outbound DR park is connector-less and engine-parked (#3067), and resuming it on
         # the calendar drives nothing. An operator start of an INBOUND clears its marker, and from then
         # the calendar owns it again; a reload re-evaluates the profile for both directions.
         if (kind, name) in self._filtered:
@@ -3826,7 +3938,7 @@ class RegistryRunner:
         # config without failing the build and bringing the engine up DEGRADED at every boot.
         #
         # And, unlike EVERY other down state (auto_start, DR park, ADR-0031 build failure), NO DELIVERY
-        # WORKER IS SPAWNED. Those states all keep the worker so a routed row queues + retries + self-
+        # WORKER IS SPAWNED. Those states all keep the worker so a routed row is kept + self-
         # heals — the right answer for a lane that is *coming back*. A not-deployed lane is not coming
         # back without a config change, so a queued row there could only sit forever and buildup-alert on
         # an INTENTIONAL state — the exact defect this feature removes. Nothing can queue to it anyway:
@@ -3851,17 +3963,20 @@ class RegistryRunner:
         if not oc.auto_start:
             self._destinations.pop(name, None)  # no live connector for a start-disabled lane
             self._park_outbound_lane(name)
+            # Record the DR park too (vault BACKLOG #3067). This gate runs first, so without it a
+            # below-threshold lane read as start-disabled only, and an operator start under DR built
+            # its connector and delivered a feed the profile parks.
+            self._dr_filters_out(name, oc.priority, kind="outbound")
             self._spawn_worker(name)
             return
-        # DR run-profile (#61, ADR 0048): a below-threshold outbound is NOT built — but its delivery
-        # worker still spawns (the retry/ordering/etc. above are set regardless), so a row routed to it
-        # sits in the outbound stage and backs off via the retry policy, self-healing on the next full
-        # (non-DR) startup. This is exactly the ADR-0031 degraded-outbound branch (the worker's "no
-        # connector for a claimed row" path), so the count-and-log + at-least-once invariants hold: the
-        # row is queued + retried + buildup-alerted, never silently dropped. status:"filtered" (not
-        # "failed") tells the operator it was deliberately parked.
+        # DR run-profile (#61, ADR 0048): a below-threshold outbound is NOT built, and its lane is
+        # PARKED the way a start-disabled one is (:meth:`_dr_park_outbound`), so a row routed to it is
+        # RETAINED PENDING: never claimed, never charged an attempt, never dead-lettered for being
+        # parked. Its delivery worker still spawns and waits at the pause gate. status:"filtered" (not
+        # "failed" or "stopped") tells the operator it was deliberately parked.
         if self._dr_filters_out(name, oc.priority, kind="outbound"):
             self._destinations.pop(name, None)  # no live connector for a parked lane
+            self._dr_park_outbound(name, live=False)
             self._spawn_worker(name)
             return
         self._filtered.pop(
@@ -3925,6 +4040,10 @@ class RegistryRunner:
                 # enters it.
                 await self._teardown_unsafe(TeardownReason.SHUTDOWN)
             self._stop.clear()
+            if self._dr_threshold is None:
+                # As in reload: with the profile off nothing is parked, and a marker left by a run
+                # under it would otherwise refuse doors until the next reload (vault BACKLOG #3067).
+                self._filtered.clear()
             # Capture the engine loop so a handler's worker thread can bridge a db_lookup back onto it.
             self._loop = asyncio.get_running_loop()
             # #122 (ADR 0162): subscribe to the application-log write guard. Done here, after the loop
@@ -5208,6 +5327,8 @@ class RegistryRunner:
                 if stale is not None:
                     await stale.aclose()
                 self._failed.pop(("outbound", name), None)
+                # Not deployed outranks a DR park, so a door refuses it as not deployed.
+                self._filtered.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
                 continue
             # Per-connection auto-start (#115): a reload must not RESURRECT a start-disabled lane. It had
@@ -5224,6 +5345,9 @@ class RegistryRunner:
                     await stale.aclose()
                 self._failed.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
+                # The DR park is recorded here too, as at start (_start_outbound), so the doors
+                # refuse a start the profile would not allow (vault BACKLOG #3067).
+                self._dr_filters_out(name, oc.priority, kind="outbound")
                 if worker is None or worker.done():
                     self._spawn_worker(name)
                 continue
@@ -5232,8 +5356,8 @@ class RegistryRunner:
             # otherwise the branches below would faithfully rebuild its connector and respawn its worker
             # and the lane would sit PAUSED forever, so "flip the flag and reload" (AC-4: with no other
             # change) would silently not deploy it. A no-op for an OPERATOR pause (not in _gate_parked):
-            # a reload never undoes an operator action. Placed ABOVE the DR gate so a DR park applies its
-            # own semantics (queued rows RETRIED, status:"filtered") to a clean, unpaused lane.
+            # a reload never undoes an operator action. Placed ABOVE the DR gate so a DR park re-applies
+            # its own park (queued rows HELD, status:"filtered") to a clean lane (vault BACKLOG #3067).
             #
             # REFUSED while a #122 halt is in force and the log is still unwritable (see the memo at
             # the top of this method), and the SAME refusal covers both of this method's doors.
@@ -5287,8 +5411,10 @@ class RegistryRunner:
             # The membership test is what separates them, and it is the caller's filter exactly as in
             # :meth:`_stop_all_for_log_failure`: every `_gate_parked` lane is already in
             # `_outbound_paused`, so it takes the no-write path. Re-stopping an already-paused lane
-            # would CLEAR its quiescence Event, flipping a drained lane's status back from 'stopped'
-            # to 'stopping' and withdrawing its purge-eligibility for a reload that changed nothing.
+            # would drop its `_gate_parked` marker, turning the engine's park into an operator pause
+            # that no later reload lifts. (It used to CLEAR the quiescence Event too, flipping a
+            # drained lane back to 'stopping'; _stop_outbound_unsafe now keeps a quiesced lane
+            # quiesced, vault BACKLOG #3067.)
             #
             # NARROWED to the lane the halt has NOT already taken down, and it reuses the very
             # membership test the paragraph above relies on. `_delivery_halted` is a PROCESS fact,
@@ -5324,10 +5450,12 @@ class RegistryRunner:
                     continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
-            # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
-            # routed rows queue + back off + self-heal on the next full startup, exactly the parked-lane
-            # behavior. Close any live connector from a prior (non-DR) run so it stops delivering.
+            # below-threshold outbound keeps (or gets) its delivery worker but NO live connector, and
+            # its lane is parked, so its rows are held PENDING until a reload with the profile off
+            # lifts the park just above (vault BACKLOG #3067). Close any live connector from a prior
+            # (non-DR) run so it stops delivering.
             if self._dr_filters_out(name, oc.priority, kind="outbound"):
+                self._dr_park_outbound(name, live=self._outbound_lane_live(name))
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
@@ -5524,8 +5652,13 @@ class RegistryRunner:
             )
         return stranded
 
-    async def reload(self, new_registry: Registry) -> None:
+    async def reload(self, new_registry: Registry | None = None) -> None:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
+
+        ``None`` re-applies the graph that is current once the reload lock is held, so a reload
+        queued behind another one re-evaluates that one's graph rather than reverting it. A DR
+        activation uses it to re-apply the running graph under a new threshold (vault BACKLOG
+        #3067).
 
         Quiesce-and-swap, in this order: (0) build-check every new connector — a bad spec raises
         here, before anything is touched, so the running graph is left intact; (1) stop accepting new
@@ -5547,7 +5680,15 @@ class RegistryRunner:
         before reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
+            if new_registry is None:
+                new_registry = self.registry
             self.build_check(new_registry)  # raises before any change on a bad connector
+            if self._dr_threshold is None:
+                # Only the DR profile writes these, and with it off nothing is parked. The loops
+                # below drop a marker only for a connection that passes the earlier gates, so one
+                # left down by auto_start or deployed would otherwise read "filtered" for good
+                # after a POST /dr/release (vault BACKLOG #3067).
+                self._filtered.clear()
             if not self._running:
                 self.registry = new_registry
                 return
@@ -5727,7 +5868,7 @@ class RegistryRunner:
             # graph, so an added schedule starts, an edited one changes and a removed one stops
             # (BACKLOG #2069). After the rollback point on purpose,
             # so a failed reload leaves every scheduler running against the graph it restored.
-            await self._reconcile_schedulers(old)
+            await self._reconcile_schedulers()
 
             # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
             # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has
