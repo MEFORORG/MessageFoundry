@@ -27,7 +27,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import _record_reload_audit
+from messagefoundry.api.app import _compare_start_config, _record_reload_audit
 from messagefoundry.auth import Role
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
@@ -477,6 +477,95 @@ async def test_two_overlapping_reloads_each_record_their_own_config(
         # the next start passes over it to B's.
         assert rows["alice"]["superseded"] is True and rows["alice"]["baseline_unchecked"] is True
         assert "superseded" not in rows["bob"] and "baseline_unchecked" not in rows["bob"]
+    finally:
+        await engine.stop()
+
+
+async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lander hold on PR 2135. Reload A sits between its swap and its row while reload B swaps and
+    then fails and rolls back to A's graph. A's row is written while B's graph is briefly live. A
+    graph-identity test then marked A's row superseded, so the next start compared against an
+    older row and raised a false config_changed. Only a committed reload or a flag toggle moves the
+    loaded fingerprint, so A's row must stay a baseline."""
+    cfg_a, cfg_b = tmp_path / "cfg_a", tmp_path / "cfg_b"
+    _write_valid_config(cfg_a, tmp_path / "in_a", tmp_path / "out_a")
+    _write_valid_config(cfg_b, tmp_path / "in_b", tmp_path / "out_b")
+    (cfg_b / "extra.py").write_text("# B differs from A\n", encoding="utf-8")
+    engine = await Engine.create(
+        tmp_path / "rollback.db",
+        poll_interval=0.02,
+        config_dir=cfg_a,
+        config_reload_roots=[cfg_b],
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        digest_a, _ = await engine.fingerprint_bundle(cfg_a.resolve())
+        assert digest_a is not None
+        # An older baseline under another digest: the row a false alert would compare against.
+        await engine.store.record_audit(
+            "config_loaded",
+            actor="system",
+            detail=json.dumps({**digest_a, "fingerprint": "0" * 64, "dry_run": False}),
+        )
+        service = await _service(engine)
+        await _add(service, "alice", Role.ADMINISTRATOR)
+        await _add(service, "bob", Role.ADMINISTRATOR)
+        a_held, release_a = asyncio.Event(), asyncio.Event()
+        b_mid_swap, a_written = asyncio.Event(), asyncio.Event()
+        real_sync = engine._reconcile_reference_sync
+        real_record = engine.store.record_audit
+
+        async def _hold_a(*, startup: bool) -> None:
+            if not a_held.is_set():  # A, after its swap and before its row
+                a_held.set()
+                await release_a.wait()
+            await real_sync(startup=startup)
+
+        async def _spy(action: str, **kwargs: Any) -> None:
+            await real_record(action, **kwargs)
+            if action == "config_reload" and kwargs.get("actor") == "alice":
+                a_written.set()
+
+        async def _fail_b(*_args: Any) -> None:
+            # B's registry is live here, before the rollback. Let A write its row now, then fail.
+            b_mid_swap.set()
+            await a_written.wait()
+            raise RuntimeError("an outbound would not start")
+
+        async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+            alice, bob = await _token(c, "alice"), await _token(c, "bob")
+            monkeypatch.setattr(engine, "_reconcile_reference_sync", _hold_a)
+            monkeypatch.setattr(engine.store, "record_audit", _spy)
+            reload_a = asyncio.ensure_future(c.post("/config/reload", json={}, headers=alice))
+            reload_b: asyncio.Future[httpx.Response] | None = None
+            try:
+                await asyncio.wait_for(a_held.wait(), timeout=30)
+                rr = engine.registry_runner
+                assert rr is not None
+                monkeypatch.setattr(rr, "_reconcile_outbounds", _fail_b)
+                reload_b = asyncio.ensure_future(
+                    c.post("/config/reload", json={"config_dir": str(cfg_b)}, headers=bob)
+                )
+                await asyncio.wait_for(b_mid_swap.wait(), timeout=30)
+            finally:
+                release_a.set()  # never leave A parked, whatever failed above
+            r_a = await asyncio.wait_for(reload_a, timeout=30)
+            assert reload_b is not None
+            r_b = await asyncio.wait_for(reload_b, timeout=30)
+        assert r_a.status_code == 200, r_a.text
+        assert r_b.status_code == 500, r_b.text  # B failed after its swap and rolled back
+        assert engine.last_reload_dir == cfg_a.resolve(), "A's graph is the one running"
+
+        (row,) = await engine.store.list_audit(action="config_reload")
+        detail = json.loads(row["detail"])
+        assert row["actor"] == "alice" and detail["fingerprint"] == digest_a["fingerprint"]
+        assert "superseded" not in detail and "baseline_unchecked" not in detail
+        outcome, comparison = await _compare_start_config(engine, digest_a)
+        assert outcome == "compared" and comparison is not None
+        assert comparison.baseline_action == "config_reload"
+        assert not comparison.changed, "a false config_changed on the next start"
     finally:
         await engine.stop()
 

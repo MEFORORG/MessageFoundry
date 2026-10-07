@@ -1238,9 +1238,11 @@ async def _record_reload_audit(
     then, so a second reload or a connection flag toggle can move the engine on first. The row then
     still names this reload's config, but marks itself ``superseded`` and
     :data:`_BASELINE_UNCHECKED`, as a superseded start row does: it is no baseline, and the next
-    start compares against an older row instead. The check runs just before the write, so a swap
-    after it is not caught. The snapshot and the check are inside the guard below, so a fault in
-    either is caught like a failed write.
+    start compares against an older row instead. The test is whether
+    :attr:`~Engine.loaded_config_fingerprint` is still this reload's digest object, which only a
+    committed reload or a flag toggle rebinds; a reload that swaps and then rolls back leaves it
+    alone. The check runs just before the write, so a change after it is not caught. The snapshot
+    and the check are inside the guard below, so a fault in either is caught like a failed write.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -1269,10 +1271,10 @@ async def _record_reload_audit(
             state = loaded
         elif outcome is not None:
             state = _LoadedConfig.of(outcome)
-            # A flag toggle rebinds the loaded fingerprint without swapping the graph, so both.
-            superseded = (
-                state.swapped(engine) or engine.loaded_config_fingerprint is not outcome.fingerprint
-            )
+            # Only a COMMITTED reload or a flag toggle rebinds the loaded fingerprint. The graph
+            # object is no test: a reload part way through its swap, which then fails and rolls back
+            # to this graph, would mark a row that still names the running config.
+            superseded = engine.loaded_config_fingerprint is not outcome.fingerprint
         else:
             state = _LoadedConfig.read(engine)
         detail = json.dumps(
@@ -1445,6 +1447,8 @@ _CONFIG_BASELINE_WINDOW = 50
 #: and any flag toggle that process writes. A later start passes over such a row to the last checked
 #: one, so the change the unchecked start could not see is still reported. A start row that a reload
 #: superseded before it was written carries it too (vault BACKLOG #2838): its digest is no baseline.
+#: So does a reload row written after a later reload or a flag toggle moved the loaded fingerprint
+#: on (vault BACKLOG #2257). A reload row the engine has not moved past is never marked.
 _BASELINE_UNCHECKED = "baseline_unchecked"
 
 #: What a start's ``config_loaded`` row records as ``comparison``.
