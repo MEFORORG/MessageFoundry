@@ -309,7 +309,7 @@ def test_the_doubles_control_signs_in_when_nothing_is_referred(
 ) -> None:
     """THE CONTROL for the two refusals above: the same doubles, with no referral, sign in."""
     _install_fakes(monkeypatch)
-    principal = LdapAuthenticator(_ad_settings()).authenticate("alice", _USER_PASSWORD)
+    principal = LdapAuthenticator(_ad_settings()).authenticate("alice", _USER_PASSWORD).principal
     assert principal is not None and principal.username == "alice"
 
 

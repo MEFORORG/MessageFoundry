@@ -240,7 +240,10 @@ def test_install_service_shellexecute_args(monkeypatch: pytest.MonkeyPatch) -> N
     The image is Windows PowerShell 5.1 under the system directory, not a bare ``powershell.exe``."""
     rec = _recorded_dispatch(monkeypatch)
 
-    assert install_service(r"C:\repo\install-service.ps1", "dev") is True
+    assert (
+        install_service(r"C:\repo\install-service.ps1", "dev")
+        is service_control.ServiceControlOutcome.DISPATCHED
+    )
     assert rec.calls == [
         (
             None,
@@ -303,14 +306,43 @@ def test_control_service_off_windows_returns_false_without_dispatch(
     assert tripped == []  # never dispatched
 
 
-def test_install_service_off_windows_returns_false_but_still_validates(
+def test_install_service_off_windows_is_unsupported_but_still_validates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Off Windows install is a no-op (False) — but env validation still runs (it's platform-independent)."""
+    """Off Windows install is a no-op (UNSUPPORTED) — but env validation still runs (it's platform-independent)."""
     monkeypatch.setattr(service_control.sys, "platform", "linux")
-    assert install_service("script.ps1", "dev") is False
+    assert install_service("script.ps1", "dev") is service_control.ServiceControlOutcome.UNSUPPORTED
     with pytest.raises(ValueError, match="unsafe environment name"):
         install_service("script.ps1", "bad;env")
+
+
+@pytest.mark.parametrize(
+    ("returned", "outcome"),
+    [
+        (42, service_control.ServiceControlOutcome.DISPATCHED),  # above 32: launched
+        (33, service_control.ServiceControlOutcome.DISPATCHED),
+        (32, service_control.ServiceControlOutcome.FAILED),  # 32 or less is an error code
+        (5, service_control.ServiceControlOutcome.FAILED),  # SE_ERR_ACCESSDENIED
+        (0, service_control.ServiceControlOutcome.FAILED),  # out of memory or resources
+    ],
+)
+def test_install_service_reads_the_shellexecute_return(
+    monkeypatch: pytest.MonkeyPatch, returned: int, outcome: object
+) -> None:
+    """A refused launch is FAILED, never reported as launched (vault BACKLOG #2787).
+
+    The elevation is stubbed at ``ctypes.windll`` with the platform forced to win32, so this runs on
+    every OS; the arguments themselves are pinned by the win32-only test above."""
+
+    class _Windll:
+        class shell32:  # noqa: N801
+            @staticmethod
+            def ShellExecuteW(*_a: object) -> int:  # noqa: N802
+                return returned
+
+    monkeypatch.setattr(service_control.sys, "platform", "win32")
+    monkeypatch.setattr(service_control.ctypes, "windll", _Windll, raising=False)
+    assert install_service("script.ps1", "dev") is outcome
 
 
 @pytest.mark.parametrize("name", ["dev", "staging", "prod", "env-1", "env_2", "a.b", "A9"])

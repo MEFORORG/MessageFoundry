@@ -410,11 +410,18 @@ create form has no password field and shows the credential once.
 
 **If no credential can be generated, nothing changes.** A site context-word list
 (`[auth].password_extra_context_words`) broad enough that no generated credential clears the policy
-makes account creation and both resets answer 503. Each generates the credential before it writes
-anything, so the account, its factors and its sessions are untouched, and the single-use step-up
-grant the route spent is given back. The engine tries the generator once at start and logs an ERROR
-if it fails, and `messagefoundry verify` reports the same as `auth.credential_generation`. Neither
-refuses to start.
+makes account creation and both resets answer 503. The web console answers 503 too. Each generates
+the credential before it touches the account, so the account, its factors and its sessions are
+untouched. On the two resets, the single-use step-up grant the route spent is given back.
+
+Each refusal writes one `auth.credential_issue_refused` audit row (BACKLOG #2359). The acting
+administrator is the actor. The detail's `op` names the operation: `create`, `password_reset` or
+`mfa_reset`. The detail also names the target `username`, plus `user_id` on a reset and the
+requested `roles` on a create. It is a separate action on purpose. A refusal issued nothing, so it
+must never read as a `user.created` or `auth.password_reset` row.
+
+The engine tries the generator once at start and logs an ERROR if it fails, and
+`messagefoundry verify` reports the same as `auth.credential_generation`. Neither refuses to start.
 
 **The factor reset issues one too.** `POST /users/{user_id}/reset-mfa` on a local account writes a
 generated credential **first**, then clears the TOTP key, the recovery codes and every passkey and
@@ -456,8 +463,18 @@ requirement off the order is as before: rotate, then enrol if you choose.
 The reset can refuse, with a 503 whose detail names `password_extra_context_words`. It does so when
 no generated password clears the policy after repeated tries. That means the site's context words
 refuse nearly every random string, and so nearly every passphrase too. The account keeps its
-password. Remove the site's short or common terms, or replace them with longer ones. Then restart
-the engine and retry, because it reads `[auth]` only at start and a `/config/reload` does not.
+password. To fix it:
+
+1. Remove the site's short or common terms, or replace them with longer ones.
+2. Make the change where the list is set. `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS` overrides the
+   TOML key when both are set.
+3. Restart **every** engine process: each engine shard and each cluster node. Each builds its
+   password policy once, at start, and a `/config/reload` does not re-read `[auth]`. A process left
+   running keeps refusing.
+4. Retry the create or the reset.
+
+The ERROR log line and the 503 detail give the same advice, from one string in the code.
+`tests/test_generated_credential_failure.py` pins it.
 
 **Anti-automation (ASVS 2.4.2).** A per-actor human-timing *pacing floor* on sensitive authenticated
 writes is **built** (BACKLOG #193). **Two** JSON-API gate families charge it, drawing **one bucket per
@@ -1266,10 +1283,10 @@ tuple: they act only on the caller's own account.
 > `verify_mfa`'s check and the reconciler read it as absent, so none of them takes another
 > account's entry as this row's. The engine warns once per distinct cause -- the attribute absent,
 > present in a shape it cannot read, or another object's -- so a site on that path learns why its
-> sign-ins fail. **At least one reader
-> still asks about an id-less row by its name:** the session reconciler, on a row with no federated
-> binding. A directory that reissued the name answers for its new holder there. `verify_mfa` asked
-> such a row by name too, until the rest of BACKLOG #2027 refused it.
+> sign-ins fail. The session reconciler asked about an id-less row with no federated binding by its
+> name until BACKLOG #2434, so a directory that reissued the name answered for its new holder there.
+> It now ends that row's sessions without a lookup. `verify_mfa` asked such a row by name too,
+> until the rest of BACKLOG #2027 refused it.
 >
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is
@@ -1732,6 +1749,21 @@ has already swapped when that row is written. So a failed write is logged at ERR
 still answers success. It reports `degraded: true` with `audit` among its `failures`. A released
 reload carries that into its `approval.approved` row.
 
+**An audit or store outage that refuses writes answers a mapped status on at least these approval
+paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
+answers **409**: that is `approval.too_early` and `approval.stale_requester`. A claim, a rejection or
+a resolution whose status write the store refuses answers **503**, and nothing runs. After a
+rejection's status write, a failed `approval.rejected` row is logged and the rejection stands. A
+request whose `approval.requested` row fails is withdrawn (moved to `failed`) before the error is
+returned, so a retry cannot leave two releasable copies. Every audit row the gate fails to write is
+logged at ERROR with its detail, and raises an `audit_write_failed` alert keyed `approval:<id>`,
+carrying the lost row's action name.
+
+What this does not cover: a store that refuses READS still answers a raw 500, since the request
+row and the requester's account are read before any of this. The status move and its audit row
+are still two writes, not one transaction, so a status write whose COMMIT landed before a fault
+was reported can leave a row moved with no audit row.
+
 **A release records what happened to it (BACKLOG #1562).** The gate claims the request as
 `executing` before it runs the operation, so two approvers cannot both release it. It then settles
 the row to one of three outcomes, each with its own audit row after the `approval.release_attempted`
@@ -1786,7 +1818,8 @@ and the floor. The 409 carries `Retry-After` with the remaining wait in whole se
 raises an `approval_too_early` alert keyed `approval:<id>`, carrying the operation key and a fixed
 reason (BACKLOG #287). An age below zero is a clock behind, not a fast approver, and raises no alert. The request stays **pending**, and nothing retries it: the approver approves again. The
 check is inside the approval gate itself, so every release path meets it. Setting the floor to `0`
-removes it. When requests expire, a floor as long as the expiry window is refused at startup, because
+removes it. A floor below the default, or `0`, can be named as a loosening (see
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)). When requests expire, a floor as long as the expiry window is refused at startup, because
 no request could ever be approved.
 
 **Where the default comes from.** It is **provisional**, and it comes from published human-timing
@@ -1854,7 +1887,7 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 | Signal | When | Where it goes |
 |---|---|---|
 | `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
-| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, or `PUT /ad-group-map` newly maps a group to it | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync newly gives an account the role (vault BACKLOG #2610) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, or `<directory>` for a directory sign-in |
 | `client` on the `user.created` audit row | An account created through `POST /users` or `POST /users/directory` (BACKLOG #2021) | The creating administrator's address, like the approval rows |
 | `account_created` notice | An account created through `POST /users` or `POST /users/directory`, neither of which creates one without a notification address (BACKLOG #2018, #2021) | The new account's own notification address |
 
@@ -1875,18 +1908,26 @@ with no page.
   holds no role until the group map gives it one at sign-in. Created after a request, it is still
   flagged at that release, like any new account, and its notification address gets the
   `account_created` notice.
-- **A directory grant.** An account that gets Administrator because the *directory* added it to a
-  group already mapped to Administrator raises no `administrator_granted` alert. The API's
-  user-administration routes raise that alert, and a directory change does not pass through them.
-  The engine does see the grant, in one of the two places below. Neither names the role in an
-  alert, and the route can end with no alert at all. An account with no live session raises none.
-  Nor does one that signs in again before the next reconciler pass. So watch membership of the
-  mapped group in the directory itself.
+- **A directory grant.** An account can get Administrator because the *directory* added it to a
+  group already mapped to Administrator. The engine sees that grant in one of the two places below,
+  whichever comes first. A sign-in that sees it first raises `administrator_granted`, unless that
+  sign-in fails with a server error after the role write; the retry then gains nothing. A reconciler
+  pass that sees it first raises `ad_session_revoked`, which does not name the role. The later
+  sign-in then gains nothing, so it raises no `administrator_granted`. An account that never signs
+  in again and holds no live session raises nothing. So watch membership of the mapped group in the
+  directory itself.
   **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
+  **CORRECTED 2026-10-06:** this read "raises no `administrator_granted` alert", and the sign-in
+  case below read "It raises no alert." Vault BACKLOG #2610 added the sign-in alert.
   - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
     with the old and new roles. It also sends a best-effort roles-changed notice to that
     account's own notification address, when the account has one and security notices are set
-    up. It raises no alert.
+    up. The sign-in route raises `administrator_granted`, keyed `user:<username>`, with
+    `granted_by` set to `<directory>` and `via` naming the route: `directory_sign_in_negotiate`
+    for `POST /auth/negotiate`, `directory_sign_in_sso` for `GET /ui/sso`, and
+    `directory_sign_in_oidc` for the `/ui/oidc` callback. A sign-in the engine refuses after the
+    sync ran raises it too, because the role was written all the same. An account that already
+    held Administrator raises nothing.
   - **Sooner, when the account holds a live session.** A pass of the
     [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
     that completes stores the new roles and revokes the session. It writes
@@ -2005,14 +2046,22 @@ directory configured. None of these checks the password or counts toward the loc
 `re-verification failed`, and the `/ui/reauth` password leg says it rather than "Incorrect
 password." A password the directory refused still reads as wrong. The words name no directory
 internals. The `auth.reauth` audit row carries the cause as `reason`: at least
-`directory_object_id_missing`, `not_in_directory` (no enabled entry for the row's id, disabled
-included), `directory_unavailable` or `not_configured`.
+`directory_object_id_missing`, `not_in_directory` (no entry for the row's id, or one not provably
+its own), `directory_disabled`, `directory_undetermined` (the account state could not be read),
+`directory_unavailable` or `not_configured`. Since BACKLOG #2434 the bind's own lookup tells a
+disabled account from an absent one, with no second directory read.
+
+An empty password is refused before the directory is asked, and is not counted either (BACKLOG
+#2434): an empty simple bind is anonymous, so the directory never judges it. It reads as a refused
+password rather than as a directory that could not confirm the account, and its `auth.reauth` row
+carries `empty_password`. A local account's empty re-auth password is still checked against the
+stored hash and counted like any wrong password.
 
 Without this, an account disabled in the directory would keep renewing its window with a code
 until the reconciliation pass revoked its sessions. The engine row's `disabled` flag is only as
 fresh as that pass, which runs every `[auth].ad_session_recheck_seconds` (300 s by default) and
 revokes after `[auth].ad_session_recheck_strikes` refusals in a row (2 by default). An id-less row
-with no binding used to be looked up by name here, as the reconciler still looks it up. Since the
+with no binding used to be looked up by name here, as the reconciler did until BACKLOG #2434. Since the
 rest of BACKLOG #2027 this check refuses it, as the Windows SSO sign-in and the password step-up do.
 
 **This check fails closed, which is the opposite of the reconciler, and the cost is availability.**
@@ -3315,8 +3364,14 @@ fails part-way keeps the audit rows for what it already revoked, but raises no a
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same
 pass. That is why *renamed* is absent from the ambiguity list below: it used to sit there, and reading a
-rename as an absence revoked the renamed person's sessions on every interval. A directory that returns
-no readable `objectGUID` still probes by name and keeps that ambiguity (BACKLOG #1471, #1532). Such a
+rename as an absence revoked the renamed person's sessions on every interval. A row with no
+`objectGUID` is **never probed by name** (BACKLOG #2434), because a name probe can read another
+account's entry and write its roles onto the row. No sign-in or step-up admits such a row (BACKLOG
+#2027), so a session it holds is anomalous. The pass reads it as unkeyed without a lookup: it
+writes no roles, and it strikes and revokes as an absent account does, with the reason
+`directory_object_id_missing`. It is not a `userAccountControl` answer, so it never moves the ADR
+0195 hold. It is never asked, so it is no part of an outage either: a pass whose every lookup fails
+still audits `auth.ad_reconcile_skipped`, and that row's `asked` count leaves it out. Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
 BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
 row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and
@@ -3570,8 +3625,14 @@ Local passwords follow an **ASVS 5.0-aligned** policy (WP-3): **min length 15**,
 character-class composition** (the `require_*` class flags are opt-in, default off — ASVS forbids
 mandatory composition), plus **offline breached/common-password screening** (a bundled offline
 corpus, no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below, which a
-site may extend with its own terms. Enforced
-identically on create-user and change-password; tune via `[auth]` (see
+site may extend with its own terms. The policy screens at least these passwords:
+
+- a password a person chooses, at change-password and when the first Administrator is provisioned;
+- each credential the engine generates, for account creation, the password reset and the factor
+  reset.
+
+A generated credential skips one screen, the breach check. A random string of at least 192 bits
+cannot be in a corpus of human-chosen passwords. Tune via `[auth]` (see
 [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
 
 **The context-word deny-list, in full.** A local password is refused if it *contains* any of these
@@ -3977,8 +4038,12 @@ session. Each refusal is also audited, so a campaign is visible in the audit log
 writes `auth.account_locked`, but the mail is **throttled by time** (ADR 0197): at most one per lock
 kind per account per 24 hours, and always one for the first lock after a quiet day. Each mail names
 the lock and its cycle count, and writes its own `auth.lock_notice` row, which is what the throttle
-reads. A sign-in lock notice on a TOTP-enrolled local account tells the owner to sign in with the
-password and the code together; a second-step notice says which factor was right and, **if the
+reads. With a relay wired, that read and the mail run in a background task (BACKLOG #2216). The
+refusal writes `auth.account_locked` first and does not wait for the task. So a large audit log would
+not push a refused sign-in past its padded slot. The task is queued per account and lock kind within
+one API process. Two locks of one kind landing together there would send one mail. A sign-in lock
+notice on a TOTP-enrolled local account tells the owner to sign in with the password and the code
+together; a second-step notice says which factor was right and, **if the
 attempts were not the owner's**, to get a password reset or `admin-unlock` and replace that factor.
 **Current lock state is shown to administrators only** (BACKLOG #1131). `GET /users` carries a
 `lock_state` object per account with both locks: whether each is live now, when it ends, its
@@ -4181,8 +4246,9 @@ ships off. Each named value reaches the `serve` loosening warning, `messagefound
 `GET /security/posture`; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) for the table of values.
 The BACKLOG #2301 time floors are named the same way: `admin_write_min_interval_seconds`,
 `mfa_verify_min_elapsed_seconds` and, with OIDC on, `oidc_callback_min_elapsed_seconds`, each when
-below its default, and as off at `0`. The dual-control `[approvals].min_dwell_seconds` floor is not
-named yet.
+below its default, and as off at `0`. The `[approvals].min_dwell_seconds` floor and
+`[approvals].expiry_hours` can be named too (BACKLOG #2489);
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says when.
 
 **Throttle observability.** A rate-limited auth attempt is written to the rotating general log at
 WARNING with a route label and the client address, deliberately **not** to the hash-chained
@@ -4316,6 +4382,13 @@ stays broken, or recovers and breaks again, is reported only by that first line.
 The `auth.lock_notice` row is written when the notice is handed to the relay, as `mailed: true`. So
 when the relay's queue is full, or the send fails, a lock notice is lost with no audit row and, now,
 no log line. The account holder is not told, and nothing says so.
+
+**Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
+engine waits about two seconds for pending notices. A notice still pending then is cut off, and may be
+neither mailed nor recorded. A failed `auth.lock_notice` row write also changes: it used to fail
+the request, and now it is logged instead. The mail goes before its row, so that failure costs at
+most a duplicate mail at the next lock. Each such line names no account and no lock. It still tells
+a `logs:view` reader when some notice failed.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
 carries a `client` column — the caller's network address, stamped at write time from the request via

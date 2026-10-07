@@ -916,7 +916,20 @@ async def test_reauth_rejects_unsafe_next(engine: Engine) -> None:
     async with _client(engine, service) as c:
         # "/ui/audit" stands for an unregistered /ui page. This used "/ui/messages" until vault
         # BACKLOG #2620 registered the PHI pages as unlock continuations.
-        for bad in ("https://evil.example/x", "//evil.example", "/ui/audit", "/etc/passwd"):
+        # The backslash, whitespace and encoded forms are what a browser, or a decoding router, takes
+        # off-origin (vault BACKLOG #2790); the anchored registry must refuse them like "//".
+        for bad in (
+            "https://evil.example/x",
+            "//evil.example",
+            "/\\evil.example",
+            "\\\\evil.example",
+            " //evil.example",
+            "/\t/evil.example",
+            "/%2F%2Fevil.example",
+            "/ui\\..\\..\\evil.example",
+            "/ui/audit",
+            "/etc/passwd",
+        ):
             r = await c.get("/ui/reauth", params={"next": bad})
             assert r.status_code == 303 and r.headers["location"] == "/ui"
 
@@ -3634,6 +3647,41 @@ async def test_create_user_duplicate_rerenders_without_password(engine: Engine) 
         assert PW not in r.text  # ...the password is NEVER echoed back
 
 
+async def test_a_refused_create_on_the_console_answers_503(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2359: when no credential can be generated, the create form re-renders with the
+    refusal and a 503, as the JSON API answers, and no account is written."""
+    from types import SimpleNamespace
+
+    from messagefoundry.auth import service as service_module
+
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            admin_write_min_interval_seconds=0,
+            password_extra_context_words=["globex"],
+        ),
+    )
+    await service.initialize()
+    async with _boss_client(engine, service) as c:
+        monkeypatch.setattr(
+            service_module,
+            "secrets",
+            SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40),
+        )
+        r = await _post_pairs(
+            c,
+            "/ui/users",
+            [("username", "newop"), ("email", "newop@example.test"), ("roles", "viewer")],
+        )
+        assert r.status_code == 503 and "password_extra_context_words" in r.text
+        assert await service.store.get_user_by_username("newop") is None
+        refused = await service.store.list_audit(action="auth.credential_issue_refused", limit=10)
+        assert [json.loads(row["detail"])["op"] for row in refused] == ["create"]
+
+
 async def test_create_user_a_posted_password_is_never_the_credential(engine: Engine) -> None:
     """ADR 0197 Amendment A, AC-A2: the create form has no password field, and a ``password`` a
     caller posts anyway is ignored. The account gets a generated credential; the posted one does not
@@ -4572,7 +4620,13 @@ async def test_a_refused_issue_on_the_console_keeps_the_account_and_the_grant(
             SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40),
         )
         r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
-        assert r.status_code == 400 and "password_extra_context_words" in r.text
+        # BACKLOG #2359: a server-side refusal stays a 503 on the console, as on the JSON API, and
+        # the service's one audit row is the console's too.
+        assert r.status_code == 503 and "password_extra_context_words" in r.text
+        refused = await service.store.list_audit(action="auth.credential_issue_refused", limit=10)
+        assert len(refused) == 1, "one refusal, one audit row"
+        expected_op = {"reset-mfa": "mfa_reset", "reset-password": "password_reset"}[action]
+        assert json.loads(refused[0]["detail"])["op"] == expected_op
         after = await service.store.get_user(uid)
         assert after == before, "a refused issue changed the account"
         monkeypatch.undo()
@@ -6264,7 +6318,7 @@ async def test_reauth_extra_less_with_credentials_renders_notice(
 
 def _ad_service(engine: Engine) -> AuthService:
     """An AuthService with a duck-typed fake directory (the _FakeLdap pattern)."""
-    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 
     principal = AdPrincipal(
         username="jdoe",
@@ -6276,8 +6330,10 @@ def _ad_service(engine: Engine) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
@@ -6460,7 +6516,7 @@ async def test_proxy_headers_middleware_rewrites_scheme_and_client() -> None:
 
 
 def _sso_service(engine: Engine) -> AuthService:
-    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 
     principal = AdPrincipal(
         username="jdoe",
@@ -6472,8 +6528,10 @@ def _sso_service(engine: Engine) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == "jdoe" and password == "pw") else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
@@ -7800,7 +7858,7 @@ def _oidc_settings(**over: object) -> AuthSettings:
 
 
 def _oidc_service(engine: Engine, **over: object) -> AuthService:
-    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 
     principal = AdPrincipal(
         username="jdoe",
@@ -7813,8 +7871,10 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if username == "jdoe" else None
+        def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+            if username != "jdoe":
+                return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+            return DirectoryBind(DirectoryAnswer.FOUND, principal)
 
         def resolve_principal(
             self, username: str, *, object_id: str | None = None

@@ -38,6 +38,7 @@ __all__ = [
     "judge_every_crl",
     "read_crl_facts",
     "read_soonest_crl_facts",
+    "crl_pem_blocks",
     "soonest_crl",
     "ca_chain_to_pem",
     "cert_to_pem",
@@ -432,6 +433,13 @@ def _begins_line(pem: bytes, at: int) -> bool:
     if pem[at - len(_UTF8_BOM) : at] == _UTF8_BOM:
         at -= len(_UTF8_BOM)
     return at == 0 or pem[at - 1 : at] == b"\n"
+
+
+def crl_pem_blocks(pem: bytes) -> list[bytes]:
+    """Each ``X509 CRL`` block in ``pem`` that OpenSSL would load, in file order (:func:`_crl_blocks`
+    says which). For a caller that must find or compare the CRLs inside a file that also holds
+    certificates, such as a CA bundle (vault BACKLOG #2319)."""
+    return list(_crl_blocks(pem))
 
 
 def _crl_blocks(pem: bytes) -> Iterator[bytes]:

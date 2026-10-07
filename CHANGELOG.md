@@ -6,6 +6,18 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A held config reload whose directory vanished, or that named a directory outside the reload
+  roots, is refused on release instead of answering 500.** The approve route answers 422 with the
+  inline route's detail, and writes the `config_reload_failed` or `config_reload_denied` row the
+  inline route writes. A refused reload's own audit row no longer raises during an audit outage.
+  (vault `BACKLOG #2459`)
+- **The approval gate answers a mapped status during an audit or store outage, and pages.** A
+  too-early or stale-requester refusal whose audit row fails still answers 409. A claim, rejection
+  or resolution whose status write fails answers 503. A request whose `approval.requested` row
+  fails is withdrawn. A new `audit_write_failed` alert, keyed `approval:<id>`, fires for every
+  audit row the gate loses. Store reads on these routes are not covered. (vault `BACKLOG #2255`)
+
 ## [0.5.1] — 2026-10-01 — Early Access
 
 ### Changed

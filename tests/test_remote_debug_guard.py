@@ -41,6 +41,7 @@ from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
+    ApprovalsSettings,
     AuthSettings,
     EgressSettings,
     SecretRotationSettings,
@@ -767,6 +768,7 @@ def _names(remote_debug: RemoteDebugPosture | None) -> list[str]:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=remote_debug,

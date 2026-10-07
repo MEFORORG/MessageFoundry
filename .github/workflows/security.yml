@@ -580,8 +580,16 @@ jobs:
           # --package-lock-only reads package-lock.json directly (no `npm install`), matching the npm-audit
           # job's install-free posture. The extension has NO runtime npm dependencies (esbuild bundles the
           # payload), so we capture the FULL tree — the build toolchain (esbuild/typescript/…) is the npm
-          # supply chain worth inventorying, and this mirrors npm-audit's full-tree scan. Tool version pinned.
-          npx --yes @cyclonedx/cyclonedx-npm@6.0.0 --package-lock-only \
+          # supply chain worth inventorying, and this mirrors npm-audit's full-tree scan.
+          # THE TOOL installs from its own committed lock, not with npx; why is the description in
+          # ci/npm-tools/package.json (vault BACKLOG #2793). That is the tool's tree, not the
+          # extension's, so the install-free posture above still holds for what is scanned. Retried,
+          # because a registry blip is not a broken SBOM; three failures are.
+          n=0
+          until npm ci --prefix ../ci/npm-tools --ignore-scripts --no-audit --no-fund; do
+            n=$((n + 1)); [ "$n" -ge 3 ] && exit 1; sleep $((n * 15))
+          done
+          ../ci/npm-tools/node_modules/.bin/cyclonedx-npm --package-lock-only \
             --output-format JSON --output-file ../sbom-ide.cdx.json
           python ../scripts/security/sbom_finalize.py ../sbom-ide.cdx.json --phase build
       - name: Score SBOM quality (sbomqs — advisory)

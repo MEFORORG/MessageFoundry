@@ -344,7 +344,13 @@ from messagefoundry.config.wiring import (
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.logging_guard import active_guard as active_log_guard
-from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runtime_level
+from messagefoundry.logging_setup import (
+    LOG_LEVELS,
+    LogLevelRefused,
+    current_log_level,
+    level_refused_on_production,
+    set_runtime_level,
+)
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
@@ -367,6 +373,7 @@ from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
+    DrParkedError,
     NotDeployedError,
     RegistryRunner,
     ShardLaneOwnershipError,
@@ -741,6 +748,36 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
     return identity.can_access_channel(channel_id)
 
 
+async def _alert_control_action(engine: Engine, action: str, target: str) -> None:
+    """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
+
+    Re-reads ``engine.registry_runner`` on each call, so it stays right across a reload that swaps
+    the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067); that
+    is the rule working as designed, not a failure, so it is logged once here at INFO and nothing
+    else happens. Any other error reaches the notifier, which logs it and never raises."""
+    rr = engine.registry_runner
+    if rr is None:
+        return
+    if action == "restart_inbound":
+        if rr.inbound_filtered(target) is not None:
+            # An operator start of a parked inbound overrides the profile; a rule is the engine,
+            # and must not (the scheduler's gate holds the same line, BACKLOG #2067).
+            _log.info(
+                "alert control_action restart_inbound for %r not run: the DR run-profile parks it",
+                target,
+            )
+            return
+        await rr.restart_inbound(target)
+    elif action == "restart_outbound":
+        try:
+            await rr.restart_outbound(target)
+        except DrParkedError:
+            _log.info(
+                "alert control_action restart_outbound for %r not run: the DR run-profile parks it",
+                target,
+            )
+
+
 def _purge_in_scope(identity: Identity) -> bool:
     """Whether ``identity`` may purge an outbound. A purge spans every inbound feeding it, so only an
     unscoped caller may. Read by the route and by the approval gate, like :func:`_replay_in_scope`."""
@@ -848,8 +885,8 @@ def _build_approval_gate(
         # ADR 0041 D2: a held config:deploy is re-executed here, on the second approver's release. It
         # is a NON-dry-run reload (a dry_run is never held — it swaps nothing), so propagate=True bumps
         # the cluster config version exactly like the inline path. The captured config_dir is replayed
-        # verbatim; the loader re-confines it to an allowed reload root (ConfigReloadDenied -> the
-        # gate surfaces it). The same fingerprint-bearing config_reload audit row is written so the
+        # verbatim; the loader re-confines it to an allowed reload root (ConfigReloadDenied -> a 422
+        # refusal, below). The same fingerprint-bearing config_reload audit row is written so the
         # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
         config_dir = p.get("config_dir")
         # Read BEFORE the reload (BACKLOG #1940): a KeyError raised after the swap would reach the
@@ -864,24 +901,26 @@ def _build_approval_gate(
                 outcome = await _reload_or_record_interruption(
                     engine, config_dir, actor=actor, client=None
                 )
-            except WiringError as exc:
-                # BACKLOG #2034: a release the engine refuses (a settings or inbound trust anchor,
-                # or a bad config) answers 422 and records the row the inline route records, rather
-                # than escaping the approve route as a 500. The gate still marks the approval failed.
-                anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
-                _log.warning("released config reload refused: %s", exc)
-                await engine.store.record_audit(
-                    "config_reload_failed",
-                    actor=actor,
-                    detail=json.dumps(
-                        {
-                            "requested": config_dir,
-                            "dry_run": False,
-                            "reason": "trust_anchor" if anchor_refused else "invalid_config",
-                        }
-                    ),
+            except _RELOAD_REFUSALS as exc:
+                # BACKLOG #2034 / vault BACKLOG #2459: a release the engine refuses records the row
+                # the inline route records, with the inline route's detail text, rather than
+                # escaping the approve route as a 500. That covers a bad config or trust anchor, and
+                # a directory that vanished or left the reload roots between the hold and the
+                # release. The gate still marks the approval failed. No `client`: see
+                # _record_reload_audit.
+                #
+                # Always 422 here, never the inline 403 or 404: on the approve route those two
+                # already mean "you cannot approve your own request" and "no such approval request",
+                # and the web console words them that way. 422 is the approve route's "the released
+                # operation was refused".
+                #
+                # The row names the requester either way and differs from an inline one only by its
+                # NULL client, so this line names the release too. Type name only, never the text.
+                _log.warning("released config reload refused: %s", type(exc).__name__)
+                _status, answer = await _audit_refused_reload(
+                    engine, exc, actor=actor, requested=config_dir, dry_run=False
                 )
-                raise ApprovalError(422, "invalid configuration") from exc
+                raise ApprovalError(422, answer) from exc
             registry = outcome.registry
             # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
             failures = await _record_reload_audit(
@@ -895,7 +934,9 @@ def _build_approval_gate(
             }
 
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
-        # write its own config_reload row rather than stopping with intake half swapped.
+        # write its own config_reload row rather than stopping with intake half swapped. A refusal
+        # raised inside _apply is part of that operation too, so a timed-out approve does not cut
+        # its row short. A shutdown drain that cancels the operation still can.
         return await outliving.run(_apply(), "released config reload")
 
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
@@ -957,6 +998,7 @@ def _posture_loosenings(
     # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed, or None when no
     # preflight ran in this process; the registry then reports nothing for it.
     store_privilege = getattr(state, "store_privilege", None)
+    gate = getattr(state, "approval_gate", None)
     # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
     # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
     auth_settings = getattr(state, "auth_settings", None) or AuthSettings()
@@ -1019,6 +1061,8 @@ def _posture_loosenings(
             attested_hops=attested_hops,
             revocation_attested_hops=revocation_hops,
             api=api_settings,
+            # BACKLOG #2489: the dual-control dwell and expiry, read off the gate that enforces them.
+            approvals=gate.settings if gate is not None else ApprovalsSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -1199,6 +1243,76 @@ async def _record_reload_audit(
         )
         return [*failed_steps, _RELOAD_AUDIT_STEP]
     return list(failed_steps)
+
+
+#: The faults ``Engine.reload_detail`` raises when a reload did NOT happen, each with its own answer
+#: and audit row (:func:`_audit_refused_reload`). The inline route and the released executor catch
+#: this one tuple, so a held reload is refused exactly as an ungated one is (vault BACKLOG #2459).
+_RELOAD_REFUSALS: tuple[type[Exception], ...] = (
+    ConfigReloadDenied,
+    FileNotFoundError,
+    WiringError,
+)
+
+
+async def _audit_refused_reload(
+    engine: Engine,
+    exc: Exception,
+    *,
+    actor: str,
+    requested: str | None,
+    dry_run: bool,
+    client: str | None = None,
+) -> tuple[int, str]:
+    """Write the audit row for a reload the engine refused, and return the status and detail to answer.
+
+    ``exc`` is one of :data:`_RELOAD_REFUSALS`. A directory outside the reload roots writes
+    ``config_reload_denied`` and answers 403. A missing directory writes ``config_reload_failed``
+    with reason ``not_found`` and answers 404. A bad graph writes ``config_reload_failed`` and
+    answers 422; its reason is ``trust_anchor`` when a trust anchor refused it inside the engine,
+    an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
+    filter sees both, and ``invalid_config`` otherwise.
+
+    The inline route and the dual-control executor share this, so a held reload whose directory
+    vanished or left the reload roots before its release is refused and recorded the way an inline
+    one is, rather than escaping the approve route as a 500 (vault BACKLOG #2459). The detail text
+    is generic on purpose: the real error is logged here, never returned, so a ``config:deploy``
+    holder cannot probe the filesystem through it.
+
+    ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.
+
+    **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
+    not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
+    #2255). A failed write is logged at ERROR with the row's detail."""
+    detail: dict[str, object] = {"requested": requested, "dry_run": dry_run}
+    if isinstance(exc, ConfigReloadDenied):
+        action = "config_reload_denied"
+        status, answer = 403, "config directory is not an allowed reload root"
+    elif isinstance(exc, FileNotFoundError):
+        _log.warning("config reload failed (missing dir): %s", exc)
+        action, detail["reason"] = "config_reload_failed", "not_found"
+        status, answer = 404, "config directory not found"
+    else:
+        anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+        _log.warning(
+            "config reload %s: %s",
+            "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
+            exc,
+        )
+        action = "config_reload_failed"
+        detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
+        status, answer = 422, "invalid configuration"
+    row = json.dumps(detail)
+    try:
+        await engine.store.record_audit(action, actor=actor, detail=row, client=client)
+    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
+        _log.exception(
+            "a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
+            action,
+            actor,
+            row,
+        )
+    return status, answer
 
 
 #: The audit actions that record which config bytes a process ran from: a start, an applied reload,
@@ -3377,6 +3491,10 @@ def create_app(
                 # connector to build and no worker to resume; deploying it is a config change, not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
+            except DrParkedError as exc:
+                # vault BACKLOG #3067: start, stop and restart of an outbound the DR run-profile parks
+                # are refused, so the lane keeps the park until the reload after POST /dr/release.
+                raise HTTPException(409, str(exc)) from None
             running = rr.outbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="destination", running=running, client=client
@@ -3684,11 +3802,14 @@ def create_app(
         #
         # This row covers the UNGATED path ONLY. A dual-control purge returns 202 above and is
         # executed later by the `_purge` executor in _build_approval_gate, which never re-enters this
-        # handler and writes no connection_purge row of its own. That path is not unaudited — the
-        # gate writes approval.requested / approval.approved, and the latter's detail carries the
-        # executor's {"cancelled": N} result — but those rows identify the operation only by
-        # approval_id: the connection NAME and the SCOPE live in the pending-approval row's params,
-        # not in the audit log. So a query of action='connection_purge' answers "which outbound, at
+        # handler and writes no connection_purge row of its own. That path is not unaudited: the
+        # gate writes approval.requested and approval.release_attempted, both before the purge runs.
+        # The executor's {"cancelled": N} result is recorded only in approval.approved, which is
+        # written after the purge and whose failure is logged and paged rather than raised (BACKLOG
+        # #1940, vault BACKLOG #2255). So a gated purge's COUNT can be missing from the audit log
+        # while the release itself is still recorded. And all of those rows identify the operation
+        # only by approval_id: the connection NAME and the SCOPE live in the pending-approval row's
+        # params, not in the audit log. So a query of action='connection_purge' answers "which outbound, at
         # what scope, cancelling how many" completely for ungated purges and not at all for gated
         # ones, which still need a join back through approval_id. Closing that asymmetry is the
         # sibling gap tracked for the _purge executor; it is deliberately not fixed here.
@@ -4540,48 +4661,16 @@ def create_app(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
                 )
             registry = outcome.registry
-        except ConfigReloadDenied as exc:
-            await engine.store.record_audit(
-                "config_reload_denied",
-                actor=user.username,
-                detail=json.dumps({"requested": req.config_dir, "dry_run": req.dry_run}),
-                client=client_ip(request),
-            )
-            raise HTTPException(403, "config directory is not an allowed reload root") from exc
-        except FileNotFoundError as exc:
-            _log.warning("config reload failed (missing dir): %s", exc)
-            await engine.store.record_audit(
-                "config_reload_failed",
-                actor=user.username,
-                detail=json.dumps(
-                    {"requested": req.config_dir, "dry_run": req.dry_run, "reason": "not_found"}
-                ),
-                client=client_ip(request),
-            )
-            raise HTTPException(404, "config directory not found") from exc
-        except WiringError as exc:
-            # A trust anchor refused inside the engine arrives wrapped: an inbound connection's CA
-            # (BACKLOG #1142, slice 3) or a settings anchor (BACKLOG #2034). Both record
-            # reason="trust_anchor", so one audit filter sees both.
-            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
-            _log.warning(
-                "config reload %s: %s",
-                "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
+        except _RELOAD_REFUSALS as exc:
+            status, answer = await _audit_refused_reload(
+                engine,
                 exc,
-            )
-            await engine.store.record_audit(
-                "config_reload_failed",
                 actor=user.username,
-                detail=json.dumps(
-                    {
-                        "requested": req.config_dir,
-                        "dry_run": req.dry_run,
-                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
-                    }
-                ),
+                requested=req.config_dir,
+                dry_run=req.dry_run,
                 client=client_ip(request),
             )
-            raise HTTPException(422, "invalid configuration") from exc
+            raise HTTPException(status, answer) from exc
         # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
         # only counts, so two reloads of the same dir with different on-disk code were
         # indistinguishable. Computed off the event loop (it reads files) and best-effort — a
@@ -6933,6 +7022,27 @@ def create_app(
 
     # --- runtime log verbosity + redacted log-tail viewer (BACKLOG #171, ADR 0130) ----
 
+    def _log_level_production(request: Request) -> bool:
+        """The production tier the level control keys on (vault BACKLOG #2777). A tier this app cannot
+        resolve counts as production, the strictest answer; ``serve`` always resolves it before the app
+        exists, from the same ``[ai]``/``[security]`` settings stashed here."""
+        ai = getattr(request.app.state, "ai", None) or AiSettings()
+        prod = ai.derived_posture()
+        return True if prod is None else prod
+
+    def _log_level_info(request: Request, level: str, *, production: bool) -> LogLevelInfo:
+        # ``levels`` is the set this instance ACCEPTS, so a client building a picker from it never
+        # offers a level the PATCH would refuse on this posture.
+        return LogLevelInfo(
+            level=level,
+            configured=getattr(request.app.state, "configured_log_level", None),
+            levels=[
+                name
+                for name in LOG_LEVELS
+                if not level_refused_on_production(name, production=production)
+            ],
+        )
+
     @app.get("/logging/level", response_model=LogLevelInfo)
     async def get_logging_level(
         request: Request,
@@ -6940,11 +7050,10 @@ def create_app(
     ) -> LogLevelInfo:
         """The current effective root log level, the startup ``[logging].level`` baseline a restart returns
         to, and the accepted level set — the read half of the runtime verbosity control (#171, ADR 0130).
-        **Not PHI** (level names only); gated by ``monitoring:diagnose`` (the diagnostic tier)."""
-        return LogLevelInfo(
-            level=current_log_level(),
-            configured=getattr(request.app.state, "configured_log_level", None),
-            levels=list(LOG_LEVELS),
+        **Not PHI** (level names only); gated by ``monitoring:diagnose`` (the diagnostic tier). On a
+        production instance the accepted set leaves out DEBUG (vault BACKLOG #2777)."""
+        return _log_level_info(
+            request, current_log_level(), production=_log_level_production(request)
         )
 
     @app.patch("/logging/level", response_model=LogLevelInfo)
@@ -6959,23 +7068,47 @@ def create_app(
         **ephemeral**: a process restart re-asserts ``[logging].level``, and a ``/config/reload`` does NOT
         reset it (``configure_logging`` does not re-run there), so it survives a reload and resets only on
         restart. Gated by ``monitoring:diagnose``; an invalid level is a 400. The change is recorded as a
-        ``logging_level_change`` audit row (old → new, actor) — level names only, no PHI."""
+        ``logging_level_change`` audit row (old → new, actor) — level names only, no PHI.
+
+        A production instance refuses DEBUG here exactly as ``serve`` refuses to start at it (vault
+        BACKLOG #2777): the same predicate, keyed on the same production tier. That refusal is a 403
+        naming the posture, leaves the level untouched, and is audited as
+        ``logging_level_change_denied``. The denial row is best-effort, like ``cluster_stepdown_denied``:
+        a store too sick to take it must not turn the refusal into a 500 that hides its reason."""
         previous = current_log_level()
+        production = _log_level_production(request)
         try:
-            applied = set_runtime_level(body.level)
+            applied = set_runtime_level(body.level, production=production)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        except LogLevelRefused as exc:
+            try:
+                await engine.store.record_audit(
+                    "logging_level_change_denied",
+                    actor=identity.username,
+                    detail=json.dumps(
+                        {
+                            "from": previous,
+                            "requested": body.level.upper(),
+                            "reason": "production_instance",
+                        }
+                    ),
+                    client=client_ip(request),
+                )
+            except Exception as audit_exc:
+                _log.warning(
+                    "refused a DEBUG log level on a production instance but could not record the "
+                    "logging_level_change_denied audit row: %s",
+                    safe_exc(audit_exc),
+                )
+            raise HTTPException(403, str(exc)) from exc
         await engine.store.record_audit(
             "logging_level_change",
             actor=identity.username,
             detail=json.dumps({"from": previous, "to": applied}),
             client=client_ip(request),
         )
-        return LogLevelInfo(
-            level=applied,
-            configured=getattr(request.app.state, "configured_log_level", None),
-            levels=list(LOG_LEVELS),
-        )
+        return _log_level_info(request, applied, production=production)
 
     @app.get("/logs/tail", response_model=LogTailPage)
     async def get_logs_tail(
@@ -7531,6 +7664,8 @@ def create_app(
             active=result.active,
             threshold=result.threshold,
             vip_hook_ran=result.vip_hook_ran,
+            drained=result.drained,
+            held_on_parked_outbounds=result.held_on_parked_outbounds,
             depth_left=result.depth_left,
         )
 
@@ -7594,12 +7729,15 @@ def create_app(
                 close_code=1013,  # try again later
             )
             return
+        # Take the slot BEFORE the first await past the check (vault BACKLOG #2775). accept() waits for
+        # the handshake to finish, so counting after it let every handshake that reached the check
+        # before any accept() returned pass the cap. No await sits between the check and this line,
+        # and the `finally` below gives the slot back on every path, an accept() that raises included.
+        state.ws_count = getattr(state, "ws_count", 0) + 1
         auth: AuthService | None = getattr(state, "auth", None)
         # Server-rendered connections fragment for the browser dashboard, installed by the web console
         # in the serve_ui path. Absent → counts-only push (see the send loop below).
         ui_connections_render = getattr(state, "ui_connections_render", None)
-        await websocket.accept()
-        state.ws_count = getattr(state, "ws_count", 0) + 1
 
         async def _reauthorize() -> Identity | None:
             """Re-validate the open socket's session (revocation/expiry/disable/downgrade/password-
@@ -7621,6 +7759,7 @@ def create_app(
             return current
 
         try:
+            await websocket.accept()
             # Re-check BEFORE the first push: a token revoked between the handshake authorize and
             # accept() must not get even one frame (close the pre-first-send window — SEC-018).
             current = await _reauthorize()
@@ -9007,13 +9146,7 @@ def create_managed_app(
             if notifier is not None:
 
                 async def _alert_control(action: str, target: str) -> None:
-                    rr = engine.registry_runner
-                    if rr is None:
-                        return
-                    if action == "restart_inbound":
-                        await rr.restart_inbound(target)
-                    elif action == "restart_outbound":
-                        await rr.restart_outbound(target)
+                    await _alert_control_action(engine, action, target)
 
                 notifier.set_control_callback(_alert_control)
             app.state.engine = engine
@@ -9250,6 +9383,18 @@ def create_managed_app(
                 except Exception:
                     _log.exception(
                         "approval gate: the shutdown drain failed; continuing the teardown"
+                    )
+            # BACKLOG #2216: a lock notice still in flight reads and writes the audit log, then
+            # hands its mail to the security notifier, so it drains before engine.stop() closes the
+            # store and before that notifier stops below. Bounded, and it logs and cancels what it
+            # cannot finish; guarded like the drain above so a failure cannot skip engine.stop().
+            if auth is not None:
+                try:
+                    await auth.close_background()
+                except Exception:
+                    _log.exception(
+                        "auth: the shutdown drain of background notices failed; continuing the "
+                        "teardown"
                     )
             # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
             # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING

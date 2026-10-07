@@ -1509,16 +1509,27 @@ async def test_every_reload_route_refuses_a_swapped_settings_anchor(
     engine, cfg = await _anchored_engine(tmp_path, spec)
     try:
         await engine.reload_detail(cfg)  # a graph goes live; the DR route only acts on a live one
-        before = engine.registry_runner.registry
+        rr = engine.registry_runner
+        real_reload = rr.reload
+        applied: list[object] = []
+
+        async def counting(registry: Any = None) -> None:
+            applied.append(registry)
+            await real_reload(registry)
+
+        # Counted at the runner, not by registry identity: the DR route re-applies the graph it
+        # already holds (vault BACKLOG #3067), so its registry object never changes.
+        monkeypatch.setattr(rr, "reload", counting)
         await route(engine, cfg)  # the control: an unchanged anchor reloads
         live = engine.registry_runner.registry
-        assert live is not before  # the control really reloaded
+        assert len(applied) == 1  # the control really reloaded
         assert "pin_mismatch" not in {r["event"] for r in await _rows(engine.store, "ad")}
 
         anchor.write_bytes(_block(b"evil"))  # swapped after the check that started it
         with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
             await route(engine, cfg)
         assert isinstance(err.value.__cause__, TrustAnchorError)
+        assert len(applied) == 1  # nothing was re-applied
         assert engine.registry_runner.registry is live  # nothing was swapped
         assert "pin_mismatch" in {r["event"] for r in await _rows(engine.store, "ad")}
     finally:
@@ -1556,8 +1567,8 @@ async def test_a_reload_refuses_a_settings_anchor_swapped_for_a_crl(
 async def test_the_dr_profile_reload_without_a_config_dir_refuses_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The DR profile reload re-runs the live graph in place when the engine has no config dir, and
-    that branch never reaches reload_detail, so it runs the preflight itself. A refusal also leaves
+    """The DR profile reload re-runs the live graph in place, with or without a config dir (vault
+    BACKLOG #3067), and never reaches reload_detail, so it runs the preflight itself. A refusal also leaves
     the DR latch off, or the next reload would park feeds on a box that is not DR-active."""
     from messagefoundry.config.wiring import WiringError, load_config
 
@@ -1568,7 +1579,7 @@ async def test_the_dr_profile_reload_without_a_config_dir_refuses_too(
     try:
         rr = engine.add_registry(load_config(cfg))
 
-        async def spy(registry: object) -> None:
+        async def spy(registry: object = None) -> None:
             reloaded.append(registry)
 
         monkeypatch.setattr(rr, "reload", spy)

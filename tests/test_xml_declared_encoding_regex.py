@@ -26,9 +26,9 @@ import pytest
 
 from messagefoundry.parsing.xml import harden
 
-# The span, the threshold and the minimum-of-rounds timer are that file's, reused so the two growth
-# arms cannot drift apart: 8x the input, where linear reads about 8x and quadratic about 64x.
-from tests.test_log_redaction_secret_domain import _GROWTH_LENGTHS, _MAX_GROWTH, _fastest
+# The span, the threshold and the growth timer are that file's, reused so the two growth arms cannot
+# drift apart: 8x the input, where linear reads about 8x and quadratic about 64x.
+from tests.test_log_redaction_secret_domain import _GROWTH_LENGTHS, _MAX_GROWTH, _growth_between
 
 _BOM = chr(0xFEFF)
 
@@ -52,11 +52,10 @@ _PROBES: dict[str, Callable[[int], str]] = {
 
 
 def _growth(pattern: re.Pattern[str], probe: Callable[[int], str], *, rounds: int) -> float:
-    small, large = (
-        _fastest(lambda text: pattern.sub(r"\1", text, count=1), probe(n), rounds)
-        for n in _GROWTH_LENGTHS
+    short, long = (probe(n) for n in _GROWTH_LENGTHS)
+    return _growth_between(
+        lambda text: pattern.sub(r"\1", text, count=1), short, long, rounds=rounds
     )
-    return large / small
 
 
 def test_the_declared_encoding_scan_grows_linearly_in_a_whitespace_run() -> None:

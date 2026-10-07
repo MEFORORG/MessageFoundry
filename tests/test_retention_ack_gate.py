@@ -26,6 +26,7 @@ from messagefoundry.config.retention_classification import (
 from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
+    ApprovalsSettings,
     AuthSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -169,6 +170,7 @@ def test_each_switch_is_a_named_loosening() -> None:
                 attested_hops=(),
                 revocation_attested_hops=(),
                 api=ApiSettings(),
+                approvals=ApprovalsSettings(),
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,

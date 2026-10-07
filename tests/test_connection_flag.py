@@ -149,9 +149,9 @@ async def test_a_listener_start_leaves_down_refuses_no_reload_toggle_or_dr_activ
 ) -> None:
     """Vault BACKLOG #2622 item 1, review round 3. IB_TOML binds 0.0.0.0 in cleartext with no escape.
     With ``auto_start = false`` engine start never binds it, so a dry run, a reload, a flag toggle
-    and a DR activation (a reload of the config dir) must all apply, as they did before the build
-    check ran the exposure gates. With ``auto_start = true`` the listener would be bound, so the
-    build check still refuses all four, naming the listener and the two settings that leave it
+    and a DR activation (a re-apply of the running graph, vault BACKLOG #3067) must all apply, as
+    they did before the build check ran the exposure gates. With ``auto_start = true`` the
+    listener would be bound, so the build check still refuses all four, naming the listener and the two settings that leave it
     down. That is the control: the passes are the predicate, not a gate that never ran."""
     eng = await _exposed_engine(tmp_path, allow=False)
     toml_path = tmp_path / "connections.toml"
