@@ -1421,8 +1421,14 @@ class PostgresStore:
                     store._load_reference_cache()
                 )  # populate the reference-snapshot read cache (ADR 0006)
         except Exception:
-            # Don't leak the pool if first-open initialization fails (M-6).
-            await pool.close()
+            # Don't leak the pool if first-open initialization fails (M-6). A cleanup that fails is
+            # logged by class, so it never replaces the open's own error (vault BACKLOG #3054).
+            try:
+                await pool.close()
+            except Exception as cleanup:
+                log.warning(
+                    "closing the pool after a failed open also failed (%s)", type(cleanup).__name__
+                )
             raise
         return store
 

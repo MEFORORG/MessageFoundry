@@ -782,38 +782,169 @@ def test_a_row_that_is_not_utf8_fails_the_check_and_its_text_is_not_printed(
 
 
 class _ServerDriverError(Exception):
-    """Stands in for asyncpg's or pyodbc's error base, which subclasses no SQLite type."""
+    """Stands in for asyncpg's or pyodbc's DatabaseError base, which subclasses no SQLite type."""
 
 
-@pytest.mark.parametrize("server", [False, True], ids=["sqlite-driver", "server-driver"])
-def test_a_driver_error_at_the_open_that_is_not_a_chain_read_still_exits_2(
-    server: bool,
+class _PyodbcError(Exception):
+    """Stands in for pyodbc's ``Error`` root, which is not installed on every leg."""
+
+
+class _InterfaceError(_PyodbcError):
+    """Stands in for ``pyodbc.InterfaceError``: a failed login, SQLSTATE 28000."""
+
+
+def _stand_in_drivers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every backend's driver and connection errors, whichever drivers this leg has installed."""
+    from messagefoundry.store import base as store_base
+
+    monkeypatch.setattr(
+        store_base, "store_driver_errors", lambda: (sqlite3.DatabaseError, _ServerDriverError)
+    )
+    monkeypatch.setattr(store_base, "store_connect_errors", lambda: (OSError, _PyodbcError))
+
+
+_UNREACHABLE = [
+    sqlite3.OperationalError("unable to open database file"),
+    _ServerDriverError("connection refused"),
+    OSError("Connect call failed ('10.0.0.5', 5432)"),
+    ConnectionRefusedError(111, "Connection refused"),
+    _InterfaceError("28000", "[28000] Login failed for user 'svc'"),
+]
+
+
+@pytest.mark.parametrize("error", _UNREACHABLE, ids=lambda e: type(e).__name__)
+def test_a_store_that_cannot_be_reached_at_the_open_exits_2(
+    error: Exception,
     shell: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The control for the row arm above: a driver error raised by the open but not while it read
-    the chain carries no tag, so it is still "could not start", exit 2. The server arm stands in a
-    driver base that is not SQLite's, as a server refusing the connection raises: it reached the
-    dispatch floor and exited 1, a broken chain's code, while only SQLite's errors were caught."""
+    """The control for the row arm above (vault BACKLOG #3054, item 10). An error the open raised
+    outside its read of the chain's rows carries no tag, so it is "could not start", exit 2: at
+    least a refused connection, as asyncpg raises it (OSError) or as the OS reports it, and a
+    failed login, pyodbc's InterfaceError. They reached the dispatch floor and exited 1, a broken
+    chain's code, while only SQLite's errors were caught."""
     from messagefoundry.store import base as store_base
 
     db = shell / "keyed.db"
     _keyed_chain(db, generate_key())
-    monkeypatch.setattr(
-        store_base, "store_driver_errors", lambda: (sqlite3.DatabaseError, _ServerDriverError)
-    )
+    _stand_in_drivers(monkeypatch)
 
     async def refusing(*_args: object, **_kwargs: object) -> object:
-        if server:
-            raise _ServerDriverError("connection refused")
-        raise sqlite3.OperationalError("unable to open database file")
+        raise error
 
     monkeypatch.setattr(store_base, "open_store", refusing)
     rc = main(["audit-verify", "--db", str(db)])
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
     assert "cannot open the store at" in captured.err and "FAIL" not in captured.out
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("connection reset"),
+        _InterfaceError("08S01", "link failure"),
+        UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "illegal UTF-16 surrogate"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+def test_an_error_while_the_open_reads_the_chain_fails_the_check(
+    error: Exception,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The other half of the split: the same kinds of error, raised while the open read the
+    chain's rows, carry the store's tag, so they are the walk's FAIL line and exit 1, an outage
+    part way included. A lone surrogate SQL Server decodes is a UnicodeDecodeError."""
+    from messagefoundry.store import base as store_base
+    from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE
+
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    _stand_in_drivers(monkeypatch)
+    error.add_note(AUDIT_CHAIN_READ_NOTE)
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: the audit chain check stopped part way"), captured.out
+    assert f"({type(error).__name__})" in captured.out, captured.out
+
+
+def test_the_store_tags_a_connection_error_raised_reading_the_chain() -> None:
+    """The tag is added by class: driver, connection and decode errors, and nothing else."""
+    from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE, note_audit_chain_read
+
+    for tagged in (
+        OSError("reset"),
+        sqlite3.OperationalError("x"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"),
+    ):
+        note_audit_chain_read(tagged)
+        assert AUDIT_CHAIN_READ_NOTE in getattr(tagged, "__notes__", ()), tagged
+    untagged = RuntimeError("an engine refusal")
+    note_audit_chain_read(untagged)
+    assert not hasattr(untagged, "__notes__")
+
+
+@pytest.mark.parametrize("arm", ["fail-verdict", "walk-stopped"])
+def test_a_close_that_fails_keeps_the_checks_exit_code(
+    arm: str,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A server driver error from ``close()`` must not turn a FAIL verdict or a stopped walk into
+    "cannot open the store", exit 2 (Lander hold on PR 2141). The close is quiet, by class."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    _stand_in_drivers(monkeypatch)
+    if arm == "fail-verdict":
+        _write(db, _DELETE_ROW_2)
+    else:
+
+        async def raising(self: MessageStore, **kwargs: object) -> object:
+            raise CipherError("Transit audit HMAC failed")
+
+        monkeypatch.setattr(MessageStore, "verify_audit_chain", raising)
+    real_close = MessageStore.close
+
+    async def failing_close(self: MessageStore) -> None:
+        await real_close(self)
+        raise _ServerDriverError("ROWMARKER in a close error")
+
+    monkeypatch.setattr(MessageStore, "close", failing_close)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: "), captured.out
+    assert "cannot open the store" not in captured.err, captured.err
+    assert "closing the store failed (_ServerDriverError)" in captured.err, captured.err
+    assert "ROWMARKER" not in captured.out + captured.err
+
+
+def test_a_server_driver_error_at_the_open_is_redacted(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Section 9: a server driver's error text is not this command's to vouch for, so the
+    store-open line renders it through ``safe_exc``. The planted value is an HL7 segment a row
+    could carry; the control shows the raw text holds it."""
+    from messagefoundry.__main__ import _emit_store_open_error
+
+    exc = _ServerDriverError("server said: PID|1||123456789^^^MRN||DOE^JOHN")
+    assert "123456789" in str(exc)  # the control
+    assert _emit_store_open_error(exc, "db", as_json=False) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error: cannot open the store at db: _ServerDriverError"), err
+    assert "123456789" not in err and "DOE^JOHN" not in err, err
 
 
 def test_a_store_open_error_cuts_the_row_text_sqlite_quotes(

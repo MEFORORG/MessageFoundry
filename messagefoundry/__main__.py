@@ -7772,7 +7772,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
-        store_driver_errors,
+        store_open_errors,
     )
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.keyprovider import KeyProviderError
@@ -7814,15 +7814,15 @@ def _audit_verify(args: argparse.Namespace) -> int:
     # The open computes the same verdict inline, because the #1916 source guard reads that call's
     # argument, so the two cannot be one expression.
     keyless_refusal = keyless_opt_out_refusal(settings.store, settings.security)
-    # Raised by the walk, after the open: a Transit HMAC that failed for a row, a key provider that
-    # failed part way, or a row the driver cannot read (text that is not UTF-8, vault BACKLOG #3054
-    # item 10). Its own tuple, not `_key_unresolved()`, whose classes are raised before a row is
-    # read. Exit 1 below: rows were read. At the open, only a CipherError or an error the store
-    # tagged as a read of the chain's rows gets that exit; any other is "could not start", 2.
+    # Raised by the walk, after the open, at least: a Transit HMAC that failed for a row, a key
+    # provider that failed part way, a connection lost part way, or a row the driver cannot read
+    # (text that is not UTF-8, vault BACKLOG #3054 item 10). Its own tuple, not `_key_unresolved()`,
+    # whose classes are raised before a row is read. Exit 1 below, with a FAIL line: rows were read.
     walk_errors: tuple[type[Exception], ...] = (
         CipherError,
         KeyProviderError,
-        *store_driver_errors(),
+        UnicodeError,
+        *store_open_errors(),
     )
 
     def stopped(exc: Exception) -> _AuditWalkStopped:
@@ -7849,14 +7849,15 @@ def _audit_verify(args: argparse.Namespace) -> int:
             # The open MACs the genesis row under Transit, so a row's content reaches this too.
             raise stopped(exc) from exc
         except walk_errors as exc:
-            # A row the driver cannot read while the open read the chain's rows: the store tags
-            # those. They are the chain's evidence, not a store that
-            # could not start, so they get the walk's FAIL line (vault BACKLOG #3054, item 10). Any
-            # other driver error at the open, such as a server refusing the connection, is exit 2
-            # below. A key that does not resolve before a row is read is exit 2 by the wrapper.
+            # Split by WHERE the error arose, not by its class (vault BACKLOG #3054, item 10). The
+            # store tags an error raised while it read the chain's rows, an outage part way
+            # included: that is the walk's FAIL line and exit 1. Any other driver or connection
+            # error at the open is "could not start", exit 2: at least a refused connection, which
+            # asyncpg raises as an OSError, and a failed login, pyodbc's InterfaceError. A key that
+            # does not resolve before a row is read is exit 2 by the wrapper.
             if AUDIT_CHAIN_READ_NOTE in getattr(exc, "__notes__", ()):
                 raise stopped(exc) from exc
-            raise
+            raise _StoreUnreachable() from exc
         try:
             verdict = await store.verify_audit_chain(expected_anchor=expected_anchor)
             if not verdict[0] or (verdict.keyless_walk and keyless_refusal is not None):
@@ -7870,7 +7871,15 @@ def _audit_verify(args: argparse.Namespace) -> int:
         except walk_errors as exc:
             raise stopped(exc) from exc
         finally:
-            await store.close()
+            # Quietly, by class: a close that fails must not replace the verdict or the FAIL line
+            # above with a store-open error (vault BACKLOG #3054, item 10).
+            try:
+                await store.close()
+            except Exception as closing:
+                print(
+                    f"warning: closing the store failed ({type(closing).__name__})",
+                    file=sys.stderr,
+                )
 
     try:
         verdict, count = run_guarded(run())
@@ -7896,13 +7905,13 @@ def _audit_verify(args: argparse.Namespace) -> int:
             "otherwise: an outage causes this, and so can a row the provider or driver refuses"
         )
         return 1
-    except store_driver_errors() as exc:  # #1670: a path that is not a database
+    except _StoreUnreachable as exc:  # #1670: a path that is not a database, or no server
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
-        # ONLY SQLite; this catch is what a server backend's open still lands in, so both guards
-        # stay live. Every backend's driver errors, so a server refusing the connection is exit 2
-        # and not the floor's 1. A driver error reading the chain's rows is a FAIL above (vault
-        # BACKLOG #3054, item 10).
-        return _emit_store_open_error(exc, settings.store.path, as_json=False)
+        # ONLY SQLite; a server backend's open lands here, so both guards stay live. Only an error
+        # the open raised outside its read of the chain's rows: see the split in `run`.
+        return _emit_store_open_error(
+            cast(Exception, exc.__cause__), settings.store.path, as_json=False
+        )
     ok, message = verdict
     if verdict.key_unavailable:
         if keyless_refusal is not None:
@@ -9504,6 +9513,11 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
         raise _StoreKeyUnresolved(str(exc)) from exc
 
 
+class _StoreUnreachable(RuntimeError):
+    """A driver or connection error ``audit-verify``'s open raised outside its read of the chain's
+    rows: "could not start", exit 2 (vault BACKLOG #3054, item 10). The error is its cause."""
+
+
 class _AuditWalkStopped(RuntimeError):
     """A key, key-provider or driver error raised while ``audit-verify`` read the chain's rows: in
     the walk, or in the open's own read of them (vault BACKLOG #3054, items 8 and 10). It does not
@@ -9532,11 +9546,18 @@ def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
 
     A ROW'S TEXT IS CUT FROM THE MESSAGE. SQLite's decode error quotes the column's bytes, "Could
     not decode to UTF-8 column 'detail' with text '...'", and those bytes are a row's content, which
-    a job keeps in its log (vault BACKLOG #3054, item 10). The column name stays.
+    a job keeps in its log (vault BACKLOG #3054, item 10). The column name stays. Any other driver's
+    error, a server backend's, goes through ``safe_exc``, the PHI redaction every log line gets: its
+    text is not this command's to vouch for.
     """
     import re
 
-    shown = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
+    from messagefoundry.redaction import safe_exc
+
+    if isinstance(exc, sqlite3.DatabaseError):
+        shown = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
+    else:
+        shown = safe_exc(exc)
     message = f"cannot open the store at {path}: {shown}"
     if as_json:
         print(json.dumps({"error": message}))

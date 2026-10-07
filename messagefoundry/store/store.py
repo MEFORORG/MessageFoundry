@@ -2898,7 +2898,7 @@ class AuditRangeHost(Protocol):
     ) -> None: ...
 
 
-#: The note an open adds to a database driver error raised while it read, or started, the
+#: The note an open adds to a driver, connection or decode error raised while it read, or started, the
 #: audit chain's rows (vault BACKLOG #3054, item 10): in :func:`load_audit_chain`, and in the empty-log
 #: check of ``open_store``. A row's content can cause such an error, so a caller that verifies the
 #: chain treats it as evidence about those rows rather than as a store that could not start. A
@@ -2908,18 +2908,20 @@ AUDIT_CHAIN_READ_NOTE = "raised while the store read or started the audit chain 
 
 
 def note_audit_chain_read(exc: BaseException) -> None:
-    """Add :data:`AUDIT_CHAIN_READ_NOTE` to ``exc`` when it is a database driver error. Other
-    errors, the engine's own refusals among them, are left as they are. A Transit refusal there is
-    a ``CipherError``, which a verifying caller already treats as row evidence."""
-    from messagefoundry.store.base import store_driver_errors
+    """Add :data:`AUDIT_CHAIN_READ_NOTE` to ``exc`` when it is a driver or connection error
+    (:func:`~messagefoundry.store.base.store_open_errors`), or a ``UnicodeError`` a driver raised
+    decoding a row. Other errors, the engine's own refusals among them, are left as they are. A
+    Transit refusal there is a ``CipherError``, which a verifying caller already treats as row
+    evidence."""
+    from messagefoundry.store.base import store_open_errors
 
-    if isinstance(exc, store_driver_errors()):
+    if isinstance(exc, (*store_open_errors(), UnicodeError)):
         exc.add_note(AUDIT_CHAIN_READ_NOTE)
 
 
 async def load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
-    """At open: learn the chain's state from its rows; see :func:`_load_audit_chain`. A database
-    driver error is re-raised unchanged, with :data:`AUDIT_CHAIN_READ_NOTE` added."""
+    """At open: learn the chain's state from its rows; see :func:`_load_audit_chain`. A driver,
+    connection or decode error is re-raised unchanged, with :data:`AUDIT_CHAIN_READ_NOTE` added."""
     try:
         await _load_audit_chain(host, read_only=read_only)
     except BaseException as exc:  # tagged only when it is one of those; always re-raised

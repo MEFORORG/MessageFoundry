@@ -4593,9 +4593,15 @@ make Transit refuse, for example a row too large for one request. A row the driv
 the same. A code that read as "not checked" would let a writer plant such a row and hide every
 break. The walk reports a break only when it finishes, so a break it had already met is lost too.
 The cause's class on the `FAIL` line is a hint, not a diagnosis: a refused row can also surface as
-a connection error. The open reads some of the chain's rows too, such as row 1. A driver error
-there gets the same line, so a lock or outage at that moment also exits 1. Any other driver error
-at the open, such as a server refusing the connection, exits 2.
+a connection error. The open reads some of the chain's rows too, such as row 1 and the newest row.
+A driver, connection or decode error raised during those reads gets the same line and exits 1. So
+a lock or an outage at that moment also exits 1. The store marks those errors; the split is by
+where the error arose, not by its class. A driver or connection error raised anywhere else in
+the open is "could not start", exit 2. That covers at least a refused connection, a failed login
+and an unreadable path. A table or column the read needs that is missing is a schema mismatch,
+which exits 2 too. A failed close of the store never changes the exit code; it prints a warning
+naming the error's class. A server driver's error text is shown only through the same PHI
+redaction as the log.
 
 At least one older case also exits 2 and is not a finding about the chain. An audit log emptied
 out of band, verified in a shell that holds no key and whose settings require one, exits 2: the

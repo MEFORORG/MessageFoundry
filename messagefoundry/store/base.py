@@ -2998,6 +2998,27 @@ def store_driver_errors() -> tuple[type[Exception], ...]:
     return tuple(errors)
 
 
+def store_connect_errors() -> tuple[type[Exception], ...]:
+    """What a driver raises when it cannot reach its server at all, beyond
+    :func:`store_driver_errors` (vault BACKLOG #3054, item 10). At least ``OSError``, which asyncpg
+    raises for a refused connection, and pyodbc's ``Error`` root, whose ``InterfaceError`` is a
+    failed login (SQLSTATE 28000). The pyodbc entry is left out when it is not installed."""
+    errors: list[type[Exception]] = [OSError]
+    try:
+        import pyodbc
+    except ImportError:
+        pass
+    else:
+        errors.append(pyodbc.Error)
+    return tuple(errors)
+
+
+def store_open_errors() -> tuple[type[Exception], ...]:
+    """:func:`store_driver_errors` and :func:`store_connect_errors`: every error a store open can
+    raise from its driver or its connection, on any backend."""
+    return (*store_driver_errors(), *store_connect_errors())
+
+
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     """The configured SQLite path when nothing is there, else ``None``.
 
