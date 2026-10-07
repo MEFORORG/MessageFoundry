@@ -125,6 +125,10 @@ async def test_only_an_operator_start_binds_a_listener_on_a_passive_standby(
         await rr.start_inbound(_NORM)  # the scheduler's call: an engine door
         await _alert_control_action(engine, "restart_inbound", _NORM)
         assert not await _accepts(norm_port)
+        # The door holds without the marker the scheduler and the alert action read first.
+        rr._filtered.clear()
+        await rr.restart_inbound(_NORM)
+        assert not rr.inbound_running(_NORM)
 
         await rr.start_inbound(_CRIT, operator=True)  # the API's call
         assert await _accepts(crit_port)

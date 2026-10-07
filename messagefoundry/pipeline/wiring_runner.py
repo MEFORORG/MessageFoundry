@@ -2560,6 +2560,11 @@ class RegistryRunner:
         inbound that would bind and is not listening, which after a release is every one, so the
         scheduler or an alert rule's restart cannot bind it before that reload (vault BACKLOG
         #3140)."""
+        if standby is None and self._dr_standby is not None:
+            # Leaving the passive standby: its inbound markers go, and the reload that follows
+            # writes the profile's own. Until then the door refuses what the profile parks.
+            for key in [k for k in self._filtered if k[0] == "inbound"]:
+                del self._filtered[key]
         self._dr_threshold = threshold
         self._dr_standby = standby
         if standby is not None:
@@ -2567,11 +2572,24 @@ class RegistryRunner:
                 if name not in self._sources and inbound_listener_starts(ic):
                     self._dr_filters_out(name, ic.priority, kind="inbound")
 
+    async def park_intake(self, standby: Priority) -> None:
+        """Make this box a passive standby for intake and unbind every inbound, in one span of the
+        reload lock, for ``POST /dr/release`` (vault BACKLOG #3140). The DR threshold is kept, so
+        the outbounds the profile parks hold their rows through the drain. Run again after the
+        drain, it unbinds a listener an operator started meanwhile, so the release returns with
+        none bound."""
+        async with self._reload_lock:
+            self.set_dr_threshold(self._dr_threshold, standby=standby)
+            for name in list(self.registry.inbound):
+                await self._stop_inbound_unsafe(name)
+            self.set_dr_threshold(self._dr_threshold, standby=standby)
+
     def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
 
-        ``False`` when no DR run-profile is active (``_dr_threshold is None``) — every normal deployment,
-        so the start path is byte-identical to before this seam. When a DR profile IS active, records the
+        ``False`` when no DR run-profile is active (``_dr_threshold is None``) and the box is not a
+        passive standby — every normal deployment, so the start path is byte-identical to before
+        this seam. When a DR profile IS active, records the
         reason in ``_filtered`` and returns ``True`` for a below-threshold connection so :meth:`start`
         skips binding/building it. The comparison is on the explicit total order (``rank``), so it is
         unambiguous: a connection runs iff ``resolved.rank >= threshold.rank``.
@@ -2749,9 +2767,9 @@ class RegistryRunner:
         the lock (start, reload) use :meth:`_start_inbound_unsafe`.
 
         On a passive DR standby only an ``operator`` start binds; an engine door such as the
-        scheduler or an alert rule does nothing (:meth:`_standby_refuses`)."""
+        scheduler or an alert rule does nothing (:meth:`_dr_refuses`)."""
         async with self._reload_lock:
-            if self._standby_refuses(name, operator=operator):
+            if self._dr_refuses(name, operator=operator):
                 return
             await self._checked_inbound_start(name)
 
@@ -2780,24 +2798,29 @@ class RegistryRunner:
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
-            if self._standby_refuses(name, operator=operator):
+            if self._dr_refuses(name, operator=operator):
                 return
             await self._stop_inbound_unsafe(name)
             await self._checked_inbound_start(name)
 
-    def _standby_refuses(self, name: str, *, operator: bool) -> bool:
+    def _dr_refuses(self, name: str, *, operator: bool) -> bool:
         """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
         #3140). The fence is enforced here, at the door, so no engine path binds a listener on a
-        passive box whatever its ``filtered`` marker says. An operator start overrides it, as ADR
-        0048 Decision 3 says of the profile. An unknown name is not refused, so it still 404s."""
+        passive box whatever its ``filtered`` marker says; the marker only reports the park. An operator start overrides it, as ADR 0048
+        Decision 3 says. An unknown or not-deployed name is not refused, so it still raises."""
         ic = self.registry.inbound.get(name)
-        if operator or self._dr_standby is None or ic is None:
+        if operator or ic is None or not ic.deployed:
             return False
-        if name not in self._sources:
+        if self._dr_standby is None:
+            # The active profile's parks stay with their markers, which the scheduler and the
+            # alert action read: after an operator start the calendar owns such an inbound again
+            # (ADR 0048 Decision 3), and a door refusal here would take that from it.
+            return False
+        if name not in self._sources and inbound_listener_starts(ic):
             self._dr_filters_out(name, ic.priority, kind="inbound")
         log.info(
-            "inbound connection %r not started: this DR standby is passive, and only an operator "
-            "start or POST /dr/activate binds a listener",
+            "inbound connection %r: engine start or restart not run, because DR parks it; only "
+            "an operator start or POST /dr/activate binds it",
             name,
         )
         return True
@@ -6055,12 +6078,6 @@ class RegistryRunner:
                 # deployed would otherwise read "filtered" for good after a POST /dr/release (vault
                 # BACKLOG #3067). A passive standby's inbound markers are written again below.
                 self._filtered.clear()
-            else:
-                # The inbound loop below writes again the marker of each inbound it evaluates, and
-                # start writes none for one it skips. So a passive standby's marker on an inbound
-                # the loop skips does not outlive the activation (vault BACKLOG #3140).
-                for key in [k for k in self._filtered if k[0] == "inbound"]:
-                    del self._filtered[key]
             if not self._running:
                 self.registry = new_registry
                 return

@@ -732,7 +732,9 @@ class Engine:
         runner binds no inbound listener while it is set (vault BACKLOG #3140), because ADR 0048's
         load balancer moves the VIP to the node that answers. It judges the listeners an
         activation would bind, so a reload here refuses what that activation would refuse."""
-        if self._dr_settings.enabled and not self._dr_active:
+        # Without store settings there is no coordinator (dr_coordinator), so nothing could
+        # activate the box; parking its intake for good would leave it dead, not passive.
+        if self._dr_settings.enabled and not self._dr_active and self._store_settings is not None:
             return self._dr_settings.priority_threshold
         return None
 
@@ -931,16 +933,21 @@ class Engine:
             depth = await self.store.in_pipeline_depth()
             self._set_dr_active(False)
             return {"depth_left": depth, "drained": depth == 0, "held_on_parked_outbounds": 0}
-        # The passive standby first, so the scheduler and an alert rule cannot bind a listener while
-        # the drain runs (vault BACKLOG #3140). The threshold stays, so the outbounds the profile
-        # parks hold their rows through the drain; the second call parks each unbound inbound.
+        # Unbind every listener, as a passive standby, so neither the scheduler nor an alert rule
+        # can bind one while the drain runs (vault BACKLOG #3140). The threshold stays, so the
+        # outbounds the profile parks hold their rows through the drain.
         standby = self._dr_settings.priority_threshold
-        rr.set_dr_threshold(rr.dr_threshold, standby=standby)
-        for name in list(rr.registry.inbound):
-            await rr.stop_inbound(name)  # unbind every listener — no new intake during fail-back
-        rr.set_dr_threshold(rr.dr_threshold, standby=standby)
-        rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
-        depth, held = await self._drain_pipeline()
+        await rr.park_intake(standby)
+        try:
+            rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
+            depth, held = await self._drain_pipeline()
+            # Again, for a listener an operator started during the drain: none is bound on return.
+            await rr.park_intake(standby)
+        except BaseException:
+            # The coordinator keeps the box active, so the runner leaves the standby with it and
+            # the next reload binds the critical set again, as before the release began.
+            rr.set_dr_threshold(self._dr_run_threshold(), standby=None)
+            raise
         self._set_dr_active(False)
         return {"depth_left": depth, "drained": depth <= held, "held_on_parked_outbounds": held}
 

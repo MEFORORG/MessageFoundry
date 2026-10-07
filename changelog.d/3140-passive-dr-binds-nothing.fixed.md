@@ -4,5 +4,6 @@
   relies on to move the VIP to the live node would then have sent it traffic. `POST /dr/activate`
   binds the feeds at or above `[dr].priority_threshold`, as before. Outbounds are unchanged. A
   release parks intake before its drain. A reload or dry run on a passive box checks the listeners
-  an activation would bind. An operator start of an inbound still binds it, until the next reload.
+  an activation would bind. An operator start of an inbound still binds it, until the next reload or its
+  schedule window closes.
   An alert rule's restart and the scheduler bind nothing. (`vault BACKLOG #3140`)

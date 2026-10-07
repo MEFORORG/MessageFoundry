@@ -280,7 +280,8 @@ in-flight rows stranded.
 > comes up on the first reload after a release, as Decision 3 says. The reload and dry-run checks judge the
 > listeners an activation would bind. So a config that activation would refuse is refused before the
 > disaster. An operator start of an inbound still overrides the passive park, as Decision 3 says of the
-> profile, until the next reload parks it again. An alert rule's restart and the scheduler bind nothing.
+> profile, until the next reload or its schedule window's close. An alert rule's restart and the scheduler
+> bind nothing.
 
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 
