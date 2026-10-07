@@ -776,7 +776,16 @@ class Engine:
         rest report ``status:"filtered"``). A reload (not a cold start) so a box already serving its
         full graph drops to the critical set in place, with in-flight rows preserved (the reload is
         quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
-        from :meth:`_dr_config_drift`."""
+        from :meth:`_dr_config_drift`.
+
+        It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
+        (vault BACKLOG #2184, engine PR 2070). The preflight reads anchor files, which can change
+        after the graph loaded. The guard judges only the graph and the startup settings, and
+        neither has changed. It already judged this graph when it loaded, through
+        :meth:`reload_detail` or the managed app's first load, over the whole graph and before the
+        shard filter. ``rr.registry`` is the filtered graph, so a guard here would judge less than
+        that load did. A graph an embedder hands to :meth:`add_registry` meets neither check at
+        load. That is a fact about embedding, and an activation is not where it changes."""
         was_active = self._dr_active
         rr = self._registry_runner
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running

@@ -650,6 +650,44 @@ async def test_a_refused_activation_puts_the_threshold_back(
     assert rr.inbound_running(_NORM)
 
 
+async def test_an_activation_preflights_the_running_graph_and_does_not_guard_it(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vault BACKLOG #2184: the activation runs the registry preflight over the graph the runner
+    holds, and not the registry guard, which judged that graph when it loaded. Red if the
+    preflight call goes, or if a guard call is added."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    running = rr.registry
+    guarded: list[object] = []
+    preflighted: list[object] = []
+    real_guard = engine.guard_registry
+    real_preflight = engine.preflight_registry
+
+    def spy_guard(registry: Any) -> None:
+        guarded.append(registry)
+        real_guard(registry)
+
+    async def spy_preflight(registry: Any) -> None:
+        preflighted.append(registry)
+        await real_preflight(registry)
+
+    monkeypatch.setattr(engine, "guard_registry", spy_guard)
+    monkeypatch.setattr(engine, "preflight_registry", spy_preflight)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+
+    assert engine.dr_active is True
+    assert len(preflighted) == 1 and preflighted[0] is running
+    assert guarded == []
+    # Control: the guard spy does record a call, so the empty list above is the activation's.
+    await engine.reload_detail(box.tiered)
+    assert len(guarded) == 1
+
+
 # --- the activation applies the running graph, not the disk ----------------------------------------
 
 
