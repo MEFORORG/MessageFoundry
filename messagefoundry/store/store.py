@@ -3172,6 +3172,13 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
 # drop on exactly the instances that thinned their logs.
 NOT_DEPLOYED_EVENT: Final = "not_deployed"
 
+#: The per-message PHI-view event :meth:`MessageStore.record_view` writes on every open, whose detail
+#: is the viewer's username. ONE spelling, shared with the API: ``get_message``'s ``message_view``
+#: audit leaves these rows out of ``events.detail``, because their detail is not the error-tier text
+#: that entry records (BACKLOG #2440). That exclusion is only sound while the store is the sole
+#: writer of the kind, so :func:`check_caller_event_kind` refuses it from ``record_message_event``.
+VIEWED_EVENT: Final = "viewed"
+
 
 def not_deployed_detail(destination: str) -> str:
     """The count-and-log detail for a Send declined because its outbound is present-but-NOT-deployed
@@ -3190,7 +3197,7 @@ def not_deployed_detail(destination: str) -> str:
 #: to be asked. ``reply_returned`` is the routine happy-path counterpart and is deliberately NOT in
 #: the floor: it is thinnable like ``delivered``.
 _AUDIT_FLOOR_EVENTS = frozenset(
-    {"viewed", "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout"}
+    {VIEWED_EVENT, "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout"}
 )
 
 #: The COMPLETE ``message_events.event`` vocabulary, shared by all three backends.
@@ -3224,7 +3231,7 @@ MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
         "cancelled",
         "edit_resend",
         "edit_resubmit",
-        "viewed",
+        VIEWED_EVENT,
         NOT_DEPLOYED_EVENT,
         # ADR 0154 D8 — the synchronous-reply outcome pair. Names, counts and waited_ms only; never a
         # fragment of the partner's reply body (that is the PHI class this design keeps structurally
@@ -3233,6 +3240,25 @@ MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
         "reply_timeout",
     }
 )
+
+#: Kinds only the store itself writes, refused from the public ``record_message_event``.
+_STORE_ONLY_EVENT_KINDS: Final[frozenset[str]] = frozenset({VIEWED_EVENT})
+
+
+def check_caller_event_kind(event: str) -> None:
+    """Refuse a ``record_message_event`` kind that is undeclared or store-only.
+
+    Shared by all three backends so the rule cannot drift between them. Undeclared: see
+    :data:`MESSAGE_EVENT_KINDS`. Store-only: :data:`VIEWED_EVENT`, because a caller-written
+    ``viewed`` row would carry a detail the error reveal unmasks while the audit leaves it out
+    (BACKLOG #2440)."""
+    if event not in MESSAGE_EVENT_KINDS:
+        raise ValueError(
+            f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
+            "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
+        )
+    if event in _STORE_ONLY_EVENT_KINDS:
+        raise ValueError(f"message_events kind {event!r} is written only by the store itself")
 
 
 def should_record_event(event: str, verbosity: str) -> bool:
@@ -11026,7 +11052,7 @@ class MessageStore:
         opened, satisfying the audit-log requirement for message views."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._event(message_id, "viewed", None, actor or "", now)
+            await self._event(message_id, VIEWED_EVENT, None, actor or "", now)
             await self._commit()
 
     async def record_message_event(
@@ -11053,11 +11079,7 @@ class MessageStore:
         ``detail`` carries names, counts and timings only. On the sync-reply path in particular it
         must never carry a fragment of the partner's reply — that rule is structural in the caller,
         and ``safe_text`` here is defence in depth, not the control."""
-        if event not in MESSAGE_EVENT_KINDS:
-            raise ValueError(
-                f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
-                "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
-            )
+        check_caller_event_kind(event)
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._event(message_id, event, destination, detail or "", now)

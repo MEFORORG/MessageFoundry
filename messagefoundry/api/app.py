@@ -402,7 +402,13 @@ from messagefoundry.store.content_search import (
 )
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.store import AuditAppend, OperatorAudit, ReingressOutcome, ResendOutcome
+from messagefoundry.store.store import (
+    VIEWED_EVENT,
+    AuditAppend,
+    OperatorAudit,
+    ReingressOutcome,
+    ResendOutcome,
+)
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -5362,7 +5368,7 @@ def create_app(
         # EVERY open, so counting it would name `events.detail` on every error reveal whatever the
         # message holds. Only an event of another kind can make that entry true (BACKLOG #2440).
         # This narrows the audit record only; the redaction above still masks and lifts every row.
-        disclosing_events = [e for e in events if e.event != "viewed"]
+        disclosing_events = [e for e in events if e.event != VIEWED_EVENT]
         revealed = sorted(
             f"{prefix}{p}"
             for prefix, cls, shown in (
