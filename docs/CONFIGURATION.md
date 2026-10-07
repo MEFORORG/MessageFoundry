@@ -410,6 +410,17 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
 - A referenced key that is **undefined for the target environment** makes the engine refuse to load
   or promote that graph (fail loud) — never a silent blank host. See the env files under
   [`environments/`](../environments/) and `samples/config/IB_ACME_ADT.py` for a worked example.
+- **A boolean setting reads its value strictly.** Write it as `env("acme_allow_expired", cast=bool)`
+  in a code-first module, or `{ env = "acme_allow_expired", cast = "bool" }` in `connections.toml`.
+  Both read `true`, `1`, `yes` and `on` as true, and `false`, `0`, `no` and `off` as false, in any
+  case. A TOML `true` or `false` in `<env>.toml` works as written. Any other value, such as `maybe`,
+  stops the load with an error that names the setting and the key. A `default=` given with a
+  bool cast is read the same way, on both routes. Before vault BACKLOG #3138, a code-first `cast=bool` used
+  Python's own `bool`, which reads any non-empty text as true. A `MEFOR_VALUE_*` of `false` would
+  then have turned on a loosening such as `tls_allow_expired` or `trust_server_certificate`.
+  **Always give a boolean setting this cast.** An `env()` with no cast, or with a `str` cast, hands
+  the setting text, and a connector reads any non-empty text as true. A cast you write yourself,
+  such as `cast=lambda s: bool(s)`, runs as written and keeps that trap.
 - **Per-face logic inside a transform:** `env()` is a *deferred reference* resolved only when a
   **connection** spec is built — using it in a handler is an always-truthy object (a bug). To branch a
   Router/Handler on the deployment, read the active environment **name** with
@@ -1786,7 +1797,7 @@ nodes automatically:
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | turn on the coordination seam; requires a server-DB store (`[store].backend` = `postgres` or `sqlserver`) and `[store].pool_size >= 2` |
-| `node_id` | str | _unset_ | override the auto id (`host:pid:hex`); pin for a stable identity / tests. Unset → reuses the store's lease owner-id, so node-id == owner-id |
+| `node_id` | str | _unset_ | override the auto id (`host:pid:hex`); pin for a stable identity / tests. Unset → reuses the store's lease owner-id, so node-id == owner-id. Pinned, a restarted node also settles the dual-control releases it left `executing` (SECURITY.md, "A restart settles its own leftover releases") |
 | `heartbeat_seconds` | num | 10 | how often a node refreshes its `last_seen` heartbeat **and** renews its leadership lease (no separate leader-check knob). Must be > 0 |
 | `node_timeout_seconds` | num | 30 | a node is considered dead when its `last_seen` is older than this (the `/cluster/nodes` freshness filter). The leadership **lease** — not this timeout — is what transfers leadership. Must be > 0, and must exceed `heartbeat_seconds` |
 | `reclaim_interval_seconds` | num | 30 | how often the **leader** runs the lease-reclaim sweep that recovers crashed nodes' in-flight rows (followers no-op). Must be > 0 |

@@ -23,7 +23,11 @@ at startup, because that is unbounded boot-time work. It is fail-closed, like th
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -44,7 +48,13 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.crypto_transit import TransitCipher
-from messagefoundry.uploads import ResealResult, UploadStore
+from messagefoundry.uploads import (
+    ResealResult,
+    UploadNotFoundError,
+    UploadQuotaError,
+    UploadStore,
+    UploadUnreadableError,
+)
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
 # A filename that would be PHI if it leaked into a log or an alert.
@@ -373,3 +383,225 @@ async def test_vault_transit_keeps_the_upload_passthrough(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         assert await store.warn_if_unsealed() == 0
     assert _counts(caplog) == []
+
+
+# --- an upload rotate-key can never seal stays inside retention (BACKLOG #2322, PR 2102 repair) ---
+
+
+def _garble(path: Path) -> None:
+    path.write_bytes(b"\xff\xfe not utf-8")
+
+
+def _remove(path: Path) -> None:
+    path.unlink()
+
+
+_BREAKS = pytest.mark.parametrize("break_body", [_remove, _garble], ids=["missing", "undecodable"])
+_DAY = 86_400
+
+
+async def _unsealable_upload(root: Path, break_body: Callable[[Path], None]) -> str:
+    """A plaintext upload whose body is then lost: the shape ``rotate-key`` holds back for good."""
+    fid = await _plaintext_upload(root)
+    break_body(root / f"{fid}.blob")
+    return fid
+
+
+def _age(root: Path, fid: str, days: float) -> None:
+    """Set the sidecar's mtime ``days`` in the past (negative: in the future)."""
+    when = time.time() - days * _DAY
+    os.utime(root / f"{fid}.meta", (when, when))
+
+
+def _files(root: Path) -> list[str]:
+    return sorted(p.name for p in root.iterdir())
+
+
+@_BREAKS
+async def test_an_unsealable_upload_is_pruned_at_expiry(
+    tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    """Both files go once the sidecar's mtime passes the window, and not before. The reseal holds it
+    back on every run, so without this it sat on disk forever, the damaged body included."""
+    root = tmp_path / "uploads"
+    fid = await _unsealable_upload(root, break_body)
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, retention_days=30)
+    assert await store.reseal_to_active() == ResealResult(unsealable=1)
+
+    _age(root, fid, 29)
+    assert (await store.prune_expired()).pruned == []
+    assert f"{fid}.meta" in _files(root)
+
+    _age(root, fid, 31)
+    result = await store.prune_expired()
+    assert _files(root) == []
+    if break_body is _garble:
+        # The body was removed, so the pass reports it. The owner is unverified, so it is blank.
+        [meta] = result.pruned
+        assert (meta.file_id, meta.uploader, meta.uploader_id, meta.filename) == (fid, "", "", "")
+    else:
+        assert result.pruned == []  # no body to remove, so no row, as for any body-less pair
+
+
+@_BREAKS
+async def test_an_unsealable_upload_is_removed_by_delete(
+    tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    root = tmp_path / "uploads"
+    fid = await _unsealable_upload(root, break_body)
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    meta = await store.delete(fid)
+    assert (meta.file_id, meta.uploader_id, meta.filename) == (fid, "", "")
+    assert _files(root) == []
+    with pytest.raises(UploadNotFoundError):
+        await store.get_meta(fid)
+
+
+async def test_a_delete_told_the_sidecar_was_refused_still_classifies_it(tmp_path: Path) -> None:
+    """BACKLOG #2322: ``sidecar_refused`` skips the second decrypt, never the check. A sealed
+    sidecar over a missing body, and a plaintext one the cipher passes through, each still answer
+    423 with nothing removed. A missing sidecar still answers 404."""
+    root = tmp_path / "uploads"
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    sealed = await store.save(
+        data=_ADT.encode(), filename="s.hl7", uploader="op", uploader_id="u-op"
+    )
+    (root / f"{sealed.file_id}.blob").unlink()
+    with pytest.raises(UploadUnreadableError):
+        await store.delete(sealed.file_id, sidecar_refused=True)
+    assert f"{sealed.file_id}.meta" in _files(root)
+
+    fid = await _plaintext_upload(root)
+    (root / f"{fid}.blob").unlink()
+    passthrough = UploadStore(root, _keyed(generate_key(), allow_unmarked=True), max_bytes=1 << 20)
+    with pytest.raises(UploadUnreadableError):
+        await passthrough.delete(fid, sidecar_refused=True)
+    assert f"{fid}.meta" in _files(root)
+
+    with pytest.raises(UploadNotFoundError):
+        await store.delete("f" * 32, sidecar_refused=True)
+
+
+@_BREAKS
+async def test_an_unsealable_upload_counts_toward_the_quota_and_is_never_listed(
+    tmp_path: Path, break_body: Callable[[Path], None], caplog: pytest.LogCaptureFixture
+) -> None:
+    """It bills the uploader its sidecar names, at the body's size on disk. It is never listed, since
+    the listing has no way to mark an upload unreadable. The startup warning counts it on a line of
+    its own, which does not send the operator to rotate-key."""
+    root = tmp_path / "uploads"
+    fid = await _unsealable_upload(root, break_body)
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, max_files_per_user=1)
+
+    on_disk = (root / f"{fid}.blob").stat().st_size if break_body is _garble else 0
+    assert store._observed_sync("u-op") == (1, on_disk)
+    with pytest.raises(UploadQuotaError):
+        await store.save(data=_ADT.encode(), filename="b.hl7", uploader="op", uploader_id="u-op")
+    assert await store.list_files() == []
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert await store.warn_if_unsealed() == 0  # nothing rotate-key would seal
+    assert _counts(caplog) == []
+    [line] = [r.getMessage() for r in caplog.records if "rotate-key cannot seal" in r.getMessage()]
+    assert "1 uploaded file(s)" in line and _PHI_NAME not in line
+
+
+async def test_a_planted_lone_sidecar_is_never_sealed_and_ages_out(tmp_path: Path) -> None:
+    """The cheapest plant: one hand-written sidecar naming another upload and a victim's quota.
+
+    It is never sealed or listed. Its negative size is ignored. The prune removes its OWN path,
+    never the id its JSON names, and a plant dated into the future is treated as expired rather
+    than kept forever."""
+    root = tmp_path / "uploads"
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, retention_days=30)
+    victim = await store.save(
+        data=_ADT.encode(), filename="v.hl7", uploader="op", uploader_id="u-op"
+    )
+    plant = "e" * 32
+    (root / f"{plant}.meta").write_text(
+        json.dumps({"file_id": victim.file_id, "uploader_id": "u-op", "size": -(10**9)}),
+        encoding="utf-8",
+    )
+    assert await store.reseal_to_active() == ResealResult(unsealable=1)
+    assert not (root / f"{plant}.meta").read_text(encoding="utf-8").startswith(MARKER_PREFIX)
+    assert [m.file_id for m in await store.list_files()] == [victim.file_id]
+    assert store._observed_sync("u-op") == (2, victim.size)
+
+    _age(root, plant, -2)  # two days in the future
+    assert (await store.prune_expired()).pruned == []  # no body, so no row
+    assert _files(root) == [f"{victim.file_id}.blob", f"{victim.file_id}.meta"]
+    assert (await store.read_bytes(victim.file_id)).decode() == _ADT
+
+
+async def test_a_body_unreadable_for_another_cause_still_waits_for_rotate_key(
+    tmp_path: Path,
+) -> None:
+    """Only a body that is missing or is not text makes an upload unsealable. One that cannot be
+    opened for another cause can be sealed once that is fixed, so it is a skip, and it stays out of
+    retention like any refused upload. A directory in the body's place stands in for that cause."""
+    root = tmp_path / "uploads"
+    fid = await _plaintext_upload(root)
+    (root / f"{fid}.blob").unlink()
+    (root / f"{fid}.blob").mkdir()
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    assert await store.reseal_to_active() == ResealResult(skipped=1)
+    assert (await store.prune_expired(now=10**12)).pruned == []
+    assert (root / f"{fid}.meta").exists()
+    with pytest.raises(CipherError):
+        await store.delete(fid)
+
+
+async def test_a_body_behind_a_current_marker_is_still_checked_before_its_sidecar_is_sealed(
+    tmp_path: Path,
+) -> None:
+    """The reseal trusts a body whose first bytes are the active marker without reading the rest.
+    Its sidecar is sealed only once the whole body is known to be text."""
+    root = tmp_path / "uploads"
+    fid = await _plaintext_upload(root)
+    cipher = _keyed(generate_key())
+    sidecar = (root / f"{fid}.meta").read_bytes()
+    (root / f"{fid}.blob").write_bytes(cipher.active_marker_prefix.encode() + b"A" * 9000 + b"\xff")
+    store = UploadStore(root, cipher, max_bytes=1 << 20)
+    assert await store.reseal_to_active() == ResealResult(unsealable=1)
+    assert (root / f"{fid}.meta").read_bytes() == sidecar
+    assert await store.list_files() == []
+
+
+async def test_a_body_the_engine_could_not_have_written_is_never_read(tmp_path: Path) -> None:
+    """The quota scan checks bodies under ``_quota_lock``, so a body past any size the engine could
+    have written is not read at all. It waits for an operator, like any refused upload."""
+    root = tmp_path / "uploads"
+    fid = await _plaintext_upload(root)
+    (root / f"{fid}.blob").write_bytes(b"\xff" * (3 * 1024 + 4096))
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1024)
+    assert store._scan_unsealable_sync() == []
+    assert (await store.prune_expired(now=10**12)).pruned == []
+    assert (root / f"{fid}.blob").exists()
+
+
+def test_rotate_key_notes_an_unsealable_upload_and_does_not_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI says what happened and what removes it. It does not tell the operator to fix and
+    re-run, which can never seal it, and it does not block retiring a key."""
+    from messagefoundry.__main__ import main
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    db, root = tmp_path / "cycle.db", tmp_path / "uploads"
+
+    async def seed() -> None:
+        store = await MessageStore.open(db)
+        try:
+            await store.enqueue_ingress(channel_id="c", raw=_ADT)
+        finally:
+            await store.close()
+        await _unsealable_upload(root, _remove)
+
+    asyncio.run(seed())
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    monkeypatch.setenv("MEFOR_STORE_UPLOADS_DIR", str(root))
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "note: 1 uploaded file(s) have a plaintext sidecar" in captured.out
+    assert "could not be read" not in captured.err

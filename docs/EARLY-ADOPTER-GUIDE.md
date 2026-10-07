@@ -481,7 +481,9 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       was changed to name a key, from `4` the chain was rewritten as keyless. Re-run with the
       engine's settings and key before deciding. Do not clear a `5` with the keyless opt-out
       unless the engine runs under it. A job that moves from `0` to `4` or `5` changed, and the
-      database may have changed too: find out what changed the job, then re-run it. Treating any
+      database may have changed too: find out what changed the job, then re-run it. A `1` whose
+      `FAIL` line says a key or key-provider error stopped the walk may be a provider outage, but
+      treat it as broken until a run that finishes says otherwise. Treating any
       of `2` to `5` as a pass leaves the real log unchecked. Add `--allow-empty` only
       where an empty log is expected. Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md)
       "Tamper-evidence".

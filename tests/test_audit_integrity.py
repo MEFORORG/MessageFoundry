@@ -727,8 +727,13 @@ def test_audit_anchor_json_refusal_of_a_non_database_is_json_on_stdout(
 # exception family `_load_service_settings` catches: an absent file (FileNotFoundError), a TOML parse
 # error (ValueError), a section that fails validation (ValidationError) and a directory named as the
 # file (OSError, a PermissionError on Windows). Each runs in both modes. The two modes must carry the
-# same message, and neither may carry a value from the file: the ValidationError case plants a canary
-# where pydantic's `input_value=` would echo it.
+# same message, and neither may carry a value from the file.
+#
+# CORRECTED (vault BACKLOG #3110, item 5): this said the ValidationError case plants a canary where
+# pydantic's `input_value=` would echo it. Since BACKLOG #296 the settings models hide their input, so
+# `str(exc)` never carries it and that canary cannot fire. The test that can is
+# `test_a_settings_error_is_rendered_rather_than_stringified`, below: it raises from a model that
+# does not hide its input, in every mode of both commands.
 
 _SETTINGS_CANARY = "CANARY2094settingsvalue"
 
@@ -816,8 +821,16 @@ def test_audit_verify_settings_refusal_echoes_no_configured_value(
     _assert_no_canary(captured.out + captured.err)
 
 
-def test_audit_verify_renders_a_settings_error_rather_than_stringifying_it(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "argv",
+    [["audit-verify"], ["audit-anchor"], ["audit-anchor", "--json"]],
+    ids=["audit-verify", "audit-anchor", "audit-anchor-json"],
+)
+def test_a_settings_error_is_rendered_rather_than_stringified(
+    argv: list[str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #3054, item 7. `audit-verify` printed `str(exc)` for a settings failure. That is
     safe only while every `ValidationError` the load raises comes from a model that hides its input
@@ -826,7 +839,8 @@ def test_audit_verify_renders_a_settings_error_rather_than_stringifying_it(
 
     The load is made to raise a `ValidationError` from a model that does NOT hide its input, with a
     secret-shaped value as that input. The control shows `str(exc)` would carry it; the command's
-    output must not."""
+    output must not. The `audit-anchor` arms replace the #2094 test's validation canary, which
+    cannot fire (vault BACKLOG #3110, item 5)."""
     from pydantic import BaseModel, ValidationError
 
     from messagefoundry.config import settings as settings_module
@@ -846,10 +860,15 @@ def test_audit_verify_renders_a_settings_error_rather_than_stringifying_it(
         raise echoing
 
     monkeypatch.setattr(settings_module, "load_settings", _raise)
-    assert main(["audit-verify", "--db", str(tmp_path / "unused.db")]) == 2
+    assert main([*argv, "--db", str(tmp_path / "unused.db")]) == 2
     captured = capsys.readouterr()
     _assert_no_canary(captured.out + captured.err)
-    assert captured.err.startswith("error: port: "), captured.err
+    if "--json" in argv:
+        assert captured.err == "", captured.err
+        assert str(json.loads(captured.out)["error"]).startswith("port: "), captured.out
+    else:
+        assert captured.out == "", captured.out
+        assert captured.err.startswith("error: port: "), captured.err
 
 
 @pytest.mark.usefixtures("keyless_verify")

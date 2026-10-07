@@ -151,8 +151,10 @@ def test_svg_sanitizer_refuses_every_entity_and_accepts_a_bare_doctype(name: str
         return
     with pytest.raises(SvgRejected) as excinfo:
         sanitize_if_svg(_SVG_LABEL, body)
-    assert type(excinfo.value.__cause__).__name__ == expected
+    # The refusal names the parser error's type and keeps the error itself off its chain, since
+    # that error can quote sender text (BACKLOG #2387).
     assert expected in str(excinfo.value)
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
 
 
 @pytest.mark.parametrize("name", ["internal-entity", "external-entity", "billion-laughs"])
