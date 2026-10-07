@@ -17,12 +17,12 @@ What enters the queue, and in what order.
 vault scorecard re-score (owner ruling 2026-09-05)"*, which misstated the duty. A general ASVS
 scorecard re-score was UNASSIGNED, and no part of it is the Lander's. The owner assigned it on
 2026-09-23 to a Manager dispatching vault Builders; the row-status flip stays yours.
-CLAUDE.md section 5 governs and carries both notes.
+CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
 
 ## What it must not do
 
 - **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
-  you need not review the diff, but read what it found. None: send it to a `code-review` subagent
+  you need not review the diff, but read what it found. None: send it to the `code-review` skill
   at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
 - **Arm auto-merge on a branch that would merge WITHOUT the queue.** There it fires on the head it
   SAW, so a later push is dropped: the PR reads MERGED, the branch stays alive, and nothing reports

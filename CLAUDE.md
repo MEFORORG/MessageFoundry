@@ -634,7 +634,7 @@ gates a merge**, and no seat has to clear one.
   change (owner ruling 2026-09-29, in session).** Proof is a code-review tag on the PR, such as the
   Builder's QA line under the `qa` label. Other evidence that code review ran against this change
   also counts. With proof, the Lander does not need to review the diff. Without it, the Lander sends
-  the change to code review: a `code-review` subagent at `xhigh`. The proof must cover the change
+  the change to code review: the `code-review` skill at `xhigh`. The proof must cover the change
   being merged. A review of an earlier head still counts after a push that only merges `main` in
   cleanly. A conflict resolution the Lander wrote itself needs its own review. So does a later
   commit that changes content. Read what the review found, not only that a tag exists: a label
@@ -682,15 +682,15 @@ gates a merge**, and no seat has to clear one.
 
 ### A Builder runs the checks before it commits, because nobody downstream can ask it to
 
-- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict),
-  in the four legs `ci.yml` runs: `mypy --platform linux messagefoundry messagefoundry_webconsole
-  messagefoundry_toolkit --exclude 'messagefoundry/tray/'`, `mypy --platform win32 messagefoundry
-  messagefoundry_toolkit`, `mypy --explicit-package-bases tests` and `mypy --platform linux scripts/asvs`. Then `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
-- **Then review your own diff with the `code-review` SUBAGENT, at effort `xhigh`, named explicitly.**
-  Ruff is style, mypy is types, pytest is regression, and `/simplify` above is a quality pass that
-  points at `code-review` for bugs -- none of them looks for a NEW correctness defect. **Say
-  "subagent", not "a review":** without the `Agent` tool `code-review` degrades to one inline pass,
-  so the looser word lets the degraded form read as compliance. Cap repair at **two rounds**, then
+- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict)
+  in the four legs `ci.yml` runs, listed in section 7, then `pytest` (with
+  `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
+- **Then review your own diff with the `code-review` SKILL, at effort `xhigh`, named explicitly:**
+  the `Skill` tool, `skill: "code-review"`. Ruff is style, mypy is types, pytest is regression, and
+  `/simplify` above is a quality pass that points at `code-review` for bugs -- none of them looks for
+  a NEW correctness defect. **Name the skill, not "a review":** the looser word lets a degraded
+  inline pass read as compliance. `code-review` is a skill, not an agent type, so a brief that asks
+  for a code-review "subagent" cannot be followed as written. Cap repair at **two rounds**, then
   ship with the critic notes in your exit report. korus `roles/BUILDER.md` section 4c is the source
   of record for the reasoning and the traps; do not restate them here.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
@@ -1005,7 +1005,6 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
     NOT by subtraction. Naming the terms discloses nothing; pasting the scorecard does.
 
 **Don't**
-- Don't manipulate HL7 with raw string slicing.
 - Don't block the asyncio event loop; don't update widgets from worker threads.
 - Don't log full PHI payloads (INFO+).
 - Don't import PySide6 (or FastAPI) inside the engine packages (`pipeline/`, `transports/`,
@@ -1067,10 +1066,4 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   [the maintainer-internal ledger](docs/BACKLOG.md) once archived,
   not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
   construction, so it must not cite only the live file.)*
-- Don't add the `Co-Authored-By` trailer or the PR-body byline to a commit or PR — omit both
-  (section 5). The project turns them off at source in `.claude/settings.json`.
-- Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
-  word (§11). The status-banner alphabet was the one machine-parsed holdout and it
-  left with the ledger (BACKLOG #1250), so nothing here parses a glyph any more. Introduce no new
-  glyph vocabulary anywhere.
 
