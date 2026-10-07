@@ -5726,12 +5726,17 @@ def create_app(
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnreadableError:
+            unreadable = True
+        else:
+            unreadable = False
+        if unreadable:
             # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
             # for everyone but an override holder, who may see any file anyway and is the one who
-            # can act on it; the refused sidecar is not an existence oracle for anyone else.
+            # can act on it; the refused sidecar is not an existence oracle for anyone else. Both
+            # raises sit after the handler ends, so neither chain carries the cipher's error.
             if identity.has(Permission.FILES_ACCESS_ANY):
-                raise _UploadSidecarRefused() from None
-            raise HTTPException(404, "no such uploaded file") from None
+                raise _UploadSidecarRefused()
+            raise HTTPException(404, "no such uploaded file")
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
                 "upload.denied",
