@@ -18,7 +18,8 @@ shared flag-with-reason check refuses a non-bool flag at load, naming the key.
 
 A strict reader AFTER ``env()`` resolves is not enough. A ``FhirLookup``, ``DatabaseLookup`` or
 ``DatabaseRef`` keeps its settings in a mutable dict, and ``env(..., cast=bool)`` written there after
-the factory resolves ``"false"`` to a real ``True``. So ``wiring.refuse_unresolved_hop_flags`` refuses
+the factory resolved ``"false"`` to a real ``True`` when this was written. Vault BACKLOG #3138 made
+``cast=bool`` strict, but any other cast still runs as given, so the refusal stays. So ``wiring.refuse_unresolved_hop_flags`` refuses
 any raw flag that is not ``None`` or a real bool, an ``EnvRef`` included, at every place a carrier is
 read at load. The loosening report ``attested_secure_hops`` must not raise, so it fails toward
 listing: any flag that is not ``None`` or ``False`` is listed.
@@ -305,9 +306,10 @@ def test_the_lookup_settings_builder_refuses_a_string_written_after_the_factory(
 
 
 # --- a flag written into a settings carrier after its factory (review of PR 2075) -----------
-# `env("att", cast=bool)` resolves the environment value "false" to True, because bool("false") is
-# True. The strict reader then sees a real bool and honours it. So the raw flag is refused before
-# env() resolves, at each place a carrier is read at load.
+# `env("att", cast=bool)` resolved the environment value "false" to True, because bool("false") is
+# True. Vault BACKLOG #3138 made that cast strict; a hand-written cast can still do it. The strict
+# reader then sees a real bool and honours it. So the raw flag is refused before env() resolves, at
+# each place a carrier is read at load.
 
 #: The environment value an operator writes to switch the flag OFF.
 _ENV_OFF = {"att": "false"}

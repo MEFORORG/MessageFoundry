@@ -229,6 +229,16 @@ class EnvRef:
     default: Any = _UNSET
     cast: Callable[[Any], Any] | None = None
 
+    def __post_init__(self) -> None:
+        # vault BACKLOG #3138: the builtin ``bool`` is the wrong cast for an environment value. Every
+        # ``MEFOR_VALUE_*`` variable is text, and ``bool("false")``/``bool("0")`` are True, so
+        # ``env("x", cast=bool)`` used to turn "false" into True on a ``tls_allow_expired`` or a
+        # ``trust_server_certificate``, silently. Swap in the strict spelling cast here rather than
+        # only in :func:`env`, so an ``EnvRef`` built directly is held to the same reading. Frozen, so
+        # ``object.__setattr__``; ``_cast_bool`` is defined below and only looked up at call time.
+        if self.cast is bool:
+            object.__setattr__(self, "cast", _cast_bool)
+
 
 def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = None) -> EnvRef:
     """Reference an environment-specific value, resolved per running instance (DEV/PROD).
@@ -243,7 +253,15 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     ``default`` makes the engine refuse to load/promote that graph — never a silent blank.
 
     The key is matched case-insensitively (lower-cased here, as it is on the value side), so
-    ``env("EPIC_HOST")``, the file key ``epic_host``, and ``MEFOR_VALUE_EPIC_HOST`` all line up."""
+    ``env("EPIC_HOST")``, the file key ``epic_host``, and ``MEFOR_VALUE_EPIC_HOST`` all line up.
+
+    ``cast=bool`` means the strict boolean reading, the same one ``connections.toml``'s
+    ``cast = "bool"`` gets (vault BACKLOG #3138): ``true``/``1``/``yes``/``on`` read True,
+    ``false``/``0``/``no``/``off`` read False, case-insensitively, and any other value is refused at
+    resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
+    ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
+    string as True. A ``default=`` is not cast, so give a boolean default as ``True``/``False``.
+    Any other callable runs as given, so ``cast=lambda s: bool(s)`` keeps the builtin's trap."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
@@ -670,8 +688,10 @@ def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool
 
     Runs on the RAW settings, before ``env()`` resolves (vault BACKLOG #2232). The factories already
     refuse an ``env()`` flag. A reference written into the dict after them would resolve through its
-    own cast, and ``env(..., cast=bool)`` turns the string ``"false"`` into ``True``. So the flag is
-    refused while it is still an :class:`EnvRef`. The attestation pair then goes through
+    own cast, and when this was written ``env(..., cast=bool)`` turned the string ``"false"`` into
+    ``True``. Vault BACKLOG #3138 made ``cast=bool`` strict, but any other callable still runs as
+    given, and the factories refuse ``env()`` on these flags outright. So the flag is still refused
+    while it is an :class:`EnvRef`. The attestation pair then goes through
     :func:`settings_hop_attestation`, so a ``DatabaseLookup`` or ``DatabaseRef`` reason is held to
     the same type and control-character rules as a ``FhirLookup`` one.
 
