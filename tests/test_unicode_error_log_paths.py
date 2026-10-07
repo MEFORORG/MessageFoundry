@@ -1045,9 +1045,23 @@ class _LoudMeta(type):
         return f"<factory {cls.held!r}>"
 
 
-def test_a_factory_whose_metaclass_prints_what_it_holds_is_not_printed() -> None:
+class _AgreeableMetaMeta(type):
+    """Its classes claim to equal anything, so only an identity test tells them from ``type``."""
+
+    def __eq__(cls, other: object) -> bool:
+        return True
+
+    __hash__ = type.__hash__
+
+
+class _AgreeableLoudMeta(_LoudMeta, metaclass=_AgreeableMetaMeta):
+    pass
+
+
+@pytest.mark.parametrize("meta", [_LoudMeta, _AgreeableLoudMeta], ids=["loud", "claims-equality"])
+def test_a_factory_whose_metaclass_prints_what_it_holds_is_not_printed(meta: type[Any]) -> None:
     err = _encode_error()
-    factory = _LoudMeta("_Loud", (), {})
+    factory = meta("_Loud", (), {})
     factory.held = err
     record = _record("%s", (collections.defaultdict[str, object](factory, k=err),))
     prepare_log_record(record)

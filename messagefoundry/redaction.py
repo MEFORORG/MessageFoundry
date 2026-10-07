@@ -2449,16 +2449,18 @@ def _pairs(fresh: list[Any]) -> list[tuple[Any, Any]]:
 
 
 _FACTORY_NOTE = "[a default factory, not rendered]"
+_NAMING_FACTORIES: tuple[type[Any], ...] = (type, ABCMeta, BuiltinFunctionType, FunctionType)
 
 
 def _factory_repr(arg: Any) -> str:
-    """A ``defaultdict``'s factory as its ``repr`` prints it, when that names code, never data:
-    ``None``, a plain function, a builtin, or a class whose real metaclass is ``type`` or
-    ``ABCMeta``. Anything else is a fixed note: a ``partial`` or a bound method may print what it
-    holds, and any other metaclass (an ``Enum``'s included) runs its own ``__repr__``, which could
-    print what the class holds. None of them is walked."""
+    """A ``defaultdict``'s factory as its ``repr`` prints it, when that is ``None``, a plain
+    function, a builtin, or a class whose real metaclass is ``type`` or ``ABCMeta``. Those print
+    only a name, a module and an address, though a caller can set a name to anything. Anything
+    else is a fixed note: a ``partial`` or a bound method may print what it holds, and any other
+    metaclass (an ``Enum``'s included) runs its own ``__repr__``. None of them is walked."""
     factory = _DEFAULT_FACTORY.__get__(arg)
-    if factory is None or type(factory) in (type, ABCMeta, BuiltinFunctionType, FunctionType):
+    kind = type(factory)  # identity tests: a metaclass's own __eq__ cannot answer for it
+    if factory is None or any(kind is safe for safe in _NAMING_FACTORIES):
         return repr(factory)
     return _FACTORY_NOTE
 
@@ -2682,14 +2684,15 @@ def _same_tuple_type(args: Any, fresh: list[Any]) -> tuple[Any, ...]:
 
     A namedtuple stays one, so a later handler can still read its fields and its own ``__bool__``
     still decides whether ``%`` applies. A subclass whose instances have a ``__dict__`` would lose
-    that state in a copy, and a structseq such as ``struct_time`` refuses ``tuple.__new__``, so
-    either is a plain tuple. It never raises."""
+    that state in a copy, so it is a plain tuple; that includes a namedtuple subclassed without
+    ``__slots__ = ()``. A structseq such as ``struct_time`` refuses ``tuple.__new__`` with a
+    ``TypeError``, so it is a plain tuple too."""
     kind = type(args)
-    try:
-        if kind is not tuple and _TUPLE_DICTOFFSET.__get__(kind) == 0:
+    if kind is not tuple and _TUPLE_DICTOFFSET.__get__(kind) == 0:
+        try:
             return tuple.__new__(kind, fresh)
-    except Exception:  # noqa: BLE001 -- a structseq refuses it; the plain tuple below serves
-        pass
+        except TypeError:  # a structseq: "tuple.__new__(time.struct_time) is not safe"
+            pass
     return tuple(fresh)
 
 
