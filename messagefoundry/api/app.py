@@ -1357,9 +1357,7 @@ async def _record_reload_audit(
         )
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
     except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
-        # The actor and the detail carry caller input (a username, a requested path), so each is
-        # scrubbed at the call site: see _audit_refused_reload for why the handler filter is not
-        # enough. ``json.dumps`` already escapes control characters, so the detail stays intact.
+        # Scrubbed at the call site for CodeQL py/log-injection; scrub_log_argument says why.
         _log.exception(
             "config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
             "loaded at start" if action == "config_loaded" else "reload swapped the graph",
@@ -1416,7 +1414,7 @@ async def _audit_refused_reload(
         action = "config_reload_denied"
         status, answer = 403, "config directory is not an allowed reload root"
     elif isinstance(exc, FileNotFoundError):
-        _log.warning("config reload failed (missing dir): %s", exc)
+        _log.warning("config reload failed (missing dir): %s", scrub_log_argument(str(exc)))
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     else:
@@ -1424,7 +1422,7 @@ async def _audit_refused_reload(
         _log.warning(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
-            exc,
+            scrub_log_argument(str(exc)),
         )
         action = "config_reload_failed"
         detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
@@ -1433,12 +1431,9 @@ async def _audit_refused_reload(
     try:
         await engine.store.record_audit(action, actor=actor, detail=row, client=client)
     except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
-        # The row names the caller's requested directory and the actor is a username, so a CR or
-        # LF in either could forge a log line on a handler with no ControlCharScrubFilter. The
-        # call-site scrub also lets CodeQL's py/log-injection query see the neutraliser, which it
-        # cannot see in a handler filter. The escapes are printable and reversible, and the row is
-        # JSON whose control characters ``json.dumps`` already escaped, so it is unchanged and an
-        # operator can still rebuild the lost row from this line.
+        # The exc above and this row carry the caller's requested directory, so every log line
+        # here is scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps``
+        # already escaped the row, so the scrub leaves it byte-identical and parseable.
         _log.exception(
             "a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
             action,
@@ -1481,7 +1476,7 @@ async def _audit_reload_attempt(
         _log.exception(
             "config reload: the audit log refused the config_reload_attempted row, so the reload "
             "did not run. Lost row: actor=%s detail=%s",
-            scrub_log_argument(actor),  # caller input: see _audit_refused_reload
+            scrub_log_argument(actor),  # for CodeQL py/log-injection, as _audit_refused_reload
             scrub_log_argument(detail),
         )
         try:

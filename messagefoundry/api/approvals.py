@@ -506,12 +506,10 @@ class ApprovalGate:
                 "approval %s: the write carrying its %s audit row failed. The request is still "
                 "held under this id if this was a repeat. It is also held, with that row, if the "
                 "COMMIT landed before the error. Lost detail: actor=%s operation=%s",
-                scrub_log_argument(lost_id),
+                lost_id,
                 action,
-                # Caller input, scrubbed at the call site so a CR or LF cannot forge a log line on
-                # a handler with no ControlCharScrubFilter (CodeQL py/log-injection).
-                scrub_log_argument(requester),
-                scrub_log_argument(operation),
+                scrub_log_argument(requester),  # CodeQL py/log-injection; see scrub_log_argument
+                operation,
             )
             self._alert_lost_audit(lost_id, action)
             raise
@@ -520,7 +518,7 @@ class ApprovalGate:
                 "approval %s: a repeat %s request by %s joined it; nothing new is held",
                 held,
                 operation,
-                requester,
+                scrub_log_argument(requester),
             )
         return held
 
@@ -1109,11 +1107,11 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - every store backend raises its own type
             log.exception(
                 "approval %s: %s, but its %s audit row failed. Lost detail: %s",
-                # The id can come from a request path and the detail names caller values, so both
-                # are scrubbed here as the lost-row logs in api/app.py are (CodeQL py/log-injection).
-                scrub_log_argument(approval_id),
+                approval_id,
                 context,
                 action,
+                # The detail names the requester. It is JSON, so the scrub leaves it byte-identical;
+                # it is here for CodeQL py/log-injection, which cannot see that.
                 scrub_log_argument(detail),
             )
             self._alert_lost_audit(approval_id, action)

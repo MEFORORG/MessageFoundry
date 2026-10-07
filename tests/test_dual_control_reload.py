@@ -21,13 +21,20 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import _compare_start_config, _record_reload_audit
+from messagefoundry.api.app import (
+    _audit_refused_reload,
+    _audit_reload_attempt,
+    _compare_start_config,
+    _record_reload_audit,
+)
 from messagefoundry.auth import Role
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
@@ -779,38 +786,77 @@ async def test_a_refused_release_whose_audit_row_fails_still_answers_422(
     )
 
 
+async def _refuse_audit(action: str, **kwargs: Any) -> None:
+    raise sqlite3.OperationalError("disk I/O error")
+
+
+#: An engine whose audit log refuses every write, for the lost-row log tests below.
+_AUDIT_DOWN = cast(Engine, SimpleNamespace(store=SimpleNamespace(record_audit=_refuse_audit)))
+
+#: A CR/LF in the actor and in the requested directory, each shaped to forge a log line.
+_FORGING_ACTOR = "alice\nFORGED actor=root"
+_FORGING_DIR = "/cfg\r\nFORGED config reload succeeded"
+
+
+def _assert_no_forged_line(caplog: pytest.LogCaptureFixture) -> None:
+    """caplog's handler has no ControlCharScrubFilter, so this reads each call site's own scrub."""
+    records = [r for r in caplog.records if r.name == "messagefoundry.api.app"]
+    assert records
+    for record in records:
+        message = record.getMessage()
+        assert "\r" not in message and "\n" not in message, message
+
+
 async def test_a_lost_refusal_row_cannot_forge_a_log_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """CodeQL py/log-injection on PR 2115: the lost-row ERROR carries the caller's requested
-    directory and the actor, so a CR or LF in either must not start a new log line. caplog's
-    handler has no ControlCharScrubFilter, so this reads the call site's own scrub. The row must
-    still be recoverable: its JSON parses back to the detail that was lost."""
-    from types import SimpleNamespace
-    from typing import cast
-
-    from messagefoundry.api.app import _audit_refused_reload
-
-    async def _refuse(action: str, **kwargs: Any) -> None:
-        raise sqlite3.OperationalError("disk I/O error")
-
-    fake = cast(Engine, SimpleNamespace(store=SimpleNamespace(record_audit=_refuse)))
-    requested = "/cfg\r\nFORGED config reload succeeded"
-    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+    """CodeQL py/log-injection on PR 2115. A refused reload logs the caller's requested directory
+    twice: in the refusal WARNING and in the lost-row ERROR. Neither may start a new line, and the
+    lost row must still parse back to the detail that was lost."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         status, _answer = await _audit_refused_reload(
-            fake,
-            FileNotFoundError(requested),
-            actor="alice\nFORGED actor=root",
-            requested=requested,
+            _AUDIT_DOWN,
+            FileNotFoundError(f"config directory not found: {_FORGING_DIR}"),
+            actor=_FORGING_ACTOR,
+            requested=_FORGING_DIR,
             dry_run=False,
         )
     assert status == 404
+    _assert_no_forged_line(caplog)
     [lost] = [r for r in caplog.records if "Lost row" in r.getMessage()]
     message = lost.getMessage()
-    assert "\r" not in message and "\n" not in message
     assert "actor=alice\\nFORGED actor=root " in message
     row = message.split(" detail=", 1)[1]
-    assert json.loads(row) == {"requested": requested, "dry_run": False, "reason": "not_found"}
+    assert json.loads(row) == {"requested": _FORGING_DIR, "dry_run": False, "reason": "not_found"}
+
+
+async def test_the_other_lost_reload_rows_cannot_forge_a_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same for the two sibling lost-row logs: a reload's own row after the swap, and the
+    attempt row an ungated reload writes first. The fake engine has no graph, so the first one
+    loses the row before its detail is built and logs the actor alone."""
+    lost_actions: list[str] = []
+    sink = SimpleNamespace(audit_write_failed=lambda name, *, action: lost_actions.append(action))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR)
+        with pytest.raises(HTTPException) as refused:
+            await _audit_reload_attempt(
+                _AUDIT_DOWN,
+                actor=_FORGING_ACTOR,
+                requested=_FORGING_DIR,
+                client=None,
+                alert_sink=cast(Any, sink),
+            )
+    assert steps and refused.value.status_code == 503
+    assert lost_actions == ["config_reload_attempted"]
+    _assert_no_forged_line(caplog)
+    lost = [r.getMessage() for r in caplog.records if "Lost row" in r.getMessage()]
+    assert len(lost) == 2
+    assert json.loads(lost[1].split(" detail=", 1)[1]) == {
+        "requested": _FORGING_DIR,
+        "dry_run": False,
+    }
 
 
 async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(
