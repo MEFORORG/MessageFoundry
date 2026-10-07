@@ -333,14 +333,20 @@ def test_the_ide_start_dialog_does_not_say_nobody_can_sign_in() -> None:
     for rel, text in texts.items():
         assert not SIGN_IN_CLAIM.search(text), f"{rel} says nobody can sign in again"
         assert "sign-in is off for this engine" not in text, f"{rel} offers a sign-in-off start"
-    # The control that makes the zeros mean something: the old dialog, wrapped as the source had it.
+    # The controls that make the zeros mean something. The old dialog is caught.
     old = (
         '"so nobody can sign in to it. Provision one now? " +\n      "Start without one only if '
-        'sign-in is off for this engine. At the shipped settings it refuses to " +\n      "start; '
-        'under other settings it starts with nobody able to sign in."'
+        'sign-in is off for this engine."'
     )
     assert SIGN_IN_CLAIM.search(_ide_prose(old))
     assert "sign-in is off for this engine" in _ide_prose(old)
+    # A phrase split across a string-literal break, or a wrapped comment, is joined before the
+    # substring check. Without the join neither raw text contains it.
+    split = '"Start without one only if sign-in is " +\n      "off for this engine."'
+    wrapped = "// Start without one only if sign-in is\n    // off for this engine."
+    for raw in (split, wrapped):
+        assert "sign-in is off for this engine" not in raw, "control: the raw text is split"
+        assert "sign-in is off for this engine" in _ide_prose(raw), raw
 
 
 def test_the_help_reader_survives_a_hyphen_wrap() -> None:
