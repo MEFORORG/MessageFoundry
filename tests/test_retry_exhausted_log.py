@@ -138,14 +138,14 @@ async def test_the_real_worker_logs_once_when_max_attempts_dead_letters_a_row(
     try:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 5.0
-        while await store.count_dead() != 1:
+        while await store.count_dead(allowed_channels=None) != 1:
             assert loop.time() < deadline, "the row never dead-lettered"
             await asyncio.sleep(0.02)
     finally:
         await runner.stop()
 
     assert dest.calls == 2
-    (msg,) = await store.list_messages(channel_id="file_in")
+    (msg,) = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert msg["status"] == MessageStatus.ERROR.value  # the dead-letter itself is unchanged
     (line,) = _exhausted_lines(caplog)
     text = line.getMessage()
@@ -186,7 +186,7 @@ async def test_the_line_fires_on_the_attempt_that_dead_letters_and_not_one_soone
         item = await store.claim_next_fifo(OUT, now=1e12)
         assert item is not None and item.attempts == attempt
         await runner._process_delivery_item(OUT, item)
-        dead = await store.count_dead()
+        dead = await store.count_dead(allowed_channels=None)
         assert dead == (1 if attempt == 3 else 0)
         assert len(_exhausted_lines(caplog)) == dead  # the line and the DEAD write move together
     (line,) = _exhausted_lines(caplog)
@@ -207,7 +207,7 @@ async def test_retry_forever_never_writes_the_line(
         item = await store.claim_next_fifo(OUT, now=1e12)
         assert item is not None
         await runner._process_delivery_item(OUT, item)
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
     assert _exhausted_lines(caplog) == []
 
 
@@ -227,7 +227,7 @@ async def test_a_batch_that_runs_out_its_attempts_logs_one_line(
         head_ids.append(head.id)
         await runner._process_delivery_batch(OUT, head, cfg)
         assert len(_exhausted_lines(caplog)) == (1 if attempt == 2 else 0)
-    assert await store.count_dead() == 3
+    assert await store.count_dead(allowed_channels=None) == 3
     (line,) = _exhausted_lines(caplog)
     text = line.getMessage()
     assert repr(OUT) in text and "a batch of 3" in text and head_ids[-1] in text
@@ -298,7 +298,7 @@ async def test_a_failed_status_read_still_logs_and_never_raises_out_of_the_arm(
     assert item is not None
     await runner._process_delivery_item(OUT, item)
 
-    assert await store.count_dead() == 1
+    assert await store.count_dead(allowed_channels=None) == 1
     (line,) = _exhausted_lines(caplog)
     assert "unconfirmed, the status read failed (RuntimeError)" in line.getMessage()
     _assert_no_token(caplog.records)
