@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import httpx
 from _ui_clients import create_local_user_chosen
+from starlette.datastructures import Headers
 
 import messagefoundry_webconsole
 from messagefoundry.api import create_app
@@ -284,7 +285,7 @@ class _Handshake:
     """A browser WebSocket handshake whose Origin equals its Host, carrying a session cookie."""
 
     def __init__(self, app: object, cookie: str) -> None:
-        self.headers = {"origin": "http://t", "host": "t"}
+        self.headers = Headers({"origin": "http://t", "host": "t"})  # has getlist (BACKLOG #2454)
         self.app = app
         self.url = SimpleNamespace(scheme="ws", path="/ws/stats")
         self.cookies = {"mf_session": cookie}

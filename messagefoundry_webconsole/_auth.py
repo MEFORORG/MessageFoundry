@@ -188,8 +188,42 @@ def session_cookie_name(conn: Request | WebSocket) -> str:
     return HOST_COOKIE_NAME if browser_hardening_enabled() else SECURE_COOKIE_NAME
 
 
+#: The 400 detail for a request carrying more than one copy of the session cookie (BACKLOG #2454).
+#: A fixed string: it names the rule, never a value.
+REPEATED_SESSION_COOKIE_DETAIL = "more than one session cookie"
+
+
+def session_cookie_copies(conn: Request | WebSocket) -> int:
+    """How many copies of this connection's session cookie the request carries, over every
+    ``Cookie`` header line (BACKLOG #2454, the cookie half).
+
+    Starlette's ``conn.cookies`` keeps only the LAST copy of a name, so it cannot see a repeat; this
+    reads the raw lines instead. A chunk is counted exactly when Starlette's own ``cookie_parser``
+    would file it under the name: it holds an ``=``, and the text before the first one, stripped,
+    is the name.
+
+    A browser holding this engine's cookie sends one copy: the engine sets it with ``Path=/`` and no
+    ``Domain``. Two copies mean another writer set a second one, such as a sibling host writing the
+    ``__Secure-`` or plain name for a parent domain, or a crafted client. RFC 6265 section 5.4 says
+    a server should not rely on the order of such copies, so neither is chosen. The cost is that a
+    browser holding a planted copy is refused until it drops it. The ``__Host-`` name, the shipped
+    default, cannot be planted from another host."""
+    name = session_cookie_name(conn)
+    return sum(
+        1
+        for line in conn.headers.getlist("cookie")
+        for chunk in line.split(";")
+        if "=" in chunk and chunk.split("=", 1)[0].strip() == name
+    )
+
+
 def session_token(conn: Request | WebSocket) -> str | None:
-    """Read the session token from whichever cookie name applies to this connection's scheme."""
+    """Read the session token from whichever cookie name applies to this connection's scheme.
+
+    Raises 400 when the request carries the cookie more than once (BACKLOG #2454). A WebSocket
+    caller checks :func:`session_cookie_copies` first, because a raise there is not an answer."""
+    if session_cookie_copies(conn) > 1:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, REPEATED_SESSION_COOKIE_DETAIL)
     return conn.cookies.get(session_cookie_name(conn))
 
 
@@ -1304,6 +1338,10 @@ async def authorize_ui_ws(
         return None, None  # native client (no Origin) — the header path handles it
     if not _origin_matches(websocket.app.state, origin, websocket.headers.get("host")):
         return None, None  # cross-origin browser handshake (CSWSH) — reject
+    if session_cookie_copies(websocket) > 1:
+        # BACKLOG #2454: a repeated session cookie authenticates nothing. The caller falls back to
+        # the header path, whose Origin check refuses a browser handshake.
+        return None, None
     token = session_token(websocket)
     if not token:
         return None, None
