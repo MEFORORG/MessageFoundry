@@ -183,7 +183,7 @@ MATRIX: tuple[MatrixRow, ...] = (
     ),
     _row(
         "B5",
-        "Off-box audit tee (single PHI-redaction path)",
+        "Off-box audit tee (single best-effort redaction path)",
         PER_DB,
         Coverage.PYTEST,
         ("tests/test_audit_offbox_tee.py",),

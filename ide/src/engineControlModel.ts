@@ -111,8 +111,8 @@ export function buildBootstrapPlan(opts: {
 
 // ── Provision before serve (ADR 0183 Amendment A, Wave 5 — BACKLOG #1136, ASVS 6.3.2) ─────────────────
 // The engine creates no account on its own. A `serve` on a store with no enabled Administrator either
-// refuses (the shipped posture) or starts with nobody able to sign in. So Start runs `provision-admin`
-// first, and only then `serve`.
+// refuses (the shipped posture) or starts with nobody able to manage users and roles. So Start runs
+// `provision-admin` first, and only then `serve`.
 //
 // `serve` is its terminal's own process (`createTerminal` with `shellPath`), so there is no shell to chain
 // a command in front of it. Provisioning therefore gets its OWN terminal, and the plan waits for it to
@@ -299,8 +299,10 @@ export interface StartPlanEffects {
  *      IDE does not) → show the reason, and let the user provision anyway or start anyway. `serve`
  *      applies every gate itself, so this weakens nothing; refusing outright would make Start a dead end
  *      the probe itself caused.
- *   3. No Administrator → provision one (the default), or start without one: a posture with sign-in off
- *      needs none, and at the shipped posture `serve` refuses and names `provision-admin` itself.
+ *   3. No Administrator → provision one (the default), or start without one: at the shipped posture
+ *      `serve` refuses, and its Administrator check names `provision-admin` itself. Under `warn`, or
+ *      with the security-notice requirement waived, it can start and route HL7, and nobody can manage
+ *      users and roles. `serve` cannot run with sign-in off.
  *   4. Provision: ask a username and address, run `provision-admin` in its own terminal, wait for it to
  *      exit, and ALWAYS probe again. An exit code alone is not trusted: on macOS and Linux a Ctrl+C can
  *      surface as exit 0. "Already exists" → serve. Exit 0 and a probe that still cannot answer → serve,

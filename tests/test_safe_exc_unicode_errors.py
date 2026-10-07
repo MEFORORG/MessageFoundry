@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from messagefoundry.redaction import safe_exc
-from tests.test_encode_wire_body import _escapes
+from tests._content_free import escapes
 
 #: Synthetic. Distinctive enough that a substring scan of the output cannot miss them.
 #: Its bare hex, ``15a``, holds a letter, so no decimal position in the output can match it.
@@ -47,7 +47,7 @@ def _translate_error() -> UnicodeTranslateError:
 
 def _assert_no_content(text: str) -> None:
     assert _PREFIX not in text and "ZZQ" not in text, f"payload text leaked: {text!r}"
-    for form in _escapes(_CHAR):
+    for form in escapes(_CHAR):
         assert form not in text, f"the offending character leaked as {form!r}: {text!r}"
 
 
@@ -184,7 +184,7 @@ def test_a_reason_that_quotes_the_input_is_dropped() -> None:
     assert "\\ue000" in str(caught.value), "the probe must quote the character, or it tests nothing"
     text = safe_exc(caught.value)
     _assert_no_content(text)
-    for form in _escapes("\ue000"):
+    for form in escapes("\ue000"):
         assert form not in text, f"the reason leaked the character as {form!r}: {text!r}"
     assert "doe" not in text and "jane" not in text
 

@@ -708,8 +708,7 @@ async def test_rest_trailing_newline_header_name_never_reaches_the_wire() -> Non
 # `message_events.detail` and the off-box AlertSink. Same ruling `encode_wire_body` already made for
 # the BODY (tests/test_encode_wire_body.py); this is the header path that fix left open.
 
-#: Un-encodable as ASCII *and* as latin-1. Same constant and same reason as
-#: tests/test_encode_wire_body.py's.
+#: Un-encodable as ASCII *and* as latin-1. Same reason as the CJK_CHAR in tests/_content_free.py.
 CJK_CHAR = "患"
 
 
