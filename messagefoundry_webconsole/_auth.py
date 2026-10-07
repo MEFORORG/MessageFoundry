@@ -1175,10 +1175,13 @@ def require_ui_reauth_only(
     return mark_route_gate(dependency)
 
 
-async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: str) -> bool:
+async def _ui_action_step_up_ok(
+    auth: AuthService, token: str | None, action: str, *, spend: bool = True
+) -> bool:
     """The /ui step-up decision for a per-action lane (ADR 0077), mirroring
     ``api.security._action_step_up_ok``: when action-binding is enforced (default) a fresh single-use
-    grant BOUND to ``action`` (consumed here); when the org opted out
+    grant BOUND to ``action`` (consumed here, or only checked with ``spend=False``, vault BACKLOG
+    #2625); when the org opted out
     (``[auth].require_action_step_up = false``) the legacy session-window recency. Uses only PUBLIC
     ``AuthService`` members, so no cross-package private import is needed.
 
@@ -1188,16 +1191,8 @@ async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: st
     if await auth.factor_binding_is_blocked(token, action):
         return False
     if auth.action_step_up_required:
-        return await auth.has_action_step_up(token, action)
-    return await auth.has_recent_step_up(token)
-
-
-async def _ui_action_step_up_held(auth: AuthService, token: str | None, action: str) -> bool:
-    """:func:`_ui_action_step_up_ok` without spending the grant (vault BACKLOG #2625), for a gate
-    with ``spend=False``. Same factor-binding refusal and the same org opt-out fork."""
-    if await auth.factor_binding_is_blocked(token, action):
-        return False
-    if auth.action_step_up_required:
+        if spend:
+            return await auth.has_action_step_up(token, action)
         return await auth.holds_action_step_up(token, action)
     return await auth.has_recent_step_up(token)
 
@@ -1231,7 +1226,6 @@ def require_ui_step_up_action(
         mfa_refusal=_reauth_refusal(reauth_next),
         new_address_check=False,
     )
-    decide = _ui_action_step_up_ok if spend else _ui_action_step_up_held
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
@@ -1244,23 +1238,27 @@ def require_ui_step_up_action(
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-        if new_ip or not await decide(auth, token, action):
+        if new_ip or not await _ui_action_step_up_ok(auth, token, action, spend=spend):
             raise _reauth_redirect(request, nxt)
         return identity
 
     return mark_route_gate(dependency)
 
 
-async def spend_ui_action_step_up(request: Request, action: str, *, reauth_next: str) -> None:
+async def spend_ui_action_step_up(
+    request: Request, action: str, *, reauth_next: Callable[[Request], str]
+) -> None:
     """Spend the grant a ``spend=False`` gate let through, just before the action runs (vault
     BACKLOG #2625). A route takes this split when it checks its own input first: a refusal of that
     input then costs the operator no proof. Sends the browser to ``/ui/reauth`` when the grant is
-    gone, for instance spent by a second tab. No-op with auth off, as the gate is."""
+    gone, for instance spent by a second tab. ``reauth_next`` is the gate's own, so both refusals
+    land on one page. No-op with auth off, as the gate is, and under the org opt-out, where there
+    is no grant and the gate has already checked the window on this request."""
     auth = get_auth(request)
-    if auth is None or not auth.enabled:
+    if auth is None or not auth.enabled or not auth.action_step_up_required:
         return
     if not await _ui_action_step_up_ok(auth, session_token(request), action):
-        raise _reauth_redirect(request, reauth_next)
+        raise _reauth_redirect(request, reauth_next(request))
 
 
 def require_ui_reauth_only_action(

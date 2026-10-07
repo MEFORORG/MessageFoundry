@@ -8352,10 +8352,8 @@ class AuthService:
         it leaves the refund record alone."""
         if not token:
             return False
-        now = time.monotonic()
-        self._prune_action_step_up_grants(now)
         deadline = self._action_step_up_grants.get((hash_token(token), action))
-        return deadline is not None and deadline > now
+        return deadline is not None and deadline > time.monotonic()
 
     def refund_action_step_up(self, action: str) -> bool:
         """Give back the step-up grant THIS REQUEST spent on ``action``, when the route it opened

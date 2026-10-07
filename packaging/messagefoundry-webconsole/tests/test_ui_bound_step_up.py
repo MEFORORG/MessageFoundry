@@ -29,7 +29,6 @@ from _ui_clients import (
     ui_client,
 )
 
-from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.pipeline import Engine
@@ -104,20 +103,15 @@ async def test_upload_resend_needs_messages_edit_and_its_own_proof(
     )
     await provision(service, "reader", [reader.id])
     await provision(service, "op", [Role.OPERATOR.value])
-    app = create_app(
-        engine,
-        auth=service,
-        serve_ui=True,
-        store_settings=StoreSettings(uploads_dir=str(tmp_path / "uploads")),
-    )
+    uploads = StoreSettings(uploads_dir=str(tmp_path / "uploads"))
     confirm = f"/ui/uploaded-logs/file/{NO_SUCH}/resend-confirm?index=0&to=IB_X"
     post = f"/ui/uploaded-logs/file/{NO_SUCH}/resend?index=0&to=IB_X"
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+    async with ui_client(engine, service, store_settings=uploads) as c:
         await cookie_login(c, "reader")
         # files:browse alone is a read: the confirm page and the POST both refuse it outright.
         assert (await c.get(confirm)).status_code == 403
         assert (await c.post(post, headers=SAME_ORIGIN)).status_code == 403
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+    async with ui_client(engine, service, store_settings=uploads) as c:
         await cookie_login(c, "op")
         refused = await c.post(post, headers=SAME_ORIGIN)
         assert _reauth_next(refused) == confirm

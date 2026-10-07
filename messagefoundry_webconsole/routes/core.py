@@ -203,6 +203,13 @@ register_ui_action(
     label="Open the message edit page",
 )
 
+
+def _edit_page(request: Request) -> str:
+    """The editor an edit-resend POST re-opens after a re-auth, never the POST path itself (a
+    re-POST would drop the edited body). The gate and the spend both send the browser here."""
+    return request.url.path.removesuffix("/edit-resend") + "/edit"
+
+
 # The PHI pages `require_ui(..., phi=True)` gates, as unlock continuations (vault BACKLOG #2620).
 # That gate sends a read from a host the session has not verified from to /ui/reauth, carrying the
 # page's own target, and /ui/reauth acts only on a registered continuation: without these the
@@ -1239,7 +1246,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 phi=True,
                 # A missing proof on this body-carrying POST → re-open the /edit form, never the
                 # POST path (a re-POST would drop the edited body).
-                reauth_next=lambda r: r.url.path.removesuffix("/edit-resend") + "/edit",
+                reauth_next=_edit_page,
                 spend=False,
             )
         ),
@@ -1292,7 +1299,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         await spend_ui_action_step_up(
             request,
             STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
-            reauth_next=request.url.path.removesuffix("/edit-resend") + "/edit",
+            reauth_next=_edit_page,
         )
         try:
             result = await core.edit_resend_message(

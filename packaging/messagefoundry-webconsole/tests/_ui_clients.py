@@ -55,9 +55,12 @@ async def auth_service(engine: Engine) -> AuthService:
     return service
 
 
-def ui_client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    """An ASGI client over the engine app with the console mounted -- the real ``mount_ui`` path."""
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
+def ui_client(engine: Engine, service: AuthService, **app_kwargs: Any) -> httpx.AsyncClient:
+    """An ASGI client over the engine app with the console mounted -- the real ``mount_ui`` path.
+    ``app_kwargs`` reach ``create_app``, for a test that needs, say, an uploads store."""
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, serve_ui=True, **app_kwargs)
+    )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 

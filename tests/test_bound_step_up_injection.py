@@ -88,10 +88,15 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _service(engine: Engine) -> AuthService:
-    # require_action_step_up is left at its shipped default, which is what this file is about.
+async def _service(engine: Engine, *, require_action_step_up: bool = True) -> AuthService:
+    # require_action_step_up defaults to the shipped default, which is what this file is about.
     service = AuthService(
-        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0,
+            require_mfa=False,
+            require_action_step_up=require_action_step_up,
+        ),
     )
     await service.initialize()
     return service
@@ -290,13 +295,7 @@ async def test_the_org_opt_out_puts_the_bound_routes_back_on_the_window(
 ) -> None:
     """``[auth].require_action_step_up = false`` reaches these routes as it reaches every
     action-bound route, so the binding is the setting's to switch and nothing else's."""
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            admin_write_min_interval_seconds=0, require_mfa=False, require_action_step_up=False
-        ),
-    )
-    await service.initialize()
+    service = await _service(engine, require_action_step_up=False)
     await _add(service, "adm", [Role.ADMINISTRATOR.value])
     async with _client(engine, service, tmp_path) as c:
         token = await _login(c, "adm")
