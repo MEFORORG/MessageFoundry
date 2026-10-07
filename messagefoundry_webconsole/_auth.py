@@ -79,6 +79,8 @@ __all__ = [
     "set_oidc_flow_cookie",
     "set_session_cookie",
     "spend_ui_action_step_up",
+    "carry_across_reauth",
+    "take_carried",
 ]
 
 COOKIE_NAME = "mf_session"
@@ -968,9 +970,75 @@ def continues_after_reauth(action: UiWriteAction, token: str | None, next_path: 
     return action.unlock or continuation_issued(token, next_path)
 
 
+class _CarriedValues:
+    """Small values a refused request hands to the page its re-auth returns to, held server-side
+    and bound to ONE session (vault BACKLOG #2625).
+
+    For a value that must survive the re-auth but must not ride the URL, where a crafted link could
+    set it. The first is the console resend's idempotency key: a refreshed outcome page is refused
+    for its spent proof, and only that POST's own key lets the resubmit be called a duplicate.
+
+    Keyed by ``hash_token(session token)`` and then a caller-chosen name; bounded, TTL'd on the
+    monotonic clock, re-keyed with the continuations on a rotation, and single-use. Every drop is
+    fail-safe: the page mints a fresh value, as it did before this table existed."""
+
+    def __init__(self) -> None:
+        self._sessions: OrderedDict[str, OrderedDict[str, tuple[str, float]]] = OrderedDict()
+
+    def put(self, token: str, name: str, value: str) -> None:
+        now = time.monotonic()
+        for session_hash in [
+            h for h, e in self._sessions.items() if all(d <= now for _v, d in e.values())
+        ]:
+            del self._sessions[session_hash]
+        session_hash = hash_token(token)
+        entries = self._sessions.pop(session_hash, None) or OrderedDict()
+        entries.pop(name, None)
+        entries[name] = (value, now + REAUTH_CONTINUATION_TTL_SECONDS)
+        while len(entries) > _REAUTH_CONTINUATIONS_PER_SESSION:
+            entries.popitem(last=False)
+        self._sessions[session_hash] = entries
+        while len(self._sessions) > _REAUTH_CONTINUATION_SESSIONS_MAX:
+            self._sessions.popitem(last=False)
+
+    def take(self, token: str | None, name: str) -> str | None:
+        entries = self._sessions.get(hash_token(token)) if token else None
+        held = entries.pop(name, None) if entries is not None else None
+        if entries is not None and not entries and token:
+            del self._sessions[hash_token(token)]
+        if held is None or held[1] <= time.monotonic():
+            return None
+        return held[0]
+
+    def rekey(self, old_token: str | None, new_token: str | None) -> None:
+        if not old_token or not new_token or old_token == new_token:
+            return
+        entries = self._sessions.pop(hash_token(old_token), None)
+        if entries:
+            self._sessions[hash_token(new_token)] = entries
+
+
+_CARRIED = _CarriedValues()
+
+
+def carry_across_reauth(request: Request, name: str, value: str) -> None:
+    """Hold ``value`` for this session's next :func:`take_carried` of ``name``. Only for a
+    same-origin POST with a session, the condition :func:`_issue_continuation` applies, so a
+    request the console did not send cannot plant a value for the page to pick up."""
+    token = session_token(request)
+    if token and request.method == "POST" and _request_is_same_origin(request):
+        _CARRIED.put(token, name, value)
+
+
+def take_carried(request: Request, name: str) -> str | None:
+    """The value carried for ``name`` to this session, once; ``None`` when there is none."""
+    return _CARRIED.take(session_token(request), name)
+
+
 def rekey_continuations(old_token: str | None, new_token: str | None) -> None:
-    """Move this session's issued continuations onto its rotated token."""
+    """Move this session's issued continuations, and its carried values, onto its rotated token."""
     _ISSUED_CONTINUATIONS.rekey(old_token, new_token)
+    _CARRIED.rekey(old_token, new_token)
 
 
 def _request_is_same_origin(request: Request) -> bool:
@@ -1203,6 +1271,7 @@ def require_ui_step_up_action(
     phi: bool = False,
     reauth_next: Callable[[Request], str] | None = None,
     spend: bool = True,
+    on_refusal: Callable[[Request], None] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_ui_step_up`, but the step-up must be a fresh proof **bound to** ``action``
     (single-use, ADR 0077 / ASVS 7.5.1), not the shared session window. Keeps the MFA gate — used for
@@ -1217,7 +1286,11 @@ def require_ui_step_up_action(
     ``spend=False`` asks only that the grant is HELD, and leaves it for a later request to spend.
     It is for a page that opens an action without performing it, so the operator proves who they
     are before doing work a re-auth would throw away. The route that performs the action must
-    still spend it, either through its own gate or through :func:`spend_ui_action_step_up`."""
+    still spend it, either through its own gate or through :func:`spend_ui_action_step_up`.
+
+    ``on_refusal`` runs when the proof (or a new client address) refuses the request, just before
+    the redirect to ``/ui/reauth``. Never on a request let through: ``reauth_next`` is computed for
+    every request, so a side effect belongs here instead."""
     # mfa_refusal, NOT allow_mfa_pending: the base's gate refuses and audits a pending session, and
     # the hook only points it at /ui/reauth with the continuation. See require_ui_step_up for why.
     base = require_ui(
@@ -1239,6 +1312,8 @@ def require_ui_step_up_action(
             raise _reauth_redirect(request, nxt)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         if new_ip or not await _ui_action_step_up_ok(auth, token, action, spend=spend):
+            if on_refusal is not None:
+                on_refusal(request)
             raise _reauth_redirect(request, nxt)
         return identity
 

@@ -289,6 +289,29 @@ def test_the_step_up_handler_re_proves_and_restarts_the_poller(
         panel.shutdown()
 
 
+def test_the_step_up_handler_refuses_off_the_gui_thread(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Qt dialog built off the GUI thread can crash the process. Every worker read goes through
+    the handler-less polling client, and this is the second guard: called from any other thread,
+    the handler declines without opening a dialog or sending anything."""
+    panel = MonitorPanel()
+    client = _ReauthClient()
+    panel._client = client  # type: ignore[assignment]
+    monkeypatch.setattr(
+        QInputDialog, "getText", lambda *a, **k: pytest.fail("a dialog opened off the GUI thread")
+    )
+    answers: list[bool] = []
+    worker = threading.Thread(target=lambda: answers.append(panel._step_up()))
+    try:
+        worker.start()
+        worker.join(10)
+        assert answers == [False] and client.passwords == []
+    finally:
+        panel._client = None
+        panel.shutdown()
+
+
 class _MustChangeClient:
     """Answers ``me()`` like an authed engine does before sign-in: a 401."""
 
@@ -573,6 +596,12 @@ def test_monitor_observes_engine(qapp: Any, server: tuple[str, Path]) -> None:
     deadline = time.time() + 60  # ONE budget spanning both waits, not 30s each
     try:
         assert panel._client is not None
+        # Vault BACKLOG #2625: the main client carries a Qt step-up handler, so the message panels,
+        # whose reads run on worker threads, must read through the handler-less polling client.
+        assert panel._poll_client is not None and panel._poll_client is not panel._client
+        assert panel._poll_client._step_up_handler is None
+        assert panel._messages is not None and panel._messages._poll is panel._poll_client
+        assert panel._detail is not None and panel._detail._poll is panel._poll_client
 
         def ctx() -> str:
             """Failure-path only. The status label carries 'poll failed: …' when the background
@@ -587,7 +616,7 @@ def test_monitor_observes_engine(qapp: Any, server: tuple[str, Path]) -> None:
         _spin(qapp, lambda: _has_message(panel, qapp), "delivered message in list", deadline, ctx)
     finally:
         panel.shutdown()
-    assert panel._client is None
+    assert panel._client is None and panel._poll_client is None
 
 
 @pytest.mark.timeout(120)

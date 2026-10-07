@@ -527,9 +527,8 @@ async def test_the_resend_lane_stands_on_messages_resend_alone(engine: Engine) -
 async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engine: Engine) -> None:
     """A body-carrying POST cannot be auto-retried, and this one is body-LESS only because the
     selection rides the query. So the re-auth is pointed at the CONFIRM page carrying ``to`` and
-    ``source`` -- the operator is not stranded mid-task -- and the ``idempotency_key`` too, since
-    vault BACKLOG #2625: the refused POST may be a refresh of one that already ran, and only its own
-    key lets the handler call the resubmit a duplicate."""
+    ``source`` -- the operator is not stranded mid-task. The ``idempotency_key`` never rides the
+    URL: since vault BACKLOG #2625 it goes back server-side (see the refresh test below)."""
     service = await _service(engine, step_up_max_age=-1)
     await _add(service, "op", Role.OPERATOR.value)
     mid = await _seed(engine)
@@ -542,7 +541,8 @@ async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engin
         nxt = unquote(dict(parse_qsl(urlsplit(location).query))["next"])
         assert nxt.startswith(f"/ui/messages/{mid}/resend-confirm?")
         params = dict(parse_qsl(urlsplit(nxt).query))
-        assert params == {"to": "OB2", "source": "archive", "idempotency_key": "k1"}
+        assert params == {"to": "OB2", "source": "archive"}
+        assert "idempotency_key" not in nxt
 
 
 async def test_a_refreshed_resend_is_still_a_duplicate_after_the_re_auth(
@@ -565,14 +565,36 @@ async def test_a_refreshed_resend_is_still_a_duplicate_after_the_re_auth(
         refreshed = await _post_resend(c, mid, key="refresh-key-1", mint=False)
         assert refreshed.status_code == 303
         nxt = unquote(dict(parse_qsl(urlsplit(refreshed.headers["location"]).query))["next"])
+        assert "idempotency_key" not in nxt  # the key goes back server-side, never in the URL
         await _mint(c, mid)
         confirm = await c.get(nxt)
         assert confirm.status_code == 200
         assert "idempotency_key=refresh-key-1" in confirm.text
         again = await _post_resend(c, mid, key="refresh-key-1")
         assert again.status_code == 200 and "Already resent" in again.text
+        # Single use: opening the confirm page again mints a fresh key, a genuine second resend.
+        reopened = await c.get(nxt)
+        assert "idempotency_key=refresh-key-1" not in reopened.text
     rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
     assert len(rows) == 1
+
+
+async def test_a_query_string_key_cannot_preload_the_confirm_page(engine: Engine) -> None:
+    """A crafted link must not set the key: a spent one would make the operator's resend silently
+    do nothing, answered as a duplicate. The confirm page ignores a key in its query and mints one;
+    only a refused POST of the same session can hand a key back (vault BACKLOG #2625)."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        page = await c.get(
+            f"/ui/messages/{mid}/resend-confirm",
+            params={"to": "OB2", "source": "archive", "idempotency_key": "planted-key"},
+        )
+        assert page.status_code == 200
+        assert "planted-key" not in page.text
+        assert "idempotency_key=" in page.text  # control: a key was minted
 
 
 async def test_the_longest_accepted_names_still_fit_the_reauth_continuation(

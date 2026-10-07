@@ -205,6 +205,8 @@ class MonitorPanel(QWidget):
         super().__init__()
         self._allow_insecure = allow_insecure
         self._client: EngineClient | None = None
+        # The handler-less reader the message panels use off the GUI thread (see _build_inner).
+        self._poll_client: EngineClient | None = None
         self._thread: QThread | None = None
         self._poller: MonitorPoller | None = None
 
@@ -334,7 +336,9 @@ class MonitorPanel(QWidget):
         The re-proof rotates the session, so the poller's copy of the old token is dead: it is
         restarted on the new one. The password is passed straight to ``reauth`` and kept nowhere."""
         client = self._client
-        if client is None:
+        # A dialog belongs on the GUI thread. Every worker read goes through the polling client,
+        # which has no handler, so this is a second guard: refuse rather than build Qt off-thread.
+        if client is None or QThread.currentThread() is not self.thread():
             return False
         password, ok = QInputDialog.getText(
             self,
@@ -353,6 +357,9 @@ class MonitorPanel(QWidget):
 
     def _disconnect(self) -> None:
         self._stop_poller()
+        if self._poll_client is not None:
+            self._poll_client.close()
+            self._poll_client = None
         if self._client is not None:
             with contextlib.suppress(ApiError):
                 self._client.logout()
@@ -450,8 +457,12 @@ class MonitorPanel(QWidget):
         tabs.addTab(live, "Live")
 
         # Messages: reuse the console's filter list + detail pane (user-initiated, GUI thread).
-        self._messages = MessagesPanel(self._client)
-        self._detail = MessageDetailPanel(self._client)
+        # Their reads run on worker threads, so they get a polling client: it shares the token but
+        # carries no step-up handler, so a refusal there can never open a Qt dialog off the GUI
+        # thread (vault BACKLOG #2625 gave the main client one).
+        self._poll_client = self._client.for_polling()
+        self._messages = MessagesPanel(self._client, poll_client=self._poll_client)
+        self._detail = MessageDetailPanel(self._client, poll_client=self._poll_client)
         self._messages.message_selected.connect(self._detail.load)
         self._messages.error.connect(lambda m: self._set_status(m, error=True))
         self._detail.error.connect(lambda m: self._set_status(m, error=True))

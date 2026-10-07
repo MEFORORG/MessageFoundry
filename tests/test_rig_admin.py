@@ -381,7 +381,7 @@ def test_the_step_up_handler_re_proves_on_a_session_of_its_own(
     monkeypatch.setattr(
         rigadmin, "renew_session", lambda *a, **k: pytest.fail("the held session was replaced")
     )
-    monkeypatch.setattr(enginepoll.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(enginepoll, "_STEP_UP_RETRY_GAP_SECONDS", 0.0)
     client = _FakeClient(accepts={"fresh", "private"})
     enginepoll.adopt_rig_session(client, "https://b", None)  # type: ignore[arg-type]
     assert client.step_up() is True
