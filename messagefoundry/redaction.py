@@ -2318,8 +2318,10 @@ class _RenderedMapping(dict[Any, Any]):
     error. ``"%s"`` of the whole mapping prints the rebuilt text.
 
     It is a dict, as the stdlib's own ``LogRecord`` expects of a mapping argument, and its storage is
-    the rebuilt keys and values, so a later handler that reads ``.get()`` or ``.items()`` gets the
-    safe text too. It writes nothing to the caller's mapping."""
+    the keys and values rebuilt when the filter ran, so a later handler that reads ``.get()`` or
+    ``.items()`` gets that safe text too. An error added to a value after that is out of scope, as
+    it is for a positional argument; only a ``"%(key)s"`` lookup scans its value again. It writes
+    nothing to the caller's mapping."""
 
     __slots__ = ("_original", "_repr", "_str")
 
@@ -2332,7 +2334,7 @@ class _RenderedMapping(dict[Any, Any]):
     def __getitem__(self, key: Any) -> Any:
         value = self._original[key]  # the caller's own lookup, as "%(key)s" makes it with no filter
         try:
-            # Scanned afresh: it may have changed since the filter ran, and a handler may format late.
+            # Scanned afresh, so this lookup shares no state with the filter's own walk.
             return _safe_arg(value, 1)
         except Exception as exc:  # noqa: BLE001 -- fail closed, see prepare_log_record
             return _withheld(type(exc).__name__)
@@ -2352,10 +2354,12 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
     methods. A mapping's are its keys and values, flattened in order.
 
     Each read is one ``list()`` over a C iterator, so it is short, but it is not atomic: a garbage
-    collection inside it can run other code and switch threads. A container another thread changes
-    mid-read raises, that propagates, and the scan fails closed, so that argument prints as a
-    withheld note rather than as the object. A ``UserDict``'s ``.data`` is the one read that can run the caller's code; an
-    error from it leaves the argument untouched, since its ``repr`` reads the same attribute and
+    collection inside it can run other code and switch threads. A dict, set or deque that another
+    thread changes mid-read raises, that propagates, and the scan fails closed, so that argument
+    prints as a withheld note. A list or tuple read does not raise, so an error another thread adds
+    to one during the read can be missed. An error added AFTER the filter ran is out of scope for
+    every argument form. A ``UserDict``'s ``.data`` is the one read that can run the caller's code;
+    an error from it leaves the argument untouched, since its ``repr`` reads the same attribute and
     fails the same way, as it would with no filter.
 
     It never iterates through a subclass's own ``__iter__``, which may consume what it reads. A
@@ -2452,7 +2456,10 @@ def _factory_repr(arg: Any) -> str:
     so names code, never data. Any other callable, as a ``partial`` or a bound method, may print
     what it holds, and it is not walked, so it is a fixed note."""
     factory = _DEFAULT_FACTORY.__get__(arg)
-    if factory is None or isinstance(factory, type):  # a class, whatever its metaclass
+    meta: Any = type(factory)
+    # A class, by its real type, whose metaclass prints it as type does (ABCMeta does): a
+    # metaclass's own __repr__ could print what the class holds.
+    if factory is None or (issubclass(meta, type) and meta.__repr__ is type.__repr__):
         return repr(factory)
     if type(factory) in (BuiltinFunctionType, FunctionType):
         return repr(factory)
@@ -2716,8 +2723,8 @@ def prepare_log_record(record: logging.LogRecord) -> None:
             except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
                 fresh.append(_withheld(type(exc).__name__))
         if any(new is not old for new, old in zip(fresh, items, strict=True)):
-            # The same type, built through tuple's own constructor, so a namedtuple stays one.
-            record.args = tuple.__new__(type(args), fresh)
+            # A plain tuple: a structseq refuses tuple.__new__, and a subclass's copy lacks its state.
+            record.args = tuple(fresh)
         return
     try:
         safe = _safe_mapping_args(args)

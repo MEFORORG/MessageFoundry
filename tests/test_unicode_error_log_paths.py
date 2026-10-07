@@ -1002,12 +1002,38 @@ def test_a_deque_whose_iteration_consumes_it_is_not_consumed_by_the_filter() -> 
 
 def test_a_namedtuple_given_as_the_args_formats_field_by_field() -> None:
     record = _record("%s %s", _POINT(_encode_error(), 2))
-    prepare_log_record(record)
-    assert type(record.args) is _POINT  # the same type, so a later handler can still read .y
     RedactionFilter().filter(record)
     out = record.getMessage()
     _assert_encode_safe(out)
     assert out.endswith(" 2")
+
+
+def test_a_struct_sequence_given_as_the_args_never_raises() -> None:
+    # tuple.__new__ refuses a structseq type, so a rebuild must not try to keep it.
+    import time
+
+    args = time.struct_time((_encode_error(), 2, 3, 4, 5, 6, 7, 8, 9))
+    record = _record("%s " * 9, args)
+    prepare_log_record(record)
+    _assert_encode_safe(record.getMessage())
+
+
+class _LoudMeta(type):
+    held: object = None
+
+    def __repr__(cls) -> str:
+        return f"<factory {cls.held!r}>"
+
+
+def test_a_factory_whose_metaclass_prints_what_it_holds_is_not_printed() -> None:
+    err = _encode_error()
+    factory = _LoudMeta("_Loud", (), {})
+    factory.held = err
+    record = _record("%s", (collections.defaultdict[str, object](factory, k=err),))
+    prepare_log_record(record)
+    out = record.getMessage()
+    assert "caf" not in out
+    assert "[a default factory, not rendered]" in out
 
 
 def test_a_default_factory_that_could_print_data_is_not_printed() -> None:
