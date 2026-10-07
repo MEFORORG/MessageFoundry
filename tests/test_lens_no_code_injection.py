@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A typed Steps edit cannot write code that runs (Theia review finding R1).
+"""What ``lens rewrite`` refuses to write from a Steps edit (Theia review finding R1).
 
-``lens rewrite`` used to splice an ``{"expr": ...}`` verbatim on ``insert_row`` and on a send row's
-destination, and the raw ``if``/``elif`` ``test`` could carry line breaks that add statements. Each
-refused case below is paired with a control the lens must still accept, so a refusal is attributable to
-the payload and not to a broken edit spec.
+Closed here, at least:
 
-``paste_block`` and a single-line raw ``test`` still take arbitrary source: both are the escape hatches
-ADR 0076 section 5 and ADR 0106 license, and restricting them is an owner question, not this fix.
+* an ``{"expr": ...}`` on ``insert_row`` (its params, occurrence kwargs and the code-lookup default)
+  or on a send row's destination that calls, walks an attribute or applies an operator;
+* message content (a read, a template, or a local that may hold one) in a parameter that is not a
+  value parameter, and a lookup ``params`` that is not a dict with literal keys;
+* an ``insert_row`` ``assign_to`` that rebinds ``msg`` or any name the handler or module binds;
+* a raw ``if``/``elif`` ``test`` that spans lines, is not one condition, yields, or awaits in a sync
+  handler;
+* under ``typed_only``, every ``paste_block`` and every raw ``test``.
+
+Each refused case is paired with a control the lens must still accept, so a refusal is attributable to
+the payload and not to a broken edit spec. Without ``typed_only``, ``paste_block`` and a one-line raw
+``test`` still take arbitrary source: they are the escape hatches ADR 0076 section 5 and ADR 0106
+license for a developer.
 """
 
 from __future__ import annotations
@@ -25,60 +33,62 @@ import pytest
 from messagefoundry.lens import LensRewriteError, parse_source, rewrite_source
 
 SOURCE = """\
+OB_DEST = "OB_X"
+
+
 @handler("H")
 def h(msg):
+    pid5 = msg.field("PID-5")
     for i in range(1, msg.count_segments("OBX") + 1):
         pass
     if msg.field("PID-3.1"):
         pass
     return Send("OB_ACME_ADT", msg)
 """
-_FOR, _IF, _SEND = 3, 5, 7
+_FOR, _IF, _SEND = 7, 9, 11
+
+REFUSED = "not a value a Steps edit may write"
 
 EVIL_CALL = '__import__("os").system("x")'
-EVIL_ATTR = "msg.__class__.__init__.__globals__"
-EVIL_METHOD = 'msg.field("PID-3").upper()'
-EVIL_OP = '"a" + "b"'
-EVIL_LAMBDA = "(lambda: 0)"
-EVIL_DUNDER_NAME = "__builtins__"
-EVIL_SPLAT = "[*x]"
-EVIL_DICT_SPLAT = "{**x}"
-EVIL_NESTED = '{"k": [__import__("os")]}'
-EVIL_FSTRING_CALL = 'f"{x()}"'
-EVIL_WALRUS = "(x := 1)"
-
 _ACTIVE = [
-    EVIL_FSTRING_CALL,
-    EVIL_WALRUS,
     EVIL_CALL,
-    EVIL_ATTR,
-    EVIL_METHOD,
-    EVIL_OP,
-    EVIL_LAMBDA,
-    EVIL_DUNDER_NAME,
-    EVIL_SPLAT,
-    EVIL_DICT_SPLAT,
-    EVIL_NESTED,
+    "msg.__class__.__init__.__globals__",
+    'msg.field("PID-3").upper()',
+    '"a" + "b"',
+    "(lambda: 0)",
+    "__builtins__",
+    "[*x]",
+    "{**x}",
+    '{"k": [__import__("os")]}',
+    'f"{x()}"',
+    "(x := 1)",
+    "msg",
+    # Message.field takes occurrence/repetition keyword-only, so a positional extra raises TypeError.
+    'msg.field("PID-5", 2)',
 ]
 
 
-def _insert(params: dict[str, Any], action: str = "set_field") -> str:
-    return rewrite_source(
-        SOURCE,
-        {
-            "line_start": _SEND,
-            "line_end": _SEND,
-            "op": "insert_row",
-            "position": "before",
-            "action": action,
-            "params": params,
-        },
-    )
+def _insert(params: dict[str, Any], action: str = "set_field", **extra: Any) -> str:
+    edit = {
+        "line_start": _SEND,
+        "line_end": _SEND,
+        "op": "insert_row",
+        "position": "before",
+        "action": action,
+        "params": params,
+        **extra,
+    }
+    return rewrite_source(SOURCE, edit)
+
+
+def _clause(test: str, source: str = SOURCE, line: int = _IF, **kw: Any) -> str:
+    edit = {"line_start": line, "line_end": line, "op": "insert_clause", "clause": "elif"}
+    return rewrite_source(source, {**edit, "test": test}, **kw)
 
 
 @pytest.mark.parametrize("expr", _ACTIVE)
-def test_insert_row_refuses_an_expr_that_runs_code(expr: str) -> None:
-    with pytest.raises(LensRewriteError, match="would run code"):
+def test_insert_row_refuses_an_expr_that_is_not_an_inert_value(expr: str) -> None:
+    with pytest.raises(LensRewriteError, match=REFUSED):
         _insert({"path": "PID-3.1", "value": {"expr": expr}})
 
 
@@ -93,7 +103,14 @@ def test_insert_row_refuses_an_expr_that_runs_code(expr: str) -> None:
             "set_field",
             'msg["PID-5"] or ""',
         ),
-        ({"path": "PID-3.1", "value": {"expr": "other_var"}}, "set_field", "other_var"),
+        (
+            {"path": "PID-3.1", "value": {"expr": 'msg.field("PID-5", occurrence=2)'}},
+            "set_field",
+            'msg.field("PID-5", occurrence=2)',
+        ),
+        # A value parameter may carry message content, so a local holding some is fine there.
+        ({"path": "PID-3.1", "value": {"expr": "pid5"}}, "set_field", "pid5"),
+        ({"path": {"expr": "OB_DEST"}, "value": "x"}, "set_field", "OB_DEST"),
         (
             {"src": "PID-5", "sep": "^", "dests": {"expr": '["PID-5.1", "PID-5.2"]'}},
             "split_field",
@@ -108,10 +125,19 @@ def test_insert_row_refuses_an_expr_that_runs_code(expr: str) -> None:
             {
                 "connection": "MPI",
                 "statement": "select 1",
-                "params": {"expr": '{"mrn": msg["PID-3.1"]}'},
+                "params": {"expr": '{"m": msg["PID-3"]}'},
             },
             "db_lookup",
-            '{"mrn": msg["PID-3.1"]}',
+            '{"m": msg["PID-3"]}',
+        ),
+        (
+            {
+                "connection": "EPIC",
+                "query": "Patient",
+                "params": {"expr": '{"identifier": FhirToken("MRN", msg["PID-3.1"] or "")}'},
+            },
+            "fhir_lookup",
+            'FhirToken("MRN", msg["PID-3.1"] or "")',
         ),
     ],
 )
@@ -121,168 +147,6 @@ def test_insert_row_still_accepts_inert_values(
     out = _insert(params, action)
     assert spliced in out
     ast.parse(out)
-
-
-def test_occurrence_loop_index_is_still_accepted_and_a_call_is_not() -> None:
-    edit = {
-        "line_start": _FOR + 1,
-        "line_end": _FOR + 1,
-        "op": "insert_row",
-        "position": "before",
-        "action": "set_field",
-        "params": {"path": "OBX-11", "value": "F", "occurrence": {"expr": "i"}},
-    }
-    assert "occurrence=i" in rewrite_source(SOURCE, edit)
-    edit["params"] = {"path": "OBX-11", "value": "F", "occurrence": {"expr": EVIL_CALL}}
-    with pytest.raises(LensRewriteError, match="would run code"):
-        rewrite_source(SOURCE, edit)
-
-
-def test_code_lookup_default_refuses_an_expr_that_runs_code() -> None:
-    edit: dict[str, Any] = {
-        "line_start": _SEND,
-        "line_end": _SEND,
-        "op": "insert_code_lookup",
-        "position": "before",
-        "code_set": "gender",
-        "path": "PID-8",
-        "default": {"expr": EVIL_CALL},
-    }
-    with pytest.raises(LensRewriteError, match="would run code"):
-        rewrite_source(SOURCE, edit)
-    edit["default"] = "U"
-    assert 'code_lookup(msg, "PID-8", GENDER, default="U")' in rewrite_source(SOURCE, edit)
-
-
-@pytest.mark.parametrize("expr", [EVIL_CALL, EVIL_ATTR, EVIL_OP])
-def test_send_destination_refuses_an_expr_that_runs_code(expr: str) -> None:
-    with pytest.raises(LensRewriteError, match="would run code"):
-        rewrite_source(
-            SOURCE,
-            {
-                "line_start": _SEND,
-                "line_end": _SEND,
-                "op": "set_params",
-                "params": {"to": {"expr": expr}},
-            },
-        )
-
-
-@pytest.mark.parametrize(("expr", "spliced"), [('"OB_NEW"', '"OB_NEW"'), ("OB_DEST", "OB_DEST")])
-def test_send_destination_still_accepts_a_literal_or_a_name(expr: str, spliced: str) -> None:
-    out = rewrite_source(
-        SOURCE,
-        {
-            "line_start": _SEND,
-            "line_end": _SEND,
-            "op": "set_params",
-            "params": {"to": {"expr": expr}},
-        },
-    )
-    assert f"return Send({spliced}, msg)" in out
-
-
-def test_route_list_edit_is_unaffected() -> None:
-    src = '@router("R")\ndef r(msg):\n    return ["a"]\n'
-    out = rewrite_source(
-        src,
-        {"line_start": 3, "line_end": 3, "op": "set_params", "params": {"handlers": ["b", "c"]}},
-        contract=2,
-    )
-    assert 'return ["b", "c"]' in out
-
-
-_SMUGGLE = "True:\n        " + EVIL_CALL + "\n    elif True"
-
-
-@pytest.mark.parametrize("test", [_SMUGGLE, "True\r\nx = 1", "True:"])
-def test_elif_raw_test_must_be_one_line_and_one_expression(test: str) -> None:
-    with pytest.raises(LensRewriteError, match="raw 'test'"):
-        rewrite_source(
-            SOURCE,
-            {
-                "line_start": _IF,
-                "line_end": _IF,
-                "op": "insert_clause",
-                "clause": "elif",
-                "test": test,
-            },
-        )
-
-
-def test_if_template_raw_test_must_be_one_line() -> None:
-    with pytest.raises(LensRewriteError, match="raw 'test'"):
-        rewrite_source(
-            SOURCE,
-            {
-                "line_start": _SEND,
-                "line_end": _SEND,
-                "op": "template",
-                "template": "if",
-                "position": "before",
-                "test": _SMUGGLE,
-            },
-        )
-
-
-def test_typed_if_and_a_single_line_raw_test_are_still_accepted() -> None:
-    typed = rewrite_source(
-        SOURCE,
-        {
-            "line_start": _IF,
-            "line_end": _IF,
-            "op": "insert_clause",
-            "clause": "elif",
-            "field": "PID-3.1",
-            "operator": "equals",
-            "value": "A",
-        },
-    )
-    assert 'elif msg.field("PID-3.1") == "A":' in typed
-    raw = rewrite_source(
-        SOURCE,
-        {
-            "line_start": _IF,
-            "line_end": _IF,
-            "op": "insert_clause",
-            "clause": "elif",
-            "test": 're.match("^A", msg["PID-3.1"] or "")',
-        },
-    )
-    assert 'elif re.match("^A", msg["PID-3.1"] or ""):' in raw
-    # The smuggled form would have added a statement; the accepted one adds exactly the clause.
-    assert len(parse_source(raw)[0]["rows"]) == len(parse_source(SOURCE)[0]["rows"]) + 2
-
-
-def test_the_cli_refuses_an_injected_insert_value(tmp_path: Path) -> None:
-    module = tmp_path / "h.py"
-    module.write_text(SOURCE, encoding="utf-8")
-    edit = {
-        "line_start": _SEND,
-        "line_end": _SEND,
-        "op": "insert_row",
-        "position": "before",
-        "action": "set_field",
-        "params": {"path": "PID-3.1", "value": {"expr": EVIL_CALL}},
-    }
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "messagefoundry",
-            "lens",
-            "rewrite",
-            str(module),
-            "--edit",
-            json.dumps(edit),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert proc.returncode != 0
-    assert "would run code" in proc.stdout + proc.stderr
-    assert module.read_text(encoding="utf-8") == SOURCE
 
 
 @pytest.mark.parametrize(
@@ -298,65 +162,103 @@ def test_the_cli_refuses_an_injected_insert_value(tmp_path: Path) -> None:
             },
         ),
         (
+            "db_lookup",
+            {"connection": "MPI", "statement": {"expr": "pid5"}, "params": {"expr": "{}"}},
+        ),
+        (
             "fhir_lookup",
             {"connection": {"expr": 'msg["MSH-3"]'}, "query": "Patient", "params": {"expr": "{}"}},
         ),
-        # A diagnostic template is logged unredacted.
+        # A diagnostic template is logged unredacted, whether it is a read or a local holding one.
         ("log_note", {"template": {"expr": 'msg["PID-5"]'}}),
+        ("log_note", {"template": {"expr": "pid5"}}),
+        ("log_note", {"template": {"expr": "msg"}}),
         # A path chosen by message content picks which field is overwritten.
         ("set_field", {"path": {"expr": 'msg["ZZZ-1"]'}, "value": "x"}),
+        ("set_field", {"path": {"expr": "pid5"}, "value": "x"}),
+        # A lookup params value must be a dict with literal keys; the two lookups take a Mapping.
+        ("db_lookup", {"connection": "MPI", "statement": "s", "params": {"expr": '[msg["A"]]'}}),
+        ("db_lookup", {"connection": "MPI", "statement": "s", "params": {"expr": '{msg["A"]: 1}'}}),
+        ("db_lookup", {"connection": "MPI", "statement": "s", "params": {"expr": "pid5"}}),
+        (
+            "fhir_lookup",
+            {
+                "connection": "EPIC",
+                "query": "Patient",
+                "params": {"expr": '{"identifier": FhirToken(msg["A"], "c")}'},
+            },
+        ),
+        (
+            "db_lookup",
+            {
+                "connection": "MPI",
+                "statement": "s",
+                "params": {"expr": '{"identifier": FhirToken("MRN", "c")}'},
+            },
+        ),
     ],
 )
 def test_insert_row_keeps_message_content_out_of_non_value_params(
     action: str, params: dict[str, Any]
 ) -> None:
-    with pytest.raises(LensRewriteError, match="not a value a Steps edit may write"):
+    with pytest.raises(LensRewriteError, match=REFUSED):
         _insert(params, action)
 
 
-def test_occurrence_cannot_be_message_content() -> None:
+def test_occurrence_takes_a_loop_index_but_not_message_content_or_a_call() -> None:
     edit = {
         "line_start": _FOR + 1,
         "line_end": _FOR + 1,
         "op": "insert_row",
         "position": "before",
         "action": "set_field",
-        "params": {"path": "OBX-11", "value": "F", "occurrence": {"expr": 'msg["PID-9"]'}},
+        "params": {"path": "OBX-11", "value": "F", "occurrence": {"expr": "i"}},
     }
-    with pytest.raises(LensRewriteError, match="not a value a Steps edit may write"):
-        rewrite_source(SOURCE, edit)
+    assert "occurrence=i" in rewrite_source(SOURCE, edit)
+    for bad in (EVIL_CALL, 'msg["PID-9"]', "pid5"):
+        edit["params"] = {"path": "OBX-11", "value": "F", "occurrence": {"expr": bad}}
+        with pytest.raises(LensRewriteError, match=REFUSED):
+            rewrite_source(SOURCE, edit)
 
 
-@pytest.mark.parametrize("name", ["msg", "__x__", "class"])
-def test_insert_row_assign_to_cannot_rebind_msg_or_take_a_reserved_name(name: str) -> None:
-    edit = {
+def test_code_lookup_default_is_gated_and_a_reserved_variable_names_the_code_set() -> None:
+    edit: dict[str, Any] = {
         "line_start": _SEND,
         "line_end": _SEND,
-        "op": "insert_row",
+        "op": "insert_code_lookup",
         "position": "before",
-        "action": "db_lookup",
-        "assign_to": name,
-        "params": {"connection": "MPI", "statement": "select 1", "params": {"expr": "{}"}},
+        "code_set": "gender",
+        "path": "PID-8",
+        "default": {"expr": EVIL_CALL},
     }
-    with pytest.raises(LensRewriteError, match="assign_to"):
+    with pytest.raises(LensRewriteError, match=REFUSED):
         rewrite_source(SOURCE, edit)
-    edit["assign_to"] = "row"
-    assert 'row = db_lookup("MPI", "select 1", {})' in rewrite_source(SOURCE, edit)
+    edit["default"] = "U"
+    assert 'code_lookup(msg, "PID-8", GENDER, default="U")' in rewrite_source(SOURCE, edit)
+    edit["code_set"] = "__init__"
+    with pytest.raises(LensRewriteError, match="code set '__init__' is a reserved name"):
+        rewrite_source(SOURCE, edit)
 
 
-@pytest.mark.parametrize("test", ["(yield)", "(yield from x)", "(await x)"])
-def test_raw_test_cannot_yield_or_await(test: str) -> None:
-    with pytest.raises(LensRewriteError, match="raw 'test'"):
-        rewrite_source(
-            SOURCE,
-            {
-                "line_start": _IF,
-                "line_end": _IF,
-                "op": "insert_clause",
-                "clause": "elif",
-                "test": test,
-            },
-        )
+def _set_send(expr: str, source: str = SOURCE, line: int = _SEND) -> str:
+    edit = {
+        "line_start": line,
+        "line_end": line,
+        "op": "set_params",
+        "params": {"to": {"expr": expr}},
+    }
+    return rewrite_source(source, edit)
+
+
+@pytest.mark.parametrize("expr", [EVIL_CALL, "msg.__class__", '"a" + "b"', "pid5", 'msg["MSH-5"]'])
+def test_send_destination_refuses_code_and_message_content(expr: str) -> None:
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        _set_send(expr)
+
+
+@pytest.mark.parametrize("expr", ['"OB_NEW"', "OB_DEST"])
+def test_send_destination_still_accepts_a_literal_or_a_module_name(expr: str) -> None:
+    assert f"return Send({expr}, msg)" in _set_send(expr)
 
 
 _APPEND_SOURCE = """\
@@ -369,12 +271,383 @@ def h(msg):
 
 
 @pytest.mark.parametrize(
-    ("expr", "ok"), [(EVIL_CALL, False), ("__builtins__", False), ('"OB_NEW"', True)]
+    ("expr", "ok"), [(EVIL_CALL, False), ("__builtins__", False), ('"OB_N"', True)]
 )
 def test_appended_send_destination_is_gated_too(expr: str, ok: bool) -> None:
-    edit = {"line_start": 4, "line_end": 4, "op": "set_params", "params": {"to": {"expr": expr}}}
     if ok:
-        assert f"sends.append(Send({expr}, msg))" in rewrite_source(_APPEND_SOURCE, edit)
+        assert f"sends.append(Send({expr}, msg))" in _set_send(expr, _APPEND_SOURCE, 4)
     else:
-        with pytest.raises(LensRewriteError, match="not a value a Steps edit may write"):
-            rewrite_source(_APPEND_SOURCE, edit)
+        with pytest.raises(LensRewriteError, match=REFUSED):
+            _set_send(expr, _APPEND_SOURCE, 4)
+
+
+def test_route_list_edit_is_unaffected() -> None:
+    src = '@router("R")\ndef r(msg):\n    return ["a"]\n'
+    edit = {"line_start": 3, "line_end": 3, "op": "set_params", "params": {"handlers": ["b", "c"]}}
+    assert 'return ["b", "c"]' in rewrite_source(src, edit, contract=2)
+
+
+@pytest.mark.parametrize("name", ["msg", "__x__", "class", "pid5", "i", "OB_DEST"])
+def test_insert_row_assign_to_cannot_rebind_a_bound_or_reserved_name(name: str) -> None:
+    params = {"connection": "MPI", "statement": "select 1", "params": {"expr": "{}"}}
+    with pytest.raises(LensRewriteError, match="assign_to"):
+        _insert(params, "db_lookup", assign_to=name)
+    assert 'row = db_lookup("MPI", "select 1", {})' in _insert(params, "db_lookup", assign_to="row")
+
+
+_SMUGGLE = "True:\n        " + EVIL_CALL + "\n    elif True"
+
+
+@pytest.mark.parametrize(
+    "test",
+    [_SMUGGLE, "True\r\nx = 1", "True:", "a) or (b", "(yield)", "(yield from x)", "(await x)"],
+)
+def test_elif_raw_test_must_be_one_condition_on_one_line(test: str) -> None:
+    with pytest.raises(LensRewriteError, match="raw 'test'"):
+        _clause(test)
+
+
+def test_if_template_raw_test_must_be_one_line() -> None:
+    edit = {
+        "line_start": _SEND,
+        "line_end": _SEND,
+        "op": "template",
+        "template": "if",
+        "position": "before",
+        "test": _SMUGGLE,
+    }
+    with pytest.raises(LensRewriteError, match="raw 'test'"):
+        rewrite_source(SOURCE, edit)
+
+
+@pytest.mark.parametrize(
+    ("test", "header"),
+    [
+        ('re.match("^A", msg["PID-3.1"] or "")', 'elif re.match("^A", msg["PID-3.1"] or ""):'),
+        # An unparenthesized walrus is valid in an if header, so the escape hatch takes it.
+        ('x := msg.field("PID-3.1")', 'elif x := msg.field("PID-3.1"):'),
+        ("   True  ", "elif True:"),
+        # A yield inside a lambda belongs to the lambda, not to the handler.
+        ("(lambda: (yield))", "elif (lambda: (yield)):"),
+    ],
+)
+def test_a_single_line_raw_test_is_still_accepted(test: str, header: str) -> None:
+    out = _clause(test)
+    assert header in out
+    assert len(parse_source(out)[0]["rows"]) == len(parse_source(SOURCE)[0]["rows"]) + 2
+
+
+def test_await_in_a_raw_test_is_accepted_only_in_an_async_handler() -> None:
+    async_src = SOURCE.replace("def h(msg):", "async def h(msg):")
+    assert "elif await x:" in _clause("await x", async_src)
+    with pytest.raises(LensRewriteError, match="raw 'test'"):
+        _clause("await x")
+
+
+# --- typed-only mode (owner ruling 2026-10-07) ---------------------------------------------------
+
+_PASTE = {
+    "line_start": _SEND,
+    "line_end": _SEND,
+    "op": "paste_block",
+    "position": "before",
+    "block": '    msg["MSH-4"] = "X"',
+}
+_IF_RAW = {
+    "line_start": _SEND,
+    "line_end": _SEND,
+    "op": "template",
+    "template": "if",
+    "position": "before",
+    "test": "True",
+}
+_ELIF_RAW = {
+    "line_start": _IF,
+    "line_end": _IF,
+    "op": "insert_clause",
+    "clause": "elif",
+    "test": "True",
+}
+
+
+@pytest.mark.parametrize("edit", [_PASTE, _IF_RAW, _ELIF_RAW], ids=["paste", "if-raw", "elif-raw"])
+def test_typed_only_refuses_raw_source_that_the_default_mode_accepts(edit: dict[str, Any]) -> None:
+    assert rewrite_source(SOURCE, edit) != SOURCE
+    with pytest.raises(LensRewriteError, match="typed-only mode") as info:
+        rewrite_source(SOURCE, edit, typed_only=True)
+    assert info.value.code == "refused"
+
+
+def test_typed_only_still_accepts_typed_edits() -> None:
+    typed_if = {k: v for k, v in _IF_RAW.items() if k != "test"} | {"field": "PID-3.1"}
+    assert "if msg.field(" in rewrite_source(SOURCE, typed_if, typed_only=True)
+    typed_elif = {k: v for k, v in _ELIF_RAW.items() if k != "test"} | {"field": "PID-3.1"}
+    assert "elif msg.field(" in rewrite_source(SOURCE, typed_elif, typed_only=True)
+    insert = {
+        "line_start": _SEND,
+        "line_end": _SEND,
+        "op": "insert_row",
+        "position": "before",
+        "action": "set_field",
+        "params": {"path": "PID-3.1", "value": "B"},
+    }
+    assert 'msg.set("PID-3.1", "B")' in rewrite_source(SOURCE, insert, typed_only=True)
+
+
+def _cli(module: Path, edit: dict[str, Any], *flags: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "messagefoundry",
+            "lens",
+            "rewrite",
+            str(module),
+            "--edit",
+            json.dumps(edit),
+            *flags,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+
+
+def test_the_cli_refuses_an_injected_insert_value(tmp_path: Path) -> None:
+    module = tmp_path / "h.py"
+    module.write_text(SOURCE, encoding="utf-8")
+    edit = {
+        "line_start": _SEND,
+        "line_end": _SEND,
+        "op": "insert_row",
+        "position": "before",
+        "action": "set_field",
+        "params": {"path": "PID-3.1", "value": {"expr": EVIL_CALL}},
+    }
+    proc = _cli(module, edit)
+    assert proc.returncode != 0
+    assert json.loads(proc.stdout)["code"] == "refused"
+    assert REFUSED in json.loads(proc.stdout)["error"]
+    assert "__import__" not in proc.stdout  # nothing rewritten was emitted
+
+
+def test_the_cli_typed_only_flag_refuses_paste_block(tmp_path: Path) -> None:
+    module = tmp_path / "h.py"
+    module.write_text(SOURCE, encoding="utf-8")
+    ok = _cli(module, _PASTE)
+    assert ok.returncode == 0
+    assert 'msg["MSH-4"] = "X"' in ok.stdout
+    proc = _cli(module, _PASTE, "--typed-only")
+    assert proc.returncode != 0
+    assert json.loads(proc.stdout)["code"] == "refused"
+    assert "typed-only mode" in proc.stdout
+    assert 'msg["MSH-4"]' not in proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("binding", "name"),
+    [
+        ("    try:\n        pass\n    except ValueError as err:\n        pass\n", "err"),
+        ('    match msg["PID-8"]:\n        case sex:\n            pass\n', "sex"),
+        ('    match msg["PID-8"]:\n        case [*rest]:\n            pass\n', "rest"),
+        ('    match msg["PID-8"]:\n        case {"a": 1, **more}:\n            pass\n', "more"),
+        ("    import os as osmod\n", "osmod"),
+        ("    with open('x') as fh:\n        pass\n", "fh"),
+        ("    total = 0\n    total += 1\n", "total"),
+    ],
+)
+def test_every_kind_of_handler_binding_is_blocked_from_a_literal_param(
+    binding: str, name: str
+) -> None:
+    src = SOURCE.replace('    pid5 = msg.field("PID-5")\n', binding)
+    send = len(src.splitlines())
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        _set_send(name, src, send)
+
+
+def test_a_name_any_function_declares_global_is_blocked() -> None:
+    src = (
+        'LAST = ""\n\n\ndef note(msg):  # type: ignore[no-untyped-def]\n    global LAST\n'
+        '    LAST = msg["PID-5"]\n\n\n' + SOURCE
+    )
+    send = len(src.splitlines())
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        _set_send("LAST", src, send)
+    assert "return Send(OB_DEST, msg)" in _set_send("OB_DEST", src, send)
+
+
+def test_a_loop_index_reused_by_two_for_each_loops_is_still_admitted() -> None:
+    loop = '    for i in range(1, msg.count_segments("OBX") + 1):\n        pass\n'
+    src = SOURCE.replace(loop, loop + loop)
+    edit = {
+        "line_start": _FOR + 3,
+        "line_end": _FOR + 3,
+        "op": "insert_row",
+        "position": "before",
+        "action": "set_field",
+        "params": {"path": "OBX-11", "value": "F", "occurrence": {"expr": "i"}},
+    }
+    assert "occurrence=i" in rewrite_source(src, edit)
+    # The same name bound once more by something other than a range loop is no longer an index.
+    rebound = src.replace('    pid5 = msg.field("PID-5")\n', '    i = msg.field("PID-5")\n')
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        rewrite_source(rebound, edit)
+
+
+@pytest.mark.parametrize("name", ["range", "len", "print"])
+def test_assign_to_and_code_set_var_cannot_shadow_a_builtin(name: str) -> None:
+    params = {"connection": "MPI", "statement": "select 1", "params": {"expr": "{}"}}
+    with pytest.raises(LensRewriteError, match="assign_to"):
+        _insert(params, "db_lookup", assign_to=name)
+    edit = {
+        "line_start": _SEND,
+        "line_end": _SEND,
+        "op": "insert_code_lookup",
+        "position": "before",
+        "code_set": "gender",
+        "path": "PID-8",
+        "var": name,
+    }
+    with pytest.raises(LensRewriteError, match="reserved name"):
+        rewrite_source(SOURCE, edit)
+
+
+@pytest.mark.parametrize(
+    "token",
+    ['FhirToken("MRN", msg["A"], "x")', 'FhirToken("MRN", code=msg["A"])', "FhirToken(*x)"],
+)
+def test_fhir_token_admits_only_the_two_positional_form(token: str) -> None:
+    params = {"connection": "EPIC", "query": "Patient", "params": {"expr": f'{{"id": {token}}}'}}
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        _insert(params, "fhir_lookup")
+
+
+@pytest.mark.parametrize(("expr", "ok"), [("i + 1", True), ("1/3", True), ("2 ** 99", False)])
+def test_plain_arithmetic_in_a_numeric_field_is_admitted(expr: str, ok: bool) -> None:
+    edit = {
+        "line_start": _FOR + 1,
+        "line_end": _FOR + 1,
+        "op": "insert_row",
+        "position": "before",
+        "action": "set_field",
+        "params": {"path": "OBX-11", "value": "F", "occurrence": {"expr": expr}},
+    }
+    if ok:
+        assert f"occurrence={expr}" in rewrite_source(SOURCE, edit)
+    else:
+        with pytest.raises(LensRewriteError, match=REFUSED):
+            rewrite_source(SOURCE, edit)
+
+
+def test_the_reported_send_destination_payload_is_refused() -> None:
+    # The exact payload an independent review spliced through set_params on a send row at origin/main.
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        _set_send("__import__('os').getenv('X') or 'OB_A'")
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"line_start": _IF, "line_end": _IF, "op": "insert_clause", "clause": "else", "test": "x"},
+        {**_ELIF_RAW, "test": ""},
+        {**_IF_RAW, "template": "filter"},
+    ],
+    ids=["else-ignores-test", "empty-test", "non-if-template"],
+)
+def test_typed_only_refuses_only_a_test_that_would_be_rendered(edit: dict[str, Any]) -> None:
+    if edit.get("test") == "":
+        edit = {**edit, "field": "PID-3.1"}
+    assert rewrite_source(SOURCE, edit, typed_only=True) != SOURCE
+
+
+_DB = {"connection": "MPI", "statement": "select 1", "params": {"expr": "{}"}}
+
+
+@pytest.mark.parametrize(
+    ("prefix", "binding", "name"),
+    [
+        # A try-guarded module import the handler reads would turn local and raise UnboundLocalError.
+        (
+            "try:\n    from zoneinfo import ZoneInfo\nexcept ImportError:\n    pass\n",
+            "    ZoneInfo\n",
+            "ZoneInfo",
+        ),
+        # Under a star import, a name the handler reads may come from it.
+        ("from messagefoundry import *\n", "", "Send"),
+        ("", "    try:\n        pass\n    except ValueError as err:\n        pass\n", "err"),
+        ("", "    import os as osmod\n", "osmod"),
+        # Pinned behaviour change: a second lookup into an existing local needs a new name.
+        ("", "    row = 1\n", "row"),
+    ],
+)
+def test_assign_to_refuses_any_name_the_handler_or_module_binds_or_reads(
+    prefix: str, binding: str, name: str
+) -> None:
+    src = prefix + SOURCE.replace('    pid5 = msg.field("PID-5")\n', binding)
+    send = len(src.splitlines())
+    edit = {
+        "line_start": send,
+        "line_end": send,
+        "op": "insert_row",
+        "position": "before",
+        "action": "db_lookup",
+        "assign_to": name,
+        "params": _DB,
+    }
+    with pytest.raises(LensRewriteError, match="assign_to"):
+        rewrite_source(src, edit)
+    # A name bound only inside ANOTHER function is not this handler's, so it is free here.
+    other = "def other(msg):  # type: ignore[no-untyped-def]\n    fresh = 1\n\n\n" + SOURCE
+    edit_other = {**edit, "assign_to": "fresh", "line_start": _SEND + 4, "line_end": _SEND + 4}
+    assert "fresh = db_lookup(" in rewrite_source(other, edit_other)
+
+
+@pytest.mark.parametrize(
+    ("expr", "ok"),
+    [
+        ("pid5 * 2000000000", False),
+        ("OB_DEST * 2000000000", False),
+        ("OB_DEST % 3", False),
+        ("i - 1", True),
+        ("-i", True),
+        ("2 * 3", True),
+    ],
+)
+def test_multiplication_and_modulo_take_numbers_only(expr: str, ok: bool) -> None:
+    edit = {
+        "line_start": _FOR + 1,
+        "line_end": _FOR + 1,
+        "op": "insert_row",
+        "position": "before",
+        "action": "set_field",
+        "params": {"path": "OBX-11", "value": {"expr": expr}},
+    }
+    if ok:
+        assert expr in rewrite_source(SOURCE, edit)
+    else:
+        with pytest.raises(LensRewriteError, match=REFUSED):
+            rewrite_source(SOURCE, edit)
+
+
+def test_a_fhir_repeated_parameter_list_of_tokens_is_admitted() -> None:
+    value = '{"id": [FhirToken("MRN", msg["A"] or ""), "x"]}'
+    params = {"connection": "EPIC", "query": "Patient", "params": {"expr": value}}
+    assert value in _insert(params, "fhir_lookup")
+    bad = '{"id": [FhirToken("MRN", msg["A"]), __import__("os")]}'
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        _insert({**params, "params": {"expr": bad}}, "fhir_lookup")
+
+
+def test_a_rebound_range_voids_the_loop_index_exemption() -> None:
+    src = "range = lambda *a: [1]\n" + SOURCE
+    edit = {
+        "line_start": _FOR + 2,
+        "line_end": _FOR + 2,
+        "op": "insert_row",
+        "position": "before",
+        "action": "set_field",
+        "params": {"path": "OBX-11", "value": "F", "occurrence": {"expr": "i"}},
+    }
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        rewrite_source(src, edit)

@@ -640,8 +640,9 @@ def test_an_expr_may_not_author_a_dynamic_argument() -> None:
 
 
 def test_the_gate_leaves_the_unmoded_expr_paths_alone() -> None:
-    """Scope control: route and send rows, and structural inserts, keep splicing ``{"expr": ...}``.
-    Only set_params on an action, lookup or diagnostic argument is moded."""
+    """Scope control: route and send rows, and structural inserts, are not MODED. Only set_params on an
+    action, lookup or diagnostic argument is. Their ``{"expr": ...}`` values pass the separate inert-value
+    gate instead (Theia review finding R1, tests/test_lens_no_code_injection.py), which these admit."""
     send = PREAMBLE + '@handler("h")\ndef h(msg):\n    return Send(dest, msg)\n'
     out = _set(send, {"to": {"expr": "other_dest"}})
     assert "Send(other_dest, msg)" in out

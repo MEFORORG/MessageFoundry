@@ -355,9 +355,9 @@ def test_insert_db_lookup_assigned_round_trips_as_lookup_row() -> None:
         _anchor(),
         action="db_lookup",
         assign_to="row",
-        params={"connection": "MPI", "statement": "select 1", "params": {"expr": '["A"]'}},
+        params={"connection": "MPI", "statement": "select 1", "params": {"expr": '{"id": "A"}'}},
     )
-    assert 'row = db_lookup("MPI", "select 1", ["A"])' in out
+    assert 'row = db_lookup("MPI", "select 1", {"id": "A"})' in out
     assert "from messagefoundry import db_lookup" in out
     ast.parse(out)
     rows = parse_source(out)[0]["rows"]
@@ -429,7 +429,7 @@ def test_insert_lookup_does_not_double_inject_existing_import() -> None:
         anchor,
         action="db_lookup",
         assign_to="row",
-        params={"connection": "MPI", "statement": "select 1", "params": {"expr": '["A"]'}},
+        params={"connection": "MPI", "statement": "select 1", "params": {"expr": '{"id": "A"}'}},
     )
     assert out.count("import db_lookup") == 1  # already in scope → no second import
 
