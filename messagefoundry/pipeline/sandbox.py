@@ -59,8 +59,8 @@ sockets — those objects are never constructed in the child (it loads the messa
 store/crypto). Its environment is an allowlist, not the engine's own
 (:mod:`messagefoundry.childenv`, which also says why that is not a boundary by itself).
 On top of that address-space boundary the child adds defence-in-depth: a
-forbidden-import guard (``socket``/store/crypto), a wall-clock cap enforced by the parent (plus
-POSIX ``RLIMIT_CPU``/``RLIMIT_AS`` when available), and a fail-closed refusal of the live
+forbidden-import guard (``socket``/store/crypto), a wall-clock cap enforced by the parent (plus a
+POSIX ``RLIMIT_AS`` memory cap when available), and a fail-closed refusal of the live
 ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop, which a process boundary
 breaks — forwarding them over IPC is a documented next-phase residual). The import guard is
 **defence-in-depth only** — a module imported before it goes up keeps a live reference, so the
@@ -89,7 +89,6 @@ import enum
 import logging
 import queue
 import secrets
-import signal
 import struct
 import subprocess
 import sys
@@ -175,14 +174,12 @@ class SandboxPolicy:
     ``wall_seconds`` is the
     **authoritative** cap on every platform — the parent kills a worker that overruns it (so a
     pathological busy-loop Router/Handler can never wedge intake), and it is enforced **only** at
-    ``mode=subprocess``: the in-process path has no timeout at all. ``cpu_seconds`` / ``mem_mb`` add
-    a POSIX ``RLIMIT_CPU`` / ``RLIMIT_AS`` backstop *inside* the child where the ``resource`` module
-    exists (a no-op on Windows, where the wall cap governs). ``startup_seconds`` bounds the one-time
-    child bootstrap (config load)."""
+    ``mode=subprocess``: the in-process path has no timeout at all. It is also the only bound on CPU
+    time; there is no ``RLIMIT_CPU`` (ADR 0087, amendment of 2026-10-07). ``mem_mb`` adds a POSIX ``RLIMIT_AS`` backstop *inside* the child where the ``resource`` module exists (a no-op on
+    Windows). ``startup_seconds`` bounds the one-time child bootstrap (config load)."""
 
     mode: SandboxMode
     wall_seconds: float = 5.0
-    cpu_seconds: float = 2.0
     mem_mb: int | None = 512
     startup_seconds: float = 30.0
     forbidden_modules: tuple[str, ...] = DEFAULT_FORBIDDEN_MODULES
@@ -479,15 +476,6 @@ def _read_frame_bytes(stream: Any) -> bytes | None:
 # hook.
 
 
-def _killed_by_cpu_cap(returncode: int | None) -> bool:
-    """Whether a worker's exit status is the POSIX ``RLIMIT_CPU`` soft limit's ``SIGXCPU`` (the
-    worker sets its hard limit one second higher so the kill is that, not an anonymous SIGKILL). The
-    reap that follows does not change it: the worker is already dead, so the reap collects the signal
-    it died of. Windows has no ``SIGXCPU``, and no CPU cap to report."""
-    sigxcpu = getattr(signal, "SIGXCPU", None)
-    return sigxcpu is not None and returncode == -int(sigxcpu)
-
-
 def _kill_single(proc: subprocess.Popen[bytes]) -> None:
     """Best-effort single-process kill (the reap fallback when no job/group is available)."""
     try:  # noqa: SIM105
@@ -695,7 +683,6 @@ class SandboxSession:
                 codec.encode_boot(
                     config_dir=self._config_dir,
                     forbidden=self.policy.forbidden_modules,
-                    cpu_seconds=self.policy.cpu_seconds,
                     mem_mb=self.policy.mem_mb,
                     code_sets=self._code_sets,
                 ),
@@ -754,11 +741,6 @@ class SandboxSession:
                 sink.put(body)
         except OSError:
             sink.put(_EOF)
-
-    def _cpu_cap_error(self, phase: str, name: str) -> SandboxError:
-        return SandboxError(
-            f"sandbox {phase} {name!r} exceeded the {self.policy.cpu_seconds}s CPU cap"
-        )
 
     def _kill(self, proc: subprocess.Popen[bytes] | None) -> None:
         if proc is None:
@@ -920,17 +902,11 @@ class SandboxSession:
                 # Wall cap exceeded — the authoritative resource bound on every platform. Kill the
                 # runaway child (a busy-loop can't wedge intake) and fail closed.
                 self._kill(proc)
-                if _killed_by_cpu_cap(proc.returncode):
-                    # Dead of the CPU cap already, with a grandchild still holding its stdout open,
-                    # so no EOF came and the wall cap is only what noticed.
-                    raise self._cpu_cap_error(phase, name) from None
                 raise SandboxError(
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap"
                 ) from None
             if frame is _EOF:
                 self._kill(proc)
-                if _killed_by_cpu_cap(proc.returncode):
-                    raise self._cpu_cap_error(phase, name)
                 raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}")
             try:
                 # Decoding happens HERE, on the dispatch thread, inside this try — not on the daemon

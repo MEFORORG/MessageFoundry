@@ -899,7 +899,10 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.3 ACK-on-receipt is the default", s.inbound.ack_after, AckAfter.INGEST),
         ("15.1.3 sandbox default = off (no Router/Handler wall cap)", s.sandbox.mode, "off"),
         ("15.1.3 sandbox wall cap = 5.0 s", s.sandbox.wall_seconds, 5.0),
-        ("15.1.3 sandbox cpu cap = 2.0 s (POSIX)", s.sandbox.cpu_seconds, 2.0),
+        # The "sandbox cpu cap = 2.0 s (POSIX)" row left with [sandbox].cpu_seconds (ADR 0087,
+        # amendment of 2026-10-07; vault BACKLOG #3133 part 1). COUPLED edit, like the retry row
+        # below: the vault `docs/security/THREAT-MODEL.md` 15.1.3 row must stop claiming a POSIX
+        # CPU cap and name the wall cap as the only CPU bound.
         ("15.1.3 sandbox mem cap = 512 MiB (POSIX)", s.sandbox.mem_mb, 512),
         ("15.1.3 live-lookup bridge = 30.0 s", wiring_runner._LOOKUP_RESULT_TIMEOUT_SECONDS, 30.0),
         # BACKLOG #1051 flipped this from None (retry forever) to a finite 100. This is a COUPLED
