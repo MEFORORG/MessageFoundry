@@ -8285,7 +8285,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     # #1780: no store there. #3054: a key error, a key that is not base64 of 32 bytes among them,
     # which `resolve_active_key` above does not decode. One the OPEN raises arrives wrapped as
-    # `_StoreKeyUnresolved` (#2109, below); this arm takes the same classes raised after the open.
+    # `_StoreKeyUnresolved` (#2109, below). Nothing after the open is known to raise these classes;
+    # they stay here so one that does still exits 2 rather than reaching the dispatch floor.
     could_not_start: tuple[type[Exception], ...] = (
         NotImplementedError,
         StoreNotFoundError,
