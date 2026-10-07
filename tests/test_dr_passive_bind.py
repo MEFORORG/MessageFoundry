@@ -111,20 +111,48 @@ async def test_a_box_activated_at_startup_binds_only_the_critical_feed(tmp_path:
         assert rr.dr_standby is None
 
 
-@pytest.mark.parametrize("door", ["operator", "alert_rule"])
 async def test_only_an_operator_start_binds_a_listener_on_a_passive_standby(
-    tmp_path: Path, door: str
+    tmp_path: Path,
 ) -> None:
     """ADR 0048 Decision 3: an operator start of an inbound overrides the profile. The engine's
-    own doors do not, so the passive fence holds until a person chooses to open it."""
+    own doors do not, so the passive fence holds until a person chooses to open it, and an
+    alert rule's restart cannot undo that person's start either."""
+    cfg = tmp_path / "cfg"
+    crit_port, norm_port = _write_graph(cfg, tmp_path)
+    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+        rr = engine.registry_runner
+        assert rr is not None
+        await rr.start_inbound(_NORM)  # the scheduler's call: an engine door
+        await _alert_control_action(engine, "restart_inbound", _NORM)
+        assert not await _accepts(norm_port)
+
+        await rr.start_inbound(_CRIT, operator=True)  # the API's call
+        assert await _accepts(crit_port)
+        await rr.restart_inbound(_CRIT)  # an engine restart is refused whole
+        assert rr.inbound_running(_CRIT) and await _accepts(crit_port)
+
+
+async def test_no_engine_door_binds_a_listener_while_a_release_drains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The release parks intake before its drain, not after it. Red when the standby was set only
+    once the drain ended: the scheduler's start bound the critical listener mid-drain."""
     cfg = tmp_path / "cfg"
     crit_port, _norm_port = _write_graph(cfg, tmp_path)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
         rr = engine.registry_runner
         assert rr is not None
-        if door == "operator":
+        await engine._dr_activate_profile()
+        assert await _accepts(crit_port)  # control: the activation bound it
+        real_drain = engine._drain_pipeline
+        mid_drain: list[bool] = []
+
+        async def drain_with_a_scheduler_tick() -> tuple[int, int]:
             await rr.start_inbound(_CRIT)
-            assert await _accepts(crit_port)
-        else:
-            await _alert_control_action(engine, "restart_inbound", _CRIT)
-            assert not await _accepts(crit_port)
+            mid_drain.append(await _accepts(crit_port))
+            return await real_drain()
+
+        monkeypatch.setattr(engine, "_drain_pipeline", drain_with_a_scheduler_tick)
+        await engine._dr_release_drain()
+        assert mid_drain == [False]
+        assert _CRIT in rr.filtered_inbound()

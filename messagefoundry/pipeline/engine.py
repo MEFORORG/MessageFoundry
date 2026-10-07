@@ -931,8 +931,14 @@ class Engine:
             depth = await self.store.in_pipeline_depth()
             self._set_dr_active(False)
             return {"depth_left": depth, "drained": depth == 0, "held_on_parked_outbounds": 0}
+        # The passive standby first, so the scheduler and an alert rule cannot bind a listener while
+        # the drain runs (vault BACKLOG #3140). The threshold stays, so the outbounds the profile
+        # parks hold their rows through the drain; the second call parks each unbound inbound.
+        standby = self._dr_settings.priority_threshold
+        rr.set_dr_threshold(rr.dr_threshold, standby=standby)
         for name in list(rr.registry.inbound):
             await rr.stop_inbound(name)  # unbind every listener — no new intake during fail-back
+        rr.set_dr_threshold(rr.dr_threshold, standby=standby)
         rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
         depth, held = await self._drain_pipeline()
         self._set_dr_active(False)

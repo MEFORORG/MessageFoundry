@@ -274,12 +274,13 @@ in-flight rows stranded.
 > `[dr].enabled = true` that is not activated, at start or after `POST /dr/release`, binds no inbound
 > listener of any tier, and each reads `status: "filtered"`. The VIP fence below needs it: the load balancer
 > moves the VIP to the node that answers, so a passive box must answer on nothing. AC-11 already leaves a
-> released box with no listener bound, and this keeps that state across a reload until an activation. The
-> ADR says nothing of a passive box's outbounds, so they are built as before, and a lane the profile parked
-> still comes up on the first reload after a release, as Decision 3 says. The reload and dry-run checks
-> judge the listeners an activation would bind, so a config that activation would refuse is refused
-> before the disaster. An operator start of an inbound still overrides the passive park, as Decision 3
-> says of the profile; an alert rule's restart and the scheduler do not.
+> released box with no listener bound, and this keeps that state across a reload until an activation. A
+> release parks intake before its drain, so no engine door binds a listener while the drain runs. The ADR
+> says nothing of a passive box's outbounds, so they are built as before. A lane the profile parked still
+> comes up on the first reload after a release, as Decision 3 says. The reload and dry-run checks judge the
+> listeners an activation would bind. So a config that activation would refuse is refused before the
+> disaster. An operator start of an inbound still overrides the passive park, as Decision 3 says of the
+> profile, until the next reload parks it again. An alert rule's restart and the scheduler bind nothing.
 
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 
