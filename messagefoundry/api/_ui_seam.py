@@ -302,14 +302,17 @@ from typing import Any
 #:
 #: BACKLOG #2454: the console imports ``authorization_header`` from ``api.security``. ``GET /ui/sso``
 #: reads ``Authorization`` through it, so a repeated header is refused 400 by the same rule the
-#: engine's own reads use. The digest moved because the imported surface grew.
+#: engine's own reads use. The digest moved because the imported surface grew. It moved again
+#: when the console's session-cookie read joined the rule: the console now imports
+#: ``RepeatedCredentialError`` and ``record_repeated_credential``, so a repeated cookie is logged
+#: and audited by the same handler as a repeated header.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "5a49b51d647866fa"
+ENGINE_UI_SEAM: str = "2e7ba51c6149c0e1"
 
 
 @dataclass(frozen=True, slots=True)

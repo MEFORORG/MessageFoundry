@@ -59,6 +59,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # token requests can't amplify into unbounded audit_log growth. The rate-limit
         # reject itself is a _log.warning (NOT an audit) — parity with the JSON
         # _rate_limited path's anti-flood posture — so exhaustion writes zero DB rows.
+        # Read BEFORE the limiter: a repeated session cookie is refused 400 and charged once, by
+        # the handler that records it (BACKLOG #2454), not twice.
+        prior_session = session_token(request)
         client = request.client.host if request.client else None
         if not auth.allow_login_attempt(client):
             _log.warning("SSO rate limit exceeded for %s", client or "<unknown>")
@@ -95,7 +98,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # leg's start page does for OIDC. A same-site navigation, such as the login page's own link,
         # carries the cookie and is covered.
         outcome = await auth.authenticate_kerberos(
-            token_bytes, client=client, supersedes=session_token(request)
+            token_bytes, client=client, supersedes=prior_session
         )
         alert_directory_administrator_granted(
             request.app.state, outcome, via="directory_sign_in_sso"

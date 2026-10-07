@@ -10,6 +10,9 @@ lines first. HTTP answers 400; the WebSocket cookie hook declines the handshake.
 
 from __future__ import annotations
 
+import json
+import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -111,3 +114,81 @@ def test_the_copy_count_files_chunks_as_starlette_does() -> None:
     assert copies(_NAME, f"{_NAME}=a") == 1
     assert copies(f"{_NAME}x=a; x{_NAME}=b; {_NAME}=c") == 1
     assert copies() == 0
+
+
+async def _rows(engine: Engine) -> list[dict[str, object]]:
+    rows = await engine.store.list_audit(action="auth.repeated_credential", limit=100)
+    return [dict(row) for row in rows]
+
+
+async def test_a_page_refusal_is_logged_and_audited_without_the_value(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The engine's handler answers the console's raise too, so the cookie refusal leaves the
+    same WARNING line and ``auth.repeated_credential`` row the header refusal does."""
+    caplog.set_level("WARNING")
+    c, token = await _signed_in_cookie(engine)
+    try:
+        assert (await c.get("/ui", headers={"Cookie": f"{_NAME}={token}"})).status_code == 200
+        assert len(await _rows(engine)) == 0, "control: an accepted page writes no row"
+        repeated = await c.get("/ui", headers={"Cookie": f"{_NAME}=forged; {_NAME}={token}"})
+    finally:
+        await c.aclose()
+    assert repeated.status_code == 400
+    (row,) = await _rows(engine)
+    assert row["actor"] is None
+    assert json.loads(str(row["detail"])) == {"credential": "session_cookie", "path": "/ui"}
+    lines = [r.getMessage() for r in caplog.records if "API credential refused" in r.getMessage()]
+    assert len(lines) == 1 and "repeated session_cookie" in lines[0], lines
+    for text in (*(r.getMessage() for r in caplog.records), str(row["detail"])):
+        assert token not in text and "forged" not in text
+
+
+async def test_the_socket_cookie_refusal_is_audited(engine: Engine) -> None:
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    token = (await service.login("op", "a-strong-test-passphrase")).token
+    assert token is not None
+    app = create_app(engine, auth=service, serve_ui=True, loopback=True)
+    repeated = _handshake(app, [f"{_NAME}={token}", f"{_NAME}={token}"])
+    assert await authorize_ui_ws(repeated, Permission.MONITORING_READ) == (None, None)  # type: ignore[arg-type]
+    (row,) = await _rows(engine)
+    assert json.loads(str(row["detail"])) == {"credential": "session_cookie", "path": "/ws/stats"}
+
+
+#: A read of a request's cookie dict, the spelling that would skip the copy count.
+_COOKIE_READ = re.compile(r"\.cookies(?:\.get\(|\[)")
+#: The two reads allowed: ``session_token`` itself, and the OIDC flow cookie, which is a one-leg
+#: correlation value and not a session credential.
+_ALLOWED = {
+    ("messagefoundry_webconsole/_auth.py", "conn.cookies.get(session_cookie_name(conn))"),
+    (
+        "messagefoundry_webconsole/routes/oidc.py",
+        "request.cookies.get(oidc_flow_cookie_name(request))",
+    ),
+}
+
+
+def test_every_session_cookie_read_goes_through_session_token() -> None:
+    """A new ``cookies.get(session_cookie_name(...))`` would skip the copy count and reopen #2454
+    for the cookie, with every other test still green. Each allowed read is a positive control."""
+    assert _COOKIE_READ.search("token = request.cookies.get(name)")
+    assert _COOKIE_READ.search('value = websocket.cookies["mf_session"]')
+    root = Path(__file__).resolve().parents[3]
+    sources = [
+        path
+        for package in ("messagefoundry", "messagefoundry_webconsole")
+        for path in sorted((root / package).rglob("*.py"))
+    ]
+    assert len(sources) > 100, "the walk found too few source files to mean anything"
+    hits = [
+        (path.relative_to(root).as_posix(), line.strip())
+        for path in sources
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if _COOKIE_READ.search(line) and not line.lstrip().startswith("#")
+    ]
+    assert hits, "control: the walk must at least find session_token's own read"
+    allowed = [hit for hit in hits if any(f == hit[0] and code in hit[1] for f, code in _ALLOWED)]
+    assert len(allowed) == len(_ALLOWED), f"control: an allowed read moved: {allowed}"
+    offenders = [hit for hit in hits if hit not in allowed]
+    assert offenders == [], offenders

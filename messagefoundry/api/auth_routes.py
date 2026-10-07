@@ -19,7 +19,8 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import StreamingResponse
 
 # The /ui admin pages moved to the messagefoundry_webconsole package (Option B, ADR 0065); this module
@@ -71,6 +72,7 @@ from messagefoundry.api.auth_models import (
 )
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
+    RepeatedCredentialError,
     alert_administrator_granted,
     alert_directory_administrator_granted,
     answers_before_body,
@@ -82,6 +84,7 @@ from messagefoundry.api.security import (
     pending_credential_deadline,
     pending_credential_deadline_for,
     public_route,
+    record_repeated_credential,
     require,
     require_reauth_only_action,
     require_step_up,
@@ -407,6 +410,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     # (BACKLOG #2372), so on a router without it they would go out cacheable.
     if not issubclass(app.router.route_class, AuthenticatedBeforeBodyRoute):
         raise RuntimeError("add_auth_routes needs the AuthenticatedBeforeBodyRoute route class")
+
+    async def _repeated_credential(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2454: every HTTP read of a repeated Authorization header or session cookie, on
+        # the engine or the mounted console, raises this one error, so it is logged and audited in
+        # one place. Then the ordinary 400 answer, the one a plain HTTPException gets.
+        assert isinstance(exc, RepeatedCredentialError)
+        await record_repeated_credential(request, exc.credential)
+        return await http_exception_handler(request, exc)
+
+    app.add_exception_handler(RepeatedCredentialError, _repeated_credential)
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)
@@ -483,9 +496,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def negotiate(
         request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:
+        # Read BEFORE the limiter: a repeated header is refused 400 and charged once, by the
+        # handler that records it (BACKLOG #2454), not twice.
+        header = authorization_header(request)
         if not service.allow_login_attempt(_client(request)):
             raise _rate_limited(request, "negotiate")
-        header = authorization_header(request)  # 400 on a repeated header (BACKLOG #2454)
         if not header.startswith("Negotiate "):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing SPNEGO token")
         try:

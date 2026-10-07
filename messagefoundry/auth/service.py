@@ -2663,6 +2663,20 @@ class AuthService:
         """Record a failed boot-time SPNEGO acceptor preflight (app lifespan, ADR 0068 §9)."""
         self._kerberos_unavailable_reason = reason
 
+    async def audit_repeated_credential(
+        self, credential: str, path: str, *, client: str | None
+    ) -> None:
+        """Audit a request refused for carrying a credential more than once (BACKLOG #2454): the
+        ``Authorization`` header or the console's session cookie. ``credential`` is a fixed label,
+        never the value, and there is no actor, because neither copy was compared. The API plane's
+        twin of the intake listener's ``intake.auth_failed`` row (BACKLOG #2051). The caller charges
+        the sign-in limiter first (``api.security.record_repeated_credential``)."""
+        await self._audit(
+            "auth.repeated_credential",
+            detail=_json({"credential": credential, "path": path}),
+            client=client,
+        )
+
     async def audit_kerberos_reject(self, reason: str, *, client: str | None) -> None:
         """AUTH-K-AUDIT for route-level SSO rejects that never reach ``authenticate_kerberos``, such
         as cross-site hygiene and malformed base64, so a defender sees them. Rate-limit exhaustion

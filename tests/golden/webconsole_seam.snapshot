@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-5a49b51d647866fa
+2e7ba51c6149c0e1
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -109,6 +109,7 @@ current_user
 federated_identity_view
 
 ## api.security surface (imported directly by the console, outside UiDeps)
+RepeatedCredentialError: (credential: 'str', detail: 'str') -> 'None'
 alert_directory_administrator_granted: (state: 'Any', outcome: 'LoginOutcome', *, via: 'str') -> 'None'
 authorization_header: (request: 'Request') -> 'str'
 client_ip: (conn: 'Request | WebSocket') -> 'str | None'
@@ -120,6 +121,7 @@ mark_route_gate: (gate: 'G') -> 'G'
 pending_credential_deadline: (auth: 'AuthService', user: 'UserRecord | None') -> 'float | None'
 pending_credential_deadline_for: (auth: 'AuthService', user_id: 'str') -> 'float | None'
 public_route: (reason: 'str') -> 'Callable[[F], F]'
+record_repeated_credential: (conn: 'Request | WebSocket', credential: 'str') -> 'None'
 
 ## auth.service names imported by the console
 AuthService: class; its members are the AuthService section

@@ -23,10 +23,12 @@ from fastapi import HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import RedirectResponse
 
 from messagefoundry.api.security import (
+    RepeatedCredentialError,
     client_ip,
     enforce_phi_read_hop,
     get_auth,
     mark_route_gate,
+    record_repeated_credential,
 )
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
@@ -220,10 +222,11 @@ def session_cookie_copies(conn: Request | WebSocket) -> int:
 def session_token(conn: Request | WebSocket) -> str | None:
     """Read the session token from whichever cookie name applies to this connection's scheme.
 
-    Raises 400 when the request carries the cookie more than once (BACKLOG #2454). A WebSocket
-    caller checks :func:`session_cookie_copies` first, because a raise there is not an answer."""
+    Raises 400 when the request carries the cookie more than once (BACKLOG #2454), as the engine's
+    ``RepeatedCredentialError``, whose handler logs and audits it. A WebSocket caller checks
+    :func:`session_cookie_copies` first, because a raise there is not an answer."""
     if session_cookie_copies(conn) > 1:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, REPEATED_SESSION_COOKIE_DETAIL)
+        raise RepeatedCredentialError("session_cookie", REPEATED_SESSION_COOKIE_DETAIL)
     return conn.cookies.get(session_cookie_name(conn))
 
 
@@ -1339,8 +1342,10 @@ async def authorize_ui_ws(
     if not _origin_matches(websocket.app.state, origin, websocket.headers.get("host")):
         return None, None  # cross-origin browser handshake (CSWSH) — reject
     if session_cookie_copies(websocket) > 1:
-        # BACKLOG #2454: a repeated session cookie authenticates nothing. The caller falls back to
+        # BACKLOG #2454: a repeated session cookie authenticates nothing, and the refusal is logged
+        # and audited here, since a handshake has no exception handler. The caller falls back to
         # the header path, whose Origin check refuses a browser handshake.
+        await record_repeated_credential(websocket, "session_cookie")
         return None, None
     token = session_token(websocket)
     if not token:

@@ -50,6 +50,7 @@ from messagefoundry.config.tls_policy import HopDisposition
 from messagefoundry.credential import client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store.store import UserRecord
 
 log = logging.getLogger(__name__)
@@ -382,16 +383,64 @@ def sole_authorization(conn: HTTPConnection) -> str | None:
     return values[0] if values else ""
 
 
+class RepeatedCredentialError(HTTPException):
+    """A 400 for a request carrying a credential more than once (BACKLOG #2454).
+
+    ``credential`` names WHICH credential was repeated, as a fixed label (``authorization`` or
+    ``session_cookie``), never its value. The exception handler ``add_auth_routes`` installs
+    answers it with :func:`record_repeated_credential` and then the ordinary 400. It carries no
+    ``WWW-Authenticate``: a 400 is not an authentication challenge."""
+
+    def __init__(self, credential: str, detail: str) -> None:
+        super().__init__(status.HTTP_400_BAD_REQUEST, detail)
+        self.credential = credential
+
+
+#: How much of the request path the repeated-credential line and row keep.
+_REPEATED_PATH_MAX = 256
+
+
+async def record_repeated_credential(conn: Request | WebSocket, credential: str) -> None:
+    """Make a repeated-credential refusal visible, as #2051's intake refusal is (BACKLOG #2454).
+
+    A WARNING line always, and an ``auth.repeated_credential`` audit row when an auth service is
+    attached. Neither carries the header or cookie value: the line and the row name the credential
+    by label, the path and the caller's address. The row is charged to the sign-in limiter first,
+    as #2051 charges its refusal to the failed-attempt budget, because this is an unauthenticated
+    request and an uncharged row would let anyone grow ``audit_log`` without bound. Over budget,
+    the line is written and the row is not, which is how ``GET /ui/sso`` treats its own refusals.
+    The audit write is fail-soft: a store fault cannot turn the 400 into a 500."""
+    client = client_ip(conn)
+    # Starlette has already percent-decoded the path, so it can hold a line break or run long.
+    # Bounded for both sinks, and logged with %r so it cannot forge a second log line.
+    path = conn.url.path[:_REPEATED_PATH_MAX]
+    auth: AuthService | None = getattr(conn.app.state, "auth", None)
+    audited = False
+    if auth is not None and auth.allow_login_attempt(client):
+        try:
+            await auth.audit_repeated_credential(credential, path, client=client)
+            audited = True
+        except Exception as exc:  # noqa: BLE001 - fail-soft, as #2051's sink is
+            log.warning("repeated-credential audit write failed: %s", safe_exc(exc))
+    log.warning(
+        "API credential refused: repeated %s; peer=%s path=%r audited=%s",
+        credential,
+        client or "unknown",
+        path,
+        audited,
+    )
+
+
 def authorization_header(request: Request) -> str:
     """:func:`sole_authorization` for an HTTP route: a repeated header is refused with 400.
 
     400 and not 401, as #2051 answers at intake: the request is malformed, and no credential in it
     was compared. The header name is public here, so unlike #2051's configurable intake header the
-    refusal tells a caller nothing it did not know. This helper charges no rate limiter itself; a
-    route that consults one first, as ``POST /auth/negotiate`` does, has already charged it."""
+    refusal tells a caller nothing it did not know. The raise is a :class:`RepeatedCredentialError`,
+    which the handler logs, audits and charges (:func:`record_repeated_credential`)."""
     value = sole_authorization(request)
     if value is None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, REPEATED_AUTHORIZATION_DETAIL)
+        raise RepeatedCredentialError("authorization", REPEATED_AUTHORIZATION_DETAIL)
     return value
 
 
@@ -1590,11 +1639,13 @@ async def optional_identity(request: Request) -> Identity | None:
     ``GET /ai/policy``) are non-PHI.
 
     A repeated ``Authorization`` header (BACKLOG #2454) reads as no token here rather than a 400,
-    to keep the never-raises contract: the caller gets the tokenless answer, which grants nothing."""
+    to keep the never-raises contract: the caller gets the tokenless answer, which grants nothing.
+    It is still logged and audited like every other refusal (:func:`record_repeated_credential`)."""
     auth = get_auth(request)
     if auth is None:
         return _SYSTEM_IDENTITY if _allow_no_auth(request.app.state) else None
     if sole_authorization(request) is None:
+        await record_repeated_credential(request, "authorization")
         return None
     return await auth.identity_for_token(bearer_token(request))
 
@@ -1649,6 +1700,11 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     auth: AuthService | None = getattr(websocket.app.state, "auth", None)
     if auth is None:
         return _SYSTEM_IDENTITY if _allow_no_auth(websocket.app.state) else None
+    if sole_authorization(websocket) is None:
+        # BACKLOG #2454: refused like the HTTP reads, and recorded here because a handshake has no
+        # exception handler to do it. ws_token below would read the repeat as no token anyway.
+        await record_repeated_credential(websocket, "authorization")
+        return None
     identity = await auth.identity_for_token(ws_token(websocket))
     if identity is None:
         return None

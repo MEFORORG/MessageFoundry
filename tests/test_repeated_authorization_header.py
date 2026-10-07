@@ -21,20 +21,28 @@ is the guard that keeps a new read from bypassing the helper.
 from __future__ import annotations
 
 import functools
+import json
 import re
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from starlette.requests import Request
 from starlette.testclient import TestClient, WebSocketDenialResponse
 
 from messagefoundry.api import create_managed_app
-from messagefoundry.api.security import REPEATED_AUTHORIZATION_DETAIL
+from messagefoundry.api.security import (
+    REPEATED_AUTHORIZATION_DETAIL,
+    record_repeated_credential,
+)
 from messagefoundry.auth import Role
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests.test_api_auth import PW, _add
+from tests.test_api_auth import _client as _api_client
+from tests.test_api_auth import _service as _api_service
 from tests.test_directory_sign_in_admin_alert import _NEGOTIATE, _Sink
 from tests.test_directory_sign_in_admin_alert import _client as _directory_client
 from tests.test_directory_sign_in_admin_alert import _service as _directory_service
@@ -123,6 +131,46 @@ def test_optional_identity_answers_a_repeat_as_tokenless(
     assert tokenless.status_code == signed.status_code == repeated.status_code == 200
     assert signed.json() != tokenless.json(), "control: the signed-in answer differs"
     assert repeated.json() == tokenless.json()
+    # Not refused, but still recorded like every other repeat.
+    (row,) = _rows(tc)
+    assert json.loads(str(row["detail"])) == {"credential": "authorization", "path": "/ai/policy"}
+
+
+async def test_the_logged_path_cannot_forge_a_line(caplog: pytest.LogCaptureFixture) -> None:
+    """Starlette percent-decodes the path, so a server can see a line break in it that a test
+    client would have normalised away. Driven on a hand-built scope: the line carries the path
+    through ``%r`` and bounds its length."""
+    caplog.set_level("WARNING")
+    app = SimpleNamespace(state=SimpleNamespace(auth=None))
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/messages/a" + chr(10) + "API credential refused: forged" + "x" * 1000,
+        "query_string": b"",
+        "headers": [],
+        "client": ("192.0.2.9", 1),
+        "server": ("t", 80),
+        "app": app,
+    }
+    await record_repeated_credential(Request(scope), "authorization")
+    (line,) = _lines(caplog)
+    # The engine's log filter may also strip control characters, so assert only the outcome.
+    assert chr(10) not in line and "forged" in line, line
+    assert len(line) < 400, len(line)
+
+
+async def test_negotiate_charges_a_repeat_to_the_sign_in_budget_once(engine: Engine) -> None:
+    """The route reads the header before its own limiter call, so the handler's charge is the only
+    one: a budget of four admits four audited refusals, where a double charge would admit two."""
+    service = await _api_service(engine, AuthSettings(require_mfa=False, login_rate_limit_per_ip=4))
+    async with _api_client(engine, service) as c:
+        negotiate = _NEGOTIATE["Authorization"]
+        for _ in range(6):
+            answer = await c.post("/auth/negotiate", headers=_twice(negotiate, negotiate))
+            assert answer.status_code == 400 and answer.json() == _REPEATED
+    rows = await engine.store.list_audit(action="auth.repeated_credential", limit=100)
+    assert len(rows) == 4
 
 
 async def test_negotiate_refuses_a_repeated_header(
@@ -192,3 +240,83 @@ def test_every_authorization_read_goes_through_the_helper() -> None:
     assert len(helper) == 1, f"control: the helper's own read was not found once: {helper}"
     offenders = [f"{file}:{n}" for file, n, line in hits if (file, n, line) not in helper]
     assert offenders == [], offenders
+
+
+# --- visibility: the WARNING line and the audit row (BACKLOG #2454, #2051's shape) ---------------
+
+
+def _rows(tc: TestClient) -> list[dict[str, object]]:
+    assert tc.portal is not None
+    store = tc.app.state.auth.store  # type: ignore[attr-defined]
+    rows = tc.portal.call(
+        functools.partial(store.list_audit, action="auth.repeated_credential", limit=100)
+    )
+    return [dict(row) for row in rows]
+
+
+def _lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and "API credential refused" in r.getMessage()
+    ]
+
+
+def test_a_refusal_is_logged_and_audited_without_the_value(
+    signed_in: tuple[TestClient, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    tc, bearer = signed_in
+    caplog.set_level("WARNING")
+    # Control: an accepted request writes neither.
+    assert tc.get("/auth/me", headers={"Authorization": bearer}).status_code == 200
+    assert len(_rows(tc)) == 0 and len(_lines(caplog)) == 0
+    answer = tc.get("/auth/me", headers=_twice(bearer, "Bearer synthetic-other"))
+    assert answer.status_code == 400 and answer.json() == _REPEATED
+    assert "www-authenticate" not in answer.headers
+    (row,) = _rows(tc)
+    assert row["actor"] is None and row["client"] == "testclient"
+    assert json.loads(str(row["detail"])) == {"credential": "authorization", "path": "/auth/me"}
+    (line,) = _lines(caplog)
+    assert "repeated authorization" in line and "audited=True" in line, line
+    token = bearer.removeprefix("Bearer ")
+    for text in (line, str(row["detail"]), *(r.getMessage() for r in caplog.records)):
+        assert token not in text and "synthetic-other" not in text
+
+
+def test_the_socket_refusal_is_logged_and_audited(
+    signed_in: tuple[TestClient, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    tc, bearer = signed_in
+    caplog.set_level("WARNING")
+    with (
+        pytest.raises(WebSocketDenialResponse),
+        tc.websocket_connect("/ws/stats", headers=httpx.Headers(_twice(bearer, bearer))),
+    ):
+        pass
+    (row,) = _rows(tc)
+    assert json.loads(str(row["detail"])) == {"credential": "authorization", "path": "/ws/stats"}
+    assert len(_lines(caplog)) == 1
+
+
+def test_over_the_sign_in_budget_the_line_is_written_and_the_row_is_not(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The row is charged to the sign-in limiter, so an unauthenticated caller cannot grow the
+    audit log without bound. Over budget the refusal is still a 400, and still logged."""
+    app = create_managed_app(
+        db_path=tmp_path / "repeated-budget.db",
+        poll_interval=0.05,
+        auth_settings=AuthSettings(
+            require_mfa=False, notify_security_events=False, login_rate_limit_per_ip=3
+        ),
+        egress_settings=_EGRESS,
+    )
+    caplog.set_level("WARNING")
+    with TestClient(app) as tc:
+        repeated = _twice("Bearer synthetic-a", "Bearer synthetic-b")
+        answers = [tc.get("/auth/me", headers=repeated).status_code for _ in range(5)]
+        assert answers == [400] * 5
+        assert len(_rows(tc)) == 3, "the budget of three admits three rows"
+    lines = _lines(caplog)
+    assert len(lines) == 5
+    assert [("audited=True" in line) for line in lines] == [True, True, True, False, False]
