@@ -651,3 +651,211 @@ def test_a_rebound_range_voids_the_loop_index_exemption() -> None:
     }
     with pytest.raises(LensRewriteError, match=REFUSED):
         rewrite_source(src, edit)
+
+
+# --- round 3 (Theia review finding R1) -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "test",
+    [
+        "(lambda x=(yield): x)",  # a lambda's default runs in the handler
+        "(lambda: (await x))",  # parses, does not compile
+        "[x async for x in y]",  # parses, does not compile in a sync handler
+        "[i := 0 for i in w]",  # parses, does not compile
+    ],
+)
+def test_raw_test_that_does_not_compile_or_yields_through_a_default_is_refused(test: str) -> None:
+    with pytest.raises(LensRewriteError, match="raw 'test'|invalid Python"):
+        _clause(test)
+
+
+@pytest.mark.parametrize(
+    ("action", "params", "name"),
+    [
+        ("db_lookup", _DB, "db_lookup"),
+        (
+            "fhir_lookup",
+            {
+                "connection": "EPIC",
+                "query": "Patient",
+                "params": {"expr": '{"id": FhirToken("MRN", msg["A"] or "")}'},
+            },
+            "FhirToken",
+        ),
+        ("db_lookup", _DB, "exit"),
+    ],
+)
+def test_assign_to_cannot_shadow_what_the_inserted_line_reads(
+    action: str, params: dict[str, Any], name: str
+) -> None:
+    with pytest.raises(LensRewriteError, match="assign_to"):
+        _insert(params, action, assign_to=name)
+
+
+def test_a_thousand_term_sum_is_a_clean_refusal() -> None:
+    with pytest.raises(LensRewriteError, match="nested too deeply"):
+        _insert({"path": "PID-3.1", "value": {"expr": "+".join(["1"] * 1000)}})
+
+
+def test_inert_reads_with_a_loop_index_and_the_copy_fallback_are_admitted() -> None:
+    edit = {
+        "line_start": _FOR + 1,
+        "line_end": _FOR + 1,
+        "op": "insert_row",
+        "position": "before",
+        "action": "set_field",
+        "params": {"path": "OBX-11", "value": {"expr": 'msg.field("OBX-5", occurrence=i)'}},
+    }
+    assert 'msg.field("OBX-5", occurrence=i)' in rewrite_source(SOURCE, edit)
+    assert 'msg.field("PID-5") or ""' in _insert(
+        {"path": "PID-3.1", "value": {"expr": 'msg.field("PID-5") or ""'}}
+    )
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        _insert({"path": "PID-3.1", "value": {"expr": 'msg.field("OBX-5", occurrence=pid5)'}})
+
+
+@pytest.mark.parametrize(
+    ("value", "ok"),
+    [('FhirRaw("status,-date")', True), ('FhirRaw(msg["A"])', False), ("FhirRaw(x, y)", False)],
+)
+def test_fhir_raw_takes_a_literal_only(value: str, ok: bool) -> None:
+    params = {"connection": "EPIC", "query": "Patient", "params": {"expr": f'{{"_sort": {value}}}'}}
+    if ok:
+        assert value in _insert(params, "fhir_lookup")
+    else:
+        with pytest.raises(LensRewriteError, match=REFUSED):
+            _insert(params, "fhir_lookup")
+
+
+def test_code_lookup_var_bound_by_except_as_is_refused() -> None:
+    binding = "    try:\n        pass\n    except ValueError as GENDER:\n        pass\n"
+    src = SOURCE.replace('    pid5 = msg.field("PID-5")\n', binding)
+    send = len(src.splitlines())
+    edit = {
+        "line_start": send,
+        "line_end": send,
+        "op": "insert_code_lookup",
+        "position": "before",
+        "code_set": "gender",
+        "path": "PID-8",
+    }
+    with pytest.raises(LensRewriteError, match="local variable"):
+        rewrite_source(src, edit)
+
+
+def test_a_star_import_voids_the_loop_index_exemption() -> None:
+    src = "from somewhere import *\n" + SOURCE
+    edit = {
+        "line_start": _FOR + 2,
+        "line_end": _FOR + 2,
+        "op": "insert_row",
+        "position": "before",
+        "action": "set_field",
+        "params": {"path": "OBX-11", "value": "F", "occurrence": {"expr": "i"}},
+    }
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        rewrite_source(src, edit)
+
+
+@pytest.mark.parametrize("expr", ["1//0", "1/0", "1%3", 'b"x"', "1j", "...", "i / 2", "i // n"])
+def test_division_by_zero_modulo_and_odd_constants_are_refused(expr: str) -> None:
+    edit = {
+        "line_start": _FOR + 1,
+        "line_end": _FOR + 1,
+        "op": "insert_row",
+        "position": "before",
+        "action": "set_field",
+        "params": {"path": "OBX-11", "value": "F", "occurrence": {"expr": expr}},
+    }
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        rewrite_source(SOURCE, edit)
+
+
+@pytest.mark.parametrize(
+    ("action", "params"),
+    [
+        # Measured, item 3: an f-string reading the message is refused in a statement and in a
+        # log_note template or operand, because none of those is a value parameter.
+        (
+            "db_lookup",
+            {"connection": "M", "statement": {"expr": "f\"s {msg['PID-3']}\""}, "params": None},
+        ),
+        ("log_note", {"template": {"expr": "f\"MRN {msg['PID-3']}\""}}),
+        ("log_note", {"template": "MRN {}", "operand": {"expr": "f\"{msg['PID-3']}\""}}),
+    ],
+)
+def test_an_f_string_read_is_refused_outside_a_value_param(
+    action: str, params: dict[str, Any]
+) -> None:
+    with pytest.raises(LensRewriteError, match=REFUSED):
+        _insert(params, action)
+
+
+# --- dynamic overwrite, every mode ---------------------------------------------------------------
+
+
+def test_route_set_params_refuses_to_overwrite_a_computed_list() -> None:
+    src = '@router("R")\ndef r(msg):\n    return [pick(msg)]\n'
+    edit = {"line_start": 3, "line_end": 3, "op": "set_params", "params": {"handlers": ["H1"]}}
+    with pytest.raises(LensRewriteError, match="computed by code") as info:
+        rewrite_source(src, edit, contract=2)
+    assert info.value.code == "refused"
+    literal = src.replace("[pick(msg)]", '["H0"]')
+    assert 'return ["H1"]' in rewrite_source(literal, edit, contract=2)
+
+
+def test_send_set_params_refuses_to_overwrite_a_computed_destination() -> None:
+    src = '@handler("H")\ndef h(msg):\n    return Send(pick(msg), msg)\n'
+    edit = {"line_start": 3, "line_end": 3, "op": "set_params", "params": {"to": {"expr": '"OB"'}}}
+    with pytest.raises(LensRewriteError, match="computed by code"):
+        rewrite_source(src, edit)
+    named = src.replace("pick(msg)", "OB_DEST")
+    assert 'return Send("OB", msg)' in rewrite_source(named, edit)
+
+
+# --- typed-only structure limits (Manager decision 2026-10-07) -----------------------------------
+
+_STRUCT = """\
+@handler("H")
+def h(msg):
+    x = compute(msg)
+    if msg.field("PID-3.1") == "A":
+        pass
+    if msg.field("PID-3.1"):
+        y = compute(msg)
+    if re.match("A", msg["PID-3"] or ""):
+        pass
+    for i in range(1, msg.count_segments("OBX") + 1):
+        msg.set("OBX-11", "F", occurrence=i)
+    return Send("OB", msg)
+"""
+
+
+def _struct(op: str, line: int, *, typed_only: bool) -> str:
+    edit: dict[str, Any] = {"line_start": line, "line_end": line, "op": op}
+    if op == "move_row":
+        edit["direction"] = "down" if line == 3 else "up"
+    return rewrite_source(_STRUCT, edit, typed_only=typed_only)
+
+
+@pytest.mark.parametrize(
+    ("op", "line"),
+    [
+        ("move_row", 3),  # a lone code row
+        ("move_row", 6),  # an if whose body holds a code row
+        ("delete_row", 6),
+        ("move_row", 8),  # an if whose test no typed input renders
+        ("delete_row", 8),
+    ],
+)
+def test_typed_only_refuses_moving_or_deleting_untyped_code(op: str, line: int) -> None:
+    assert _struct(op, line, typed_only=False) != _STRUCT
+    with pytest.raises(LensRewriteError, match="typed-only mode") as info:
+        _struct(op, line, typed_only=True)
+    assert info.value.code == "refused"
+
+
+@pytest.mark.parametrize(("op", "line"), [("move_row", 4), ("delete_row", 4), ("delete_row", 10)])
+def test_typed_only_still_moves_and_deletes_typed_blocks(op: str, line: int) -> None:
+    assert _struct(op, line, typed_only=True) != _STRUCT

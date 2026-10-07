@@ -618,8 +618,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     lens_rewrite.add_argument(
         "--typed-only",
         action="store_true",
-        help="refuse the two edits that carry raw Python source - a 'paste_block' and an if/elif "
-        "'test' - so only typed Steps edits apply (default off; an analyst-facing editor must set it)",
+        help="refuse at least the edits known to carry raw Python source - a 'paste_block', an "
+        "if/elif 'test', and a move or delete of code not shown as typed steps (default off; an "
+        "analyst-facing editor must set it)",
     )
     # `lens rewrite` has no --json flag, yet every error it reports is JSON on stdout. Setting the
     # attribute lets `main` treat it as a --json command: its logging goes to stderr (BACKLOG #1489),

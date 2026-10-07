@@ -2299,16 +2299,14 @@ _MAX_LINE_LENGTH = 100
 
 
 def _refuse_raw_source(op: str, edit: dict[str, Any]) -> None:
-    """Refuse the edits that carry raw Python source, for the ``typed_only`` mode (owner ruling
+    """Refuse, in ``typed_only`` mode, the edits known to carry raw Python source (owner ruling
     2026-10-07, Theia review finding R1).
 
-    Two edits take source rather than typed values: a ``paste_block`` (the clipboard text) and an
-    ``if``/``elif`` raw ``test`` (the ADR 0106 escape hatch). Both stay available by default, for a
-    developer and today's IDE. An analyst-facing editor must set ``typed_only`` (nothing in this
-    repository sets it yet), so that, with its role-based access as the primary control, no edit it
-    sends can write arbitrary Python. Every other op writes
-    only what the lens renders from typed values. Refused with the generic code, so the IDE contract
-    gains no new refusal family."""
+    This refuses at least a ``paste_block`` (the clipboard text) and a rendered ``if``/``elif`` raw
+    ``test`` (the ADR 0106 escape hatch); :func:`_refuse_untyped_structure` adds the move and delete
+    limits. Both stay available by default, for a developer and today's IDE. An analyst-facing editor
+    must set ``typed_only`` (nothing in this repository sets it yet), with its role-based access as the
+    primary control. Refused with the generic code, so the IDE contract gains no new refusal family."""
     if op == "paste_block":
         raise LensRewriteError(
             "paste_block carries raw source and is refused in typed-only mode - edit it as text"
@@ -2322,6 +2320,135 @@ def _refuse_raw_source(op: str, edit: dict[str, Any]) -> None:
             "a raw 'test' carries raw source and is refused in typed-only mode - use a field, "
             "operator and value instead"
         )
+
+
+def _is_typed_if_test(test: ast.expr) -> bool:
+    """Whether ``test`` is one the ``if`` template renders from typed inputs (:func:`_render_if_test`):
+    ``msg.field(F)``, ``msg.field(F) == V``, ``msg.field(F) != V`` or ``V in (msg.field(F) or "")``."""
+
+    def _field(n: ast.expr) -> bool:
+        return (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "field"
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "msg"
+            and len(n.args) == 1
+            and not n.keywords
+            and isinstance(n.args[0], ast.Constant)
+            and isinstance(n.args[0].value, str)
+        )
+
+    def _str(n: ast.expr) -> bool:
+        return isinstance(n, ast.Constant) and isinstance(n.value, str)
+
+    if _field(test):
+        return True
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1):
+        return False
+    op, right = test.ops[0], test.comparators[0]
+    if isinstance(op, ast.Eq | ast.NotEq):
+        return _field(test.left) and _str(right)
+    return (
+        isinstance(op, ast.In)
+        and _str(test.left)
+        and isinstance(right, ast.BoolOp)
+        and isinstance(right.op, ast.Or)
+        and len(right.values) == 2
+        and _field(right.values[0])
+        and isinstance(right.values[1], ast.Constant)
+        and right.values[1].value == ""
+    )
+
+
+def _is_typed_for(node: ast.For) -> bool:
+    """Whether ``node`` is the For-Each header the template renders from a typed segment id:
+    ``for i in range(1, msg.count_segments(SEG) + 1):``."""
+    segment = None
+    it = node.iter
+    if (
+        isinstance(it, ast.Call)
+        and len(it.args) == 2
+        and not it.keywords
+        and isinstance(it.args[1], ast.BinOp)
+        and isinstance(it.args[1].left, ast.Call)
+        and it.args[1].left.args
+        and isinstance(it.args[1].left.args[0], ast.Constant)
+    ):
+        segment = it.args[1].left.args[0].value
+    if not isinstance(segment, str):
+        return False
+    rendered = ast.parse(_render_template({"template": "for_each", "segment_id": segment}).strip())
+    expected = rendered.body[0]
+    return (
+        isinstance(expected, ast.For)
+        and ast.dump(node.target) == ast.dump(expected.target)
+        and ast.dump(node.iter) == ast.dump(expected.iter)
+        and not node.orelse
+    )
+
+
+def _refuse_untyped_structure(
+    handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    row: dict[str, Any],
+    rows: list[dict[str, Any]],
+    op: str,
+    line_start: int,
+    line_end: int,
+) -> None:
+    """In ``typed_only`` mode, refuse a move or delete that would carry code the Steps view does not
+    show as typed rows (Manager decision 2026-10-07, Theia review finding R1).
+
+    Refused: a lone ``code`` row, and a control block whose header is not one the templates render
+    from typed inputs (:func:`_is_typed_if_test`, :func:`_is_typed_for`), whose body nests any other
+    block (``while``, ``try``, ``with``, ``match``, a ``def``), or whose body holds a ``code`` row with
+    any statement other than ``pass`` (a comment-only or ``pass`` row is what a typed edit leaves)."""
+    refusal = (
+        f"{op} of the rows at lines {line_start}-{line_end} is refused in typed-only mode - it would "
+        "move or remove code the Steps view does not show as typed steps; edit it as text"
+    )
+    if row["kind"] == "code":
+        raise LensRewriteError(refusal)
+    if row["kind"] != "control":
+        return
+    block = next(
+        (s for s in ast.walk(handler_node) if isinstance(s, ast.stmt) and s.lineno == line_start),
+        None,
+    )
+    if not isinstance(block, ast.If | ast.For):
+        raise LensRewriteError(refusal)
+    code_spans = [(r["line_start"], r["line_end"]) for r in rows if r["kind"] == "code"]
+    for node in ast.walk(block):
+        if isinstance(node, ast.If):
+            if not _is_typed_if_test(node.test):
+                raise LensRewriteError(refusal)
+        elif isinstance(node, ast.For):
+            if not _is_typed_for(node):
+                raise LensRewriteError(refusal)
+        elif isinstance(node, ast.stmt):
+            if _is_compound(node):
+                raise LensRewriteError(refusal)
+            if not isinstance(node, ast.Pass) and any(
+                lo <= node.lineno <= hi for lo, hi in code_spans
+            ):
+                raise LensRewriteError(refusal)
+
+
+def _is_compound(node: ast.stmt) -> bool:
+    """Whether ``node`` is a block statement (it has a body of its own)."""
+    return isinstance(
+        node,
+        ast.While
+        | ast.AsyncFor
+        | ast.With
+        | ast.AsyncWith
+        | ast.Try
+        | ast.TryStar
+        | ast.Match
+        | ast.FunctionDef
+        | ast.AsyncFunctionDef
+        | ast.ClassDef,
+    )
 
 
 def rewrite_module(
@@ -2393,8 +2520,9 @@ def rewrite_source(
     PROJECTED with
     (:data:`CONTRACT_V1` default): the row is located through the same grammar the client saw, so a v1
     client's coordinates resolve against the v1 partition and a v2 client's against the v2 one.
-    ``typed_only`` refuses the two edits that carry raw source, a ``paste_block`` and a raw ``test``
-    (:func:`_refuse_raw_source`). Raises :class:`LensParseError` on a syntax error,
+    ``typed_only`` refuses at least a ``paste_block``, a raw ``test``, and a move or delete of code the
+    Steps view does not show as typed (:func:`_refuse_raw_source`, :func:`_refuse_untyped_structure`).
+    Raises :class:`LensParseError` on a syntax error,
     :class:`LensRewriteError` on any refusal."""
     op = edit.get("op", "set_params")
     if op not in _SUPPORTED_OPS:
@@ -2475,6 +2603,13 @@ def rewrite_source(
         raise LensRewriteError(
             f"internal: could not locate {role} {row['_handler']!r} for lines {line_start}-{line_end}"
         )
+    if typed_only and op in ("move_row", "delete_row"):
+        rows = next(
+            c["rows"]
+            for c in contracts
+            if c["handler"] == row["_handler"] and c.get("role", "handler") == role
+        )
+        _refuse_untyped_structure(handler_node, row, rows, op, line_start, line_end)
 
     if op == "set_params" and kind == "note":
         # A note has no ``ast`` node, so every statement locator is unusable — this is the lens's only
@@ -2601,7 +2736,9 @@ def _assert_reparses(result: str, module: str) -> None:
     (:func:`_has_collapsible_wrapped_stmt`) a line — so the output ``ruff format`` would produce is the
     output the lens already wrote. Static-only: this parses (it never imports/executes) the result."""
     try:
-        ast.parse(result)
+        # `compile` too: it runs nothing, and it refuses what parses but cannot compile -- an
+        # `await` in a sync handler, a walrus rebinding a comprehension variable (Theia review R1).
+        compile(ast.parse(result), module, "exec", dont_inherit=True)
     except SyntaxError as exc:
         raise LensRewriteError(
             f"{module}: the rewrite would produce invalid Python ({exc.msg} at line {exc.lineno}) - "
@@ -2622,7 +2759,7 @@ def _apply_set_params(
     line_start: int,
     line_end: int,
     *,
-    blocked: frozenset[str] = frozenset({"msg"}),
+    blocked: frozenset[str],
 ) -> str:
     """v1 + v2 ``set_params``: splice edited argument values in place; return the bom-stripped result.
 
@@ -2648,9 +2785,21 @@ def _apply_set_params(
                 "(list-of-sends / dynamic return editing is out of scope)"
             )
         return src
+    if row["kind"] == "send":
+        for pname, node in slots.items():
+            if pname in params and not isinstance(node, ast.Constant | ast.Name):
+                # ``Send(pick(msg), msg)`` projects with no destination value, so a Steps edit
+                # would silently overwrite logic a developer wrote (Theia review finding R1).
+                raise LensRewriteError(
+                    f"row at lines {line_start}-{line_end}: the send's {pname!r} is computed by code "
+                    "the Steps view does not show - editing it would overwrite that code; edit it as "
+                    "text"
+                )
     if row["kind"] not in _MODED_KINDS:
         return _splice_slots(src, slots, params, blocked=blocked)
-    result = _splice_slots(src, slots, params, moded=(row["kind"], row.get("action")))
+    result = _splice_slots(
+        src, slots, params, moded=(row["kind"], row.get("action")), blocked=blocked
+    )
     if any(isinstance(v, dict) and set(v) == {"parts"} for v in params.values()):
         _refuse_overlong_template_lines(src, result, line_start, line_end)
     action = row.get("action")
@@ -2961,10 +3110,24 @@ def _apply_set_route(
             f"row at lines {line_start}-{line_end} is a bare 'return' — there is no destination list to "
             "splice; edit it as text"
         )
+    base = stmt.value
+    literal = (isinstance(base, ast.Constant) and isinstance(base.value, str)) or (
+        isinstance(base, ast.List | ast.Tuple)
+        and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in base.elts)
+    )
+    if not literal:
+        # ``return [pick(msg)]`` projects as ``handlers: []``, so writing a list over it would silently
+        # destroy routing logic a developer wrote (Theia review finding R1). Every mode refuses.
+        raise LensRewriteError(
+            f"row at lines {line_start}-{line_end}: the route's handler list is computed by code the "
+            "Steps view does not show - editing it would overwrite that code; edit it as text"
+        )
     rendered = "[" + ", ".join(_str_lit(h) for h in handlers) + "]"
     # Route through the audited slot splice: it works in UTF-8 byte space, refuses a multi-line value
     # (which would change the line count), and validates the rendered expression parses.
-    return _splice_slots(src, {"handlers": stmt.value}, {"handlers": {"expr": rendered}})
+    return _splice_slots(
+        src, {"handlers": stmt.value}, {"handlers": {"expr": rendered}}, blocked=frozenset({"msg"})
+    )
 
 
 # --- rewrite helpers ---------------------------------------------------------
@@ -3087,7 +3250,7 @@ def _splice_slots(
     params: dict[str, Any],
     *,
     moded: tuple[str, str | None] | None = None,
-    blocked: frozenset[str] = frozenset({"msg"}),
+    blocked: frozenset[str],
 ) -> str:
     """Replace ONLY each edited parameter's exact byte-span (its arg node in ``slots``) with the newly-
     rendered value; every other byte — the callee, parens, commas, unedited args, a read-only
@@ -3446,16 +3609,14 @@ def _insert_value_policy(call: str, pname: str) -> str:
     return _POLICY_LITERAL
 
 
-def _is_field_read(node: ast.expr) -> bool:
-    """Whether ``node`` is a message read that runs as written: ``msg["LIT"]``, its ``or ""`` fallback,
-    or ``msg.field("LIT")`` with only ``occurrence=``/``repetition=`` integer keywords.
+def _is_field_call(node: ast.expr, *, blocked: frozenset[str]) -> bool:
+    """Whether ``node`` is ``msg.field("LIT")`` with only ``occurrence=``/``repetition=`` keywords whose
+    values are integers or admitted names (a For-Each index: ``occurrence=i``).
 
     Stricter than :func:`_is_bounded_message_read`, which also admits extra POSITIONAL constants:
     ``Message.field`` takes ``occurrence`` and ``repetition`` keyword-only, so ``msg.field("X", 2)``
     raises TypeError on every message. That classifier is left alone because AC-M3 pins what it reads
     as ``templated``; this one decides only what a Steps insert may write."""
-    if _is_msg_subscript(node) or _is_empty_fallback_read(node):
-        return True
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -3467,11 +3628,55 @@ def _is_field_read(node: ast.expr) -> bool:
         and isinstance(node.args[0].value, str)
         and all(
             kw.arg in ("occurrence", "repetition")
-            and isinstance(kw.value, ast.Constant)
-            and type(kw.value.value) is int
+            and (
+                (isinstance(kw.value, ast.Constant) and type(kw.value.value) is int)
+                or (isinstance(kw.value, ast.Name) and _is_free_name(kw.value.id, blocked))
+            )
             for kw in node.keywords
         )
     )
+
+
+def _is_field_read(node: ast.expr, *, blocked: frozenset[str]) -> bool:
+    """Whether ``node`` is a message read that runs as written: ``msg["LIT"]``, an admitted
+    ``msg.field(...)`` call (:func:`_is_field_call`), or either one with an ``or ""`` fallback -- the
+    form the lens itself writes for ``copy_field``."""
+    if _is_msg_subscript(node) or _is_field_call(node, blocked=blocked):
+        return True
+    return (
+        isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.Or)
+        and len(node.values) == 2
+        and (_is_msg_subscript(node.values[0]) or _is_field_call(node.values[0], blocked=blocked))
+        and isinstance(node.values[1], ast.Constant)
+        and node.values[1].value == ""
+    )
+
+
+def _is_free_name(name: str, blocked: frozenset[str]) -> bool:
+    """Whether a plain name may appear where message content may not: not ``msg``, not a dunder, not in
+    ``blocked`` (:func:`_message_locals`)."""
+    return name != "msg" and not _is_dunder(name) and name not in blocked
+
+
+#: The constant types a Steps edit writes. Bytes, complex numbers and ``...`` are left out: no
+#: vocabulary parameter takes one, and a typed form cannot produce one.
+_INERT_CONSTANT_TYPES = (str, int, float, bool, type(None))
+
+#: The deepest expression tree the inert check walks. A typed value is a few levels deep; a
+#: thousand-term ``1+1+...`` would otherwise exhaust the recursion limit (Theia review finding R1).
+_MAX_INERT_DEPTH = 40
+
+
+def _expr_depth(node: ast.AST) -> int:
+    """The depth of ``node``'s tree, measured without recursion."""
+    deepest = 0
+    pending: list[tuple[ast.AST, int]] = [(node, 1)]
+    while pending:
+        current, depth = pending.pop()
+        deepest = max(deepest, depth)
+        pending.extend((child, depth + 1) for child in ast.iter_child_nodes(current))
+    return deepest
 
 
 def _is_inert_value(node: ast.expr, *, reads_ok: bool, blocked: frozenset[str]) -> bool:
@@ -3481,14 +3686,15 @@ def _is_inert_value(node: ast.expr, *, reads_ok: bool, blocked: frozenset[str]) 
     code-lookup ``default``) or on a send row's destination was spliced verbatim, so a typed edit could
     write ``__import__("os").system(...)`` into a handler. A ``set_params`` on an action, lookup or
     diagnostic row was already closed by ADR 0076 Amendment E (only a literal); this closes at least
-    those other paths.
+    those other paths. The caller bounds the tree's depth first (:data:`_MAX_INERT_DEPTH`).
 
     A CLOSED set, built on the existing classifiers. Always admitted:
 
-    * a ``static`` value (:func:`_param_mode`), a literal, and a sign on a number (``-1``);
-    * ``+ - * / // %`` over numbers and admitted names (``i + 1``), never ``**``;
-    * a plain name outside ``blocked`` (:func:`_message_locals`): a module-level binding no function
-      rebinds, or a For-Each ``range`` loop index. Neither can hold message content;
+    * a ``str``, ``int``, ``float``, ``bool`` or ``None`` literal, and a sign on a number (``-1``);
+    * ``+`` and ``-`` over numbers and admitted names (``i + 1``); ``*``, ``/`` and ``//`` over
+      number literals only, with a non-zero divisor. No ``%`` and no ``**``;
+    * a plain name :func:`_is_free_name` admits: a module-level binding no function rebinds, or a
+      For-Each ``range`` loop index. Neither can hold message content;
     * a list, tuple, set or dict built only from admitted values, with no ``*``/``**`` splat.
 
     Admitted only where ``reads_ok``:
@@ -3498,37 +3704,20 @@ def _is_inert_value(node: ast.expr, *, reads_ok: bool, blocked: frozenset[str]) 
       exactly what ``reads_ok`` allows.
 
     Everything else is refused: any other call, any attribute access, a subscript of anything but
-    ``msg``, an operator, a lambda, a comprehension. Nothing admitted here calls anything."""
-    mode = _param_mode(node)
-    if mode == MODE_STATIC:
-        return True
-    if mode == MODE_TEMPLATED and isinstance(node, ast.JoinedStr):
+    ``msg``, any other operator, a lambda, a comprehension. Nothing admitted here calls anything."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, _INERT_CONSTANT_TYPES)
+    if _param_mode(node) == MODE_TEMPLATED and isinstance(node, ast.JoinedStr):
         reads = [v.value for v in node.values if isinstance(v, ast.FormattedValue)]
-        return not reads or (reads_ok and all(_is_field_read(r) for r in reads))
-    if _is_field_read(node):
+        return not reads or (reads_ok and all(_is_field_read(r, blocked=blocked) for r in reads))
+    if _is_field_read(node, blocked=blocked):
         return reads_ok
     if isinstance(node, ast.Name):
-        if _is_dunder(node.id):
-            return False
-        return node.id != "msg" and (reads_ok or node.id not in blocked)
-    if isinstance(node, ast.UnaryOp):
-        return isinstance(node.op, ast.USub | ast.UAdd) and _is_numeric_operand(
-            node.operand, reads_ok=reads_ok, blocked=blocked
-        )
-    if isinstance(node, ast.BinOp):
-        # The IDE's free-text numeric fields (an index, a width, an occurrence) send `i + 1` or
-        # `1/3`. Plain arithmetic over numbers and admitted names calls nothing; `**` is left out.
-        # `*` and `%` take numbers only: a name may hold a string, and `s * 2000000000` repeats it
-        # into gigabytes on every message, while `s % x` is printf formatting.
-        if isinstance(node.op, ast.Mult | ast.Mod) and any(
-            isinstance(n, ast.Name) for n in ast.walk(node)
-        ):
-            return False
-        return (
-            isinstance(node.op, ast.Add | ast.Sub | ast.Mult | ast.Div | ast.FloorDiv | ast.Mod)
-            and _is_numeric_operand(node.left, reads_ok=reads_ok, blocked=blocked)
-            and _is_numeric_operand(node.right, reads_ok=reads_ok, blocked=blocked)
-        )
+        if reads_ok:
+            return node.id != "msg" and not _is_dunder(node.id)
+        return _is_free_name(node.id, blocked)
+    if isinstance(node, ast.UnaryOp | ast.BinOp):
+        return _is_arithmetic(node, reads_ok=reads_ok, blocked=blocked, names_ok=True)
     if isinstance(node, ast.List | ast.Tuple | ast.Set):
         return all(_is_inert_value(e, reads_ok=reads_ok, blocked=blocked) for e in node.elts)
     if isinstance(node, ast.Dict):
@@ -3541,46 +3730,80 @@ def _is_inert_value(node: ast.expr, *, reads_ok: bool, blocked: frozenset[str]) 
     return False
 
 
-def _is_numeric_operand(node: ast.expr, *, reads_ok: bool, blocked: frozenset[str]) -> bool:
-    """An operand of admitted arithmetic: a number, a signed number, an admitted name, or more of it."""
+def _is_arithmetic(
+    node: ast.expr, *, reads_ok: bool, blocked: frozenset[str], names_ok: bool
+) -> bool:
+    """Admitted arithmetic (see :func:`_is_inert_value`). ``names_ok`` is False under ``*``, ``/`` and
+    ``//``: a name may hold a string, and ``s * 2000000000`` repeats it into gigabytes per message."""
     if isinstance(node, ast.Constant):
         return type(node.value) in (int, float)
-    if isinstance(node, ast.Name | ast.UnaryOp | ast.BinOp):
-        return _is_inert_value(node, reads_ok=reads_ok, blocked=blocked)
-    return False
+    if isinstance(node, ast.Name):
+        return names_ok and _is_inert_value(node, reads_ok=reads_ok, blocked=blocked)
+    if isinstance(node, ast.UnaryOp):
+        return isinstance(node.op, ast.USub | ast.UAdd) and _is_arithmetic(
+            node.operand, reads_ok=reads_ok, blocked=blocked, names_ok=names_ok
+        )
+    if not isinstance(node, ast.BinOp):
+        return False
+    if isinstance(node.op, ast.Add | ast.Sub):
+        return _is_arithmetic(
+            node.left, reads_ok=reads_ok, blocked=blocked, names_ok=names_ok
+        ) and _is_arithmetic(node.right, reads_ok=reads_ok, blocked=blocked, names_ok=names_ok)
+    if not isinstance(node.op, ast.Mult | ast.Div | ast.FloorDiv):
+        return False
+    if isinstance(node.op, ast.Div | ast.FloorDiv) and not (
+        isinstance(node.right, ast.Constant)
+        and type(node.right.value) in (int, float)
+        and node.right.value != 0
+    ):
+        return False  # a divisor that is zero, or could be, raises ZeroDivisionError per message
+    return _is_arithmetic(
+        node.left, reads_ok=reads_ok, blocked=blocked, names_ok=False
+    ) and _is_arithmetic(node.right, reads_ok=reads_ok, blocked=blocked, names_ok=False)
+
+
+def _is_fhir_value_object(v: ast.expr, *, blocked: frozenset[str]) -> bool:
+    """``FhirToken(system, code)`` with a literal system and a code that may read the message, or
+    ``FhirRaw(<string literal>)``: the documented FHIR search value objects. ``FhirRaw`` is author
+    syntax passed through unscreened, and its own docstring says never to build one from message
+    data, so it takes a literal only."""
+    if not (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and not v.keywords):
+        return False
+    if v.func.id == "FhirToken":
+        return (
+            len(v.args) == 2
+            and _is_inert_value(v.args[0], reads_ok=False, blocked=blocked)
+            and _is_inert_value(v.args[1], reads_ok=True, blocked=blocked)
+        )
+    return (
+        v.func.id == "FhirRaw"
+        and len(v.args) == 1
+        and isinstance(v.args[0], ast.Constant)
+        and isinstance(v.args[0].value, str)
+    )
 
 
 def _is_inert_params_dict(node: ast.expr, *, blocked: frozenset[str], fhir: bool) -> bool:
     """Whether ``node`` is a lookup ``params`` value: a dict with literal keys and values that may read
     the message, or ``None``. Both lookups take ``params: Mapping[str, ...] | None``, so a list is
-    refused.
-
-    A FHIR one may also hold ``FhirToken(system, code)`` values, whose system half is literal and whose
-    code half may read (``FhirToken("MRN", msg["PID-3.1"] or "")``, the documented form)."""
+    refused. A FHIR one may also hold :func:`_is_fhir_value_object` values, alone or in a list (a
+    repeated search parameter)."""
     if isinstance(node, ast.Constant) and node.value is None:
         return True  # the signature's own default
     if not isinstance(node, ast.Dict):
         return False
 
-    def _value_ok(v: ast.expr) -> bool:
+    def _value_ok(v: ast.expr, *, top: bool) -> bool:
         if _is_inert_value(v, reads_ok=True, blocked=blocked):
             return True
-        if fhir and isinstance(v, ast.List):
-            # A repeated search parameter: a list of values or tokens (`FhirSearchParams`).
-            return all(_value_ok(e) for e in v.elts)
-        return (
-            fhir
-            and isinstance(v, ast.Call)
-            and isinstance(v.func, ast.Name)
-            and v.func.id == "FhirToken"
-            and not v.keywords
-            and len(v.args) == 2
-            and _is_inert_value(v.args[0], reads_ok=False, blocked=blocked)
-            and _is_inert_value(v.args[1], reads_ok=True, blocked=blocked)
-        )
+        if fhir and top and isinstance(v, ast.List):
+            return all(_value_ok(e, top=False) for e in v.elts)
+        return fhir and _is_fhir_value_object(v, blocked=blocked)
 
     return all(
-        k is not None and _is_inert_value(k, reads_ok=False, blocked=blocked) and _value_ok(v)
+        k is not None
+        and _is_inert_value(k, reads_ok=False, blocked=blocked)
+        and _value_ok(v, top=True)
         for k, v in zip(node.keys, node.values, strict=True)
     )
 
@@ -3590,7 +3813,7 @@ def _bound_names(node: ast.AST) -> list[str]:
 
     Assignment, ``for``, ``with`` and comprehension targets (``ast.Name`` in a Store context), ``except
     ... as`` names, ``match`` captures, imports, nested ``def``/``class`` names, and the parameters of a
-    nested ``def`` or ``lambda``."""
+    nested ``def`` or ``lambda``. A ``from m import *`` contributes ``*``."""
     out: list[str] = []
     for n in ast.walk(node):
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
@@ -3608,30 +3831,6 @@ def _bound_names(node: ast.AST) -> list[str]:
     return out
 
 
-def _module_level_names(tree: ast.Module) -> set[str]:
-    """Every name bound at MODULE scope, at any depth of ``if``/``try``/``with`` nesting, but not
-    inside a ``def``, ``class`` or ``lambda`` body (their own names count; their locals do not)."""
-    names: set[str] = set()
-    pending: list[ast.AST] = list(tree.body)
-    while pending:
-        node = pending.pop()
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            names.add(node.name)
-            continue
-        if isinstance(node, ast.Lambda):
-            continue
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            names.add(node.id)
-        elif isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name:
-            names.add(node.name)
-        elif isinstance(node, ast.MatchMapping) and node.rest:
-            names.add(node.rest)
-        elif isinstance(node, ast.Import | ast.ImportFrom):
-            names.update((al.asname or al.name).split(".")[0] for al in node.names)
-        pending.extend(ast.iter_child_nodes(node))
-    return names
-
-
 def _message_locals(
     func: ast.FunctionDef | ast.AsyncFunctionDef, tree: ast.Module
 ) -> frozenset[str]:
@@ -3640,10 +3839,11 @@ def _message_locals(
     Every name the handler binds (:func:`_bound_names`; its parameters, ``msg`` above all), except a
     For-Each ``range`` loop index, plus every name any function in the module declares ``global``: any
     of those may have been read from the message (``pid5 = msg.field("PID-5")``). A loop index is
-    exempt only when every binding of the name is a ``for <name> in range(...)`` target, so it is an
-    int. What is left is a module-level binding no function rebinds (an import, a constant, a
-    ``code_set`` capture) or a name not bound yet; neither holds message content, because module code
-    runs before any message exists."""
+    exempt only when every binding of the name is a ``for <name> in range(...)`` target, and only while
+    ``range`` is the builtin: rebound in the handler or module, or possibly supplied by a star import,
+    voids the exemption. What is left is a module-level binding no function rebinds (an import, a
+    constant, a ``code_set`` capture) or a name not bound yet; neither holds message content, because
+    module code runs before any message exists."""
     bound = _bound_names(func)
     range_targets = [
         n.target.id
@@ -3655,8 +3855,9 @@ def _message_locals(
         and n.iter.func.id == "range"
     ]
     loop_indexes = {x for x in set(range_targets) if bound.count(x) == range_targets.count(x)}
-    if "range" in bound or "range" in _module_level_names(tree):
-        loop_indexes = set()  # a rebound `range` is not the builtin, so its loop yields anything
+    module_names, star = _module_bound_names(tree)
+    if star or "range" in bound or "range" in module_names:
+        loop_indexes = set()
     globals_ = {name for n in ast.walk(tree) if isinstance(n, ast.Global) for name in n.names}
     return frozenset((set(bound) - loop_indexes) | globals_ | {"msg"})
 
@@ -3668,7 +3869,16 @@ def _is_reserved_binding(name: str) -> bool:
     return name == "msg" or keyword.iskeyword(name) or _is_dunder(name) or name in _BUILTIN_NAMES
 
 
-_BUILTIN_NAMES = frozenset(dir(builtins))
+#: ``dir(builtins)`` plus the names the ``site`` module adds, which ``python -S`` leaves out, so the
+#: set does not depend on how the engine was started.
+_BUILTIN_NAMES = frozenset(dir(builtins)) | {
+    "copyright",
+    "credits",
+    "exit",
+    "help",
+    "license",
+    "quit",
+}
 
 
 def _refuse_active_expr(
@@ -3676,12 +3886,17 @@ def _refuse_active_expr(
     pname: str,
     *,
     policy: str = _POLICY_LITERAL,
-    blocked: frozenset[str] = frozenset({"msg"}),
+    blocked: frozenset[str],
 ) -> None:
     """Refuse an ``{"expr": ...}`` value the ``policy`` does not admit (Theia review finding R1).
 
     ``rendered`` has already passed :func:`_validated_expr`, so it parses as one expression."""
     node = ast.parse(rendered, mode="eval").body
+    if _expr_depth(node) > _MAX_INERT_DEPTH:
+        raise LensRewriteError(
+            f"parameter {pname!r}: the expression is nested too deeply for a Steps edit; "
+            "edit it as text"
+        )
     if policy in (_POLICY_DB_PARAMS, _POLICY_FHIR_PARAMS):
         ok = _is_inert_params_dict(node, blocked=blocked, fhir=policy == _POLICY_FHIR_PARAMS)
         allowed = (
@@ -3691,15 +3906,16 @@ def _refuse_active_expr(
         reads_ok = policy == _POLICY_VALUE
         ok = _is_inert_value(node, reads_ok=reads_ok, blocked=blocked)
         allowed = (
-            "a literal, a name, a message read, or a list or dict of those"
+            "a literal, a name, a message read, simple arithmetic, or a list or dict of those"
             if reads_ok
-            else "a literal, a module-level name or loop index, or a list or dict of those"
+            else "a literal, a module-level name or loop index, simple arithmetic, or a list or "
+            "dict of those"
         )
     if not ok:
         raise LensRewriteError(
             f"parameter {pname!r}: the expression is not a value a Steps edit may write here - only "
-            f"{allowed} is accepted (a call, an attribute access, an operator, or message content "
-            "where it must not go is refused); edit it as text"
+            f"{allowed} is accepted (a call, an attribute access, other operators, or message "
+            "content where it must not go is refused); edit it as text"
         )
 
 
@@ -3831,30 +4047,38 @@ def _paste_anchor_indent(lines: list[str], line_start: int, line_end: int, posit
 
 
 def _module_bound_names(tree: ast.Module) -> tuple[set[str], bool]:
-    """Names bound at module scope (imports, assignments, def/class) + whether a wildcard import exists.
+    """Names bound at MODULE scope + whether a wildcard import exists.
 
-    Used by :func:`_name_in_scope` to decide whether an inserted vocabulary call would resolve. A
-    ``from m import *`` binds an unknown set, so the second element is ``True`` and the caller treats any
-    name as in scope (permissive — never a false refusal)."""
+    Any depth of ``if``/``try``/``with``/``for``/``match`` nesting counts (a ``try``-guarded import binds
+    its name), but not the body of a ``def``, ``class`` or ``lambda``: their own names count, their
+    locals do not. A ``from m import *`` binds an unknown set, so the second element is ``True``; for
+    :func:`_name_in_scope` that means any name may be in scope (permissive, never a false refusal),
+    and for :func:`_message_locals` that ``range`` may not be the builtin."""
     names: set[str] = set()
     star = False
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                names.add(alias.asname or alias.name.split(".")[0])
+    pending: list[ast.AST] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)
+        elif isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)
+        elif isinstance(node, ast.Import):
+            names.update(al.asname or al.name.split(".")[0] for al in node.names)
         elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if alias.name == "*":
+            for al in node.names:
+                if al.name == "*":
                     star = True
                 else:
-                    names.add(alias.asname or alias.name)
-        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            names.add(node.name)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                names.update(sub.id for sub in ast.walk(target) if isinstance(sub, ast.Name))
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names.add(node.target.id)
+                    names.add(al.asname or al.name)
+        pending.extend(ast.iter_child_nodes(node))
     return names, star
 
 
@@ -3987,8 +4211,15 @@ def _apply_insert_row(
             if isinstance(n, ast.Global | ast.Nonlocal)
             for name in n.names
         }
+        # The inserted line's own reads: the callee and the import it may inject (``db_lookup =
+        # db_lookup(...)`` raises UnboundLocalError), and any name in its arguments (``FhirToken``).
+        handler_names |= {
+            n.id
+            for n in ast.walk(ast.parse(rendered))
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+        } | {action}
         if isinstance(assign_to, str) and (
-            assign_to in handler_names or assign_to in _module_level_names(module_tree)
+            assign_to in handler_names or assign_to in _module_bound_names(module_tree)[0]
         ):
             # A name the handler binds or reads anywhere would change under it: ``sends``, a loop
             # index, an earlier result, or a module or star-imported name (``Send``, a ``code_set``
@@ -4688,6 +4919,9 @@ def _validated_raw_test(test: str, *, is_async: bool = False) -> str:
     while pending:
         node = pending.pop()
         if isinstance(node, ast.Lambda):
+            # The body belongs to the lambda; its defaults run in the handler (`x=(yield)`).
+            pending.extend(node.args.defaults)
+            pending.extend(d for d in node.args.kw_defaults if d is not None)
             continue
         if isinstance(node, ast.Yield | ast.YieldFrom) or (
             isinstance(node, ast.Await) and not is_async
@@ -5035,7 +5269,7 @@ def _apply_insert_code_lookup(
     # ``var`` local for the whole body, so a module-level ``var = code_set(...)`` would be SHADOWED and the
     # inserted ``code_lookup(msg, path, var)`` would reference the local instead — refuse (module-scope
     # collisions are caught below).
-    if _function_binds(handler_node, var):
+    if var in _bound_names(handler_node):
         raise LensRewriteError(
             f"insert_code_lookup: {var!r} is a local variable of this handler — a module-level "
             "code_set(...) binding would be shadowed; choose a different variable name"
@@ -5200,7 +5434,7 @@ def _render_native_insert_call(
     params: dict[str, Any],
     assign_to: Any,
     *,
-    blocked: frozenset[str] = frozenset({"msg"}),
+    blocked: frozenset[str],
 ) -> str:
     """Render the NATIVE Message-API form of an inserted ``set_field``/``copy_field``/``delete_segment``.
 
@@ -5285,9 +5519,7 @@ _NATIVE_OCCURRENCE_KW: dict[str, tuple[str, ...]] = {
 }
 
 
-def _native_occurrence_suffix(
-    name: str, params: dict[str, Any], blocked: frozenset[str] = frozenset({"msg"})
-) -> str:
+def _native_occurrence_suffix(name: str, params: dict[str, Any], blocked: frozenset[str]) -> str:
     """Render the ``, occurrence=<v>[, repetition=<v>]`` kwarg suffix for a native insert (ADR 0106 §5 C).
 
     Only the kwargs the underlying Message method accepts are allowed; an unsupported one (e.g. a
@@ -5381,7 +5613,7 @@ def _render_insert_call(
     params: dict[str, Any],
     assign_to: Any,
     *,
-    blocked: frozenset[str] = frozenset({"msg"}),
+    blocked: frozenset[str],
 ) -> str:
     """Render a NEW vocabulary action/lookup call ``name(...)`` (optionally ``target = name(...)``).
 
@@ -5459,7 +5691,7 @@ def _render_insert_value(
     pname: str,
     *,
     policy: str = _POLICY_LITERAL,
-    blocked: frozenset[str] = frozenset({"msg"}),
+    blocked: frozenset[str],
 ) -> str:
     """Render a NEW call argument value: a scalar as a Python literal, an ``{"expr": …}`` verbatim.
 
