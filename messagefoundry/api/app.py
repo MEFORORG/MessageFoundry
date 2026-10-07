@@ -226,7 +226,6 @@ from messagefoundry.api.security import (
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
     get_auth,
-    holds_step_up_action,
     optional_identity,
     pending_credential_deadline,
     public_route,
@@ -239,6 +238,7 @@ from messagefoundry.api.security import (
     require_step_up,
     require_step_up_action,
     spend_step_up_action,
+    step_up_window_live,
     ws_token,
 )
 from messagefoundry.api.svg_sanitize import SvgRejected, may_be_svg, sanitize_if_svg
@@ -4020,6 +4020,29 @@ def create_app(
         )
         return result
 
+    async def _rejoin_without_proof(
+        request: Request,
+        gate: ApprovalGate | None,
+        operation: str,
+        params: dict[str, Any],
+        identity: Identity,
+    ) -> str | None:
+        """The caller's open hold for this exact request, answered with no proof, or ``None``.
+
+        For the two ``proof_in_route`` routes (vault BACKLOG #2625). A rejoin holds and runs nothing,
+        so it spends no proof, even one the request brought. It does need a live session window,
+        as the org opt-out asks of every request, so a session whose window has lapsed goes to the
+        proof instead. ``None`` sends the route on to its spend and its guard."""
+        if gate is None or not await step_up_window_live(request):
+            return None
+        return await gate.rejoin(
+            operation,
+            params,
+            requester=identity.username,
+            requester_user_id=identity.user_id,
+            client=client_ip(request),
+        )
+
     @app.post("/connections/{name}/purge", response_model=PurgeResult | PendingApprovalResponse)
     async def purge_connection(
         name: ConnectionName,
@@ -4036,22 +4059,17 @@ def create_app(
     ) -> PurgeResult | PendingApprovalResponse:
         """Soft-cancel queued deliveries to an outbound connection (across all inbounds).
 
-        A repeat of the caller's own open dual-control hold, sent with no proof, answers its 202
-        again (vault BACKLOG #2625). It does so only while the purge would still be held, so a
-        repeat for an outbound since restarted or removed is refused as a first request is. Any
-        other request spends the proof bound to ``connection_purge`` before it is held or run."""
+        A repeat of the caller's own open dual-control hold answers its 202 again with no new proof
+        (vault BACKLOG #2625), see :func:`_rejoin_without_proof`. It does so only while the purge
+        would still be held. Any other request spends the proof bound to ``connection_purge``
+        before it is held or run."""
+        # Both of the core's refusals before its guard, so a doomed purge is never told "held".
         if (
-            gate is not None
-            and _purge_in_scope(identity)
+            _purge_in_scope(identity)
             and _purge_target_refusal(engine.registry_runner, name) is None
-            and not await holds_step_up_action(request, STEP_UP_ACTION_CONNECTION_PURGE)
         ):
-            held = await gate.rejoin(
-                "connection_purge",
-                _purge_hold_params(name, scope),
-                requester=identity.username,
-                requester_user_id=identity.user_id,
-                client=client_ip(request),
+            held = await _rejoin_without_proof(
+                request, gate, "connection_purge", _purge_hold_params(name, scope), identity
             )
             if held is not None:
                 return _held_reply(response, held, "connection_purge")
@@ -4085,6 +4103,8 @@ def create_app(
             raise HTTPException(
                 403, "channel-scoped users cannot purge a shared outbound connection"
             )
+        # The proof-free rejoin in purge_connection reads this same function, so a new refusal
+        # before the guard belongs inside it, or a doomed repeat is told "held".
         refusal = _purge_target_refusal(engine.registry_runner, name)
         if refusal is not None:
             raise refusal
@@ -4922,23 +4942,21 @@ def create_app(
         An inline reload writes ``config_reload_attempted`` before it swaps anything, and answers 503
         without reloading when the audit log refuses that row (vault BACKLOG #2254).
 
-        A repeat of the caller's own open hold, sent with no proof, answers its 202 again (vault
-        BACKLOG #2625). Any other request, a ``dry_run`` included, spends the proof bound to
-        ``config_reload`` first.
+        A repeat of the caller's own open hold answers its 202 again with no new proof (vault
+        BACKLOG #2625), see :func:`_rejoin_without_proof`. Any other request, a ``dry_run``
+        included, spends the proof bound to ``config_reload`` first.
 
         Error responses are intentionally generic (the detail is logged server-side, not returned)
         so a config:deploy holder can't probe the filesystem via reload error text."""
-        if (
-            gate is not None
-            and not req.dry_run
-            and not await holds_step_up_action(request, STEP_UP_ACTION_CONFIG_RELOAD)
-        ):
-            held = await gate.rejoin(
+        # The core refuses nothing before its guard. A refusal added there must be read here too,
+        # as the purge route reads _purge_target_refusal, or a doomed repeat is told "held".
+        if not req.dry_run:
+            held = await _rejoin_without_proof(
+                request,
+                gate,
                 "config_reload",
                 _reload_hold_params(req.config_dir, user.username),
-                requester=user.username,
-                requester_user_id=user.user_id,
-                client=client_ip(request),
+                user,
             )
             if held is not None:
                 return _held_reply(response, held, "config_reload")
