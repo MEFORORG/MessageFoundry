@@ -484,8 +484,9 @@ async def test_a_caller_without_view_summary_gets_no_error_text_and_no_reveal_li
 ) -> None:
     """The control for the mask: it only hides what permission allows. A Viewer holds
     ``messages:read`` and not ``messages:view_summary``, so the dead-letter list gives it null
-    rather than a mask, and offers no reveal. The Operator on the same row is the positive
-    control that the row renders at all."""
+    rather than a mask, and offers no reveal. It lacks ``messages:view_raw`` too, so the row's
+    "view" link is gone as well (BACKLOG #2440) and the message id renders as plain text, which is
+    the evidence the row rendered. The Operator on the same row is the positive control."""
     service = await _service(engine)
     await _add(service, "vw", Role.VIEWER)
     await _add(service, "op", Role.OPERATOR)
@@ -494,13 +495,14 @@ async def test_a_caller_without_view_summary_gets_no_error_text_and_no_reveal_li
     async with _client(engine, service) as c:
         await _cookie_login(c, "vw")
         dead = await c.get("/ui/dead-letters")
-        assert dead.status_code == 200 and f"/ui/messages/{mid}" in dead.text
+        assert dead.status_code == 200 and f"<td>{mid}</td>" in dead.text
+        assert f'href="/ui/messages/{mid}"' not in dead.text
         assert _DELIVERY_ERROR not in dead.text and reveal not in dead.text
         assert "****" not in dead.text
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         dead = await c.get("/ui/dead-letters")
-        assert reveal in dead.text
+        assert reveal in dead.text and f'href="/ui/messages/{mid}"' in dead.text
 
 
 async def test_a_view_summary_role_without_view_raw_sees_the_mask_and_no_reveal_link(
@@ -524,16 +526,19 @@ async def test_a_view_summary_role_without_view_raw_sees_the_mask_and_no_reveal_
     async with _client(engine, service) as c:
         await _cookie_login(c, "summ")
         dead = await c.get("/ui/dead-letters")
-        assert dead.status_code == 200 and f"/ui/messages/{mid}" in dead.text
+        assert dead.status_code == 200 and f"<td>{mid}</td>" in dead.text
         assert "****" in dead.text, "the role holds view_summary, so the error arrives masked"
         assert _DELIVERY_ERROR not in dead.text
         assert reveal not in dead.text
-        # Why the link must go: the reveal route refuses this role.
+        assert f'href="/ui/messages/{mid}"' not in dead.text
+        # Why both links must go: both routes refuse this role.
         assert (await c.get(f"/ui/messages/{mid}/errors")).status_code == 403
+        assert (await c.get(f"/ui/messages/{mid}")).status_code == 403
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         dead = await c.get("/ui/dead-letters")
         assert "****" in dead.text and reveal in dead.text
+        assert f'href="/ui/messages/{mid}"' in dead.text
 
 
 async def test_the_replay_redirect_lands_on_a_page_that_reveals_nothing(engine: Engine) -> None:

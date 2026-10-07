@@ -118,14 +118,14 @@ def test_the_dead_letter_replay_forms_encode_a_name_carrying_a_slash() -> None:
             _dead_letters("IB/ACME", "OB/PARTNER"),
             channel_id="IB/ACME",
             destination_name="OB/PARTNER",
-            can_reveal_errors=True,
+            can_view_raw=True,
         )
     ) + str(
         dead_letters(
             _dead_letters("IB/ACME", "OB/PARTNER"),
             channel_id="IB/ACME",
             destination_name="",
-            can_reveal_errors=True,
+            can_view_raw=True,
         )
     )
 
@@ -147,14 +147,14 @@ def test_a_benign_connection_name_still_renders_readably() -> None:
             _dead_letters("IB_ACME_ADT", "OB_PARTNER_ADT"),
             channel_id="IB_ACME_ADT",
             destination_name="OB_PARTNER_ADT",
-            can_reveal_errors=True,
+            can_view_raw=True,
         )
     ) + str(
         dead_letters(
             _dead_letters("IB_ACME_ADT", "OB_PARTNER_ADT"),
             channel_id="IB_ACME_ADT",
             destination_name="",
-            can_reveal_errors=True,
+            can_view_raw=True,
         )
     )
     assert "/ui/dead-letters/IB_ACME_ADT/replay" in html
