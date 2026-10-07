@@ -42,6 +42,7 @@ import time
 
 import pytest
 
+from harness.load.connscale import runner
 from harness.load.connscale.probe import ProcSample
 from harness.load.connscale.runner import (
     _MIN_IN_HOLD_SAMPLES,
@@ -84,14 +85,34 @@ class _FakePoller:
     """A poller that answers instantly, so the loop's own cadence is the only thing under test.
 
     `answers` is the sequence of verdicts: True hands back a reading, False hands back `None` (the
-    shape a transient poll failure takes). The last verdict repeats forever."""
+    shape a transient poll failure takes). The last verdict repeats forever.
 
-    def __init__(self, answers: tuple[bool, ...] = (True,)) -> None:
+    Given the hold's `stop`, it also counts the polls made AFTER the hold ended -- the floor's make-up
+    attempts, read off the loop's own behaviour rather than off a stopwatch -- and refuses one past
+    `max_calls_after_stop`, so an unbounded floor fails at once instead of spinning to the timeout."""
+
+    def __init__(
+        self,
+        answers: tuple[bool, ...] = (True,),
+        *,
+        stop: asyncio.Event | None = None,
+        max_calls_after_stop: int | None = None,
+    ) -> None:
         self._answers = answers
+        self.stop = stop
+        self._max_calls_after_stop = max_calls_after_stop
         self.calls = 0
+        self.calls_after_stop = 0
         self.origin = time.perf_counter()
 
     async def sample_once(self) -> EngineSample | None:
+        if self.stop is not None and self.stop.is_set():
+            self.calls_after_stop += 1
+            cap = self._max_calls_after_stop
+            assert cap is None or self.calls_after_stop <= cap, (
+                f"the sampler polled {self.calls_after_stop} times after the hold ended against a "
+                f"bound of {cap} -- the make-up ticks are unbounded"
+            )
         verdict = self._answers[min(self.calls, len(self._answers) - 1)]
         self.calls += 1
         return _engine_sample(time.perf_counter() - self.origin) if verdict else None
@@ -118,15 +139,20 @@ async def _hold(stop: asyncio.Event, seconds: float) -> None:
 
 
 async def _run_sampler(
-    poller: _FakePoller, *, hold_s: float, interval: float = _INTERVAL_S
+    poller: _FakePoller,
+    *,
+    hold_s: float,
+    interval: float = _INTERVAL_S,
 ) -> tuple[list[EngineSample], int]:
     """Drive `_sample_loop` for one simulated hold. Returns the in-hold readings and the number of
-    make-up ticks the floor had to spend.
+    make-up ticks the floor had to spend. The hold ends on the poller's own `stop` when it was given
+    one, so the poller and the loop can never be watching two different events.
 
     THE ONE LINE THAT MOVED FOR THE RED RUN. Against unmodified code this called
     `_sample_loop(poller, None, interval, stop, out)` -- the old parameter list, with the OS probe on
-    the poll's tick. Every assertion below is the same in both arms."""
-    stop = asyncio.Event()
+    the poll's tick, and every assertion was the same in both arms. The dead-poller and control arms
+    were later moved from timing the step to counting its polls; their bounds did not change."""
+    stop = poller.stop if poller.stop is not None else asyncio.Event()
     out: list[EngineSample] = []
     floor_ticks, _ = await asyncio.gather(
         _sample_loop(poller, interval, stop, out),  # type: ignore[arg-type]
@@ -201,35 +227,67 @@ async def test_a_probe_costing_multiples_of_the_interval_no_longer_starves_the_s
     )
 
 
-async def test_a_poller_that_never_answers_cannot_hold_the_step_open() -> None:
+async def test_a_poller_that_never_answers_cannot_hold_the_step_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """THE BOUND. The floor counts ATTEMPTS past the stop, not readings, so an engine that has stopped
-    answering ends the step with an honest short window instead of spinning inside it."""
-    poller = _FakePoller(answers=(False,))
-    started = time.perf_counter()
-    samples, _ = await _run_sampler(poller, hold_s=0.05)
-    elapsed = time.perf_counter() - started
+    answering ends the step with an honest short window instead of spinning inside it: at most
+    `_MIN_IN_HOLD_SAMPLES` make-up ticks, each under one interval.
+
+    COUNTED, NOT TIMED. This arm used to assert the step's elapsed seconds against
+    `0.05 + interval * (floor + 2)`, and a loaded windows-2022 merge-queue runner measured 1.21 s
+    against that 1.05 s bound on 2026-10-07. Elapsed time is the attempts TIMES what one tick costs on
+    that box, and only the first factor is the property. So both halves of the bound are read off the
+    loop's own decisions: the poller counts the polls made after the hold ended, and the make-up
+    sleeps are recorded as the delays the loop ASKED for, which no runner's speed can move. That is
+    also stricter than the stopwatch was: one extra attempt, or a make-up tick asking for twice the
+    interval, both fitted inside the old 1.05 s and both fail here."""
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    class _RecordingAsyncio:
+        """The runner's `asyncio`, with `sleep` -- the make-up tick's only use of it -- recorded."""
+
+        async def sleep(self, delay: float) -> None:
+            slept.append(delay)
+            await real_sleep(delay)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(asyncio, name)
+
+    monkeypatch.setattr(runner, "asyncio", _RecordingAsyncio())
+    poller = _FakePoller(
+        answers=(False,), stop=asyncio.Event(), max_calls_after_stop=_MIN_IN_HOLD_SAMPLES
+    )
+    samples, floor_ticks = await _run_sampler(poller, hold_s=0.05)
     assert samples == []
-    # At most `_MIN_IN_HOLD_SAMPLES` make-up ticks of one interval each, plus the hold itself.
-    assert elapsed < 0.05 + _INTERVAL_S * (_MIN_IN_HOLD_SAMPLES + 2), (
-        f"the sampler stayed in its floor for {elapsed:.2f}s against a dead poller -- the make-up "
-        f"ticks are unbounded"
+    assert floor_ticks == poller.calls_after_stop, (
+        f"the loop reported {floor_ticks} make-up tick(s) but polled {poller.calls_after_stop} "
+        f"time(s) after the hold -- the provenance field miscounts the floor's attempts"
+    )
+    assert len(slept) == poller.calls_after_stop, (slept, poller.calls_after_stop)
+    assert all(0.0 <= delay <= _INTERVAL_S for delay in slept), (
+        f"the floor's make-up ticks asked to sleep {slept} against a {_INTERVAL_S}s interval -- each "
+        f"must be the REST of one interval, or the bound on attempts no longer bounds the step"
     )
 
 
 async def test_a_hold_with_room_to_spare_is_not_extended_by_the_floor() -> None:
     """THE CONTROL. The floor must be a floor, not a tax: a hold that already affords several readings
     must stop when it is told to. Without this arm, a loop that always ran two extra ticks would pass
-    every assertion above."""
-    poller = _FakePoller()
-    started = time.perf_counter()
+    every assertion above.
+
+    The extra ticks are COUNTED as polls after the hold ended, for the reason the dead-poller arm
+    gives: this arm's stopwatch had 0.5 s of headroom, less than a loaded runner was measured to add
+    to that arm on 2026-10-07."""
+    poller = _FakePoller(stop=asyncio.Event(), max_calls_after_stop=0)
     samples, floor_ticks = await _run_sampler(poller, hold_s=_HOLD_S)
-    elapsed = time.perf_counter() - started
     assert len(samples) >= 4, len(samples)
     assert floor_ticks == 0, (
         f"a hold that met the floor unaided reported {floor_ticks} make-up tick(s) -- the field "
         f"cannot separate a starved step from a healthy one if it fires on both"
     )
-    assert elapsed < _HOLD_S + _INTERVAL_S * 2, (
-        f"a {_HOLD_S}s hold that already met the floor took {elapsed:.2f}s to stop -- the make-up "
-        f"ticks are running when they are not needed"
+    assert poller.calls_after_stop == 0, (
+        f"a {_HOLD_S}s hold that already met the floor polled {poller.calls_after_stop} more time(s) "
+        f"after it ended -- the make-up ticks are running when they are not needed"
     )
