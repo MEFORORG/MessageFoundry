@@ -372,8 +372,9 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
     )
 
 
-#: Identifiers of the packages two acknowledgements were triaged as ABSENT from the bundle on
-#: (cla-action-advisories.toml, the 2026-10-07 block). Each must count 0 in ``dist/index.js``.
+#: Identifiers of every package on the braces and sprintf-js chains, which two acknowledgements were
+#: triaged as ABSENT from the bundle on (cla-action-advisories.toml, the 2026-10-07 block). Each
+#: must count 0 in ``dist/index.js``. Removing one needs that triage redone, not just this edit.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
@@ -398,7 +399,11 @@ def test_the_triaged_bundle_reading_still_holds() -> None:
         encoding="utf-8"
     )
 
+    # One check per input the probe walk reads, so a zero below cannot come from walking nothing:
+    # the control shows the probes can find code in this bundle text, and the probe list is
+    # non-empty. Which probes the list must hold is the triage's call, recorded in the baseline.
     assert len(_PRESENT_IN_BUNDLE.findall(bundle)) == 2, "the control no longer finds @actions/core"
+    assert _ABSENT_FROM_BUNDLE, "no probes left, so the absence below would check nothing"
     present = [probe.pattern for probe in _ABSENT_FROM_BUNDLE if probe.search(bundle)]
     assert not present, f"triaged as absent from the bundle, now present: {present}"
 
