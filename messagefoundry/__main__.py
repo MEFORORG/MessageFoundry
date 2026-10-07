@@ -7771,8 +7771,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
+        audit_chain_read_errors,
         open_store,
-        store_open_errors,
     )
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.keyprovider import KeyProviderError
@@ -7821,8 +7821,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
     walk_errors: tuple[type[Exception], ...] = (
         CipherError,
         KeyProviderError,
-        UnicodeError,
-        *store_open_errors(),
+        *audit_chain_read_errors(),
     )
 
     def stopped(exc: Exception) -> _AuditWalkStopped:
@@ -7832,7 +7831,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
             type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
         )
 
-    async def run() -> tuple[AuditVerdict, int]:
+    async def run() -> AuditVerdict:
         # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
         # this build does not match, so a store an incompatible version wrote can still be verified.
         try:
@@ -7851,23 +7850,17 @@ def _audit_verify(args: argparse.Namespace) -> int:
         except walk_errors as exc:
             # Split by WHERE the error arose, not by its class (vault BACKLOG #3054, item 10). The
             # store tags an error raised while it read the chain's rows, an outage part way
-            # included: that is the walk's FAIL line and exit 1. Any other driver or connection
-            # error at the open is "could not start", exit 2: at least a refused connection, which
-            # asyncpg raises as an OSError, and a failed login, pyodbc's InterfaceError. A key that
-            # does not resolve before a row is read is exit 2 by the wrapper.
+            # included. That gets the walk's FAIL line and exit 1. Any other such error at the open
+            # is "could not start", exit 2. That covers at least a refused connection (asyncpg's
+            # OSError), a failed login (pyodbc's InterfaceError), and a missing table, column or
+            # grant. A key that does not resolve before a row is read is exit 2 by the wrapper.
             if AUDIT_CHAIN_READ_NOTE in getattr(exc, "__notes__", ()):
                 raise stopped(exc) from exc
             raise _StoreUnreachable() from exc
         try:
-            verdict = await store.verify_audit_chain(expected_anchor=expected_anchor)
-            if not verdict[0] or (verdict.keyless_walk and keyless_refusal is not None):
-                # A FAIL exits 1 or 4, and a keyless walk here exits 5, whatever the count; so
-                # don't query for it.
-                return verdict, -1
-            # The row count decides the empty-log exit below. Ask the store for an integer rather
-            # than pattern-matching "verified 0 " out of a human-readable message.
-            count, _head = await store.audit_anchor()
-            return verdict, count
+            # The verdict carries the walk's own row count, which decides the empty-log exit
+            # below: no second query, which could fail after a clean walk or see other rows.
+            return await store.verify_audit_chain(expected_anchor=expected_anchor)
         except walk_errors as exc:
             raise stopped(exc) from exc
         finally:
@@ -7882,7 +7875,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
                 )
 
     try:
-        verdict, count = run_guarded(run())
+        verdict = run_guarded(run())
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -7909,9 +7902,13 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; a server backend's open lands here, so both guards stay live. Only an error
         # the open raised outside its read of the chain's rows: see the split in `run`.
-        return _emit_store_open_error(
-            cast(Exception, exc.__cause__), settings.store.path, as_json=False
+        # A server backend has no file: name it as the store names itself, server/database.
+        where = (
+            settings.store.path
+            if settings.store.backend == StoreBackend.SQLITE
+            else f"{settings.store.server}/{settings.store.database}"
         )
+        return _emit_store_open_error(cast(Exception, exc.__cause__), where, as_json=False)
     ok, message = verdict
     if verdict.key_unavailable:
         if keyless_refusal is not None:
@@ -7942,7 +7939,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # reading only the code never sees the WARNING, so 0 would hide that. NOT 4 EITHER: this is
         # the one setup where a rewritten first row turns later tampering from 1 into 4 (#2725). With
         # 5 as its steady state, that rewrite shows as a move from 5 to 4. Neither the exit nor the
-        # text reads the row count: it is a second query, which a writer can change after the walk,
+        # text reads the row count, which only decides the empty-log exit,
         # and an empty log (no first row naming a key) is keyless-shaped too. Content-free.
         print(
             f"NOT CHECKED: this shell holds no store key and its settings require one, so the audit "
@@ -7970,7 +7967,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         )
         return 5
     print("OK: " + (message or ""))
-    if count:
+    if verdict.rows:
         return 0
 
     # An empty log on a real audit database is legitimate, and at a glance indistinguishable from

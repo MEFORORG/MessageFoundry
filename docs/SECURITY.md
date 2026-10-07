@@ -4598,8 +4598,8 @@ A driver, connection or decode error raised during those reads gets the same lin
 a lock or an outage at that moment also exits 1. The store marks those errors; the split is by
 where the error arose, not by its class. A driver or connection error raised anywhere else in
 the open is "could not start", exit 2. That covers at least a refused connection, a failed login
-and an unreadable path. A table or column the read needs that is missing is a schema mismatch,
-which exits 2 too. A failed close of the store never changes the exit code; it prints a warning
+and an unreadable path. A table, column or grant the read needs that is missing exits 2 too: it
+says the store does not match this build, not anything about a row. A failed close of the store never changes the exit code; it prints a warning
 naming the error's class. A server driver's error text is shown only through the same PHI
 redaction as the log.
 

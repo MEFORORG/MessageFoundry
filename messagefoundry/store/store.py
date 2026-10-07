@@ -2579,6 +2579,9 @@ class AuditVerdict(tuple[bool, str | None]):
 
     key_unavailable: bool
     keyless_walk: bool
+    #: How many rows the walk covered, on a clean verdict; -1 where it does not say. Read from the
+    #: walk itself, so a caller needs no second query that could fail or see other rows.
+    rows: int
 
     def __new__(
         cls,
@@ -2586,14 +2589,19 @@ class AuditVerdict(tuple[bool, str | None]):
         message: str | None,
         key_unavailable: bool = False,
         keyless_walk: bool = False,
+        rows: int = -1,
     ) -> Self:
         verdict = super().__new__(cls, (ok, message))
         verdict.key_unavailable = key_unavailable and not ok
         verdict.keyless_walk = keyless_walk and ok
+        verdict.rows = rows
         return verdict
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (type(self), (self[0], self[1], self.key_unavailable, self.keyless_walk))
+        return (
+            type(self),
+            (self[0], self[1], self.key_unavailable, self.keyless_walk, self.rows),
+        )
 
 
 def verify_audit_rows(
@@ -2847,6 +2855,7 @@ def verify_audit_rows(
         True,
         f"verified {count} audit row(s)",
         keyless_walk=not capable,
+        rows=count,
     )
 
 
@@ -2908,14 +2917,15 @@ AUDIT_CHAIN_READ_NOTE = "raised while the store read or started the audit chain 
 
 
 def note_audit_chain_read(exc: BaseException) -> None:
-    """Add :data:`AUDIT_CHAIN_READ_NOTE` to ``exc`` when it is a driver or connection error
-    (:func:`~messagefoundry.store.base.store_open_errors`), or a ``UnicodeError`` a driver raised
-    decoding a row. Other errors, the engine's own refusals among them, are left as they are. A
+    """Add :data:`AUDIT_CHAIN_READ_NOTE` to ``exc`` when it is one of
+    :func:`~messagefoundry.store.base.audit_chain_read_errors` and not a missing table, column or
+    grant. Other errors, the engine's own refusals among them, are left as they are. A
     Transit refusal there is a ``CipherError``, which a verifying caller already treats as row
     evidence."""
-    from messagefoundry.store.base import store_open_errors
+    from messagefoundry.store.base import audit_chain_read_errors, is_store_shape_error
 
-    if isinstance(exc, (*store_open_errors(), UnicodeError)):
+    # A shape error is a store this build cannot read, which a caller reports as "could not start".
+    if isinstance(exc, audit_chain_read_errors()) and not is_store_shape_error(exc):
         exc.add_note(AUDIT_CHAIN_READ_NOTE)
 
 

@@ -2999,24 +2999,49 @@ def store_driver_errors() -> tuple[type[Exception], ...]:
 
 
 def store_connect_errors() -> tuple[type[Exception], ...]:
-    """What a driver raises when it cannot reach its server at all, beyond
-    :func:`store_driver_errors` (vault BACKLOG #3054, item 10). At least ``OSError``, which asyncpg
-    raises for a refused connection, and pyodbc's ``Error`` root, whose ``InterfaceError`` is a
-    failed login (SQLSTATE 28000). The pyodbc entry is left out when it is not installed."""
-    errors: list[type[Exception]] = [OSError]
+    """What a store raises when it cannot reach its database, beyond :func:`store_driver_errors`
+    (vault BACKLOG #3054, item 10). At least ``OSError``, which asyncpg raises for a refused
+    connection, :class:`StoreAcquireTimeout`, a pool borrow that waited out a database that stopped
+    answering, and ``pyodbc.InterfaceError``, a failed login (SQLSTATE 28000). The pyodbc entry is
+    left out when it is not installed. Not pyodbc's ``Error`` root, which would take in a defect."""
+    errors: list[type[Exception]] = [OSError, StoreAcquireTimeout]
     try:
         import pyodbc
     except ImportError:
         pass
     else:
-        errors.append(pyodbc.Error)
+        errors.append(pyodbc.InterfaceError)
     return tuple(errors)
 
 
 def store_open_errors() -> tuple[type[Exception], ...]:
-    """:func:`store_driver_errors` and :func:`store_connect_errors`: every error a store open can
-    raise from its driver or its connection, on any backend."""
+    """:func:`store_driver_errors` and :func:`store_connect_errors`: at least the driver and
+    connection errors a store open can raise, on any backend."""
     return (*store_driver_errors(), *store_connect_errors())
+
+
+def audit_chain_read_errors() -> tuple[type[Exception], ...]:
+    """What a read of the audit chain's rows can raise from the store: :func:`store_open_errors`,
+    and ``UnicodeError``, which a driver raises decoding a row's text. The one list both the open's
+    tag (:func:`~messagefoundry.store.store.note_audit_chain_read`) and ``audit-verify`` read, so
+    the two cannot drift (vault BACKLOG #3054, item 10)."""
+    return (*store_open_errors(), UnicodeError)
+
+
+def is_store_shape_error(exc: BaseException) -> bool:
+    """Whether ``exc`` says the store's tables, columns or grants are not what a read needs, and
+    not anything about a row: SQLite's schema-step error, or SQLSTATE class 42 from a server
+    driver (a missing table or column, or a permission denied). Row content cannot cause one."""
+    import sqlite3
+
+    from messagefoundry.store.schema_verify import is_schema_step_error
+
+    if is_schema_step_error(exc):
+        return True
+    state = getattr(exc, "sqlstate", None)  # asyncpg
+    if state is None and not isinstance(exc, sqlite3.Error) and exc.args:
+        state = exc.args[0]  # pyodbc: (sqlstate, message)
+    return isinstance(state, str) and state.startswith("42")
 
 
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
@@ -3180,8 +3205,9 @@ async def _close_quietly(store: Store) -> None:
     """Close ``store`` on an error path without letting a close failure replace the real error."""
     try:
         await store.close()
-    except Exception:
-        log.warning("closing the store after a failed open also failed", exc_info=True)
+    except Exception as exc:
+        # By class only: a driver's text is not this function's to vouch for (vault BACKLOG #3054).
+        log.warning("closing the store after a failed open also failed (%s)", type(exc).__name__)
 
 
 async def _open_backend(

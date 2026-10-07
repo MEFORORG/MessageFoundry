@@ -800,7 +800,11 @@ def _stand_in_drivers(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         store_base, "store_driver_errors", lambda: (sqlite3.DatabaseError, _ServerDriverError)
     )
-    monkeypatch.setattr(store_base, "store_connect_errors", lambda: (OSError, _PyodbcError))
+    monkeypatch.setattr(
+        store_base,
+        "store_connect_errors",
+        lambda: (OSError, store_base.StoreAcquireTimeout, _PyodbcError),
+    )
 
 
 _UNREACHABLE = [
@@ -809,6 +813,7 @@ _UNREACHABLE = [
     OSError("Connect call failed ('10.0.0.5', 5432)"),
     ConnectionRefusedError(111, "Connection refused"),
     _InterfaceError("28000", "[28000] Login failed for user 'svc'"),
+    _ServerDriverError("42P01", 'relation "audit_log" does not exist'),
 ]
 
 
@@ -929,6 +934,97 @@ def test_a_close_that_fails_keeps_the_checks_exit_code(
     assert "cannot open the store" not in captured.err, captured.err
     assert "closing the store failed (_ServerDriverError)" in captured.err, captured.err
     assert "ROWMARKER" not in captured.out + captured.err
+
+
+def test_a_driver_error_in_a_real_open_of_the_chain_fails_the_check(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Through the real read-only open, not a stand-in for it: a driver error raised while the open
+    reads the genesis row is tagged by ``load_audit_chain`` and survives ``_load_read_only``, so it
+    is the FAIL line and exit 1. The control is the same open with no error, which exits 0."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    assert main(["audit-verify", "--db", str(db)]) == 0  # the control
+    capsys.readouterr()
+
+    async def failing(self: MessageStore) -> object:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(MessageStore, "_audit_genesis_row", failing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: the audit chain check stopped part way"), captured.out
+
+
+def test_a_shape_error_reading_the_chain_is_not_tagged() -> None:
+    """A missing table, column or grant says nothing about a row, so the store does not tag it,
+    and the open reports it as "could not start". SQLSTATE class 42, as asyncpg names it and as
+    pyodbc puts it first in ``args``. The controls are a connection error and a decode error."""
+    from messagefoundry.store.base import is_store_shape_error
+    from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE, note_audit_chain_read
+
+    asyncpg_like = _ServerDriverError('relation "audit_log" does not exist')
+    asyncpg_like.sqlstate = "42P01"  # type: ignore[attr-defined]
+    pyodbc_like = _ServerDriverError("42S22", "Invalid column name 'seq'.")
+    lost = _ServerDriverError("08S01", "Communication link failure")
+    assert is_store_shape_error(asyncpg_like) and is_store_shape_error(pyodbc_like)
+    assert not is_store_shape_error(lost)
+    assert not is_store_shape_error(sqlite3.OperationalError("42 is not a code"))
+    with pytest.MonkeyPatch.context() as patch:
+        _stand_in_drivers(patch)
+        for shape in (asyncpg_like, pyodbc_like):
+            note_audit_chain_read(shape)
+            assert AUDIT_CHAIN_READ_NOTE not in getattr(shape, "__notes__", ()), shape
+        note_audit_chain_read(lost)
+        assert AUDIT_CHAIN_READ_NOTE in getattr(lost, "__notes__", ())
+
+
+def test_a_clean_walk_needs_no_second_query_for_its_count(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The verdict carries the walk's own row count. A count query that failed after a clean walk
+    turned an OK into "stopped part way"; there is no such query now."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+
+    async def failing(self: MessageStore) -> object:
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(MessageStore, "audit_anchor", failing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 0, (captured.out, captured.err)
+    assert captured.out.startswith("OK: verified 3 audit row(s)"), captured.out
+
+
+def test_a_server_store_that_cannot_be_reached_is_named_by_server_and_database(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A server backend has no file, so the could-not-start line names it as the store names
+    itself, server/database, not the unused SQLite path."""
+    from messagefoundry.store import base as store_base
+
+    _stand_in_drivers(monkeypatch)
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "postgres")
+    monkeypatch.setenv("MEFOR_STORE_SERVER", "db01")
+    monkeypatch.setenv("MEFOR_STORE_DATABASE", "mefor")
+    monkeypatch.setenv("MEFOR_STORE_USERNAME", "svc")
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-verify"])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert "cannot open the store at db01/mefor: ConnectionRefusedError" in captured.err, (
+        captured.err
+    )
 
 
 def test_a_server_driver_error_at_the_open_is_redacted(

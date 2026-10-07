@@ -3,9 +3,9 @@
   not UTF-8, including the rows the store open reads. These reached the last-resort handler
   (exit 1) or the store-open refusal (exit 2) with no `FAIL` line, so a job on a first deployment
   would have had nothing to read, or a code a planted row could pick. The line names the error's
-  class and its cause's class, never its text. A store that cannot be reached at the open, such
-  as a refused connection or a failed login, exits 2 on every backend; on a server backend it
-  reached the last-resort handler and exited 1. A server driver's error text goes through the
+  class and its cause's class, never its text. A store that cannot be reached at the open now
+  exits 2 on every backend. That covers at least a refused connection and a failed login, which
+  on a server backend exited 1 at the last-resort handler. A server driver's error text goes through the
   PHI redaction, and a failed close never changes the exit code. A store cipher the settings
   cannot build, a key that is not base64 of 32 bytes among them, now exits 2, could not start,
   from at least `audit-verify`, `audit-anchor`, `admin-unlock`, `admin-set-notify-email`,
