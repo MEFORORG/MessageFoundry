@@ -2372,6 +2372,22 @@ class AuthService:
             if settings.login_rate_limit_enabled
             else None
         )
+        # BACKLOG #2454: the budget for ``auth.repeated_credential`` audit rows. A repeated
+        # Authorization header or session cookie is refused before any credential is read, so the
+        # row is written for an unauthenticated caller and needs a bound. It is its OWN budget, on
+        # the login knobs like _reauth_limiter, and never draws on _login_limiter: a proxy that
+        # duplicates a header, or a tab holding a planted cookie, would otherwise spend the sign-in
+        # budget of everyone behind the same address. Keyed on the client address, with a global
+        # ceiling of its own so a flood from many addresses still cannot grow audit_log unbounded.
+        self._repeated_credential_limiter: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=settings.login_rate_limit_per_ip,
+                glob=settings.login_rate_limit_global,
+                window_seconds=settings.login_rate_limit_window_seconds,
+            )
+            if settings.login_rate_limit_enabled
+            else None
+        )
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # host keys already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
@@ -2539,6 +2555,15 @@ class AuthService:
             return True
         return self._login_limiter.allow(client or "unknown")
 
+    def allow_repeated_credential_audit(self, client: str | None) -> bool:
+        """Whether a repeated-credential refusal may write its ``auth.repeated_credential`` row
+        (BACKLOG #2454). Its own budget, never the sign-in one, so a flood of such refusals cannot
+        refuse a sign-in from the same address. True = write; always True when the limiter is
+        disabled."""
+        if self._repeated_credential_limiter is None:
+            return True
+        return self._repeated_credential_limiter.allow(client or "unknown")
+
     def allow_reauth_attempt(self, actor: str) -> bool:
         """Rate-limit gate for the POST-session credential ceremonies, keyed on the acting user.
 
@@ -2670,7 +2695,8 @@ class AuthService:
         ``Authorization`` header or the console's session cookie. ``credential`` is a fixed label,
         never the value, and there is no actor, because neither copy was compared. The API plane's
         twin of the intake listener's ``intake.auth_failed`` row (BACKLOG #2051). The caller charges
-        the sign-in limiter first (``api.security.record_repeated_credential``)."""
+        :meth:`allow_repeated_credential_audit` first, never the sign-in limiter
+        (``api.security.record_repeated_credential``)."""
         await self._audit(
             "auth.repeated_credential",
             detail=_json({"credential": credential, "path": path}),

@@ -160,17 +160,37 @@ async def test_the_logged_path_cannot_forge_a_line(caplog: pytest.LogCaptureFixt
     assert len(line) < 400, len(line)
 
 
-async def test_negotiate_charges_a_repeat_to_the_sign_in_budget_once(engine: Engine) -> None:
-    """The route reads the header before its own limiter call, so the handler's charge is the only
-    one: a budget of four admits four audited refusals, where a double charge would admit two."""
+async def test_negotiate_charges_the_sign_in_budget_once_per_repeat(engine: Engine) -> None:
+    """The route charges the sign-in limiter, then reads the header; the refusal's row draws its
+    own budget. So a budget of four admits four 400s, then the limiter's 429. A refusal that also
+    drew the sign-in budget would turn the third request into a 429."""
     service = await _api_service(engine, AuthSettings(require_mfa=False, login_rate_limit_per_ip=4))
     async with _api_client(engine, service) as c:
         negotiate = _NEGOTIATE["Authorization"]
-        for _ in range(6):
-            answer = await c.post("/auth/negotiate", headers=_twice(negotiate, negotiate))
-            assert answer.status_code == 400 and answer.json() == _REPEATED
+        answers = [
+            (await c.post("/auth/negotiate", headers=_twice(negotiate, negotiate))).status_code
+            for _ in range(6)
+        ]
+    assert answers == [400, 400, 400, 400, 429, 429]
     rows = await engine.store.list_audit(action="auth.repeated_credential", limit=100)
     assert len(rows) == 4
+
+
+async def test_a_flood_of_repeats_leaves_sign_in_usable(engine: Engine) -> None:
+    """The row's budget is not the sign-in one: ten refusals from one address, over a budget of
+    three, write three rows and leave that address able to sign in."""
+    service = await _api_service(engine, AuthSettings(require_mfa=False, login_rate_limit_per_ip=3))
+    await _add(service, "root", Role.ADMINISTRATOR)
+    async with _api_client(engine, service) as c:
+        repeated = _twice("Bearer synthetic-a", "Bearer synthetic-b")
+        for _ in range(10):
+            assert (await c.get("/auth/me", headers=repeated)).status_code == 400
+        login = await c.post(
+            "/auth/login", json={"username": "root", "password": PW, "provider": "local"}
+        )
+        assert login.status_code == 200, login.text
+    rows = await engine.store.list_audit(action="auth.repeated_credential", limit=100)
+    assert len(rows) == 3, "the row stops once its own budget is spent"
 
 
 async def test_negotiate_refuses_a_repeated_header(
@@ -298,11 +318,11 @@ def test_the_socket_refusal_is_logged_and_audited(
     assert len(_lines(caplog)) == 1
 
 
-def test_over_the_sign_in_budget_the_line_is_written_and_the_row_is_not(
+def test_over_its_own_budget_the_line_is_written_and_the_row_is_not(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The row is charged to the sign-in limiter, so an unauthenticated caller cannot grow the
-    audit log without bound. Over budget the refusal is still a 400, and still logged."""
+    """The row is charged to its own limiter, so an unauthenticated caller cannot grow the audit
+    log without bound. Over budget the refusal is still a 400, and still logged."""
     app = create_managed_app(
         db_path=tmp_path / "repeated-budget.db",
         poll_interval=0.05,

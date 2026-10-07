@@ -62,7 +62,9 @@ _H_CONFIG_AUTH = "### `[auth]` — authentication & RBAC"
 #: belong to the 2.1.3 table instead. The split is asserted rather than assumed:
 #: ``test_every_sliding_window_limiter_is_filed_under_the_right_requirement`` fails if a fifth
 #: limiter appears, forcing an explicit decision about which table it joins.
-_AUTH_SURFACE_ACCESSORS = frozenset({"allow_login_attempt", "allow_reauth_attempt"})
+_AUTH_SURFACE_ACCESSORS = frozenset(
+    {"allow_login_attempt", "allow_reauth_attempt", "allow_repeated_credential_audit"}
+)
 _BUSINESS_LIMIT_ACCESSORS = frozenset({"allow_phi_read", "allow_admin_write"})
 
 #: Anti-automation controls that are not objects and so cannot be derived: they are enforcement
@@ -1775,7 +1777,8 @@ def _derived_protection_seams() -> dict[str, str]:
 def test_every_sliding_window_limiter_is_filed_under_the_right_requirement() -> None:
     """A fifth limiter must join one table or the other — it cannot land undocumented.
 
-    ``allow_login_attempt``/``allow_reauth_attempt`` defend the AUTHENTICATION surface (6.1.1);
+    ``allow_login_attempt``/``allow_reauth_attempt``/``allow_repeated_credential_audit`` defend the
+    AUTHENTICATION surface (6.1.1);
     ``allow_phi_read``/``allow_admin_write`` are post-authentication business-logic limits (2.1.3).
     The split is asserted, so a new accessor forces an explicit decision rather than silently
     inheriting one table's coverage claim.

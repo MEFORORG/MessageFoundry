@@ -496,11 +496,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def negotiate(
         request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:
-        # Read BEFORE the limiter: a repeated header is refused 400 and charged once, by the
-        # handler that records it (BACKLOG #2454), not twice.
-        header = authorization_header(request)
         if not service.allow_login_attempt(_client(request)):
             raise _rate_limited(request, "negotiate")
+        header = authorization_header(request)  # 400 on a repeated header (BACKLOG #2454)
         if not header.startswith("Negotiate "):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing SPNEGO token")
         try:

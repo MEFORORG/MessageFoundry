@@ -405,18 +405,20 @@ async def record_repeated_credential(conn: Request | WebSocket, credential: str)
 
     A WARNING line always, and an ``auth.repeated_credential`` audit row when an auth service is
     attached. Neither carries the header or cookie value: the line and the row name the credential
-    by label, the path and the caller's address. The row is charged to the sign-in limiter first,
-    as #2051 charges its refusal to the failed-attempt budget, because this is an unauthenticated
-    request and an uncharged row would let anyone grow ``audit_log`` without bound. Over budget,
-    the line is written and the row is not, which is how ``GET /ui/sso`` treats its own refusals.
-    The audit write is fail-soft: a store fault cannot turn the 400 into a 500."""
+    by label, the path and the caller's address. The row is charged to its own limiter first
+    (``AuthService.allow_repeated_credential_audit``), as #2051 charges its refusal to a budget,
+    because this is an unauthenticated request and an uncharged row would let anyone grow
+    ``audit_log`` without bound. That budget is NOT the sign-in one, so a flood of these refusals
+    cannot refuse a sign-in. Over budget, the line is written and the row is not, which is how
+    ``GET /ui/sso`` treats its own refusals. The audit write is fail-soft: a store fault cannot
+    turn the 400 into a 500."""
     client = client_ip(conn)
     # Starlette has already percent-decoded the path, so it can hold a line break or run long.
     # Bounded for both sinks, and logged with %r so it cannot forge a second log line.
     path = conn.url.path[:_REPEATED_PATH_MAX]
     auth: AuthService | None = getattr(conn.app.state, "auth", None)
     audited = False
-    if auth is not None and auth.allow_login_attempt(client):
+    if auth is not None and auth.allow_repeated_credential_audit(client):
         try:
             await auth.audit_repeated_credential(credential, path, client=client)
             audited = True
