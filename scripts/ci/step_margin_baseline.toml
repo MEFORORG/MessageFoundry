@@ -30,21 +30,33 @@
 # CENSORABLE IS NOT CENSORED, and the rows below already keep the two apart on evidence rather than on
 # the structure. The windows-2025 engine row is censored and says how it knows: seven runs killed AT
 # the 36:00 cap, reporting 36:01 to 36:08. The ubuntu and windows-2022 rows say `censored = false` and
-# each states the evidence it rests on -- the largest step FAILURE observed on that leg, offered as
-# showing the leg never touched its cap, so nothing was truncated even though something could have
-# been. Read each row's own `source` for that evidence rather than taking it from here; this paragraph
-# does not restate how far below the cap those failures sat, because the rows do not say and it must
-# not be inferred. Do not flatten any of it into "every engine row is a lower bound".
+# each states the evidence it rests on -- the largest step FAILURE observed on that leg, and since
+# 2026-10-07 on ubuntu the largest cancellation too, offered as showing the leg never touched its cap,
+# so nothing was truncated even though something could have been. Read each row's own `source` for
+# that evidence rather than taking it from here; this paragraph does not restate it. Do not flatten any of it into "every engine row is a lower bound".
 # Splitting the engine pair the way the web console pair is now split is a separate change nobody has
 # made.
+
+# THE UBUNTU ENGINE ROW WAS RE-MEASURED 2026-10-07 UTC, in the web console step-margin gate re-measure
+# of that date, after merge-group run 37568821379 reddened it at 24:36 of 31:00 with every test
+# passing. ci.yml's "THE UBUNTU ROW WAS RE-DERIVED AGAIN 2026-10-07" note sizes `step_timeout` from it
+# and records why no single PR was the cause. The row it replaces, measured 2026-08-08, read:
+#
+#   max_passing 16:08, uncensored. Pool: every ci.yml run created 2026-08-01T00:00Z..2026-08-09T00:00Z
+#   UTC (688 runs, 1,618 leg-executions), jobs fetched with ?filter=all, rows this leg's
+#   `Tests (pytest)` STEP kept when THAT STEP concluded success, executions under 60s dropped; n=441.
+#   The largest ubuntu step FAILURE in 535 leg-executions was 14:21.
+#
+# It was already stale when ci.yml re-derived this leg's cap on 2026-08-12 from a 20:28 maximum, and
+# nothing moved it then, so every ubuntu run since has compared itself with a two-month-old record.
 
 [[baseline]]
 step = "Tests (pytest)"
 leg = "ubuntu-latest"
-max_passing = "16:08"
+max_passing = "24:36"
 censored = false
 censored_by = ""
-source = "measured 2026-08-08; pool: every ci.yml run created 2026-08-01T00:00Z..2026-08-09T00:00Z UTC (688 runs, 1,618 leg-executions), jobs fetched with ?filter=all so an attempt killed at the cap is not hidden behind its passing re-run, rows are this leg's `Tests (pytest)` STEP kept when THAT STEP concluded success, executions under 60s dropped; n=441. Uncensored on evidence, not assumption: the largest ubuntu step FAILURE in 535 leg-executions is 14:21, so the leg has never touched its cap."
+source = "measured 2026-10-07 UTC (web console step-margin gate re-measure, 2026-10-07). Pool: every ci.yml run with event merge_group, pull_request, push or workflow_dispatch created 2026-09-30T19:25:00Z..2026-10-07T04:24:59Z UTC, the web console rows' window extended to the ejection, each event listed on its own in 12-hour slices: 1298 runs (merge_group 473, pull_request 603, push 215, workflow_dispatch 7). Jobs fetched with ?filter=all; a row is this leg's `Tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at, executions under 60s dropped, re-run copies with identical stamps dropped (37). Runs still in progress when first read were re-read until every ubuntu job had finished, last at about 04:51Z UTC on 2026-10-07. n=1056 (merge_group 411, pull_request 431, push 209, workflow_dispatch 5), min 9:20, median 15:48, p90 20:33, p95 21:10. Worst 24:36, run 37568821379 job 112622697747 (merge_group, 2026-10-07, the ejection this re-measure was cut for); next 23:32, run 37506786823 (pull_request). The gate went red on that one success row at the 31:00 cap. The distribution is bimodal by runner; ci.yml's note says so. Uncensored on evidence even though this leg's cap is also its kill: the longest of 118 step failures (run 37571163103) stopped at 22:22 and the longest of 72 cancellations at 19:06, both far under the 31:00 kill."
 
 [[baseline]]
 step = "Tests (pytest)"
@@ -52,7 +64,7 @@ leg = "windows-2022"
 max_passing = "29:23"
 censored = false
 censored_by = ""
-source = "measured 2026-08-08; same pool as the ubuntu row; n=399. Uncensored on evidence: the largest windows-2022 step FAILURE in 542 leg-executions is 25:48. This is also a post-#1027 row."
+source = "measured 2026-08-08; pool: every ci.yml run created 2026-08-01T00:00Z..2026-08-09T00:00Z UTC (688 runs, 1,618 leg-executions), jobs fetched with ?filter=all, rows this leg's `Tests (pytest)` STEP kept when THAT STEP concluded success, executions under 60s dropped; n=399. Uncensored on evidence: the largest windows-2022 step FAILURE in 542 leg-executions is 25:48. This is also a post-#1027 row."
 
 [[baseline]]
 step = "Tests (pytest)"
@@ -60,7 +72,7 @@ leg = "windows-2025"
 max_passing = "35:47"
 censored = true
 censored_by = "the 36:00 step_timeout in force when the pool was collected: this leg was killed AT the cap seven times in the window (36:08 on runs 31189317409 / 31199321840 / 31202372465, 36:07 on 30955150892 / 31094875320 / 31192717684, 36:01 on 31149117314), three of them push runs on main"
-source = "measured 2026-08-08; same pool as the ubuntu row; n=360. 35:47 is the largest step that FIT in 36:00, and 36:08 is a lower bound on the largest the suite wants. The kills were slowness, not a wedge -- run 31149117314's pytest finished GREEN (0:35:48) and the step was killed 4.85s later, and no faulthandler native-stack dump appears in any kill log."
+source = "measured 2026-08-08; same pool and filter as the windows-2022 row; n=360. 35:47 is the largest step that FIT in 36:00, and 36:08 is a lower bound on the largest the suite wants. The kills were slowness, not a wedge -- run 31149117314's pytest finished GREEN (0:35:48) and the step was killed 4.85s later, and no faulthandler native-stack dump appears in any kill log."
 
 # THE THREE WEB CONSOLE ROWS WERE RE-MEASURED 2026-10-07 UTC, as the web console step-margin gate
 # re-measure of that date, after the gate reddened green suites in the merge queue. ci.yml's "THE

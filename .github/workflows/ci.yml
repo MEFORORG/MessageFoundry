@@ -622,6 +622,43 @@ jobs:
       #
       #   leg              max passing step   n     old cap   old margin   new cap   new margin
       #   ubuntu-latest    20:28              35    25:00     1.221x       31:00     1.515x   <- RE-DERIVED 2026-08-12
+      #                    (SUPERSEDED 2026-10-07: 34:00 over a 24:36 row, in the note directly below)
+      #
+      # THE UBUNTU ROW WAS RE-DERIVED AGAIN 2026-10-07, AS PART OF THE WEB CONSOLE STEP-MARGIN GATE
+      # RE-MEASURE OF THAT DATE, AND IT IS NOW 34:00 / JOB 46:00. Merge-group run 37568821379, a
+      # five-PR stack headed by PR 2087, reddened this leg at 24:36 of 31:00 (1.260x) with `32060
+      # passed, 1143 skipped`, and the queue ejected it. The step-margin record it was compared with,
+      # 16:08, dated from 2026-08-08 and had never followed the 2026-08-12 re-derivation below. The
+      # pool, its n and its uncensored-on-evidence reading live ONCE, in this leg's row of
+      # scripts/ci/step_margin_baseline.toml; this note carries the attribution and the sizing.
+      #
+      # ONE PR WAS NOT THE CAUSE, CHECKED BEFORE RE-SIZING. The leg's timings are BIMODAL by runner,
+      # and the slow mode became the common one around 2026-10-03: the pool's median is 14:16 before
+      # that day and 18:37 from it. Push-to-main runs within six hours
+      # of each other on 2026-10-06 read 19:43 (94af27177), 14:22 (2267d4276, `30194 passed` in
+      # 856.95s) and 20:11 (a43f74883), and as late as 20:01Z a main run still took 15:14. The
+      # `--durations=40` lists of the fast run and of the slow merge-group runs below name
+      # the same tests, each uniformly about 1.5x to 2x slower in the slow mode
+      # (test_redaction.py's custom-delimiter cases 16s against 34s, the seam-snapshot digests 19s
+      # against 25s to 36s), which is runner speed and not a test. The red run sits in that slow mode:
+      # beside merge-group run 37565463490, by pytest's own clock, it ran 710 more tests (2.3
+      # percent) in 13.7 percent more time (1470.53s against 1292.91s), with the same tests at the top
+      # and none new to the stack among them. The stacked PRs' own ubuntu runs spread from 15:15 to
+      # 21:49, and PR 2104 ran both on two heads of one branch. Test functions under tests/ -- the
+      # summed `git grep -c "def test_"` counts -- rose 20279 at 24e803a02, main's last commit before
+      # 2026-10-03, to 22001 at 0ed4ad8eb, 8.5 percent, so growth is real but is the smaller part.
+      #
+      # THE SIZING. This step no longer carries the web console suite -- it has its own job and this
+      # step's `--ignore-glob` drops it -- so the post-#1027 anchor's second addend below no longer
+      # applies, and the anchor is the worst passing step. ceil_minute(1.35 x 24:36) is 34:00, which
+      # is also what the gate's RE-SIZE annotation on the red run computed. The job cap keeps the 12
+      # minutes the overhead row below derives, 34 + 12 = 46. That row's setup and web console terms
+      # date from 2026-08 and were not re-read here, so 46 rests on that derivation, not on a new
+      # measurement; the red run's own pre-pytest setup was 2:28. At 34:00 the gate reds at 26:10 or longer, 6 percent over the worst pooled run, and with
+      # the record current again its RE-DERIVE annotation is the trigger to re-measure: the slow
+      # runner mode's share and the suite were both growing when this was written. The two Windows
+      # rows were left alone: from 2026-10-03 their worst passing steps were 28:07 and 31:02, under
+      # their 55:00 caps' 42:19 red line.
       #
       # THE UBUNTU ROW WAS RE-DERIVED 2026-08-12 AND THE OLD ONE IS KEPT ABOVE IN THE PROSE, NOT DELETED.
       # Pool: every run of this workflow created after 2026-08-10 that contributed an ubuntu
@@ -731,6 +768,7 @@ jobs:
       # SIZING RULE: step_timeout = ceil_minute(1.35 x that leg's post-#1027 anchor). 1.35 is the multiple
       # #131 used when it set 36:00 (1.364x over 26:23, the largest execution then observed).
       #   ubuntu  22:50 x 1.35 = 30:50 -> 31:00   (1.358x over the anchor, 1.515x over max passing)
+      #           SUPERSEDED 2026-10-07: 24:36 x 1.35 -> 34:00, under "RE-DERIVED AGAIN 2026-10-07" above
       #   W22     29:23 x 1.35 = 39:40 -> 40:00   (takes the shared Windows value below)
       #   W25     40:07 x 1.35 = 54:09 -> 55:00   (1.371x over the anchor, 1.537x over max passing)
       #
@@ -814,6 +852,7 @@ jobs:
       #
       #   leg      worst same-row   setup(max)+wc(max)   overhead used   x1.5    room   job
       #   ubuntu   7:12 (n=451)     5:22 + 2:22 = 7:44   7:44            11:36   12:00  31+12 = 43
+      #            (34+12 = 46 since 2026-10-07; the 12 is unchanged)
       #   W22      6:16 (n=413)     4:05 + 2:51 = 6:56   6:56            10:24   11:00  55+11 = 66
       #   W25      6:29 (n=372)     2:32 + 3:59 = 6:31   6:31             9:47   10:00  (takes W22's 66)
       #
@@ -821,6 +860,7 @@ jobs:
       # independent maxima with `Tests` passing one second under its cap, new values against old:
       #
       #   ubuntu  5:22 + 30:59 + 2:22 = 38:43 vs 43:00  +4:17   |  old: 32:43 vs 37:00  +4:17  (band held)
+      #           (since 2026-10-07: 5:22 + 33:59 + 2:22 = 41:43 vs 46:00, +4:17)
       #   W22     4:05 + 54:59 + 2:51 = 61:55 vs 66:00  +4:05   |  old: 42:55 vs 46:00  +3:04
       #   W25     2:32 + 54:59 + 3:59 = 61:30 vs 66:00  +4:30   |  old: 42:30 vs 46:00  +3:30
       #
@@ -839,6 +879,7 @@ jobs:
       # NESTING INVARIANT, first gated step -- setup(max) + step_timeout must stay under job_timeout, so a
       # `Tests` kill is a NAMED STEP failure rather than an unattributed job cancellation:
       #   ubuntu  5:22 + 25:00 = 30:22 < 37:00  (gap 6:38)
+      #           (since 2026-10-07: 5:22 + 34:00 = 39:22 < 46:00, gap 6:38)
       #   W22     4:05 + 55:00 = 59:05 < 66:00  (gap 6:55)
       #   W25     2:32 + 55:00 = 57:32 < 66:00  (gap 8:28)
       #
@@ -1067,7 +1108,7 @@ jobs:
       #
       # 5 MINUTES, AND NO MORE. On `!cancelled()` this step also runs after a pytest step that used its
       # whole `step_timeout`, so it must fit in what the ubuntu job cap leaves after setup plus that
-      # step (43 - 31 - about 5.5 minutes of setup). The script's own time budget sits inside it, so a
+      # step (46 - 34 - about 5.5 minutes of setup). The script's own time budget sits inside it, so a
       # slow fetch fails the script by name first.
       #
       # PULL REQUESTS ONLY. Why `merge_group` is skipped, and what the scan does not cover, is in the
@@ -2385,7 +2426,7 @@ jobs:
           # `webconsole_margin_cap`, so sizing this close to the observed run would buy no detection and
           # cost false reds on green suites. That knob is the gate's ruler and `webconsole_step_timeout`
           # is only the wall -- this sentence named the wall until they were split.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":7,"webconsole_step_timeout":10,"webconsole_job_timeout":21,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":46,"step_timeout":34,"webconsole_margin_cap":7,"webconsole_step_timeout":10,"webconsole_job_timeout":21,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":8,"webconsole_step_timeout":11,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":12,"webconsole_step_timeout":16,"webconsole_job_timeout":24,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
