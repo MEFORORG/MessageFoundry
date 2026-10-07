@@ -165,9 +165,9 @@ These URLs are FastAPI's defaults and can change when FastAPI is upgraded.
 
 What that means for a browser:
 
-- **Their only CSP is `frame-ancestors 'none'`.** It blocks framing and nothing else, so no script
-  source is restricted, and the files carry no integrity hash. What runs is whatever those hosts
-  serve that day.
+- **Their only CSP is `frame-ancestors 'none'; base-uri 'none'`.** It blocks framing and `<base>`
+  injection and nothing else, so no script source is restricted, and the files carry no integrity
+  hash. What runs is whatever those hosts serve that day.
 - **They need JavaScript and a route to those hosts.** Without either, the page renders blank, and
   nothing tells you why.
 - The engine still sends `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and
