@@ -294,7 +294,7 @@ async def test_accepts_raise_is_a_content_error(store: MessageStore, tmp_path: P
 
     # ...and it stays listable in the tracking view (counted and logged, not dropped). The DLQ view is
     # delivery-scoped by design (store._dead_filter), so a router-stage failure surfaces here.
-    errored = await store.list_messages(status=MessageStatus.ERROR.value)
+    errored = await store.list_messages(status=MessageStatus.ERROR.value, allowed_channels=None)
     assert len(errored) == 2
 
 

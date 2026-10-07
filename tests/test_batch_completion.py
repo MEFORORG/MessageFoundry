@@ -97,7 +97,7 @@ async def test_mark_batch_done_finalizes_every_message(store: Any) -> None:
     await store.mark_batch_done(ids, now=300.0)
     for mid in mids:
         assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
     # No pending rows remain on the lane.
     depth, _ = await store.pending_depth("OB1")
     assert depth == 0
@@ -121,7 +121,7 @@ async def test_mark_batch_failed_transient_repends_all_to_one_deadline(store: An
     # All 3 are PENDING again on the lane, re-claimable as the same prefix (strict FIFO).
     depth, _ = await store.pending_depth("OB1")
     assert depth == 3
-    assert await store.count_dead() == 0
+    assert await store.count_dead(allowed_channels=None) == 0
 
 
 async def test_mark_batch_failed_exhausted_deadletters_all(store: Any) -> None:
@@ -131,7 +131,7 @@ async def test_mark_batch_failed_exhausted_deadletters_all(store: Any) -> None:
         ids, "permanent-ish", RetryPolicy(max_attempts=1), now=300.0
     )
     assert result is None  # dead-lettered → no reschedule float
-    assert await store.count_dead() == 3
+    assert await store.count_dead(allowed_channels=None) == 3
     depth, _ = await store.pending_depth("OB1")
     assert depth == 0
 
@@ -142,7 +142,7 @@ async def test_mark_batch_failed_exhausted_deadletters_all(store: Any) -> None:
 async def test_dead_letter_batch_deadletters_all_atomically(store: Any) -> None:
     mids, ids = await _n_outbound(store, 3)
     await store.dead_letter_batch(ids, "AR: partner rejected the batch", now=300.0)
-    assert await store.count_dead() == 3
+    assert await store.count_dead(allowed_channels=None) == 3
     # Each message finalizes to a terminal ERROR disposition (not PROCESSED).
     for mid in mids:
         assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
@@ -151,7 +151,7 @@ async def test_dead_letter_batch_deadletters_all_atomically(store: Any) -> None:
 async def test_dead_letter_batch_skips_vanished(store: Any) -> None:
     _mids, ids = await _n_outbound(store, 2)
     await store.dead_letter_batch([ids[0], "gone", ids[1]], "AR", now=300.0)
-    assert await store.count_dead() == 2
+    assert await store.count_dead(allowed_channels=None) == 2
 
 
 # --- H-8 lock ordering: every multi-message finalizer takes its per-message locks in SORTED order --

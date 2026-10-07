@@ -678,13 +678,17 @@ async def test_messages_sent_during_a_pause_are_all_persisted_after_resume(tmp_p
                 writer.write(_tcp_frame(ADT.format(cid=f"P{i}")))
             await writer.drain()
             await asyncio.sleep(_PAUSED_WINDOW)
-            assert await store.count_messages() == 0, "a paused listener committed a message"
+            assert await store.count_messages(allowed_channels=None) == 0, (
+                "a paused listener committed a message"
+            )
             gate.release(DEPTH_REASON)
             for _ in range(200):
-                if await store.count_messages() == 3:
+                if await store.count_messages(allowed_channels=None) == 3:
                     break
                 await asyncio.sleep(0.05)
-            assert await store.count_messages() == 3, "a message offered during the pause was lost"
+            assert await store.count_messages(allowed_channels=None) == 3, (
+                "a message offered during the pause was lost"
+            )
             writer.close()
             await asyncio.gather(writer.wait_closed(), return_exceptions=True)
             del reader

@@ -208,8 +208,10 @@ async def test_provider_resolves_off_loop(store: MessageStore, tmp_path: Path) -
         await runner.stop()
 
     # The outbound payload reflects the provider value, not a "no active context" default.
-    mid = (await store.list_messages(channel_id="file_in", status=MessageStatus.PROCESSED.value))[
-        0
-    ]["id"]
+    mid = (
+        await store.list_messages(
+            channel_id="file_in", status=MessageStatus.PROCESSED.value, allowed_channels=None
+        )
+    )[0]["id"]
     payloads = await store.outbox_payloads_for(mid)
     assert payloads and payloads[0]["payload"] == "env=staging"

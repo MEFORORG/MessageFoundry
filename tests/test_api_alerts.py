@@ -173,7 +173,7 @@ async def test_alerts_active_reflects_open_count(
 
     (acked,) = [
         x
-        for x in (await engine.store.list_active_alert_instances())
+        for x in (await engine.store.list_active_alert_instances(allowed_channels=None))
         if x.event_type == "queue_buildup"
     ]
     await engine.store.ack_alert_instance(acked.id, actor="op")
@@ -241,7 +241,7 @@ async def test_alerts_routes_require_diagnose(engine: Engine) -> None:
     async with _client(engine, service) as c:
         vh = await _login(c, "viewer")
         assert (await c.get("/alerts/active", headers=vh)).status_code == 403
-        (a,) = await engine.store.list_active_alert_instances()
+        (a,) = await engine.store.list_active_alert_instances(allowed_channels=None)
         assert (await c.post(f"/alerts/{a.id}/ack", headers=vh)).status_code == 403
 
         oh = await _login(c, "operator")
@@ -284,7 +284,9 @@ async def test_alerts_ack_resolve_out_of_scope_refused_no_mutation(engine: Engin
     await engine.store.upsert_alert_instance(
         event_type="connection_stopped", connection="IB_B", severity="critical", now=100.0
     )
-    (inst,) = await engine.store.list_active_alert_instances()  # the IB_B instance
+    (inst,) = await engine.store.list_active_alert_instances(
+        allowed_channels=None
+    )  # the IB_B instance
     assert inst.connection == "IB_B" and inst.status == "open"
 
     async with _client(engine, service) as c:
@@ -293,7 +295,7 @@ async def test_alerts_ack_resolve_out_of_scope_refused_no_mutation(engine: Engin
         assert (await c.post(f"/alerts/{inst.id}/resolve", headers=h)).status_code == 404
 
     # NO state change: the instance is still open, un-acked, un-resolved.
-    (after,) = await engine.store.list_active_alert_instances()
+    (after,) = await engine.store.list_active_alert_instances(allowed_channels=None)
     assert after.id == inst.id
     assert after.status == "open" and after.acked_by is None and after.resolved_at is None
 
@@ -306,7 +308,9 @@ async def test_alerts_ack_resolve_out_of_scope_refused_no_mutation(engine: Engin
         event_type="connection_stopped", connection="IB_A", severity="critical", now=200.0
     )
     in_scope = next(
-        x for x in await engine.store.list_active_alert_instances() if x.connection == "IB_A"
+        x
+        for x in await engine.store.list_active_alert_instances(allowed_channels=None)
+        if x.connection == "IB_A"
     )
     async with _client(engine, service) as c:
         h = await _login(c, "op")

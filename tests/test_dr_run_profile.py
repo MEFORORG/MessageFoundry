@@ -183,7 +183,9 @@ async def test_filtered_inbound_drains_backlog(store: MessageStore, tmp_path: Pa
         async def _processed() -> bool:
             return bool(
                 await store.list_messages(
-                    channel_id="in_norm", status=MessageStatus.PROCESSED.value
+                    channel_id="in_norm",
+                    status=MessageStatus.PROCESSED.value,
+                    allowed_channels=None,
                 )
             )
 

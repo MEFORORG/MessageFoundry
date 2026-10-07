@@ -62,18 +62,18 @@ async def test_record_and_list_round_trip(tmp_path: Path) -> None:
             reason="connect refused",
             now=150.0,
         )
-        events = await store.list_connection_events()
+        events = await store.list_connection_events(allowed_channels=None)
         # newest-first by ts
         assert [e.kind for e in events] == ["closed", "connection_lost", "established"]
         lost = events[1]
         assert lost.direction == "outbound" and lost.message_id == "m-1"
         assert lost.reason == "connect refused"
         # filters
-        ib = await store.list_connection_events(connection="IB_ACME_ADT")
+        ib = await store.list_connection_events(connection="IB_ACME_ADT", allowed_channels=None)
         assert {e.kind for e in ib} == {"established", "closed"}
-        kinds = await store.list_connection_events(kinds=["established"])
+        kinds = await store.list_connection_events(kinds=["established"], allowed_channels=None)
         assert [e.kind for e in kinds] == ["established"]
-        since = await store.list_connection_events(since=175.0)
+        since = await store.list_connection_events(since=175.0, allowed_channels=None)
         assert [e.kind for e in since] == ["closed"]
     finally:
         await store.close()
@@ -103,7 +103,7 @@ async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
         # turn up in random ciphertext by chance (the rule in tests/test_store_encryption.py).
         assert "boom!" not in reason_disk
         # …and the read path decrypts it back
-        events = await store.list_connection_events()
+        events = await store.list_connection_events(allowed_channels=None)
         assert events[0].reason == "boom!"
     finally:
         await store.close()
@@ -121,7 +121,7 @@ async def test_reason_is_safe_text_scrubbed(tmp_path: Path) -> None:
             reason=f"bad frame: {ADT}",
             now=1.0,
         )
-        events = await store.list_connection_events()
+        events = await store.list_connection_events(allowed_channels=None)
         assert "DOE" not in (events[0].reason or "")  # PID segment scrubbed by safe_text (#120)
     finally:
         await store.close()
@@ -142,7 +142,7 @@ async def test_reason_truncated(tmp_path: Path) -> None:
             reason=_LONG_REASON,
             now=1.0,
         )
-        events = await store.list_connection_events()
+        events = await store.list_connection_events(allowed_channels=None)
     finally:
         await store.close()
     reason = events[0].reason
@@ -173,7 +173,7 @@ async def test_reason_one_long_token_keeps_no_head(tmp_path: Path) -> None:
             reason="x" * 500,
             now=1.0,
         )
-        events = await store.list_connection_events()
+        events = await store.list_connection_events(allowed_channels=None)
     finally:
         await store.close()
     assert events[0].reason == "…(+500 chars)"
@@ -199,7 +199,7 @@ async def test_message_id_is_nullable_and_not_a_foreign_key(tmp_path: Path) -> N
             message_id="does-not-exist",
             now=2.0,
         )
-        events = await store.list_connection_events()
+        events = await store.list_connection_events(allowed_channels=None)
         assert {e.message_id for e in events} == {None, "does-not-exist"}
     finally:
         await store.close()
@@ -211,7 +211,7 @@ async def test_does_not_inflate_counts_or_change_disposition(tmp_path: Path) -> 
     store = await MessageStore.open(tmp_path / "ce_count.db")
     try:
         mid = await store.enqueue_message(channel_id="ch", raw=ADT, deliveries=[("d", ADT)])
-        before = await store.count_messages()
+        before = await store.count_messages(allowed_channels=None)
         status_before = (await store.get_message(mid))["status"]  # type: ignore[index]
         await store.record_connection_event(
             connection="OB",
@@ -222,7 +222,7 @@ async def test_does_not_inflate_counts_or_change_disposition(tmp_path: Path) -> 
             reason="x",
             now=1.0,
         )
-        assert await store.count_messages() == before
+        assert await store.count_messages(allowed_channels=None) == before
         assert (await store.get_message(mid))["status"] == status_before  # type: ignore[index]
     finally:
         await store.close()
@@ -247,7 +247,7 @@ async def test_retention_deletes_old_events(tmp_path: Path) -> None:
         )
         deleted = await store.purge_connection_events(older_than=150.0)
         assert deleted == 1
-        remaining = await store.list_connection_events()
+        remaining = await store.list_connection_events(allowed_channels=None)
         assert [e.kind for e in remaining] == ["closed"]
     finally:
         await store.close()

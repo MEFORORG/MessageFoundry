@@ -108,7 +108,9 @@ async def _until_status(
     store: MessageStore, status: str, *, channel_id: str = "file_in", timeout: float = 8.0
 ) -> list[dict[str, object]]:
     for _ in range(int(timeout / 0.02)):
-        msgs = await store.list_messages(channel_id=channel_id, status=status)
+        msgs = await store.list_messages(
+            channel_id=channel_id, status=status, allowed_channels=None
+        )
         if msgs:
             return msgs
         await asyncio.sleep(0.02)
