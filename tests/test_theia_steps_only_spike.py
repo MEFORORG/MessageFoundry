@@ -364,7 +364,7 @@ def test_fail_moved_hand_written_header() -> None:
         to_line_start=_row(src, "peek = FhirPeek.parse")["line_start"],
         to_position="after",
     )
-    verdict = _fails(src, head, "header", path)
+    verdict = _fails(src, head, "order", path)
     assert not any(r.startswith("code-row") for r in verdict.reasons)
 
 
@@ -499,3 +499,109 @@ def test_fail_one_bad_path_fails_the_whole_change() -> None:
         "samples/config/_demo_oru_transforms.py: path: a _-prefixed helper "
         "module is not Steps-only",
     )
+
+
+# --- review round 1: bypasses the first prototype passed, now pinned -------------------------
+
+_ONE_LINE = '@handler("h")\ndef h(msg): return [Send("OB", msg)]\n'
+_GUARDED = (
+    '@handler("h")\n'
+    "def h(msg):\n"
+    "    if consent_ok(msg):\n"
+    '        msg.set("PID-19", ssn_from(msg))\n'
+    "    scrub(msg)\n"
+    '    return Send("OB", msg)\n'
+)
+_CHAIN = (
+    '@handler("h")\n'
+    "def h(msg):\n"
+    '    if msg.field("PID-3") == "A":\n'
+    "        pass\n"
+    '    elif msg.field("PID-3") == "B":\n'
+    "        pass\n"
+    "    else:\n"
+    "        audit_or_block(msg)\n"
+    '    return Send("OB", msg)\n'
+)
+_ACC = (
+    '@handler("h")\n'
+    "def h(msg):\n"
+    "    sends = []\n"
+    '    sends.append(Send("OB", msg))\n'
+    "    enforce_policy(msg)\n"
+    "    return sends\n"
+)
+_LOOP = '@handler("h")\ndef h(msg):\n    for item in feed(msg):\n        use(item)\n    return []\n'
+_EXT = (
+    "try:\n    from site_ext import set_field\nexcept ImportError:\n    pass\n\n\n"
+    '@handler("h")\ndef h(msg):\n    set_field(msg, "PID-5", "x")\n    return []\n'
+)
+_BUILT = '@handler("h")\ndef h(msg):\n    evil = build(msg)\n    return []\n'
+
+
+@pytest.mark.parametrize(
+    ("base", "head", "rule"),
+    [
+        (
+            _ONE_LINE,
+            _ONE_LINE.replace("(msg)", '(msg, _=__import__("os").getcwd())'),
+            "outside",
+        ),
+        (
+            _GUARDED,
+            _GUARDED.replace(
+                '        msg.set("PID-19", ssn_from(msg))\n',
+                '        pass\n    msg.set("PID-19", ssn_from(msg))\n',
+            ),
+            "order",
+        ),
+        (
+            _GUARDED,
+            _GUARDED.replace(
+                '        msg.set("PID-19", ssn_from(msg))\n    scrub(msg)\n',
+                '        scrub(msg)\n    msg.set("PID-19", ssn_from(msg))\n',
+            ),
+            "code-row",
+        ),
+        (
+            _CHAIN,
+            _CHAIN.replace('    elif msg.field("PID-3") == "B":\n        pass\n', ""),
+            "code-row",
+        ),
+        (
+            _ACC,
+            _ACC.replace("    enforce_policy", "    return sends\n    enforce_policy"),
+            "code-row",
+        ),
+        (
+            _LOOP,
+            _LOOP.replace("def h(msg)", "async def h(msg)").replace("for item", "async for item"),
+            "header",
+        ),
+        (
+            _EXT,
+            _EXT.replace("    pass\n", "    pass\nfrom messagefoundry import set_field\n"),
+            "outside",
+        ),
+        (_BUILT, _BUILT.replace("return []", 'return Send("LEAK", evil)'), "send"),
+    ],
+    ids=[
+        "one-line-signature",
+        "dynamic-row-leaves-its-condition",
+        "dynamic-row-swapped-with-code",
+        "elif-removed-before-a-coded-else",
+        "early-return-sends",
+        "async-for",
+        "import-shadows-a-conditional-binding",
+        "send-delivers-a-built-object",
+    ],
+)
+def test_fail_review_round_one_bypasses(base: str, head: str, rule: str) -> None:
+    _fails(base, head, rule, "cfg/h.py")
+
+
+def test_pass_literal_edit_on_a_developer_written_dynamic_row_and_its_delete() -> None:
+    head = _GUARDED.replace('msg.set("PID-19"', 'msg.set("PID-20"')
+    _passes(_GUARDED, head, "cfg/h.py")
+    deleted = _GUARDED.replace('        msg.set("PID-19", ssn_from(msg))\n', "        pass\n")
+    _passes(_GUARDED, deleted, "cfg/h.py")

@@ -75,10 +75,14 @@ class Verdict:
 
 @dataclass(frozen=True)
 class _Mark:
-    """One entry of an element's fixed skeleton: a code-row line or a control header, with its path."""
+    """One entry of an element's fixed skeleton, with its suite path.
+
+    A code-row line, a control header, or a typed, send or route row that carries a value the lens
+    could not have written (a developer-written dynamic row). The last kind may be deleted but not
+    moved, so it cannot leave the condition it was written under."""
 
     path: tuple[Any, ...]
-    tag: str  # "code" or "header"
+    tag: str  # "code", "header" or "row"
     content: Any
     generator_shaped: bool = False
 
@@ -163,7 +167,7 @@ def _split_lines(source: str) -> list[str]:
 
 def _load(source: str) -> _Module:
     contracts = parse_source(source, contract=CONTRACT_V2)
-    tree = ast.parse(source.removeprefix("﻿"))
+    tree = ast.parse(source.removeprefix("\ufeff"))
     lines = _split_lines(source)
     defs = {n.lineno: n for n in tree.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)}
     elements: list[_Element] = []
@@ -172,7 +176,7 @@ def _load(source: str) -> _Module:
         node = defs[entry["def_line"]]
         el = _Element(role=entry["role"], name=entry["handler"], node=node)
         rows: list[dict[str, Any]] = entry["rows"]
-        _index_rows(el, rows, lines)
+        _index_rows(el, rows, lines, tree)
         lo = min(r["line_start"] for r in rows)
         hi = max(r["line_end"] for r in rows)
         # Lines between the signature and the first statement that are blank or comment-only are
@@ -199,18 +203,20 @@ def _own_stmts(node: ast.AST) -> dict[tuple[int, int], ast.stmt]:
     return found
 
 
-def _index_rows(el: _Element, rows: list[dict[str, Any]], lines: list[str]) -> None:
+def _index_rows(
+    el: _Element, rows: list[dict[str, Any]], lines: list[str], tree: ast.Module
+) -> None:
     """Walk the lens rows once, recording code lines, headers and typed statements with suite paths.
 
     A suite path is the chain of enclosing control frames, each compared by content (FR-40 item 3).
-    An ``if`` frame is its test; an ``elif`` frame is the chain's ``if`` plus its own test; an
-    ``else`` frame is the chain's ``if`` (spike reading of an ambiguity, see the report)."""
+    An ``if`` frame is its test; an ``elif`` frame is every earlier clause test plus its own; an
+    ``else`` frame is every clause test of its chain, because each one decides when it runs."""
     by_span = _own_stmts(el.node)
     by_line: dict[int, ast.stmt] = {}
     for (start, _end), stmt in by_span.items():
         by_line.setdefault(start, stmt)
     stack: list[tuple[Any, ...]] = []
-    chain_head: dict[int, tuple[Any, ...]] = {}
+    chain: dict[int, list[Any]] = {}
     for row in rows:
         nesting: int = row["nesting"]
         del stack[nesting:]
@@ -225,18 +231,19 @@ def _index_rows(el: _Element, rows: list[dict[str, Any]], lines: list[str]) -> N
                 assert isinstance(stmt, ast.If)
                 content = ("test", ast.dump(stmt.test))
                 if control == "if":
-                    chain_head[nesting] = content
+                    chain[nesting] = [content]
                     frame = ("if", content)
                 else:
-                    frame = ("elif", chain_head.get(nesting), content)
+                    frame = ("elif", tuple(chain.get(nesting, [])), content)
+                    chain.setdefault(nesting, []).append(content)
                 el.marks.append(_Mark(path, "header", frame, _if_test_generated(stmt.test)))
             elif control == "else":
-                frame = ("else", chain_head.get(nesting))
+                frame = ("else", tuple(chain.get(nesting, [])))
                 el.marks.append(_Mark(path, "header", frame, True))
             elif control == "for":
                 stmt = by_line[ls]
                 assert isinstance(stmt, ast.For | ast.AsyncFor)
-                frame = ("for", ast.dump(stmt.target), ast.dump(stmt.iter))
+                frame = ("for", type(stmt).__name__, ast.dump(stmt.target), ast.dump(stmt.iter))
                 el.marks.append(_Mark(path, "header", frame, _for_generated(stmt)))
                 if isinstance(stmt.target, ast.Name):
                     el.for_targets[stmt.lineno] = {stmt.target.id}
@@ -250,7 +257,7 @@ def _index_rows(el: _Element, rows: list[dict[str, Any]], lines: list[str]) -> N
                 stack.append(frame)
             continue
         if kind == "code":
-            if row.get("scaffold") and _is_scaffold_stmt(by_span.get((ls, le))):
+            if row.get("scaffold") and _is_scaffold_stmt(by_span.get((ls, le)), el.node):
                 continue  # ADR 0108 accumulator scaffold, sanctioned by FR-40 item 3
             pass_lines = {
                 s.lineno
@@ -275,15 +282,45 @@ def _index_rows(el: _Element, rows: list[dict[str, Any]], lines: list[str]) -> N
         elif kind == "route":
             assert isinstance(stmt, ast.Return)
             el.routes.append(stmt)
+        dynamic = _dynamic_key(kind, stmt, el, tree)
+        if dynamic is not None:
+            el.marks.append(_Mark(path, "row", dynamic))
 
 
-def _is_scaffold_stmt(stmt: ast.stmt | None) -> bool:
-    if stmt is None:
+def _dynamic_key(kind: str, stmt: ast.stmt, el: _Element, tree: ast.Module) -> Any:
+    """The part of a typed, send or route row the lens could not have written, or None.
+
+    The key leaves out the inert parameters, so a literal edit on a developer-written row keeps it."""
+    if kind in _TYPED_KINDS:
+        d = _decompose(stmt)
+        if d is None:
+            return ("row", ast.dump(stmt))
+        fixed = tuple(
+            (p, ast.dump(n)) for p, n in d.params.items() if not _value_ok(d, p, n, el, stmt, tree)
+        )
+        return ("row", d.skeleton, fixed) if fixed else None
+    if kind == "send":
+        calls = _send_calls(stmt) or []
+        fixed_calls = tuple(ast.dump(c) for c in calls if not _literal_send(c))
+        return ("send", fixed_calls) if fixed_calls else None
+    if kind == "route" and isinstance(stmt, ast.Return) and not _literal_route(stmt):
+        return ("route", ast.dump(stmt))
+    return None
+
+
+def _is_scaffold_stmt(stmt: ast.stmt | None, node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """The generated ``sends = []`` at the top level, or ``return sends`` as the LAST statement.
+
+    An earlier top-level ``return sends`` is tagged scaffold by the lens too, but it ends the handler
+    early, so it stays a code row here."""
+    if stmt is None or stmt not in node.body:
         return False
     if isinstance(stmt, ast.Assign):
         return ast.dump(stmt) == ast.dump(ast.parse(f"{_ACCUMULATOR} = []").body[0])
     if isinstance(stmt, ast.Return):
-        return ast.dump(stmt) == ast.dump(_parse_in_def(f"return {_ACCUMULATOR}"))
+        return stmt is node.body[-1] and ast.dump(stmt) == ast.dump(
+            _parse_in_def(f"return {_ACCUMULATOR}")
+        )
     return False
 
 
@@ -369,9 +406,9 @@ def _sanctioned_module_stmt(
             and len(stmt.names) == 1
             and stmt.names[0].asname is None
             and names[0] in _INJECTABLE
-            # Bound, not read: the lens injects exactly when the bare name is not in scope, and a
-            # module may already read the name it is about to import (lens._name_in_scope).
-            and not lens._name_in_scope(base_tree, names[0])
+            # Bound, not read: a module may already read the name it is about to import. Bound
+            # ANYWHERE, not only at top level, so a conditional import cannot be shadowed.
+            and not _bound_anywhere(base_tree, names[0])
             and text == f"from messagefoundry import {names[0]}"
         ):
             return None
@@ -397,6 +434,23 @@ def _sanctioned_module_stmt(
         new_bindings.add(var)
         return None
     return f"an added module-scope statement: {text!r}"
+
+
+def _bound_anywhere(tree: ast.Module, name: str) -> bool:
+    """Whether the module binds ``name`` anywhere: an assignment, import, def, class or global."""
+    for sub in ast.walk(tree):
+        if isinstance(sub, ast.Name) and sub.id == name and not isinstance(sub.ctx, ast.Load):
+            return True
+        if isinstance(sub, ast.alias) and (sub.asname or sub.name.split(".")[0]) == name:
+            return True
+        if (
+            isinstance(sub, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+            and sub.name == name
+        ):
+            return True
+        if isinstance(sub, ast.Global | ast.Nonlocal) and name in sub.names:
+            return True
+    return lens._name_in_scope(tree, name)
 
 
 def _module_names(tree: ast.Module) -> set[str]:
@@ -432,6 +486,10 @@ def _assignable_name(name: str) -> bool:
 def _check_element(base: _Module, head: _Module, b: _Element, h: _Element) -> list[str]:
     label = f"{h.role} {h.name!r}"
     reasons: list[str] = []
+    # Item 2 again, by AST: the decorators and signature. A body that starts on the def line puts
+    # the signature inside the masked body span, where the byte comparison cannot see it.
+    if _signature(b.node) != _signature(h.node):
+        reasons.append(f"outside: {label}: the decorators or signature changed")
     # Items 3 and 4 together. A generator-shaped header may be added, removed or moved freely; every
     # code-row line and every other header must keep its content, its suite path and its order
     # relative to the others. Order is checked across the two kinds as well as within each, because
@@ -441,17 +499,36 @@ def _check_element(base: _Module, head: _Module, b: _Element, h: _Element) -> li
     if codes_b != codes_h:
         reasons.append(f"code-row: {label}: a code row was changed, added, removed or moved")
     reasons.extend(f"header: {label}: {r}" for r in _check_headers(b.marks, h.marks))
-    fixed_b = [m for m in b.marks if not m.generator_shaped]
     fixed_h = [m for m in h.marks if not m.generator_shaped]
+    # A developer-written dynamic row may be deleted (a typed-row delete), never moved or copied.
+    kept = Counter(m.content for m in fixed_h if m.tag == "row")
+    fixed_b: list[_Mark] = []
+    for m in b.marks:
+        if m.generator_shaped:
+            continue
+        if m.tag == "row":
+            if kept[m.content] == 0:
+                continue
+            kept[m.content] -= 1
+        fixed_b.append(m)
     if not reasons and fixed_b != fixed_h:
         reasons.append(
-            f"header: {label}: a hand-written header and a code row moved relative to each other"
+            f"order: {label}: a hand-written header, code row or developer-written dynamic row "
+            "moved relative to the others, or into another block"
         )
     # Items 5 and 6.
     reasons.extend(f"param: {label}: {r}" for r in _check_typed(base, head, b, h))
     reasons.extend(f"send: {label}: {r}" for r in _check_sends(b, h))
     reasons.extend(f"route: {label}: {r}" for r in _check_routes(b, h))
     return reasons
+
+
+def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """The def with its body emptied: name, decorators, arguments with defaults, and annotations."""
+    parts: list[ast.AST] = [*node.decorator_list, node.args, *node.type_params]
+    if node.returns is not None:
+        parts.append(node.returns)
+    return f"{type(node).__name__} {node.name} " + " | ".join(ast.dump(p) for p in parts)
 
 
 def _check_headers(base: list[_Mark], head: list[_Mark]) -> list[str]:
@@ -716,7 +793,7 @@ def _check_new_params(
     for pname, node in new.params.items():
         if old is not None and ast.dump(old.params[pname]) == ast.dump(node):
             continue  # a parameter the change left alone, dynamic or not (FR-40 item 5)
-        if _value_ok(new, pname, node, el, stmt, head):
+        if _value_ok(new, pname, node, el, stmt, head.tree):
             continue
         out.append(f"{new.verb}.{pname} at line {stmt.lineno} is new or changed and not a literal")
     return out
@@ -731,7 +808,7 @@ def _is_literal(node: ast.expr) -> bool:
 
 
 def _value_ok(
-    new: _Decomposed, pname: str, node: ast.expr, el: _Element, stmt: ast.stmt, head: _Module
+    new: _Decomposed, pname: str, node: ast.expr, el: _Element, stmt: ast.stmt, tree: ast.Module
 ) -> bool:
     """FR-40 item 5 for one new or changed value."""
     if _is_literal(node):
@@ -745,7 +822,7 @@ def _value_ok(
     if pname == "params" and new.verb in ("db_lookup", "fhir_lookup"):
         return _lookup_params_ok(node, fhir=new.verb == "fhir_lookup")
     if new.verb == "code_lookup" and pname == "table":
-        return isinstance(node, ast.Name) and _is_code_set_binding(head.tree, node.id)
+        return isinstance(node, ast.Name) and _is_code_set_binding(tree, node.id)
     if pname.rsplit(".", 1)[-1] in _OCCURRENCE_KW and isinstance(node, ast.Name):
         # G.7 inert: a For Each range loop index of an enclosing generated loop.
         return any(
@@ -836,7 +913,10 @@ def _send_calls(stmt: ast.stmt) -> list[ast.expr] | None:
 
 
 def _literal_send(node: ast.expr) -> bool:
-    """One literal destination, the message a plain name, no keywords: ``Send("OB", msg)``."""
+    """One literal destination, the message ``msg``, no keywords: ``Send("OB", msg)``.
+
+    FR-40 item 6 says "a plain name"; any name would let a new send deliver an object a code row
+    built, so this requires the name the generator writes (spike departure, item 6)."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
@@ -844,6 +924,7 @@ def _literal_send(node: ast.expr) -> bool:
         and len(node.args) == 2
         and _str_const(node.args[0])
         and isinstance(node.args[1], ast.Name)
+        and node.args[1].id == "msg"
         and not node.keywords
     )
 
