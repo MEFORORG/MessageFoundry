@@ -97,10 +97,11 @@ this line.**
   directory the engine could not check is counted apart. They come from the new
   `interpreter` block of the engine's security posture, which moves the supported engine UI seam.
   The file names are in `GET /security/posture`. (vault BACKLOG #2701, #2700)
-- **An attached auth service can no longer be turned off.** The engine's `AuthService.enabled` is
-  now a read-only property that is always true, so the console's sign-in checks hold whenever a
-  service is attached. The console code is unchanged; the supported engine UI seam moved because
-  the property is now part of the contract the seam digest reads. (vault BACKLOG #2825)
+- **An attached auth service can no longer be turned off.** The console's sign-in checks hold
+  whenever a service is attached. They now ask only whether one is attached, and the engine's
+  `AuthService.enabled` is gone. The supported engine UI seam moved for that removal. (vault
+  BACKLOG #2825, #3062) **CORRECTED for #3062:** this entry said `AuthService.enabled` was a
+  read-only property that is always true, and that the seam read it.
 - **The passkey leg says when the directory could not confirm the account.** The engine refuses
   a directory account's passkey assertion when the directory does not confirm the account. The
   console's `POST /ui/reauth/webauthn` now shows the directory message for that refusal, in the
