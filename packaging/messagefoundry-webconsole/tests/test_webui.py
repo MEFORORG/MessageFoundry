@@ -916,7 +916,20 @@ async def test_reauth_rejects_unsafe_next(engine: Engine) -> None:
     async with _client(engine, service) as c:
         # "/ui/audit" stands for an unregistered /ui page. This used "/ui/messages" until vault
         # BACKLOG #2620 registered the PHI pages as unlock continuations.
-        for bad in ("https://evil.example/x", "//evil.example", "/ui/audit", "/etc/passwd"):
+        # The backslash, whitespace and encoded forms are what a browser, or a decoding router, takes
+        # off-origin (vault BACKLOG #2790); the anchored registry must refuse them like "//".
+        for bad in (
+            "https://evil.example/x",
+            "//evil.example",
+            "/\\evil.example",
+            "\\\\evil.example",
+            " //evil.example",
+            "/\t/evil.example",
+            "/%2F%2Fevil.example",
+            "/ui\\..\\..\\evil.example",
+            "/ui/audit",
+            "/etc/passwd",
+        ):
             r = await c.get("/ui/reauth", params={"next": bad})
             assert r.status_code == 303 and r.headers["location"] == "/ui"
 
