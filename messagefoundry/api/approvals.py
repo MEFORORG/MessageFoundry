@@ -490,17 +490,20 @@ class ApprovalGate:
                 on_repeat=_repeat,
             )
         except Exception:
-            # Still raised, so the caller is told the request was not held. Nothing was written,
-            # so a retry cannot leave two releasable copies. Logged and paged, since the error
-            # alone reaches only this caller. A repeat's lost row is keyed on the request it named.
+            # Still raised. A write that failed before its COMMIT held nothing, but a COMMIT that
+            # landed before the error (a lost reply, a timeout) holds the request, and a retry the
+            # repeat rule misses files a second one; docs/SECURITY.md lists the cases. Logged and
+            # paged, since the error alone reaches only this caller. A repeat's lost row is keyed
+            # on the request it named, which stays held.
             lost_id, action = (
                 (repeat_of[-1], "approval.request_repeated")
                 if repeat_of
                 else (approval_id, "approval.requested")
             )
             log.exception(
-                "approval %s: the request and its %s audit row failed to write, so nothing new is "
-                "held. Lost detail: actor=%s operation=%s",
+                "approval %s: the write carrying its %s audit row failed. Check GET /approvals: the "
+                "request is still held under this id if this was a repeat, or if the COMMIT landed "
+                "before the error. Lost detail: actor=%s operation=%s",
                 lost_id,
                 action,
                 requester,

@@ -1766,26 +1766,34 @@ reload carries that into its `approval.approved` row.
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is `approval.too_early` and `approval.stale_requester`. A claim, a rejection or
 a resolution that the store cannot write with its audit row answers **503**, and the request does
-not move. A request whose `approval.requested` row fails is not held, and the call returns the
-error. Every audit row the gate fails to write is logged at ERROR with its detail, and raises an
+not move. Every audit row the gate fails to write is logged at ERROR with its detail, and raises an
 `audit_write_failed` alert keyed `approval:<id>`, carrying the lost row's action name.
 
-**A failed request holds nothing, unless its COMMIT landed and only the reply was lost.** The store
-writes the request and its `approval.requested` row in one transaction on all three backends. So a
-failed write leaves neither, and a retry files the only copy. The exceptions listed above, such as a
-lost COMMIT reply, can commit both while the call still fails. Then the ERROR line and the alert
-report the row as lost, though it exists. A retry still files nothing new if the repeat rule above
-catches it. That needs the same user, identical parameters, and the first request still pending and
-unexpired. The rule does not catch a retry in at least these cases, so a second request is held:
+What this does not cover, at least: a store that refuses READS still answers a raw 500, since the
+request row and the requester's account are read before any of this. A request or a repeat whose
+write fails is not mapped either, and answers a raw 500.
 
-- a different user sends it, or the parameters differ;
-- the first request was rejected, expired, or claimed by an approver before the retry arrived.
+**A failed request write can still hold the request, so a retry may file a second one.** The request
+and its `approval.requested` row are one write, as above, so a write that fails before its COMMIT
+holds neither. At least these cases hold the request while the call still fails:
 
-After a rejection or an expiry, the new request is the only one that can be released. After a
-claim, the first may already have run, so releasing the second can run the operation twice.
+- the COMMIT exceptions listed above, such as a lost COMMIT reply;
+- a call cancelled while its COMMIT runs, for example by the request timeout. The gate writes no
+  ERROR line and no alert for it;
+- a repeat whose `approval.request_repeated` row fails. The earlier request it named stays held.
 
-What this does not cover: a store that refuses READS still answers a raw 500, since the request
-row and the requester's account are read before any of this.
+A retry files nothing new when the repeat rule above joins it to the held request. The rule misses
+it in at least these cases:
+
+- a different user retries, or the captured parameters differ. At least two gated operations capture
+  the requester's name, so a rename counts. Both requests can be released, so the operation can run
+  twice;
+- an approver claimed the held request before the retry. It may already have run, so releasing the
+  new one can run the operation twice;
+- the held request was rejected or expired before the retry. It can never be released, so the new
+  one is the only live copy;
+- dual control stopped gating the operation, so the retry ran at once. If the operation is gated
+  again before the held request expires, an approver can release that one too.
 
 **A release records what happened to it (BACKLOG #1562).** The gate claims the request as
 `executing` before it runs the operation, so two approvers cannot both release it. It then settles
