@@ -167,6 +167,7 @@ from messagefoundry.store.store import (
     AlertSummary,
     AppendedAuditRow,
     AuditAppend,
+    AuditedWrite,
     AuditVerdict,
     CapturedResponse,
     ChannelScopeSource,
@@ -185,6 +186,7 @@ from messagefoundry.store.store import (
     MessageSearchResult,
     MessageStatus,
     MessageStore,
+    OperatorAudit,
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
@@ -219,6 +221,7 @@ from messagefoundry.store.store import (
     lockout_escalates,
     next_lockout_state,
     not_deployed_detail,
+    operator_audits,
     owned_lane_scope,
     password_claim_set,
     require_notify_email,
@@ -3307,6 +3310,7 @@ class PostgresStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
+        audit: OperatorAudit[str] | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001). In one transaction: insert the message
@@ -3324,7 +3328,7 @@ class PostgresStore:
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
         refs = list(dict.fromkeys(attachment_refs or ()))
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             await self._insert_message(
                 conn,
                 mid,
@@ -3376,6 +3380,8 @@ class PostgresStore:
                     mid,
                     ref,
                 )
+            if audit is not None:  # an operator's inject (BACKLOG #2624); a live receipt has none
+                await self._append_operator_audit(conn, written, audit, mid)
         return mid
 
     async def handoff(
@@ -6170,7 +6176,13 @@ class PostgresStore:
         )
         return len(orphans)
 
-    async def replay(self, message_id: str, now: float | None = None) -> int:
+    async def replay(
+        self,
+        message_id: str,
+        now: float | None = None,
+        *,
+        audit: OperatorAudit[int] | None = None,
+    ) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset). Two modes: **recover**
         any ``dead``/``pending`` row (never a ``done`` sibling — the M-2 hazard), else **re-send** the
         ``done`` rows. ``cancelled`` rows are never touched. Returns rows requeued.
@@ -6179,9 +6191,10 @@ class PostgresStore:
         #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
         idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
-        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580)."""
+        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
+        ``audit``'s row commits with the replay (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
                 "SELECT COUNT(*) AS n FROM queue WHERE message_id=$1 AND status = ANY($2::text[])",
                 message_id,
@@ -6228,6 +6241,7 @@ class PostgresStore:
                     "UPDATE messages SET status=$1, error=NULL WHERE id=$2", status, message_id
                 )
                 await self._event(conn, message_id, "replayed", None, f"{count} row(s)", now)
+            await self._append_operator_audit(conn, written, audit, count)
         return count
 
     async def resend_to(
@@ -6239,15 +6253,17 @@ class PostgresStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[ResendOutcome] | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
         Mirrors :meth:`MessageStore.resend_to`. Strict-FIFO writer-funnel: takes the per-lane advisory
         lock for ``to`` (:meth:`_lock_outbound_lanes`) so the resend commits in seq-order for the lane
         and can't be claimed ahead of an older producer row still uncommitted-and-invisible under
         SKIP-LOCKED/MVCC. Idempotency: the ``resend_log`` INSERT (ON CONFLICT DO NOTHING) runs FIRST and
-        the outbound row is created only when it returned a row (ADR 0090 §4)."""
+        the outbound row is created only when it returned a row (ADR 0090 §4). ``audit``'s row
+        commits with the resend, a duplicate included (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:  # noqa: SIM117
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 await self._lock_outbound_lanes(conn, (to,))
                 # Idempotency gate FIRST: claim the key; proceed only if we created the row.
@@ -6279,13 +6295,15 @@ class PostgresStore:
                             f" {prior['message_id']!r} to {prior['to_destination']!r}; it cannot be"
                             f" reused for message {message_id!r} to {to!r}"
                         )
-                    return ResendOutcome(
+                    outcome = ResendOutcome(
                         status="duplicate",
                         message_id=message_id,
                         to_destination=prior["to_destination"] if prior else to,
                         from_destination=prior["from_destination"] if prior else (from_ or ""),
                         outbox_id=prior["outbox_id"] if prior else None,
                     )
+                    await self._append_operator_audit(conn, written, audit, outcome)
+                    return outcome
                 if body_override is not None:
                     # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                     # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN row
@@ -6418,13 +6436,15 @@ class PostgresStore:
                     outbox_id,
                     idempotency_key,
                 )
-                return ResendOutcome(
+                outcome = ResendOutcome(
                     status="resent",
                     message_id=message_id,
                     to_destination=to,
                     from_destination=src_dest,
                     outbox_id=outbox_id,
                 )
+                await self._append_operator_audit(conn, written, audit, outcome)
+                return outcome
 
     async def reingress(
         self,
@@ -6433,6 +6453,7 @@ class PostgresStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
+        audit: OperatorAudit[ReingressOutcome] | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
         fresh, correlated ``RECEIVED`` child message at the origin channel's ingress stage; the origin
@@ -6441,9 +6462,10 @@ class PostgresStore:
         created only when it claimed the key. Deterministic child id (content-address of key+channel+body)
         is the defense-in-depth against a partial-rollback double-inject. Like a pass-through child
         (ADR 0013) the fresh INGRESS row lands at the channel's ingress tail — a new logged receipt, not
-        re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies."""
+        re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies.
+        ``audit``'s row commits with the resubmit, a duplicate included (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:  # noqa: SIM117
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 orow = await conn.fetchrow(
                     "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=$1",
@@ -6479,12 +6501,14 @@ class PostgresStore:
                             f" resubmit ({prior['message_id']!r} -> {prior['to_destination']!r}); it"
                             f" cannot be reused for message {origin_message_id!r}"
                         )
-                    return ReingressOutcome(
+                    outcome = ReingressOutcome(
                         status="duplicate",
                         message_id=origin_message_id,
                         new_message_id=(prior["outbox_id"] if prior else "") or "",
                         channel_id=channel_id,
                     )
+                    await self._append_operator_audit(conn, written, audit, outcome)
+                    return outcome
                 raw_meta = self._dec(
                     orow["metadata"], aad=cell_aad("messages", "metadata", origin_message_id)
                 )
@@ -6556,12 +6580,14 @@ class PostgresStore:
                     new_mid,
                     idempotency_key,
                 )
-                return ReingressOutcome(
+                outcome = ReingressOutcome(
                     status="resubmitted",
                     message_id=origin_message_id,
                     new_message_id=new_mid,
                     channel_id=channel_id,
                 )
+                await self._append_operator_audit(conn, written, audit, outcome)
+                return outcome
 
     async def replay_dead(
         self,
@@ -6569,6 +6595,7 @@ class PostgresStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Re-queue dead-lettered **outbound** deliveries only (optionally scoped): set them back to
         ``pending`` with attempts reset, revert each affected message from ``error`` to ``routed``.
@@ -6580,9 +6607,10 @@ class PostgresStore:
         DISTINCT``, and guarding only the UPDATE would revert a purged message from ``ERROR`` to
         ``ROUTED`` with nothing re-queued. ``tests/test_replay_erased_body_scope.py`` pins both. The
         pass-through marker exclusion (:data:`_NOT_PT_MARKER`, BACKLOG #1580) is written twice for the
-        same reason, and the same file pins it."""
+        same reason, and the same file pins it. ``audit``'s row commits with the replay, zero
+        included (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
                 "SELECT DISTINCT message_id FROM queue WHERE stage=$1 AND status=$2"
                 " AND ($3::text IS NULL OR channel_id=$3)"
@@ -6595,6 +6623,7 @@ class PostgresStore:
             )
             message_ids = [r["message_id"] for r in ids]
             if not message_ids:
+                await self._append_operator_audit(conn, written, audit, 0)
                 return 0
             result = await conn.execute(
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
@@ -6618,6 +6647,7 @@ class PostgresStore:
                     MessageStatus.ERROR.value,
                 )
                 await self._event(conn, message_id, "replayed", None, "dead-letter replay", now)
+            await self._append_operator_audit(conn, written, audit, count)
         return count
 
     async def cancel_queued(
@@ -6627,6 +6657,7 @@ class PostgresStore:
         *,
         top_only: bool = False,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, log a
         ``cancelled`` event each, and finalize any message whose deliveries are now all terminal.
@@ -6648,7 +6679,8 @@ class PostgresStore:
         )
         if top_only:
             query += " LIMIT 1"
-        async with self._timed_acquire() as conn, conn.transaction():
+        # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             rows = await conn.fetch(
                 query,
                 destination_name,
@@ -6657,6 +6689,7 @@ class PostgresStore:
                 Stage.OUTBOUND.value,
             )
             if not rows:
+                await self._append_operator_audit(conn, written, audit, 0)
                 return 0
             ids = [r["id"] for r in rows]
             await conn.execute(
@@ -6679,6 +6712,7 @@ class PostgresStore:
             await self._lock_finalize_batch(conn, (r["message_id"] for r in rows))
             for message_id in {r["message_id"] for r in rows}:
                 await self._maybe_finalize_message(conn, message_id, now)
+            await self._append_operator_audit(conn, written, audit, len(ids))
         return len(ids)
 
     # --- read helpers (API / console) ----------------------------------------
@@ -7153,19 +7187,37 @@ class PostgresStore:
             return
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await conn.execute(sql, *params)
-            appended = [
-                await self._append_audit_row(
-                    conn,
-                    a.action,
-                    actor=a.actor,
-                    channel_id=None,
-                    detail=a.detail,
-                    client=a.client,
-                    now=now,
-                )
-                for a in audits
-            ]
+            appended = await self._append_audits(conn, audits, now=now)
         tee_audits(audits, appended, ts=now)
+
+    async def _append_audits(
+        self, conn: Any, audits: Sequence[AuditAppend], *, now: float
+    ) -> list[AppendedAuditRow]:
+        """Append each of a write's ``audits``, in order, inside its transaction on ``conn``."""
+        return [
+            await self._append_audit_row(
+                conn,
+                a.action,
+                actor=a.actor,
+                channel_id=a.channel_id,
+                detail=a.detail,
+                client=a.client,
+                now=now,
+            )
+            for a in audits
+        ]
+
+    async def _append_operator_audit[R](
+        self, conn: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+    ) -> None:
+        """Append an operator mutation's audit row inside its transaction (BACKLOG #2624), so an
+        append that fails rolls the mutation back. ``written`` tees the row once the commit lands.
+
+        The mutation already holds its queue rows and finalize locks; the append then takes the audit
+        advisory lock. No audit-lock holder takes a queue or finalize lock, so the order cannot
+        cycle."""
+        audits = operator_audits(audit, result)
+        written.add(audits, await self._append_audits(conn, audits, now=written.now))
 
     @staticmethod
     def _audit_where(
@@ -7779,7 +7831,7 @@ class PostgresStore:
                 conn,
                 audit.action,
                 actor=audit.actor,
-                channel_id=None,
+                channel_id=audit.channel_id,
                 detail=audit.detail,
                 client=audit.client,
                 now=now,

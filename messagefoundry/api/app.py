@@ -401,6 +401,7 @@ from messagefoundry.store.content_search import (
 )
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
+from messagefoundry.store.store import AuditAppend, OperatorAudit, ReingressOutcome, ResendOutcome
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -781,6 +782,30 @@ async def _alert_control_action(engine: Engine, action: str, target: str) -> Non
             )
 
 
+def _dead_letter_replay_audit(
+    *,
+    actor: str | None,
+    channel_id: str | None,
+    destination_name: str | None,
+    client: str | None,
+) -> OperatorAudit[int]:
+    """The ``dead_letter_replay`` row the inline route and the released replay both commit with the
+    re-queue (BACKLOG #1646, #2624). Only when PHI was actually re-transmitted (review M-4)."""
+
+    def _row(requeued: int) -> AuditAppend | None:
+        if not requeued:
+            return None
+        return AuditAppend(
+            "dead_letter_replay",
+            actor=actor,
+            channel_id=channel_id,
+            detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
+            client=client,
+        )
+
+    return _row
+
+
 def _purge_in_scope(identity: Identity) -> bool:
     """Whether ``identity`` may purge an outbound. A purge spans every inbound feeding it, so only an
     unscoped caller may. Read by the route and by the approval gate, like :func:`_replay_in_scope`."""
@@ -829,34 +854,25 @@ def _build_approval_gate(
         # auditor filtering on the action name sees the released replays too.
         channel_id = p.get("channel_id")
         destination_name = p.get("destination_name")
+        # `.get`, never p["requester"] the way _config_reload reads it below: a request persisted
+        # before the guard started capturing that key carries none. The actor is the REQUESTER,
+        # matching the inline row; no `client` accompanies it, per _record_reload_audit's docstring
+        # (ADR 0150).
+        requester = p.get("requester")
+        # BACKLOG #2624: the row commits with the re-queue, so a failed append re-queues nothing
+        # and the gate's ASVS 2.3.3 compensation records a replay that did not run as 'failed'.
+        # Before this the row was a second write after the re-queue, logged on failure (#1940).
         requeued = await engine.replay_dead(
-            channel_id=channel_id, destination_name=destination_name
+            channel_id=channel_id,
+            destination_name=destination_name,
+            audit=_dead_letter_replay_audit(
+                actor=str(requester) if requester else None,
+                channel_id=channel_id,
+                destination_name=destination_name,
+                client=None,
+            ),
         )
-        if requeued:  # only when PHI was actually re-transmitted (review M-4), as inline
-            # `.get`, never p["requester"] the way _config_reload reads it below: a request
-            # persisted before the guard started capturing that key carries none, and a KeyError
-            # here would route a released replay into the ASVS 2.3.3 compensation path and record an
-            # operation that actually ran as failed. A zero-requeue release is not hidden by the
-            # guard above -- approval.approved carries this executor's own {"requeued": 0} result.
-            # The actor is the REQUESTER, matching the inline row; no `client` accompanies it, per
-            # _record_reload_audit's docstring (ADR 0150).
-            requester = p.get("requester")
-            # BACKLOG #1940: the deliveries are already re-queued. A raise here would reach the
-            # gate's ASVS 2.3.3 compensation and record a replay that ran as 'failed'. Log instead:
-            # approval.approved still carries this executor's {"requeued": N} result.
-            try:
-                await engine.store.record_audit(
-                    "dead_letter_replay",
-                    actor=str(requester) if requester else None,
-                    channel_id=channel_id,
-                    detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
-                )
-            except Exception:  # noqa: BLE001 - every store backend raises its own type
-                _log.exception(
-                    "released replay re-queued %d deliveries, but its dead_letter_replay audit "
-                    "row failed",
-                    requeued,
-                )
+        # A zero-requeue release writes no row; approval.approved carries {"requeued": 0}.
         return {"requeued": requeued}
 
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
@@ -3902,7 +3918,7 @@ def create_app(
                     operation="connection_purge",
                     detail="held for a second approver (dual-control)",
                 )
-        cancelled = await engine.store.cancel_queued(None, name, top_only=(scope == "top"))
+        client = client_ip(request)
         # BACKLOG #1641: written UNCONDITIONALLY, cancelled=0 included. Deliberately NOT the
         # `if requeued:` shape of the dead_letter_replay sibling: replay guards on "PHI was actually
         # re-transmitted", but a purge that cancels nothing is still a completed destructive command
@@ -3923,12 +3939,18 @@ def create_app(
         # ones, which still need a join back through approval_id. Closing that asymmetry is the
         # sibling gap tracked for the _purge executor; it is deliberately not fixed here.
         #
-        # No channel_id: purge targets an outbound, which spans every inbound feeding it.
-        await engine.store.record_audit(
-            "connection_purge",
-            actor=identity.username,
-            detail=json.dumps({"connection": name, "scope": scope, "cancelled": cancelled}),
-            client=client_ip(request),
+        # No channel_id: purge targets an outbound, which spans every inbound feeding it. The row
+        # commits with the cancel (BACKLOG #2624), so no crash keeps one without the other.
+        cancelled = await engine.store.cancel_queued(
+            None,
+            name,
+            top_only=(scope == "top"),
+            audit=lambda n: AuditAppend(
+                "connection_purge",
+                actor=identity.username,
+                detail=json.dumps({"connection": name, "scope": scope, "cancelled": n}),
+                client=client,
+            ),
         )
         return PurgeResult(cancelled=cancelled)
 
@@ -4589,16 +4611,15 @@ def create_app(
                     detail="held for a second approver (dual-control)",
                 )
         requeued = await engine.replay_dead(
-            channel_id=req.channel_id, destination_name=req.destination_name
-        )
-        if requeued:  # only when PHI was actually re-transmitted (review M-4)
-            await engine.store.record_audit(
-                "dead_letter_replay",
+            channel_id=req.channel_id,
+            destination_name=req.destination_name,
+            audit=_dead_letter_replay_audit(
                 actor=identity.username,
                 channel_id=req.channel_id,
-                detail=json.dumps({"destination_name": req.destination_name, "requeued": requeued}),
+                destination_name=req.destination_name,
                 client=client_ip(request),
-            )
+            ),
+        )
         return DeadLetterReplayResult(requeued=requeued)
 
     # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
@@ -5611,7 +5632,22 @@ def create_app(
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_REPLAY)),
     ) -> ReplayResult:
         row = await get_scoped_message(engine, identity, message_id, request)
-        requeued = await engine.replay(message_id)
+        client = client_ip(request)
+
+        def _audit(requeued: int) -> AuditAppend | None:
+            # An actual re-transmission of PHI: record who did it in the tamper-evident chain (review
+            # M-4), in the replay's own transaction (BACKLOG #2624). Nothing re-queued records nothing.
+            if not requeued:
+                return None
+            return AuditAppend(
+                "message_replay",
+                actor=identity.username,
+                channel_id=row["channel_id"],
+                detail=json.dumps({"message_id": message_id, "requeued": requeued}),
+                client=client,
+            )
+
+        requeued = await engine.replay(message_id, audit=_audit)
         if requeued == 0:
             # The message exists (checked above) but has no re-queueable outbox rows — it errored,
             # was filtered, or routed nowhere. Replaying is a no-op there; say so rather than report
@@ -5624,14 +5660,6 @@ def create_app(
                 "(it errored, was filtered, routed nowhere, or its only sends went into a"
                 " pass-through inbound, which replay never retransmits)",
             )
-        # An actual re-transmission of PHI: record who did it in the tamper-evident chain (review M-4).
-        await engine.store.record_audit(
-            "message_replay",
-            actor=identity.username,
-            channel_id=row["channel_id"],
-            detail=json.dumps({"message_id": message_id, "requeued": requeued}),
-            client=client_ip(request),
-        )
         return ReplayResult(message_id=message_id, requeued=requeued)
 
     @app.post("/messages/{message_id}/resend", response_model=ResendResult)
@@ -5680,17 +5708,14 @@ def create_app(
                 raise HTTPException(409, _outbound_down_detail(rr, body.to))
         except KeyError:  # neither declared nor draining (mirrors the control handlers)
             raise HTTPException(404, f"no such outbound connection: {body.to}") from None
-        try:
-            outcome = await engine.resend(
-                message_id, to=body.to, idempotency_key=body.idempotency_key, source=body.source
-            )
-        except ResendError as exc:
-            # No delivered source body / retention-nulled body / ambiguous source / idempotency-key
-            # reused for a different message-or-target → 409 (ADR 0090 §4/§5/§7).
-            raise HTTPException(409, str(exc)) from None
-        # An actual re-transmission of PHI to a new partner: attribute it (from→to), NEVER the body.
-        if outcome.status == "resent":
-            await engine.store.record_audit(
+        client = client_ip(request)
+
+        def _audit(outcome: ResendOutcome) -> AuditAppend | None:
+            # An actual re-transmission of PHI to a new partner: attribute it (from and to), NEVER the
+            # body, in the resend's own transaction (BACKLOG #2624). A duplicate records nothing.
+            if outcome.status != "resent":
+                return None
+            return AuditAppend(
                 "message_resend",
                 actor=identity.username,
                 channel_id=row["channel_id"],
@@ -5702,8 +5727,21 @@ def create_app(
                         "outbox_id": outcome.outbox_id,
                     }
                 ),
-                client=client_ip(request),
+                client=client,
             )
+
+        try:
+            outcome = await engine.resend(
+                message_id,
+                to=body.to,
+                idempotency_key=body.idempotency_key,
+                source=body.source,
+                audit=_audit,
+            )
+        except ResendError as exc:
+            # No delivered source body / retention-nulled body / ambiguous source / idempotency-key
+            # reused for a different message-or-target gives 409 (ADR 0090 §4/§5/§7).
+            raise HTTPException(409, str(exc)) from None
         return ResendResult(
             message_id=message_id,
             status=outcome.status,
@@ -5771,16 +5809,13 @@ def create_app(
                 channel_id=row["channel_id"],
                 detail={"message_id": message_id, "mode": "direct", "to": body.to},
             )
-            try:
-                direct = await engine.edit_resend_direct(
-                    message_id, to=body.to, raw=admitted, idempotency_key=body.idempotency_key
-                )
-            except ResendError as exc:
-                # Empty edited body / idempotency-key reused for a different target → 409. str(exc)
-                # carries ids only (never the body — the messages don't interpolate ``raw``).
-                raise HTTPException(409, str(exc)) from None
-            if direct.status == "resent":
-                await engine.store.record_audit(
+            client = client_ip(request)
+
+            def _direct_audit(direct: ResendOutcome) -> AuditAppend | None:
+                # Committed with the delivery row (BACKLOG #2624); a duplicate records nothing.
+                if direct.status != "resent":
+                    return None
+                return AuditAppend(
                     "message_edit_resend",
                     actor=identity.username,
                     channel_id=row["channel_id"],
@@ -5792,8 +5827,21 @@ def create_app(
                             "outbox_id": direct.outbox_id,
                         }
                     ),
-                    client=client_ip(request),
+                    client=client,
                 )
+
+            try:
+                direct = await engine.edit_resend_direct(
+                    message_id,
+                    to=body.to,
+                    raw=admitted,
+                    idempotency_key=body.idempotency_key,
+                    audit=_direct_audit,
+                )
+            except ResendError as exc:
+                # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
+                # carries ids only (never the body — the messages don't interpolate ``raw``).
+                raise HTTPException(409, str(exc)) from None
             return EditResendResult(
                 message_id=message_id,
                 status=direct.status,
@@ -5831,14 +5879,13 @@ def create_app(
             channel_id=row["channel_id"],
             detail={"message_id": message_id, "mode": "reroute"},
         )
-        try:
-            outcome = await engine.edit_resend_reroute(
-                message_id, raw=admitted, idempotency_key=body.idempotency_key
-            )
-        except ResendError as exc:
-            raise HTTPException(409, str(exc)) from None
-        if outcome.status == "resubmitted":
-            await engine.store.record_audit(
+        client = client_ip(request)
+
+        def _reroute_audit(outcome: ReingressOutcome) -> AuditAppend | None:
+            # Committed with the re-ingress (BACKLOG #2624); a duplicate records nothing.
+            if outcome.status != "resubmitted":
+                return None
+            return AuditAppend(
                 "message_edit_resend",
                 actor=identity.username,
                 channel_id=row["channel_id"],
@@ -5850,8 +5897,15 @@ def create_app(
                         "channel_id": outcome.channel_id,
                     }
                 ),
-                client=client_ip(request),
+                client=client,
             )
+
+        try:
+            outcome = await engine.edit_resend_reroute(
+                message_id, raw=admitted, idempotency_key=body.idempotency_key, audit=_reroute_audit
+            )
+        except ResendError as exc:
+            raise HTTPException(409, str(exc)) from None
         return EditResendResult(
             message_id=message_id,
             status=outcome.status,
@@ -6398,20 +6452,22 @@ def create_app(
             channel_id=body.to,
             detail={"file_id": file_id, "index": body.index, "to": body.to},
         )
+        client = client_ip(request)
+        # The row commits with the injected message (BACKLOG #2624).
         mid = await engine.inject_message(
             channel_id=body.to,
             raw=admitted,
             source_type="upload",
             metadata=json.dumps({"upload_file_id": file_id, "upload_index": body.index}),
-        )
-        await engine.store.record_audit(
-            "upload.resend",
-            actor=identity.username,
-            channel_id=body.to,
-            detail=json.dumps(
-                {"file_id": file_id, "index": body.index, "to": body.to, "message_id": mid}
+            audit=lambda new_mid: AuditAppend(
+                "upload.resend",
+                actor=identity.username,
+                channel_id=body.to,
+                detail=json.dumps(
+                    {"file_id": file_id, "index": body.index, "to": body.to, "message_id": new_mid}
+                ),
+                client=client,
             ),
-            client=client_ip(request),
         )
         return UploadResendResult(
             file_id=file_id, index=body.index, to=body.to, message_id=mid, status="injected"
