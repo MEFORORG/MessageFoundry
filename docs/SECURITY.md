@@ -4539,7 +4539,7 @@ onto keyless rows fails the verify, and is also reported as
 | Exit | Meaning |
 |---|---|
 | `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
-| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. So does a store key or key-provider error that stops the walk part way, such as a Transit outage: its `FAIL` line names the error's class and its cause's class, never its text, and says the rest of the chain was not checked. That reached the last-resort handler with no `FAIL` line before vault BACKLOG #3054. An error the command does not classify still does. |
+| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. A key, key-provider or database error that stops the check part way prints one too, such as a Transit outage or a row that is not UTF-8. That line names the error's class and its cause's class, never its text. It says the rest of the chain was not checked. Before vault BACKLOG #3054 these exited 1 or 2 with no `FAIL` line. An error the command does not classify still exits 1 with none. |
 | `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
@@ -4550,19 +4550,19 @@ to check, and it opens read-only so it cannot write to that file either way. It 
 any of them. A store key that cannot be resolved, or that is not base64 of 32 bytes, is refused
 while the store opens, before it reads a row.
 
-**A walk stopped by a key error stays exit 1, deliberately.** Under
-`cipher_provider = "vault_transit"` each row goes to Transit for its MAC, so a row's own content can
-make Transit refuse, for example one too large for a request. A code of its own that read as "not
-checked" would let a writer plant such a row and hide every break the rest of the walk would have
-found. The cause's class on the `FAIL` line tells a provider outage from a row the provider refused.
+**A check stopped part way stays exit 1, deliberately.** Under
+`cipher_provider = "vault_transit"` each row goes to Transit for its MAC. So a row's own content can
+make Transit refuse, for example a row too large for one request. A row the driver cannot read does
+the same. A code that read as "not checked" would let a writer plant such a row and hide every
+break. The walk reports a break only when it finishes, so a break it had already met is lost too.
+The cause's class on the `FAIL` line is a hint, not a diagnosis: a refused row can also surface as
+a connection error.
 
-At least these older cases also exit 2 and are not findings about the chain. An audit log emptied
+At least one older case also exits 2 and is not a finding about the chain. An audit log emptied
 out of band, verified in a shell that holds no key and whose settings require one, exits 2: the
-store open refuses it, as the paragraph on that setup below says. A row holding text that is not
-valid UTF-8 exits 2 too, because the database driver refuses to read it, and the line says the
-store could not be opened. The line names the column and leaves out its text, which is a row's
-content. A writer can cause either, so a 2 from a job that ran clean before is worth the same look
-as a 1.
+store open refuses it, as the paragraph on that setup below says. A writer can cause it, so a 2
+from a job that ran clean before is worth the same look as a 1. A store-open error that quotes a
+row's text has that text cut from its line.
 
 Exits 4 and 5 are each decided by a flag the store's verify sets only in a process that holds no
 key, so nothing a database holds can turn a verify run with the key into either (vault BACKLOG

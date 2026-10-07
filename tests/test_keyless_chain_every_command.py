@@ -743,13 +743,14 @@ def test_a_keyless_chain_under_the_opt_out_does_not_warn(
     assert "WARNING" not in capsys.readouterr().err
 
 
-def test_a_row_that_is_not_utf8_exits_2_and_its_text_is_not_printed(
+def test_a_row_that_is_not_utf8_fails_the_check_and_its_text_is_not_printed(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Vault BACKLOG #3054, item 10. A row holding text that is not valid UTF-8 exits 2: the driver
-    refuses to read it, and the line says the store could not be opened. SQLite's error quotes the
-    column's bytes, which are a row's content, so the line names the column and cuts the text. The
-    control is the same keyless chain before the write, which exits 0 under the opt-out."""
+    """Vault BACKLOG #3054, item 10. A row holding text that is not valid UTF-8 exited 2, "could not
+    start", with the row's text in the line. The driver refuses it during the walk, after the open,
+    so a writer could plant one to turn a broken chain into a 2. It is exit 1 with a FAIL line that
+    names the error's classes only. The control is the same chain before the write, which exits 0
+    under the opt-out."""
     _opt_out(monkeypatch)
     db = shell / "keyless.db"
     _keyless_chain(db)
@@ -758,9 +759,24 @@ def test_a_row_that_is_not_utf8_exits_2_and_its_text_is_not_printed(
     _write(db, "UPDATE audit_log SET actor = CAST(x'ff524f574d41524b4552' AS TEXT) WHERE seq = 2")
     rc = main(["audit-verify", "--db", str(db)])
     captured = capsys.readouterr()
-    assert rc == 2, (captured.out, captured.err)
-    assert "cannot open the store at" in captured.err and "'actor'" in captured.err, captured.err
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: the audit chain check stopped part way"), captured.out
+    assert "(OperationalError)" in captured.out, captured.out
     assert "ROWMARKER" not in captured.out + captured.err, captured.err
+
+
+def test_a_store_open_error_cuts_the_row_text_sqlite_quotes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The store-open refusal prints the driver's error, and SQLite's decode error quotes the
+    column's bytes, a row's content. The line keeps the column and cuts the text."""
+    from messagefoundry.__main__ import _emit_store_open_error
+
+    exc = sqlite3.OperationalError("Could not decode to UTF-8 column 'actor' with text 'ROWMARKER'")
+    assert _emit_store_open_error(exc, "x.db", as_json=False) == 2
+    err = capsys.readouterr().err
+    assert "'actor'" in err and "its text is not shown" in err, err
+    assert "ROWMARKER" not in err, err
 
 
 @pytest.mark.parametrize("error", [KeyProviderError, CipherError], ids=lambda e: e.__name__)
@@ -785,17 +801,42 @@ def test_a_key_error_raised_after_the_open_is_not_reported_as_could_not_start(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
 
     async def raising(self: MessageStore, **kwargs: object) -> object:
-        raise error("Transit audit HMAC failed (key='TEXTMARKER')") from ConnectionError("gone")
+        if error is CipherError:
+            raise error("Transit audit HMAC failed (key='TEXTMARKER')") from ConnectionError("gone")
+        raise error("Transit audit HMAC failed (key='TEXTMARKER')")
 
     monkeypatch.setattr(MessageStore, "verify_audit_chain", raising)
     rc = main(["audit-verify", "--db", str(db)])
     captured = capsys.readouterr()
     assert rc == 1, (captured.out, captured.err)
     assert captured.out.startswith("FAIL: "), captured.out
-    assert f"({error.__name__} from ConnectionError)" in captured.out, captured.out
+    named = "CipherError from ConnectionError" if error is CipherError else "KeyProviderError"
+    assert f"({named})" in captured.out, captured.out
     assert "NOT CHECKED" not in captured.out and "OK" not in captured.out, captured.out
     assert "gone" not in captured.out + captured.err, (captured.out, captured.err)
     assert "TEXTMARKER" not in captured.out + captured.err, (captured.out, captured.err)
+
+
+def test_a_cipher_error_at_the_open_fails_the_check(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The read-only open reads the chain's first row and, under Transit, MACs it there, so a
+    Transit refusal can come from the open as well as the walk. It is the same FAIL line and exit
+    1, not the last-resort handler's line. Code review round 2 of vault BACKLOG #3054, item 8."""
+    from messagefoundry.store import base as store_base
+
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise CipherError("Transit audit HMAC failed (key='TEXTMARKER')")
+
+    monkeypatch.setattr(store_base, "open_store", refusing)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, (captured.out, captured.err)
+    assert captured.out.startswith("FAIL: ") and "(CipherError)" in captured.out, captured.out
+    assert "TEXTMARKER" not in captured.out + captured.err
 
 
 _FORGE_GENESIS = (

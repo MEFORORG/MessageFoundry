@@ -1,7 +1,7 @@
-- **`audit-verify` prints a `FAIL` line when a store key or key-provider error stops the walk
-  part way**, such as a Transit outage. It still exits 1, but the error reached the last-resort
-  handler with no `FAIL` line, so a job on a first deployment would have seen a broken chain's
-  code with nothing to read. The line names the error's class and its cause's class, never its
+- **`audit-verify` prints a `FAIL` line and exits 1 when a key, key-provider or database error
+  stops the check part way**, such as a Transit outage or a row that is not UTF-8. These reached
+  the last-resort handler (exit 1) or the store-open refusal (exit 2) with no `FAIL` line, so a
+  job on a first deployment would have had nothing to read, or a code a planted row could pick. The line names the error's class and its cause's class, never its
   text. A store cipher the settings cannot build, a key that is not base64 of 32 bytes among
   them, now exits 2, could not start, from at least `audit-verify`, `audit-anchor`,
   `admin-unlock`, `admin-set-notify-email`, `admin-reset-totp`, `provision-admin` and

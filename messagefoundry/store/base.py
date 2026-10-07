@@ -2766,8 +2766,6 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
     from the open could mean anything (vault BACKLOG #3054, item 8)."""
     try:
         return _build_store_cipher(settings)
-    except StoreCipherConfigError:
-        raise
     except ValueError as exc:
         raise StoreCipherConfigError(str(exc)) from exc
 

@@ -7772,6 +7772,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
+        store_driver_errors,
     )
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.keyprovider import KeyProviderError
@@ -7813,17 +7814,40 @@ def _audit_verify(args: argparse.Namespace) -> int:
     # The open computes the same verdict inline, because the #1916 source guard reads that call's
     # argument, so the two cannot be one expression.
     keyless_refusal = keyless_opt_out_refusal(settings.store, settings.security)
+    # Raised by the walk, after the open: a Transit HMAC that failed for a row, a key provider that
+    # failed part way, or a row the driver cannot read (text that is not UTF-8, vault BACKLOG #3054
+    # item 10). Its own tuple, not `_key_unresolved()`, whose classes are raised before a row is
+    # read. Exit 1 below, never 2: rows were read.
+    walk_errors: tuple[type[Exception], ...] = (
+        CipherError,
+        KeyProviderError,
+        *store_driver_errors(),
+    )
+
+    def stopped(exc: Exception) -> _AuditWalkStopped:
+        """The class of ``exc`` and of its cause, never its text (vault BACKLOG #3054, item 8)."""
+        cause = exc.__cause__
+        return _AuditWalkStopped(
+            type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
+        )
 
     async def run() -> tuple[AuditVerdict, int]:
         # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
         # this build does not match, so a store an incompatible version wrote can still be verified.
-        store = await _open_store_or_refuse_the_key(
-            open_store(
-                settings.store,
-                read_only=True,
-                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        try:
+            store = await _open_store_or_refuse_the_key(
+                open_store(
+                    settings.store,
+                    read_only=True,
+                    keyless_chain_refusal=keyless_opt_out_refusal(
+                        settings.store, settings.security
+                    ),
+                )
             )
-        )
+        except CipherError as exc:
+            # The open reads the chain's first row and, under Transit, MACs it there, so a row's
+            # content reaches this too. A key that does not resolve was turned into exit 2 above.
+            raise stopped(exc) from exc
         try:
             verdict = await store.verify_audit_chain(expected_anchor=expected_anchor)
             if not verdict[0] or (verdict.keyless_walk and keyless_refusal is not None):
@@ -7834,13 +7858,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
             # than pattern-matching "verified 0 " out of a human-readable message.
             count, _head = await store.audit_anchor()
             return verdict, count
-        except (CipherError, KeyProviderError) as exc:
-            # Raised by the walk, after the open: a Transit HMAC that failed for a row, or a key
-            # provider that failed part way. Its own tuple, not `_key_unresolved()`, whose classes
-            # are raised before a row is read. Exit 1 below, never 2: rows were already read.
-            cause = exc.__cause__
-            named = type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
-            raise _AuditWalkStopped(named) from exc
+        except walk_errors as exc:
+            raise stopped(exc) from exc
         finally:
             await store.close()
 
@@ -7859,18 +7878,19 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # softer code of its own: under Transit each row goes to the provider for its MAC, so a
         # planted row the provider refuses stops the walk, and a code that reads as "not checked"
         # would let that row hide every break the rest of the walk would have found. The line names
-        # the error's class and its cause's class only, which tells an outage from a refused row.
+        # the error's class and its cause's class only, never its text. The walk reports a break only
+        # once it finishes, so a break it had already met is lost too, and the line says so.
         print(
-            f"FAIL: the audit chain walk stopped part way on a store key or key-provider error "
-            f"({exc}), so the rest of the chain was not checked. Treat it as broken until a run "
-            "that finishes says otherwise: a provider outage causes this, and so can a row the "
-            "provider refuses"
+            f"FAIL: the audit chain check stopped part way on a store key, key-provider or "
+            f"database error ({exc}). The rest of the chain was not checked, and a break found "
+            "before it is not reported. Treat the chain as broken until a run that finishes says "
+            "otherwise: an outage causes this, and so can a row the provider or driver refuses"
         )
         return 1
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
-        # ONLY SQLite; this catch is what a server backend and any error raised after the open
-        # still land in, so both guards stay live.
+        # ONLY SQLite; this catch is what a server backend's open still lands in, so both guards
+        # stay live. A driver error after the open is a FAIL above (vault BACKLOG #3054, item 10).
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
     ok, message = verdict
     if verdict.key_unavailable:
@@ -8130,12 +8150,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import (
-        StoreCipherConfigError,
-        StoreNotFoundError,
-        open_store,
-        resolve_active_key,
-    )
+    from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.uploads import ResealResult, UploadStore
 
@@ -8252,6 +8267,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
+    # #1780: no store there. #3054: a key error the open raises before it reads a row, a key that is
+    # not base64 of 32 bytes among them, which `resolve_active_key` above does not decode.
+    could_not_start: tuple[type[Exception], ...] = (
+        NotImplementedError,
+        StoreNotFoundError,
+        *_key_unresolved(),
+    )
     try:
         count, uploads, (rolled_ok, rolled_msg) = run_guarded(run())
     except CipherError as exc:
@@ -8266,9 +8288,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308).
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
-    # #1780: no store there. #3054: a key that is not base64 of 32 bytes, which the open finds
-    # when it builds the cipher, before it reads a row; `resolve_active_key` above does not decode it.
-    except (NotImplementedError, StoreNotFoundError, StoreCipherConfigError) as exc:
+    except could_not_start as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
