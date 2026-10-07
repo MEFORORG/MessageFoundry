@@ -2853,10 +2853,10 @@ class PostgresStore:
         caller's open transaction** (Postgres twin of :meth:`MessageStore._record_delivered_key`).
 
         Only outbound rows deliver; ingress/routed completions (``destination_name`` NULL) are skipped.
-        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (replay-stable, like
-        ``response_seq``). Stored row carries hashes + ids only — never a body/PHI. One row per outbox
-        row INSTANCE (a double mark_done must not accumulate a second entry); ``ON CONFLICT DO NOTHING``
-        is the belt-and-suspenders backstop on the content hash."""
+        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (a counter, not a unique
+        id; :func:`delivery_key` takes its uniqueness from the ids). Stored row carries hashes + ids
+        only — never a body/PHI. One row per outbox row INSTANCE (a double mark_done must not
+        accumulate a second entry); ``ON CONFLICT DO NOTHING`` is the backstop on the key."""
         if destination_name is None:
             return
         already = await conn.fetchval(
@@ -2873,6 +2873,7 @@ class PostgresStore:
         key = delivery_key(
             control_id=control_id,
             message_id=message_id,
+            outbox_id=outbox_id,
             destination_name=destination_name,
             handler_name=handler_name,
             delivery_seq=int(seq),
