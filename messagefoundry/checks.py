@@ -2473,9 +2473,7 @@ def _check_hop_attested(config_dir: str | Path) -> CheckResult:
     listed = "; ".join(
         _declared_entry(hop.name, hop.reason, refused=hop.refused) for hop in attested
     )
-    # Vault BACKLOG #3139: an entry the build check refuses is listed too, marked REFUSED, so the
-    # sentence must not say every listed hop is allowed. The mark comes from AttestedHop.refused and
-    # sits outside the quoted reason, so no reason text can supply or imitate it.
+    # The sentence must not say every listed hop is allowed; see AttestedHop (vault BACKLOG #3139).
     return CheckResult(
         "tls-hop-attested",
         ok=True,

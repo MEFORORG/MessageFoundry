@@ -6,9 +6,6 @@ Vault BACKLOG #3139. The mark used to be plain text appended to the author's rea
 rule refused only control characters. So a live attestation whose reason held the mark text read as
 REFUSED, and a reviewer would skip it. A reason holding ``); name (`` read as two entries. Each test
 here loads a config the build check accepts, so every listed hop is one the engine would cross.
-
-The module imports only names that existed before the fix, so it runs unchanged against the old
-code and fails there.
 """
 
 from __future__ import annotations
@@ -20,17 +17,9 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.checks import _check_hop_attested
-from messagefoundry.config.wiring import load_config
-
-_LOGIC = (
-    "from messagefoundry import Send, handler, router\n\n"
-    '@router("r")\n'
-    "def route(msg):\n"
-    '    return ["h"]\n\n'
-    '@handler("h")\n'
-    "def handle(msg):\n"
-    '    return Send("OB", msg)\n'
-)
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.wiring import AttestedHop, attested_secure_hop_records, load_config
+from messagefoundry.pipeline.wiring_runner import build_check_registry
 
 OLD_MARK = "[REFUSED: the build check rejects this declaration; no gate allows it]"
 
@@ -75,7 +64,6 @@ def _entries(detail: str) -> list[tuple[str, str | None, bool]]:
 
 
 def _config(tmp_path: Path, reason: str) -> Path:
-    (tmp_path / "logic.py").write_text(_LOGIC, encoding="utf-8")
     (tmp_path / "ob.py").write_text(
         "from messagefoundry import Tcp, outbound\n"
         'outbound("OB", Tcp(host="10.0.0.5", port=5000), tls_hop_attested=True,\n'
@@ -93,10 +81,16 @@ def test_a_reason_renders_as_one_quoted_live_entry(tmp_path: Path, reason: str) 
     assert _entries(detail) == [("OB", reason, False)]
 
 
-def test_a_reason_holding_the_old_mark_leaves_the_refused_field_false(tmp_path: Path) -> None:
-    # Imported here, not at the top, so the line-level tests above still run against old code.
-    from messagefoundry.config.wiring import AttestedHop, attested_secure_hop_records
-
-    reason = FORGERIES["old-mark-text"]
+@pytest.mark.parametrize("reason", list(FORGERIES.values()), ids=list(FORGERIES))
+def test_a_forged_reason_is_a_live_attestation_with_refused_false(
+    tmp_path: Path, reason: str
+) -> None:
     registry = load_config(_config(tmp_path, reason))
+    # Control: the build check accepts it, so this is a hop the engine would cross.
+    build_check_registry(
+        registry,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert attested_secure_hop_records(registry) == [AttestedHop("OB", reason, refused=False)]
