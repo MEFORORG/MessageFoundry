@@ -316,11 +316,13 @@ nothing, which is honest. The day someone allocates it, your citation quietly st
 unrelated work. If you must gesture at unfiled work, name the subject rather than a number. Where the
 number exists but has not merged, say that in the same sentence.
 
-**Never arm auto-merge**, unless you are the Lander acting under its 2026-10-07 exception in
-the CLAUDE.md section 5 roster. Enqueuing a PR and merging it are BOTH the Lander's, since the Console's
-retirement on 2026-09-10. A Manager talks to the Lander and leaves the queue to it.
-Arming a PR and then pushing to it is a silent race. Auto-merge fires on the head it saw and drops
-your later push. The PR reads MERGED, the branch stays alive, and nothing reports it.
+**Never arm auto-merge**, unless you are the Lander acting under its 2026-10-07 exception in the
+CLAUDE.md section 5 roster. Enqueuing a PR and merging it are BOTH the Lander's, since the
+Console's retirement on 2026-09-10. A Manager talks to the Lander and leaves the queue to it.
+Arming a PR and then pushing to it is a silent race with two outcomes. If the merge fires first,
+your push is dropped: the PR reads MERGED and the branch stays alive. If the push lands first, a
+write-access push leaves auto-merge armed, so the new head can merge with no review. Nothing
+reports either one. The safeguards are in the 2026-10-07 note under that roster.
 
 Never announce a hold, a freeze, or a promise about future state. A 2026-08-01 rehearsal of that
 shape stayed "in force" for hours after its condition had cleared. `main` moved four times underneath
@@ -500,6 +502,10 @@ tool-grant spelling, and the careful spelling is the broken one** -- same bullet
   **unmeasured** — what is measured on this repository is eviction and group rebuild, which is a
   different event with a different cause. Until somebody watches a push land under a live entry, the
   safe course is to dequeue before pushing, and the claim above must not be read as covering it.
+
+  *Added 2026-10-07:* for a deferred auto-merge request, the quoted claim is half the story. A
+  push that lands before the merge fires does not disarm it when the pusher has write access, so
+  that head can merge unreviewed. This addendum says nothing new about a QUEUED entry.
 
 ## Retired CLAUDE.md notices, kept verbatim
 
