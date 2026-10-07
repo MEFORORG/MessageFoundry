@@ -95,6 +95,11 @@ _NOT_GATED = (
     "Dual control no longer applies to this operation, so it cannot be approved. Reject it; if it "
     "is still needed, run it again, without a second approver."
 )
+# The same note on the requester's own row, whose button reads Withdraw rather than Reject.
+_NOT_GATED_OWN = (
+    "Dual control no longer applies to this operation, so it cannot be approved. Withdraw it; if "
+    "it is still needed, run it again, without a second approver."
+)
 
 # What a None parameter means for the operations that hold one: the broadest scope, not "nothing".
 # Any other None reads "not set".
@@ -194,7 +199,7 @@ def _pending_row(a: PendingApprovalInfo) -> list[object]:
     # Each such row gets the reject and a note saying why. The not-gated note comes first, so the
     # requester, who alone can run the operation again, sees it on their own row too.
     if not a.gated:
-        note: str | None = _NOT_GATED
+        note: str | None = _NOT_GATED_OWN if a.caller_is_requester else _NOT_GATED
     elif a.caller_is_requester:
         note = _OWN_REQUEST
     elif a.params is None:

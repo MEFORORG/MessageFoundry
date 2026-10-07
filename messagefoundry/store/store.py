@@ -11250,12 +11250,12 @@ class MessageStore:
         now = time.time()
         held = approval_id
         append = audit
-        # Each statement is spelled at its `execute` from module constants, not built into a local
-        # first: `tests/test_writer_txn_is_the_only_begin.py` reads the SQL at the call, and a local
-        # variable there is an argument it cannot read.
+        # Each INSERT is concatenated at its `execute` from module constants, never built in a local
+        # or an f-string: `tests/test_writer_txn_is_the_only_begin.py` reads the SQL at the call and
+        # resolves module names only through `+`, so either other shape hides the statement's verb.
         async with _writer_guard(self._db, self._lock):
             if on_repeat is None:
-                cur = await self._db.execute(
+                await self._db.execute(
                     _SQLITE_APPROVAL_INSERT + " VALUES (?,?,?,?,?,?,'pending',?)", args
                 )
             else:
@@ -11267,19 +11267,21 @@ class MessageStore:
                     "SELECT 1 FROM pending_approvals WHERE " + _SQLITE_OPEN_REPEAT + ")",
                     args + match,
                 )
-            if on_repeat is not None and cur.rowcount == 0:
-                # The INSERT opened this connection's write transaction, so this read is the
-                # authoritative one. Oldest first: that is the request every earlier caller got.
-                found = await self._db.execute(
-                    f"SELECT id FROM pending_approvals WHERE {_SQLITE_OPEN_REPEAT}"
-                    " ORDER BY requested_at ASC LIMIT 1",
-                    match,
-                )
-                row = await found.fetchone()
-                if row is None:  # the INSERT's own NOT EXISTS matched one, under the write lock
-                    raise RuntimeError("pending_approvals: a repeat matched no open request")
-                held = str(row["id"])
-                append = on_repeat(held)
+                if cur.rowcount == 0:
+                    # The INSERT opened this connection's write transaction, so this read is the
+                    # authoritative one. Oldest first: that is the request every earlier caller got.
+                    found = await self._db.execute(
+                        "SELECT id FROM pending_approvals WHERE "
+                        + _SQLITE_OPEN_REPEAT
+                        + " ORDER BY requested_at ASC LIMIT 1",
+                        match,
+                    )
+                    row = await found.fetchone()
+                    # The INSERT's own NOT EXISTS matched one, under the write lock.
+                    if row is None:
+                        raise RuntimeError("pending_approvals: a repeat matched no open request")
+                    held = str(row["id"])
+                    append = on_repeat(held)
             if append is not None:
                 # vault BACKLOG #2255. Before the one commit, so a failed append rolls the request
                 # back and no releasable row is left without its approval.requested row.

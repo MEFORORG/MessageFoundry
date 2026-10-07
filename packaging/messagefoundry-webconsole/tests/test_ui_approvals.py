@@ -165,6 +165,10 @@ def test_an_ungated_row_offers_no_approve() -> None:
     )
     assert "Withdraw" in own and "Dual control no longer applies" in own
     assert f'action="/ui/approvals/{aid}/approve"' not in own
+    # The note names the same verb as the button beside it: Withdraw on their own row, Reject
+    # on anyone else's.
+    assert "Withdraw it;" in own and "Reject it;" not in own
+    assert "Reject it;" in ungated and "Withdraw it;" not in ungated
 
 
 def test_enter_in_the_resolve_form_records_no_outcome() -> None:
