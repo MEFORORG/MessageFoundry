@@ -6881,11 +6881,13 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
     # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
     # duplicate WiringError via add_inbound/add_outbound (no silent precedence).
     from messagefoundry.config.connections_file import (
-        CONNECTIONS_FILE_NAME,
+        connections_file_path,
         load_connections_file,
     )
 
-    conn_file = directory / CONNECTIONS_FILE_NAME
+    # The live file, or the candidate a `connections_edit` write is validating before it replaces the
+    # live one (vault BACKLOG #2782).
+    conn_file = connections_file_path(directory)
     if conn_file.is_file():
         load_connections_file(conn_file, registry)
     registry.validate(allow_empty=allow_empty)
@@ -7714,10 +7716,13 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     # *.py ones and the router/port checks below cover TOML-authored connections. Lazy import (cycle).
     from messagefoundry.config.connections_file import (
         CONNECTIONS_FILE_NAME,
+        connections_file_path,
         load_connections_file,
     )
 
-    conn_file = directory / CONNECTIONS_FILE_NAME
+    # The candidate a `connections_edit` write is validating, when this runs inside one (vault
+    # BACKLOG #2782), as `load_config` does.
+    conn_file = connections_file_path(directory)
     if conn_file.is_file():
         try:
             load_connections_file(conn_file, registry)
