@@ -626,3 +626,50 @@ Until this amendment the relying party authenticated to the token endpoint one w
 
 **Not decided here.** Refusing `client_secret_post` outright, the enforce-refuse arm BACKLOG #296's
 gate once named, stays an owner decision. The default is unchanged.
+
+---
+
+## Amendment E (2026-10-06) — only a transport failure marks the IdP unavailable (BACKLOG #1948)
+
+> Decided 2026-10-06 by the batch 195 Manager, under the owner's standing driver rule. This
+> amendment does not change the status line at the top of this ADR.
+
+`oidc_available` drives the federated link on `/ui/login` and `/auth/providers`. The resolution
+note above makes it advisory and non-sticky: a failed IdP interaction sets it, and the next
+success clears it. It did not say which failures count, and a signed-out caller chooses the
+authorization `code`. PR 1643 stopped a 4xx from the token endpoint setting the flag. A faulty
+IdP may answer a bad `code` with a 5xx, though, so a caller could still hide the link from every
+visitor, again and again.
+
+- **Only a transport failure sets the flag.** That is a failure where no answer arrived:
+  connection refused or reset, DNS, a timeout, a TLS handshake, or a reply cut short. In code it
+  is `TokenEndpointUnreachableError`, an `http.client` exception such as `BadStatusLine`, or an
+  `OSError` that is not an `HTTPError` (`_is_idp_transport_failure` in `auth/service.py`). A reply
+  whose header block did not parse arrived, so it is an answer, not a transport failure.
+- **Any received status means the IdP answered**, a 5xx and a 3xx included, and so does a reply
+  the engine cannot read as a token response. `exchange_code` raises `TokenRefusedError` with the
+  status. The sign-in fails, audited `auth.login_failed` with `reason=token_refused` and the
+  status; a step-up's `auth.reauth` row carries the same. The flag is left as it was, neither set
+  nor cleared.
+- **Any other non-transport failure the outage arm sees is an answer too**, such as a status from
+  the JWKS fetch. It is audited `auth.login_error` with the exception type and any status, and
+  the outcome reason is `idp_answer_unusable`. It does not set the flag.
+
+**AC-8 is unchanged in what it requires.** A real outage is a transport failure, so it still sets
+the flag, and the next success still clears it with no restart.
+
+**The costs, stated.** An IdP that is up but answers every request with a 5xx no longer hides the
+link. Visitors keep seeing a federated sign-in that fails each time. The operator sees it on the
+audit rows, each with its status. The same holds for a JWKS endpoint answering with an error
+status, though no caller input reaches that request. That is the trade the decision makes: a link
+that shows while the IdP is failing, rather than a link any caller can hide.
+
+**At least these residuals remain.**
+
+- A transport failure can itself be provoked at some sites. A web application firewall or load
+  balancer in front of the token endpoint may reset a connection whose request body looks
+  hostile, and the caller chooses the `code` in that body. At such a site a caller can still hide
+  the link. The engine cannot tell that reset from an outage.
+- A JWKS reply that `bounded_read` refuses for its body framing, or cuts short, still marks the
+  IdP. `jwks_fetcher` in `auth/oidc_http.py` retypes it as a plain `http.client` exception, which
+  reads as transport. No caller input reaches the JWKS request.

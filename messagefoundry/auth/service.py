@@ -23,6 +23,7 @@ import secrets
 import sqlite3
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 from collections.abc import (
     AsyncIterator,
@@ -140,6 +141,7 @@ from messagefoundry.store.store import (
     require_notify_email,
     seed_notify_email,
 )
+from messagefoundry.transports.bounded_read import EgressReplyError
 from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -654,6 +656,11 @@ FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
 #: started. Audit only. The caller sees its leg's ordinary failure, which says nothing about timing.
 TOO_EARLY = "too_early"
 
+#: The reason for an IdP failure that is NOT a transport failure and not a token-endpoint answer,
+#: such as a status from the JWKS fetch (BACKLOG #1948). The IdP answered, so it does not mark the
+#: IdP unavailable. Distinct from ``idp_error``, which is the IdP's own ``error=`` on the callback.
+IDP_ANSWER_UNUSABLE = "idp_answer_unusable"
+
 #: Operator-readable text for the step-up leg's refusals. None of it echoes anything the IdP sent.
 #: A slug not listed here reads as the generic line in ``_step_up_refused``.
 _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
@@ -683,6 +690,7 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         "state_unknown": "The confirmation expired. Try again.",
         "state_mismatch": "The confirmation could not be matched to this browser. Try again.",
         "idp_unavailable": "The identity provider is unavailable. Try again later.",
+        IDP_ANSWER_UNUSABLE: "The identity provider's answer could not be used. Try again later.",
         "not_configured": "Federated sign-in is not configured.",
         "idp_error": "The identity provider did not complete the sign-in. Try again.",
         "malformed_callback": "The identity provider's answer was incomplete. Try again.",
@@ -1931,6 +1939,32 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
 
 
+def _is_idp_transport_failure(exc: BaseException) -> bool:
+    """Whether an IdP interaction failed with no answer, the ONLY failure that may mark the IdP
+    unavailable (BACKLOG #1948). ADR 0142 Amendment E is the source of record for the rule, its
+    reason, and the residuals it leaves.
+
+    In code: a ``TokenEndpointUnreachableError``, an ``http.client`` exception such as
+    ``BadStatusLine``, or an ``OSError`` that is not an ``HTTPError``."""
+    if isinstance(exc, oidc.TokenEndpointUnreachableError):
+        return True
+    if isinstance(exc, http.client.HTTPException):
+        # MalformedReplyHeadError is an HTTPException too, raised for a reply whose header block
+        # did not parse, as from the JWKS fetch. A reply arrived, so it is an answer.
+        return not isinstance(exc, EgressReplyError)
+    # HTTPError is an OSError subclass that carries a received status, as from the JWKS fetch.
+    return isinstance(exc, OSError) and not isinstance(exc, urllib.error.HTTPError)
+
+
+def _idp_error_fields(exc: BaseException) -> dict[str, object]:
+    """The audit fields for a failed IdP interaction: the exception TYPE, never ``str(exc)``, and
+    the received status when there was one (BACKLOG #1948)."""
+    fields: dict[str, object] = {"error": type(exc).__name__}
+    if isinstance(exc, urllib.error.HTTPError):
+        fields["status"] = exc.code
+    return fields
+
+
 # BACKLOG #1138, ASVS 6.3.5: the audit action each suspicious-sign-in event is recorded under. A fixed
 # map, not ``f"auth.{event_type}"``, so the action names stay greppable and no other notice kind can
 # be passed in and double-audit an event its own call site already audits.
@@ -2661,16 +2695,16 @@ class AuthService:
         until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
         and ``/auth/providers``, nothing more. Do not "fix" the asymmetry with the Kerberos twin.
 
-        "A failed login" means an IdP OUTAGE, never a refusal the caller chose: a token endpoint
-        refusing a bad ``code`` leaves the flag alone (BACKLOG #1948).
+        "A failed login" means a TRANSPORT failure and nothing else (BACKLOG #1948): see
+        :func:`_is_idp_transport_failure` and ADR 0142 Amendment E.
         """
         return self.oidc_enabled and self._oidc_unavailable_reason is None
 
     def mark_oidc_unavailable(self, reason: str) -> None:
         """Record that an IdP interaction failed. Advisory only — see :attr:`oidc_available`.
 
-        Only for a failure no caller can cause. A token endpoint refusing a bad ``code`` is not one:
-        the IdP answered, and a signed-out caller chooses the code (BACKLOG #1948)."""
+        Only for a transport failure (:func:`_is_idp_transport_failure`, BACKLOG #1948). A token
+        endpoint answering a bad ``code``, with any status, is not one."""
         self._oidc_unavailable_reason = reason
 
     def clear_oidc_unavailable(self) -> None:
@@ -3899,7 +3933,11 @@ class AuthService:
         )
         id_token = payload["id_token"]
         if not isinstance(id_token, str):
-            raise oidc.FlowError("token endpoint returned a non-string id_token")
+            # exchange_code already refuses this as an answer; kept to narrow the type, and raised
+            # as the same answer so it never reads as an outage (BACKLOG #1948).
+            raise oidc.TokenRefusedError(
+                "token endpoint returned a non-string id_token", status=None
+            )
         return oidc.validate_id_token(id_token, self._oidc_policy(flow.nonce), self._oidc_jwks)
 
     @property
@@ -4099,15 +4137,18 @@ class AuthService:
             await self._directory_reject_audit("<oidc>", "oidc", exc.reason, client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=exc.reason)
         except oidc.TokenRefusedError as exc:
-            # BACKLOG #1948. The token endpoint ANSWERED with a 4xx, which a signed-out caller
-            # causes by presenting a bad code. It must not mark the IdP unavailable: that flag
-            # hides the federated link on /ui/login and in /auth/providers for everyone, so marking
-            # here would let any caller switch federated sign-in off. Nor does it clear the flag, as
+            # BACKLOG #1948. The token endpoint ANSWERED: any received status, 5xx and 3xx
+            # included since the Manager decision of 2026-10-06, or a 2xx with no usable token.
+            # A signed-out caller causes a 4xx by presenting a bad code, and a faulty IdP may
+            # answer one with a 5xx. It must not mark the IdP unavailable: that flag hides the
+            # federated link on /ui/login and in /auth/providers for everyone, so marking here
+            # would let any caller switch federated sign-in off. Nor does it clear the flag, as
             # no sign-in succeeded. It is a FlowError, so this arm must stay above the outage arm.
             # Audited with the client address, as the outage arm is: a spray of junk codes is the
             # abuse this arm exists for, and the operator needs to see where it comes from. The
             # status is the only other thing recorded, and it is what tells a spray (400) from the
-            # engine's own misconfiguration (a 401 on every sign-in). Never the IdP's body.
+            # engine's own misconfiguration (a 401 on every sign-in) or a failing IdP (a 5xx).
+            # Never the IdP's body.
             await self._audit(
                 "auth.login_failed",
                 actor="<oidc>",
@@ -4123,20 +4164,28 @@ class AuthService:
             )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="token_refused")
         except (OSError, ValueError, http.client.HTTPException) as exc:
-            # IdP unreachable / a 3xx or 5xx / malformed response. JwksCache's injected fetch raises
+            # IdP unreachable, or a JWKS or other IdP failure. JwksCache's injected fetch raises
             # RAW urllib errors (not wrapped in JwksError), so a narrow `except JwksError` here
             # would let an IdP outage escape as an unhandled 500 instead of a degraded login.
             # http.client.HTTPException is neither an OSError nor a ValueError: a proxy answering the
             # token POST with a non-HTTP status line raises BadStatusLine, which would otherwise
             # escape uncaught — a 500 with the IdP's bytes rendered into the traceback log, no audit
             # row, and oidc_available left stale. The exception TYPE is audited, never str(exc).
-            self.mark_oidc_unavailable(type(exc).__name__)
+            # BACKLOG #1948: ONLY a transport failure marks the IdP unavailable (ADR 0142
+            # Amendment E). Anything else here is the IdP answering, still audited as an IdP error.
+            transport = _is_idp_transport_failure(exc)
+            if transport:
+                self.mark_oidc_unavailable(type(exc).__name__)
             await self._audit(
                 "auth.login_error",
                 actor="<oidc>",
-                detail=_json({"provider": "ad", "mech": "oidc", "error": type(exc).__name__}),
+                detail=_json({"provider": "ad", "mech": "oidc", **_idp_error_fields(exc)}),
                 client=client,
             )
+            if not transport:
+                return LoginOutcome(
+                    ok=False, error="federated sign-in failed", reason=IDP_ANSWER_UNUSABLE
+                )
             return LoginOutcome(
                 ok=False, error="identity provider unavailable", reason="idp_unavailable"
             )
@@ -4567,16 +4616,34 @@ class AuthService:
             return await self._step_up_refused(
                 exc.reason, actor=actor, client=client, return_to=return_to
             )
-        except oidc.TokenRefusedError:
-            # The endpoint answered a 4xx. As on the sign-in leg, that is not an outage (#1948).
+        except oidc.TokenRefusedError as exc:
+            # The endpoint answered. As on the sign-in leg, that is not an outage (#1948), and the
+            # status is what tells a junk code from a misconfiguration or a failing IdP.
             return await self._step_up_refused(
-                "token_refused", actor=actor, client=client, return_to=return_to
+                "token_refused",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra={"status": exc.status},
             )
         except (OSError, ValueError, http.client.HTTPException) as exc:
-            # The sign-in leg's outage arm, for the same reasons. Only the exception TYPE is kept.
+            # The sign-in leg's outage arm, for the same reasons (#1948). Only the exception TYPE,
+            # and a received status, are kept.
+            if not _is_idp_transport_failure(exc):
+                return await self._step_up_refused(
+                    IDP_ANSWER_UNUSABLE,
+                    actor=actor,
+                    client=client,
+                    return_to=return_to,
+                    extra=_idp_error_fields(exc),
+                )
             self.mark_oidc_unavailable(type(exc).__name__)
             return await self._step_up_refused(
-                "idp_unavailable", actor=actor, client=client, return_to=return_to
+                "idp_unavailable",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=_idp_error_fields(exc),
             )
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(principal_claims.amr) if arrived_too_early else ()
@@ -4757,16 +4824,21 @@ class AuthService:
         client: str | None,
         return_to: str = "/ui",
         lost: bool = False,
+        extra: Mapping[str, object] | None = None,
     ) -> OidcStepUp:
-        """Audit and package one refusal of the federated step-up leg. ``reason`` is closed-set."""
-        await self._audit(
-            "auth.reauth",
-            actor=actor,
-            detail=_json(
-                {"ok": False, "provider": AuthProvider.AD.value, "mech": "oidc", "reason": reason}
-            ),
-            client=client,
-        )
+        """Audit and package one refusal of the federated step-up leg. ``reason`` is closed-set.
+
+        ``extra`` adds fields to the audit row only, such as a received status or an exception
+        type (BACKLOG #1948). It never carries IdP text."""
+        detail: dict[str, object] = {
+            "ok": False,
+            "provider": AuthProvider.AD.value,
+            "mech": "oidc",
+            "reason": reason,
+        }
+        if extra:
+            detail.update(extra)
+        await self._audit("auth.reauth", actor=actor, detail=_json(detail), client=client)
         return OidcStepUp(
             elevation=Elevation(session_lost=lost),
             return_to=return_to,

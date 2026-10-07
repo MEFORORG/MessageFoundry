@@ -841,12 +841,67 @@ def test_every_4xx_is_the_endpoint_answering(status: int, body: bytes) -> None:
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 302])
-def test_a_5xx_or_3xx_stays_an_outage(status: int) -> None:
-    """A 5xx is the IdP failing and a 3xx a redirect the no-redirect opener refuses. Neither is an
-    answer to the grant, so each stays a plain FlowError and still marks the IdP unavailable."""
-    with pytest.raises(oidc.FlowError, match=f"returned HTTP {status}") as excinfo:
+def test_a_5xx_or_3xx_is_the_endpoint_answering_too(status: int) -> None:
+    """BACKLOG #1948's residual, reversed on purpose by the Manager decision of 2026-10-06. This
+    test used to pin a 5xx and a 3xx as a plain FlowError that marks the IdP unavailable. A faulty
+    IdP may answer a caller's bad code with a 5xx, so that let any caller hide the federated link.
+    Every received status is now the endpoint answering, carried with its status."""
+    with pytest.raises(oidc.TokenRefusedError, match=f"returned HTTP {status}") as excinfo:
         _refusing_exchange(status)
+    assert excinfo.value.status == status
+    assert not isinstance(excinfo.value, oidc.TokenEndpointUnreachableError)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        pytest.param(urllib.error.URLError("connection refused"), id="refused"),
+        pytest.param(TimeoutError("timed out"), id="timeout"),
+        pytest.param(ConnectionResetError("reset"), id="reset"),
+        pytest.param(urllib.error.URLError(OSError("name or service not known")), id="dns"),
+    ],
+)
+def test_a_transport_failure_is_the_only_unreachable_outcome(raised: BaseException) -> None:
+    """The control for the arm above: no status arrived, so this is the one outcome that may still
+    mark the IdP unavailable."""
+    with pytest.raises(oidc.TokenEndpointUnreachableError, match="unreachable") as excinfo:
+        oidc.exchange_code(
+            token_endpoint="https://idp.example/token",
+            client_id="c",
+            client_auth=None,
+            code="x",
+            redirect_uri="http://localhost/cb",
+            code_verifier="v",
+            opener=_RaisingOpener(raised),  # type: ignore[arg-type]
+        )
     assert not isinstance(excinfo.value, oidc.TokenRefusedError)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        (b"not json", "not valid JSON"),
+        (b"[1, 2]", "not a JSON object"),
+        (b'{"error": "invalid_grant"}', "carries no id_token"),
+        (b'{"id_token": 7}', "non-string id_token"),
+    ],
+)
+def test_a_2xx_with_no_usable_token_is_the_endpoint_answering(body: bytes, match: str) -> None:
+    """A faulty IdP may answer a bad code with a 2xx that carries no token. The endpoint still
+    answered, so this is not an outage either (Manager decision 2026-10-06)."""
+    with pytest.raises(oidc.TokenRefusedError, match=match) as excinfo:
+        oidc.exchange_code(
+            token_endpoint="https://idp.example/token",
+            client_id="c",
+            client_auth=None,
+            code="x",
+            redirect_uri="http://localhost/cb",
+            code_verifier="v",
+            opener=_FakeOpener(body),  # type: ignore[arg-type]
+        )
+    assert excinfo.value.status == 200
 
 
 class _TripwireOpener:
