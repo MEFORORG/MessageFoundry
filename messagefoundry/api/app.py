@@ -39,7 +39,6 @@ import logging
 import os
 import re
 import shutil
-import sys
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -997,7 +996,8 @@ def _build_approval_gate(
                 # operation was refused".
                 #
                 # The row names the requester either way and differs from an inline one only by its
-                # NULL client, so this line names the release too. Type name only, never the text.
+                # NULL client, so this line names the release too. Type name only, never the text:
+                # _audit_refused_reload logs the redacted text once, in its own WARNING.
                 _log.warning("released config reload refused: %s", type(exc).__name__)
                 _status, answer = await _audit_refused_reload(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False
@@ -1410,13 +1410,13 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     WiringError,
 )
 
-#: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for its refusal WARNINGs.
-#: Those WARNINGs are the only place the real reload error is written, so they keep all of it:
-#: ``safe_exc``'s default 200-character cut dropped the directory from a long config path, and a long
-#: WiringError lost its fix instruction. ``safe_exc`` still redacts the text, and ``safe_text`` still
-#: bounds the redactor's scan to its own window, so this lifts the answer cut and nothing else. The
-#: line is then as long as the handler's RedactionFilter keeps any log argument.
-_REFUSAL_LOG_LIMIT: Final = sys.maxsize
+#: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for its 404 and 422 refusal
+#: WARNINGs, which are the only place the real reload error is written. ``safe_exc``'s default
+#: 200-character cut dropped the directory from a long config path and the fix from a long
+#: WiringError. 4096 characters holds a realistic path and a multi-line WiringError, and still bounds
+#: the line: how much redaction-missed text it can carry, what every handler's filters re-scan on the
+#: event loop, and its fit in one syslog datagram. ``safe_exc`` still redacts before the cut.
+_REFUSAL_LOG_LIMIT: Final = 4096
 
 
 async def _audit_refused_reload(
@@ -1441,9 +1441,9 @@ async def _audit_refused_reload(
     vanished or left the reload roots before its release is refused and recorded the way an inline
     one is, rather than escaping the approve route as a 500 (vault BACKLOG #2459). The detail text
     is generic on purpose: the real error is logged here, never returned, so a ``config:deploy``
-    holder cannot probe the filesystem through it. The 404 and 422 WARNINGs log the whole error,
-    redacted by ``safe_exc`` and with every line break escaped, and are not cut to a fixed length
-    (:data:`_REFUSAL_LOG_LIMIT`). The 403 writes no WARNING.
+    holder cannot probe the filesystem through it. The 404 and 422 WARNINGs log that error redacted,
+    with every line break escaped, and cut only past :data:`_REFUSAL_LOG_LIMIT`, which says why. The
+    403 writes no WARNING.
 
     ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.
 

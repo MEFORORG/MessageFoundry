@@ -902,16 +902,28 @@ async def test_a_missing_dir_refusal_logs_the_whole_long_path(
     )
 
 
+@pytest.mark.parametrize(
+    ("cause", "prefix"),
+    [
+        (None, "config reload failed (invalid config): WiringError: "),
+        (
+            ta.TrustAnchorError("pin mismatch"),
+            "config reload refused (trust anchor): WiringError: ",
+        ),
+    ],
+)
 async def test_an_invalid_config_refusal_cannot_forge_a_log_line_and_keeps_its_fix(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, cause: Exception | None, prefix: str
 ) -> None:
-    """The 422 WiringError arm of the same WARNING. A CR/LF in the error text must not start a new
-    log line, and a long error keeps its tail, which is where a WiringError puts its fix."""
+    """The 422 WiringError arm of the same WARNING, in both its wordings. A CR/LF in the error text
+    must not start a new log line, and a long error keeps its tail, which is where a WiringError
+    puts its fix."""
     fix = "fix: point tls_ca_file at a readable PEM bundle"
     padding = " ".join(f"step-{i:02d}-checked" for i in range(20))
     error = WiringError(
         f"inbound IB_X_ADT at {_FORGING_DIR}: tls_ca_file unreadable; {padding}; {fix}"
     )
+    error.__cause__ = cause
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         status, answer = await _audit_refused_reload(
             _AUDIT_UP, error, actor="alice", requested=_FORGING_DIR, dry_run=False
@@ -919,9 +931,23 @@ async def test_an_invalid_config_refusal_cannot_forge_a_log_line_and_keeps_its_f
     assert (status, answer) == (422, "invalid configuration")
     _assert_no_forged_line(caplog)
     [warning] = _refusal_warnings(caplog)
-    assert warning.startswith("config reload failed (invalid config): WiringError: ")
+    assert warning.startswith(prefix)
     assert "/cfg\\r\\nFORGED config reload succeeded" in warning
     assert warning.endswith(fix)
+
+
+async def test_a_refusal_warning_is_still_bounded(caplog: pytest.LogCaptureFixture) -> None:
+    """The lifted cut is a larger bound, not none: an error past _REFUSAL_LOG_LIMIT is cut, so one
+    refusal cannot write a 64 KiB line for every handler to re-scan on the event loop."""
+    error = WiringError(" ".join(f"word-{i:05d}" for i in range(2000)))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        await _audit_refused_reload(
+            _AUDIT_UP, error, actor="alice", requested="/cfg", dry_run=False
+        )
+    [warning] = _refusal_warnings(caplog)
+    assert "word-00300" in warning  # well past the old 200-character cut
+    assert "word-01999" not in warning
+    assert len(warning) < 4096 + 200
 
 
 async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(
