@@ -109,6 +109,7 @@ def test_an_unreadable_cast_bool_default_is_refused_naming_the_key(default: obje
         env("acme_flag", default=default, cast=bool)
     msg = str(ei.value)
     assert "'acme_flag'" in msg and "default=" in msg and "value withheld" in msg
+    assert "maybe" not in msg  # the bare text, not only its repr
     assert f"{default!r}" not in msg.replace("'acme_flag'", "")
 
 
@@ -238,3 +239,45 @@ def test_a_toml_bool_default_is_read_strictly(default: object, want: bool) -> No
 def test_an_unreadable_toml_bool_default_is_refused() -> None:
     with pytest.raises(WiringError, match="default= is not a boolean"):
         parse_env_setting({"env": "flag", "cast": "bool", "default": "maybe"})
+
+
+# --- the same, through a real connections.toml load --------------------------------------------------
+
+_TOML = """
+[[outbound]]
+name = "OB_SYNTH_REST"
+transport = "rest"
+  [outbound.settings]
+  url = "https://partner.example.org/in"
+  tls_allow_expired = {{ env = "rx", cast = "bool", default = {default} }}
+"""
+
+
+def _toml_registry(tmp_path: Path, default: str) -> Any:
+    (tmp_path / "connections.toml").write_text(
+        textwrap.dedent(_TOML.format(default=default)), encoding="utf-8"
+    )
+    return load_config(tmp_path, allow_empty=True)
+
+
+def test_an_unreadable_toml_bool_default_names_the_connection_and_setting(tmp_path: Path) -> None:
+    # The refusal is raised while decoding [settings]. It must still say which connection and which
+    # setting, as every other bad [settings] value does, and still withhold the value.
+    with pytest.raises(WiringError) as ei:
+        _toml_registry(tmp_path, '"maybe"')
+    msg = str(ei.value)
+    assert "OB_SYNTH_REST" in msg and "'tls_allow_expired'" in msg and "'rx'" in msg
+    assert "maybe" not in msg
+
+
+@pytest.mark.parametrize(
+    ("default", "want"), [('"false"', False), ('"on"', True), ("false", False)]
+)
+def test_a_toml_bool_default_resolves_through_a_real_load(
+    tmp_path: Path, default: str, want: bool
+) -> None:
+    reg = _toml_registry(tmp_path, default)
+    dest = _dest_config(
+        reg.outbound["OB_SYNTH_REST"], {}, None, EgressSettings(deny_by_default=False)
+    )
+    assert dest.settings["tls_allow_expired"] is want

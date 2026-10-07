@@ -605,7 +605,10 @@ def parse_env_setting(value: Any) -> Any:
     :class:`EnvRef` — the inverse of :func:`display_settings`'s ``{"env": key[, "default"]}`` encoding;
     ``cast`` is a **named** cast (``"int"``/``"float"``/``"bool"``/``"str"``) since a file can't carry a
     Python callable. Any other value (a scalar, list, or a plain dict like a REST ``headers`` map) is
-    returned verbatim. Raises :class:`WiringError` on a malformed env marker or an unknown cast name."""
+    returned verbatim. Raises :class:`WiringError` on a malformed env marker, an unknown cast name, or
+    a ``cast = "bool"`` default that is not a boolean spelling (vault BACKLOG #3138; :class:`EnvRef`
+    reads that default when it is made). The message names neither the connection nor the setting;
+    ``connections_file._build_spec`` adds both."""
     if not _is_env_marker(value):
         return value
     key = value["env"]
@@ -740,8 +743,8 @@ def refuse_resolved_verify_off(
         return
     if not settings["verify_tls"] and settings.get("tls_ca_file"):
         raise WiringError(
-            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to false, which "
-            "verifies nothing, and DICOMweb has no token hop."
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false, empty "
+            "or unset value, which verifies nothing, and DICOMweb has no token hop."
         )
 
 

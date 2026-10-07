@@ -385,7 +385,15 @@ def _build_spec(transport: str, table: dict[str, Any], where: str) -> Connection
     raw = table.get("settings", {})
     if not isinstance(raw, dict):
         raise WiringError(f"{where}: [settings] must be a table")
-    settings = {key: parse_env_setting(value) for key, value in raw.items()}
+    settings: dict[str, Any] = {}
+    for key, value in raw.items():
+        # Per setting, so a refused env() marker names the connection and the setting. The handler
+        # below re-raises a WiringError verbatim, so moving this inside it would add nothing. Vault
+        # BACKLOG #3138 made this matter more: an unreadable `cast = "bool"` default is refused here.
+        try:
+            settings[key] = parse_env_setting(value)
+        except WiringError as exc:
+            raise WiringError(f"{where}: invalid {transport!r} settings — {key!r}: {exc}") from exc
     try:
         # INSIDE the try, not above it. This module's contract is that a bad [settings] table fails
         # loud as a WiringError NAMING THE CONNECTION, and the check below reads annotations through
@@ -562,9 +570,11 @@ def _check_setting_types(
         subject = (f"{key!r} env() default" if is_default else repr(key)) + suffix
         expected = _render_expected(judged, None if is_default or suffix else param.annotation)
         detail = f"{subject} must be {expected}, got {_word_for(offender)}"
-        if is_default and not suffix:
+        if is_default and not suffix and not isinstance(checked, bool):
             # Without this the refusal reads as simply wrong to an author looking at the `cast = "int"`
             # they wrote on the same line. The reason lives in the comment above, where they cannot see it.
+            # A bool default is skipped: the bool cast DOES convert its default (vault BACKLOG #3138),
+            # and a native TOML bool needed no converting, so the note would be false for either.
             detail += " (a default is not converted by the ref's cast)"
         elif judged.scalars and isinstance(offender, str) and str not in judged.scalars:
             # Stated as a FACT, not as an instruction. "Write it unquoted" is wrong for every value
