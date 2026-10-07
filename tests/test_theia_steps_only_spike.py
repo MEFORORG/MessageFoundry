@@ -605,3 +605,52 @@ def test_pass_literal_edit_on_a_developer_written_dynamic_row_and_its_delete() -
     _passes(_GUARDED, head, "cfg/h.py")
     deleted = _GUARDED.replace('        msg.set("PID-19", ssn_from(msg))\n', "        pass\n")
     _passes(_GUARDED, deleted, "cfg/h.py")
+
+
+# --- PR 2154 review input (F1, F6): full call source, not params only ------------------------
+
+_TRIM = '@handler("h")\ndef h(msg):\n    trim_field(msg, "PID-5.1")\n    return []\n'
+
+
+@pytest.mark.parametrize(
+    ("base", "head"),
+    [
+        (_TRIM, _TRIM.replace("trim_field(msg,", 'trim_field(__import__("os").getcwd() or msg,')),
+        (
+            _TRIM,
+            _TRIM.replace(
+                "    return []",
+                '    set_field(__import__("os").getcwd() or msg, "PID-5.1", "X")\n    return []',
+            ),
+        ),
+    ],
+    ids=["changed-msg-positional", "new-row-msg-positional"],
+)
+def test_fail_msg_positional_carrying_code(base: str, head: str) -> None:
+    rows = [r for e in parse_source(head, contract=CONTRACT_V2) for r in e["rows"]]
+    # The lens drops the msg positional from params, so these read back as ordinary steps.
+    assert {r["kind"] for r in rows} == {"action", "send"}
+    _fails(base, head, "param", "cfg/h.py")
+
+
+def test_fail_attribute_callee_on_send() -> None:
+    adt = _sample("adt.py")
+    head = adt.replace(SEND, 'return anything.Send("FILE-OUT_Test_ADT", msg)')
+    assert _row(head, "anything.Send")["kind"] == "send"  # the lens still reads it as a send
+    _fails(adt, head, "send")
+
+
+def test_fail_mutable_module_binding_read_by_a_typed_row() -> None:
+    adt = _sample("adt.py")
+    marker = "EVENT_LABELS = code_set"
+    with_seen = adt.replace(marker, "SEEN = []\n" + marker, 1)
+    _fails(adt, with_seen, "outside")  # adding the binding is a module-scope change
+    for action, pname in (("checkpoint", "label"), ("log_note", "template")):
+        head = _edit(
+            with_seen,
+            MNEMONIC,
+            op="insert_row",
+            action=action,
+            params={pname: {"expr": "SEEN"}},
+        )
+        _fails(with_seen, head, "param")  # with SEEN already at base, the row itself fails
