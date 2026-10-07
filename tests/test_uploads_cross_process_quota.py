@@ -35,6 +35,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -236,6 +238,46 @@ def test_a_leaked_reservation_is_reclaimed_once_it_goes_stale(tmp_path: Path) ->
     asyncio.run(_run())
 
 
+@asynccontextmanager
+async def _a_save_held_mid_write(
+    tmp_path: Path,
+) -> AsyncIterator[tuple[MessageStore, UploadStore, asyncio.Future[UploadedFileMeta]]]:
+    """Shard A: a save over a fresh store, held inside its write with its reservation taken. On
+    exit the write is released, the save settles, and its heartbeat is given time to end before
+    the store closes, so a test failure never strands a cancel-resistant write thread."""
+    store = await MessageStore.open(tmp_path / "engine.db")
+    try:
+        uploads = UploadStore(
+            tmp_path / "uploads",
+            make_cipher(generate_key()),
+            max_bytes=4096,
+            max_files_per_user=1,
+            store=store,
+        )
+        entered, gate = threading.Event(), threading.Event()
+        real_encrypt = uploads._encrypt_blob
+
+        def _held(data: bytes, file_id: str) -> str:
+            entered.set()
+            gate.wait(timeout=30)
+            return real_encrypt(data, file_id)
+
+        uploads._encrypt_blob = _held  # type: ignore[method-assign]
+        save = asyncio.ensure_future(
+            uploads.save(data=b"slow\n", filename="a.txt", uploader="alice", uploader_id="u-alice")
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
+            yield store, uploads, save
+        finally:
+            gate.set()
+            await asyncio.gather(save, return_exceptions=True)
+            if uploads._heartbeats:
+                await asyncio.wait(set(uploads._heartbeats), timeout=10)
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize(("heartbeat", "reclaimed"), [(0.05, False), (3600.0, True)])
 def test_a_slow_save_keeps_its_slot_past_the_staleness_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heartbeat: float, reclaimed: bool
@@ -247,49 +289,14 @@ def test_a_slow_save_keeps_its_slot_past_the_staleness_window(
     monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", heartbeat)
 
     async def _run() -> bool:
-        store = await MessageStore.open(tmp_path / "engine.db")
-        try:
-            uploads = UploadStore(
-                tmp_path / "uploads",
-                make_cipher(generate_key()),
-                max_bytes=4096,
-                max_files_per_user=1,
-                store=store,
-            )
-            entered, gate = threading.Event(), threading.Event()
-            real_encrypt = uploads._encrypt_blob
-
-            def _held(data: bytes, file_id: str) -> str:
-                entered.set()
-                gate.wait(timeout=30)
-                return real_encrypt(data, file_id)
-
-            uploads._encrypt_blob = _held  # type: ignore[method-assign]
-            save = asyncio.ensure_future(
-                uploads.save(
-                    data=b"slow\n", filename="a.txt", uploader="alice", uploader_id="u-alice"
-                )
-            )
-            assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
+        async with _a_save_held_mid_write(tmp_path) as (store, uploads, save):
             await asyncio.sleep(0.6)
-            try:
-                applied = await store.reserve_upload_quota(
-                    "u-alice",
-                    files=1,
-                    size_bytes=5,
-                    max_files=1,
-                    max_total_bytes=4096,
-                    stale_after=0.3,
-                )
-            finally:
-                gate.set()
-            await save
-            if uploads._heartbeats:
-                await asyncio.wait(set(uploads._heartbeats), timeout=10)
-            assert not uploads._heartbeats, "the heartbeat outlived its save"
-            return applied
-        finally:
-            await store.close()
+            applied = await store.reserve_upload_quota(
+                "u-alice", files=1, size_bytes=5, max_files=1, max_total_bytes=4096, stale_after=0.3
+            )
+        assert isinstance(save.result(), UploadedFileMeta)
+        assert not uploads._heartbeats, "the heartbeat outlived its save"
+        return applied
 
     assert asyncio.run(_run()) is reclaimed
 
@@ -303,44 +310,51 @@ def test_the_heartbeat_stops_at_its_lifetime_cap(
     monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_MAX_SECONDS", 0.1)
 
     async def _run() -> None:
-        store = await MessageStore.open(tmp_path / "engine.db")
-        try:
-            uploads = UploadStore(
-                tmp_path / "uploads",
-                make_cipher(generate_key()),
-                max_bytes=4096,
-                max_files_per_user=1,
-                store=store,
-            )
-            entered, gate = threading.Event(), threading.Event()
-            real_encrypt = uploads._encrypt_blob
-
-            def _held(data: bytes, file_id: str) -> str:
-                entered.set()
-                gate.wait(timeout=30)
-                return real_encrypt(data, file_id)
-
-            uploads._encrypt_blob = _held  # type: ignore[method-assign]
-            save = asyncio.ensure_future(
-                uploads.save(
-                    data=b"hung\n", filename="a.txt", uploader="alice", uploader_id="u-alice"
-                )
-            )
-            try:
-                assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
-                (beat,) = uploads._heartbeats
-                await asyncio.wait((beat,), timeout=10)
-                assert beat.done(), "the heartbeat ran past its cap"
-                assert not save.done()
-            finally:
-                gate.set()
-                await save
-        finally:
-            await store.close()
+        async with _a_save_held_mid_write(tmp_path) as (_store, uploads, save):
+            for _ in range(500):
+                if "no longer refreshed" in caplog.text:
+                    break
+                await asyncio.sleep(0.02)
+            assert "no longer refreshed" in caplog.text, "the heartbeat ran past its cap"
+            await asyncio.sleep(0.05)  # the task leaves the set on its done callback
+            assert not uploads._heartbeats
+            assert not save.done()
 
     with caplog.at_level("WARNING", logger=uploads_mod._log.name):
         asyncio.run(_run())
-    assert "no longer refreshed" in caplog.text
+
+
+def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:
+    """BACKLOG #2648. ``since`` is stamped from each writer's own clock. A shard whose clock lags
+    must not age a row a sibling keeps fresh, or the sibling's next reserve reclaims live slots.
+    The row is stamped an hour ahead to stand in for the sibling; a reserve, a release and a touch
+    from this host must all leave that stamp where it is."""
+
+    async def _run() -> None:
+        store = await MessageStore.open(tmp_path / "engine.db")
+        try:
+            assert await store.reserve_upload_quota(
+                "u-alice", files=1, size_bytes=10, max_files=5, max_total_bytes=100
+            )
+            ahead = time.time() + 3600.0
+            await store._db.execute(
+                "UPDATE upload_quota SET since = ? WHERE uploader_id = ?", (ahead, "u-alice")
+            )
+            await store._db.commit()
+            assert await store.reserve_upload_quota(
+                "u-alice", files=1, size_bytes=10, max_files=5, max_total_bytes=100
+            )
+            await store.reserve_upload_quota("u-alice", files=-1, size_bytes=-10)
+            await store.reserve_upload_quota("u-alice", files=0, size_bytes=0)
+            cur = await store._db.execute(
+                "SELECT since FROM upload_quota WHERE uploader_id = ?", ("u-alice",)
+            )
+            row = await cur.fetchone()
+            assert row is not None and float(row[0]) == ahead
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
 
 
 def test_the_heartbeat_fits_three_times_inside_the_staleness_window() -> None:

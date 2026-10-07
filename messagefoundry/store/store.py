@@ -11699,7 +11699,8 @@ class MessageStore:
                     "UPDATE upload_quota SET"
                     " inflight_files = MAX(0, inflight_files + ?),"
                     " inflight_bytes = MAX(0, inflight_bytes + ?),"
-                    " since = ?"
+                    # Never backwards: a host whose clock lags must not age a live row (#2648).
+                    " since = MAX(since, ?)"
                     " WHERE uploader_id = ?",
                     (int(files), int(size_bytes), now, uploader_id),
                 )
@@ -11720,8 +11721,9 @@ class MessageStore:
                 " inflight_bytes ="
                 " CASE WHEN upload_quota.since <= ? THEN 0 ELSE upload_quota.inflight_bytes END + ?,"
                 # Every applied reserve refreshes `since`, as a release does: a live slot joining
-                # an old row must not be reclaimed along with it (BACKLOG #2648).
-                " since = ?"
+                # an old row must not be reclaimed along with it (BACKLOG #2648). Never backwards,
+                # so a host whose clock lags cannot age a row a sibling keeps fresh.
+                " since = MAX(upload_quota.since, ?)"
                 " WHERE (CASE WHEN upload_quota.since <= ? THEN 0"
                 " ELSE upload_quota.inflight_files END) + ? <= ?"
                 " AND (CASE WHEN upload_quota.since <= ? THEN 0"
