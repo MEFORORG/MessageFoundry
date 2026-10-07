@@ -18,17 +18,22 @@ from __future__ import annotations
 
 import ast
 import collections
+import collections.abc
+import configparser
 import io
 import itertools
 import logging
 import struct
+import sys
 import traceback
+import types
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from messagefoundry import redaction
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.wiring import Registry, Send, WiringError
@@ -264,6 +269,144 @@ def test_a_unicode_error_as_a_key_or_in_a_container_subclass_renders_safely() ->
     assert "caf" not in out
 
 
+def _nested(leaf: object, levels: int) -> object:
+    for _ in range(levels):
+        leaf = [leaf]
+    return leaf
+
+
+@pytest.mark.parametrize("levels", [4, 5])
+@pytest.mark.parametrize("chain", ["engine", "tray"])
+def test_a_unicode_error_deep_inside_nested_containers_renders_safely(
+    levels: int, chain: str
+) -> None:
+    # Round 2 checked the depth cutoff before the error, so an error at the last walked level
+    # printed its whole .object again. Four levels is the case the Lander measured.
+    arg = _nested(_encode_error(), levels)
+    assert "caf" in repr(arg)  # control: the raw nesting carries the input
+    record = logging.LogRecord("t", logging.WARNING, __file__, 1, "x %r", (arg,), None)
+    (RedactionFilter() if chain == "engine" else TrayLogScrubFilter()).filter(record)
+    out = record.getMessage()
+    _assert_encode_safe(out)
+    assert "caf" not in out
+
+
+def test_a_unicode_error_deep_inside_a_single_mapping_argument_renders_safely() -> None:
+    logger, stream = _capture()
+    logger.warning("%(e)r", {"e": _nested(_decode_error(), 5)})
+    out = stream.getvalue()
+    _assert_decode_safe(out)
+    assert "ok\\xfe" not in out
+
+
+def test_an_exception_group_argument_holding_a_unicode_error_renders_safely() -> None:
+    group = ExceptionGroup("batch", [ValueError("x"), ExceptionGroup("inner", [_encode_error()])])
+    assert "caf" in repr(group)  # control
+    logger, stream = _capture()
+    logger.warning("failed: %r", group)
+    out = stream.getvalue()
+    assert "caf" not in out and "ExceptionGroup" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+class _RaisingMapping(collections.abc.Mapping[str, int]):
+    """A Mapping whose reads raise, as a ConfigParser's interpolation or a lazy table's can."""
+
+    def __getitem__(self, key: str) -> int:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(["k"])
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _RaisingIterList(list[object]):
+    def __iter__(self) -> Iterator[object]:
+        raise RuntimeError("a subclass's own iteration")
+
+
+def _config_with_a_missing_interpolation() -> configparser.ConfigParser:
+    parser = configparser.ConfigParser()
+    parser["s"] = {"k": "%(missing)s"}
+    return parser
+
+
+@pytest.mark.parametrize(
+    "arg",
+    [_config_with_a_missing_interpolation(), _RaisingMapping(), _RaisingIterList([1])],
+    ids=["configparser", "raising-mapping", "raising-iter"],
+)
+def test_a_log_argument_whose_own_code_raises_renders_as_the_stdlib_renders_it(arg: object) -> None:
+    # A log call must never raise because of its arguments. Round 2 read any Mapping through its
+    # own .items() and any list subclass through its own __iter__, on every record.
+    logger, stream = _capture()
+    logger.warning("cfg %s %s", arg, 1)
+    assert f"cfg {arg} 1" in stream.getvalue()  # what the stdlib's own "%s" renders
+
+
+def test_a_single_mapping_argument_renders_as_the_stdlib_renders_it() -> None:
+    logger, stream = _capture()
+    logger.info("%(a)s and %(b)r", {"a": 1, "b": "two"})
+    assert "1 and 'two'" in stream.getvalue()
+
+
+def test_a_defaultdict_holding_a_unicode_error_keeps_its_default() -> None:
+    # Round 2 rebuilt it as a plain dict, so "%(b)s" lost its default and raised KeyError.
+    logger, stream = _capture()
+    args: collections.defaultdict[str, object] = collections.defaultdict(str, a=_encode_error())
+    logger.warning("[%(a)s] [%(b)s]", args)
+    out = stream.getvalue()
+    _assert_encode_safe(out)
+    assert "] []" in out
+
+
+def test_two_unicode_error_keys_that_render_alike_stay_two_keys() -> None:
+    first, second = _encode_error(), _encode_error()
+    record = logging.LogRecord(
+        "t", logging.WARNING, __file__, 1, "%s %s", ({first: 1, second: 2}, {first, second}), None
+    )
+    prepare_log_record(record)
+    keyed, members = cast(tuple[dict[str, int], set[str]], record.args)
+    assert sorted(keyed.values()) == [1, 2] and len(members) == 2
+    _assert_encode_safe(record.getMessage())
+
+
+class _FrozenDict(dict[str, object]):
+    def __setitem__(self, key: str, value: object) -> None:
+        raise TypeError("frozen")
+
+
+def test_an_argument_that_cannot_be_rebuilt_is_withheld_never_raised() -> None:
+    logger, stream = _capture()
+    logger.warning("frozen %s", _FrozenDict(e=_encode_error()))
+    out = stream.getvalue()
+    assert "frozen %s [log arguments withheld: TypeError while scanning them]" in out
+    assert "caf" not in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+def test_a_traceback_that_cannot_be_rendered_is_withheld_never_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(ei: object) -> str:
+        raise RuntimeError("renderer")
+
+    monkeypatch.setattr(redaction, "safe_traceback", broken)
+    logger, stream = _capture()
+    try:
+        f"caf{_CHAR}".encode("ascii")
+    except UnicodeEncodeError:
+        logger.exception("encode failed")
+    out = stream.getvalue()
+    assert "[traceback withheld: RuntimeError while rendering it]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
 def test_a_renamed_private_traceback_line_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     # A later CPython that drops TracebackException._str must not print the raw line.
     original = traceback.TracebackException.__init__
@@ -344,6 +487,36 @@ def test_a_sandboxed_handler_raising_a_unicode_error_reports_it_safely(
     assert error == "ValueError: plain"  # any other error keeps its old text
 
 
+def test_a_sandbox_bootstrap_unicode_failure_is_reported_without_the_character(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    # The bootstrap arm sent the same f"{type(exc).__name__}: {exc}" its sibling arm used to.
+    import messagefoundry.config.wiring as wiring
+    from messagefoundry.pipeline import _sandbox_codec as codec
+    from messagefoundry.pipeline import _sandbox_worker, sandbox
+
+    stdin, stdout = io.BytesIO(), io.BytesIO()
+    boot = codec.encode_boot(config_dir=".", forbidden=(), mem_mb=None, code_sets=None)
+    sandbox._write_frame(stdin, boot)
+    stdin.seek(0)
+
+    def unreadable(config_dir: object) -> object:
+        raise _encode_error()
+
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(buffer=stdin))
+    monkeypatch.setattr(sys, "stdout", types.SimpleNamespace(buffer=stdout))
+    monkeypatch.setattr(_sandbox_worker, "_redirect_stdout_to_stderr", lambda: None)
+    monkeypatch.setattr(wiring, "load_config", unreadable)
+    assert _sandbox_worker.main() == 1
+    stdout.seek(0)
+    reply = sandbox._read_frame_bytes(stdout)
+    assert reply is not None
+    graph, why = codec.decode_boot_reply(reply)
+    assert graph is None
+    _assert_encode_safe(why)
+
+
 def test_a_send_whose_message_cannot_encode_is_refused_without_the_character() -> None:
     class _Unencodable:
         def encode(self) -> str:
@@ -401,9 +574,11 @@ _SCANNED = ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolk
 _UNICODE_TYPES = frozenset(
     {"UnicodeError", "UnicodeEncodeError", "UnicodeDecodeError", "UnicodeTranslateError"}
 )
-#: Attributes that hold the input or a free-text reason. ``.start``, ``.end`` and ``.encoding`` are
-#: positions and the caller's codec name, and stay allowed.
-_RAW_ATTRS = frozenset({"object", "args", "reason"})
+#: Attributes that hold the input or a free-text reason, or render it. ``.start``, ``.end`` and
+#: ``.encoding`` are positions and the caller's codec name, and stay allowed.
+_RAW_ATTRS = frozenset({"object", "args", "reason", "__str__", "__repr__"})
+#: Calls that render the exception being handled without being handed it.
+_CURRENT_RENDERS = frozenset({"format_exc", "print_exc"})
 #: Calls that render their argument as text. The scan cannot know what a lowercase helper of the
 #: code's own does, so a raw error handed to one passes it: a stated limit, not a check.
 _RENDER_CALLS = frozenset(
@@ -450,6 +625,8 @@ def _raw_renders(handler: ast.ExceptHandler) -> Iterator[tuple[int, str]]:
             right = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
             if any(_is_raw(r, name) for r in right):
                 yield node.lineno, "% formatting"
+        elif isinstance(node, ast.Call) and callee_name(node) in _CURRENT_RENDERS:
+            yield node.lineno, f"{callee_name(node)}() of the handled error"
         elif isinstance(node, ast.Call):
             yield from _raw_call(node, name)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
@@ -556,6 +733,16 @@ def j(b):
         b.decode()
     except UnicodeDecodeError as exc:
         text = "".join(traceback.format_exception(exc))
+def k(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError as exc:
+        text = traceback.format_exc()
+def m(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError as exc:
+        text = exc.__str__()
 """
 
 _CLEAN = """
@@ -580,7 +767,7 @@ def c(b):
 
 def test_the_guard_fires_on_every_planted_shape() -> None:
     handlers, found = _scan_source(_PLANTED, "planted.py")
-    assert handlers == 9
+    assert handlers == 11
     kinds = [line.split(": ", 1)[1] for line in found]
     assert kinds == [
         "f-string interpolation",
@@ -594,6 +781,8 @@ def test_the_guard_fires_on_every_planted_shape() -> None:
         "format() of the error",
         "aliased out of the handler",
         "format_exception() of the error",
+        "format_exc() of the handled error",
+        ".__str__ read",
     ], found
 
 

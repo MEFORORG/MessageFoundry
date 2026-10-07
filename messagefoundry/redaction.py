@@ -63,6 +63,7 @@ Pure stdlib, so it can be used from any engine package.
 
 from __future__ import annotations
 
+import copy
 import encodings
 import encodings.aliases
 import hashlib
@@ -72,7 +73,7 @@ import pkgutil
 import re
 import traceback
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
@@ -2205,7 +2206,7 @@ def safe_traceback(ei: ExcInfo) -> str:
         if node is None or exc is None:  # exc is None at the root of an empty exc_info
             continue
         if isinstance(exc, UnicodeError):
-            if "_str" not in vars(node):  # the stdlib renamed its line: fail closed, no traceback
+            if not hasattr(node, "_str"):  # the stdlib renamed its line: fail closed, no traceback
                 return safe_exc(value) if value is not None else ""
             node._str = _unicode_error_detail(exc)  # the stdlib's private name: see docstring
         pending.append((node.__cause__, exc.__cause__))
@@ -2226,45 +2227,73 @@ def codec_safe_str(exc: BaseException) -> str:
 
 #: The containers a log argument is walked through, and how deep. A ``UnicodeError`` inside one
 #: renders through ``repr``, which prints ``.object``, the whole input. The record's own ``args`` is
-#: the first level. Subclasses count (an ``OrderedDict``, a namedtuple, a ``deque``), and one that
-#: holds an error is rebuilt as its plain builtin, since its own constructor may not take a list.
-#: Other objects, a dataclass among them, are not walked.
-_ARG_SEQUENCES = (tuple, list, set, frozenset, deque)
+#: level 0, so an error inside five nested containers of the caller's own is found, and a container
+#: at a sixth level is not walked. Subclasses count (an ``OrderedDict``, a ``defaultdict``, a
+#: namedtuple, a ``deque``), and an exception group's members are walked too.
+#:
+#: ONLY THESE BUILTINS ARE WALKED, AND ONLY THROUGH THE BUILTIN'S OWN METHODS (``dict.items(arg)``),
+#: so a subclass's override never runs. A log call must never raise because of its arguments, and
+#: any other ``Mapping`` runs its own code to be read: ``ConfigParser.items()`` interpolates and can
+#: raise, and the engine's ``CodeSet`` would be walked whole on every record. Those, a dataclass and
+#: every other object are left as they are.
+_ARG_SEQUENCES: tuple[type[Any], ...] = (tuple, list, set, frozenset, deque)
 _ARG_DEPTH = 5
-#: The argument types nearly every record carries, answered without an ABC check.
+#: The argument types nearly every record carries, answered without an ``isinstance`` check.
 _ARG_SCALARS = frozenset({str, int, float, bool, bytes, type(None)})
 
 
-def _holds_unicode_error(arg: Any, depth: int = 0) -> bool:
-    if type(arg) in _ARG_SCALARS or depth >= _ARG_DEPTH:
-        return False
-    if isinstance(arg, UnicodeError):
-        return True
-    if isinstance(arg, Mapping):
-        return any(
-            _holds_unicode_error(k, depth + 1) or _holds_unicode_error(v, depth + 1)
-            for k, v in arg.items()
-        )
-    if isinstance(arg, _ARG_SEQUENCES):
-        return any(_holds_unicode_error(a, depth + 1) for a in arg)
-    return False
+class _SafeText(str):
+    """:func:`safe_exc`'s text standing in for a ``UnicodeError`` in a log argument.
+
+    It hashes and compares by identity, as the error it replaces did, so two errors that render the
+    same text stay two dict keys or two set members. It still equals a plain ``str`` of its text."""
+
+    __slots__ = ()
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+    __ne__ = object.__ne__
 
 
 def _safe_arg(arg: Any, depth: int = 0) -> Any:
-    """``arg`` with each ``UnicodeError`` in it replaced by :func:`safe_exc` text. A part holding
-    none is returned as it is, so only the path down to an error is rebuilt."""
-    if isinstance(arg, UnicodeError):
-        return safe_exc(arg)
-    if not _holds_unicode_error(arg, depth):
+    """``arg`` with each ``UnicodeError`` in it replaced by :func:`safe_exc` text, or ``arg`` itself
+    when nothing was replaced, so a record with nothing to replace keeps its own objects.
+
+    One walker finds and rebuilds, so the two cannot disagree about how deep to look (round 2 of
+    vault BACKLOG #3185 split them, and the copy that checked depth first missed an error at the last
+    level). It may raise from a subclass's own ``copy`` or ``__setitem__``; its caller catches that."""
+    if type(arg) in _ARG_SCALARS:
         return arg
-    if isinstance(arg, Mapping):
-        return {_safe_arg(k, depth + 1): _safe_arg(v, depth + 1) for k, v in arg.items()}
-    items = [_safe_arg(a, depth + 1) for a in arg]
-    if isinstance(arg, tuple):
-        return tuple(items)
-    if isinstance(arg, frozenset):
-        return frozenset(items)
-    return set(items) if isinstance(arg, set) else items
+    # Before the depth cutoff: an error AT the last level is replaced, only a container there is not.
+    if isinstance(arg, UnicodeError):
+        return _SafeText(safe_exc(arg))
+    if depth > _ARG_DEPTH:
+        return arg
+    if isinstance(arg, BaseExceptionGroup):
+        # repr() of a group prints each member's repr(), and with it each member's ``.object``.
+        members = arg.exceptions
+        return arg if _safe_arg(members, depth + 1) is members else _SafeText(safe_exc(arg))
+    if isinstance(arg, dict):
+        pairs = list(dict.items(arg))
+        new = [(_safe_arg(k, depth + 1), _safe_arg(v, depth + 1)) for k, v in pairs]
+        if all(nk is k and nv is v for (k, v), (nk, nv) in zip(pairs, new, strict=True)):
+            return arg
+        if type(arg) is dict:
+            return dict(new)
+        # Keep the subclass: a defaultdict's default must still answer a "%(name)s" it lacks.
+        kept = copy.copy(arg)
+        kept.clear()
+        for k, v in new:  # one at a time: Counter.update would add to the counts
+            kept[k] = v
+        return kept
+    for kind in _ARG_SEQUENCES:
+        if isinstance(arg, kind):
+            items = list(kind.__iter__(arg))
+            fresh = [_safe_arg(a, depth + 1) for a in items]
+            if all(n is o for n, o in zip(fresh, items, strict=True)):
+                return arg
+            # The plain builtin, not the subclass: a namedtuple's constructor does not take a list.
+            return kind(fresh)
+    return arg
 
 
 def prepare_log_record(record: logging.LogRecord) -> None:
@@ -2279,14 +2308,28 @@ def prepare_log_record(record: logging.LogRecord) -> None:
     :func:`safe_exc`'s text, inside builtin containers too. ``log.warning("unreadable: %s", exc)``
     renders ``str(exc)``, which names the character or byte the codec failed on, and ``%r`` or a
     container renders ``repr(exc)``, which prints ``.object``, the whole input. Args with nothing to
-    replace are left as the same object."""
+    replace are left as the same object.
+
+    IT NEVER RAISES. ``Handler.handle`` does not catch a filter's exception, so one raised here would
+    reach the caller's log call. A traceback that cannot be rendered, or arguments that cannot be
+    walked, are withheld with a fixed note: either could hold the error this function exists to stop."""
     if record.exc_info:
-        record.exc_text = safe_traceback(record.exc_info)
+        try:
+            record.exc_text = safe_traceback(record.exc_info)
+        except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
+            record.exc_text = f"[traceback withheld: {type(exc).__name__} while rendering it]"
     record.exc_info = None
-    if _holds_unicode_error(record.msg):
-        record.msg = _safe_arg(record.msg)
-    if _holds_unicode_error(record.args):
-        record.args = _safe_arg(record.args)
+    try:
+        msg, args = _safe_arg(record.msg), _safe_arg(record.args)
+    except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
+        # With no args the formatter applies no %, so a str template prints as it was written.
+        template = record.msg if type(record.msg) is str else "[log message withheld]"
+        record.msg = (
+            f"{template} [log arguments withheld: {type(exc).__name__} while scanning them]"
+        )
+        record.args = ()
+    else:
+        record.msg, record.args = msg, args
 
 
 def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:

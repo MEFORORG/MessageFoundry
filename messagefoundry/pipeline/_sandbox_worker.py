@@ -275,8 +275,12 @@ def main() -> int:
         _apply_resource_caps(boot.mem_mb)
         _install_import_guard(boot.forbidden)
     except Exception as exc:  # noqa: BLE001 — report a bootstrap failure, do not crash silently
+        # As in _run_one: a Unicode error's str() names the character or byte (vault BACKLOG #3185).
+        from messagefoundry.redaction import safe_exc
+
+        why = safe_exc(exc) if isinstance(exc, UnicodeError) else f"{type(exc).__name__}: {exc}"
         try:  # noqa: SIM105
-            _write_frame(stdout, codec.encode_bootfail(f"{type(exc).__name__}: {exc}"))
+            _write_frame(stdout, codec.encode_bootfail(why))
         except (OSError, SandboxError):
             pass
         return 1
