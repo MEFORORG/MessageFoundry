@@ -7256,16 +7256,25 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     # A refused write on every backend (BACKLOG #1983), as admin-set-notify-email names them.
     store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
 
-    def open_refused(exc: Exception) -> int:
-        """The exit for a refusal raised while a store was opened or checked: nothing written."""
+    def open_refused(exc: Exception, *, hint: str = "") -> int:
+        """The exit for a refusal raised while a store was opened or checked: nothing written.
+        ``hint`` follows the message once the key has been shown. The texts of the first two
+        families are the engine's own and name settings, files, tables or key ids, never a value."""
         if isinstance(exc, could_not_start):
-            _emit_error(f"{_sentence(exc)} Nothing was written.", as_json=args.json)
+            _emit_error(f"{_sentence(exc)} Nothing was written.{hint}", as_json=args.json)
             return 2
         if isinstance(exc, (StoreKeylessError, CipherError)):
-            return _emit_error(f"{_sentence(exc)} Nothing was written", as_json=args.json)
-        if isinstance(exc, sqlite3.DatabaseError):  # #1670: a path that is not a database
+            return _emit_error(f"{_sentence(exc)} Nothing was written.{hint}", as_json=args.json)
+        if isinstance(exc, sqlite3.DatabaseError) and not hint:  # #1670: not a database
             return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-        raise exc  # unreachable: open_refusals has no other member
+        # After the key was shown the store had already opened once, so this is no "cannot open".
+        # The class only: a driver's message can quote a stored value (ASVS 16.5.4).
+        _emit_error(
+            f"the store failed before the replacement ({type(exc).__name__}); nothing was "
+            f"written.{hint}",
+            as_json=args.json,
+        )
+        return 2
 
     async def opened() -> Store:
         return await open_store(
@@ -7351,6 +7360,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     unused_entry = (
         f" If you added the new {label!r} entry to the app, delete it: its seed was never stored."
     )
+    no_terminal = "refusing to replace the authenticator seed without a terminal"
     try:
         secret, code, read_at = _enrol_totp_at_terminal(
             username=username,
@@ -7360,11 +7370,14 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 f"it as {label!r}. The old entry, the one you sign in with today, keeps working "
                 "until this command succeeds, then stops; delete it from the app afterwards."
             ),
-            no_terminal="refusing to replace the authenticator seed without a terminal",
+            no_terminal=no_terminal,
             label=label,
         )
     except _PasswordEntryRefused as exc:
-        return _emit_error(_sentence(exc) + unused_entry, as_json=args.json)
+        # The two refusals that fire before the key reaches the console get no hint: there is no
+        # entry to delete. Their openings are fixed texts, here and in _enrol_totp_at_terminal.
+        before_key = str(exc).startswith((no_terminal, "could not open the console to show"))
+        return _emit_error(_sentence(exc) + ("" if before_key else unused_entry), as_json=args.json)
     # The prompt proved the code but returns no step (provision-admin hands the code to the service,
     # which derives the step the same way). The swap records this step, so the proving code is spent.
     step = totp.verify_totp_step(secret, code, now=read_at, window=settings.auth.totp_skew_steps)
@@ -7380,15 +7393,15 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     swapped: list[tuple[UserRecord, dict[str, Any]]] = []
     #: Filled when the swap raised and the re-read that would say whether it landed failed too.
     unknown: list[UserRecord] = []
-    reread_errors: tuple[type[Exception], ...] = (*store_errors, CipherError)
 
     async def swap_landed(store: Store, user_id: str) -> bool | None:
-        """After a store error from the swap, did its commit land anyway? On a server backend an
+        """After an error from the swap, did its commit land anyway? On a server backend an
         error can follow the COMMIT, a lost acknowledgment or a failed pool release, so the error
-        alone does not say. ``None`` when the re-read fails too."""
+        alone does not say. ``None`` when the re-read fails too, whatever it raised: its one job
+        is to tell "landed" from "not landed", and anything else is "unknown"."""
         try:
             return await store.get_totp_secret(user_id) == secret
-        except reread_errors:
+        except Exception:  # noqa: BLE001 - any failure here means only "unknown"
             return None
 
     async def run() -> str | None:
@@ -7422,21 +7435,22 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     expected_enrolled_at=target.enrolled_at,
                     audit=AuditAppend(ADMIN_TOTP_RESET_ACTION, actor=actor, detail=detail),
                 )
-            except Exception as exc:
-                # Any error may follow the commit, so every one is read back. Only a store refusal
-                # that the re-read confirms becomes a refusal; a defect still reaches the dispatch
-                # floor, after the re-read has said whether the swap landed.
+            except BaseException as exc:  # noqa: BLE001 - read back, then refused or re-raised
+                # Any error may follow the commit, Ctrl-C included, so every one is read back.
+                # Only a store refusal that the re-read confirms becomes a refusal; anything else
+                # is re-raised, after the re-read has said whether the swap landed.
                 landed = await swap_landed(store, user.id)
                 if landed is False and not isinstance(exc, store_errors):
                     raise
                 if landed is False:
                     # One transaction: the seed, the session sweep and the audit row rolled back
-                    # as one, and the re-read confirms the old seed is still there.
+                    # as one, and the re-read confirms the old seed is still there. The class
+                    # only: a driver's message can quote a stored value (ASVS 16.5.4).
                     return (
-                        f"the store refused the replacement ({_sentence(exc)} The new seed, its "
-                        "audit row and the session sweep are one write, and the account still holds "
-                        "its old seed: nothing was written, and the old authenticator entry still "
-                        "works. If the engine is running, stop it and run the command again."
+                        f"the store refused the replacement ({type(exc).__name__}). The new seed, "
+                        "its audit row and the session sweep are one write, and the account still "
+                        "holds its old seed: nothing was written, and the old authenticator entry "
+                        "still works. If the engine is running, stop it and run the command again."
                         + unused_entry
                     )
                 if landed:
@@ -7460,9 +7474,11 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         refused = run_guarded(run())
     except BaseException as exc:  # noqa: BLE001 - re-raised below unless the swap may have landed
         if not (swapped or unknown):
-            if isinstance(exc, open_refusals):
-                return open_refused(exc)
-            raise  # nothing written; not a known refusal, so the dispatch floor reports it
+            # Before the swap, but after the key was shown: nothing written, and the new entry
+            # in the app has no seed behind it, so the hint goes with every store failure here.
+            if isinstance(exc, Exception) and isinstance(exc, (*open_refusals, *store_errors)):
+                return open_refused(exc, hint=unused_entry)
+            raise  # nothing written; not a store failure, so the dispatch floor reports it
         # The swap committed, or may have, before this failure: Ctrl-C included, the codes must
         # still reach the operator and the report must say what happened.
         failure, refused = exc, None
@@ -7479,14 +7495,25 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             which="the new recovery codes",
             without_them="Run this command again from a console once the store answers.",
         )
-        _emit_error(
+        unsure = (
             f"the store reported an error during the replacement for {username!r} "
-            f"({_sentence(failure)} The account could not be re-read, so whether its seed was "
-            "replaced is UNKNOWN. Keep both authenticator entries. Sign in with the new one: if it "
-            "works the replacement landed, and if it does not the old one still works.",
-            as_json=args.json,
-            code="replacement_unknown",
+            f"({type(failure).__name__}). The account could not be re-read, so whether its seed "
+            "was replaced is UNKNOWN. Keep both authenticator entries. Sign in with the new one: "
+            "if it works the replacement landed, and if it does not the old one still works."
         )
+        if args.json:
+            _print_json(
+                {
+                    "error": unsure,
+                    "code": "replacement_unknown",
+                    "replaced": None,
+                    "username": username,
+                    "recovery_codes_shown": codes_shown,
+                },
+                compact=True,
+            )
+        else:
+            print(f"error: {unsure}", file=sys.stderr)
         return 3
 
     user, report = swapped[0]
@@ -7519,7 +7546,8 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     try:
         report["holder_notice"] = run_guarded(notice())
-    except Exception as exc:  # noqa: BLE001 - best effort, after the commit; the swap stands
+    except BaseException as exc:  # noqa: BLE001 - best effort, after the commit; the swap stands
+        # Ctrl-C on a slow relay included: the report below must still say the seed was replaced.
         # The class only, as AuthService._notify_security logs it: the text could name the address.
         print(
             f"WARNING: the security notice could not be queued ({type(exc).__name__}).",
@@ -7550,8 +7578,8 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         # must not take a replaced seed for one. 2 stays "could not start".
         message = (
             f"the authenticator seed of {username!r} WAS replaced, with its audit row, and its "
-            f"sessions were ended, but the command then failed ({_sentence(failure)} The new "
-            "authenticator entry works and the old one does not; "
+            f"sessions were ended, but the command then failed ({type(failure).__name__}). The "
+            "new authenticator entry works and the old one does not; "
             + (
                 "the new recovery codes were shown on the console"
                 if codes_shown

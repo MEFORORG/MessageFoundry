@@ -677,7 +677,11 @@ def test_record_audit_raising_no_longer_leaves_an_unrecorded_seed(
     """THE REVIEWER'S PROBE. The first build appended its audit row with ``record_audit`` AFTER the
     swap, and a ``record_audit`` that raised left the new seed live with no row and no codes shown.
     The row now commits inside the swap's own transaction, so the same probe changes nothing: the
-    command succeeds, the row is there, and the codes reach the console."""
+    command succeeds, the row is there, and the codes reach the console.
+
+    What it guards is narrow: a return to a ``record_audit`` append fails it. A return to a second
+    write through some other method would not; ``test_a_refused_audit_append_rolls_the_swap_back``
+    is the atomicity test."""
     monkeypatch.chdir(tmp_path)
     db = tmp_path / "probe-record.db"
     _seed(db)
@@ -732,7 +736,12 @@ def test_a_failure_after_the_swap_still_shows_the_codes_and_says_the_seed_was_re
     assert len(_audit_rows(db)) == 1
 
 
-def _commit_then_raise(monkeypatch: pytest.MonkeyPatch, *, reread_fails: bool) -> None:
+def _commit_then_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    reread_fails: bool,
+    error: BaseException | None = None,
+) -> None:
     """The server-backend shape a SQLite store cannot produce on its own: the swap's COMMIT lands,
     then the call raises, as a lost acknowledgment or a failed pool release would. With
     ``reread_fails`` the re-read that would say whether it landed fails too."""
@@ -743,7 +752,7 @@ def _commit_then_raise(monkeypatch: pytest.MonkeyPatch, *, reread_fails: bool) -
     async def replace(self: MessageStore, *a: Any, **k: Any) -> int | None:
         await real_replace(self, *a, **k)
         committed.append(True)
-        raise RuntimeError("probe: the commit acknowledgment was lost")
+        raise error or RuntimeError("probe: the commit acknowledgment was lost")
 
     async def secret(self: MessageStore, user_id: str) -> str | None:
         if committed and reread_fails:
@@ -793,6 +802,51 @@ def test_an_error_whose_outcome_cannot_be_read_back_says_unknown(
     assert body["code"] == "replacement_unknown" and "UNKNOWN" in body["error"]
     assert "Keep both" in body["error"]
     assert "Recovery codes for the NEW entry" in "".join(console.shown)
+
+
+def test_ctrl_c_after_a_landed_commit_still_shows_the_codes_and_exits_3(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    console: _Console,
+) -> None:
+    """A KeyboardInterrupt that lands as the swap returns is read back like any other error: the
+    seed is the new one, so the operator gets the codes and a replacement report, not a
+    traceback with the old entry already dead."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "ctrl-c.db"
+    _seed(db)
+    _commit_then_raise(monkeypatch, reread_fails=False, error=KeyboardInterrupt())
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 3
+    body = json.loads(capsys.readouterr().out)
+    assert body["code"] == "replaced_then_failed" and "KeyboardInterrupt" in body["error"]
+    assert "New recovery codes" in "".join(console.shown)
+
+
+def test_a_store_failure_after_the_key_was_shown_says_delete_the_new_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A read that fails in the write's open, after the operator enrolled the new entry, writes
+    nothing. It is no "cannot open the store" either, since the store opened once already, and
+    the operator is told the new entry has no seed behind it."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "locked.db"
+    _seed(db)
+    before = _state(db)
+    shown = _live_terminal(monkeypatch)
+
+    async def locked(*_a: object, **_k: object) -> bool:
+        raise sqlite3.OperationalError("probe: database is locked")
+
+    monkeypatch.setattr(MessageStore, "has_webauthn_credentials", locked)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    assert "OperationalError" in error and "cannot open the store" not in error
+    assert "delete it: its seed was never stored" in error
+    assert "database is locked" not in error  # the class only, never the driver's text
+    monkeypatch.undo()
+    assert _state(db) == before
+    assert shown == []
 
 
 def test_kept_passkeys_are_warned_about_in_text_output(
