@@ -166,16 +166,18 @@ ordinary review is what catches these (D-C):
   permit;
 - raise an error, or filter the message so nothing is delivered;
 - insert a typed step that changes data an unchanged `code` row below it later reads;
-- delete a developer-written dynamic row. The analyst build refuses this (ADR 0076 Amendment G,
-  G.6 rule 4), but a change made with another tool passes the repository check (FR-40 item 3);
-- delete a lookup row, or move it below a row that reads its variable, leaving that read unbound.
+- delete a developer-written dynamic row. The analyst build would refuse this (ADR 0076 Amendment
+  G, G.6 rule 4), but a change made with another tool would pass the repository check (FR-40 item
+  3);
+- delete a binding row (a Read Field or an assigned lookup), or move it below a row that reads its
+  variable, leaving that read unbound.
   The analyst build would refuse both (G.6 rule 6), but the repository check does not test for an
   unbound read. Today the lens refuses a delete or move of a Read Field row for this reason (the
   `read_field` gate in `rewrite_source`, `messagefoundry/lens.py`). That gate keys on `read_field`
   alone, because it was written for Read Field rows (ADR 0089 row 4, BACKLOG #1505), so it does not
   yet cover a lookup's `assign_to`. Under typed-only mode, the R1 branch's `_is_typed_stmt` already
-  refuses a moved or deleted block that holds a binding row. The top-level case of rule 6 is open
-  work for the R1 fix.
+  refuses a moved or deleted block that holds a binding row. The rest of rule 6 is open work for the
+  R1 fix.
 
 **What already gates what runs, under both:** a change reaches a running engine only when someone with
 `config:deploy` reloads it, under the existing step-up and the site's `[approvals]` dual control. That
@@ -475,8 +477,7 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
      are compared by AST, not bytes, and blank or comment-only lines between the signature and the
      first statement count as body.
   3. Inside each def body, the ordered sequence of `code` rows is unchanged, each compared by content
-     and by its enclosing suite path (the chain of control headers above it, compared by content),
-     never by line number. So a hand-written line moved from under one condition to another fails.
+     and by its suite path, never by line number. So a hand-written line moved from under one condition to another fails.
      *Suite path*, *dynamic row* and *hand-written header* are defined once, in ADR 0076 Amendment G,
      G.6. From spike S-4:
      - Changing a generated `if` test that encloses a hand-written line is not Steps-only, because
@@ -484,8 +485,8 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
      - A `pass` statement is ignored on either side, so the `pass` seed of an If or For Each template
        or an Else If or Else clause (`_apply_insert_clause`) neither adds nor removes a row.
      - G.6 rule 3 holds between base and head. A dynamic row keeps its order relative to `code` rows
-       and hand-written headers, and its suite path, but may be deleted: the check passes that,
-       while the analyst build refuses it (G.6 rule 4, and section 5.2).
+       and hand-written headers, and its suite path, but may be deleted: the check would pass that,
+       while the analyst build would refuse it (G.6 rule 4, and section 5.2).
 
      The other sanctioned exception is the `sends = []` / `sends.append(...)` / `return sends`
      accumulator scaffold (ADR 0108), only when generator-shaped, with `return sends` only as the
@@ -679,11 +680,11 @@ route work.
 - The engine half is shared: `lens parse`, `lens rewrite`, `lens schema` and `dryrun` stay engine
   commands.
 - `ide/src/stepsModel.ts` (about 3,500 lines) could become a shared view-model package. Spike S-1
-  measured it: every line compiles outside VS Code except through one types-only chain,
-  `stepsModel.ts` to `liveDebugModel` to `editorToolbar`'s `ElementKind` to `vscode`. The shared
-  package moves `ElementKind` into a module free of `vscode`. About 84.1% of the file's bundled
-  bytes is the share a full port links; that is not the share that carries over, since every line
-  compiles (Manager decision 2026-10-07, from spike S-1).
+  measured it: every line bundles outside VS Code, and one types-only chain reaches `vscode`
+  (`stepsModel.ts` to `liveDebugModel` to `editorToolbar`'s `ElementKind`), so the shared package
+  moves `ElementKind` into a module free of `vscode`. About 84.1% of the file's bundled bytes is the
+  share a full port links; that is not the share that carries over (Manager decision 2026-10-07,
+  from spike S-1).
 - `ide/media/stepsWebview.js` reaches the host only through `acquireVsCodeApi()`. Spike S-1 rendered
   it unchanged in a sandboxed iframe with a shim that supplies that function. The page shell, toolbar
   and CSS live in `ide/src/stepsView.ts`, so they move to the shared package too.

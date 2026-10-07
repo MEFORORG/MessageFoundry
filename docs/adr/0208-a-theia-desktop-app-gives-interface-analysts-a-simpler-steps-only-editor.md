@@ -125,9 +125,9 @@ it, only when the site meets spec section 5.4.**
   `@theia/userstorage`, or it hangs on a missing `PreferenceProvider` binding; that brings in
   `@theia/markers`, `@theia/outline-view` and `@theia/variable-resolver` (Manager decision 2026-10-07, from spike S-1). The port is the
   main cost (spec section 11). Spike S-1 measured the reuse on a browser target:
-  `ide/media/stepsWebview.js` renders unchanged through an `acquireVsCodeApi` shim, and every line of
-  `ide/src/stepsModel.ts` compiles outside VS Code, with about 84.1% of its bundled bytes being the
-  share a full port links.
+  `ide/media/stepsWebview.js` renders unchanged through an `acquireVsCodeApi` shim. Every line of
+  `ide/src/stepsModel.ts` bundles outside VS Code, and one types-only chain reaches `vscode`, so
+  `ElementKind` moves; about 84.1% of its bundled bytes is the share a full port links.
 - **D4 -- `code:steps` and a built-in Analyst role.** `code:steps` is added to the permission catalog
   and is **advisory**: the analyst build reads it, and no engine route checks it. `Coding` gains it.
   A new built-in Analyst role holds it and not `code:edit` (ruling 7). "`code:edit` implies

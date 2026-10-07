@@ -1359,13 +1359,16 @@ invariant rather than a property of the moved row):
 5. A deleted or moved block takes no hand-written Python with it: no `code` row, no dynamic row, and
    no hand-written header. A delete of an `if` covers its whole chain: every `elif` test must be
    generator-shaped too, and no `elif` or `else` body may hold a `code` row or a dynamic row.
-6. A block that holds a binding row is never moved or deleted. A top-level binding row is never
-   deleted while a later row reads its variable, and never moved below a row that reads it
-   (Manager decision 2026-10-07, after review). Either would leave that read unbound. The R1
-   branch's `_is_typed_stmt` already refuses the block case.
+6. A block that holds a binding row is never moved or deleted. A binding row, at any depth, is never
+   deleted while a later row reads its variable, and never moved below a row that reads it; and no
+   row that reads the variable is moved above its binding row (Manager decision 2026-10-07, after
+   review). Each would leave that read unbound. The R1 branch's `_is_typed_stmt` already refuses the
+   block case; it checks the moved or deleted row itself with `top=True`, so the rest is open work
+   for the R1 fix.
 
-A typed row that is not dynamic may move past a `code` row in the same suite: rule 2 holds, and the
-result is the same as inserting the typed row there, which the analyst build already allows. A `pass`
+A typed row that is not dynamic may move past a `code` row in the same suite, unless rule 6 refuses
+it: rule 2 holds, and the result is the same as inserting the typed row there, which the analyst
+build already allows. A `pass`
 statement does not count as a `code` row for this rule, so an analyst can delete a block whose body
 is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager decisions
 2026-10-07, from spike S-4, which found that the repository check needs them (ADR 0208 spec FR-40).
@@ -1402,8 +1405,8 @@ The R1 fix would change that, in every mode, at least as follows:
 describes it for a reader. **The list is not a gate.** No check, test or requirement may treat it as
 the definition of inert; a checker calls the lens's predicate (Manager decision 2026-10-07, after
 review). The list is a lower bound: the predicate admits at least these, with one exception that
-is a ceiling, the module-level name rule below. Nothing it admits calls anything, except at least a
-bounded `msg.field(...)` read, `FhirToken(...)` and `FhirRaw(<string literal>)`.
+is a ceiling, the module-level name rule below. Nothing it admits calls anything, except a bounded
+`msg.field(...)` read, `FhirToken(...)` and `FhirRaw(<string literal>)`.
 
 - a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
 - `+` and `-` over numbers and admitted names; `*`, `/` and `//` over number literals only, with a
@@ -1421,16 +1424,20 @@ bounded `msg.field(...)` read, `FhirToken(...)` and `FhirRaw(<string literal>)`.
     refused everywhere else (Manager decision 2026-10-07, after review). `code_set` returns the
     shared active `CodeSet`, whose storage is a plain dict, so any `code` row can write message
     content into it without naming the bound variable: `code_set("lab")._data["k"] = msg["PID-3"]`.
-    No engine change is made for this;
+    No engine change is made for this. The `table` use is still accepted because `code_lookup` only
+    writes the looked-up value into the message, where a value param may already put message
+    content; the risk the refusal guards is message content reaching a log or a destination through
+    a label, a template or a lookup parameter, and `table` reaches none of those;
   - **these two bullets are a ceiling: outside value params, the predicate SHALL NOT admit a
     module-level name beyond them, whatever the R1 tests say;**
-  - in value params, any non-dunder name other than `msg`, because a value param may carry message
-    content anyway;
+  - in value params, any other non-dunder name except `msg` and a name bound to
+    `code_set("<literal>")`, because a value param may carry message content anyway. The
+    `code_set` bullet above applies in value params too;
 - a list, tuple, set or dict built only from inert values, with no splat;
 - in value params only, a bounded field read (`msg.field(...)` taking only `occurrence` and
   `repetition` keywords) or a `templated` f-string whose every read is one;
 - for lookup `params`, a dict with literal keys and literal or read values, and in a FHIR lookup,
-  `FhirToken(literal, read)`.
+  `FhirToken(literal, read)` or `FhirRaw(<string literal>)`.
 
 **The source of record is the R1 fix's tests** (`tests/test_lens_no_code_injection.py` on the R1
 branch, not yet merged), except for the module-level name ceiling. Elsewhere, where this list and
