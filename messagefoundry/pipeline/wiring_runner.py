@@ -750,12 +750,14 @@ class TeardownReason(StrEnum):
     """Why :meth:`RegistryRunner._teardown_unsafe` is running (ADR 0157 C6).
 
     SHUTDOWN — the historical single path (process stop, a failed start's unwind). Statement-for-
-    statement unchanged, and the ONLY value single-node SQLite can reach: the only DEMOTE caller is
+    statement unchanged except for the lookup-executor close (:meth:`_teardown_body`), and the ONLY
+    value single-node SQLite can reach: the only DEMOTE caller is
     ``Engine._stop_graph``, reachable only from ``_reconcile_graph``, which runs only under
     ``is_clustered()`` — and ``[cluster].enabled`` is rejected on SQLite at config load.
     DEMOTE — loss of leadership, racing a lease this node no longer holds. Dispatchers drain
     cooperatively BEFORE any hard cancel, and both phases are bounded. An inbound that cannot stop
-    inside the budget is ABANDONED — not awaited, and not cancelled."""
+    inside the budget is ABANDONED — not awaited, and not cancelled. So is a lookup-executor close
+    (:meth:`_teardown_body`)."""
 
     SHUTDOWN = "shutdown"
     DEMOTE = "demote"
@@ -1559,6 +1561,11 @@ class RegistryRunner:
         # BACKLOG #2348: the post-reload stranded-row report runs detached, so a committed reload never
         # waits on (or is cancelled inside) its store reads. Held here so the task is not collected.
         self._reload_report_tasks: set[asyncio.Task[dict[str, int]]] = set()
+        # A retired lookup executor (a reload's old or refused one, or the live one at teardown)
+        # closes DETACHED: see :meth:`_retire_lookup_executor` and :meth:`_teardown_body`.
+        self._lookup_close_tasks: set[asyncio.Task[None]] = set()
+        # Closes a DEMOTE teardown gave up on. Held so they are not collected, never waited on again.
+        self._abandoned_lookup_closes: set[asyncio.Task[None]] = set()
         # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
         # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
         # /stats; default 0, so byte-identical when the connection-scale harness never reads it.
@@ -2190,6 +2197,29 @@ class RegistryRunner:
         # to the UNCLAMPED escape at query time and let a prod-PHI weakened-TLS live read cross.
         with active_hop_posture(self._hop_posture):
             return DatabaseLookupExecutor(resolved, egress=self._egress)
+
+    def _retire_lookup_executor(self, executor: DatabaseLookupExecutor | None) -> None:
+        """Close a lookup executor nothing references any more, in a DETACHED task. Synchronous,
+        so it cannot be interrupted between a reload's swap (or rollback) and the close being owned:
+        an awaited close could be cut off by a cancellation, which would leak the pools and make a
+        committed reload look cancelled, and an unbounded ``wait_closed`` behind an in-flight lookup
+        would hold ``_reload_lock``. Tracked so :meth:`_teardown_body` waits for it."""
+        if executor is None:
+            return
+        task = asyncio.create_task(self._close_lookup_executor(executor))
+        self._lookup_close_tasks.add(task)
+        task.add_done_callback(self._lookup_close_tasks.discard)
+        task.add_done_callback(self._abandoned_lookup_closes.discard)
+
+    @staticmethod
+    async def _close_lookup_executor(executor: DatabaseLookupExecutor) -> None:
+        try:
+            await executor.aclose()
+        # Broad on purpose: this runs as a detached task whose exception nothing else retrieves,
+        # so anything not logged here would surface only as "exception was never retrieved". The
+        # type only, never the text: a driver error can carry DSN attributes (as at connect).
+        except Exception as exc:
+            log.warning("could not close a lookup executor's pools: %s", type(exc).__name__)
 
     def _run_lookup(
         self, connection: str, statement: str, params: Mapping[str, Any] | None
@@ -4819,7 +4849,8 @@ class RegistryRunner:
         _reload_lock) and idempotent — cleans up whatever is registered even if the runner never
         reached _running, so a half-started runner (review M-8) and a double stop() are both safe.
 
-        ``reason`` (ADR 0157 C6) selects the SOURCE + DISPATCHER phases only; every other phase, and
+        ``reason`` (ADR 0157 C6) selects the SOURCE + DISPATCHER phases and the bound on the
+        lookup-executor close wait (:meth:`_teardown_body` states it); every other phase, and
         their order, is shared. Under SHUTDOWN the executed statements are today's, verbatim.
 
         **THE INVARIANT: ``self._running = False`` must execute on every path.**
@@ -4965,9 +4996,39 @@ class RegistryRunner:
         # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop.
         # No-op unless [sandbox].mode=subprocess actually spawned any.
         await self._close_sandbox_sessions()
-        if self._lookup_executor is not None:
-            await self._lookup_executor.aclose()
-            self._lookup_executor = None
+        # THE LOOKUP-EXECUTOR CLOSE, stated here once. The live executor retires like a reload's:
+        # its close joins any a reload left pending, and ONE wait covers them all, concurrently. A
+        # close that raises is logged by its task rather than unwinding this sequence. Never
+        # cancelled by the wait, since a cancelled close leaves its pools open; asyncio.wait, unlike
+        # gather, does not cancel them if this teardown is itself cancelled. Under DEMOTE the wait
+        # takes the whole budget as its timeout (so the worst-case teardown is longer than the
+        # budget), and a timeout continues the sequence (ADR 0157: every DEMOTE bound is absorbed
+        # where it is set): the closes still pending are ABANDONED, held but never waited on again,
+        # so a flapping node does not spend each later budget on the same hung close. Under
+        # SHUTDOWN the wait is unbounded, as the live close always was, and an abandoned close is
+        # cancelled: it already outlived a budget, and waiting on it would wedge the stop.
+        self._retire_lookup_executor(self._lookup_executor)
+        self._lookup_executor = None
+        if self._lookup_close_tasks:
+            _done, still = await asyncio.wait(
+                self._lookup_close_tasks, timeout=budget if demote else None
+            )
+            if still:
+                self._abandoned_lookup_closes |= still
+                self._lookup_close_tasks -= still
+                log.warning(
+                    "teardown: %d lookup executor close(s) still pending after %.2fs; left running",
+                    len(still),
+                    budget,
+                )
+        if not demote and self._abandoned_lookup_closes:
+            log.warning(
+                "teardown: cancelling %d lookup executor close(s) a demotion abandoned",
+                len(self._abandoned_lookup_closes),
+            )
+            for _close_task in list(self._abandoned_lookup_closes):
+                _close_task.cancel()
+            self._abandoned_lookup_closes.clear()
         self._workers.clear()
         self._router_workers.clear()
         self._transform_workers.clear()
@@ -5961,8 +6022,9 @@ class RegistryRunner:
         detached report that warns with the count of rows each dropped inbound leaves waiting
         (:meth:`_warn_stranded_by_dropped_inbounds`). If any of steps 0-3 fails, or is cancelled
         (vault BACKLOG #2753), the previous graph's intake is restored before the error or the
-        cancellation propagates, and steps 3a and 4 do not run. Restarting inbounds
-        before reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
+        cancellation propagates, with its lookup executors and ADR 0057 inline eligibility, and steps
+        3a and 4 do not run. Restarting inbounds before reconciling outbounds means a slow/hung
+        outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
             if new_registry is None:
@@ -5984,6 +6046,9 @@ class RegistryRunner:
             anchors_passed = await self._check_reload_lane_anchors(
                 old, new_registry, old_inbound_names
             )
+            # Step 2 rebuilds both lookup executors for the new graph; the rollback restores these.
+            old_lookup_executor = self._lookup_executor
+            old_fhir_lookup_executor = self._fhir_lookup_executor
 
             try:
                 # 1. Quiesce intake: stop every inbound source so no NEW messages are accepted. Any
@@ -6004,6 +6069,20 @@ class RegistryRunner:
                 await self._recover_stopped_worker_residue()
                 # 2. Swap the registry and restart inbound listeners from it (intake back up first).
                 self.registry = new_registry
+                # Rebuild the live-lookup executor from the new graph, with no await since the swap, so
+                # no worker that reads them after the swap pairs the new graph with the old graph's
+                # lookups or inline cache. (A worker that read _inline_ok BEFORE the swap and then
+                # awaited still pairs it with the new registry; that race predates this ordering.)
+                # build_check already validated the new specs, so this can't fail on a bad spec here.
+                # The OLD executor is closed only once the swap commits, below the except, since a
+                # rollback puts it back, pools and all.
+                self._lookup_executor = self._build_lookup_executor()
+                # The FHIR-read executor holds no pools (a shared, stateless opener), so no aclose: just
+                # rebuild it from the new graph (None when the new graph declares no FhirLookup).
+                self._fhir_lookup_executor = self._build_fhir_lookup_executor()
+                # ADR 0057: re-evaluate inline eligibility against the swapped graph + rebuilt executors
+                # (a reload may add/remove a lookup, flip an inbound's inline=, or change ack_after).
+                self._recompute_inline_ok()
                 # 2a. ADR 0066 D4: decide the OUTBOUND lane partition for every lane this reload ADDS,
                 # before anything downstream can act on one. :meth:`_per_lane_delivery` returns the
                 # dispatcher-drained DEFAULT for a lane nothing has resolved, and TWO things read it
@@ -6052,18 +6131,6 @@ class RegistryRunner:
                 # effect immediately" now also holds under mode=subprocess). Off-loop: close() waits on a
                 # process. No-op unless mode=subprocess actually spawned any.
                 await self._close_sandbox_sessions()
-                # Rebuild the live-lookup executor from the new graph, closing the old pools. build_check
-                # already validated the new specs, so this can't fail on a bad spec here.
-                old_lookup_executor = self._lookup_executor
-                self._lookup_executor = self._build_lookup_executor()
-                if old_lookup_executor is not None:
-                    await old_lookup_executor.aclose()
-                # The FHIR-read executor holds no pools (a shared, stateless opener), so no aclose: just
-                # rebuild it from the new graph (None when the new graph declares no FhirLookup).
-                self._fhir_lookup_executor = self._build_fhir_lookup_executor()
-                # ADR 0057: re-evaluate inline eligibility against the swapped graph + rebuilt executors
-                # (a reload may add/remove a lookup, flip an inbound's inline=, or change ack_after).
-                self._recompute_inline_ok()
                 for ic in new_registry.inbound.values():
                     # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS
                     # over auto_start. Unconditional (unlike the auto_start gate below, which honors an
@@ -6143,6 +6210,16 @@ class RegistryRunner:
                         "reload failed; rolling back inbound intake to the previous graph"
                     )
                 self.registry = old
+                # The lookup executors and ADR 0057 inline eligibility follow the registry back, before
+                # the first await below, so no worker that reads them after the restore pairs the old
+                # graph with the refused graph's lookups (a db_lookup naming a connection only the old
+                # graph declares would fail) or takes or skips the inline path for the wrong graph. A
+                # no-op if step 2 never got there.
+                if self._lookup_executor is not old_lookup_executor:
+                    self._retire_lookup_executor(self._lookup_executor)
+                self._lookup_executor = old_lookup_executor
+                self._fhir_lookup_executor = old_fhir_lookup_executor
+                self._recompute_inline_ok()
                 # A session made after the swap holds a worker that loaded the NEW graph. Drop it,
                 # or that worker would go on answering for a graph the engine no longer serves.
                 await self._close_sandbox_sessions()
@@ -6158,6 +6235,8 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
+            # The swap committed, so nothing can put the previous graph's executor back any more.
+            self._retire_lookup_executor(old_lookup_executor)
             # vault BACKLOG #2371: the swap committed, so a lane the pre-check passed loses any old
             # refusal mark. Not before: a rolled-back reload leaves the old marks as they were.
             for lane in anchors_passed:
