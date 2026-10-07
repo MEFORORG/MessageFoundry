@@ -38,7 +38,7 @@ class _FakePool:
     async def close(self) -> None:
         self.closed += 1
         if self._close_fails:
-            raise RuntimeError("pool close wedged")
+            raise ConnectionResetError("pool close wedged")
 
 
 def _install_fake_asyncpg(monkeypatch: pytest.MonkeyPatch, pool: _FakePool) -> None:
@@ -97,7 +97,7 @@ async def test_a_pool_close_that_fails_does_not_replace_the_opens_error(
     ):
         await PostgresStore.open(_settings())
     assert pool.closed == 1
-    assert "closing the pool after a failed open also failed (RuntimeError)" in caplog.text
+    assert "closing the pool after a failed open also failed (ConnectionResetError)" in caplog.text
     assert "pool close wedged" not in caplog.text  # by class only
 
 

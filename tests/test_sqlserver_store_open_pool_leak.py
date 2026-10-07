@@ -51,7 +51,7 @@ class _FakePool:
     async def wait_closed(self) -> None:
         self.wait_closed_called += 1
         if self._wait_closed_hangs:
-            raise RuntimeError("wait_closed wedged")
+            raise ConnectionResetError("wait_closed wedged")
 
 
 class _FakeExecutor:
@@ -173,7 +173,7 @@ async def test_open_still_shuts_down_the_executor_when_wait_closed_hangs(
         pytest.raises(RuntimeError, match="schema boom"),
     ):
         await SqlServerStore.open(_settings())
-    assert "closing the pool after a failed open also failed (RuntimeError)" in caplog.text
+    assert "closing the pool after a failed open also failed (ConnectionResetError)" in caplog.text
     assert "wait_closed wedged" not in caplog.text  # by class only
 
     assert pool.closed == 1
