@@ -44,6 +44,13 @@ ownership, it is the intersection semantics plus :func:`csp_names_frame_ancestor
 append whenever a policy already on the response names the directive, so a writer that HAS made a
 frame-ancestors decision keeps it.
 
+**``base-uri`` rides the same append, for the same reason (ASVS 3.4.3, BACKLOG #2341).** Like
+``frame-ancestors`` it takes no fallback from ``default-src``, so a policy that omits it -- the
+attachment sandbox was the headline case -- leaves ``<base>`` injection unrestricted however strict
+the rest of the policy is. Each directive is checked on its own: the floor appends ONE extra policy
+naming only the directives no policy on the response already names (:data:`FLOOR_CSP` when it names
+neither), so a writer that decided either one keeps its decision.
+
 **HSTS is emitted only where a user agent is permitted to note it** (:func:`hsts_notable`, ASVS
 3.4.1). Since ADR 0172 the engine mints a self-signed pair and serves https by default, so the
 scheme condition alone would stamp a one-year ``includeSubDomains`` policy onto every response of a
@@ -80,13 +87,17 @@ from starlette.websockets import WebSocket
 
 __all__ = [
     "BASELINE_SECURITY_HEADERS",
+    "BASE_URI_CSP",
+    "BASE_URI_DIRECTIVE",
     "CSP_HEADER",
+    "FLOOR_CSP",
     "FRAME_ANCESTORS_CSP",
     "FRAME_ANCESTORS_DIRECTIVE",
     "HSTS_HEADER",
     "HSTS_VALUE",
     "WEBSOCKET_DENIAL_EXTENSION",
     "SecurityHeaderFloorMiddleware",
+    "csp_names_directive",
     "csp_names_frame_ancestors",
     "host_is_ip_literal",
     "hsts_applies",
@@ -114,6 +125,18 @@ FRAME_ANCESTORS_DIRECTIVE = "frame-ancestors"
 #: The whole second policy this floor appends. ``'none'`` is the strictest value the directive takes,
 #: and the requirement's posture limb is default-DENY, so there is no narrower correct answer.
 FRAME_ANCESTORS_CSP = f"{FRAME_ANCESTORS_DIRECTIVE} 'none'"
+BASE_URI_DIRECTIVE = "base-uri"
+#: ``base-uri`` takes no fallback from ``default-src`` either (ASVS 3.4.3), and ``'none'`` is right
+#: for every engine-written document: none of them carries a ``<base>`` element.
+BASE_URI_CSP = f"{BASE_URI_DIRECTIVE} 'none'"
+#: Each directive the floor guarantees, paired with the policy text it appends when no policy names it.
+_FLOOR_DIRECTIVES: tuple[tuple[str, str], ...] = (
+    (FRAME_ANCESTORS_DIRECTIVE, FRAME_ANCESTORS_CSP),
+    (BASE_URI_DIRECTIVE, BASE_URI_CSP),
+)
+#: The whole policy the floor appends to a response that names none of its directives. Also what an
+#: emitter outside the floor's path (the unhandled-500 handler) sets by hand.
+FLOOR_CSP = "; ".join(policy for _, policy in _FLOOR_DIRECTIVES)
 
 #: The ASGI extension that lets an app answer a WebSocket handshake with an HTTP response.
 WEBSOCKET_DENIAL_EXTENSION = "websocket.http.response"
@@ -191,8 +214,8 @@ def hsts_notable(scheme: str, exposure_protected: bool, *, host: str) -> bool:
     return not served_chain_is_self_signed(scheme, exposure_protected)
 
 
-def csp_names_frame_ancestors(policies: Iterable[str]) -> bool:
-    """Whether any serialized CSP in ``policies`` already names ``frame-ancestors``.
+def csp_names_directive(policies: Iterable[str], directive: str) -> bool:
+    """Whether any serialized CSP in ``policies`` already names ``directive`` (given in lower case).
 
     Parsed per CSP Level 3: a policy is ``;``-separated directives, each a name followed by optional
     whitespace-separated values, and directive names are ASCII case-insensitive. A substring test
@@ -200,10 +223,15 @@ def csp_names_frame_ancestors(policies: Iterable[str]) -> bool:
     would miss ``FRAME-ANCESTORS``."""
     for policy in policies:
         for serialized in policy.split(";"):
-            directive = serialized.strip()
-            if directive and directive.split(None, 1)[0].casefold() == FRAME_ANCESTORS_DIRECTIVE:
+            named = serialized.strip()
+            if named and named.split(None, 1)[0].casefold() == directive:
                 return True
     return False
+
+
+def csp_names_frame_ancestors(policies: Iterable[str]) -> bool:
+    """Whether any serialized CSP in ``policies`` already names ``frame-ancestors``."""
+    return csp_names_directive(policies, FRAME_ANCESTORS_DIRECTIVE)
 
 
 def _bare_host(authority: str) -> str:
@@ -257,15 +285,17 @@ async def refuse_websocket(websocket: WebSocket, response: Response, *, close_co
 
 def _apply_floor(message: Message, want_hsts: bool) -> None:
     """Add the floor to one response-start message, in place. See the module docstring for why the
-    single-valued names are ``setdefault`` and the frame-ancestors policy is an append."""
+    single-valued names are ``setdefault`` and the frame-ancestors / base-uri policy is an append."""
     message.setdefault("headers", [])  # optional on websocket.accept
     headers = MutableHeaders(scope=message)
     for name, value in BASELINE_SECURITY_HEADERS:
         headers.setdefault(name, value)
     if want_hsts:
         headers.setdefault(HSTS_HEADER, HSTS_VALUE)
-    if not csp_names_frame_ancestors(headers.getlist(CSP_HEADER)):
-        headers.append(CSP_HEADER, FRAME_ANCESTORS_CSP)
+    present = headers.getlist(CSP_HEADER)
+    missing = [p for d, p in _FLOOR_DIRECTIVES if not csp_names_directive(present, d)]
+    if missing:
+        headers.append(CSP_HEADER, "; ".join(missing))
 
 
 class SecurityHeaderFloorMiddleware:

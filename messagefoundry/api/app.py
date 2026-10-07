@@ -80,7 +80,7 @@ from messagefoundry.api.field_authz import (
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
     CSP_HEADER,
-    FRAME_ANCESTORS_CSP,
+    FLOOR_CSP,
     HSTS_HEADER,
     HSTS_VALUE,
     SecurityHeaderFloorMiddleware,
@@ -1882,7 +1882,9 @@ _DEFAULT_ATTACHMENT_EXT = ".bin"
 #: strictest policy the engine writes -- was the one document family carrying no framing decision at
 #: all. The floor's carrier now skips a response whose policy already names the directive, so this
 #: constant is what that response is governed by, and it stays correct if the floor is ever removed.
-_ATTACHMENT_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
+#: ``base-uri 'none'`` is named for the same reason (ASVS 3.4.3, BACKLOG #2341): it takes no fallback
+#: from ``default-src`` either.
+_ATTACHMENT_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'; base-uri 'none'"
 #: ``GET /messages/{message_id}/attachments/{attachment_id}`` and the web console's same-handler
 #: delegate ``GET /ui/messages/...`` — see :class:`AttachmentSecurityHeadersMiddleware`.
 _ATTACHMENT_PATH_RE = re.compile(r"^(?:/ui)?/messages/[^/]+/attachments/[^/]+$")
@@ -2673,9 +2675,9 @@ def create_app(
         # SecurityHeaderFloorMiddleware is in this response's path, and a 500 shipped with none of
         # them. Status and body are unchanged: this adds headers only.
         headers = dict(BASELINE_SECURITY_HEADERS)
-        # ASVS 3.4.6: the floor's frame-ancestors carrier cannot reach this response either, and a
-        # 500 is as navigable as any other, so the same directive is set here by hand.
-        headers[CSP_HEADER] = FRAME_ANCESTORS_CSP
+        # ASVS 3.4.6 / 3.4.3: the floor's CSP carrier cannot reach this response either, and a
+        # 500 is as navigable as any other, so the same policy is set here by hand.
+        headers[CSP_HEADER] = FLOOR_CSP
         if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             headers[HSTS_HEADER] = HSTS_VALUE
         return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
