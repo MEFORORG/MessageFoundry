@@ -118,14 +118,38 @@ async def test_with_the_prior_dek_dropped_the_age_is_kept_and_the_gap_is_logged(
     assert _VALUE not in caplog.text
 
 
-async def test_a_malformed_stored_date_on_a_rekey_reads_as_rotated_not_a_failure(
+async def test_a_malformed_stored_date_on_a_rekey_falls_back_to_tracked_since(
     tmp_path: Path,
 ) -> None:
-    """The row is writable out of band. A date that does not parse must not fail the reconcile."""
+    """The row is writable out of band. A date that does not parse must not fail the reconcile, and
+    must not reset the clock to today either: that would lift an overdue refusal."""
     path, a, b = tmp_path / "malformed.db", generate_key(), generate_key()
     await _seed_under(path, a, last_rotated="not-a-date")
     stamps, _stored = await _reconcile_after_rotation(path, retired=(a,), value=_VALUE, new_dek=b)
-    assert stamps[_AD].last_rotated == _TODAY
+    assert stamps[_AD].last_rotated == datetime.date.fromisoformat(_OLD)
+
+
+async def test_a_fingerprint_written_before_key_ids_is_settled_under_the_keys_in_hand(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bare MAC (no key id) is compared under the keys in hand: the same secret keeps its date,
+    a changed one reads as rotated, and neither claims a key is missing."""
+    path, a = tmp_path / "bare.db", generate_key()
+    store = await MessageStore.open(path, cipher=make_cipher(a))
+    try:
+        fp_key = store.secret_rotation_fingerprint_key()
+        assert fp_key is not None
+        await store.upsert_secret_rotation_meta(
+            _AD, fingerprint=sr._bare_mac(fp_key, _VALUE), tracked_since=_OLD, last_rotated=_OLD
+        )
+    finally:
+        await store.close()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):
+        same, _ = await _reconcile_after_rotation(path, retired=(), value=_VALUE, new_dek=a)
+    assert same[_AD].last_rotated == datetime.date.fromisoformat(_OLD)
+    assert "no longer configured" not in caplog.text
+    changed, _ = await _reconcile_after_rotation(path, retired=(), value="test-only-new", new_dek=a)
+    assert changed[_AD].last_rotated == _TODAY
 
 
 async def test_control_a_changed_secret_under_the_same_dek_reads_as_rotated(
