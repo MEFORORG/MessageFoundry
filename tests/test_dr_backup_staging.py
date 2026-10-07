@@ -1033,7 +1033,7 @@ def test_the_first_check_leaves_an_idle_wal_out(tmp_path, monkeypatch) -> None:
         config_dir=None,
         instance="dev",
     )
-    runner._space_shortfall(data_dir, tmp_path / "dest", config_only=False)
+    runner._space_shortfall(data_dir, tmp_path / "dest", config_only=False, config_dir=None)
     assert [n for _p, n in needs[0]] == [2000, 1000]
 
 

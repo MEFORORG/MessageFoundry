@@ -1167,6 +1167,22 @@ class Engine:
 
     # --- lifecycle -----------------------------------------------------------
 
+    @property
+    def instance_identity(self) -> str | None:
+        """Which engine process this is, among those sharing one store: ``node:<node_id>`` on a
+        cluster node, ``shard:<id>`` on an engine shard of a multi-shard config (the same shard id
+        :meth:`_owned_lanes` scopes recovery by), and ``None`` for a lone engine that owns its store.
+
+        A cluster node's id is the same after a restart only when ``[cluster].node_id`` is pinned.
+        The shard id is known once the engine holds its graph (:meth:`start` or ``add_registry``).
+        Read by the approval gate to mark the releases it claims (BACKLOG #1562)."""
+        if self._coordinator.is_clustered():
+            return f"node:{self._coordinator.node_id}"
+        runner = self._registry_runner
+        if runner is not None and runner.registry.shard_id is not None:
+            return f"shard:{runner.registry.shard_id}"
+        return None
+
     def _owned_lanes(self) -> OwnedLanes | None:
         """The ADR 0073 ownership scope for crash recovery — ``None`` (recover globally) unless this
         process runs a SHARDED registry (a >1-shard config filtered by ``--shard``). Channel-keyed
@@ -1530,7 +1546,7 @@ class Engine:
                 self.store,
                 self._backup_settings,
                 store_settings=self._store_settings,
-                config_dir=self.config_dir,
+                config_dir=lambda: self.running_config_dir,
                 engine_version=self._engine_version,
                 instance=self._active_environment or "",
                 alert_sink=self._alert_sink,
@@ -1879,7 +1895,8 @@ class Engine:
             # ADR 0157 C6: demotion is BOUNDED — the source and dispatcher phases only. Phases after
             # them (connector aclose, executor shutdown, sandbox close) remain unbounded; they run
             # after the graph has stopped so they cannot extend the split-brain window, but do NOT
-            # describe this as 'the demotion teardown is bounded'.
+            # describe this as 'the demotion teardown is bounded'. The lookup-executor close that
+            # follows them takes the budget too; RegistryRunner._teardown_body states how.
             budget, _headroom = demote_stop_budget(
                 lease_ttl_seconds=self._cluster_settings.leader_lease_ttl_seconds,
                 fence_timeout_seconds=self._cluster_settings.leader_fence_timeout_seconds,

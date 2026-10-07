@@ -670,9 +670,52 @@ async def test_the_error_text_is_masked_until_its_own_reveal_act(
         for a in await engine.store.list_audit()
         if a["action"] == "message_view"
     )
-    # The error reveal also returned the earlier opens' `viewed` events whole: their `detail` is
-    # error-tier text too, and the audit records it under its list's name.
+    # The error reveal returned the `error` event's detail (the error text) whole, and the audit
+    # records it under its list's name. The earlier opens' `viewed` events are not what names it
+    # (BACKLOG #2440); the pair of tests below pins both arms of that rule.
     assert [v for _id, v in views] == [[], ["summary"], ["error", "events.detail"], []]
+
+
+async def _message_view_reveals(engine: Engine) -> list[list[str]]:
+    return [
+        json.loads(a["detail"])["revealed"]
+        for a in sorted(await engine.store.list_audit(), key=lambda a: a["id"])
+        if a["action"] == "message_view"
+    ]
+
+
+async def test_an_error_reveal_with_only_viewed_events_does_not_name_event_detail(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """BACKLOG #2440 limb (i). Every open writes a `viewed` event whose detail is the viewer's
+    username, so before the fix every ``reveal_errors`` open recorded `events.detail` as revealed.
+    A message with no other event detail must not."""
+    # FILTERED leaves one event with no detail, so `viewed` is the only event with a detail at all.
+    mid = await engine.store.record_received(
+        channel_id="ch1", raw=ADT, status=MessageStatus.FILTERED, source_type="file"
+    )
+    await client.get(f"/messages/{mid}")  # leaves a `viewed` event with a non-empty detail
+    opened = (await client.get(f"/messages/{mid}?reveal_errors=true")).json()
+    viewed = [e for e in opened["events"] if e["event"] == "viewed"]
+    assert viewed and all(e["detail"] for e in viewed), "the leg needs a populated viewed detail"
+    assert all(not e["detail"] for e in opened["events"] if e["event"] != "viewed")
+    assert (await _message_view_reveals(engine))[-1] == []
+
+
+async def test_an_error_reveal_names_event_detail_when_another_event_carries_one(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """The control for the test above: an event of another kind with a detail IS a disclosure the
+    error reveal makes, so `events.detail` is recorded."""
+    mid = await engine.store.enqueue_message(
+        channel_id="ch1", raw=ADT, deliveries=[("archive", ADT)], control_id="MSG-2440-B"
+    )
+    await engine.store.record_message_event(
+        mid, "reply_timeout", destination="archive", detail="waited 5000 ms"
+    )
+    opened = (await client.get(f"/messages/{mid}?reveal_errors=true")).json()
+    assert any(e["event"] == "reply_timeout" and e["detail"] for e in opened["events"])
+    assert (await _message_view_reveals(engine))[-1] == ["events.detail"]
 
 
 async def test_summary_access_audited_server_side_and_coalesced(engine: Engine) -> None:

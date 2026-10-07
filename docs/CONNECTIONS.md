@@ -146,6 +146,7 @@ transport = "mllp"
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
+  The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
   cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
   those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
@@ -1209,7 +1210,7 @@ property of the product rather than of the host's MIME registry.
 The allow-list decides what is **declared**, never whether the file is served: an unrecognized type
 downloads exactly as a refused one does. The response carries `Content-Disposition: attachment` (a
 download, never an inline render), `X-Content-Type-Options: nosniff` (no MIME re-sniff), and
-`Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'` (an opaque origin with scripts/forms disabled, and no framing),
+`Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'; base-uri 'none'` (an opaque origin with scripts/forms disabled, and no framing),
 re-asserted on the `/ui` delegate from **outside** the console's own CSP writers, so a browser-active
 representation can never execute in the application origin, and none can be framed.
 `frame-ancestors` is named in that policy rather than left to the API's security header

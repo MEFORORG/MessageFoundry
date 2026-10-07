@@ -134,6 +134,12 @@ def setenv_at_rest_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(name, value)
 
 
+def delenv_at_rest_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove :data:`AT_REST_OPT_OUT_ENV` from the environment for one test, the setter's undo."""
+    for name in AT_REST_OPT_OUT_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 #: BACKLOG #1966 (owner ruling R4 (a), ADR 0200): an enforcing PHI start refuses without off-box
 #: forwarding configured as verified TLS to a non-loopback collector. The gate reads configuration
 #: only, so the collector need not exist: `siem.invalid` is a reserved name that never resolves, and

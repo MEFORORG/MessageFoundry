@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +39,11 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
+from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import AuditAppend
+from messagefoundry.uploads import UploadStore
 from tests._admin_account import create_local_user_chosen
+from tests.test_uploads_strict_ciphertext import _BREAKS
 
 PW = "Correct-Horse-Battery-Staple-9"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN123^^^H^MR||DOE^JANE\r"
@@ -62,6 +66,12 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 def _uploads_settings(tmp_path: Path) -> StoreSettings:
     return StoreSettings(uploads_dir=str(tmp_path / "uploads"), max_upload_bytes=1_000_000)
+
+
+def _keyed_store(root: Path) -> UploadStore:
+    """A store over ``root`` under a fresh key: the engine here is keyless, so swapping this in for
+    the app's own store is "the key is now enabled" for every upload already on disk."""
+    return UploadStore(root, make_cipher(generate_key(), write_v2=True), max_bytes=10**6)
 
 
 async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
@@ -1005,8 +1015,6 @@ async def test_the_RUNNER_prune_audit_row_also_names_the_system(tmp_path: Path) 
     pytest.importorskip("psutil")
     from messagefoundry.api import create_managed_app
     from messagefoundry.store.base import open_store
-    from messagefoundry.store.crypto import generate_key
-    from messagefoundry.uploads import UploadStore
 
     uploads = tmp_path / "runner-uploads"
     settings = StoreSettings(
@@ -1086,14 +1094,13 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
       holder gets the same 404 as an absent id, and the override holder gets 423 with the fix.
     * A refused BODY behind a readable sidecar reaches the owner as 423 on browse and on resend.
       A reseal that crashes part way does not leave that shape, because it seals the body first.
-      A reseal that SKIPS an unreadable body still seals the sidecar, so it can, and so can a body
+      A reseal that SKIPS an unreadable body leaves a plaintext sidecar too (BACKLOG #2322), but
+      still re-seals one under a retired key, so dropping that key afterwards can. So can a body
       swapped in behind a real sidecar. Not 409: resend already spends 409 on "inbound not
       running".
     * No body names the file."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
-    from messagefoundry.store.crypto import generate_key, make_cipher
-    from messagefoundry.uploads import UploadStore
 
     engine.add_registry(_running_registry(tmp_path))
     await engine.start()
@@ -1114,8 +1121,8 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
             for i in range(2)
         ]  # the test engine is keyless, so both are plaintext uploads
         plain = app.state.upload_store
-        keyed = UploadStore(root, make_cipher(generate_key(), write_v2=True), max_bytes=10**6)
-        # The second upload: seal only its sidecar, as a reseal that skipped its body would leave it.
+        keyed = _keyed_store(root)
+        # The second upload: seal only its sidecar, the shape a body swapped in behind it leaves.
         half = fids[1]
         (root / f"{half}.meta").write_text(
             keyed._encrypt_meta(await plain.get_meta(half)),  # noqa: SLF001
@@ -1137,6 +1144,64 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
         ):
             assert r.status_code == 423, r.text
             assert "rotate-key" in r.text and "acme" not in r.text
+        # BACKLOG #2322: the override DELETE above reaches UploadStore.delete, which must refuse a
+        # body rotate-key can seal and remove nothing.
+        assert (root / f"{refused}.meta").exists() and (root / f"{refused}.blob").exists()
         assert [f["file_id"] for f in (await c.get("/uploads", headers=h)).json()["files"]] == [
             half
         ]
+
+
+@_BREAKS
+async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
+    engine: Engine,
+    tmp_path: Path,
+    break_body: Callable[[Path], None],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #2322: on a keyed store, a plaintext sidecar over a missing or non-text body is
+    refused on every read, and ``rotate-key`` never seals it.
+
+    * The owner, who lacks FILES_ACCESS_ANY, still gets 404 and removes nothing.
+    * An override holder deletes it: both files go, and one ``upload.delete`` row names its id
+      and no owner, because the engine cannot verify the plaintext one. The sidecar is decrypted
+      once, so the delete raises one cipher WARNING, not two."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.ADMINISTRATOR, name="root")
+    root = tmp_path / "uploads"
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ha = await _login(c, "root")
+        r = await c.post("/uploads", files={"file": ("acme.hl7", BATCH, "text/plain")}, headers=h)
+        fid = r.json()["file_id"]  # the test engine is keyless, so this is a plaintext upload
+        blob, sidecar = root / f"{fid}.blob", root / f"{fid}.meta"
+        break_body(blob)
+        had_body = blob.exists()
+        app.state.upload_store = _keyed_store(root)  # the key is now enabled
+
+        r = await c.delete(f"/uploads/{fid}", headers=h)
+        assert r.status_code == 404, r.text  # the owner is unreadable: no existence oracle
+        assert sidecar.exists() and blob.exists() == had_body, (
+            "a caller without FILES_ACCESS_ANY removed part of the upload"
+        )
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.store.crypto"):
+            r = await c.delete(f"/uploads/{fid}", headers=ha)
+        assert r.status_code == 200, r.text
+        assert r.json() == {"file_id": fid, "filename": "", "deleted": True}
+        refusals = [m for m in caplog.messages if m.startswith("refused an unmarked value")]
+        assert len(refusals) == 1, refusals
+        assert not sidecar.exists() and not blob.exists(), "the delete left a file behind"
+
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "upload.delete"]
+    assert len(rows) == 1, rows
+    assert rows[0]["actor"] == "root"
+    detail = json.loads(str(rows[0]["detail"]))
+    assert detail["file_id"] == fid and detail["filename"] == ""
+    assert "acme" not in str(rows[0]["detail"])

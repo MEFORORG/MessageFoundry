@@ -410,6 +410,17 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
 - A referenced key that is **undefined for the target environment** makes the engine refuse to load
   or promote that graph (fail loud) — never a silent blank host. See the env files under
   [`environments/`](../environments/) and `samples/config/IB_ACME_ADT.py` for a worked example.
+- **A boolean setting reads its value strictly.** Write it as `env("acme_allow_expired", cast=bool)`
+  in a code-first module, or `{ env = "acme_allow_expired", cast = "bool" }` in `connections.toml`.
+  Both read `true`, `1`, `yes` and `on` as true, and `false`, `0`, `no` and `off` as false, in any
+  case. A TOML `true` or `false` in `<env>.toml` works as written. Any other value, such as `maybe`,
+  stops the load with an error that names the setting and the key. A `default=` given with a
+  bool cast is read the same way, on both routes. Before vault BACKLOG #3138, a code-first `cast=bool` used
+  Python's own `bool`, which reads any non-empty text as true. A `MEFOR_VALUE_*` of `false` would
+  then have turned on a loosening such as `tls_allow_expired` or `trust_server_certificate`.
+  **Always give a boolean setting this cast.** An `env()` with no cast, or with a `str` cast, hands
+  the setting text, and a connector reads any non-empty text as true. A cast you write yourself,
+  such as `cast=lambda s: bool(s)`, runs as written and keeps that trap.
 - **Per-face logic inside a transform:** `env()` is a *deferred reference* resolved only when a
   **connection** spec is built — using it in a handler is an always-truthy object (a bug). To branch a
   Router/Handler on the deployment, read the active environment **name** with
@@ -1782,7 +1793,7 @@ nodes automatically:
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | turn on the coordination seam; requires a server-DB store (`[store].backend` = `postgres` or `sqlserver`) and `[store].pool_size >= 2` |
-| `node_id` | str | _unset_ | override the auto id (`host:pid:hex`); pin for a stable identity / tests. Unset → reuses the store's lease owner-id, so node-id == owner-id |
+| `node_id` | str | _unset_ | override the auto id (`host:pid:hex`); pin for a stable identity / tests. Unset → reuses the store's lease owner-id, so node-id == owner-id. Pinned, a restarted node also settles the dual-control releases it left `executing` (SECURITY.md, "A restart settles its own leftover releases") |
 | `heartbeat_seconds` | num | 10 | how often a node refreshes its `last_seen` heartbeat **and** renews its leadership lease (no separate leader-check knob). Must be > 0 |
 | `node_timeout_seconds` | num | 30 | a node is considered dead when its `last_seen` is older than this (the `/cluster/nodes` freshness filter). The leadership **lease** — not this timeout — is what transfers leadership. Must be > 0, and must exceed `heartbeat_seconds` |
 | `reclaim_interval_seconds` | num | 30 | how often the **leader** runs the lease-reclaim sweep that recovers crashed nodes' in-flight rows (followers no-op). Must be > 0 |
@@ -1851,9 +1862,9 @@ one AES-256-GCM `.mfbak` archive to a local/UNC destination (#60,
 [ADR 0049](adr/0049-turnkey-dr-backup-restore-verify.md)). **Opt-in:** `enabled = false` (the default) is a
 complete no-op. When enabled, the leader-gated `BackupRunner`
 ([pipeline/dr_backup.py](../messagefoundry/pipeline/dr_backup.py)) takes a **consistent SQLite snapshot**
-(read-only against the live store — it never claims or mutates a staged-queue row), bundles the loaded
-`--config` dir, encrypts under the existing store DEK (ADR 0019 KeyProvider), applies keep-N retention, runs
-a lightweight restore-verify, and records one PHI-free `dr_backup` audit row. **No cloud target** — local /
+(read-only against the live store — it never claims or mutates a staged-queue row), bundles the config dir
+the running graph came from (the last applied reload's root, else `--config`), encrypts under the existing
+store DEK (ADR 0019 KeyProvider), applies keep-N retention, runs a lightweight restore-verify, and records one PHI-free `dr_backup` audit row. **No cloud target** — local /
 UNC only, so it adds no egress. On a **server-DB** store (Postgres/SQL Server) the *database* backup is
 DBA-delegated (#52): config-only, or skipped, per `config_only_on_server_db`.
 
@@ -1864,7 +1875,7 @@ DBA-delegated (#52): config-only, or skipped, per `config_only_on_server_db`.
 | `schedule_at` | str | `"02:00"` | daily local `"HH:MM"` the scheduled backup runs at (the same clock grammar as `[retention].vacuum_at`). `""` = **on-demand only** (the `messagefoundry backup` CLI), no scheduled pass |
 | `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all, which on an enforcing instance needs `[security].allow_keeping_backup_archives_indefinitely = true` or `serve` refuses (BACKLOG #1967). Only archives that passed every configured check are counted: a backup is written as `<name>.part` and renamed onto its canonical name after the verify, so a verify-**failed** archive keeps a `.failed` name and can evict a good one in neither this prune nor any later one. The flip side: `.failed` and `.part` files at the destination sit **outside** keep-N and nothing expires them — clear them yourself (ADR 0049) |
 | `snapshot_method` | str | `vacuum_into` | `vacuum_into` (default; a defragmented copy) or `online_backup` (a page-for-page copy). Neither holds the store write lock for the copy (BACKLOG #1937). The copy still has costs, so an off-peak `schedule_at` remains sensible; ADR 0049 points to where they are stated |
-| `include_config` | bool | `true` | bundle the loaded `--config` dir into the archive, so the cold seed is self-sufficient (store **plus** the config that interprets it) without assuming the DR box can reach the org's git repo |
+| `include_config` | bool | `true` | bundle the running config dir (the last applied reload's root, else `--config`) into the archive, so the cold seed is self-sufficient (store **plus** the config that interprets it) without assuming the DR box can reach the org's git repo. The manifest and the `dr_backup` audit row record `config_bundled`, the `config_dir` the pass read, and `config_bundle_error`. When that dir is gone or cannot be listed, a full backup still succeeds with the store snapshot, logs one WARNING naming the directory and the error class, and records `config_bundled: false` with that class; no alert is raised for it. A config-only backup fails instead, as a `snapshot` failure. The `messagefoundry backup` CLI bundles its own `--config` argument instead |
 | `verify_after_backup` | bool | `true` | run the lightweight restore-verify after every backup (open + `integrity_check` + row-count). On by default — a backup nobody has opened is a backup that silently doesn't restore |
 | `full_restore_verify` | bool | `false` | the heavier verify: restore the snapshot to a throwaway temp DB, open it through the real `open_store` path **under this instance's live `[store]` settings** (only the path and the backend substituted), then decrypt and authenticate its cipher-covered cells and report how many were opened. A snapshot holding sealed cells that these settings resolve no key for is reported `KEY_MISMATCH`, not `FAIL` — the archive is fine, the key configuration is not. On-demand / opt-in extra, deliberately **not** the per-backup default |
 | `config_only_on_server_db` | bool | `true` | on a Postgres/SQL Server store the DB backup is DBA-delegated (#52), so back up the **config bundle only**. `false` = skip the backup entirely on a server-DB store (not even a config-only archive) |

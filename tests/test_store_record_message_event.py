@@ -108,3 +108,49 @@ async def test_detail_is_scrubbed_at_the_store_boundary(tmp_path: Path) -> None:
     detail = next(row[2] for row in _events(db) if row[0] == "reply_timeout")
     assert detail is not None
     assert "DOE^JANE" not in detail, "an HL7 field value reached message_events.detail unscrubbed"
+
+
+async def test_the_viewed_kind_is_refused_and_record_view_still_writes_it(tmp_path: Path) -> None:
+    """BACKLOG #2440. ``get_message``'s audit leaves ``viewed`` rows out of ``events.detail`` because
+    their detail is the viewer's username. A caller-written ``viewed`` row could carry anything, and
+    the error reveal would unmask it unrecorded, so only ``record_view`` may write the kind. The
+    record_view leg is the control: the kind is refused on this path, not dead."""
+    from messagefoundry.store.store import VIEWED_EVENT
+
+    db = tmp_path / "viewed.db"
+    store = await MessageStore.open(db)
+    try:
+        mid = await store.enqueue_message(channel_id="IB_HTTP", raw=ADT, deliveries=[])
+        with pytest.raises(ValueError, match="written only by the store"):
+            await store.record_message_event(mid, VIEWED_EVENT, detail="not a username")
+        await store.record_view(mid, actor="alice")
+    finally:
+        await store.close()
+
+    assert [row for row in _events(db) if row[0] == VIEWED_EVENT] == [(VIEWED_EVENT, None, "alice")]
+
+
+def test_every_backend_validates_through_the_shared_check() -> None:
+    """The refusal lives in ONE function so the three backends cannot drift. This pins that each
+    backend's ``record_message_event`` calls it rather than an inline copy."""
+    import ast
+
+    from messagefoundry.store.store import check_caller_event_kind
+
+    with pytest.raises(ValueError, match="written only by the store"):
+        check_caller_event_kind("viewed")
+    root = Path(__file__).resolve().parents[1] / "messagefoundry" / "store"
+    for name in ("store.py", "postgres.py", "sqlserver.py"):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"))
+        methods = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "record_message_event"
+        ]
+        assert len(methods) == 1, name
+        called = {
+            c.func.id
+            for c in ast.walk(methods[0])
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+        }
+        assert "check_caller_event_kind" in called, name

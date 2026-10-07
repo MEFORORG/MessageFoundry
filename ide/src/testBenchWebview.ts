@@ -23,6 +23,7 @@ export function testBenchScript(token: string): string {
     let traceMode = (vscode.getState() || {}).traceMode || 'coverage'; // 'coverage' | 'profile'
     let lastTrace = null; // the most recent trace detail, so the toggle can re-render it
     let wantCase = null; // the run case the developer last asked to see, as { run, index }; null: none
+    let shownRun = null; // the run id whose view is on screen, so leaving it can be told; null: none
 
     // Stringifies first, so a number reaching innerHTML goes through the same escape as a string.
     // Quotes too, matching the host-side esc(): a value must not be able to leave an attribute.
@@ -237,6 +238,7 @@ export function testBenchScript(token: string): string {
     // on click"). The DOM keys cases on their index, never on a name.
     function renderCollectionRun(msg){
       wantCase = null;
+      shownRun = msg.run;
       const cases = msg.results.map((r, i) => {
         const badge = r.pass ? '<span class="badge pass">PASS</span>' : '<span class="badge fail">FAIL</span>';
         return '<div class="case"><div class="hd">' + badge + '<span class="cn">' + esc(r.name) +
@@ -262,6 +264,13 @@ export function testBenchScript(token: string): string {
           vscode.postMessage({ command: 'caseDetail', run, index });
         });
       }
+    }
+    // Tell the host the run view is gone, so it stops holding that run's per-case values and answers
+    // no later caseDetail for it (BACKLOG #2441). Once per run view: a second leave posts nothing.
+    function leaveRun(){
+      if (shownRun === null) return;
+      vscode.postMessage({ command: 'leaveRun', run: shownRun });
+      shownRun = null;
     }
     // Clear the one case on show, if any, and forget the request for it.
     function closeCase(){
@@ -306,6 +315,7 @@ export function testBenchScript(token: string): string {
     document.getElementById('savecoll').addEventListener('click', () => vscode.postMessage({ command: 'saveCollection' }));
     back.addEventListener('click', () => {
       closeCase(); // a revealed case's values do not stay behind in the hidden view
+      leaveRun();
       detail.style.display='none'; results.style.display=''; lastTrace=null;
       back.hidden=true; layout.hidden=true; tracetoggle.hidden=true;
     });
@@ -331,8 +341,8 @@ export function testBenchScript(token: string): string {
         console.warn('MessageFoundry Test Bench: discarded a malformed "' + String(m.type) + '" message');
         return;
       }
-      // Any other view replaces the run view, so a case request made there is no longer wanted.
-      if (m.type !== 'caseDetail') wantCase = null;
+      // Any other view replaces the run view: drop its case request, and tell the host (leaveRun).
+      if (m.type !== 'caseDetail') { wantCase = null; leaveRun(); }
       if (m.type === 'detail') {
         const diff = m.diff;
         detail.innerHTML =
@@ -373,5 +383,8 @@ export function testBenchScript(token: string): string {
         renderCaseDetail(m);
       }
     });
+    // A fresh page has no run view. Say so, so the host drops a held run even when the page reloaded
+    // without a host render, as "Developer: Reload Webviews" does (BACKLOG #2441).
+    vscode.postMessage({ command: 'ready' });
   `;
 }
