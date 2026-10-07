@@ -1295,8 +1295,17 @@ def test_r9_an_index_inside_a_field_read_is_1_or_more(read: str, ok: bool) -> No
         'import os\n\n\ndef poke():  # type: ignore[no-untyped-def]\n    getattr(os, "globals")\n',
         "from inspect import builtins as b\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
         '    b.globals()["OB_DEST"] = 1\n',
+        "import os\n\n\ndef poke():  # type: ignore[no-untyped-def]\n"
+        '    getattr(os, "importlib")\n',
+        "from somewhere import importlib\n",
     ],
-    ids=["getattr-builtins-literal", "getattr-writer-literal", "from-import-builtins"],
+    ids=[
+        "getattr-builtins-literal",
+        "getattr-writer-literal",
+        "from-import-builtins",
+        "getattr-importlib-literal",
+        "from-import-importlib",
+    ],
 )
 def test_r10_a_literal_route_name_voids_inert_names(write: str) -> None:
     src = (

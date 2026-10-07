@@ -4274,8 +4274,8 @@ def _insert_value_policy(call: str, pname: str) -> str:
 def _is_field_call(node: ast.expr, *, scope: _Scope) -> bool:
     """Whether ``node`` is ``msg.field("LIT")`` with only ``occurrence=``/``repetition=`` keywords whose
     values are 1 or more on every message (:func:`_is_index_value`: int arithmetic, a 1-based
-    For-Each index such as ``occurrence=i``, or that index with a non-negative literal added on
-    either side, ``i + 1`` or ``2 + i``), or a
+    For-Each index such as ``occurrence=i``, or that index added on either side to int-literal
+    arithmetic that comes to 0 or more, such as ``i + 1`` or ``2 + i``), or a
     ``repetition=None``.
 
     Stricter than :func:`_is_bounded_message_read`, which also admits extra POSITIONAL constants:
@@ -4776,7 +4776,8 @@ def _reaches_globals(n: ast.AST, safe_getattr: set[int]) -> bool:
     * a ``getattr`` name used any way but a direct call whose attribute name is a non-dunder string
       literal outside those sets (``safe_getattr`` holds the ``id`` of each such safe call).
 
-    It is a deny list and does NOT catch every route. Known to pass: ``inspect.builtins.globals()``,
+    It is a deny list and does NOT catch every route. Known to pass, at least:
+    ``inspect.builtins.globals()`` and any other attribute named ``builtins`` or ``importlib``,
     a ``match`` class pattern capturing ``__globals__``, ``pkgutil.resolve_name`` and other
     resolver strings, ``inspect.getmodule``, ``gc.get_referrers``, a self-import, a re-export under
     another name, and a relative import. Each needs hand-written code that deliberately hides a
@@ -4839,7 +4840,9 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
     Manager decision 2026-10-07 (Lander review of PR 2155, finding 7; PR 2154 F6). A name qualifies
     only when it has exactly ONE binding at module scope, ``NAME = <literal>`` of an immutable type
     (:func:`_literal_kind`), and nothing in the module mutates it: no attribute call on it, no
-    attribute or subscript store or delete through it, no augmented assignment. So ``SEEN = []``
+    attribute or subscript store or delete through it, no augmented assignment. This function does
+    not look at ``global`` declarations: a function that rebinds the name through ``global`` is
+    caught by its caller, :func:`_message_scope`, which removes every ``global``-declared name. So ``SEEN = []``
     never qualifies: ``SEEN.append(msg.field("PID-3"))`` fills it from the message. A star import,
     or any route :func:`_reaches_globals` knows, leaves no name inert. That check is a deny list:
     hand-written code that deliberately rebinds a global by a route it does not know is outside its
