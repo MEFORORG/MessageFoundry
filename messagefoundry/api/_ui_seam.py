@@ -294,9 +294,11 @@ from typing import Any
 #:
 #: Vault BACKLOG #2132: ``AuthService.audit_oidc_reject`` and ``audit_kerberos_reject`` take a
 #: required keyword ``client``, and the ``/ui/oidc`` and ``/ui/sso`` routes pass the caller's
-#: address, so their ``auth.login_failed`` rows record where a reject came from. A breaking change:
-#: an older console calls both with the reason alone and would raise ``TypeError`` on every
-#: route-level reject. The digest moved because both signatures changed.
+#: address, so their ``auth.login_failed`` rows record where a reject came from. A breaking change
+#: in both directions: an older console calls both with the reason alone, and a newer console
+#: passes ``client=`` to an engine that takes none. Either way every route-level reject would raise
+#: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
+#: signatures changed.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

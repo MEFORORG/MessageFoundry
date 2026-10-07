@@ -7878,10 +7878,13 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
     return AuthService(engine.store, _oidc_settings(**over), ldap=_FakeLdap())  # type: ignore[arg-type]
 
 
-def _oidc_client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
+def _oidc_client(
+    engine: Engine, service: AuthService, *, peer: str = "127.0.0.1"
+) -> httpx.AsyncClient:
     # public_origin is required: the redirect_uri derives from it, never from the Host header.
     app = create_app(engine, auth=service, serve_ui=True, public_origin="https://ops.example")
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    transport = httpx.ASGITransport(app=app, client=(peer, 123))
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
 async def _oidc_audits(engine: Engine) -> list[str]:
@@ -8006,9 +8009,7 @@ async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) 
     callbacks is the cheapest one to send, and the operator needs its source."""
     service = _oidc_service(engine)
     await service.initialize()
-    app = create_app(engine, auth=service, serve_ui=True, public_origin="https://ops.example")
-    transport = httpx.ASGITransport(app=app, client=("192.0.2.46", 50000))
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+    async with _oidc_client(engine, service, peer="192.0.2.46") as c:
         r = await c.get("/ui/oidc/callback?code=abc&state=xyz", follow_redirects=False)
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/login?e=flow_binding_missing"
