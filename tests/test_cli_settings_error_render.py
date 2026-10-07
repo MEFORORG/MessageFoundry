@@ -302,6 +302,35 @@ def test_security_edit_rolls_back_when_the_callback_refuses_in_its_own_type(
         assert not path.exists()
 
 
+#: The commands whose settings refusal is "could not start", exit 2. `audit-verify` and
+#: `audit-anchor` have the same case in `tests/test_audit_integrity.py`'s `_BAD_SETTINGS`.
+_DIRECTORY_ARMS = [
+    ["rotate-key"],
+    ["admin-unlock", "--username", "a", "--json"],
+    ["admin-set-notify-email", "--username", "a", "--email", "a@example.org", "--json"],
+    ["admin-reset-totp", "--username", "a", "--json"],
+]
+
+
+@pytest.mark.parametrize("argv", _DIRECTORY_ARMS, ids=[argv[0] for argv in _DIRECTORY_ARMS])
+def test_a_directory_named_as_the_service_config_exits_2(
+    argv: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3110, item 4. A directory named as ``--service-config`` passes the load's
+    existence check and raises an ``OSError`` at the open, which ``_load_service_settings`` catches
+    (#2760). These commands then exit 2, could not start, with one rendered line. ``rotate-key``
+    exited 1 at the dispatch floor before #2760, and the admin commands' shared host gate exited 1,
+    the code they give a refusal about the account."""
+    code = main([*argv, "--service-config", str(tmp_path), "--db", str(tmp_path / "x.db")])
+    captured = capsys.readouterr()
+    assert code == 2, (captured.out, captured.err)
+    if "--json" in argv:
+        assert "error" in json.loads(captured.out), captured.out
+    else:
+        assert captured.err.startswith("error: "), captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
 def test_support_bundle_refuses_an_explicit_settings_path_it_cannot_read(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

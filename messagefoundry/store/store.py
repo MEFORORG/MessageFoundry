@@ -2574,11 +2574,14 @@ class AuditVerdict(tuple[bool, str | None]):
     It is set only with ``ok`` true. A caller whose settings require a key must not report it as a
     pass: ``audit-verify`` exits 5, "not checked", on it (vault BACKLOG #3054).
 
-    ``==`` and ``hash`` are the tuple's and ignore both flags; ``__reduce__`` keeps them through a
+    ``==`` and ``hash`` are the tuple's and ignore both flags and ``rows``; ``__reduce__`` keeps all three through a
     copy."""
 
     key_unavailable: bool
     keyless_walk: bool
+    #: How many rows the walk covered, on a clean verdict; -1 where it does not say. Read from the
+    #: walk itself, so a caller needs no second query that could fail or see other rows.
+    rows: int
 
     def __new__(
         cls,
@@ -2586,14 +2589,19 @@ class AuditVerdict(tuple[bool, str | None]):
         message: str | None,
         key_unavailable: bool = False,
         keyless_walk: bool = False,
+        rows: int = -1,
     ) -> Self:
         verdict = super().__new__(cls, (ok, message))
         verdict.key_unavailable = key_unavailable and not ok
         verdict.keyless_walk = keyless_walk and ok
+        verdict.rows = rows
         return verdict
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (type(self), (self[0], self[1], self.key_unavailable, self.keyless_walk))
+        return (
+            type(self),
+            (self[0], self[1], self.key_unavailable, self.keyless_walk, self.rows),
+        )
 
 
 def verify_audit_rows(
@@ -2847,6 +2855,7 @@ def verify_audit_rows(
         True,
         f"verified {count} audit row(s)",
         keyless_walk=not capable,
+        rows=count,
     )
 
 
@@ -2898,7 +2907,39 @@ class AuditRangeHost(Protocol):
     ) -> None: ...
 
 
+#: The note an open adds to a driver, connection or decode error raised while it read, or started, the
+#: audit chain's rows (vault BACKLOG #3054, item 10): in :func:`load_audit_chain`, and in the empty-log
+#: check of ``open_store``. A row's content can cause such an error, so a caller that verifies the
+#: chain treats it as evidence about those rows rather than as a store that could not start. A
+#: driver error there may also be a lock or an outage; that caller then fails closed. A note and not
+#: a new class, so every other caller catches the error exactly as before.
+AUDIT_CHAIN_READ_NOTE = "raised while the store read or started the audit chain at open"
+
+
+def note_audit_chain_read(exc: BaseException) -> None:
+    """Add :data:`AUDIT_CHAIN_READ_NOTE` to ``exc`` when it is one of
+    :func:`~messagefoundry.store.base.audit_chain_read_errors` and not a missing table, column or
+    grant. Other errors, the engine's own refusals among them, are left as they are. A
+    Transit refusal there is a ``CipherError``, which a verifying caller already treats as row
+    evidence."""
+    from messagefoundry.store.base import audit_chain_read_errors, is_store_shape_error
+
+    # A shape error is a store this build cannot read, which a caller reports as "could not start".
+    if isinstance(exc, audit_chain_read_errors()) and not is_store_shape_error(exc):
+        exc.add_note(AUDIT_CHAIN_READ_NOTE)
+
+
 async def load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
+    """At open: learn the chain's state from its rows; see :func:`_load_audit_chain`. A driver,
+    connection or decode error is re-raised unchanged, with :data:`AUDIT_CHAIN_READ_NOTE` added."""
+    try:
+        await _load_audit_chain(host, read_only=read_only)
+    except BaseException as exc:  # tagged only when it is one of those; always re-raised
+        note_audit_chain_read(exc)
+        raise
+
+
+async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
     """At open: learn the chain's state from the chain itself, and start it when it is empty (vault
     BACKLOG #2594). Shared by all three backends.
 
