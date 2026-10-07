@@ -2956,19 +2956,26 @@ def create_app(
         store: object, key_name: str | None
     ) -> TransitBoundAttestationView | None:
         """The vault_transit bound attestation as the start gate reads it (BACKLOG #2337), through
-        the same reader and the same verdict. ``None`` off vault_transit."""
+        the same reader and the same verdict. ``None`` off vault_transit.
+
+        A Transit failure during the audit-row MAC check comes back from the store as a gap, so it
+        reads as not attested rather than failing the whole posture. A row its audit row does not
+        back reports no ``attested_*`` fields: they are whatever a writer with DML put there, and
+        showing a named actor beside ``attested: false`` would still read as that person's
+        attestation."""
         if key_name is None:
             return None
         recorded = await read_transit_bound_attestation(store)
         gap = transit_bound_gap(key_name, recorded)
+        backed = recorded if recorded is not None and recorded.audit_gap is None else None
         return TransitBoundAttestationView(
             key_name=key_name,
             attested=gap is None,
             gap=gap,
-            attested_key_name=recorded.key_name if recorded else None,
-            attested_by=recorded.actor if recorded else None,
-            attested_at=recorded.attested_at if recorded else None,
-            reason=recorded.reason if recorded else None,
+            attested_key_name=backed.key_name if backed else None,
+            attested_by=backed.actor if backed else None,
+            attested_at=backed.attested_at if backed else None,
+            reason=backed.reason if backed else None,
         )
 
     @app.get("/security/posture", response_model=SecurityPosture)

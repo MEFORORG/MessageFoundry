@@ -6129,6 +6129,15 @@ class _StoreOpenFailed(Exception):  # noqa: N818 -- a carrier, caught one frame 
         self.cause = cause
 
 
+class _StoreConnectFailed(Exception):  # noqa: N818 -- a carrier, caught one frame up
+    """Any other store error raised while OPENING the store, such as a server backend that cannot
+    be reached, so ``_store_transit_bound`` reports exit 2 rather than a refused write."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 def _store_transit_bound(args: argparse.Namespace) -> int:
     """Record or withdraw the vault_transit AES-GCM bound attestation (BACKLOG #2337).
 
@@ -6144,6 +6153,7 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     the engine holds the file, is a refused write and exit 1."""
     import datetime
     import getpass
+    import math
 
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
@@ -6154,11 +6164,9 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
         store_driver_errors,
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
-    from messagefoundry.store.store import AuditAppend
     from messagefoundry.store.transit_attestation import (
         TRANSIT_BOUND_KEY_NAME_MAX,
         TRANSIT_BOUND_REASON_MAX,
-        TRANSIT_BOUND_WITHDRAWN_ACTION,
         TransitBoundAttestation,
         TransitBoundAttestationStore,
         utf16_units,
@@ -6192,44 +6200,6 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
         )
     actor = f"cli:{getpass.getuser()}"
 
-    def withdrawn_row(withdrawn: TransitBoundAttestation) -> AuditAppend:
-        detail: dict[str, object] = {
-            "key_name": withdrawn.key_name,
-            "attested_by": withdrawn.actor,
-            "attested_at": withdrawn.attested_at,
-        }
-        if reason:
-            detail["reason"] = reason
-        return AuditAppend(TRANSIT_BOUND_WITHDRAWN_ACTION, actor=actor, detail=json.dumps(detail))
-
-    async def run() -> tuple[str, TransitBoundAttestation | None, str]:
-        """``(outcome, the row recorded or withdrawn, the store path)``."""
-        try:
-            store = await open_store(
-                settings.store,
-                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-            )
-        except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-            raise _StoreOpenFailed(exc) from exc
-        try:
-            if not isinstance(store, TransitBoundAttestationStore):
-                return ("unsupported", None, store.path)
-            _refuse_an_unauditable_write(store)
-            if not attesting:
-                withdrawn = await store.withdraw_transit_bound_attestation(audit=withdrawn_row)
-                return ("withdrawn" if withdrawn else "none", withdrawn, store.path)
-            key_name = store.cipher_info().transit_key_name
-            if key_name is None:  # cipher_provider said vault_transit; the open built another
-                return ("no-transit-key", None, store.path)
-            if utf16_units(key_name) > TRANSIT_BOUND_KEY_NAME_MAX:
-                return ("key-name-too-long", None, store.path)
-            recorded = await store.record_transit_bound_attestation(
-                key_name=key_name, reason=reason, actor=actor
-            )
-            return ("attested", recorded, store.path)
-        finally:
-            await store.close()
-
     # A refused write raises one of these on every backend (BACKLOG #1983). The row and its audit
     # row share one transaction, so a refusal leaves neither. sqlite3.DatabaseError is here because
     # an open's own failure has already been re-raised as _StoreOpenFailed, so what reaches this
@@ -6246,6 +6216,49 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
         StoreKeylessError,
         CipherError,
     )
+    # Raised by the open, and each reported by its own clause below rather than as a failed open.
+    open_refusals: tuple[type[Exception], ...] = (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        *key_errors,
+    )
+
+    async def run() -> tuple[str, TransitBoundAttestation | None, str]:
+        """``(outcome, the row recorded or withdrawn, the store path)``."""
+        try:
+            store = await open_store(
+                settings.store,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+            raise _StoreOpenFailed(exc) from exc
+        except open_refusals:
+            raise  # each has its own message and exit code below
+        except store_errors as exc:
+            # A server backend that cannot be reached or refuses the login fails here, and that is
+            # "could not open the store" (exit 2), not a refused write.
+            raise _StoreConnectFailed(exc) from exc
+        try:
+            if not isinstance(store, TransitBoundAttestationStore):
+                return ("unsupported", None, store.path)
+            _refuse_an_unauditable_write(store)
+            if not attesting:
+                withdrawn = await store.withdraw_transit_bound_attestation(
+                    actor=actor, reason=reason or None
+                )
+                return ("withdrawn" if withdrawn else "none", withdrawn, store.path)
+            key_name = store.cipher_info().transit_key_name
+            if key_name is None:  # cipher_provider said vault_transit; the open built another
+                return ("no-transit-key", None, store.path)
+            if utf16_units(key_name) > TRANSIT_BOUND_KEY_NAME_MAX:
+                return ("key-name-too-long", None, store.path)
+            recorded = await store.record_transit_bound_attestation(
+                key_name=key_name, reason=reason, actor=actor
+            )
+            return ("attested", recorded, store.path)
+        finally:
+            await store.close()
+
     try:
         outcome, row, path = run_guarded(run())
     except (KeylessAuditChainRefused, StoreNotFoundError, _UnauditableWrite) as exc:
@@ -6256,6 +6269,9 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
         return 2
     except _StoreOpenFailed as exc:
         return _emit_store_open_error(exc.cause, settings.store.path, as_json=args.json)
+    except _StoreConnectFailed as exc:
+        _emit_error(f"could not open the store: {exc.cause}", as_json=args.json)
+        return 2
     except store_errors as exc:
         return _emit_error(
             f"the store refused the write, so nothing was recorded ({exc}). If the engine is "
@@ -6287,7 +6303,8 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
                     "key_name": row.key_name,
                     "reason": row.reason,
                     "actor": row.actor,
-                    "attested_at": row.attested_at,
+                    # null for a corrupt, non-finite time: NaN is not JSON.
+                    "attested_at": row.attested_at if math.isfinite(row.attested_at) else None,
                 },
             },
             compact=True,
@@ -6298,7 +6315,12 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
             f"OK: no vault_transit bound attestation is recorded in {path}; nothing changed"
         )
         return 0
-    when = datetime.datetime.fromtimestamp(row.attested_at, tz=datetime.UTC).isoformat()
+    try:
+        when = datetime.datetime.fromtimestamp(row.attested_at, tz=datetime.UTC).isoformat()
+    except (ValueError, OverflowError, OSError):
+        # A withdrawn row whose time is corrupt has already been deleted and audited; report that,
+        # rather than a traceback and a failure exit for a write that succeeded.
+        when = "an unreadable time"
     if outcome == "attested":
         _safe_print(
             f"OK: recorded the AES-GCM bound attestation for Transit data key {row.key_name!r} "
@@ -6307,7 +6329,7 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     else:
         _safe_print(
             f"OK: withdrew the attestation for Transit data key {row.key_name!r} (recorded by "
-            f"{row.actor} at {when}) from {path}. Under [security].enforcement=enforce, serve now "
+            f"{row.actor!r} at {when}) from {path}. Under [security].enforcement=enforce, serve now "
             "refuses to start on vault_transit until one is recorded again"
         )
     return 0

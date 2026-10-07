@@ -1343,8 +1343,9 @@ class TransitBoundAttestationView(BaseModel):
     #2337). Present only when the store cipher is ``vault_transit``.
 
     ``attested`` is true only when the recorded row names ``key_name``, the configured Transit data
-    key, and its audit row backs it. A row for another key, or one its audit row does not back, is
-    reported in the ``attested_*`` fields with ``attested`` false, and ``gap`` says why. Under
+    key, and its audit row backs it. A backed row for another key is reported in the ``attested_*``
+    fields with ``attested`` false. A row its audit row does not back leaves them empty, because a
+    writer with DML chose their values. Either way ``gap`` says why. Under
     ``[security].enforcement = enforce`` a false here means the engine would refuse its next start.
     Non-secret: names, a reason, who and when."""
 

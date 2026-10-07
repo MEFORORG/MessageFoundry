@@ -10,13 +10,17 @@ Transit from ``tests/test_crypto_transit.py``; the SQL Server and Postgres twins
 
 from __future__ import annotations
 
+import base64
 import getpass
+import hashlib
+import hmac
 import json
 import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -35,7 +39,8 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import open_store
-from messagefoundry.store.store import AuditAppend, MessageStore
+from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.store import MessageStore
 from messagefoundry.store.transit_attestation import (
     TRANSIT_BOUND_ATTESTED_ACTION,
     TRANSIT_BOUND_WITHDRAWN_ACTION,
@@ -43,7 +48,7 @@ from messagefoundry.store.transit_attestation import (
     TransitBoundUnattestedError,
 )
 from tests._admin_account import create_local_user_chosen
-from tests.test_crypto_transit import _KEY_NAME, _use_fake
+from tests.test_crypto_transit import _KEY_NAME, _FakeTransit, _use_fake
 
 PW = "a-strong-test-passphrase"
 
@@ -77,9 +82,7 @@ async def _attest(store: MessageStore, key_name: str = _KEY_NAME) -> TransitBoun
 
 
 async def _withdraw(store: MessageStore) -> TransitBoundAttestation | None:
-    return await store.withdraw_transit_bound_attestation(
-        audit=lambda w: AuditAppend(TRANSIT_BOUND_WITHDRAWN_ACTION, actor="cli:tester")
-    )
+    return await store.withdraw_transit_bound_attestation(actor="cli:tester")
 
 
 async def _start(store: MessageStore, enforcement: SecurityEnforcement) -> None:
@@ -236,6 +239,114 @@ async def test_a_forged_audit_row_does_not_verify(store: MessageStore, tmp_path:
         con.close()
     assert prev  # the chain had a head to forge after
     await _refused_with(db, "MAC does not verify")
+
+
+class _RotatingTransit(_FakeTransit):
+    """Fake Transit with key versions: ``generate_hmac`` uses the latest unless ``key_version`` pins
+    one, as the real engine does, and each version MACs under its own secret."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.latest = 1
+        self.pinned: list[int | None] = []
+
+    def generate_hmac(
+        self,
+        *,
+        name: str,
+        hash_input: str,
+        algorithm: str = "sha2-256",
+        key_version: int | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        self.pinned.append(key_version)
+        version = self.latest if key_version is None else key_version
+        secret = self._hmac_secret[name] + version.to_bytes(4, "big")
+        digest = hmac.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
+        return {"data": {"hmac": f"vault:v{version}:" + base64.b64encode(digest).decode("ascii")}}
+
+
+async def test_rotating_the_transit_key_keeps_the_attestation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator attests that they rotate the key, so a rotation must not read as a forgery: the
+    check recomputes the audit row's MAC under the version that row names, not Transit's latest."""
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "rotating.db"
+    store = await _transit_store(db)
+    await _attest(store)
+    await store.close()
+    transit.latest = 2  # Transit rotated the key; new MACs are vault:v2:
+    again = await _transit_store(db)
+    try:
+        got = await again.get_transit_bound_attestation()
+        # The audit chain walk pins the same way, so the rotation reads as no break there either.
+        chain_ok, chain_msg = await again.verify_audit_chain()
+    except BaseException:
+        await again.close()
+        raise
+    assert got is not None and got.audit_gap is None, got
+    assert chain_ok, chain_msg
+    assert 1 in transit.pinned
+    await _start(again, SecurityEnforcement.ENFORCE)  # no raise; stopping closes the store
+
+
+async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A DML writer sets both hashes to a key version Transit does not hold. Transit refuses the
+    pinned recompute; that must read as unattested, so a warn start still starts."""
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "forged-version.db"
+    store = await _transit_store(db)
+    recorded = await _attest(store)
+    await store.close()
+    forged = "vault:v9999999:AAAA"
+    _dml(db, "UPDATE transit_bound_attestation SET audit_hash = ? WHERE id = 1", (forged,))
+    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", (forged, recorded.audit_seq))
+
+    real = transit.generate_hmac
+
+    def refuse_unknown(**kw: Any) -> dict[str, Any]:
+        if kw.get("key_version") == 9999999:
+            raise RuntimeError("key version does not exist")
+        return real(**kw)
+
+    monkeypatch.setattr(transit, "generate_hmac", refuse_unknown)
+    again = await _transit_store(db)
+    try:
+        got = await again.get_transit_bound_attestation()
+    except BaseException:
+        await again.close()
+        raise
+    assert got is not None and got.audit_gap is not None and "Transit refused" in got.audit_gap
+    await _start(again, SecurityEnforcement.WARN)  # no raise
+
+
+async def test_a_non_numeric_attested_at_is_a_gap_not_a_crash(
+    store: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SQLite's REAL affinity keeps text. The row must read as unattested, warn must still start,
+    and the withdraw must still remove it."""
+    await _attest(store)
+    await store.close()
+    db = tmp_path / "transit.db"
+    _dml(db, "UPDATE transit_bound_attestation SET attested_at = 'x' WHERE id = 1")
+    again = await _transit_store(db)
+    got = await again.get_transit_bound_attestation()
+    assert got is not None and got.audit_gap is not None and "finite" in got.audit_gap
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.transit_attestation"):
+        await _start(again, SecurityEnforcement.WARN)  # no raise
+    third = await _transit_store(db)
+    try:
+        assert await _withdraw(third) is not None
+        assert await third.get_transit_bound_attestation() is None
+        [withdrawn] = _audit_rows(db, TRANSIT_BOUND_WITHDRAWN_ACTION)
+        assert json.loads(withdrawn["detail"])["attested_at"] is None
+    finally:
+        await third.close()
 
 
 async def test_warn_names_the_audit_gap(
@@ -405,6 +516,22 @@ def test_cli_a_file_that_is_not_a_database_is_exit_2(
     assert "cannot open the store" in capsys.readouterr().err
 
 
+def test_cli_a_store_that_cannot_be_reached_is_exit_2(
+    transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A server backend refusing the connection fails in the OPEN: exit 2, not a refused write."""
+    import messagefoundry.store.base as store_base
+
+    async def unreachable(*_a: object, **_k: object) -> object:
+        raise ConnectionRefusedError("connection refused")
+
+    monkeypatch.setattr(store_base, "open_store", unreachable)
+    rc = main(["store", "withdraw-transit-bound", "--db", str(transit_db)])
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "could not open the store" in err and "refused the write" not in err
+
+
 def test_cli_record_refuses_a_store_not_on_vault_transit(
     transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -476,6 +603,44 @@ async def test_posture_reports_the_attestation(store: MessageStore) -> None:
     assert view["attested"] is True and view["gap"] is None
     assert view["attested_by"] == "cli:tester"
     assert view["attested_at"] == recorded.attested_at
+
+
+async def test_posture_shows_no_attribution_from_an_unbacked_row(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A DML-forged row names whoever the forger chose. The posture must not repeat it."""
+    await store.close()
+    db = tmp_path / "transit.db"
+    _dml(db, _INSERT, (_KEY_NAME, "forged", "cli:officer", time.time(), 9999, "0" * 64))
+    again = await _transit_store(db)
+    try:
+        view = (await _posture(again))["transit_bound_attestation"]
+    finally:
+        await again.close()
+    assert isinstance(view, dict)
+    assert view["attested"] is False and "not backed" in str(view["gap"])
+    assert view["attested_by"] is None and view["reason"] is None
+    assert view["attested_key_name"] is None and view["attested_at"] is None
+
+
+async def test_posture_survives_a_transit_failure(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Vault outage during the MAC check reads as not attested; the rest of the posture still
+    answers."""
+    import messagefoundry.store.store as store_module
+
+    await _attest(store)
+
+    def boom(*_a: object, **_k: object) -> str | None:
+        raise CipherError("Transit audit HMAC failed (key='mefor-store'): ConnectionError")
+
+    # The attestation's MAC check is the only caller of _audit_row_mac on this path; appends
+    # (the login's audit rows) hash through audit_row_hash directly.
+    monkeypatch.setattr(store_module, "_audit_row_mac", boom)
+    view = (await _posture(store))["transit_bound_attestation"]
+    assert isinstance(view, dict)
+    assert view["attested"] is False and "Transit refused" in str(view["gap"])
 
 
 async def test_posture_reports_no_attestation_off_vault_transit(tmp_path: Path) -> None:
