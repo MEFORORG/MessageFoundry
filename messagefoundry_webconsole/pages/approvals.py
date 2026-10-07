@@ -23,8 +23,9 @@ hand-built POST either way.
 release would do. A ``None`` reads as the scope it means, such as all inbound connections.
 
 **A pending row whose operation dual control no longer gates offers no Approve.** The engine marks
-it ``gated`` False, from the same test its release refusal uses, so the page offers Reject and says
-why, rather than a button the gate answers with 409.
+it ``gated`` False, from the same test its release refusal uses, so the page offers the reject and
+says why, rather than a button the gate answers with 409. The reject reads Withdraw on the
+requester's own row and Reject on anyone else's, and the note names the same verb.
 
 Every value goes through the escaping ``el`` builder.
 """
@@ -90,15 +91,12 @@ _OWN_REQUEST = "Your request. A different approver decides it."
 
 _UNREADABLE = "Unreadable; reject it."
 
-# Mirrors the engine's approval.no_longer_gated refusal, so the advice is the same either way.
+# Follows the engine's approval.no_longer_gated refusal. ``{verb}`` is the row's own button label,
+# Withdraw on the requester's row and Reject elsewhere, so the note never names a button the row
+# does not have; the engine's text always says Reject.
 _NOT_GATED = (
-    "Dual control no longer applies to this operation, so it cannot be approved. Reject it; if it "
+    "Dual control no longer applies to this operation, so it cannot be approved. {verb} it; if it "
     "is still needed, run it again, without a second approver."
-)
-# The same note on the requester's own row, whose button reads Withdraw rather than Reject.
-_NOT_GATED_OWN = (
-    "Dual control no longer applies to this operation, so it cannot be approved. Withdraw it; if "
-    "it is still needed, run it again, without a second approver."
 )
 
 # What a None parameter means for the operations that hold one: the broadest scope, not "nothing".
@@ -198,15 +196,16 @@ def _pending_row(a: PendingApprovalInfo) -> list[object]:
     # row whose operation dual control no longer gates, and on a row whose params are unreadable.
     # Each such row gets the reject and a note saying why. The not-gated note comes first, so the
     # requester, who alone can run the operation again, sees it on their own row too.
+    verb = "Withdraw" if a.caller_is_requester else "Reject"
     if not a.gated:
-        note: str | None = _NOT_GATED_OWN if a.caller_is_requester else _NOT_GATED
+        note: str | None = _NOT_GATED.format(verb=verb)
     elif a.caller_is_requester:
         note = _OWN_REQUEST
     elif a.params is None:
         note = _UNREADABLE
     else:
         note = None
-    reject = _post_button(f"{base}/reject", "Withdraw" if a.caller_is_requester else "Reject")
+    reject = _post_button(f"{base}/reject", verb)
     controls = (
         [_post_button(f"{base}/approve", "Approve"), reject]
         if note is None

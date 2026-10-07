@@ -11250,9 +11250,10 @@ class MessageStore:
         now = time.time()
         held = approval_id
         append = audit
-        # Each INSERT is concatenated at its `execute` from module constants, never built in a local
-        # or an f-string: `tests/test_writer_txn_is_the_only_begin.py` reads the SQL at the call and
-        # resolves module names only through `+`, so either other shape hides the statement's verb.
+        # Each statement is concatenated at its `execute` from module constants, so
+        # `tests/test_writer_txn_is_the_only_begin.py` can read it whole. That guard counts SQL held
+        # in a local as unreadable against a pinned count, and it reads an f-string's interpolated
+        # name only as a placeholder, so it would miss a verb that name carries.
         async with _writer_guard(self._db, self._lock):
             if on_repeat is None:
                 await self._db.execute(

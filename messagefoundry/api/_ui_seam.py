@@ -301,12 +301,13 @@ from typing import Any
 #: signatures changed.
 #:
 #: Vault BACKLOG #2460 / #2458: ``CoreHandlers`` gains a required ``resolve_action`` for the
-#: console's resolve of an interrupted release. ``api.models`` gains ``ResolveOutcome``, the type of
-#: ``ApprovalResolveRequest.outcome``. ``PendingApprovalInfo`` gains ``params``,
-#: ``caller_is_requester`` and ``gated``. The digest moved because the surface grew. An older console
-#: on this engine is refused at mount by the digest. A newer console on an older engine fails
-#: earlier, at import: its approvals modules import ``ResolveOutcome``. The engine reports that as an
-#: installed console that failed to import (BACKLOG #1907), before any digest check runs.
+#: console's resolve of an interrupted release, with ``ApprovalResolveRequest`` and its ``outcome``
+#: values. ``PendingApprovalInfo`` gains ``params``, ``caller_is_requester`` and ``gated``. The
+#: digest moved because the surface grew. An older console on this engine is refused at mount by the
+#: digest. A newer console on an older engine fails earlier, at import: its approvals modules import
+#: the alias ``ResolveOutcome`` from ``api.models``. The engine reports that as an installed console
+#: that failed to import (BACKLOG #1907), before any digest check runs. The digest records the
+#: alias's values, not its name, so renaming it alone would not move the digest.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

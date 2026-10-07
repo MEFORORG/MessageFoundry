@@ -30,9 +30,9 @@ this line.**
   request, on a row whose stored parameters are unreadable, or on a row whose operation dual
   control no longer gates. Each such row says why and offers the reject instead, labelled
   Withdraw on the requester's own row and Reject on anyone else's. Seam change:
-  `resolve_action` joins the handlers, the console imports `ResolveOutcome` from
-  `messagefoundry.api.models`, and `PendingApprovalInfo` gains `params`, `caller_is_requester`
-  and `gated`.
+  `resolve_action` joins the handlers, and `PendingApprovalInfo` gains `params`,
+  `caller_is_requester` and `gated`. The console also imports `ResolveOutcome` from
+  `messagefoundry.api.models`, so on an older engine it fails at import, before the seam check.
 
 ### Fixed
 
