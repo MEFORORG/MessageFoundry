@@ -17,7 +17,11 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService, _allowed_channels
+from messagefoundry.auth.service import (
+    CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
+    AuthService,
+    _allowed_channels,
+)
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL, MessageStore
@@ -755,6 +759,55 @@ async def test_a_sign_in_between_the_read_and_the_write_is_a_conflict(
     assert r.status_code == 409
     assert "IB_A" not in r.text and "IB_Z" not in r.text
     assert await _scope_row(engine, ada_id) == ('["IB_A"]', SCOPE_SOURCE_AD)  # the sign-in's
+    [row] = await _audit_rows(engine)
+    assert row == {
+        "actor": "boss",
+        "user_id": ada_id,
+        "username": "ada",
+        "reason": "source_changed",
+        "expected_source": expected_source,
+        "owner": SCOPE_SOURCE_MANUAL,
+    }
+
+
+async def _audit_rows(
+    engine: Engine, action: str = CHANNEL_SCOPE_CHANGE_REFUSED_ACTION
+) -> list[dict[str, object]]:
+    """The ``action`` rows, oldest first, each detail with its actor. By default the refusals."""
+    rows = await engine.store.list_audit(action=action, limit=50)
+    return [{"actor": r["actor"], **json.loads(r["detail"])} for r in reversed(rows)]
+
+
+async def test_each_refused_save_writes_one_audit_row(engine: Engine) -> None:
+    """BACKLOG #2271: a 409 from ``PUT /users/{id}/channel-scope`` writes exactly one audit row,
+    naming the administrator, the account and the conflict, and never the scope. The save that goes
+    through writes ``user.channel_scope_changed`` as before and no refusal row.
+
+    Fails on the tree before #2271, where only the successful write was audited."""
+    service = await _admin_service(engine)
+    ada_id = await _directory_scoped_user(engine, service)
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _boss_headers(c)
+        url = f"/users/{ada_id}/channel-scope"
+        assert await _audit_rows(engine) == []  # control: the setup refused nothing
+
+        r = await c.put(url, json={"channels": ["IB_Z"]}, headers=h)
+        assert r.status_code == 409
+        r = await c.put(url, json={"channels": ["IB_Z"], "expected_source": "manual"}, headers=h)
+        assert r.status_code == 409
+        expected = {"actor": "boss", "user_id": ada_id, "username": "ada", "owner": SCOPE_SOURCE_AD}
+        assert await _audit_rows(engine) == [
+            {**expected, "reason": "directory_owned", "expected_source": None},
+            {**expected, "reason": "expected_source_mismatch", "expected_source": "manual"},
+        ]
+
+        r = await c.put(url, json={"channels": ["IB_Z"], "expected_source": "ad"}, headers=h)
+        assert r.status_code == 200
+    assert len(await _audit_rows(engine)) == 2  # the save added no refusal row
+    assert await _audit_rows(engine, "user.channel_scope_changed") == [
+        {"actor": "boss", "user_id": ada_id, "channels": ["IB_Z"]}
+    ]
 
 
 async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:

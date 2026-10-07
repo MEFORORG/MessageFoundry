@@ -1169,7 +1169,15 @@ class ChannelScopeSourceConflict(RuntimeError):
     ``expected_source="ad"``, so the write would make it manual without anyone saying so. The
     caller's ``expected_source`` does not match the stored one. Or an AD sign-in changed the source
     between this write's read and its compare-and-set. "The directory's" and "the stored one" both
-    mean :func:`_effective_scope_source`, not the raw column (BACKLOG #2252)."""
+    mean :func:`_effective_scope_source`, not the raw column (BACKLOG #2252).
+
+    Each refusal writes one :data:`CHANNEL_SCOPE_CHANGE_REFUSED_ACTION` row first (BACKLOG #2271)."""
+
+
+#: BACKLOG #2271: the row a refused :meth:`AuthService.set_channel_scope` writes. Its detail names the
+#: account, the caller's ``expected_source``, the ``owner`` that write read, and a ``reason``:
+#: ``directory_owned``, ``expected_source_mismatch`` or ``source_changed``. Never the scope itself.
+CHANNEL_SCOPE_CHANGE_REFUSED_ACTION: Final = "user.channel_scope_change_refused"
 
 
 def _effective_scope_source(user: UserRecord) -> ChannelScopeSource | None:
@@ -11008,7 +11016,8 @@ class AuthService:
         source. Either failure raises :class:`ChannelScopeSourceConflict`. The write itself is a
         compare-and-set against the source read here, so an AD sign-in that changes it before the
         write lands raises the same error instead of being overwritten. A caller that leaves
-        ``expected_source`` unset on a scope the directory does not own is unaffected.
+        ``expected_source`` unset on a scope the directory does not own is unaffected. Every such
+        refusal is audited (BACKLOG #2271); see :data:`CHANNEL_SCOPE_CHANGE_REFUSED_ACTION`.
 
         "The stored source" in both checks is :func:`_effective_scope_source`, which counts an AD
         account's stored scope with no recorded writer as the directory's (BACKLOG #2252). The
@@ -11020,16 +11029,37 @@ class AuthService:
             raise ValueError("no such user")
         stored = user.channel_scope_source
         owner = _effective_scope_source(user)
+
+        async def refuse(reason: str, message: str) -> ChannelScopeSourceConflict:
+            # BACKLOG #2271: a refused takeover leaves a row, as a successful write does. It names
+            # the actor, the account and the conflict, never the scope either side holds.
+            await self._audit(
+                CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
+                actor=actor,
+                detail=_json(
+                    {
+                        "user_id": user_id,
+                        "username": user.username,
+                        "reason": reason,
+                        "expected_source": expected_source,
+                        "owner": owner,
+                    }
+                ),
+            )
+            return ChannelScopeSourceConflict(message)
+
         if expected_source is None and owner == SCOPE_SOURCE_AD:
-            raise ChannelScopeSourceConflict(
+            raise await refuse(
+                "directory_owned",
                 "the directory owns this channel scope; send expected_source='ad' to confirm "
-                "that saving it makes it manual"
+                "that saving it makes it manual",
             )
         if expected_source is not None and expected_source != owner:
-            raise ChannelScopeSourceConflict(
+            raise await refuse(
+                "expected_source_mismatch",
                 "expected_source does not match who owns this channel scope; re-read the user and "
                 "retry. Where no writer is recorded, a directory account's stored scope needs "
-                "'ad'; omit expected_source when no scope is stored or the account is local"
+                "'ad'; omit expected_source when no scope is stored or the account is local",
             )
         scope_json = None if channels is None else _json(sorted(set(channels)))
         if not await self._store.set_user_channel_scope_if_source(
@@ -11037,8 +11067,9 @@ class AuthService:
         ):
             if await self._store.get_user(user_id) is None:
                 raise ValueError("no such user")
-            raise ChannelScopeSourceConflict(
-                "this channel scope changed hands while the write ran; re-read the user and retry"
+            raise await refuse(
+                "source_changed",
+                "this channel scope changed hands while the write ran; re-read the user and retry",
             )
         await self._store.revoke_user_sessions(user_id)
         await self._audit(
