@@ -169,8 +169,10 @@ ordinary review is what catches these (D-C):
 - delete a lookup row, leaving its variable unbound for the rows after it. The lens already refuses
   a delete or move of a Read Field row for this reason (the `read_field` gate in `rewrite_source`,
   `messagefoundry/lens.py`), but that gate keys on `read_field` alone, so it does not cover a
-  lookup's `assign_to`. Extending it to every row that binds a name is a lens change, not yet made,
-  so this stays open.
+  lookup's `assign_to`. The R1 branch goes part of the way: under typed-only mode, its
+  `_is_typed_stmt` treats a Read Field or assigned lookup row nested in a moved or deleted block as
+  untyped, so that block is refused. A delete of a top-level lookup row is still allowed, so this
+  stays open.
 
 **What already gates what runs, under both:** a change reaches a running engine only when someone with
 `config:deploy` reloads it, under the existing step-up and the site's `[approvals]` dual control. That
@@ -289,7 +291,7 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   |---|---|
   | Success | The session is good |
   | 401 (the token is invalid, expired or revoked) | Treat the user as signed out |
-  | 403 naming a session gate | Treat the user as signed out and name the gate, as in FR-5. The engine marks the gates by the `X-MFA-Required` and `X-Notify-Email-Required` headers and the password-change detail, which `classifyForbidden` in `ide/src/engineStatusModel.ts` already matches |
+  | 403 naming a session gate | Treat the user as signed out and name the gate, as in FR-5. Read the gate from the `X-MFA-Required` and `X-Notify-Email-Required` headers and from the password-change detail. `classifyForbidden` in `ide/src/engineStatusModel.ts` matches the detail text only and has no notification-address case, so it cannot be reused unchanged |
   | Any other 403, such as a missing permission or a step-up demand | Keep the session, show the Steps view read-only, and show the FR-13 banner for no Steps permission. Do not sign the user out |
   | 429 (rate limited) | Keep the session, stay read-only, and show the FR-13 banner with Retry, enabled once any `Retry-After` time has passed. No automatic retry |
   | A 5xx answer, a timeout, or no connection | Keep the session and show the FR-13 banner for an unreachable engine. Do not sign the user out |
@@ -372,7 +374,9 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   no way to turn it off (owner ruling 5; ADR AC-3a).
 - **FR-26.** THE ANALYST BUILD SHALL apply each row edit through Theia's document model, as `ide/`
   does with a `WorkspaceEdit` (`ide/src/stepsView.ts`, file header). Undo, redo and dirty state work
-  through it. Hot-exit SHALL be verified by spike S-1 and is not promised before then.
+  through it. Hot-exit is not in this phase: spike S-1 measured that Theia 1.76 has none, and a
+  dirty buffer is lost on reload, with no backup support in any `@theia` package. Hot-exit is a
+  future item (Manager decision 2026-10-07, from spike S-1).
 - **FR-27.** THE ANALYST BUILD SHALL pass the row-contract version explicitly on every `lens parse`
   and `lens rewrite` call, and SHALL refuse with a visible message when the engine command rejects
   it. It SHALL NOT retry on an unknown-argument error, which `ide/src/cli.ts` does today (review R14).
@@ -404,7 +408,8 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
 - **FR-34.** WHEN the analyst selects *Submit for review*, THE ANALYST BUILD SHALL take these steps
   in order, and stop at the first that fails (Manager decision 2026-10-07, after review, so a merge
   never runs over uncommitted edits):
-  1. Commit the edited modules (FR-35).
+  1. Commit the edited modules (FR-35). Skip this step when there is nothing new to commit, as on a
+     resubmit after an earlier submit committed and then failed.
   2. If the base is stale, update the review branch from the default branch (FR-39).
   3. Run `messagefoundry check` on the resulting tree, and show any failure in plain words.
   4. Push (FR-37).
@@ -475,8 +480,9 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
        the line's suite path changes. This is intended (Manager decision 2026-10-07, from spike S-4).
      - A `pass` statement is ignored on either side, so the `pass` seed of an If or For Each template
        or an Else If or Else clause (`_apply_insert_clause`) neither adds nor removes a row.
-     - A typed, send or route row with a dynamic parameter keeps its suite path and its order
-       relative to `code` rows and hand-written headers. It may be deleted.
+     - Rules 3 and 4 of the structure rule in ADR 0076 Amendment G, G.6 hold between base and head:
+       hand-written headers and dynamic rows keep their order and suite path. A dynamic row may be
+       deleted.
 
      The other sanctioned exception is the `sends = []` / `sends.append(...)` / `return sends`
      accumulator scaffold (ADR 0108), only when generator-shaped, with `return sends` only as the
@@ -484,16 +490,16 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   4. **Every control header** (`if`, `elif`, `for`, and the `raise` expression) is compared by content
      against base, like a `code` row, with its suite path. A changed or added header is Steps-only
      only when generator-shaped. A removed or moved header passes only when the base header was
-     itself generator-shaped. A hand-written header keeps its suite path and its order relative to
-     `code` rows and other hand-written headers (from spike S-4). `recognized` is not evidence: it is
+     itself generator-shaped. A hand-written header keeps its order and suite path (G.6 rule 3, from
+     spike S-4). `recognized` is not evidence: it is
      a deny-list (`_is_bounded`, `_emit_if` and `_is_message_iteration` in `messagefoundry/lens.py`,
      and the raise branch), so `if os.system("calc"):`, `for g in msg.groups(os.system("calc")):` and
      `raise ValueError(os.system("calc"))` read back as recognized today.
   5. Every typed parameter that is new or changed is a literal or an inert value under ADR 0076
-     Amendment G, G.7, as the lens's own predicate decides. The four value params ADR 0076 E.11 rule 4
-     admits (`set_field.value`, `add_repetition.value`, `append_to_field.suffix`,
-     `replace_literal.new`) may also be a template (from spike S-4: `insert_code_lookup` writes a
-     code-set name, and For Each writes `occurrence=i`). A template anywhere else, such as a
+     Amendment G, G.7, as the lens's own predicate decides (from spike S-4: `insert_code_lookup`
+     writes a code-set name, and For Each writes `occurrence=i`, and neither is a literal). The four
+     value params ADR 0076 E.11 rule 4 admits (`set_field.value`, `add_repetition.value`,
+     `append_to_field.suffix`, `replace_literal.new`) may also be a template. A template anywhere else, such as a
      `db_lookup` statement or a `log_note` operand, is not Steps-only even though it reads back
      `templated`. Every new or changed `assign_to` meets G.7. A developer-written dynamic parameter
      the change leaves alone does not fail it.
@@ -579,6 +585,9 @@ Each was re-checked against `ide/` at `ddf350e1d0`.
 | 3 | Refusals and warnings appear as pop-up notifications | `ide/src/stepsView.ts` raises about 20 `show*Message` notifications; the one in-page hint is the field picker's | FR-17 |
 | 4 | Test opens a separate Test Bench panel | The `test` message runs `messagefoundry.openTestBench` in `ide/src/stepsView.ts` | FR-32 |
 
+Spike S-1 confirmed gap 1 in Theia. The `ide/` page it reused also still shows Test, Pick Sample and
+View as Code; the analyst build drops or replaces each (Manager decision 2026-10-07, from spike S-1).
+
 ### 8.2 Practices the design follows
 
 | # | Practice | Seen in | This phase |
@@ -593,19 +602,28 @@ Each was re-checked against `ide/` at `ddf350e1d0`.
 | 8 | The visual view never quietly rewrites code it does not understand | Logic Apps, Power Query | **Already a rule:** ADR 0076 section 5's row-scoped splice |
 | 9 | Full keyboard use from day one | Blockly | **Adopted** (FR-24) |
 
-Spike S-1 measures the typed-row versus `code`-row share over `samples/config`, since a module that
-is mostly `code` rows gives an analyst little to edit.
+**A measured risk to the purpose.** Spike S-1 counted the rows over `samples/config`: 67 rows, 15
+of them `code` rows (22.4% of rows and 38.4% of lines), and **no action or lookup rows at all**.
+Every sample transform is a `code` row, so an analyst opening the samples would find nothing to edit
+but sends, routes and control headers. Samples written in the typed vocabulary are needed before the
+analyst build can be shown or tested on realistic work (Manager decision 2026-10-07, from spike S-1).
 
 ## 9. How the analyst build is put together
 
 - **Backend services.** Spawning Python and git, the credential store, and engine HTTPS calls run in
   Theia's Node backend, exposed to the frontend as JSON-RPC interfaces. The frontend never runs a
   process or holds the token.
+- **Process spawn.** Every engine command runs as `<interpreter> -I -X utf8 -m messagefoundry
+  ...`: an absolute interpreter path, no shell, a minimal environment, input on stdin with size
+  caps, and a timeout. `-I` is load-bearing: without it, `-m` would put the working directory on
+  `sys.path`, so a file in the repository could shadow an engine module. Spike S-1 used this pattern
+  (Manager decision 2026-10-07, from spike S-1).
 - **Python resolution.** An administrator setting, then the bundled runtime. Nothing else: no `PATH`
   fallback. It never runs an interpreter the repository supplies, the rule `ide/src/cli.ts` calls
   SEC-004. It refuses to run an engine below the build's minimum version (FR-28).
 - **Workspace trust.** The analyst build trusts only the repository it cloned at setup, with no
-  prompt. It opens no other folder.
+  prompt. It opens no other folder. Theia's workspace-trust dialog blocks the interface by default,
+  so the analyst build sets `security.workspace.trust.enabled` to false, or an equivalent (Manager decision 2026-10-07, from spike S-1).
 - **Installer.** It bundles the Python runtime and the pinned engine. The analyst never sees a
   virtual environment or `PATH`.
 - **Errors.** Every failure reads as a plain summary, with the details behind a toggle.
@@ -623,7 +641,10 @@ Theia applications are assembled from npm packages at build time.
 | Git UI | No (*Submit for review* does the git work) | Yes, through the built-in `vscode.git` (`@theia/git` is deprecated, review R32) |
 | Extension installation, Open VSX | No | Vendored at build time, pinned by content hash, transitive packs resolved; no runtime registry access (review R21) |
 | Theia AI | No | No (this phase) |
+| `@theia/preferences` (with `@theia/userstorage`) | **Required.** Without it the app hangs on a missing `PreferenceProvider` binding. It brings in `@theia/markers`, `@theia/outline-view` and `@theia/variable-resolver` | Yes |
 | File explorer | Feeds list only (FR-12) | Yes |
+
+Spike S-1 found the `@theia/preferences` need and its transitive packages (Manager decision 2026-10-07, from spike S-1).
 
 **How "no `.py` editor" is enforced:** the analyst build rebinds Theia's `EditorManager` so a `.py`
 resource opens only in the Steps view, and removes the *Open With* contribution. Spike S-2 tests
@@ -651,11 +672,14 @@ route work.
 
 - The engine half is shared: `lens parse`, `lens rewrite`, `lens schema` and `dryrun` stay engine
   commands.
-- `ide/src/stepsModel.ts` (about 3,500 lines) is mostly free of `vscode` imports and could become a
-  shared view-model package.
-- `ide/media/stepsWebview.js` reaches the host only through `acquireVsCodeApi()`. An iframe shim that
-  supplies that function over Theia's messaging could let the native extension reuse it. Spike S-1
-  measures the shim.
+- `ide/src/stepsModel.ts` (about 3,500 lines) could become a shared view-model package. Spike S-1
+  measured it: every line compiles outside VS Code except through one types-only chain,
+  `stepsModel.ts` to `liveDebugModel` to `editorToolbar`'s `ElementKind` to `vscode`. The shared
+  package moves `ElementKind` into a module free of `vscode`. About 84.1% of the file by bytes is
+  reused in a full port (Manager decision 2026-10-07, from spike S-1).
+- `ide/media/stepsWebview.js` reaches the host only through `acquireVsCodeApi()`. Spike S-1 rendered
+  it unchanged in a sandboxed iframe with a shim that supplies that function. The page shell, toolbar
+  and CSS live in `ide/src/stepsView.ts`, so they move to the shared package too.
 - The provider, `ide/src/stepsView.ts` (about 1,350 lines), is written against
   `vscode.CustomTextEditorProvider` and would be rewritten.
 - The Steps views must stay in step. ADR 0076 already runs a differential test between the provider
@@ -678,7 +702,9 @@ route work.
 - **VSIX.** `ide/` keeps building its `.vsix` as today.
 - **Audit.** A separate, **non-required** audit job runs over the Theia tree's dependencies. A high
   finding in a runtime dependency of a shipped build is triaged within a release; a finding only in
-  build tooling is triaged at the next Theia bump.
+  build tooling is triaged at the next Theia bump. Spike S-1's `npm audit` found 35 findings in the
+  full tree (1 critical, 11 high) and 16 moderate in the runtime tree, all through `@theia`
+  dependencies, which is why the job is non-required and triaged rather than a gate (Manager decision 2026-10-07, from spike S-1).
 - **SBOM and updates.** Each installer ships with an SBOM. Dependabot covers the Theia tree.
 - **Installers.** Built in CI, Authenticode-signed, and published as release assets beside the
   engine's (section 13).
@@ -719,6 +745,7 @@ route work.
 - creating a new Router or Handler file at the Steps level;
 - promote from the analyst build;
 - OIDC sign-in in the analyst build;
+- hot-exit (FR-26);
 - AI in either build;
 - Theia Cloud.
 
@@ -748,14 +775,14 @@ The repository check (FR-40 to FR-46, ADR AC-9) would be tested in Python, with 
 config repository as its fixture. Build composition (ADR AC-10) would be a test over the analyst
 build's resolved package list.
 
-In CI these would start as separate, **non-required** jobs (section 12). Spike S-1 would confirm that
-`@theia/playwright` works at the pinned Theia version.
+In CI these would start as separate, **non-required** jobs (section 12). Spike S-1 confirmed that
+`@theia/playwright` 1.76.0 works, with `@playwright/test` 1.63.0 against an installed Edge.
 
 ## 17. Spikes required before the ADR is accepted
 
 | Spike | Question | Pass condition |
 |---|---|---|
-| S-1 | Does a native Theia Steps extension render and edit `samples/config`, and how much of `ide/` does it reuse? | Parse, render, edit, undo and Test work in a pinned Theia build; hot-exit is verified or dropped from FR-26; the shared share of `stepsModel.ts` and the `acquireVsCodeApi` shim are measured; the typed-row versus `code`-row share over `samples/config` is recorded; the Theia version and language server are recorded; @theia/playwright runs at that version (section 16) |
+| S-1 | Does a native Theia Steps extension render and edit `samples/config`, and how much of `ide/` does it reuse? | Parse, render, edit, undo and Test work in a pinned Theia build; hot-exit is verified or dropped from FR-26; the shared share of `stepsModel.ts` and the `acquireVsCodeApi` shim are measured; the typed-row versus `code`-row share over `samples/config` is recorded; the Theia version and language server are recorded; @theia/playwright runs at that version (section 16). **Met except the Test leg**: branch `claude/theia-spike-s1` at `cd97e6b1b4`, under `theia-spike/`, not merged, on Theia 1.76.0. Hot-exit was dropped (FR-26). Test is still open because it needs the D-B generator-spec engine change, which is not built |
 | S-2 | Does the analyst build have no text-editor route for `.py`? | A scripted walk of every command, menu and *Open With* entry opens no `.py` in Monaco, and finds no pop-up notification (FR-17) |
 | S-3 | Does the analyst build install and run on a managed Windows image? | It installs and runs Test without administrator rights; installer size and memory use are recorded |
 | S-4 | The repository check as a CI step on a sample config repository | It meets FR-41, run from a base-ref workflow per section 5.4. **Classifier half met by the spike**: branch `claude/theia-spike-s4-steps-only` at `673faa7c60`, `scripts/theia_spike/steps_only.py` with 80 tests in `tests/test_theia_steps_only_spike.py`, not merged. The base-ref workflow half is untested |
@@ -886,7 +913,8 @@ Each was checked against the tree and that branch.
 ### Review round 4 (2026-10-07)
 
 The Lander held PR 2154 at `f381613ba3` after a code review of the repair delta, with findings F1 to
-F15. Spike S-4 then built FR-40 as a prototype and reported where its text was wrong. Each finding
+F15. Spike S-4 then built FR-40 as a prototype and reported where its text was wrong, and spike S-1
+reported its measurements. Each finding
 was checked against `messagefoundry/lens.py` at `origin/main` and on the R1 branch at `8df2bcf210`.
 
 | Finding | Where it landed |
@@ -907,6 +935,7 @@ was checked against `messagefoundry/lens.py` at `origin/main` and on the R1 bran
 | F14. Block rule restated; stale index rows | Amendment G, G.6 states it once; G.1, AC-G5, FR-20, section 8.2, ADR AC-12 point there; `docs/adr/README.md` rows |
 | F15. Deleted-lookup residual | Section 5.2: kept open. The `read_field` gate covers Read Field rows only |
 | Spike S-4 findings | FR-40 items 2 to 6, the false-failure and public-surface notes, FR-41, section 17 |
+| Spike S-1 findings | FR-26, sections 8.1, 8.2, 9, 10, 11.2, 12, 16 and 17; ADR D3, D9 and AC-10 |
 
 ## Appendix C: what changed from the 2026-10-02 drafts
 

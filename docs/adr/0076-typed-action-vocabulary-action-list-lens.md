@@ -1333,34 +1333,41 @@ Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and
 
 **The structure rule, stated once here.** ADR 0208, its specification and AC-G5 point to it. A
 *generator-shaped* header is one AST-equal to what the lens emits from literal inputs. A
-*hand-written* header is any other. Under the flag, a move or delete is refused unless all of these
-hold after it (Manager decision 2026-10-07, after review, which states it as an invariant rather than
-a property of the moved row):
+*hand-written* header is any other. A *dynamic* row is a typed, send or route row the lens could not
+have written: one with a parameter that is not a literal or inert value (G.7), or whose full
+statement lacks the generator's skeleton (ADR 0208 spec FR-40 item 5a), such as
+`set_field(<code> or msg, ...)` or `anything.Send(...)`. Under the flag (Manager decision 2026-10-07,
+after review, which states the rule as an invariant rather than a property of the moved row):
 
-1. Every `code` row keeps its order relative to the other `code` rows, and its suite path: the chain
-   of control headers above it, compared by content. So swapping a typed row with a `code` row
-   neighbour is refused whichever of the two is the one moved.
-2. Every hand-written header keeps its order relative to `code` rows and other hand-written headers,
+1. A move or delete never targets a `code` row, and never carries one inside a block (rule 5).
+2. After a move or delete, every `code` row keeps its order relative to the other `code` rows, and
+   its suite path: the chain of control headers above it, compared by content.
+3. Every hand-written header keeps its order relative to `code` rows and other hand-written headers,
    and its suite path.
-3. A typed, send or route row with a parameter the lens could not have written (a *dynamic* row)
-   keeps its order relative to `code` rows and hand-written headers, and its suite path. It may be
-   deleted.
-4. A deleted block takes no hand-written Python with it. A delete of an `if` covers its whole chain:
-   every `elif` test must be generator-shaped too, and no `elif` or `else` body may hold a `code`
-   row.
+4. A dynamic row keeps its order relative to `code` rows and hand-written headers, and its suite
+   path. It may be deleted.
+5. A deleted or moved block takes no hand-written Python with it. A delete of an `if` covers its
+   whole chain: every `elif` test must be generator-shaped too, and no `elif` or `else` body may
+   hold a `code` row.
 
-A `pass` statement does not count as a `code` row for this rule, so an analyst can delete a block
-whose body is still the generator's `pass` seed. Rules 2 and 3 are Manager decisions 2026-10-07,
-from spike S-4, which found that the classifier needs them (ADR 0208 spec FR-40).
+A typed row that is not dynamic may move past a `code` row in the same suite: rule 2 holds, and the
+result is the same as inserting the typed row there, which the analyst build already allows. A `pass`
+statement does not count as a `code` row for this rule, so an analyst can delete a block whose body
+is still the generator's `pass` seed. Rules 3 and 4 are Manager decisions 2026-10-07, from spike S-4,
+which found that the repository check needs them (ADR 0208 spec FR-40).
 
 This narrows, in typed-only mode only, at least: §2 Phase 3 and §5 of this ADR; ADR 0106; the
 *Delete* and *Move* verbs of [ADR 0103](0103-steps-view-row-context-menu.md)'s row menu; and the
-[ADR 0089](0089-recognition-first-lens-native-idioms.md) block-cut, the `delete_row` of a whole
-`if`/`for` block from its header row that a Steps cut reuses. None of those texts is changed; this
-amendment is the record. None of it has landed. The R1 branch's `_refuse_untyped_structure`, read at
-`8df2bcf210`, checks the moved row, an up/down neighbour and a drop target's enclosing blocks. Where
-that differs from this rule, the difference is open work for the R1 fix, and the R1 tests are the
-source of record for what the lens refuses.
+`delete_row` of a whole `if`/`for` block from its header row, which the comment above the
+editable-kind guard in `rewrite_source` (`messagefoundry/lens.py`) calls the ADR 0089 block-cut a
+Steps cut reuses. None of those texts is changed; this amendment is the record. None of it has
+landed.
+
+**This rule is the target, and the R1 tests are evidence only once they match it.** The R1 branch's
+`_refuse_untyped_structure`, read at `8df2bcf210`, checks the moved row, an up/down neighbour and a
+drop target's enclosing blocks. That is not the same rule: for example, it lets a dynamic row be
+dragged across a `code` row to a typed anchor, which rule 4 refuses. Where the two differ, the R1 code
+is what has to change.
 
 ### G.7 The R1 fix: values a typed edit may write
 
@@ -1379,8 +1386,9 @@ The R1 fix would change that, in every mode, at least as follows:
 **The inert rule, stated once here.** The lens's own predicate decides what is inert; the list below
 describes it for a reader. **The list is not a gate.** No check, test or requirement may treat it as
 the definition of inert; a checker calls the lens's predicate (Manager decision 2026-10-07, after
-review). The list is a lower bound: the predicate admits at least these. Nothing it admits calls
-anything.
+review). The list is a lower bound: the predicate admits at least these, with one exception that
+is a ceiling, the module-level name rule below. Nothing it admits calls anything, except a bounded
+`msg.field(...)` read and `FhirToken(...)`, named below.
 
 - a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
 - `+` and `-` over numbers and admitted names; `*`, `/` and `//` over number literals only, with a
@@ -1390,10 +1398,13 @@ anything.
   - a module-level name, only when its one binding is to a literal of an immutable type (a `str`,
     number, `bool`, `None`, or a tuple of those) or to `code_set("<literal>")`, and nothing in the
     module mutates it. *Mutates* covers at least a second binding (a `global` rebind included), a
-    `del`, an augmented assignment, and an assignment or `del` through an attribute or subscript of
-    it (Manager decision 2026-10-07, after review). A mutable container fails this however it is
-    used: `SEEN = []` plus `SEEN.append(msg["PID-3"])` rebinds nothing, yet `SEEN` then holds
-    message content;
+    `del`, an augmented assignment, an assignment or `del` through an attribute or subscript of it,
+    and a method call on it or on an attribute of it. A `CodeSet` is frozen in use but holds a plain
+    dict, so `X._data.update(...)` would change it without a binding (Manager decision 2026-10-07,
+    after review). A mutable container fails this however it is used: `SEEN = []` plus
+    `SEEN.append(msg["PID-3"])` rebinds nothing, yet `SEEN` then holds message content. **This is a
+    ceiling: the predicate SHALL NOT admit a module-level name outside it, whatever the R1 tests
+    say;**
   - in value params only, any other such name, because a value param may carry message content;
 - a list, tuple, set or dict built only from inert values, with no splat;
 - in value params only, a bounded field read (`msg.field(...)` taking only `occurrence` and
@@ -1402,19 +1413,22 @@ anything.
   `FhirToken(literal, read)`.
 
 **The source of record is the R1 fix's tests** (`tests/test_lens_no_code_injection.py` on the R1
-branch, not yet merged). Where this list and those tests differ, the tests win. `set_params` on
-action, lookup and diagnostic rows already refuses a `dynamic` value (AC-M5).
+branch, not yet merged), except for the module-level name ceiling. Elsewhere, where this list and
+those tests differ, the tests win. `set_params` on action, lookup and diagnostic rows already
+refuses a `dynamic` value (AC-M5).
 
-**The module-level name rule is not yet what the R1 branch does.** Read at `8df2bcf210`, its
-`_message_locals` admits any module-level binding no function rebinds, and a name bound nowhere. The
-R1 code (PR 2155) is being changed to match the rule above.
+**The module-level name ceiling is not yet what the R1 branch does.** Read at `8df2bcf210`, its
+`_message_locals` admits any module-level binding no function rebinds, and a name bound nowhere, and
+its tests admit `SEEN`. The R1 code (PR 2155) is being changed to match the ceiling, and AC-G9 adds
+a refusal test for it.
 
 **A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
 `_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
 accepts any `X.attr` callee by its last name. So `set_field(__import__("os").getcwd() or msg,
 "PID-5.1", "X")` and `anything.Send("OB", msg)` read back as ordinary typed rows whose `params` look
 unchanged. The Steps view then shows code that runs as a typed step. ADR 0208's repository check
-closes this for itself by comparing each typed row's full statement (spec FR-40); whether the lens
+would close this for itself, once built, by comparing each typed row's full statement (spec FR-40
+item 5a); whether the lens
 should refuse to project such a row as typed is open work for the R1 fix.
 
 That sentence of E.11 is not rewritten; the dated pointer appended to it sends the reader here. The
@@ -1446,4 +1460,6 @@ change is being built separately and has not landed.
 - [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite` call.
 - [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`
   G.7 refuses, or a `set_params` on a route row whose base `handlers` is not a literal list, THEN
-  `lens rewrite` SHALL refuse it, in every mode. R1 payloads 3 and 4 (G.5) are refusal tests.
+  `lens rewrite` SHALL refuse it, in every mode. R1 payloads 3 and 4 (G.5) are refusal tests, and
+  so is an `{"expr": "SEEN"}` value on a `checkpoint` label in a module that binds `SEEN = []` and
+  calls `SEEN.append(...)` (the G.7 ceiling).

@@ -121,8 +121,12 @@ it, only when the site meets spec section 5.4.**
   Theia's build keeps transitive extensions (review R6). Filtering a plugin-ext build was weighed and
   not chosen (spec 11.1). Monaco ships in the analyst build, because Theia's document model uses it;
   the analyst build rebinds Theia's `EditorManager` so a `.py` opens only in the Steps view and
-  removes *Open With* (AC-G1, spike S-2). The port is the main cost (spec section 11). Reusing
-  `ide/media/stepsWebview.js` through an `acquireVsCodeApi` shim is measured by spike S-1.
+  removes *Open With* (AC-G1, spike S-2). The analyst build also needs `@theia/preferences`, with
+  `@theia/userstorage`, or it hangs on a missing `PreferenceProvider` binding; that brings in
+  `@theia/markers`, `@theia/outline-view` and `@theia/variable-resolver` (Manager decision 2026-10-07, from spike S-1). The port is the
+  main cost (spec section 11). Spike S-1 measured the reuse: `ide/media/stepsWebview.js` renders
+  unchanged through an `acquireVsCodeApi` shim, and about 84.1% of `ide/src/stepsModel.ts` by bytes
+  carries over.
 - **D4 -- `code:steps` and a built-in Analyst role.** `code:steps` is added to the permission catalog
   and is **advisory**: the analyst build reads it, and no engine route checks it. `Coding` gains it.
   A new built-in Analyst role holds it and not `code:edit` (ruling 7). "`code:edit` implies
@@ -161,7 +165,9 @@ it, only when the site meets spec section 5.4.**
   text-editor fallback on a parse failure, and the Steps view is the only way to open a Router or
   Handler. ADR 0076 Amendment G records this. The developer build keeps every guardrail.
 - **D9 -- Edits save through the document model**, as `ide/` does, so undo and dirty state keep
-  working. Hot-exit is verified by spike S-1. There is no server-side broker in this phase.
+  working. There is no hot-exit in this phase: spike S-1 measured that Theia 1.76 has none, so a
+  dirty buffer is lost on reload. It is a future item (Manager decision 2026-10-07, from spike S-1). There is no server-side broker in this
+  phase.
 - **D10 -- Analyst Test uses a generated message and never `--show-phi`.** Test takes a message type
   and seed, saves the buffer, and runs `dryrun` or a thin wrapper that generates the message
   in-process. Values are shown unredacted only for that generated input (D-B). For a message type
@@ -220,7 +226,9 @@ promote stays `POST /config/reload` with step-up and the site's dual control unc
   edit and each sanctioned generated shape (spec FR-41).
   -> repository-check test (path set with the command) and spike S-4
 - **AC-10** -- THE ANALYST BUILD SHALL contain no `@theia/plugin-ext`, terminal, task, debug, SCM or
-  AI package.
+  AI package. It SHALL contain `@theia/preferences` and `@theia/userstorage`, and the test SHALL
+  expect `@theia/markers`, `@theia/outline-view` and `@theia/variable-resolver`, which come in with
+  them (D3).
   -> editor build test *analyst package set* (path open)
 - **AC-11** -- WHEN the lens refuses an edit, THE ANALYST BUILD SHALL show the refusal on the step it
   concerns, in the Steps panel.
