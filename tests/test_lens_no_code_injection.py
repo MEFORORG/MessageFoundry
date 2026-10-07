@@ -96,8 +96,13 @@ def test_insert_row_refuses_an_expr_that_is_not_an_inert_value(expr: str) -> Non
 @pytest.mark.parametrize(
     ("params", "action", "spliced"),
     [
-        ({"path": "PID-3.1", "value": {"expr": "0"}}, "set_field", "0"),
-        ({"path": "PID-3.1", "value": {"expr": "-1"}}, "set_field", "-1"),
+        # A field value must be text; a number goes in a number slot (review of PR 2155).
+        ({"path": "PID-3.1", "value": {"expr": '"0"'}}, "set_field", '"0"'),
+        (
+            {"path": "PID-3.1", "value": "x", "occurrence": {"expr": "-1"}},
+            "set_field",
+            "occurrence=-1",
+        ),
         ({"path": "PID-3.1", "value": {"expr": 'msg["PID-5"]'}}, "set_field", 'msg["PID-5"]'),
         (
             {"path": "PID-3.1", "value": {"expr": 'msg["PID-5"] or ""'}},
@@ -622,7 +627,8 @@ def test_multiplication_and_modulo_take_numbers_only(expr: str, ok: bool) -> Non
         "op": "insert_row",
         "position": "before",
         "action": "set_field",
-        "params": {"path": "OBX-11", "value": {"expr": expr}},
+        # A number slot: a field value must be text (review of PR 2155).
+        "params": {"path": "OBX-11", "value": "F", "occurrence": {"expr": expr}},
     }
     if ok:
         assert expr in rewrite_source(SOURCE, edit)

@@ -422,20 +422,38 @@ def h(msg):
 """
 
 
+@pytest.mark.parametrize("expr", ["-pid5", "+pid5", "pid5 + 1", "SHOUT - 1"])
+def test_finding_11_arithmetic_refuses_a_name_that_may_hold_text(expr: str) -> None:
+    edit = _edit(
+        "insert_row",
+        10,
+        position="before",
+        action="set_field",
+        params={"path": "PID-3.1", "value": {"expr": expr}},
+    )
+    _refused(_ARITH, edit, match=REFUSED)
+
+
+@pytest.mark.parametrize("expr", ["i + 1", "LIMIT - 1", "-LIMIT"])
+def test_finding_11_control_arithmetic_on_a_numeric_name_in_a_number_slot(expr: str) -> None:
+    edit = _edit(
+        "insert_row",
+        9,
+        position="before",
+        action="set_field",
+        params={"path": "OBX-3", "value": "x", "occurrence": {"expr": expr}},
+    )
+    assert f"occurrence={expr}" in rewrite_source(_ARITH, edit)
+
+
+# --- review of head 513797260a ------------------------------------------------------------------
+
+
 @pytest.mark.parametrize(
     ("expr", "ok"),
-    [
-        ("-pid5", False),
-        ("+pid5", False),
-        ("pid5 + 1", False),
-        ("SHOUT - 1", False),
-        ("i + 1", True),
-        ("LIMIT - 1", True),
-        ("-LIMIT", True),
-        ("pid5", True),
-    ],
+    [("1 + 2", False), ("0", False), ("None", False), ('[{"a": 1}]', False), ("pid5", True)],
 )
-def test_finding_11_arithmetic_takes_numeric_names_only(expr: str, ok: bool) -> None:
+def test_r2_finding_5_a_field_value_must_be_text(expr: str, ok: bool) -> None:
     edit = _edit(
         "insert_row",
         10,
@@ -444,6 +462,162 @@ def test_finding_11_arithmetic_takes_numeric_names_only(expr: str, ok: bool) -> 
         params={"path": "PID-3.1", "value": {"expr": expr}},
     )
     if ok:
-        assert expr in rewrite_source(_ARITH, edit)
+        assert f'msg.set("PID-3.1", {expr})' in rewrite_source(_ARITH, edit)
     else:
-        _refused(_ARITH, edit, match=REFUSED)
+        with pytest.raises(LensRewriteError):
+            rewrite_source(_ARITH, edit)
+
+
+_GUARD = """\
+@handler("H")
+def h(msg):
+    msg.set("A", "1")
+    if msg.field("C"):
+        msg.set("B", "2")
+        raise ValueError("bad")
+    if msg.field("D"):
+        x = compute(msg)
+    msg.set("E", "5")
+    y = other(msg)
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        # A guarded raise lifted out of its guard runs on every message.
+        _edit("move_row", 6, to_line_start=3, to_position="before"),
+        # A typed row dropped into a typed block that holds code.
+        _edit("move_row", 9, to_line_start=8, to_position="before"),
+    ],
+    ids=["raise-out-of-guard", "into-block-with-code"],
+)
+def test_r2_findings_1_and_6_typed_only_keeps_guards_and_code_blocks(edit: dict[str, Any]) -> None:
+    assert rewrite_source(_GUARD, edit) != _GUARD
+    _refused(_GUARD, edit, typed_only=True)
+
+
+def test_r2_finding_1_control_a_raise_still_reorders_inside_its_guard() -> None:
+    edit = _edit("move_row", 6, direction="up")
+    out = rewrite_source(_GUARD, edit, typed_only=True)
+    assert out.index('raise ValueError("bad")') < out.index('msg.set("B", "2")')
+
+
+_COMP = """\
+@handler("H")
+def h(msg):
+    codes = [r for r in msg.segments("OBX")]
+    key = lambda r: r
+    r = db_lookup("C", "select 1", {"a": 1})
+    msg.set("A", r)
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [_edit("delete_row", 5), _edit("move_row", 5, to_line_start=6, to_position="after")],
+)
+def test_r2_finding_2_a_comprehension_or_lambda_does_not_bind_for_the_handler(
+    edit: dict[str, Any],
+) -> None:
+    _refused(_COMP, edit, typed_only=True)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"path": "PID-3.1", "value": {"expr": "pid5"}},  # above its binding
+        {"path": "PID-3.1", "value": {"expr": "nosuchname"}},  # bound nowhere
+        {"path": "PID-3.1", "value": "x", "occurrence": {"expr": "i"}},  # outside its loop
+    ],
+)
+@pytest.mark.parametrize("typed_only", [False, True])
+def test_r2_finding_3_an_insert_reads_no_name_before_it_is_bound(
+    params: dict[str, Any], typed_only: bool
+) -> None:
+    edit = _edit("insert_row", 7, position="before", action="set_field", params=params)
+    with pytest.raises(LensRewriteError):
+        rewrite_source(_ARITH, edit, typed_only=typed_only)
+    below = _edit("insert_row", 10, position="before", action="set_field", params=params)
+    if params["path"] == "PID-3.1" and params.get("value") == {"expr": "pid5"}:
+        assert "pid5)" in rewrite_source(_ARITH, below, typed_only=typed_only)
+
+
+_SHADOW = """\
+import os
+
+from messagefoundry import Send, handler
+
+
+def set_field(msg, path, value):  # type: ignore[no-untyped-def]
+    os.system(value)
+
+
+class FhirToken:
+    pass
+
+
+@handler("H")
+def h(msg):
+    msg.set("A", "1")
+    set_field(msg, "B", "2")
+    return Send("OB", msg)
+"""
+
+
+def test_r2_finding_4_a_module_level_shadow_of_a_vocabulary_name_is_not_typed() -> None:
+    _refused(_SHADOW, _edit("delete_row", 17), typed_only=True)
+    _refused(_SHADOW, _edit("move_row", 17, direction="up"), typed_only=True)
+    edit = _edit(
+        "insert_row",
+        18,
+        position="before",
+        action="fhir_lookup",
+        params={
+            "connection": "EPIC",
+            "query": "Patient",
+            "params": {"expr": '{"identifier": FhirToken("sys", msg["PID-3"] or "")}'},
+        },
+    )
+    _refused(_SHADOW, edit, match=REFUSED)
+
+
+def test_r2_finding_7_setattr_voids_every_inert_name() -> None:
+    src = _DEST.replace(
+        "    dest = msg.field",
+        "    setattr(sys.modules[__name__], 'OB_DEST', 1)\n    dest = msg.field",
+    )
+    _refused(
+        src, _edit("set_params", 10, params={"to": {"expr": "OB_DEST"}}), match="computed by code"
+    )
+
+
+def test_r2_finding_8_an_existing_compile_error_is_named_as_such() -> None:
+    src = "def helper():  # type: ignore[no-untyped-def]\n    await thing()\n\n\n" + _DROP.replace(
+        "    x = compute(msg)\n", ""
+    )
+    with pytest.raises(LensRewriteError, match="does not compile as it stands"):
+        rewrite_source(src, _edit("delete_row", 7))
+
+
+# --- review of PR 2154: the reads_ok path takes inert names and locals only ----------------------
+
+
+@pytest.mark.parametrize(
+    ("action", "params"),
+    [
+        ("db_lookup", {"connection": "C", "statement": "s", "params": {"expr": '{"a": SEEN}'}}),
+        ("db_lookup", {"connection": "C", "statement": "s", "params": {"expr": '{"a": CS}'}}),
+        ("set_field", {"path": "PID-3.1", "value": {"expr": "CS"}}),
+        ("set_field", {"path": "PID-3.1", "value": {"expr": "SEEN"}}),
+    ],
+)
+def test_the_reads_ok_path_refuses_mutable_and_code_set_names(
+    action: str, params: dict[str, Any]
+) -> None:
+    edit = _edit("insert_row", _MOD_SEND, position="before", action=action, params=params)
+    if action == "db_lookup":
+        edit["assign_to"] = "fresh"
+    _refused(_MOD, edit, match=REFUSED)
