@@ -781,7 +781,6 @@ class DrIntakeState(NamedTuple):
     threshold: Priority | None
     standby: Priority | None
     parked: frozenset[str]
-    listening: frozenset[str]
 
 
 class _IngressFields(NamedTuple):
@@ -2577,34 +2576,28 @@ class RegistryRunner:
         if standby is not None or leaving:
             self._rewrite_inbound_parks()
 
-    def _rewrite_inbound_parks(
-        self, held: frozenset[str] = frozenset(), freed: frozenset[str] = frozenset()
-    ) -> None:
+    def _rewrite_inbound_parks(self, held: frozenset[str] = frozenset()) -> None:
         """Write every inbound DR marker again under the current thresholds (vault BACKLOG #3140).
 
         An idle inbound is marked when start would bind it, or when it holds a marker now or is
         named in ``held``. That second test keeps the park of an ``auto_start = false`` feed a
-        reload parked after an operator start. A listening inbound, a name in ``freed``, or a name
-        the registry no longer declares gets none. It reads the registry as it is now, so a feed a
-        reload added, dropped or re-tiered is judged on its current tier."""
-        marked = set(self.filtered_inbound()) | held
+        reload parked after an operator start. A listening inbound, or a name the registry no
+        longer declares, gets none. It reads the registry as it is now, so a feed a reload added,
+        dropped or re-tiered is judged on its current tier."""
+        marked = {name for (kind, name) in self._filtered if kind == "inbound"} | held
         for name in marked:
             self._filtered.pop(("inbound", name), None)
         for name, ic in self.registry.inbound.items():
-            if name in self._sources or name in freed or not ic.deployed:
+            if name in self._sources or not ic.deployed:
                 continue
             if inbound_listener_starts(ic) or name in marked:
                 self._dr_filters_out(name, ic.priority, kind="inbound")
 
     def dr_intake_state(self) -> DrIntakeState:
-        """What :meth:`restore_dr_intake` puts back: the DR thresholds, which inbounds the
-        profile parks, and which are listening. The engine reads it before a release parks intake
-        (vault BACKLOG #3140)."""
+        """What :meth:`restore_dr_intake` puts back: the DR thresholds, and which inbounds the
+        profile parks. The engine reads it before a release parks intake (vault BACKLOG #3140)."""
         return DrIntakeState(
-            self._dr_threshold,
-            self._dr_standby,
-            frozenset(self.filtered_inbound()),
-            frozenset(self._sources),
+            self._dr_threshold, self._dr_standby, frozenset(self.filtered_inbound())
         )
 
     def restore_dr_intake(self, state: DrIntakeState) -> None:
@@ -2612,13 +2605,12 @@ class RegistryRunner:
         coordinator says (vault BACKLOG #3140). The thresholds come back, and the inbound markers
         are written again under them, so the scheduler and an alert rule still leave a feed below
         the threshold down. That includes a feed parked before the release and one a reload
-        parked during it. A feed that was listening before the release gets no marker, so one an
-        operator started stays the calendar's, as ADR 0048 Decision 3 says. Nothing is bound
-        here: the listeners the park unbound come back on the next reload, as before the release
-        began."""
+        parked during it. It errs toward parking: a below-threshold feed an operator started
+        before the release is parked too. Nothing is bound here: the critical listeners the park
+        unbound come back on the next reload."""
         self._dr_threshold = state.threshold
         self._dr_standby = state.standby
-        self._rewrite_inbound_parks(state.parked, freed=state.listening)
+        self._rewrite_inbound_parks(state.parked)
 
     async def park_intake(self, standby: Priority) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the

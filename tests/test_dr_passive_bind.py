@@ -268,12 +268,13 @@ async def test_a_failed_release_parks_a_normal_feed_a_reload_added_during_the_dr
         assert await _accepts(crit_port) and not await _accepts(added_port)
 
 
-async def test_a_failed_release_leaves_an_operator_start_from_before_it_unparked(
+async def test_a_failed_release_parks_a_feed_an_operator_started_before_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ADR 0048 Decision 3: after an operator starts a parked feed, the calendar owns it again.
-    A release that fails gives it back as it was, unbound by the park but with no marker, so the
-    scheduler and an alert rule may bind it again. Parking it instead would undo that start."""
+    """A deliberate choice, pinned here: the restore errs toward parking. A below-threshold
+    feed an operator started before the release is parked after a failed one, so only an
+    operator start brings it back. Leaving it unmarked needed a record of which parks an
+    operator overrode, and a stand-in for that record left a re-tiered feed unparked."""
     cfg = tmp_path / "cfg"
     _crit_port, norm_port = _write_graph(cfg, tmp_path)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
@@ -289,9 +290,11 @@ async def test_a_failed_release_leaves_an_operator_start_from_before_it_unparked
         monkeypatch.setattr(engine, "_drain_pipeline", failing_drain)
         with pytest.raises(OSError):
             await engine._dr_release_drain()
-        assert rr.filtered_inbound() == {}
+        assert set(rr.filtered_inbound()) == {_NORM}
         assert not await _accepts(norm_port)  # the park unbound it
         await _alert_control_action(engine, "restart_inbound", _NORM)
+        assert not await _accepts(norm_port)
+        await rr.start_inbound(_NORM, operator=True)
         assert await _accepts(norm_port)
 
 
