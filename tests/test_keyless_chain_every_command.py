@@ -955,13 +955,14 @@ def test_a_driver_error_in_a_real_open_of_the_chain_fails_the_check(
     assert captured.out.startswith("FAIL: the audit chain check stopped part way"), captured.out
 
 
-def test_a_shape_error_reading_the_chain_is_not_tagged() -> None:
+def test_a_shape_error_reading_the_chain_is_not_tagged(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing table, column or grant says nothing about a row, so the store does not tag it,
     and the open reports it as "could not start". SQLSTATE class 42, as asyncpg names it and as
-    pyodbc puts it first in ``args``. The controls are a connection error and a decode error."""
+    pyodbc puts it first in ``args``. The controls are a connection error and a lock timeout."""
     from messagefoundry.store.base import is_store_shape_error
     from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE, note_audit_chain_read
 
+    _stand_in_drivers(monkeypatch)
     asyncpg_like = _ServerDriverError('relation "audit_log" does not exist')
     asyncpg_like.sqlstate = "42P01"  # type: ignore[attr-defined]
     pyodbc_like = _ServerDriverError("42S22", "Invalid column name 'seq'.")
@@ -971,14 +972,15 @@ def test_a_shape_error_reading_the_chain_is_not_tagged() -> None:
     assert is_store_shape_error(asyncpg_like) and is_store_shape_error(pyodbc_like)
     assert is_store_shape_error(denied)
     assert not is_store_shape_error(lost) and not is_store_shape_error(lock)
+    retyped = _ServerDriverError("operator does not exist: text = integer")
+    retyped.sqlstate = "42883"  # type: ignore[attr-defined]
+    assert is_store_shape_error(retyped)  # a column of another type: Postgres class 42
     assert not is_store_shape_error(sqlite3.OperationalError("42 is not a code"))
-    with pytest.MonkeyPatch.context() as patch:
-        _stand_in_drivers(patch)
-        for shape in (asyncpg_like, pyodbc_like):
-            note_audit_chain_read(shape)
-            assert AUDIT_CHAIN_READ_NOTE not in getattr(shape, "__notes__", ()), shape
-        note_audit_chain_read(lost)
-        assert AUDIT_CHAIN_READ_NOTE in getattr(lost, "__notes__", ())
+    for shape in (asyncpg_like, pyodbc_like):
+        note_audit_chain_read(shape)
+        assert AUDIT_CHAIN_READ_NOTE not in getattr(shape, "__notes__", ()), shape
+    note_audit_chain_read(lost)
+    assert AUDIT_CHAIN_READ_NOTE in getattr(lost, "__notes__", ())
 
 
 def test_a_clean_walk_needs_no_second_query_for_its_count(
@@ -1027,18 +1029,60 @@ def test_a_server_store_that_cannot_be_reached_is_named_by_server_and_database(
 
 
 def test_a_server_driver_error_with_a_sqlstate_prints_no_text(
-    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A server message can quote a stored value, which ``safe_exc``'s patterns keep (BACKLOG
     #1661 measured SQL Server's duplicate-key text). With a SQLSTATE, the line is the class and
     the SQLSTATE only. The control shows the raw text holds the value."""
     from messagefoundry.__main__ import _emit_store_open_error
 
+    _stand_in_drivers(monkeypatch)
     exc = _ServerDriverError("23000", "The duplicate key value is (4242ROWMARKER).")
     assert "ROWMARKER" in str(exc)  # the control
     assert _emit_store_open_error(exc, "db01/mefor", as_json=False) == 2
     err = capsys.readouterr().err
     assert "_ServerDriverError [SQLSTATE 23000]" in err and "ROWMARKER" not in err, err
+
+
+def test_only_a_server_drivers_error_is_read_for_a_sqlstate(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``OSError("reset")`` has a five-letter first argument and is no driver's error, so it gets
+    no SQLSTATE; a driver's connect error keeps its native number and drops its text."""
+    from messagefoundry.__main__ import _emit_store_open_error
+    from messagefoundry.store.base import driver_sqlstate
+
+    _stand_in_drivers(monkeypatch)
+    assert driver_sqlstate(OSError("reset")) is None
+    assert driver_sqlstate(TimeoutError("timed")) is None
+    refused = _ServerDriverError(
+        "08001", "[08001] TCP Provider: No connection ROWMARKER (10061) (SQLDriverConnect)"
+    )
+    assert driver_sqlstate(refused) == "08001"
+    assert _emit_store_open_error(refused, "db01/mefor", as_json=False) == 2
+    err = capsys.readouterr().err
+    assert "[SQLSTATE 08001] native error 10061" in err and "ROWMARKER" not in err, err
+
+
+def test_a_shape_error_in_the_walk_exits_2(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A column or grant gone between the open and the walk says nothing about a row: exit 2, as
+    at the open. The control for the FAIL arm is the walk-stopped test above."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    _stand_in_drivers(monkeypatch)
+
+    async def revoked(self: MessageStore, **kwargs: object) -> object:
+        raise _ServerDriverError("42S22", "Invalid column name 'seq'.")
+
+    monkeypatch.setattr(MessageStore, "verify_audit_chain", revoked)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert "cannot open the store at" in captured.err and "FAIL" not in captured.out
 
 
 def test_audit_anchor_exits_2_when_the_store_cannot_be_reached(

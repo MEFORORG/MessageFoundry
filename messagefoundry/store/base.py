@@ -3032,36 +3032,44 @@ def audit_chain_read_errors() -> tuple[type[Exception], ...]:
 
 def driver_sqlstate(exc: BaseException) -> str | None:
     """The 5-character SQLSTATE a server driver's error carries, or ``None``: asyncpg's
-    ``sqlstate`` attribute, or pyodbc's first argument. A SQLite error carries none."""
-    import sqlite3
-
+    ``sqlstate`` attribute, or pyodbc's first argument. Only a server driver's own error is read for
+    one, so an ``OSError("reset")`` is never given a SQLSTATE of ``reset``."""
     state = getattr(exc, "sqlstate", None)
-    if state is None and not isinstance(exc, sqlite3.Error) and exc.args:
+    if state is None and _is_server_driver_error(exc) and exc.args:
         state = exc.args[0]
     if isinstance(state, str) and len(state) == 5 and state.isalnum():
         return state
     return None
 
 
-#: SQLSTATEs that name a missing table or column, or a permission denied, and nothing else:
-#: Postgres 42P01, 42703 and 42501, ODBC 42S02 and 42S22. SQL Server reports a denied permission
-#: under the generic 42000, so that one counts only with its native error 229 or 230.
-_SHAPE_SQLSTATES = frozenset({"42P01", "42703", "42501", "42S02", "42S22"})
+def _is_server_driver_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a server driver's error: one of :func:`store_driver_errors` or pyodbc's
+    root, and not SQLite's."""
+    import sqlite3
+
+    bases = [*store_driver_errors()]
+    try:
+        import pyodbc
+    except ImportError:
+        pass
+    else:
+        bases.append(pyodbc.Error)
+    return isinstance(exc, tuple(bases)) and not isinstance(exc, sqlite3.Error)
 
 
 def is_store_shape_error(exc: BaseException) -> bool:
-    """Whether ``exc`` says the store's tables, columns or grants are not what a read needs, and
-    not anything about a row: SQLite's schema-step error, or one of the SQLSTATEs above. Row content
-    cannot cause one. A broader class 42 would take in a lock timeout or a full log, which SQL
-    Server also reports as 42000."""
+    """Whether ``exc`` says the store's tables, columns, types or grants are not what a read needs,
+    and not anything about a row: SQLite's schema-step error, or SQLSTATE class 42 (syntax error or
+    access rule violation). SQL Server reports at least a lock timeout and a full log under the
+    generic 42000 too, so that one counts only with native error 229 or 230, a denied permission."""
     from messagefoundry.store.schema_verify import is_schema_step_error
 
     if is_schema_step_error(exc):
         return True
     state = driver_sqlstate(exc)
-    if state in _SHAPE_SQLSTATES:
-        return True
-    return state == "42000" and any(f"({code})" in str(exc) for code in (229, 230))
+    if state == "42000":
+        return any(f"({code})" in str(exc) for code in (229, 230))
+    return state is not None and state.startswith("42")
 
 
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:

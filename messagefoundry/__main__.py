@@ -7772,6 +7772,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         audit_chain_read_errors,
+        is_store_shape_error,
         open_store,
     )
     from messagefoundry.store.crypto import CipherError
@@ -7862,6 +7863,9 @@ def _audit_verify(args: argparse.Namespace) -> int:
             # below: no second query, which could fail after a clean walk or see other rows.
             return await store.verify_audit_chain(expected_anchor=expected_anchor)
         except walk_errors as exc:
+            if is_store_shape_error(exc):
+                # A table, column or grant gone since the open: still not a row's evidence.
+                raise _StoreUnreachable() from exc
             raise stopped(exc) from exc
         finally:
             await _close_store_quietly(store)
@@ -9554,10 +9558,11 @@ def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
     A ROW'S TEXT IS CUT FROM THE MESSAGE. SQLite's decode error quotes the column's bytes, "Could
     not decode to UTF-8 column 'detail' with text '...'", and those bytes are a row's content, which
     a job keeps in its log (vault BACKLOG #3054, item 10). The column name stays. A server driver's
-    error renders as its class and SQLSTATE only, never its text: a server message can quote a
-    stored value, such as SQL Server's "The duplicate key value is (...)", and ``safe_exc``'s
-    pattern redaction keeps that (measured in BACKLOG #1661). Anything else, a refused connection
-    among them, carries no row value by construction and goes through ``safe_exc``.
+    error that carries a SQLSTATE renders as its class, SQLSTATE and native error number, never its
+    text: a server message can quote a stored value, such as SQL Server's "The duplicate key value
+    is (...)", and ``safe_exc``'s pattern redaction keeps that (measured in BACKLOG #1661). An
+    error with no SQLSTATE goes through ``safe_exc``: at least asyncpg's refused connection, an
+    OSError, and its client errors, whose text ``safe_exc`` redacts by pattern only.
     """
     import re
 
@@ -9568,7 +9573,11 @@ def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
     if isinstance(exc, sqlite3.DatabaseError):
         shown = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
     elif state is not None:
-        shown = f"{type(exc).__name__} [SQLSTATE {state}]"
+        # The native number, read by the anchored pattern the database connector uses; never text.
+        native = re.findall(r"\((\d{1,6})\)\s*\(SQL[A-Za-z]+\)", str(exc))
+        shown = f"{type(exc).__name__} [SQLSTATE {state}]" + (
+            f" native error {native[-1]}" if native else ""
+        )
     else:
         shown = safe_exc(exc)
     message = f"cannot open the store at {path}: {shown}"

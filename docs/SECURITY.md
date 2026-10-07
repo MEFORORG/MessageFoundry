@@ -4598,11 +4598,13 @@ A driver, connection or decode error raised during those reads gets the same lin
 a lock or an outage at that moment also exits 1. The store marks those errors, so the split is
 by where the error arose. A driver or connection error raised anywhere else in the open is
 "could not start", exit 2. That covers at least a refused connection, a failed login
-and an unreadable path. One exception holds wherever it arises: a table, column or grant the
-read needs that is missing exits 2. It says the store does not match this build, not anything
-about a row. A failed close of the store never changes the exit code; it prints a warning
-naming the error's class. A server driver's error is shown as its class and SQLSTATE only,
-never its text, because a server message can quote a stored value.
+and an unreadable path. One exception holds in the open and in the walk: a table, column,
+type or grant the read needs that is missing exits 2. It says the store does not match this
+build, not anything about a row. A failed close of the store never changes the exit code; it prints a warning
+naming the error's class. A server driver's error that carries a SQLSTATE is shown as its
+class, SQLSTATE and native error number, not its text, because a server message can quote a
+stored value. Other errors, at least a refused connection, go through the log's PHI redaction,
+which works by pattern and cannot promise to catch every value.
 
 At least one older case also exits 2 and is not a finding about the chain. An audit log emptied
 out of band, verified in a shell that holds no key and whose settings require one, exits 2: the
