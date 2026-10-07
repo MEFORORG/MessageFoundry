@@ -29,6 +29,12 @@ this line.**
 
 ### Security
 
+- **A route-level sign-in reject records where it came from.** The `/ui/oidc` start and callback
+  legs and `GET /ui/sso` now pass the caller's address when they refuse a sign-in before it
+  reaches the engine: no flow cookie, an IdP error, a malformed callback or Negotiate token, a
+  failed start, or a non-navigation fetch. Those `auth.login_failed` rows used to carry no
+  `client`. Seam change: `audit_oidc_reject` and `audit_kerberos_reject` take a required keyword
+  `client`. (vault BACKLOG #2132)
 - **The step-up re-auth page names the action, and auto-submits only a continuation the server
   issued to this session.** `/ui/reauth` used to auto-submit whichever registered action its `next`
   named, so a typed, bookmarked or clicked link to it could turn a routine re-authentication into a
