@@ -21,7 +21,7 @@ export interface StepUpSignal {
   viaIdp: boolean;
 }
 
-/** A non-2xx engine response. `status` lets callers branch (e.g. 401 → (re)authenticate). `stepUp`
+/** A non-2xx engine response. `status` lets callers branch (a 401 means sign in again). `stepUp`
  *  is set only on a step-up refusal, so a caller can re-prove and retry (see stepUp.ts). */
 export class HttpError extends Error {
   constructor(

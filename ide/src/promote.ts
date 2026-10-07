@@ -157,7 +157,7 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
   if (preflight === undefined) {
-    return; // sign-in cancelled
+    return; // the user cancelled a sign-in or a step-up password prompt
   }
   const pre = preflightOutcome(preflight);
   if (!pre.ok) {
@@ -188,7 +188,7 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
   if (result === undefined) {
-    return; // sign-in cancelled
+    return; // the user cancelled a sign-in or a step-up password prompt
   }
   showPromoteMessage(promoteOutcomeMessage(target.name, result));
 }

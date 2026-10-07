@@ -75,7 +75,8 @@ register_ui_action(
 
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L3b: outbound queue purge (soft-cancel an outbound's queued deliveries) + the bulk
-    connection-control surface. Purge is step-up-gated (require_ui_step_up → /ui/reauth) +
+    connection-control surface. Purge takes a step-up proof bound to it (require_ui_step_up_action,
+    then /ui/reauth; vault BACKLOG #2625) +
     dual-control (may hold for a second approver) and acts on an OUTBOUND, so a channel-scoped user
     is refused; bulk-control mirrors the per-name control primitive (CONNECTIONS_CONTROL, no
     step-up). The literal bulk paths are registered BEFORE the ``{name}/purge/{scope}`` route so a
@@ -251,7 +252,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # (mapping a missing proof's re-auth to the confirm UNLOCK page, never a body-less
         # re-POST). Validate the scope BEFORE fan-out (a directly-called purge_connection skips its
         # own Query pattern, so an unvalidated scope would silently become purge-all). Then, per
-        # UNIQUE dest, call purge_connection DIRECTLY (its require_step_up Depends is skipped, so
+        # UNIQUE dest, call purge_connection DIRECTLY (its own gate's Depends is skipped, so
         # the 409 require-quiesced guard + the ApprovalGate dual-control run per dest), capturing
         # PurgeResult / PendingApprovalResponse / HTTPException(403/404/409) — one bad dest never
         # aborts the batch.

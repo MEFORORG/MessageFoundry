@@ -15,8 +15,9 @@ import { HttpError, type StepUpSignal } from "./engineClient";
 /** What {@link withStepUp} needs from its host. Every member is supplied by the caller, so this
  *  module never holds a password beyond the one call that sends it. */
 export interface StepUpHost {
-  /** Ask the user for their password, masked. `undefined` means the user cancelled. */
-  promptPassword(signal: StepUpSignal): Promise<string | undefined>;
+  /** Ask the user for their password, masked. `undefined` means the user cancelled. `retry` is
+   *  true after a wrong one, so the prompt can say so. */
+  promptPassword(signal: StepUpSignal, retry: boolean): Promise<string | undefined>;
   /** POST /me/reauth with `token`; resolve to the re-keyed token the engine returns, if any. */
   reauth(token: string, password: string, purpose: string | undefined): Promise<string | undefined>;
   /** Keep the re-keyed token, so later calls and the sign-in cache use the live session. */
@@ -35,6 +36,41 @@ export class IdpStepUpRequiredError extends Error {
   }
 }
 
+/** How many passwords one step-up asks for before it gives up, as the sign-in prompt does. Each
+ *  wrong one counts toward the engine's own re-proof budget and lockout, which stay the real bound. */
+export const STEP_UP_ATTEMPTS = 3;
+
+const CANCELLED = Symbol("cancelled");
+
+/** Prompt and re-prove, re-asking after a wrong password. Resolves to the re-keyed token (or
+ *  `undefined` from an older engine), or {@link CANCELLED}. A refusal that is not a wrong password,
+ *  and the last wrong one, reject as they came. */
+async function reprove(
+  token: string,
+  signal: StepUpSignal,
+  host: StepUpHost,
+): Promise<string | undefined | typeof CANCELLED> {
+  for (let attempt = 1; ; attempt++) {
+    const password = await host.promptPassword(signal, attempt > 1);
+    if (password === undefined) {
+      return CANCELLED;
+    }
+    try {
+      return await host.reauth(token, password, signal.action);
+    } catch (e) {
+      // A wrong password is a plain 403 from /me/reauth. A 403 carrying the IdP signal, a 401 (the
+      // session ended) and anything else are not, and re-asking would not help.
+      const wrong = e instanceof HttpError && e.status === 403 && e.stepUp === undefined;
+      if (!wrong || attempt >= STEP_UP_ATTEMPTS) {
+        if (stepUpOf(e)?.viaIdp) {
+          throw new IdpStepUpRequiredError();
+        }
+        throw e;
+      }
+    }
+  }
+}
+
 function stepUpOf(e: unknown): StepUpSignal | undefined {
   return e instanceof HttpError && e.status === 403 ? e.stepUp : undefined;
 }
@@ -42,8 +78,9 @@ function stepUpOf(e: unknown): StepUpSignal | undefined {
 /**
  * Run `call` with `token`. On a step-up refusal, re-prove once and retry once.
  *
- * Resolves to `undefined` when the user cancels the prompt. A second refusal, a wrong password and
- * every other error reject as they came, so no loop can form. The password is passed straight to
+ * Resolves to `undefined` when the user cancels the prompt. A wrong password re-asks, up to
+ * {@link STEP_UP_ATTEMPTS} in all. A refusal of the retried call, the last wrong password and every
+ * other error reject as they came, so no loop can form. The password is passed straight to
  * `host.reauth` and is never stored, logged or put in an error message.
  */
 export async function withStepUp<T>(
@@ -61,13 +98,12 @@ export async function withStepUp<T>(
     if (signal.viaIdp) {
       throw new IdpStepUpRequiredError();
     }
-    const password = await host.promptPassword(signal);
-    if (password === undefined) {
-      return undefined; // cancelled: nothing was sent
+    const rotated = await reprove(token, signal, host);
+    if (rotated === CANCELLED) {
+      return undefined; // cancelled: nothing more was sent
     }
     // The engine rotates the session on a successful re-proof (ASVS 7.2.4), so the token this call
     // used is dead once reauth returns. A body with no token is an older engine: keep the one we have.
-    const rotated = await host.reauth(token, password, signal.action);
     let live = token;
     if (rotated !== undefined && rotated !== "") {
       live = rotated;

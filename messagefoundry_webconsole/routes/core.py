@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
@@ -47,6 +48,7 @@ from messagefoundry.parsing.tree import ParseTreeTooLargeError
 
 from .. import pages
 from .._auth import (
+    _REAUTH_NEXT_MAX,
     CLEAR_SITE_DATA_HEADER,
     CLEAR_SITE_DATA_VALUE,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
@@ -332,6 +334,34 @@ _RESEND_NOTICES: dict[int, str] = {
 #: 478. A connection name longer than this cannot be resent from the console; it still can over the
 #: JSON API, which has no continuation to carry.
 _RESEND_NAME_MAX = 200
+
+#: An idempotency key as this console mints one (``uuid4().hex``), the only shape the re-auth
+#: continuation carries back to the confirm page (vault BACKLOG #2625).
+_RESEND_KEY_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+
+
+def _resend_confirm_next(request: Request) -> str:
+    """Where a resend POST refused for its proof sends the browser: the confirm page, carrying the
+    selection and, when it fits, the key the refused POST used.
+
+    The key matters since vault BACKLOG #2625. The POST spends a single-use proof, so a refreshed
+    outcome page is refused at the gate before the idempotent handler can call it a duplicate. With
+    the key carried back, the confirm page re-renders with it, and a resend that already ran
+    answers "already resent" instead of queuing a second delivery. A key that never ran is unused,
+    so carrying it costs nothing. It is dropped only when it is not this console's shape, or when
+    the longest names leave no room under the re-auth page's cap; the confirm page then mints one.
+
+    ``_seg`` on the id for the reason the page builder applies it: a ``?`` or ``#`` here produces a
+    ``next`` the write-action registry cannot fullmatch, and an unmatched continuation is dropped
+    SILENTLY. Measured."""
+    path = f"/ui/messages/{_seg(request.path_params['message_id'])}/resend-confirm?"
+    selection = {k: request.query_params.get(k, "") for k in ("to", "source")}
+    key = request.query_params.get("idempotency_key", "")
+    if re.fullmatch(_RESEND_KEY_PATTERN, key):
+        with_key = path + urlencode({**selection, "idempotency_key": key})
+        if len(with_key) <= _REAUTH_NEXT_MAX:
+            return with_key
+    return path + urlencode(selection)
 
 
 def _csp_report_bodies(doc: object) -> list[dict[str, object]] | None:
@@ -1101,12 +1131,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         to: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
         source: str = Query(..., min_length=1, max_length=_RESEND_NAME_MAX),
         _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
+        idempotency_key: str | None = Query(None, pattern=_RESEND_KEY_PATTERN),
     ) -> HTMLResponse:
         # A fresh per-render idempotency token: a double-submit of THIS rendered confirm is the
         # ADR 0090 §4 no-op, while re-opening the confirm page mints a new one and is a genuine
         # second resend. It rides the POST's query rather than its body, which is what keeps that
-        # POST body-less.
-        return HTMLResponse(pages.message_resend_confirm(message_id, to, source, uuid4().hex))
+        # POST body-less. The one exception is a key the re-auth carried back from a refused POST
+        # (``_resend_confirm_next``): reusing it is what keeps a refreshed resend a duplicate.
+        key = idempotency_key or uuid4().hex
+        return HTMLResponse(pages.message_resend_confirm(message_id, to, source, key))
 
     # BOTH OUTCOMES ARE ANSWERED IN PLACE, not with a 303 to the message detail page. That page is
     # `require_ui(MESSAGES_VIEW_RAW)`, so redirecting there handed a resend-without-read role a raw
@@ -1114,9 +1147,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # permission choice above exists to serve. Rendering here costs that role nothing it does not
     # already hold.
     #
-    # Re-POSTing this page on a browser refresh is safe by construction, which is why the usual
-    # post-redirect-get is not needed to make it so: the idempotency key is IN the URL, so a repeat
-    # is ADR 0090 §4's no-op and says "already queued" rather than queuing a second delivery.
+    # Re-POSTing this page on a browser refresh does not queue a second delivery, which is why the
+    # usual post-redirect-get is not needed: the idempotency key is IN the URL, so a repeat is ADR
+    # 0090 §4's no-op. Since vault BACKLOG #2625 the repeat first meets the gate, whose proof the
+    # first POST spent, so it goes through /ui/reauth; ``_resend_confirm_next`` carries the key back,
+    # and the resubmit still says "already resent".
     @app.post("/ui/messages/{message_id}/resend", response_class=HTMLResponse)
     async def ui_message_resend(
         message_id: str,
@@ -1130,19 +1165,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             require_ui_step_up_action(
                 STEP_UP_ACTION_MESSAGE_RESEND,
                 Permission.MESSAGES_RESEND,
-                # A stale-window step-up re-opens the CONFIRM page, never this POST path. The target
-                # and source are carried back so the operator is not stranded mid-task; the stale
-                # `idempotency_key` deliberately is NOT, because the confirm page mints a fresh one
-                # and the attempt behind the old key never ran.
-                #
-                # `_seg` on the id for the reason the page builder applies it: a `?` or `#` here
-                # produces a `next` the write-action registry cannot fullmatch, and an unmatched
-                # continuation is dropped SILENTLY — the operator lands on /ui with the message and
-                # the selection gone and no error anywhere. Measured.
-                reauth_next=lambda r: (
-                    f"/ui/messages/{_seg(r.path_params['message_id'])}/resend-confirm?"
-                    + urlencode({k: r.query_params.get(k, "") for k in ("to", "source")})
-                ),
+                # A missing proof re-opens the CONFIRM page, never this POST path, carrying the
+                # selection and the key back (``_resend_confirm_next`` says why the key).
+                reauth_next=_resend_confirm_next,
             )
         ),
     ) -> Response:
@@ -1237,14 +1262,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         # Held, not spent, in the gate (vault BACKLOG #2625): the grant is spent below, after this
-        # route's own input checks, so a mistyped destination costs the operator no proof.
+        # route's own input checks, so a refusal of those (direct mode with no outbound, an invalid
+        # body) costs the operator no proof. A refusal from the engine handler comes after the
+        # spend, so the next submit asks again and re-opens the editor from the stored body.
         identity: Identity = Depends(
             require_ui_step_up_action(
                 STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
                 Permission.MESSAGES_EDIT,
                 Permission.MESSAGES_VIEW_RAW,
                 phi=True,
-                # A missing proof on this body-carrying POST → re-open the /edit form, never the
+                # A missing proof on this body-carrying POST re-opens the /edit form, never the
                 # POST path (a re-POST would drop the edited body).
                 reauth_next=_edit_page,
                 spend=False,
@@ -1654,9 +1681,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         ),
                     )
                 )
-        # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action. action.action
-        # is None for every non-factor continuation (replay/purge/config/create-user), so reauth mints
-        # nothing there and those flows stay byte-identical; the factor-binding lanes tag their action.
+        # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action.
+        # action.action is None for a continuation whose route rides the session window (replay,
+        # create-user and the like), so reauth mints nothing there. The factor-binding lanes tag their
+        # action, and so, since vault BACKLOG #2625, do the purge, reload, resend, edit-resend and
+        # upload-resend continuations.
         # Vault BACKLOG #2764: only for a continuation that will run. A `next` the console did not
         # issue to this session takes no grant, because ADR 0077 derives the grant's purpose from
         # `next` itself, and a forged one would otherwise bind the proof to the forged action.

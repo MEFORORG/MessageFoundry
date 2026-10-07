@@ -30,6 +30,8 @@ from messagefoundry.config.settings import EgressSettings
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtWidgets import QInputDialog  # noqa: E402
+
 from harness import monitor  # noqa: E402
 from harness.monitor import MonitorPanel  # noqa: E402
 from messagefoundry.api import create_managed_app  # noqa: E402
@@ -230,6 +232,55 @@ def test_monitor_panel_builds_disconnected(qapp: Any) -> None:
     # The engine always serves TLS (ADR 0172), so an http default names a socket that never answers.
     assert panel._url.text().startswith("https://")
     panel.shutdown()  # safe to call when never connected
+
+
+class _ReauthClient:
+    """Records what ``reauth`` was given, and refuses it when told to."""
+
+    def __init__(self, refuse: bool = False) -> None:
+        self.refuse = refuse
+        self.passwords: list[str] = []
+
+    def reauth(self, password: str) -> None:
+        self.passwords.append(password)
+        if self.refuse:
+            raise ApiError("re-verification failed", status=403)
+
+
+@pytest.mark.parametrize(
+    ("answer", "refuse", "expected", "restarts"),
+    [
+        (("typed-pw", True), False, True, 1),  # re-proved: the poller moves to the new token
+        (("", False), False, False, 0),  # cancelled: nothing is sent
+        (("typed-pw", True), True, False, 0),  # refused: the old session is untouched
+    ],
+)
+def test_the_step_up_handler_re_proves_and_restarts_the_poller(
+    qapp: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: tuple[str, bool],
+    refuse: bool,
+    expected: bool,
+    restarts: int,
+) -> None:
+    """Vault BACKLOG #2625: reload and purge take a proof bound to their action, which a sign-in
+    does not mint, so the harness answers the step-up refusal with a masked password prompt. The
+    re-proof rotates the session, so the poller, which holds its own copy of the token, restarts."""
+    panel = MonitorPanel()
+    client = _ReauthClient(refuse=refuse)
+    panel._client = client  # type: ignore[assignment]
+    started: list[int] = []
+    # On the class: an instance patch would leave a bound method in the panel's own dict on undo.
+    monkeypatch.setattr(MonitorPanel, "_stop_poller", lambda self: None)
+    monkeypatch.setattr(MonitorPanel, "_start_poller", lambda self: started.append(1))
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: answer)
+    try:
+        assert panel._step_up() is expected
+        assert client.passwords == ([answer[0]] if answer[1] and answer[0] else [])
+        assert len(started) == restarts
+    finally:
+        panel._client = None
+        panel.shutdown()
 
 
 class _MustChangeClient:

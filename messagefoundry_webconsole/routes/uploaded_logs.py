@@ -461,6 +461,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         and by the POST that filters on a needle (BACKLOG #1184)."""
         # No outcome banner here: this page is step-up-gated, so a flag aimed at it is dropped whenever
         # the window is stale (see :data:`_FAILED_TARGET`). Every refused mutation reports on the list.
+        # A resend also needs messages:edit (vault BACKLOG #2625), so a role without it is not
+        # offered a form whose confirm page would refuse it.
+        can_resend = identity.has(Permission.MESSAGES_EDIT)
         shared = dict(  # noqa: C408
             content=content or "",
             field_path=field_path or "",
@@ -519,12 +522,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         return answer
                     raise
                 return HTMLResponse(
-                    pages.uploaded_log_detail(result, error=str(exc.detail), **shared),
+                    pages.uploaded_log_detail(
+                        result, error=str(exc.detail), can_resend=can_resend, **shared
+                    ),
                     status_code=400,
                 )
             raise
         return HTMLResponse(
-            pages.uploaded_log_detail(result, error=error, **shared), status_code=status_code
+            pages.uploaded_log_detail(result, error=error, can_resend=can_resend, **shared),
+            status_code=status_code,
         )
 
     @app.get("/ui/uploaded-logs/file/{file_id}", response_class=HTMLResponse)

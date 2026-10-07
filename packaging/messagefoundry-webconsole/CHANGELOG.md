@@ -32,9 +32,12 @@ this line.**
 - **Resend, edit-resend, upload resend, queue purge and config reload each take a proof bound to
   that action.** A fresh session window no longer reaches them. Each needs a re-authentication made
   for it, which it spends. The re-auth page mints that proof when it continues to the action's
-  confirm page, editor or auto-retry. The message editor asks for it before it opens, so a re-auth
-  never drops a typed edit, and the resubmit spends it only after its own input checks pass. Upload
-  resend also needs `messages:edit`, on the confirm page and on the POST. Seam change:
+  confirm page, editor or auto-retry. The message editor asks for it before it opens, and the
+  resubmit spends it only after its own input checks pass. A refusal from the engine comes after the
+  spend, so the next submit asks again and re-opens the editor. A refreshed resend outcome page goes
+  through the re-auth carrying its idempotency key, so it is still answered as a duplicate. Upload
+  resend also needs `messages:edit`, on the confirm page and on the POST, and the browse page offers
+  its form only to a role that holds it. Seam change:
   `AuthService.holds_action_step_up` is new, and the console imports five new step-up action
   constants. (vault BACKLOG #2625)
 - **A route-level sign-in reject records where it came from.** The `/ui/oidc` start and callback

@@ -2801,11 +2801,13 @@ class AuthSettings(_Section):
     # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), a fixed set of routes
     # requires a fresh proof BOUND to that specific action (POST /me/reauth with a matching
     # `purpose`), single-use, instead of riding the session-wide step-up window: the self-service
-    # factor and session-terminate routes, and the admin user-update, reset-password, reset-mfa and
-    # federated-identity routes (the STEP_UP_ACTION_* constants in auth/service.py; the route list is
-    # in docs/CONFIGURATION.md). This closes the most-exploitable default: a session hijacked inside
-    # the 300s login-seeded window could otherwise bind an attacker's authenticator with no fresh
-    # proof. Every other step-up route keeps the session-window step-up (7.5.3). Default True is
+    # factor and session-terminate routes, the admin user-update, reset-password, reset-mfa and
+    # federated-identity routes, and since vault BACKLOG #2625 the injection and bulk-export routes:
+    # resend, edit-resend, upload resend, export, purge and config reload (the STEP_UP_ACTION_*
+    # constants in auth/service.py; the route list is in docs/CONFIGURATION.md). This closes the
+    # most-exploitable default: a session hijacked inside the 300s login-seeded window could
+    # otherwise bind an attacker's authenticator, inject a message or export bodies in bulk with no
+    # fresh proof. Every other step-up route keeps the session-window step-up (7.5.3). Default True is
     # secure-by-default and does not touch the loopback bind, TLS, or any collector path. Set False to revert to the legacy
     # session-window behaviour (0.2.x semantics) — the documented org opt-out.
     require_action_step_up: bool = True

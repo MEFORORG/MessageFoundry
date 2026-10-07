@@ -9,7 +9,12 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { HttpError, postApprovable, stepUpSignalOf } from "../../engineClient";
-import { IdpStepUpRequiredError, type StepUpHost, withStepUp } from "../../stepUp";
+import {
+  IdpStepUpRequiredError,
+  STEP_UP_ATTEMPTS,
+  type StepUpHost,
+  withStepUp,
+} from "../../stepUp";
 
 const PASSWORD = "a-typed-password-never-echoed";
 
@@ -172,16 +177,62 @@ suite("stepUp — withStepUp re-proves once and retries once (vault BACKLOG #262
     assert.strictEqual(seen.prompts, 0);
   });
 
-  test("a refused re-proof rejects without the password in the error", async () => {
+  test("a wrong password re-asks, saying so, and the right one then goes through", async () => {
+    const retries: boolean[] = [];
+    let reauths = 0;
     const host: StepUpHost = {
-      promptPassword: () => Promise.resolve(PASSWORD),
+      promptPassword: (_s, retry) => {
+        retries.push(retry);
+        return Promise.resolve(PASSWORD);
+      },
+      reauth: () =>
+        ++reauths === 1
+          ? Promise.reject(new HttpError(403, "re-verification failed"))
+          : Promise.resolve("rotated"),
+      storeToken: () => Promise.resolve(),
+    };
+    let calls = 0;
+    const out = await withStepUp(
+      "old",
+      () => (++calls === 1 ? Promise.reject(refusal("config_reload")) : Promise.resolve("swapped")),
+      host,
+    );
+    assert.strictEqual(out, "swapped");
+    assert.deepStrictEqual(retries, [false, true]);
+  });
+
+  test("wrong passwords stop at the attempt cap, without the password in the error", async () => {
+    let prompts = 0;
+    const host: StepUpHost = {
+      promptPassword: () => {
+        prompts += 1;
+        return Promise.resolve(PASSWORD);
+      },
       reauth: () => Promise.reject(new HttpError(403, "re-verification failed")),
       storeToken: () => Promise.resolve(),
     };
     await assert.rejects(
       () => withStepUp("old", () => Promise.reject(refusal("config_reload")), host),
-      (e: unknown) => e instanceof Error && !e.message.includes(PASSWORD),
+      (e: unknown) => e instanceof HttpError && e.status === 403 && !e.message.includes(PASSWORD),
     );
+    assert.strictEqual(prompts, STEP_UP_ATTEMPTS);
+  });
+
+  test("a re-proof refused for a reason a password cannot fix is not re-asked", async () => {
+    let prompts = 0;
+    const host: StepUpHost = {
+      promptPassword: () => {
+        prompts += 1;
+        return Promise.resolve(PASSWORD);
+      },
+      reauth: () => Promise.reject(new HttpError(401, "session ended; sign in again")),
+      storeToken: () => Promise.resolve(),
+    };
+    await assert.rejects(
+      () => withStepUp("old", () => Promise.reject(refusal("config_reload")), host),
+      (e: unknown) => e instanceof HttpError && e.status === 401,
+    );
+    assert.strictEqual(prompts, 1);
   });
 
   test("control: any other error passes through untouched, with no prompt", async () => {

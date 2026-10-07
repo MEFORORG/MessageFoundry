@@ -509,6 +509,11 @@ async def sample_until_reconciled(
     return last
 
 
+#: How long a rig waits after a step-up re-proof before the client retries the refused write: just
+#: past the engine's default [auth].admin_write_min_interval_seconds (0.15 s).
+_STEP_UP_RETRY_GAP_SECONDS = 0.25
+
+
 def adopt_rig_session(client: EngineClient, url: str, cacert: str | None) -> None:
     """Sign ``client`` in as this run's rig Administrator (:mod:`harness.load.rigadmin`).
 
@@ -534,12 +539,21 @@ def adopt_rig_session(client: EngineClient, url: str, cacert: str | None) -> Non
 
     def _step_up() -> bool:
         # A sensitive route (the reload probe's POST /config/reload) wants a credential proved
-        # within the last few minutes. A fresh sign-in is that proof, and it leaves the session
-        # every other client holds alone, where a re-authentication would rotate it under them.
+        # just now, and since vault BACKLOG #2625 the reload takes a proof bound to its action
+        # (X-Step-Up-Action: config_reload), which no sign-in mints. So this client signs in to a
+        # session of its OWN and re-proves there: reauth() sends the action the client stashed as
+        # `purpose` and adopts the re-keyed token. The rotation touches only that private session,
+        # never the one every other client holds, which is why this is not renew_session.
         try:
-            client.set_token(rigadmin.renew_session(url, None, cacert=cacert))
+            client.set_token(rigadmin.sign_in(url, cacert=cacert))
+            client.reauth(rigadmin.rig_admin().password)
         except (ApiError, rigadmin.RigAdminError):
             return False
+        # The refused POST was an admitted admin write, and the engine refuses another from the same
+        # actor sooner than [auth].admin_write_min_interval_seconds after it (0.15 s by default,
+        # BACKLOG #2301). A rig re-proves at machine speed, so the retry waits the gap out; a person
+        # typing a password never comes near it.
+        time.sleep(_STEP_UP_RETRY_GAP_SECONDS)
         return True
 
     client.set_step_up_handler(_step_up)

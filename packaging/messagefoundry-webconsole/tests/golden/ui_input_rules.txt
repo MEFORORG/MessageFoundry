@@ -33,6 +33,7 @@ GET /ui/messages/{message_id}/body	message_id	path	-	-
 GET /ui/messages/{message_id}/edit	message_id	path	-	-
 GET /ui/messages/{message_id}/errors	message_id	path	-	-
 GET /ui/messages/{message_id}/parse-tree	message_id	path	-	-
+GET /ui/messages/{message_id}/resend-confirm	idempotency_key	query	-	-
 GET /ui/messages/{message_id}/resend-confirm	message_id	path	-	-
 GET /ui/messages/{message_id}/resend-confirm	source	query	-	-
 GET /ui/messages/{message_id}/resend-confirm	to	query	-	-

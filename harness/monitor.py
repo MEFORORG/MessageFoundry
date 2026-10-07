@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from PySide6.QtCore import QMetaObject, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -284,6 +285,9 @@ class MonitorPanel(QWidget):
             return
 
         self._client = client
+        # Vault BACKLOG #2625: reload and purge take a step-up proof bound to their action, which
+        # a sign-in does not mint, so answer the engine's step-up refusal with a re-proof.
+        client.set_step_up_handler(self._step_up)
         inner = self._build_inner()
         self._body.addWidget(inner)
         self._body.setCurrentWidget(inner)
@@ -321,6 +325,33 @@ class MonitorPanel(QWidget):
             )
             return False
         return client.token is not None
+
+    def _step_up(self) -> bool:
+        """Answer a step-up refusal (403 + ``X-Step-Up-Required``): ask for the password, masked,
+        and re-prove it. ``EngineClient.reauth`` sends the action the refusal named as ``purpose``
+        and adopts the re-keyed session, and the client then retries the call once.
+
+        The re-proof rotates the session, so the poller's copy of the old token is dead: it is
+        restarted on the new one. The password is passed straight to ``reauth`` and kept nowhere."""
+        client = self._client
+        if client is None:
+            return False
+        password, ok = QInputDialog.getText(
+            self,
+            "Confirm it's you",
+            "This action needs your password again:",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not password:
+            return False
+        try:
+            client.reauth(password)
+        except ApiError as exc:
+            self._set_status(str(exc), error=True)
+            return False
+        self._stop_poller()
+        self._start_poller()
+        return True
 
     def _disconnect(self) -> None:
         self._stop_poller()

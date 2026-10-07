@@ -527,8 +527,9 @@ async def test_the_resend_lane_stands_on_messages_resend_alone(engine: Engine) -
 async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engine: Engine) -> None:
     """A body-carrying POST cannot be auto-retried, and this one is body-LESS only because the
     selection rides the query. So the re-auth is pointed at the CONFIRM page carrying ``to`` and
-    ``source`` -- the operator is not stranded mid-task -- while the stale ``idempotency_key`` is
-    dropped, because the confirm page mints a fresh one and the attempt behind the old key never ran."""
+    ``source`` -- the operator is not stranded mid-task -- and the ``idempotency_key`` too, since
+    vault BACKLOG #2625: the refused POST may be a refresh of one that already ran, and only its own
+    key lets the handler call the resubmit a duplicate."""
     service = await _service(engine, step_up_max_age=-1)
     await _add(service, "op", Role.OPERATOR.value)
     mid = await _seed(engine)
@@ -541,8 +542,37 @@ async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engin
         nxt = unquote(dict(parse_qsl(urlsplit(location).query))["next"])
         assert nxt.startswith(f"/ui/messages/{mid}/resend-confirm?")
         params = dict(parse_qsl(urlsplit(nxt).query))
-        assert params == {"to": "OB2", "source": "archive"}
-        assert "idempotency_key" not in nxt
+        assert params == {"to": "OB2", "source": "archive", "idempotency_key": "k1"}
+
+
+async def test_a_refreshed_resend_is_still_a_duplicate_after_the_re_auth(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #2625. The resend POST spends a single-use proof, so a refresh of the outcome
+    page is refused at the gate before the idempotent handler sees it. The re-auth must carry the
+    first POST's key back, or the confirm page mints a fresh one and the resubmit queues a SECOND
+    delivery to the partner. The audit row count is the control: one real resend, one row."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        first = await _post_resend(c, mid, key="refresh-key-1")
+        assert first.status_code == 200 and "Resend queued" in first.text
+        # The browser's refresh: the same POST, the same key, and no proof left.
+        refreshed = await _post_resend(c, mid, key="refresh-key-1", mint=False)
+        assert refreshed.status_code == 303
+        nxt = unquote(dict(parse_qsl(urlsplit(refreshed.headers["location"]).query))["next"])
+        await _mint(c, mid)
+        confirm = await c.get(nxt)
+        assert confirm.status_code == 200
+        assert "idempotency_key=refresh-key-1" in confirm.text
+        again = await _post_resend(c, mid, key="refresh-key-1")
+        assert again.status_code == 200 and "Already resent" in again.text
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert len(rows) == 1
 
 
 async def test_the_longest_accepted_names_still_fit_the_reauth_continuation(

@@ -6,8 +6,8 @@ The console calls the engine handlers by reference, so their action-bound gates 
 each ``/ui`` route has to re-assert the same action. Pinned for each lane the console has (export
 has none): a fresh login's window is refused and sent to ``/ui/reauth``; the re-auth mints the
 lane's grant; one action spends it. The message editor is the one lane that only CHECKS the grant
-on its way in, so a re-auth never drops a typed edit, and its resubmit spends the grant after its
-own input checks. Upload resend also needs ``messages:edit``. The JSON plane is pinned in
+on its way in, so the re-auth comes before the operator types, and its resubmit spends the grant
+after its own input checks. Upload resend also needs ``messages:edit``. The JSON plane is pinned in
 ``tests/test_bound_step_up_injection.py``.
 """
 
@@ -165,3 +165,25 @@ async def test_a_replay_still_opens_on_the_window(engine: Engine) -> None:
         for _ in range(2):
             r = await c.post(f"/ui/messages/{mid}/replay", headers=SAME_ORIGIN)
             assert _reauth_next(r) is None, r.headers
+
+
+def test_the_browse_page_offers_resend_only_to_a_role_that_can_resend() -> None:
+    """A resend needs messages:edit, so a role without it is told so in place of the form, rather
+    than offered one its confirm page refuses."""
+    from messagefoundry.api.models import UploadedMessagesResult
+    from messagefoundry_webconsole.pages import uploaded_log_detail
+
+    result = UploadedMessagesResult(
+        file_id=NO_SUCH,
+        filename="acme.hl7",
+        matched=0,
+        messages=[],
+        scanned=0,
+        total_messages=0,
+        truncated=False,
+    )
+    confirm = f"/ui/uploaded-logs/file/{NO_SUCH}/resend-confirm"
+    assert confirm in str(uploaded_log_detail(result))  # control: the default offers it
+    reader = str(uploaded_log_detail(result, can_resend=False))
+    assert confirm not in reader
+    assert "messages:edit" in reader

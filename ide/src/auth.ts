@@ -301,12 +301,13 @@ export async function withStepUpAuth<T>(
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
   const host: StepUpHost = {
-    promptPassword: async (signal) =>
+    promptPassword: async (signal, retry) =>
       await vscode.window.showInputBox({
         prompt:
-          signal.action === undefined
+          (retry ? "That password was not accepted. " : "") +
+          (signal.action === undefined
             ? `Re-enter your MessageFoundry password for ${url} to continue`
-            : `Re-enter your MessageFoundry password for ${url} to confirm this action (${signal.action})`,
+            : `Re-enter your MessageFoundry password for ${url} to confirm this action (${signal.action})`),
         password: true,
         ignoreFocusOut: true,
       }),

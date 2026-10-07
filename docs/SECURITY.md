@@ -2023,8 +2023,10 @@ grant that a step-up mints for that action instead:
 A JSON client answers the 403 with `POST /me/reauth`, setting `purpose` to the action the 403 named
 in `X-Step-Up-Action`; the engine client does this itself. The console's re-auth page mints the grant
 when it continues to the action's confirm page, editor or auto-retry. The message editor asks for the
-grant before it opens and the resubmit spends it after its own input checks, so a re-auth never drops
-a typed edit. One grant covers one request, and a bulk purge from the console is one request. The
+grant before it opens and the resubmit spends it after its own input checks, so a re-auth no longer
+drops an edit the operator is about to type, and a refusal of the console's own input costs no proof.
+A refusal from the engine handler comes after the spend: the next submit asks again and re-opens the
+editor from the stored body, as an expired grant (300 s by default) does. One grant covers one request, and a bulk purge from the console is one request. The
 grant is keyed on the session and the action, not on a target. The rest of the step-up surface keeps
 the shared window on purpose: a bound proof is a typed password per action, and an operator replaying
 dead letters during an incident would type it per message. `[auth].require_action_step_up = false`
