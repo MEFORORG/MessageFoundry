@@ -9756,8 +9756,8 @@ def _dest_config(
     # off (every existing outbound unchanged). The connector loads the key + mints the signature; this
     # is the single choke point feeding start/check/dry-run, so a bad key fails loud at all three.
     settings = resolve_env_settings(oc.spec.settings, env_values, connection=oc.name)
-    # Vault BACKLOG #3138: a verify_tls env() can now resolve to a real False, which the factory's
-    # literal-only checks never saw.
+    # Vault BACKLOG #3138: a verify_tls env() can resolve falsy, which the factory's literal-only
+    # unread-CA check never sees.
     refuse_resolved_verify_off(oc.spec.type, settings, f"outbound connection {oc.name!r}")
     # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
     # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.

@@ -238,17 +238,18 @@ class EnvRef:
         # ``object.__setattr__``; ``_cast_bool`` is defined below and only looked up at call time.
         if self.cast is bool:
             object.__setattr__(self, "cast", _cast_bool)
-            # A default is never cast at resolve time, so ``default="false"`` would reach the
-            # connector as text and read True there. Read it strictly here instead, once, at authoring.
-            # ``None`` stays a deliberate None. The value is withheld for the reason ``_cast_bool`` gives.
-            if self.default is not _UNSET and self.default is not None:
-                try:
-                    object.__setattr__(self, "default", _cast_bool(self.default))
-                except ValueError:
-                    raise WiringError(
-                        f"env({self.key!r}, cast=bool): default= is not a boolean "
-                        f"({', '.join(sorted(_BOOL_SPELLINGS))}, or True/False; value withheld)"
-                    ) from None
+        # A default is never cast at resolve time, so ``default="false"`` would reach the connector
+        # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
+        # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
+        # the reason ``_cast_bool`` gives.
+        if self.cast is _cast_bool and self.default is not _UNSET and self.default is not None:
+            try:
+                object.__setattr__(self, "default", _cast_bool(self.default))
+            except ValueError:
+                raise WiringError(
+                    f"env reference {self.key!r} with a bool cast: default= is not a boolean "
+                    f"({', '.join(sorted(_BOOL_SPELLINGS))}, or True/False; value withheld)"
+                ) from None
 
 
 def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = None) -> EnvRef:
@@ -728,23 +729,19 @@ def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool
 def refuse_resolved_verify_off(
     type_: ConnectorType, settings: Mapping[str, Any], where: str
 ) -> None:
-    """Re-run the two ``verify_tls=False`` refusals the factories make, on RESOLVED settings.
+    """Re-run the DICOMweb factory's unread-CA refusal on RESOLVED settings.
 
-    The factories see an ``env()`` reference, which is truthy, so they pass it. Once ``env(...,
-    cast=bool)`` reads ``false`` as False (vault BACKLOG #3138), the resolved value can be the False
-    those checks refuse as a literal: a DICOMweb ``tls_ca_file`` nothing would read, and a SOAP client
-    cert offered to an unverified peer. Only a real ``False`` fires, the literal's own test."""
-    if settings.get("verify_tls") is not False:
+    The factory refuses ``tls_ca_file`` with a falsy literal ``verify_tls``, because nothing would
+    read the CA. An ``env()`` reference is truthy there, so it passes. Once it resolves, it can be
+    falsy, and more often since vault BACKLOG #3138 made ``cast=bool`` read ``false`` as False. So
+    the same test runs here, on the value the connector will read. SOAP needs no copy: its
+    connector refuses a client cert with verification off when it is built."""
+    if type_ is not ConnectorType.DICOMWEB or "verify_tls" not in settings:
         return
-    if type_ is ConnectorType.DICOMWEB and settings.get("tls_ca_file"):
+    if not settings["verify_tls"] and settings.get("tls_ca_file"):
         raise WiringError(
             f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to false, which "
             "verifies nothing, and DICOMweb has no token hop."
-        )
-    if type_ is ConnectorType.SOAP and settings.get("client_cert_file"):
-        raise WiringError(
-            f"{where}: SOAP client cert is incompatible with verify_tls=false, which it resolved to "
-            "(presenting an identity to an unverified peer is incoherent) (ADR 0015)."
         )
 
 

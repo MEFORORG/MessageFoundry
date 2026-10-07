@@ -27,6 +27,7 @@ from messagefoundry.config.wiring import (
     WiringError,
     env,
     load_config,
+    parse_env_setting,
     resolve_env_settings,
 )
 from messagefoundry.pipeline.wiring_runner import _dest_config
@@ -96,6 +97,9 @@ def test_a_cast_bool_default_is_read_strictly(default: object, want: bool) -> No
 
 
 def test_a_cast_bool_default_of_none_stays_none() -> None:
+    # Kept as it was before #3138: None is a deliberate "unset". A connector reads a None flag as
+    # False, which on verify_tls is the insecure side. That is a separate question, not settled here.
+    # The DICOMweb unread-CA check below does catch it.
     assert resolve_env_settings({"flag": env("flag", default=None, cast=bool)}, {})["flag"] is None
 
 
@@ -105,7 +109,7 @@ def test_an_unreadable_cast_bool_default_is_refused_naming_the_key(default: obje
         env("acme_flag", default=default, cast=bool)
     msg = str(ei.value)
     assert "'acme_flag'" in msg and "default=" in msg and "value withheld" in msg
-    assert "maybe" not in msg
+    assert f"{default!r}" not in msg.replace("'acme_flag'", "")
 
 
 # --- end to end: a code-first module, the instance's values, the outbound build choke point ---------
@@ -178,16 +182,19 @@ def test_an_unknown_spelling_is_refused_end_to_end_naming_the_key(tmp_path: Path
     assert "maybe" not in msg
 
 
-# --- a verify_tls that RESOLVES false meets the refusals its literal form meets at the factory ------
-# The factories test the literal; an env() reference is truthy there, so they pass it. Now that "false"
-# reads False, the resolved value can be the one they refuse.
+# --- a DICOMweb verify_tls that RESOLVES falsy meets the unread-CA refusal its literal meets --------
+# The factory tests the literal; an env() reference is truthy there, so it passes. Now that "false"
+# reads False, the resolved value can be the one it refuses. The test is truthiness, as the
+# connector's own read is, so an uncast "" and a None default are refused too.
 
 _VERIFY_MODULE = """
-from messagefoundry import DICOMweb, Soap, env, outbound
+from messagefoundry import DICOMweb, env, outbound
 outbound("OB_DW", DICOMweb(url="https://pacs.example.org/dw", tls_ca_file="ca.pem",
                            verify_tls=env("dw_verify", cast=bool)))
-outbound("OB_SOAP", Soap(url="https://ws.example.org/ws", client_cert_file="c.pem",
-                         client_key_file="k.pem", verify_tls=env("soap_verify", cast=bool)))
+outbound("OB_DW_RAW", DICOMweb(url="https://pacs.example.org/dw", tls_ca_file="ca.pem",
+                               verify_tls=env("dw_raw")))
+outbound("OB_DW_NONE", DICOMweb(url="https://pacs.example.org/dw", tls_ca_file="ca.pem",
+                                verify_tls=env("dw_none", default=None, cast=bool)))
 """
 
 
@@ -198,17 +205,36 @@ def _verify_dest(tmp_path: Path, name: str, values: dict[str, str]) -> Any:
 
 
 @pytest.mark.parametrize(
-    ("name", "needle"),
-    [("OB_DW", "tls_ca_file would never be read"), ("OB_SOAP", "client cert is incompatible")],
+    ("name", "values"),
+    [
+        ("OB_DW", {"dw_verify": "false"}),
+        ("OB_DW", {"dw_verify": "0"}),
+        ("OB_DW_RAW", {"dw_raw": ""}),
+        ("OB_DW_NONE", {}),
+    ],
 )
-def test_a_verify_tls_that_resolves_false_is_refused(
-    tmp_path: Path, name: str, needle: str
+def test_a_dicomweb_verify_tls_that_resolves_falsy_is_refused(
+    tmp_path: Path, name: str, values: dict[str, str]
 ) -> None:
-    with pytest.raises(WiringError, match=needle):
-        _verify_dest(tmp_path, name, {"dw_verify": "false", "soap_verify": "false"})
+    with pytest.raises(WiringError, match="tls_ca_file would never be read"):
+        _verify_dest(tmp_path, name, values)
 
 
-@pytest.mark.parametrize("name", ["OB_DW", "OB_SOAP"])
-def test_a_verify_tls_that_resolves_true_builds(tmp_path: Path, name: str) -> None:
-    dest = _verify_dest(tmp_path, name, {"dw_verify": "true", "soap_verify": "true"})
+def test_a_dicomweb_verify_tls_that_resolves_true_builds(tmp_path: Path) -> None:
+    dest = _verify_dest(tmp_path, "OB_DW", {"dw_verify": "true"})
     assert dest.settings["verify_tls"] is True
+
+
+# --- connections.toml hands in _cast_bool itself, so its default is read the same way ----------------
+
+
+@pytest.mark.parametrize(("default", "want"), [("false", False), ("on", True), (False, False)])
+def test_a_toml_bool_default_is_read_strictly(default: object, want: bool) -> None:
+    ref = parse_env_setting({"env": "flag", "cast": "bool", "default": default})
+    assert isinstance(ref, EnvRef)
+    assert resolve_env_settings({"flag": ref}, {})["flag"] is want
+
+
+def test_an_unreadable_toml_bool_default_is_refused() -> None:
+    with pytest.raises(WiringError, match="default= is not a boolean"):
+        parse_env_setting({"env": "flag", "cast": "bool", "default": "maybe"})

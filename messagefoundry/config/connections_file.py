@@ -540,7 +540,8 @@ def _check_setting_types(
             # What CAN be judged here is an inline `default =`, because resolve_env_settings returns a
             # default WITHOUT applying the ref's `cast`. So `{ env = "m", cast = "int", default = "16" }`
             # reaches the factory as the STRING "16" -- the exact shape this check exists to stop,
-            # written one level down where the cast looks like it covers it.
+            # written one level down where the cast looks like it covers it. The bool cast is the one
+            # exception: EnvRef reads its default strictly when it is made (vault BACKLOG #3138).
             #
             # The value that arrives FROM the environment is NOT judged here and must not be claimed to
             # be: an uncast ref hands the factory whatever the environment holds, as a string. That is
