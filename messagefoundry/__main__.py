@@ -7817,7 +7817,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
     # Raised by the walk, after the open: a Transit HMAC that failed for a row, a key provider that
     # failed part way, or a row the driver cannot read (text that is not UTF-8, vault BACKLOG #3054
     # item 10). Its own tuple, not `_key_unresolved()`, whose classes are raised before a row is
-    # read. Exit 1 below, never 2: rows were read.
+    # read. Exit 1 below: rows were read. At the open, only a CipherError or an error the store
+    # tagged as a read of the chain's rows gets that exit; any other is "could not start", 2.
     walk_errors: tuple[type[Exception], ...] = (
         CipherError,
         KeyProviderError,
@@ -7844,16 +7845,16 @@ def _audit_verify(args: argparse.Namespace) -> int:
                     ),
                 )
             )
+        except CipherError as exc:
+            # The open MACs the genesis row under Transit, so a row's content reaches this too.
+            raise stopped(exc) from exc
         except walk_errors as exc:
-            # The open reads the chain's first rows and, under Transit, MACs the genesis row there,
-            # so a row's content reaches this too: a Transit refusal, or a row the driver cannot
-            # read. Those are the chain's evidence, not a store that could not start, so they get
-            # the walk's FAIL line (vault BACKLOG #3054, item 10). Any other driver error at the
-            # open, such as a server that refuses the connection, stays exit 2 below. A key that
-            # does not resolve was turned into exit 2 by the wrapper.
-            if isinstance(exc, CipherError) or AUDIT_CHAIN_READ_NOTE in getattr(
-                exc, "__notes__", ()
-            ):
+            # A row the driver cannot read while the open read the chain's rows: the store tags
+            # those. They are the chain's evidence, not a store that
+            # could not start, so they get the walk's FAIL line (vault BACKLOG #3054, item 10). Any
+            # other driver error at the open, such as a server refusing the connection, is exit 2
+            # below. A key that does not resolve before a row is read is exit 2 by the wrapper.
+            if AUDIT_CHAIN_READ_NOTE in getattr(exc, "__notes__", ()):
                 raise stopped(exc) from exc
             raise
         try:
@@ -7895,10 +7896,12 @@ def _audit_verify(args: argparse.Namespace) -> int:
             "otherwise: an outage causes this, and so can a row the provider or driver refuses"
         )
         return 1
-    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+    except store_driver_errors() as exc:  # #1670: a path that is not a database
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; this catch is what a server backend's open still lands in, so both guards
-        # stay live. A driver error after the open is a FAIL above (vault BACKLOG #3054, item 10).
+        # stay live. Every backend's driver errors, so a server refusing the connection is exit 2
+        # and not the floor's 1. A driver error reading the chain's rows is a FAIL above (vault
+        # BACKLOG #3054, item 10).
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
     ok, message = verdict
     if verdict.key_unavailable:
@@ -9502,13 +9505,14 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
 
 
 class _AuditWalkStopped(RuntimeError):
-    """A key or key-provider error raised AFTER the store opened, while ``audit-verify`` walked the
-    chain (vault BACKLOG #3054, item 8). Its text is the class names of the error and its cause
+    """A key, key-provider or driver error raised while ``audit-verify`` read the chain's rows: in
+    the walk, or in the open's own read of them (vault BACKLOG #3054, items 8 and 10). It does not
+    mean the store finished opening. Its text is the class names of the error and its cause
     only: under Transit the error is raised for a row's MAC, and its own text is not this command's
     to print."""
 
 
-def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool) -> int:
+def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
     """One line and exit 2 for a store that could not be opened (BACKLOG #1670).
 
     EXIT 2 AND NOT 1, DELIBERATELY. These subcommands already spend 1 on a negative *finding* --

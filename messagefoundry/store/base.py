@@ -101,6 +101,7 @@ from messagefoundry.store.store import (
     StreamingAttachmentsUnsupported,
     UserRecord,
     WebAuthnCredential,
+    note_audit_chain_read,
 )
 
 log = logging.getLogger(__name__)
@@ -3127,7 +3128,9 @@ async def _refuse_to_start_a_keyless_chain(
         # A keyed chain is never empty, since it holds its genesis row. So an empty log is one
         # nobody has started, and this handle's first append would start it keyless.
         starts_keyless = count == 0
-    except BaseException:
+    except BaseException as exc:
+        # The anchor read is a read of the chain's newest row (vault BACKLOG #3054, item 10).
+        note_audit_chain_read(exc)
         await _close_quietly(store)
         raise
     if starts_keyless:
