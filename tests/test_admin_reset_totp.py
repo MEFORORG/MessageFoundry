@@ -635,7 +635,9 @@ def test_a_re_enrolment_during_the_prompt_is_not_overwritten(
     shown = _live_terminal(monkeypatch)
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol_while_re_enrolled)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
-    assert "enrolled again while this command ran" in _error(capsys)
+    error = _error(capsys)
+    assert "enrolled again while this command ran" in error
+    assert "delete it: its seed was never stored" in error
     after = _state(db)
     assert (after["enabled"], after["secret"], after["sessions"]) == (True, other_seed, 1)
     assert _audit_rows(db) == []
@@ -718,14 +720,79 @@ def test_a_failure_after_the_swap_still_shows_the_codes_and_says_the_seed_was_re
 
     monkeypatch.setattr(MessageStore, "replace_totp_enrolment", replace)
     monkeypatch.setattr(MessageStore, "close", close)
-    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    # Exit 3, not 1: 1 is a refusal that wrote nothing.
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 3
     body = json.loads(capsys.readouterr().out)
-    assert body["code"] == "replaced_then_failed"
+    assert body["code"] == "replaced_then_failed" and body["replaced"] is True
+    assert body["recovery_codes_shown"] is True
     assert "WAS replaced" in body["error"] and "cannot open the store" not in body["error"]
     assert "New recovery codes" in "".join(console.shown)
     monkeypatch.setattr(MessageStore, "close", real_close)
     assert _state(db)["secret"] == _NEW_SECRET
     assert len(_audit_rows(db)) == 1
+
+
+def _commit_then_raise(monkeypatch: pytest.MonkeyPatch, *, reread_fails: bool) -> None:
+    """The server-backend shape a SQLite store cannot produce on its own: the swap's COMMIT lands,
+    then the call raises, as a lost acknowledgment or a failed pool release would. With
+    ``reread_fails`` the re-read that would say whether it landed fails too."""
+    real_replace = MessageStore.replace_totp_enrolment
+    real_secret = MessageStore.get_totp_secret
+    committed: list[bool] = []
+
+    async def replace(self: MessageStore, *a: Any, **k: Any) -> int | None:
+        await real_replace(self, *a, **k)
+        committed.append(True)
+        raise RuntimeError("probe: the commit acknowledgment was lost")
+
+    async def secret(self: MessageStore, user_id: str) -> str | None:
+        if committed and reread_fails:
+            raise RuntimeError("probe: the store stopped answering")
+        return await real_secret(self, user_id)
+
+    monkeypatch.setattr(MessageStore, "replace_totp_enrolment", replace)
+    monkeypatch.setattr(MessageStore, "get_totp_secret", secret)
+
+
+def test_an_error_after_a_landed_commit_is_read_back_and_reported_as_a_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    console: _Console,
+) -> None:
+    """An error from the swap does not by itself mean nothing was written. The command re-reads
+    the seed: here it finds the new one, so it reports a replacement and shows the codes, rather
+    than telling the operator the old entry still works."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "landed.db"
+    _seed(db)
+    _commit_then_raise(monkeypatch, reread_fails=False)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 3
+    body = json.loads(capsys.readouterr().out)
+    assert body["code"] == "replaced_then_failed" and "WAS replaced" in body["error"]
+    assert body["sessions_ended"] == "unknown"
+    assert "New recovery codes" in "".join(console.shown)
+    monkeypatch.undo()
+    assert _state(db)["secret"] == _NEW_SECRET
+
+
+def test_an_error_whose_outcome_cannot_be_read_back_says_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    console: _Console,
+) -> None:
+    """When the re-read fails too, the command says the outcome is unknown, tells the operator to
+    keep both entries, and still shows the codes, which a swap that landed has nowhere else."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "unknown.db"
+    _seed(db)
+    _commit_then_raise(monkeypatch, reread_fails=True)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 3
+    body = json.loads(capsys.readouterr().out)
+    assert body["code"] == "replacement_unknown" and "UNKNOWN" in body["error"]
+    assert "Keep both" in body["error"]
+    assert "Recovery codes for the NEW entry" in "".join(console.shown)
 
 
 def test_kept_passkeys_are_warned_about_in_text_output(
@@ -763,7 +830,8 @@ def test_kept_passkeys_are_warned_about_in_text_output(
 
     _with_store(db, add_passkey)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db)]) == 0
-    assert "passkeys were kept" in capsys.readouterr().out
+    # A diagnostic, so stderr (BACKLOG #1673); the --json body carries passkeys_kept.
+    assert "passkeys were kept" in capsys.readouterr().err
 
 
 def test_a_store_key_that_cannot_be_resolved_exits_2(

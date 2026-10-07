@@ -7213,7 +7213,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     **After the commit nothing can undo the swap, so nothing may hide it.** The codes are shown
     first, then the holder gets an ``mfa_enabled`` notice, best effort, after the audit row. A
-    failure after the commit is reported as what it is: the seed WAS replaced.
+    failure after the commit is reported as what it is: the seed WAS replaced, exit 3. An error
+    from the swap itself is read back first, because on a server backend it can follow the COMMIT;
+    the ADR's table gives the three outcomes.
     """
     import getpass
     import time as _time
@@ -7273,7 +7275,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     async def refusal_for(store: Store, user: UserRecord) -> str | None:
         """Why this account's seed cannot be replaced here, or ``None``. Asked twice: before the
-        key is shown, and again inside the write's open, so a change in between is caught."""
+        key is shown, and again inside the write's open, so a change during the prompt is caught.
+        A role, disabled or peer change in the moment between the second ask and the UPDATE is
+        not; the engine-stopped rule covers that (ADR 0171 Amendment B, Not addressed)."""
         if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
             return (
                 f"the account {user.username!r} is not an Administrator; an Administrator resets "
@@ -7328,10 +7332,25 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         return _emit_error(checked, as_json=args.json)
     target = checked
     username = target.username
+    try:
+        # Before the key is shown: a shell whose OS user cannot be named fails here, not after the
+        # operator has enrolled a seed that would never be stored.
+        actor = f"cli:{getpass.getuser()}"
+    except OSError as exc:
+        return _emit_error(
+            f"cannot name the OS user for the audit row ({exc}); nothing was written",
+            as_json=args.json,
+        )
 
-    # The app lists an entry by this name, so the new one is named apart from the old one, which
-    # carries the bare username (provision-admin and the web console both label it that way).
-    label = f"{username} (replaced {_time.strftime('%Y-%m-%d')})"
+    # The app lists an entry by this name. The old entry carries the bare username (provision-admin
+    # and the web console label it that way), and the time keeps a second run apart from the first.
+    # No colon in it: the URI's label uses one to separate the issuer from the account.
+    label = f"{username} (replaced {_time.strftime('%Y%m%d-%H%M%S')})"
+    # Every refusal after the key was shown says so, or the app keeps an entry for a seed that was
+    # never stored, under the name the next run's entry will resemble.
+    unused_entry = (
+        f" If you added the new {label!r} entry to the app, delete it: its seed was never stored."
+    )
     try:
         secret, code, read_at = _enrol_totp_at_terminal(
             username=username,
@@ -7345,20 +7364,32 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             label=label,
         )
     except _PasswordEntryRefused as exc:
-        return _emit_error(str(exc), as_json=args.json)
+        return _emit_error(_sentence(exc) + unused_entry, as_json=args.json)
     # The prompt proved the code but returns no step (provision-admin hands the code to the service,
     # which derives the step the same way). The swap records this step, so the proving code is spent.
     step = totp.verify_totp_step(secret, code, now=read_at, window=settings.auth.totp_skew_steps)
     if step is None:  # reachable only through a stubbed prompt; refused rather than asserted
         return _emit_error(
-            "the authenticator code did not match; nothing was written", as_json=args.json
+            "the authenticator code did not match; nothing was written." + unused_entry,
+            as_json=args.json,
         )
     plain_codes = totp.generate_recovery_codes(settings.auth.mfa_recovery_code_count)
     code_hashes = [hash_password(c) for c in plain_codes]
-    actor = f"cli:{getpass.getuser()}"
-    #: Filled the moment the swap commits. Anything that fails after that is reported as a seed that
-    #: WAS replaced, never as a refusal, and the codes are still shown.
+    #: Filled the moment the swap is known to have committed. Anything that fails after that is
+    #: reported as a seed that WAS replaced, never as a refusal, and the codes are still shown.
     swapped: list[tuple[UserRecord, dict[str, Any]]] = []
+    #: Filled when the swap raised and the re-read that would say whether it landed failed too.
+    unknown: list[UserRecord] = []
+    reread_errors: tuple[type[Exception], ...] = (*store_errors, CipherError)
+
+    async def swap_landed(store: Store, user_id: str) -> bool | None:
+        """After a store error from the swap, did its commit land anyway? On a server backend an
+        error can follow the COMMIT, a lost acknowledgment or a failed pool release, so the error
+        alone does not say. ``None`` when the re-read fails too."""
+        try:
+            return await store.get_totp_secret(user_id) == secret
+        except reread_errors:
+            return None
 
     async def run() -> str | None:
         """The swap, its session sweep and its audit row in one transaction, or why not."""
@@ -7368,11 +7399,11 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             if user is None or user.id != target.user_id:
                 return (
                     f"the account {wanted!r} was removed or replaced while this command ran; "
-                    "nothing was written. Run the command again"
+                    "nothing was written. Run the command again." + unused_entry
                 )
             again = await refusal_for(store, user)
             if again is not None:
-                return again
+                return _sentence(again) + unused_entry
             _refuse_an_unauditable_write(store)
             report: dict[str, Any] = {
                 "recovery_codes_issued": len(plain_codes),
@@ -7391,39 +7422,74 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     expected_enrolled_at=target.enrolled_at,
                     audit=AuditAppend(ADMIN_TOTP_RESET_ACTION, actor=actor, detail=detail),
                 )
-            except store_errors as exc:
-                # One transaction: the seed, the session sweep and the audit row rolled back as one.
-                return (
-                    f"the store refused the replacement ({_sentence(exc)} The new seed, its audit "
-                    "row and the session sweep are one write, so none of them landed: nothing was "
-                    "written, and the old authenticator entry still works. If the engine is "
-                    "running, stop it and run the command again"
-                )
+            except Exception as exc:
+                # Any error may follow the commit, so every one is read back. Only a store refusal
+                # that the re-read confirms becomes a refusal; a defect still reaches the dispatch
+                # floor, after the re-read has said whether the swap landed.
+                landed = await swap_landed(store, user.id)
+                if landed is False and not isinstance(exc, store_errors):
+                    raise
+                if landed is False:
+                    # One transaction: the seed, the session sweep and the audit row rolled back
+                    # as one, and the re-read confirms the old seed is still there.
+                    return (
+                        f"the store refused the replacement ({_sentence(exc)} The new seed, its "
+                        "audit row and the session sweep are one write, and the account still holds "
+                        "its old seed: nothing was written, and the old authenticator entry still "
+                        "works. If the engine is running, stop it and run the command again."
+                        + unused_entry
+                    )
+                if landed:
+                    swapped.append((user, {**report, "sessions_ended": "unknown"}))
+                else:
+                    unknown.append(user)
+                raise
             if ended is None:
                 return (
                     f"the authenticator of {user.username!r} was removed or enrolled again while "
                     "this command ran, so nothing was replaced; nothing was written. Stop the "
-                    "engine and run the command again"
+                    "engine and run the command again." + unused_entry
                 )
             swapped.append((user, {**report, "sessions_ended": ended}))
             return None
         finally:
             await store.close()
 
-    failure: Exception | None = None
+    failure: BaseException | None = None
     try:
         refused = run_guarded(run())
-    except Exception as exc:
-        if not swapped:
+    except BaseException as exc:  # noqa: BLE001 - re-raised below unless the swap may have landed
+        if not (swapped or unknown):
             if isinstance(exc, open_refusals):
                 return open_refused(exc)
             raise  # nothing written; not a known refusal, so the dispatch floor reports it
-        # After the commit, so the store's close is what failed. The swap stands.
+        # The swap committed, or may have, before this failure: Ctrl-C included, the codes must
+        # still reach the operator and the report must say what happened.
         failure, refused = exc, None
     if refused is not None:
         return _emit_error(refused, as_json=args.json)
-    user, report = swapped[0]
 
+    if unknown:
+        # The error and the failed re-read leave the outcome open. The codes are shown, because a
+        # swap that did land has no other copy of them anywhere.
+        codes_shown = bool(plain_codes) and _show_recovery_codes_once(
+            plain_codes,
+            heading="Recovery codes for the NEW entry, shown once. They work only if the "
+            "replacement landed, which this command could not confirm.",
+            which="the new recovery codes",
+            without_them="Run this command again from a console once the store answers.",
+        )
+        _emit_error(
+            f"the store reported an error during the replacement for {username!r} "
+            f"({_sentence(failure)} The account could not be re-read, so whether its seed was "
+            "replaced is UNKNOWN. Keep both authenticator entries. Sign in with the new one: if it "
+            "works the replacement landed, and if it does not the old one still works.",
+            as_json=args.json,
+            code="replacement_unknown",
+        )
+        return 3
+
+    user, report = swapped[0]
     codes_shown = bool(plain_codes) and _show_recovery_codes_once(
         plain_codes,
         heading="New recovery codes, shown once; the old ones no longer work.",
@@ -7461,8 +7527,28 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         )
         report["holder_notice"] = "no_channel"
     report["recovery_codes_shown"] = codes_shown
+    # Diagnostics, so stderr in both modes (BACKLOG #1673): the --json body carries the same facts.
+    if report["passkeys_kept"]:
+        print(
+            "WARNING: the account's passkeys were kept and still sign in. If a device holding one "
+            "may be compromised too, remove that passkey from the web console.",
+            file=sys.stderr,
+        )
+    if report["holder_notice"] == "no_channel":
+        print(
+            "WARNING: no security notice was sent to the account's notification address: no "
+            "[alerts] relay is configured, or a WARNING above says why.",
+            file=sys.stderr,
+        )
+    elif report["holder_notice"] == "no_address":
+        print(
+            "WARNING: the account has no notification address, so no security notice was sent.",
+            file=sys.stderr,
+        )
     if failure is not None:
-        return _emit_error(
+        # EXIT 3, NOT 1: 1 is a refusal that wrote nothing, and a script reading only the code
+        # must not take a replaced seed for one. 2 stays "could not start".
+        message = (
             f"the authenticator seed of {username!r} WAS replaced, with its audit row, and its "
             f"sessions were ended, but the command then failed ({_sentence(failure)} The new "
             "authenticator entry works and the old one does not; "
@@ -7470,10 +7556,22 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 "the new recovery codes were shown on the console"
                 if codes_shown
                 else "run the command again from a console to get recovery codes"
-            ),
-            as_json=args.json,
-            code="replaced_then_failed",
+            )
         )
+        if args.json:
+            _print_json(
+                {
+                    "error": message,
+                    "code": "replaced_then_failed",
+                    "replaced": True,
+                    "username": username,
+                    **report,
+                },
+                compact=True,
+            )
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        return 3
     if args.json:
         _print_json(
             {
@@ -7492,16 +7590,6 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         f"{report['sessions_ended']} session(s). The old authenticator entry and the old recovery "
         "codes no longer work."
     )
-    if report["passkeys_kept"]:
-        _safe_print(
-            "WARNING: the account's passkeys were kept and still sign in. If a device holding one "
-            "may be compromised too, remove that passkey from the web console."
-        )
-    if report["holder_notice"] == "no_channel":
-        _safe_print(
-            "WARNING: no security notice was sent to the account's notification address: no "
-            "[alerts] relay is configured, or a WARNING above says why."
-        )
     return 0
 
 
