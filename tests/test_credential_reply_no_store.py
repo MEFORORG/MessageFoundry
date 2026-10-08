@@ -6,7 +6,9 @@ A session token, a staged TOTP seed, one-time recovery codes and an admin-issued
 all reach a bearer client in a response body. None of those replies may sit in a proxy or browser
 cache. Three of them set the header and four did not: ``POST /auth/login``, ``POST
 /auth/negotiate``, ``POST /me/mfa/enroll`` and ``POST /users/{user_id}/reset-password`` (BACKLOG
-#1185). All seven now declare the ``_no_store_reply`` route dependency in ``api/auth_routes.py``.
+#1185). Each then declared a ``_no_store_reply`` route dependency. Since BACKLOG #2372 none
+declares anything: each response model subclasses ``CredentialReply``, and the engine's route class
+adds ``security.no_store_reply`` to every route returning one, so a new route cannot forget it.
 
 ``tests/test_no_store_phi_coverage.py`` could not see them. Its classification arm examines a field
 only when the field's NAME matches a rated store column, and the enroll reply returns the PL-3
@@ -19,15 +21,19 @@ until it is driven here. The second drives every one of them through the real AS
 and reads the header off the wire, so a route that drops the dependency reds even if the set is
 unchanged.
 
-**What this cannot see.** It keys on a closed list of field NAMES, the same shape of blind spot it
-covers in the PHI guard. A credential returned under a new name (``api_key``, ``refresh_token``) is
-neither pinned nor driven until someone adds the name. That shape rests on review.
+Two more read the route table rather than the wire (BACKLOG #2372): every model holding a credential
+field name must be marked, and every route returning a marked model must carry the no-store step.
+
+**What this cannot see.** A credential returned under a new field name (``api_key``,
+``refresh_token``) in a model nobody marked is neither served no-store nor caught here. Marking the
+model is the one act left, and that shape rests on review.
 """
 
 from __future__ import annotations
 
 import base64
 import functools
+import inspect
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -35,9 +41,13 @@ from typing import Any
 import httpx
 import pytest
 from _totp_clock import fresh_totp
+from fastapi import Depends
 from fastapi.routing import APIRoute
+from pydantic import BaseModel
 
 from messagefoundry.api import create_app
+from messagefoundry.api.auth_models import CredentialReply, CurrentUser, LoginResponse
+from messagefoundry.api.security import carries_credential, no_store_reply, public_route
 from messagefoundry.auth import Role
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -76,16 +86,117 @@ def _app_routes() -> tuple[Any, ...]:
     return tuple(create_app().routes)
 
 
+def _is_credential_model(model: type[BaseModel]) -> bool:
+    """Marked as a credential reply, or carrying a credential field name, or both."""
+    return issubclass(model, CredentialReply) or bool(set(model.model_fields) & _CREDENTIAL_FIELDS)
+
+
 def _credential_routes(routes: tuple[Any, ...] | list[Any]) -> set[tuple[str, str]]:
     found: set[tuple[str, str]] = set()
     for route in routes:
         if not isinstance(route, APIRoute):
             continue
-        if any(
-            set(m.model_fields) & _CREDENTIAL_FIELDS for m in _response_models(route.response_model)
-        ):
+        if any(_is_credential_model(m) for m in _response_models(route.response_model)):
             found |= {(method, route.path) for method in route.methods or set()}
     return found
+
+
+def _declares_no_store(route: APIRoute) -> bool:
+    return any(d.call is no_store_reply for d in route.dependant.dependencies)
+
+
+def test_every_credential_model_is_marked() -> None:
+    """BACKLOG #2372. A response model holding a credential field name must subclass
+    ``CredentialReply``, because the mark is what makes the route class serve it no-store. The field
+    names are the backstop for a model someone forgot to mark."""
+    models = {
+        m
+        for route in _app_routes()
+        if isinstance(route, APIRoute)
+        for m in _response_models(route.response_model)
+    }
+    assert len(models) > 20, "the walk found too few response models to mean anything"
+    unmarked = sorted(
+        m.__name__
+        for m in models
+        if set(m.model_fields) & _CREDENTIAL_FIELDS and not issubclass(m, CredentialReply)
+    )
+    assert unmarked == [], (
+        f"carry a credential field but do not subclass CredentialReply: {unmarked}"
+    )
+
+
+def test_every_credential_route_carries_the_no_store_step() -> None:
+    """BACKLOG #2372. Read off the built route table, so it covers a route no test drives: every
+    route whose response model is or contains a credential model has the ``no_store_reply`` step.
+    A route added through ``include_router`` or with the credential model nested inside another
+    model escapes the route class, and reds here."""
+    routes = [r for r in _app_routes() if isinstance(r, APIRoute)]
+    credential = [
+        r
+        for r in routes
+        if any(_is_credential_model(m) for m in _response_models(r.response_model))
+    ]
+    assert len(credential) >= len(_EXPECTED), "control: the walk sees the credential routes"
+    missing = sorted(r.path for r in credential if not _declares_no_store(r))
+    assert missing == [], f"credential routes without the no-store step: {missing}"
+
+
+def test_a_route_returning_a_credential_model_by_annotation_carries_the_step() -> None:
+    """The escape the route class cannot see: ``response_model=None`` with an endpoint annotated to
+    return a credential model. Read off each endpoint's return annotation instead."""
+    returning = [
+        route
+        for route in _app_routes()
+        if isinstance(route, APIRoute)
+        and carries_credential(inspect.signature(route.endpoint, eval_str=True).return_annotation)
+    ]
+    assert len(returning) >= len(_EXPECTED), "control: the walk sees the credential handlers"
+    missing = sorted(route.path for route in returning if not _declares_no_store(route))
+    assert missing == [], f"handlers returning a credential model without no-store: {missing}"
+
+
+class _Wrapped(BaseModel):
+    """A model that holds a credential reply in a field rather than being one."""
+
+    login: LoginResponse
+
+
+def test_the_route_class_adds_the_step_with_nothing_declared() -> None:
+    """The mechanism, on routes this file plants: a credential model gets the step whether the
+    route names its response model or only annotates the return, and declares nothing else. A
+    model that carries no credential gets none, so the step is not simply on every route."""
+    app = create_app()
+
+    async def _explicit() -> Any:
+        raise AssertionError("never called")
+
+    async def _inferred() -> LoginResponse:
+        raise AssertionError("never called")
+
+    async def _plain() -> CurrentUser:
+        raise AssertionError("never called")
+
+    app.post("/planted/explicit", response_model=LoginResponse)(public_route("test")(_explicit))
+    app.post("/planted/inferred")(public_route("test")(_inferred))
+    app.post("/planted/optional", response_model=LoginResponse | None)(
+        public_route("test")(_explicit)
+    )
+    app.get("/planted/plain")(public_route("test")(_plain))
+    app.post("/planted/nested", response_model=_Wrapped)(public_route("test")(_explicit))
+    planted = {r.path: r for r in app.routes if isinstance(r, APIRoute) and "/planted/" in r.path}
+    assert len(planted) == 5
+    assert _declares_no_store(planted["/planted/nested"])
+    assert _declares_no_store(planted["/planted/explicit"])
+    assert _declares_no_store(planted["/planted/inferred"])
+    assert _declares_no_store(planted["/planted/optional"])
+    assert not _declares_no_store(planted["/planted/plain"])
+    # Declared once, not twice, when a route also names the step itself.
+    app.post(
+        "/planted/twice", response_model=LoginResponse, dependencies=[Depends(no_store_reply)]
+    )(public_route("test")(_explicit))
+    (twice,) = [r for r in app.routes if isinstance(r, APIRoute) and r.path == "/planted/twice"]
+    assert sum(d.call is no_store_reply for d in twice.dependant.dependencies) == 1
 
 
 @pytest.fixture
@@ -105,7 +216,7 @@ def test_the_credential_route_set_is_pinned() -> None:
     found = _credential_routes(_app_routes())
     assert found == _EXPECTED, (
         f"credential-bearing routes changed. New: {sorted(found - _EXPECTED)}. "
-        f"Gone: {sorted(_EXPECTED - found)}. A new one must declare _no_store_reply and be driven below."
+        f"Gone: {sorted(_EXPECTED - found)}. A new one must return a CredentialReply and be driven below."
     )
 
 

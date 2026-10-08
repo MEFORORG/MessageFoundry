@@ -32,6 +32,7 @@ from typing import Any, cast
 
 import pytest
 from fastapi import HTTPException
+from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
 import messagefoundry.api.header_floor as header_floor
@@ -255,7 +256,7 @@ def _fake_websocket(headers: dict[str, str]) -> Any:
         auth=None,
     )
     return SimpleNamespace(
-        headers=headers,
+        headers=Headers(headers),  # has getlist (BACKLOG #2454)
         app=SimpleNamespace(state=state),
         url=SimpleNamespace(scheme="wss", path="/ws/stats"),
         cookies=_RecordingCookies(),
