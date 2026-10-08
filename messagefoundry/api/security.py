@@ -83,7 +83,11 @@ def alert_administrator_granted(state: Any, key: str, *, via: str, granted_by: s
         alert_sink_for(state).administrator_granted(key, via=via, granted_by=granted_by)
     except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not 500 a
         # call whose write is already committed and audited.
-        log.exception("the administrator_granted alert for %r failed to emit", key)
+        # Scrubbed for CodeQL py/log-injection (alert 264); scrub_log_argument says why. Over
+        # ``repr``, as in ``LoggingAlertSink.administrator_granted``, so the line reads as before.
+        log.exception(
+            "the administrator_granted alert for %s failed to emit", scrub_log_argument(repr(key))
+        )
 
 
 def alert_directory_administrator_granted(state: Any, outcome: LoginOutcome, *, via: str) -> None:

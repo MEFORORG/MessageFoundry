@@ -16,12 +16,18 @@ unredacted; this one cannot be, because it only ever sees the queue's side of th
 Each line is one UTF-8 JSON object, ``{"v": 1, "level": "<levelname>", "line": "<rendered text>"}``,
 ending in ``\\n``. JSON escaping keeps one entry on one physical line whatever the rendered text holds.
 ``level`` is kept because the syslog priority is derived from it when the entry is finally sent.
+Text is written as itself, in UTF-8, so its cost against the cap is its real size. The one exception
+is an entry holding a lone surrogate, which has no UTF-8 form and is written with ASCII escapes.
 
 **Rotation and bound.** Appends go to the newest segment until it reaches ``segment_bytes``; the next
 append opens a new one. The whole directory is capped at ``max_bytes`` on disk. An append that would
 cross the cap is DROPPED and counted, newest first, which keeps the oldest evidence -- the same
 choice the in-memory queue makes, for the same reason. A segment is deleted as soon as every entry in
-it has been sent, so a drained spool holds no files.
+it has been sent, so a drained spool holds no files. A sent segment whose delete FAILED is out of
+the replay order but still on disk, so it stays counted against the cap until :meth:`LogSpool.reclaim`
+or :meth:`LogSpool.close` deletes it. One that is still there at the next start is replayed whole,
+because nothing on disk marks it as sent. A write the disk refused is dropped and counted; the empty
+segment it would have started is removed, so a full disk does not fill the directory with empty files.
 
 **Replay order.** Strictly first in, first out: segments in sequence order, lines in file order. While
 anything is spooled, the forwarder appends new records to the spool rather than sending them live,
@@ -33,8 +39,8 @@ already appended. A power loss can lose a tail the OS had not yet written.
 **Delivery is best effort, not at least once.** After a TCP or TLS collector resets, the first send
 on the dead connection can succeed into the local kernel buffer, so that entry is marked sent and
 lost. The read position is kept in memory, so after a restart the oldest segment is replayed from its
-start: a collector can see up to one segment (one eighth of the cap, 12.5 MB at the default 100 MB)
-twice. Over UDP no send failure is detectable at all. ADR 0200 states the same limits. A torn or unreadable line (a crash mid-write) is skipped
+start: a collector can see at least one segment (one eighth of the cap, 12.5 MB at the default
+100 MB) twice, and also every sent segment whose delete failed and that is still on disk. Over UDP no send failure is detectable at all. ADR 0200 states the same limits. A torn or unreadable line (a crash mid-write) is skipped
 and counted, never guessed at. After a restart, appends always start a NEW segment, so they never
 extend a file whose tail may be torn.
 
@@ -73,6 +79,10 @@ _LOCK_NAME = "spool.lock"
 class SpoolUnavailable(OSError):
     """The spool directory could not be opened for this process (unwritable, or locked by another)."""
 
+    #: Whether the cause is another process holding the lock. That process sends whatever the
+    #: directory holds; in every other case nothing does.
+    in_use = False
+
 
 @dataclass(frozen=True, slots=True)
 class SpoolEntry:
@@ -83,9 +93,15 @@ class SpoolEntry:
 
     def encode(self) -> bytes:
         payload = {"v": SPOOL_FORMAT_VERSION, "level": self.level, "line": self.line}
-        # ensure_ascii (the default): a lone surrogate in a record is written as its escape instead
-        # of raising UnicodeEncodeError on the listener thread, which would end that thread.
-        return (json.dumps(payload) + "\n").encode("ascii")
+        # Real UTF-8, so a non-ASCII character costs its own bytes against the cap and not a
+        # six-byte escape each (BACKLOG #2279). JSON still escapes every control character, so one
+        # entry stays on one physical line, and no UTF-8 sequence contains the newline byte.
+        try:
+            return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        except UnicodeEncodeError:
+            # A lone surrogate has no UTF-8 form. Write that one entry escaped, as before, instead
+            # of raising on the listener thread, which would end that thread. decode() reads both.
+            return (json.dumps(payload) + "\n").encode("ascii")
 
     @staticmethod
     def decode(raw: bytes) -> SpoolEntry | None:
@@ -110,6 +126,18 @@ def _segment_seq(path: Path) -> int | None:
     # Only the canonical 12 ASCII digits this module writes: `spool-1.jsonl` would parse as seq 1
     # while _path(1) names a different file, and str.isdigit() accepts non-ASCII digits.
     return int(digits) if len(digits) == 12 and digits.isascii() and digits.isdigit() else None
+
+
+def count_segments(directory: str | Path) -> int:
+    """How many spool segment files ``directory`` holds. ``0`` if it does not exist.
+
+    Reads names only, takes no lock and changes nothing, so it is safe on a directory another
+    process is spooling into. A directory that exists but cannot be listed raises ``OSError``:
+    "cannot tell" must not read as "nothing there"."""
+    try:
+        return sum(1 for path in Path(directory).iterdir() if _segment_seq(path) is not None)
+    except (FileNotFoundError, NotADirectoryError):
+        return 0
 
 
 def _try_lock(fd: int) -> bool:
@@ -159,6 +187,9 @@ class LogSpool:
         self.unreadable = 0
         #: Reads that failed for a reason other than a missing file. The files are kept.
         self.read_errors = 0
+        #: Whether the LAST read failed that way. :attr:`read_errors` never goes down, so it cannot
+        #: say whether a fault is still standing; this can.
+        self.read_faulted = False
         self._lock_fd: int | None = None
         #: Segment sequence numbers on disk, oldest first. The last one is the write segment once an
         #: append has opened it.
@@ -170,9 +201,17 @@ class LogSpool:
         self._read_seq: int | None = None
         self._peeked: SpoolEntry | None = None
         self._peeked_end = 0
-        #: The highest segment number ever seen or issued. Never reused: a segment whose unlink
-        #: failed stays on disk, and reusing its number would collide with it on O_EXCL for good.
+        #: The highest segment number on disk or issued. Never reused while its file may exist: a
+        #: segment whose unlink failed stays on disk, and reusing its number would collide with it
+        #: on O_EXCL for good. Only an empty write segment that WAS deleted hands its number back.
         self._last_seq = 0
+        #: Sent segments whose file would not delete (BACKLOG #2279). Out of the replay order, but
+        #: still on disk, so their bytes stay in :attr:`_sizes` and count against the cap.
+        self._undeleted: list[int] = []
+        #: The directories :meth:`open` made itself, leaf first, and whether it made the lock file.
+        #: :meth:`discard_unused` removes only what this object created.
+        self._created_dirs: list[Path] = []
+        self._created_lock = False
 
     # --- lifecycle ------------------------------------------------------------------------------
 
@@ -180,18 +219,35 @@ class LogSpool:
         """Create the directory, take its lock, and index any segments a previous process left.
 
         Raises :class:`SpoolUnavailable` when the directory cannot be used by this process."""
+        lock_path = self.directory / _LOCK_NAME
         try:
-            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd = os.open(self.directory / _LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+            missing, node = [], self.directory
+            while not node.exists() and node != node.parent:
+                missing.append(node)
+                node = node.parent
+            self._created_lock = not lock_path.exists()
+            # One level at a time, recording a directory only when THIS call made it: a level
+            # another process created in between is not ours to remove, and a failure partway
+            # leaves a true list of what to take back. Owner-only for the leaf, as before.
+            for directory in reversed(missing):
+                try:
+                    os.mkdir(directory, 0o700 if directory == self.directory else 0o777)
+                except FileExistsError:
+                    continue
+                self._created_dirs.insert(0, directory)
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError as exc:
+            self._remove_created_dirs()  # no lock file was made, so they are empty, or stay
             raise SpoolUnavailable(
                 f"log spool directory {self.directory} is not usable: {exc}"
             ) from exc
         if not _try_lock(fd):
             os.close(fd)
-            raise SpoolUnavailable(
+            in_use = SpoolUnavailable(
                 f"log spool directory {self.directory} is in use by another process"
             )
+            in_use.in_use = True
+            raise in_use
         self._lock_fd = fd
         try:
             for path in self.directory.iterdir():
@@ -213,6 +269,10 @@ class LogSpool:
 
     def close(self) -> None:
         """Close the files and release the lock. Spooled entries stay on disk for the next start."""
+        if self._lock_fd is not None:
+            # Last try at files an earlier delete left: one that stays is replayed whole by the
+            # next start, which cannot tell a sent segment from a waiting one.
+            self.reclaim()
         for handle in (self._writer, self._reader):
             if handle is not None:
                 with contextlib.suppress(OSError):
@@ -227,12 +287,55 @@ class LogSpool:
                 os.close(self._lock_fd)
             self._lock_fd = None
 
+    def discard_unused(self) -> None:
+        """Close, and remove the lock file and directory this :meth:`open` created, if the spool
+        holds nothing (BACKLOG #2279).
+
+        For a caller that opened the spool and then found it has no forwarder to put behind it.
+        Without this, a start that failed left an empty directory and a ``spool.lock`` behind for
+        a spool that never ran. Nothing that was there before is removed: not a directory that
+        already existed, not a lock file an earlier run left, and never a directory holding a
+        segment, which is undelivered evidence. Does nothing on a spool that does not hold the
+        lock: the files may then be another process's."""
+        if self._lock_fd is None:
+            return
+        empty = not self._sizes
+        lock_path = self.directory / _LOCK_NAME
+        if empty and self._created_lock and sys.platform != "win32":
+            # POSIX: unlink while the lock is still held, so no other process can lock a file
+            # that is about to vanish. Windows cannot delete an open file; it goes after close().
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+        self.close()
+        if not empty:
+            return
+        if self._created_lock and sys.platform == "win32":
+            with contextlib.suppress(OSError):  # held open by another process: theirs now, keep it
+                lock_path.unlink()
+        self._remove_created_dirs()
+
+    def _remove_created_dirs(self) -> None:
+        """Remove the directories :meth:`open` created, leaf first, stopping at the first that is
+        not empty (``rmdir`` refuses one)."""
+        for directory in self._created_dirs:
+            try:
+                directory.rmdir()
+            except OSError:
+                break
+        self._created_dirs = []
+
     # --- state ----------------------------------------------------------------------------------
 
     @property
     def bytes_used(self) -> int:
         """Bytes the segments occupy on disk, delivered-but-not-yet-deleted lines included."""
         return sum(self._sizes.values())
+
+    @property
+    def undeleted_segments(self) -> int:
+        """Sent segments still on disk because their delete failed. Their bytes count in
+        :attr:`bytes_used` until :meth:`reclaim` or :meth:`close` manages to delete them."""
+        return len(self._undeleted)
 
     @property
     def pending(self) -> bool:
@@ -257,7 +360,7 @@ class LogSpool:
             writer.flush()
         except OSError:
             self.dropped += 1
-            self._close_writer()
+            self._abandon_write()
             return False
         assert self._write_seq is not None
         self._sizes[self._write_seq] += len(data)
@@ -273,13 +376,44 @@ class LogSpool:
         ):
             self._close_writer()
         if self._writer is None:
-            seq = self._last_seq = self._last_seq + 1
-            fd = os.open(self._path(seq), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY, 0o600)
+            seq = self._last_seq + 1
+            try:
+                fd = os.open(self._path(seq), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY, 0o600)
+            except FileExistsError:
+                self._last_seq = seq  # a leftover holds this number: step past it, or stick here
+                raise
+            # Taken only once the file exists, so a create the disk refused costs no number.
+            self._last_seq = seq
             self._writer = os.fdopen(fd, "ab")
             self._write_seq = seq
             self._segments.append(seq)
             self._sizes[seq] = 0
         return self._writer
+
+    def _abandon_write(self) -> None:
+        """Close the write segment after a failed write, and leave no empty file behind.
+
+        The writer is closed, not kept: a failed write may have put part of a line on disk, and an
+        append after it would join two entries into one unreadable line. So the next append opens
+        a new segment. While a disk stays full that used to leave one EMPTY file, and burn one
+        sequence number, for every record (BACKLOG #2279). An empty segment is deleted here and
+        its number handed back; one that holds bytes is kept and its real size counted."""
+        seq = self._write_seq
+        self._close_writer()
+        if seq is None:
+            return  # the create itself failed: there is no file
+        try:
+            on_disk = self._path(seq).stat().st_size
+        except OSError:
+            return
+        if on_disk:
+            self._sizes[seq] = on_disk
+            return
+        self._retire(seq)
+        if seq not in self._undeleted:
+            # The write segment is always the newest number, and its file is gone, so handing the
+            # number back cannot collide with anything on disk.
+            self._last_seq = seq - 1
 
     def _close_writer(self) -> None:
         if self._writer is not None:
@@ -299,7 +433,9 @@ class LogSpool:
         other ``OSError`` (out of descriptors, a sharing violation) keeps every file and returns
         ``None``, so the caller tries again later instead of deleting undelivered records."""
         try:
-            return self._peek()
+            entry = self._peek()
+            self.read_faulted = False
+            return entry
         except FileNotFoundError:
             self.unreadable += 1
             seq = self._segments[0] if self._segments else None
@@ -310,6 +446,7 @@ class LogSpool:
             return None
         except OSError:
             self.read_errors += 1
+            self.read_faulted = True
             self._close_reader()
             return None
 
@@ -374,10 +511,30 @@ class LogSpool:
                 self._reader.close()
             self._reader = None
             self._read_seq = None
-        with contextlib.suppress(OSError):
-            self._path(seq).unlink()
         self._segments.remove(seq)
-        self._sizes.pop(seq, None)
+        if self._unlink(seq):
+            self._sizes.pop(seq, None)
+        else:
+            # Still on disk, so still counted. Dropping its size here would let the directory
+            # grow past the cap by one segment for every delete that failed (BACKLOG #2279).
+            self._undeleted.append(seq)
+
+    def _unlink(self, seq: int) -> bool:
+        """Delete segment ``seq``'s file. Whether it is gone afterwards."""
+        try:
+            self._path(seq).unlink(missing_ok=True)
+        except OSError:
+            return False
+        return True
+
+    def reclaim(self) -> None:
+        """Try again to delete the sent segments whose delete failed, and stop counting those now
+        gone. One ``unlink`` per leftover, so the caller decides how often: nothing in this class
+        calls it per record."""
+        freed = [seq for seq in self._undeleted if self._unlink(seq)]
+        for seq in freed:
+            self._undeleted.remove(seq)
+            self._sizes.pop(seq, None)
 
 
 #: ``O_BINARY`` on Windows (no newline translation), zero elsewhere.

@@ -117,10 +117,12 @@ let realExecFile!: typeof import("node:child_process").execFile;
 if (NODE_SIDE) {
   // sourceControl.js reads the workspace through cli.js and runs git through git.js. Another node-side
   // suite may already have loaded cli.js bound to ITS vscode stub, and a cached copy would answer
-  // "no workspace" here, which makes every refusal below pass for the wrong reason. So these three are
+  // "no workspace" here, which makes every refusal below pass for the wrong reason. So these four are
   // loaded fresh against this stub, and whatever the cache held before is put back afterwards, so
   // the other suite keeps the bindings it loaded.
-  const fresh = ["../../sourceControl", "../../cli", "../../git"].map((m) => require.resolve(m));
+  const fresh = ["../../sourceControl", "../../checksChannel", "../../cli", "../../git"].map((m) =>
+    require.resolve(m),
+  );
   const saved = new Map(fresh.map((f) => [f, require.cache[f]]));
   for (const f of fresh) {
     delete require.cache[f];
