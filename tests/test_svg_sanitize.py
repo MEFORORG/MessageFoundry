@@ -11,13 +11,16 @@ input would fail here: the drawing tests are the negative control.
 
 from __future__ import annotations
 
+import gzip
 import re
 import time
+import zlib
 from xml.etree.ElementTree import Element
 
 import pytest
 
 from messagefoundry._vendor.defusedxml.ElementTree import fromstring
+from messagefoundry.api import svg_sanitize
 from messagefoundry.api.svg_sanitize import (
     SVG_NS,
     SvgRejected,
@@ -187,11 +190,315 @@ def test_an_svg_label_on_bytes_that_are_not_markup_changes_nothing() -> None:
     assert sanitize_if_svg("image/svg+xml", pdf) is pdf
 
 
-def test_svgz_is_not_markup_and_is_left_to_the_type_downgrade() -> None:
-    # Ingress already relabels a +xml label whose bytes do not start with '<', so gzip bytes arrive
-    # as application/octet-stream; either way they are served under the generic binary type.
+def test_a_gzip_body_that_is_not_gzip_inside_is_refused() -> None:
+    # The gzip magic and junk. zlib keeps no output from a call that raises, so nothing can be judged,
+    # and a corrupt gzip is never served (BACKLOG #2391, the Lander's hold on PR 2158).
     gz = bytes.fromhex("1f8b0800") + b"synthetic"
-    assert sanitize_if_svg("image/svg+xml", gz) is gz
+    with pytest.raises(SvgRejected):
+        sanitize_if_svg("image/svg+xml", gz)
+
+
+# --- BACKLOG #2391: SVGZ ---------------------------------------------------------------------------
+
+
+def _gz(data: bytes) -> bytes:
+    return gzip.compress(data, mtime=0)
+
+
+def _flip(data: bytes, at: int) -> bytes:
+    """``data`` with the byte at ``at`` inverted."""
+    out = bytearray(data)
+    out[at] ^= 0xFF
+    return bytes(out)
+
+
+def test_the_corrupt_gzip_probes_really_fail_in_zlib() -> None:
+    """Control for the refusal cases: each damaged body makes zlib raise, so the refusal is not
+    vacuous, and the undamaged one inflates."""
+    assert gzip.decompress(_gz(_HOSTILE)) == _HOSTILE
+    for damaged in (_flip(_gz(_HOSTILE), -8), _flip(_gz(_HOSTILE), -1), _flip(_gz(_HOSTILE), 12)):
+        with pytest.raises((OSError, EOFError, zlib.error)):
+            gzip.decompress(damaged)
+
+
+def test_damage_past_a_cleared_head_is_not_read() -> None:
+    """The recorded trade. A head whose first byte is not ``<`` clears the body without reading the
+    rest, so a large non-markup gzip damaged near its end is served as stored. That cannot hide an
+    SVG: a document whose first byte is not ``<`` is not one."""
+    body = _flip(_gz(b"%PDF-1.4 " + bytes(range(256)) * 2048), -8)
+    assert sanitize_if_svg("application/gzip", body) is body
+
+
+@pytest.mark.parametrize(
+    "label", ["image/svg+xml", "application/octet-stream", "application/gzip", None]
+)
+def test_svgz_is_inflated_sanitized_and_gzipped_again(label: str | None) -> None:
+    """Ingress relabels gzip bytes under a ``+xml`` label, but the bytes stay gzip, so the label is not
+    what decides. The root of the inflated document is."""
+    out = sanitize_if_svg(label, _gz(_HOSTILE))
+    assert out.startswith(b"\x1f\x8b")
+    inner = gzip.decompress(out)
+    assert inner == sanitize_svg(_HOSTILE)
+    assert b"script" not in inner and b"<rect" in inner
+    # mtime=0 makes the served copy a function of the document alone.
+    assert sanitize_if_svg(label, _gz(_HOSTILE)) == out
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        pytest.param(b"%PDF-1.4\nsynthetic\n%%EOF\n", id="not-markup"),
+        pytest.param(b'<?xml version="1.0"?><ClinicalDocument/>', id="markup-without-svg"),
+        pytest.param(b"", id="empty"),
+        pytest.param(_gz(_HOSTILE), id="gzip-in-gzip"),
+    ],
+)
+def test_gzip_that_does_not_inflate_to_svg_is_unchanged(inner: bytes) -> None:
+    """The control. A doubly-gzipped SVG is left alone: no SVG reader inflates twice."""
+    body = _gz(inner)
+    assert sanitize_if_svg("application/gzip", body) is body
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(_gz(b"<svg><rect></svg>"), id="malformed-svg"),
+        pytest.param(
+            _gz(b'<html xmlns="http://www.w3.org/1999/xhtml"><svg/></html>'), id="embedded"
+        ),
+        pytest.param(_gz(_HOSTILE)[:-12], id="truncated"),
+        pytest.param(_gz(_HOSTILE) + b"synthetic trailing junk", id="trailing-junk"),
+        pytest.param(
+            b"".join([_gz(b"<svg>")] + [_gz(b"<g/>")] * 16 + [_gz(b"</svg>")]), id="members"
+        ),
+        pytest.param(
+            _gz(b" " * (33 * 1024 * 1024) + b'<svg onload="x"/>'), id="whitespace-past-the-bound"
+        ),
+        pytest.param(_flip(_gz(_HOSTILE), -8), id="bad-crc"),
+        pytest.param(_flip(_gz(_HOSTILE), -1), id="bad-isize"),
+        pytest.param(b"\x1f\x8b" + b"synthetic junk after the magic", id="junk-after-the-magic"),
+        pytest.param(_flip(_gz(_HOSTILE), 12), id="corrupt-first-block"),
+        pytest.param(
+            _gz(b"<svg>") + _flip(_gz(b'<g onload="x"/></svg>'), -8), id="corrupt-later-member"
+        ),
+        pytest.param(_gz(b"<svg>") + b"\x00\x00" + _gz(b"</svg>"), id="nul-between-members"),
+        pytest.param(_flip(_gz(b"%PDF-1.4 synthetic"), -8), id="bad-crc-on-a-non-svg-body"),
+        pytest.param(bytes.fromhex("1f8b08"), id="header-cut-short"),
+    ],
+)
+def test_gzip_markup_that_cannot_be_vetted_is_refused(body: bytes) -> None:
+    with pytest.raises(SvgRejected):
+        sanitize_if_svg("application/gzip", body)
+
+
+def test_a_multi_member_svgz_is_vetted_as_one_document() -> None:
+    """A gzip reader concatenates members, so a script split into a second member is still seen."""
+    body = _gz(b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="1"/>') + _gz(
+        b"<script>alert(1)</script></svg>"
+    )
+    inner = gzip.decompress(sanitize_if_svg(None, body))
+    assert b"script" not in inner and b"<rect" in inner
+    # Trailing NUL padding, which some writers add, is not junk.
+    assert gzip.decompress(sanitize_if_svg(None, body + b"\x00" * 64)) == inner
+
+
+def test_a_gzip_bomb_is_bounded() -> None:
+    """The inflate stops at the size bound, so a small body cannot cost gigabytes. Markup over the
+    bound is refused; anything else over it is served as stored."""
+    svg_bomb = _gz(b"<svg>" + b" " * (40 * 1024 * 1024))
+    text_bomb = _gz(b"A" * (40 * 1024 * 1024))
+    assert len(svg_bomb) < 100_000 and len(text_bomb) < 100_000
+    started = time.perf_counter()
+    with pytest.raises(SvgRejected):
+        sanitize_if_svg("image/svg+xml", svg_bomb)
+    assert sanitize_if_svg("image/svg+xml", text_bomb) is text_bomb
+    assert time.perf_counter() - started < 10
+
+
+# --- BACKLOG #2391: SVG below a root that is not svg -----------------------------------------------
+
+_XHTML = b'<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+#: ``ESC ( B`` decodes to nothing in ISO-2022-JP, so a browser and Python's codec both read
+#: ``<s ESC ( B vg`` as ``<svg``, while no byte scan sees the name.
+_ISO2022_SVG = (
+    b'<?xml version="1.0" encoding="ISO-2022-JP"?><s\x1b(Bvg xmlns="http://www.w3.org/2000/s\x1b(Bvg">'
+    b"<script>alert(1)</script></s\x1b(Bvg>"
+)
+
+
+def test_the_iso_2022_jp_probe_really_decodes_to_svg() -> None:
+    """Control for the refusal cases below: the bytes are an SVG once decoded."""
+    assert "<svg" in _ISO2022_SVG.decode("iso2022_jp")
+    assert b"<svg" not in _ISO2022_SVG
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(_XHTML + b'<svg xmlns="http://www.w3.org/2000/svg" onload="x"/></body></html>',
+                     id="xhtml-inline-svg"),
+        pytest.param(_XHTML + b"<svg/></body></html>", id="svg-named-in-the-xhtml-namespace"),
+        pytest.param(b'<doc xmlns:s="http://www.w3.org/2000/svg"><s:script>x</s:script></doc>',
+                     id="svg-namespace-without-an-svg-element"),
+        pytest.param(b'<?xml version="1.0"?><ClinicalDocument><svg/></ClinicalDocument>', id="cda"),
+        pytest.param(b"<html><body><svg onload=x></svg></body></html>", id="html"),
+        pytest.param(b"<html><body><SVG onload=x></SVG><br></body></html>", id="html-upper-case"),
+        pytest.param(b"<html><p><x:svg/><br></html>", id="html-prefixed"),
+        pytest.param((_XHTML + b"<svg/></body></html>").decode().encode("utf-16"), id="utf-16"),
+        pytest.param(b'<?xml version="1.0" encoding="Shift_JIS"?><doc><svg/></doc>',
+                     id="unsupported-encoding"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY e "&#60;&#115;vg onload=\'x\'/>">]><doc>&e;</doc>',
+                     id="entity-built-from-character-references"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY e "&#x3C;&#115;vg/>">]><doc>&e;</doc>',
+                     id="entity-built-from-hex-references"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY e "<&#115;vg/>">]><doc>&e;</doc>',
+                     id="entity-with-a-referenced-element-name"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY e "<svg/>">]><doc>&e;</doc>', id="entity-literal"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY n "x">]>'
+                     b'<doc xmlns:s="&#104;ttp://www.w3.org/2000/svg"><s:rect/></doc>',
+                     id="namespace-from-a-reference"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY a "<x:script xmlns:x=&#34;http://www.w3.org/2000/'
+                     b'sv&#103;&#34;>x</x:script>">]>' + _XHTML + b"&a;</body></html>",
+                     id="entity-with-a-quote-written-as-a-reference"),
+        pytest.param(_XHTML + b'&nbsp;<x:script xmlns:x="http://www.w3.org/2000/sv&#103;"/>'
+                     b"</body></html>", id="referenced-namespace-after-a-parse-error"),
+        pytest.param(b'<!DOCTYPE h [<!ENTITY a "<x:script xmln&#115;:x=&#34;http://www.w3.org/2000/'
+                     b'sv&#103;&#34;>x</x:script>">]>' + _XHTML + b"&a;</body></html>",
+                     id="entity-with-a-referenced-xmlns-name"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY % p "x"><!ENTITY e "y">]><doc>&e;</doc>',
+                     id="parameter-entity"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY e "&#38;#60;svg/>">]><doc>&e;</doc>',
+                     id="entity-yielding-an-ampersand"),
+        pytest.param(b"<html><body><!-- <svg onload=x> --><br></body></html>",
+                     id="html-svg-in-a-comment-errs-toward-refusal"),
+        pytest.param(_ISO2022_SVG, id="iso-2022-jp-svg-root"),
+        pytest.param(b'<?xml version="1.0" encoding="ISO-2022-JP"?><r><s\x1b(Bvg xmlns="http://'
+                     b'www.w3.org/2000/s\x1b(Bvg"><script>alert(1)</script></s\x1b(Bvg></r>',
+                     id="iso-2022-jp-svg-below-another-root"),
+        pytest.param(b'<!DOCTYPE r [<!ENTITY n "http&#58;//www.w3.org/2000/svg">'
+                     b'<!ATTLIST script xmlns CDATA #FIXED "&n;">]><r><script>alert(1)</script></r>',
+                     id="attlist-default-namespace-through-an-entity"),
+        pytest.param(b'<?xml version="1.0" encoding="Shift_JIS"?><!DOCTYPE r [<!ATTLIST script xmlns'
+                     b' CDATA #FIXED "http&#58;//www.w3.org/2000/svg">]><r><script>alert(1)</script></r>',
+                     id="attlist-default-namespace-under-an-unsupported-encoding"),
+        pytest.param(b"<html><body><!--><svg onload=alert(1)>--></body></html>",
+                     id="html-empty-comment"),
+        pytest.param(b"<html><body><![CDATA[><svg onload=alert(1)>]]></body></html>",
+                     id="html-cdata"),
+        pytest.param(b"<html><body><?x ><svg onload=alert(1)>?></body></html>",
+                     id="html-processing-instruction"),
+        pytest.param(b'<!DOCTYPE html SYSTEM "x><svg onload=alert(1)>"><html/>',
+                     id="html-doctype-literal"),
+    ],
+)  # fmt: skip
+def test_markup_carrying_svg_below_another_root_is_refused(data: bytes) -> None:
+    """BACKLOG #2391. The parser decides where it can read the document; a byte scan decides where it
+    cannot, and leans toward refusal. An entity is never expanded to find out."""
+    assert may_be_svg(data)
+    with pytest.raises(SvgRejected):
+        sanitize_if_svg("application/xml", data)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        _XHTML + b"<p>a chart in svg format</p></body></html>",
+        b"<doc>&lt;svg onload=x&gt;</doc>",
+        b'<doc note="&lt;svg"/>',
+        b"<html><body><p>systolic &#60; 120</p><br></body></html>",
+        b'<!DOCTYPE d [<!ENTITY nbsp "&#160;">]><doc>a&nbsp;b</doc>',
+        b"<doc><svgish/><x:svgs xmlns:x='urn:x'/></doc>",
+        b"<html><body><code>xmlns=&quot;urn:x&quot;</code><br></body></html>",
+        b"<!DOCTYPE d [<!ENTITY nbsp '&#160;'><!ENTITY co 'Synthetic &#169; Org'>]><doc>&co;</doc>",
+        b'<html xmlns="http://www.w3.org/1999/xhtml" xmlns:svg="http://www.w3.org/2000/svg">'
+        b"<body><p>report</p></body></html>",
+        b"<html><body><p>see http://www.w3.org/2000/svg spec</p></body></html>",
+        b'<doc xmlns:a="urn:x&#58;y"><a:note/></doc>',
+    ],
+)
+def test_markup_without_svg_is_unchanged(data: bytes) -> None:
+    """The control: text that names SVG, escaped markup, a ``&#60;`` in an HTML report, a text-only
+    entity and element names that only start with ``svg`` are all served as stored."""
+    assert sanitize_if_svg("application/xml", data) is data
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(b"<html>" + b"<" * 400_000, id="many-angle-brackets"),
+        pytest.param(b"<html><a" + b"b" * 400_000, id="long-name-no-colon"),
+        pytest.param(b'<!ENTITY x "y"><html xmlns="' + b"a" * 400_000, id="long-xmlns-value"),
+        pytest.param(b"<!ENTITY " * 50_000 + b"<html><x" + b":" * 400_000, id="many-colons"),
+        pytest.param(b'<!ENTITY x "y"><html ' + b"xmlns" * 80_000, id="many-xmlns"),
+        pytest.param(b'<!ENTITY x "y"><html ' + b"xmlns:" * 80_000, id="many-prefixed-xmlns"),
+        pytest.param(b"<html " + b'xmlns="' * 80_000, id="many-quoted-xmlns"),
+    ],
+)
+def test_the_embedded_svg_scan_is_linear(data: bytes) -> None:
+    """The ``xmlns`` cases took minutes once: each match ran across every ``xmlns`` after it."""
+    started = time.perf_counter()
+    assert sanitize_if_svg("text/html", data) is data
+    assert time.perf_counter() - started < 10
+
+
+@pytest.mark.parametrize("compress", [False, True], ids=["plain", "gzip"])
+def test_a_long_declaration_is_skipped_by_the_regex_engine(
+    compress: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The declaration scan stepped byte by byte in Python once. Through gzip this 32 KB body took
+    4.7 s of CPU per download; it is now skipped between tokens in one regex search."""
+    doc = b'<!DOCTYPE r [<!ENTITY a "x"> ' + b"a" * (32 * 1024 * 1024 - 100)
+    body = gzip.compress(doc, mtime=0) if compress else doc
+    steps: list[int] = []
+    real = svg_sanitize._ScanBudget.spend
+
+    def counting(self: svg_sanitize._ScanBudget) -> None:
+        steps.append(1)
+        real(self)
+
+    monkeypatch.setattr(svg_sanitize._ScanBudget, "spend", counting)
+    started = time.perf_counter()
+    assert sanitize_if_svg("application/xml", body) is body
+    # The steady assertion: a handful of tokens, not one step per byte. The clock is a loose backstop
+    # (about 1 s here, against 5 s or more for the old loop).
+    assert 0 < len(steps) < 20
+    assert time.perf_counter() - started < 20
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(b'<?xml version="1.0"?><ClinicalDocument><title>synthetic</title>'
+                     b"</ClinicalDocument>", id="cda"),
+        pytest.param(b"<html><body><p>a&nbsp;b</p><br></body></html>", id="html-nbsp"),
+        pytest.param(b'<!DOCTYPE d [<!ENTITY nbsp "&#160;">]><doc>a&nbsp;b</doc>', id="entity-160"),
+        pytest.param('<?xml version="1.0" encoding="Shift_JIS"?><doc>日本</doc>'.encode(
+                     "shift_jis"), id="shift-jis-without-escape"),
+        pytest.param(b'<?xml version="1.0" encoding="x-bogus"?><doc>synthetic</doc>', id="x-bogus"),
+    ],
+)  # fmt: skip
+def test_ordinary_documents_on_both_paths_are_unchanged(data: bytes) -> None:
+    """The no-false-refusal controls for the fail-closed fallback, pinned together."""
+    assert sanitize_if_svg("application/xml", data) is data
+
+
+def test_an_iso_2022_jp_document_is_refused_even_without_svg() -> None:
+    """The recorded trade. pyexpat cannot read ISO-2022-JP, so it always reaches the byte scan, and
+    Japanese text in it always carries the escape byte. It is refused rather than decoded."""
+    doc = '<?xml version="1.0" encoding="ISO-2022-JP"?><r>日本</r>'.encode("iso2022_jp")
+    assert b"\x1b" in doc
+    with pytest.raises(SvgRejected):
+        sanitize_if_svg("application/xml", doc)
+
+
+def test_a_root_scan_that_runs_out_of_steps_is_refused() -> None:
+    """Each bracket costs one step. Past the budget the root is unknown, so the document is treated
+    as SVG and refused, never served unread."""
+    doc = b'<!DOCTYPE r [<!ENTITY a "x">' + b"[]" * 200_000 + b"]><r/>"
+    started = time.perf_counter()
+    with pytest.raises(SvgRejected):
+        sanitize_if_svg("application/xml", doc)
+    assert time.perf_counter() - started < 3
 
 
 @pytest.mark.parametrize("label", ["text/xml", "text/plain", "application/octet-stream", None])
@@ -249,11 +556,12 @@ def test_an_svg_whose_root_the_parser_cannot_reach_is_refused(data: bytes) -> No
         b'<?xml version="1.0" encoding="Shift_JIS"?><doc>synthetic</doc>',
         b'<?xml version="1.0" encoding="x-bogus"?><doc>synthetic</doc>',
         b'<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">'
-        b"<html lang=en><body><svg onload=x></svg></body></html>",
+        b"<html lang=en><body><p>synthetic</p></body></html>",
     ],
 )
 def test_non_svg_markup_whose_root_the_parser_cannot_reach_is_unchanged(data: bytes) -> None:
-    """Including an HTML page that only embeds an ``<svg>``: its root is ``html``, not ``svg``."""
+    """An HTML page that EMBEDS an ``<svg>`` used to be here. Since BACKLOG #2391 it is refused; see
+    ``test_markup_carrying_svg_below_another_root_is_refused``."""
     assert sanitize_if_svg("application/xml", data) is data
 
 
@@ -310,7 +618,7 @@ def test_an_svg_over_the_size_bound_is_refused() -> None:
         ("application/pdf", b"%PDF-1.4\nsynthetic document <svg onload=x>\n%%EOF\n"),
         ("image/png", bytes.fromhex("89504e470d0a1a0a") + b"<svg/>"),
         ("text/plain", b"synthetic note mentioning <svg> in passing"),
-        ("text/xml", b'<?xml version="1.0"?><ClinicalDocument><svg/></ClinicalDocument>'),
+        ("text/xml", b'<?xml version="1.0"?><ClinicalDocument><note/></ClinicalDocument>'),
         ("application/json", b'{"svg": "<svg onload=x>"}'),
         ("text/plain", b""),
     ],
@@ -325,7 +633,7 @@ def test_non_svg_documents_are_returned_unchanged(label: str, data: bytes) -> No
         (b"%PDF-1.4 <svg>", False),
         (bytes.fromhex("89504e470d0a1a0a"), False),
         (b"", False),
-        (bytes.fromhex("1f8b08"), False),
+        (bytes.fromhex("1f8b08"), True),  # gzip: SVGZ is inflated before it is judged
         (b"\x00" * 128 + b"DICM", False),
         (b"  <svg/>", True),
         (b"\x0c\x0b<svg/>", True),

@@ -1465,10 +1465,15 @@ class QueueStore(StoreLifecycle, Protocol):
         clamps at zero, ignores the headroom arguments and returns ``True``.
 
         ``stale_after`` bounds a leak: a process killed between reserve and release never releases,
-        and its slot would otherwise consume the uploader's budget forever. A row whose reservation
-        has been CONTINUOUSLY outstanding for longer than ``stale_after`` seconds is reset to zero
-        before the add. The reset can only restore today's behaviour (an overshoot bounded by the
-        number of concurrent writers), never something worse."""
+        and its slot would otherwise consume the uploader's budget forever. A row with no activity
+        for longer than ``stale_after`` seconds is reset to zero before the add. Activity is an
+        applied reserve or any release, and both move the row's clock to now, never backwards, so a
+        host whose clock lags cannot age a row a sibling keeps fresh. A release of zero
+        files and zero bytes is therefore a pure touch, which is how a live save keeps its slot
+        past ``stale_after`` (BACKLOG #2648). So the reset normally reclaims only slots no live
+        process holds. When it does reclaim a live one, it can only restore the pre-ledger
+        behaviour (an overshoot bounded by the number of concurrent writers), never something
+        worse."""
         ...
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:

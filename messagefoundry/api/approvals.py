@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from typing import Any, NoReturn
 from uuid import uuid4
 
+from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.settings import ApprovalsSettings
@@ -1182,19 +1183,18 @@ class ApprovalGate:
         For a row whose answer stands whether or not it lands: a refusal, which runs nothing and
         leaves the request pending, or an outcome the gate has already settled. Before vault
         BACKLOG #2255 a failed write at the refusals turned a documented 409 into a raw 500. The
-        loss is logged at ERROR with ``context`` and the detail, and paged."""
-        try:
-            await self._store.record_audit(action, actor=actor, detail=detail, client=client)
-        except Exception:  # noqa: BLE001 - every store backend raises its own type
-            log.exception(
-                "approval %s: %s, but its %s audit row failed. Lost detail: %s",
-                approval_id,
-                context,
-                action,
-                # The detail names the requester. It is JSON, so the scrub leaves it byte-identical;
-                # it is here for CodeQL py/log-injection, which cannot see that.
-                scrub_log_argument(detail),
-            )
+        loss is logged at ERROR with ``context`` and the detail, and paged. ``defects=()``: some
+        callers run after the operation executed, and a defect raised there would skip the page
+        and report an executed release as a 500 (vault BACKLOG #2260)."""
+        if not await write_audit_soft(
+            lambda: self._store.record_audit(action, actor=actor, detail=detail, client=client),
+            log=log,
+            message="approval %s: %s, but its %s audit row failed. Lost detail: %s",
+            # The detail names the requester. It is JSON, so the scrub leaves it byte-identical;
+            # it is here for CodeQL py/log-injection, which cannot see that.
+            args=lambda: (approval_id, context, action, scrub_log_argument(detail)),
+            defects=(),
+        ):
             self._alert_lost_audit(approval_id, action)
 
     async def _requester_standing(

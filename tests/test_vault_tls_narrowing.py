@@ -523,7 +523,7 @@ def test_an_https_pool_that_is_not_narrowed_is_refused_before_sending(vault: _Tl
     drop that check; the request then handshakes on urllib3's own context."""
     import requests
 
-    from messagefoundry.transports.bounded_read import EgressReplyError
+    from messagefoundry.config.tls_policy import InsecureHopRefused
 
     adapter = _recording_adapter(ssl.create_default_context)
     classes = dict(adapter.poolmanager.pool_classes_by_scheme)
@@ -532,7 +532,7 @@ def test_an_https_pool_that_is_not_narrowed_is_refused_before_sending(vault: _Tl
     adapter.poolmanager.pool_classes_by_scheme = classes
     session = requests.Session()
     session.mount("https://", adapter)
-    with pytest.raises(EgressReplyError, match="did not narrow"):
+    with pytest.raises(InsecureHopRefused, match="did not narrow"):
         session.get(f"{vault.url}/{_PATH}", timeout=5)
     assert vault.negotiated == [], "a handshake reached the listener"
 
@@ -569,7 +569,7 @@ def test_a_connection_that_will_not_verify_is_refused_before_its_socket_opens(
     context. Since BACKLOG #300's proxy limb it is refused, and before any socket opens. Driven
     against the local listener with CERT_NONE, which is exactly that connection's shape. The
     adapter refuses the case earlier, by name; this is the connection's own backstop."""
-    from messagefoundry.transports.bounded_read import EgressReplyError
+    from messagefoundry.config.tls_policy import InsecureHopRefused
 
     made: list[ssl.SSLContext] = []
 
@@ -581,7 +581,7 @@ def test_a_connection_that_will_not_verify_is_refused_before_its_socket_opens(
     conn = manager.pool_classes_by_scheme["https"].ConnectionCls(
         "127.0.0.1", vault.port, cert_reqs="CERT_NONE"
     )
-    with pytest.raises(EgressReplyError, match="verifies no peer"):
+    with pytest.raises(InsecureHopRefused, match="verifies no peer"):
         conn.connect()
     conn.close()
     assert made == [], "the factory ran for a connection that does not verify"
@@ -700,7 +700,7 @@ def test_a_urllib3_that_ignores_the_supplied_proxy_context_is_refused(
     a urllib3 that drops the supplied context and builds its own, the pre-change behaviour."""
     import urllib3.connection
 
-    from messagefoundry.transports.bounded_read import EgressReplyError
+    from messagefoundry.config.tls_policy import InsecureHopRefused
 
     real = urllib3.connection.HTTPSConnection._connect_tls_proxy
 
@@ -712,7 +712,7 @@ def test_a_urllib3_that_ignores_the_supplied_proxy_context_is_refused(
     monkeypatch.setenv(_CA_ENV, str(pki.ca))
     monkeypatch.setenv("HTTPS_PROXY", proxy.url)
     client = _kv_client(vault.url)
-    with pytest.raises(EgressReplyError, match="did not run on the engine's narrowed"):
+    with pytest.raises(InsecureHopRefused, match="did not run on the engine's narrowed"):
         client.adapter.get(_PATH)
     # The refusal above is raised only on a leg urllib3 finished handshaking, so the proxy was
     # reached. The client closes straight after, so the listener's side of that handshake may not
@@ -778,13 +778,80 @@ def test_a_proxy_that_appears_after_construction_is_refused_before_sending(
     """The start check reads the proxy settings once. The Windows Internet Settings proxy, or an
     environment changed later, can still move the hop, so the adapter checks again before sending.
     RED before the change: the request reached the proxy on an unverified handshake."""
-    from messagefoundry.transports.bounded_read import EgressReplyError
+    from messagefoundry.config.tls_policy import InsecureHopRefused
 
     client = _kv_client("http://127.0.0.1:9")
     monkeypatch.setenv("HTTP_PROXY", proxy.url)
-    with pytest.raises(EgressReplyError, match=r"https:// proxy"):
+    with pytest.raises(InsecureHopRefused, match=r"https:// proxy"):
         client.adapter.get(_PATH)
     assert proxy.negotiated == [] and proxy.failures == 0, "a socket reached the proxy"
+
+
+# --- a send-time refusal reaches the operator whole (BACKLOG #2318) ------------------------------
+#
+# The providers' catch-all handlers used to shrink every failure to its type name, so this refusal
+# read "InsecureHopRefused" (before that, "EgressReplyError") and said nothing about the proxy.
+# Mutation for each: put `type(exc).__name__` back in the handler. Red: the text is gone.
+
+
+@pytest.mark.parametrize("call", ["encrypt", "decrypt", "audit_hmac", "build"])
+def test_a_send_time_refusal_keeps_its_text_through_the_transit_cipher(
+    call: str, proxy: _TlsProxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    client = _transit_client("http://127.0.0.1:9")
+    cipher = crypto_transit.TransitCipher(client, "mefor-store-dek")
+    monkeypatch.setattr(crypto_transit, "_build_client", lambda addr, token: client)
+    monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-store-dek")
+    monkeypatch.setenv("HTTP_PROXY", proxy.url)
+    calls: dict[str, Any] = {
+        "encrypt": lambda: cipher.encrypt("synthetic", aad=b"cell"),
+        "decrypt": lambda: cipher.decrypt("mfenc:v3:vault:v1:c3ludGhldGlj", aad=b"cell"),
+        "audit_hmac": lambda: cipher.audit_hmac(b"synthetic"),
+        "build": lambda: crypto_transit.build_transit_cipher(StoreSettings()),
+    }
+    own = KeyProviderError if call == "build" else CipherError
+    with pytest.raises(own, match=r"Vault transit key provider: an http:// Vault") as caught:
+        calls[call]()
+    # One type at both phases: the same refusal the build-time check raises.
+    assert isinstance(caught.value.__cause__, InsecureHopRefused)
+    assert proxy.negotiated == [] and proxy.failures == 0, "a socket reached the proxy"
+
+
+def test_a_send_time_refusal_keeps_its_text_through_the_key_provider(
+    proxy: _TlsProxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    client = _transit_client("http://127.0.0.1:9")
+    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda addr, token: client)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "mefor-kek")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
+    monkeypatch.setenv("HTTP_PROXY", proxy.url)
+    provider = keyprovider_vault.VaultKeyProvider(StoreSettings())
+    with pytest.raises(KeyProviderError, match=r"transit key provider: an http:// Vault"):
+        provider.active_key()
+    assert proxy.negotiated == [] and proxy.failures == 0, "a socket reached the proxy"
+
+
+def test_any_other_failure_still_gives_only_its_type_name() -> None:
+    """The fixed-text exception is narrow: a failure that is not the hop's own refusal can echo
+    ciphertext, a body or a URL, so it still shrinks to its type name."""
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.store.keyprovider_vault import vault_failure_text
+    from messagefoundry.transports.bounded_read import ResponseTooLargeError
+
+    assert vault_failure_text(RuntimeError("vault:v1:c3ludGhldGlj")) == "RuntimeError"
+    assert vault_failure_text(ValueError("https://vault.example.test")) == "ValueError"
+    assert vault_failure_text(InsecureHopRefused("fixed")) == "fixed"
+    assert vault_failure_text(ResponseTooLargeError("bound")) == "bound"
 
 
 def test_every_vault_context_pins_the_approved_kex_groups(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -745,6 +745,50 @@ async def test_detail_disposition_text_visible_to_operator_and_audited(engine: E
     assert "message_view" in actions  # opening the detail (raw) view is audited
 
 
+async def test_a_summary_reveal_by_a_view_raw_only_caller_reveals_and_records_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2425. ``reveal_summary`` only lifts a mask; it grants nothing. A caller holding
+    ``messages:view_raw`` without ``messages:view_summary`` passes the route gate, asks for the
+    summary reveal, and gets null ``summary`` and ``metadata``, and its ``message_view`` row records
+    ``revealed: []``, because the audit reads the redacted response rather than the request.
+
+    Minting refuses that role, so this lifts the rule as the outbound-body test above does. The
+    ``both`` role differs by ``view_summary`` alone and is the control: the same request reveals
+    both values and records them, so the empty arm is that permission and not a broken route."""
+    bypass_view_raw_pairing_rule(monkeypatch)
+    service = await _service(engine)
+    await _add_custom(service, "rawonly", ["messages:read", "messages:view_raw"])
+    await _add_custom(
+        service, "both", ["messages:read", "messages:view_raw", "messages:view_summary"]
+    )
+    stored = "MRN 100001, DOE, JANE"
+    # The API surfaces only the column's "user" bag, re-serialized (store.metadata.user_metadata).
+    meta = json.dumps({"ward": "4B"})
+    mid = await engine.store.enqueue_message(
+        channel_id="ch1",
+        raw=ADT,
+        deliveries=[("OB", "p")],
+        summary=stored,
+        metadata=json.dumps({"user": {"ward": "4B"}}),
+    )
+    async with _client(engine, service) as c:
+        raw_only = _auth((await _login(c, "rawonly")).json()["token"])
+        r = await c.get(f"/messages/{mid}?reveal_summary=true", headers=raw_only)
+        assert r.status_code == 200
+        assert r.json()["summary"] is None and r.json()["metadata"] is None
+        both = _auth((await _login(c, "both")).json()["token"])
+        r = await c.get(f"/messages/{mid}?reveal_summary=true", headers=both)
+        assert r.status_code == 200
+        assert r.json()["summary"] == stored and r.json()["metadata"] == meta
+    views = {
+        dict(a)["actor"]: json.loads(dict(a)["detail"])["revealed"]
+        for a in await engine.store.list_audit(limit=50)
+        if dict(a)["action"] == "message_view"
+    }
+    assert views == {"rawonly": [], "both": ["metadata", "summary"]}
+
+
 async def test_create_user_route_refuses_a_site_context_word(engine: Engine) -> None:
     # BACKLOG #1132: a site's own context words reach POST /users, not only the service method.
     settings = AuthSettings(

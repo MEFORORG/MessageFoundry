@@ -714,7 +714,13 @@ class EngineClient:
             transport.close()
 
     def _open_transport(self, verify: ssl.SSLContext | bool) -> httpx.Client:
-        return httpx.Client(base_url=self.base_url, timeout=self._timeout, verify=verify)
+        # BACKLOG #2318: never through a proxy the environment names. httpx would otherwise read
+        # HTTPS_PROXY, ALL_PROXY and the Windows system proxy, and run an https proxy's TLS leg on
+        # httpcore's own context rather than `verify`, the same reason tray/probe.py sets it
+        # (BACKLOG #300). `verify` is always passed explicitly, so this changes no trust anchor.
+        return httpx.Client(
+            base_url=self.base_url, timeout=self._timeout, verify=verify, trust_env=False
+        )
 
     def _acquire_transport(self) -> httpx.Client:
         """Read `_http` for one request attempt, and count the attempt as holding it.

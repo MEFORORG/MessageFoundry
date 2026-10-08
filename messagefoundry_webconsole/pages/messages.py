@@ -884,10 +884,13 @@ def parse_tree_unavailable(message_id: str, reason: str) -> Markup:
     )
 
 
-def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str) -> Markup:
+def dead_letters(
+    data: DeadLetterList, *, channel_id: str, destination_name: str, can_view_raw: bool
+) -> Markup:
     """The dead-letter list (newest first) + per-channel bulk replay (M3).
 
-    Each row links to the audited message detail (single-message replay lives there, M2b). The bulk
+    Each row links to the audited message detail (single-message replay lives there, M2b), for a
+    caller who may open it (``can_view_raw`` below). The bulk
     "Replay all dead" per channel re-queues every dead delivery for that channel (step-up-gated; may be
     held for dual-control approval). Channel names are the ``[TYPE]_[PARTNER]_[MSG]`` URL-safe
     identifiers, carried in the action PATH so the step-up auto-retry re-POST needs no body.
@@ -907,6 +910,12 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
     "Replay all dead (every channel)" ignores the filters, by decision, and its label says so. It
     shows whenever ``data.replayable_in_scope`` is true, even on a filtered page that matched
     nothing. The engine refuses it for a channel-scoped caller (``_replay_in_scope``).
+
+    ``can_view_raw`` says whether the caller holds ``messages:view_raw``, which both row links need:
+    ``/ui/messages/{id}`` and its ``/errors`` reveal. This page is gated on ``messages:read`` only,
+    so a caller without ``view_raw`` gets the masked error with no Reveal link and the message id as
+    plain text, rather than two links that answer 403 (BACKLOG #2440). REQUIRED for the reason the
+    two filters are.
     """
     headers = ["Failed", "Channel", "Destination", "Type", "Attempts", "Last error", "Message"]
     body = [
@@ -917,8 +926,14 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
             d.message_type,
             d.attempts,
             # No reveal here: the message's /errors reveals it (field_authz, BACKLOG #2436).
-            _reveal_cell(d.last_error, f"/ui/messages/{_seg(d.message_id)}/errors", revealed=False),
-            el("a", "view", href=f"/ui/messages/{_seg(d.message_id)}"),
+            _reveal_cell(
+                d.last_error,
+                f"/ui/messages/{_seg(d.message_id)}/errors" if can_view_raw else None,
+                revealed=False,
+            ),
+            el("a", "view", href=f"/ui/messages/{_seg(d.message_id)}")
+            if can_view_raw
+            else d.message_id,
         ]
         for d in data.dead_letters
     ]

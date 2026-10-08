@@ -155,13 +155,13 @@ from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
-    MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     PASSWORD_CHANGE_LOCKOUT_CLEAR,
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    VIEWED_EVENT,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -215,6 +215,7 @@ from messagefoundry.store.store import (
     audit_seal_next,
     birth_notify_email,
     build_audit_mac_keys,
+    check_caller_event_kind,
     check_password_generated,
     delivery_key,
     load_audit_chain,
@@ -7114,7 +7115,7 @@ class PostgresStore:
         """Append a ``viewed`` audit event (called whenever a message body / PHI is opened)."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
-            await self._event(conn, message_id, "viewed", None, actor or "", now)
+            await self._event(conn, message_id, VIEWED_EVENT, None, actor or "", now)
 
     async def record_message_event(
         self,
@@ -7129,11 +7130,7 @@ class PostgresStore:
 
         See :meth:`MessageStore.record_message_event` — same contract, same runtime kind validation
         (the static literal-call-site guard cannot see a forwarded variable), same verbosity gate."""
-        if event not in MESSAGE_EVENT_KINDS:
-            raise ValueError(
-                f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
-                "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
-            )
+        check_caller_event_kind(event)
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             await self._event(conn, message_id, event, destination, detail or "", now)
@@ -7632,7 +7629,7 @@ class PostgresStore:
                 "UPDATE upload_quota SET"
                 " inflight_files = GREATEST(0, inflight_files + $2),"
                 " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
-                " since = $4"
+                " since = GREATEST(since, $4)"  # never backwards (BACKLOG #2648)
                 " WHERE uploader_id = $1",
                 uploader_id,
                 int(files),
@@ -7652,8 +7649,8 @@ class PostgresStore:
             " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
             " inflight_bytes ="
             " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
-            " since = CASE WHEN upload_quota.since <= $5 OR upload_quota.inflight_files <= 0"
-            " THEN $4 ELSE upload_quota.since END"
+            # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
+            " since = GREATEST(upload_quota.since, $4)"
             " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
             " ELSE upload_quota.inflight_files END) + $2 <= $6"
             " AND (CASE WHEN upload_quota.since <= $5 THEN 0"

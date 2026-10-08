@@ -85,7 +85,7 @@ from messagefoundry.api.field_authz import (
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
     CSP_HEADER,
-    FRAME_ANCESTORS_CSP,
+    FLOOR_CSP,
     HSTS_HEADER,
     HSTS_VALUE,
     SecurityHeaderFloorMiddleware,
@@ -256,6 +256,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
+from messagefoundry.audit_write import write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -421,6 +422,7 @@ from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import (
+    VIEWED_EVENT,
     AuditAppend,
     MessageOrigin,
     OperatorAudit,
@@ -805,6 +807,24 @@ async def _alert_control_action(engine: Engine, action: str, target: str) -> Non
                 "alert control_action restart_outbound for %r not run: the DR run-profile parks it",
                 target,
             )
+
+
+async def _record_upload_prune(store: Store, meta: UploadedFileMeta) -> None:
+    """Write the ``upload.prune`` row for one pruned upload. The retention runner and the
+    save-time sweep both call this, so their rows cannot drift apart.
+
+    BACKLOG #1224: a prune is automated and owner-blind, so the row is attributed to the system
+    principal (matching pipeline/retention.py's ``retention_purge``), never to the pruned file's
+    uploader, and carries no ``client``. The owner is DATA in ``detail``. Both the display name and
+    the IMMUTABLE ``uploader_id`` are recorded: the file is gone, and a username is reassignable
+    (BACKLOG #1225), so a row read later could otherwise name a different person than it meant."""
+    await store.record_audit(
+        "upload.prune",
+        actor="system",
+        detail=json.dumps(
+            {"file_id": meta.file_id, "uploader": meta.uploader, "uploader_id": meta.uploader_id}
+        ),
+    )
 
 
 def _dead_letter_replay_audit(
@@ -1421,9 +1441,13 @@ async def _record_reload_audit(
     steps, so the answer says the new graph is live and its row is missing. A released reload
     carries that into ``approval.approved``.
 
-    A cancellation still propagates: it is not a failure of this helper."""
+    A cancellation still propagates: it is not a failure of this helper. The write goes through
+    :func:`~messagefoundry.audit_write.write_audit_soft` with ``defects=()``, because even a defect
+    raised here would misreport a reload that ran (vault BACKLOG #2260)."""
     detail: str | None = None
-    try:
+
+    async def write() -> None:
+        nonlocal detail
         superseded = False
         if loaded is not None:
             state = loaded
@@ -1450,18 +1474,23 @@ async def _record_reload_audit(
             }
         )
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
-    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
-        # Scrubbed at the call site for CodeQL py/log-injection; scrub_log_argument says why.
-        _log.exception(
-            "config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
+
+    written = await write_audit_soft(
+        write,
+        log=_log,
+        message="config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
+        # Scrubbed at the call site for CodeQL py/log-injection; scrub_log_argument says why. Read
+        # on a failure only, so the line carries whatever detail was built before the fault.
+        args=lambda: (
             "loaded at start" if action == "config_loaded" else "reload swapped the graph",
             action,
             _RELOAD_AUDIT_STEP,
             scrub_log_argument(actor),
             None if detail is None else scrub_log_argument(detail),
-        )
-        return [*failed_steps, _RELOAD_AUDIT_STEP]
-    return list(failed_steps)
+        ),
+        defects=(),
+    )
+    return list(failed_steps) if written else [*failed_steps, _RELOAD_AUDIT_STEP]
 
 
 #: The faults ``Engine.reload_detail`` raises when a reload did NOT happen, each with its own answer
@@ -1538,20 +1567,19 @@ async def _audit_refused_reload(
         detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
         status, answer = 422, "invalid configuration"
     row = json.dumps(detail)
-    try:
-        await engine.store.record_audit(action, actor=actor, detail=row, client=client)
-    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
-        # The exc above and this row carry the caller's requested directory, so their arguments
-        # are scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps``
-        # already escaped the row, so the scrub leaves it byte-identical and parseable. The
-        # traceback is not an argument: a caller's chained refusal can still carry the directory
-        # into it, and only the handler's ControlCharScrubFilter escapes that.
-        _log.exception(
-            "a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
-            action,
-            scrub_log_argument(actor),
-            scrub_log_argument(row),
-        )
+    # The exc above and this row carry the caller's requested directory, so their arguments are
+    # scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps`` already
+    # escaped the row, so the scrub leaves it byte-identical and parseable. The traceback is not an
+    # argument: a caller's chained refusal can still carry the directory into it, and only the
+    # handler's ControlCharScrubFilter escapes that. ``defects=()`` keeps the docstring's promise
+    # that this write never raises (vault BACKLOG #2260).
+    await write_audit_soft(
+        lambda: engine.store.record_audit(action, actor=actor, detail=row, client=client),
+        log=_log,
+        message="a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
+        args=lambda: (action, scrub_log_argument(actor), scrub_log_argument(row)),
+        defects=(),
+    )
     return status, answer
 
 
@@ -2027,7 +2055,9 @@ _DEFAULT_ATTACHMENT_EXT = ".bin"
 #: strictest policy the engine writes -- was the one document family carrying no framing decision at
 #: all. The floor's carrier now skips a response whose policy already names the directive, so this
 #: constant is what that response is governed by, and it stays correct if the floor is ever removed.
-_ATTACHMENT_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
+#: ``base-uri 'none'`` is named for the same reason (ASVS 3.4.3, BACKLOG #2341): it takes no fallback
+#: from ``default-src`` either.
+_ATTACHMENT_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'; base-uri 'none'"
 #: ``GET /messages/{message_id}/attachments/{attachment_id}`` and the web console's same-handler
 #: delegate ``GET /ui/messages/...`` — see :class:`AttachmentSecurityHeadersMiddleware`.
 _ATTACHMENT_PATH_RE = re.compile(r"^(?:/ui)?/messages/[^/]+/attachments/[^/]+$")
@@ -2823,9 +2853,9 @@ def create_app(
         # SecurityHeaderFloorMiddleware is in this response's path, and a 500 shipped with none of
         # them. Status and body are unchanged: this adds headers only.
         headers = dict(BASELINE_SECURITY_HEADERS)
-        # ASVS 3.4.6: the floor's frame-ancestors carrier cannot reach this response either, and a
-        # 500 is as navigable as any other, so the same directive is set here by hand.
-        headers[CSP_HEADER] = FRAME_ANCESTORS_CSP
+        # ASVS 3.4.6 / 3.4.3: the floor's CSP carrier cannot reach this response either, and a
+        # 500 is as navigable as any other, so the same policy is set here by hand.
+        headers[CSP_HEADER] = FLOOR_CSP
         if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             headers[HSTS_HEADER] = HSTS_VALUE
         return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
@@ -3732,12 +3762,13 @@ def create_app(
             await _control_guard(engine, identity, name, client)
             anchor_refused = False
             try:
+                # An operator door, so it overrides a passive DR standby (vault BACKLOG #3140).
                 if action == "start":
-                    await rr.start_inbound(name)
+                    await rr.start_inbound(name, operator=True)
                 elif action == "stop":
                     await rr.stop_inbound(name)
                 else:
-                    await rr.restart_inbound(name)
+                    await rr.restart_inbound(name, operator=True)
             except NotDeployedError as exc:
                 # #233 (ADR 0111): start/restart of a not-deployed connection is refused — deploying it
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
@@ -5587,12 +5618,17 @@ def create_app(
         # got nulls, and an empty value had nothing to unmask, so neither is recorded as a
         # disclosure it never received (BACKLOG #2346). A nested row's property is recorded under
         # its list's name, `outbox.last_error` or `events.detail` (BACKLOG #2436).
+        # A `viewed` event's detail is the viewer's username, which record_view above writes on
+        # EVERY open, so counting it would name `events.detail` on every error reveal whatever the
+        # message holds. Only an event of another kind can make that entry true (BACKLOG #2440).
+        # This narrows the audit record only; the redaction above still masks and lifts every row.
+        disclosing_events = [e for e in events if e.event != VIEWED_EVENT]
         revealed = sorted(
             f"{prefix}{p}"
             for prefix, cls, shown in (
                 ("", MessageDetail, [detail]),
                 ("outbox.", OutboxInfo, outbox),
-                ("events.", EventInfo, events),
+                ("events.", EventInfo, disclosing_events),
             )
             for p in reveal[cls]
             if any(getattr(m, p) for m in shown)
@@ -6475,6 +6511,7 @@ def create_app(
             ),
             client=client_ip(request),
         )
+
         # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
         # error must never fail the upload the operator just made — it is logged and retried by the
         # periodic task. Each pruned file is audited (file_id + uploader, never content).
@@ -6489,26 +6526,17 @@ def create_app(
         # ROW, and once the actor is the system principal no address is in scope (ADR 0150 decision 4
         # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
         # `detail.uploader`, which is where it belongs.
+        #
+        # BACKLOG #2261: the request deadline can cancel this handler mid-sweep. prune_on_save then
+        # stops the sweep at its next file and still writes a row for each file it removed.
+        prune_store = engine.store
+
+        async def _audit_prune(pruned: UploadedFileMeta) -> None:
+            await _record_upload_prune(prune_store, pruned)
+
         try:
-            for pruned in (await us.prune_expired()).pruned:
-                await engine.store.record_audit(
-                    "upload.prune",
-                    actor="system",
-                    detail=json.dumps(
-                        {
-                            "file_id": pruned.file_id,
-                            "uploader": pruned.uploader,
-                            # The IMMUTABLE owner key beside the display name. A prune row is a
-                            # permanent record of a deletion whose subject cannot be recovered
-                            # afterwards -- the file is gone -- and a username is reassignable
-                            # (BACKLOG #1225), so a row read later could name a different person
-                            # than it meant. UploadedFileMeta carries both deliberately
-                            # (uploads.py:116); this records both.
-                            "uploader_id": pruned.uploader_id,
-                        }
-                    ),
-                )
-        except OSError:
+            await us.prune_on_save(_audit_prune)
+        except Exception:  # noqa: BLE001 — the upload already succeeded; a prune error must not fail it
             _log.warning("opportunistic uploaded-logs retention prune failed", exc_info=True)
         return _upload_info(meta)
 
@@ -9698,23 +9726,8 @@ def create_managed_app(
                 await _upload_store.warn_if_unsealed()
 
                 async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
-                    # BACKLOG #1224: the retention runner has no operator and no request behind it, so
-                    # the row is attributed to the system principal (matching pipeline/retention.py's
-                    # `retention_purge`) rather than to the pruned file's uploader. The uploader is
-                    # carried as DATA in `detail`, where a reader can still see whose file went. Both
-                    # this site and the request-path sweep had to change together: fixing one would have
-                    # left the same false attribution reachable by the other path.
-                    await store.record_audit(
-                        "upload.prune",
-                        actor="system",
-                        detail=json.dumps(
-                            {
-                                "file_id": meta.file_id,
-                                "uploader": meta.uploader,
-                                "uploader_id": meta.uploader_id,
-                            }
-                        ),
-                    )
+                    # The same row as the request-path sweep's (_record_upload_prune, BACKLOG #1224).
+                    await _record_upload_prune(store, meta)
 
                 upload_retention_runner = UploadRetentionRunner(
                     _upload_store, audit=_audit_upload_prune

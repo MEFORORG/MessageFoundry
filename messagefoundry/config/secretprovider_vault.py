@@ -196,9 +196,13 @@ class VaultSecretProvider:
         except Exception as exc:
             # Fail closed on ANY KV/transport/shape failure. Include ONLY the exception TYPE + the
             # reference path (not the value) — a backend error could otherwise echo secret material.
+            # The hop's own refusals are the one exception: their text is fixed, so it is kept
+            # (BACKLOG #2318). Lazy, like the import in _build_client.
+            from messagefoundry.transports.strict_requests import vault_failure_text
+
             raise SecretProviderError(
                 f"[secrets].provider={_EXTRA!r} could not read secret {path!r} (field {field!r}) from "
-                f"Vault KV: {type(exc).__name__}."
+                f"Vault KV: {vault_failure_text(exc)}."
             ) from exc
         if not isinstance(data, dict) or field not in data:
             raise SecretProviderError(

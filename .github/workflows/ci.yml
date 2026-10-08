@@ -1086,7 +1086,7 @@ jobs:
       # run (docs-only PRs, a deselecting -k), and a missing diagnostic must never redden a leg.
       - name: Upload connscale readings
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: connscale-readings-${{ matrix.os }}-py${{ matrix.python-version }}
           path: out/connscale/
@@ -2161,7 +2161,7 @@ jobs:
       # count -- under `--dist loadfile` no shard finishes faster than its single largest file.
       - name: Upload the tier's junit
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tooling-junit-${{ matrix.os }}
           path: tooling-junit.xml
@@ -3613,7 +3613,7 @@ jobs:
 
       - name: Upload load report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: load-report
           path: out/load/
@@ -3840,7 +3840,7 @@ jobs:
 
       - name: Upload load report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: load-report-sqlserver
           path: out/load/
@@ -4687,7 +4687,7 @@ jobs:
 
       - name: Upload store-access logs (ADR 0183 Wave 0)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: store-access-logs-${{ matrix.os }}-py${{ matrix.python-version }}
           path: |
@@ -4698,7 +4698,7 @@ jobs:
 
       - name: Upload service logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}
           path: C:\ProgramData\MessageFoundry\logs\

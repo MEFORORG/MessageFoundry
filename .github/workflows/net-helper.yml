@@ -139,7 +139,7 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash
           "mefor-net-helper.exe: UNSIGNED development build, SHA-256 $hash" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mefor-net-helper
           path: ${{ env.HELPER_OUT }}/
@@ -217,7 +217,7 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash
           "mefor-net-helper.exe: signed, SHA-256 $hash" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: steps.sign.outcome == 'success'
         with:
           # Its own name, so the unsigned build's artifact is never replaced and each name means one thing.

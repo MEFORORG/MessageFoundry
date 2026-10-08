@@ -650,6 +650,21 @@ async def test_runner_build_check_skips_a_dr_parked_listener_but_gates_a_schedul
         _strict_runner(scheduled, store, schedule_clock=lambda: monday_noon).build_check(scheduled)
 
 
+async def test_a_passive_dr_standby_gates_the_listeners_its_activation_binds(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #3140: a passive standby binds no listener, but its build check judges the ones
+    # an activation would bind. So a reload before the disaster refuses what the activation would
+    # refuse during it, and a listener the activation leaves parked is still not gated.
+    from messagefoundry.config.models import Priority
+
+    crit = _off_loopback_plaintext_mllp(priority=Priority.CRITICAL)
+    with pytest.raises(WiringError, match="without TLS"):
+        _strict_runner(crit, store, dr_standby=Priority.CRITICAL).build_check(crit)
+    low = _off_loopback_plaintext_mllp(priority=Priority.LOW)
+    _strict_runner(low, store, dr_standby=Priority.CRITICAL).build_check(low)
+
+
 async def test_pipeline_handler_exception_logs_no_phi(store: MessageStore, tmp_path: Path) -> None:
     # Gate #1 end-to-end: a Handler that raises carrying the full body must not leak the name/MRN into
     # the general log at WARNING+ under the production logging config (the global RedactionFilter).

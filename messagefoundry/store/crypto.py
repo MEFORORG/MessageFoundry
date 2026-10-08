@@ -625,15 +625,25 @@ def rotation_fingerprint_key(cipher: Cipher) -> bytes | None:
     audit MAC runs inside Transit). In both cases per-secret fingerprinting is unavailable in-process and
     the watcher tracks only the non-secret DEK key-id stamp."""
     base = cipher.audit_mac_key()
-    if base is None:
-        return None
+    return None if base is None else _derive_rotation_fp_key(base)
+
+
+def rotation_fingerprint_keys(cipher: Cipher) -> list[bytes]:
+    """Every secret-rotation fingerprint key ``cipher`` can derive: the active DEK's and each retired
+    DEK's (BACKLOG #2242). A DEK rotation changes :func:`rotation_fingerprint_key`, so the watcher
+    uses these to recompute a stored fingerprint under the key that made it and tell a re-key from
+    a changed secret. Empty when there is no in-heap keying material."""
+    return [_derive_rotation_fp_key(base) for base in cipher.audit_mac_keyring().values()]
+
+
+def _derive_rotation_fp_key(audit_mac_key: bytes) -> bytes:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
     hkdf = HKDF(
         algorithm=hashes.SHA256(), length=_ROTATION_FP_LEN, salt=None, info=_ROTATION_FP_INFO
     )
-    return hkdf.derive(base)
+    return hkdf.derive(audit_mac_key)
 
 
 def _derive_body_digest_key(audit_key: bytes) -> bytes:

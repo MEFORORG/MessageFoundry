@@ -477,3 +477,22 @@ suite("webview message receivers check origin, source and the channel token", ()
     }
   });
 });
+
+suite("Test Bench host posts all go through its release-on-post helper (BACKLOG #2441)", () => {
+  test("testBench.ts calls postToWebview exactly once, inside post()", () => {
+    // post() releases the held run when a view replaces the run view. A direct postToWebview call
+    // elsewhere in testBench.ts would send a view without that release.
+    const lines = fs.readFileSync(path.join(SRC, "testBench.ts"), "utf8").split(/\r?\n/);
+    const isComment = (line: string): boolean => /^\s*(\/\/|\/\*|\*)/.test(line);
+    const calls = lines.flatMap((line, i) => (!isComment(line) && /postToWebview\s*\(/.test(line) ? [i] : []));
+    assert.strictEqual(calls.length, 1, `expected one postToWebview( call, found ${calls.length}`);
+    // The nearest method signature above the call must be post()'s.
+    const above = lines.slice(0, calls[0]).reverse();
+    const signature = above.find((line) => /^\s{2}(private |public |async )*\w+\(/.test(line));
+    assert.match(signature ?? "", /private post\(/, "the one postToWebview call is not inside post()");
+    assert.ok(!lines.some((line) => !isComment(line) && /\.postMessage\s*\(/.test(line)), "a raw postMessage bypasses post()");
+    // Control: the sends use the helper, so the count above is not one by having no sends at all.
+    const sends = lines.filter((line) => /this\.post\(/.test(line)).length;
+    assert.ok(sends >= 5, `post() is not the route the sends take (${sends} uses)`);
+  });
+});
