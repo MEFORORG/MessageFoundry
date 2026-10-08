@@ -3751,12 +3751,13 @@ def create_app(
             await _control_guard(engine, identity, name, client)
             anchor_refused = False
             try:
+                # An operator door, so it overrides a passive DR standby (vault BACKLOG #3140).
                 if action == "start":
-                    await rr.start_inbound(name)
+                    await rr.start_inbound(name, operator=True)
                 elif action == "stop":
                     await rr.stop_inbound(name)
                 else:
-                    await rr.restart_inbound(name)
+                    await rr.restart_inbound(name, operator=True)
             except NotDeployedError as exc:
                 # #233 (ADR 0111): start/restart of a not-deployed connection is refused — deploying it
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a

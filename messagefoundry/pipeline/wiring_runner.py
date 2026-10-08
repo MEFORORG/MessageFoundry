@@ -777,6 +777,15 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 _PENDING_STOP_SETTLE_SECONDS = 10.0
 
 
+class DrIntakeState(NamedTuple):
+    """A runner's DR intake state before a release parks it (vault BACKLOG #3140), for
+    :meth:`RegistryRunner.restore_dr_intake` to put back if the release fails."""
+
+    threshold: Priority | None
+    standby: Priority | None
+    parked: frozenset[str]
+
+
 class _IngressFields(NamedTuple):
     """The peek reads an ingress commit records, taken once (see :func:`_read_ingress_fields`)."""
 
@@ -1114,6 +1123,7 @@ class RegistryRunner:
         intake_gate: IntakeGate | None = None,  # BACKLOG #290 slice 2: the engine-wide intake pause
         priority_default: Priority | None = None,
         dr_threshold: Priority | None = None,
+        dr_standby: Priority | None = None,
         alert_sink: AlertSink | None = None,
         egress: EgressSettings,
         hop_posture: HopPosture | None = None,
@@ -1234,6 +1244,13 @@ class RegistryRunner:
         # every connection starts subject only to ADR 0031 — byte-identical to before this seam.
         self._priority_default = priority_default or Priority.NORMAL
         self._dr_threshold = dr_threshold
+        # A DR standby that is not activated (vault BACKLOG #3140): the threshold an activation will
+        # apply. While it is set no inbound listener binds, because ADR 0048's load-balancer fence
+        # moves the VIP to the node that answers, and a passive box must not be that node. The
+        # inbound exposure and CA gates judge the listeners an activation would bind. Outbounds are
+        # not touched. A release sets it before it unbinds intake, while _dr_threshold still parks
+        # outbounds for the drain, so the two are set together only then.
+        self._dr_standby = dr_standby
         # Where the delivery workers report operational stalls (a stopped connection, a building
         # backlog). Defaults to the logging sink until a real notifier is wired (docs/BACKLOG.md item 5).
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
@@ -1379,7 +1396,8 @@ class RegistryRunner:
         # (ADR 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
         # because its resolved priority tier is below [dr].priority_threshold. Surfaced as
         # status:"filtered" on /connections + /connections/{name}/metadata so an operator can tell a
-        # deliberately-parked DR feed from a broken one. Empty unless a DR run-profile is active.
+        # deliberately-parked DR feed from a broken one. Empty unless a DR run-profile is active or
+        # the box is a passive DR standby, which parks every inbound (vault BACKLOG #3140).
         # Keyed by direction for the reason _failed above is, and here the two halves of a pair resolve
         # INDEPENDENTLY (each reads its own ic.priority / oc.priority), so they can genuinely disagree
         # about the threshold - a bare-name key silently gave one half's verdict to the other.
@@ -2470,7 +2488,8 @@ class RegistryRunner:
 
     def inbound_filtered(self, name: str) -> str | None:
         """The reason the DR run-profile parked this INBOUND (its resolved priority tier is below
-        ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is **not**
+        ``[dr].priority_threshold``, or the box is a passive standby, vault BACKLOG #3140), else
+        ``None`` (#61, ADR 0048). A filtered connection is **not**
         failed (ADR 0031) - it was deliberately not started; the two are surfaced as the distinct
         ``status:"filtered"`` vs ``status:"failed"`` so an operator can tell a parked DR feed from a
         broken one."""
@@ -2483,7 +2502,8 @@ class RegistryRunner:
 
     def filtered_inbound(self) -> dict[str, str]:
         """Snapshot of ``{inbound: reason}`` for INBOUNDs the DR run-profile parked below the priority
-        threshold (#61, ADR 0048). Empty unless a DR run-profile is active."""
+        threshold (#61, ADR 0048). Empty unless a DR run-profile is active or the box is a passive
+        standby, which parks every inbound (vault BACKLOG #3140)."""
         return {
             name: reason for (kind, name), reason in self._filtered.items() if kind == "inbound"
         }
@@ -2508,11 +2528,17 @@ class RegistryRunner:
             return oc.priority or self._priority_default
         return self._priority_default
 
-    def _below_dr_threshold(self, declared: Priority | None) -> bool:
+    def _below_dr_threshold(self, declared: Priority | None, *, inbound: bool = False) -> bool:
         """Whether the active DR run-profile parks a connection of this declared tier. The pure half of
         :meth:`_dr_filters_out`, which also records the ``filtered`` marker; :meth:`build_check`
-        needs the answer without the marker (vault BACKLOG #2622 item 1)."""
+        needs the answer without the marker (vault BACKLOG #2622 item 1).
+
+        For an ``inbound`` on a passive standby it answers against the threshold an activation
+        will apply, so the gates judge the listeners that activation binds (vault BACKLOG #3140).
+        A passive standby binds none of them; :meth:`_dr_filters_out` says so."""
         threshold = self._dr_threshold
+        if inbound and self._dr_standby is not None:
+            threshold = self._dr_standby
         if threshold is None:
             return False
         return (declared or self._priority_default).rank < threshold.rank
@@ -2528,7 +2554,9 @@ class RegistryRunner:
         skips of :meth:`start` and of :meth:`reload`'s inbound loop, without their side effects.
         Reload also skips a listener outside its schedule window, but the scheduler binds that one
         when the window opens, so it is gated here. A fresh runner has nothing listening, so this
-        is exactly :meth:`start`'s test there.
+        is exactly :meth:`start`'s test there. On a passive DR standby it holds for the listeners
+        an activation would bind, though none is bound yet, so a config that activation would
+        refuse is refused before the disaster rather than during it (vault BACKLOG #3140).
 
         The listening set is snapshotted now, on the caller's thread, so the predicate can run on a
         worker thread (the flag toggle validates off the event loop). The DR threshold and default
@@ -2541,7 +2569,7 @@ class RegistryRunner:
                 return False
             if not ic.auto_start and ic.name not in listening:
                 return False
-            return not self._below_dr_threshold(ic.priority)
+            return not self._below_dr_threshold(ic.priority, inbound=True)
 
         return binds
 
@@ -2550,27 +2578,112 @@ class RegistryRunner:
         """The DR run-profile threshold this runner applies, or ``None`` when it parks nothing."""
         return self._dr_threshold
 
-    def set_dr_threshold(self, threshold: Priority | None) -> None:
+    @property
+    def dr_standby(self) -> Priority | None:
+        """On a passive DR standby, the threshold an activation will apply, else ``None``. While
+        it is set no inbound listener binds (vault BACKLOG #3140)."""
+        return self._dr_standby
+
+    def set_dr_threshold(self, threshold: Priority | None, *, standby: Priority | None) -> None:
         """Set the DR run-profile threshold (#61, ADR 0048) for the next :meth:`start` or
-        :meth:`reload`. It binds and unbinds nothing itself, so the caller follows it with a reload.
+        :meth:`reload`, and the passive standby's threshold (``standby``, vault BACKLOG #3140). It
+        binds and unbinds nothing itself, so the caller follows it with a reload.
 
         The engine calls it when ``POST /dr/activate`` or ``/dr/release`` flips the run-profile on
         a running box. Without it the threshold stayed at its construction value, so an activation
         reload parked nothing on a box built passive (vault BACKLOG #3067).
 
-        The ``filtered`` markers stay until that reload, which drops them when no threshold is set.
-        Until then a released box keeps a parked feed parked: the scheduler skips it, and its
-        status says why its outbound has no connector."""
+        The outbound ``filtered`` markers stay until that reload, which drops them when no
+        threshold is set. Until then a released box keeps a parked outbound parked: the scheduler
+        skips it, and its status says why it has no connector. The inbound markers change at once,
+        because the scheduler and an alert rule's restart read them before that reload (vault
+        BACKLOG #3140). A ``standby`` parks each inbound that would bind and is not listening,
+        which after a release is every one. Leaving the standby swaps those markers for the
+        profile's, so a tick before an activation's reload binds no feed below the threshold."""
+        leaving = standby is None and self._dr_standby is not None
         self._dr_threshold = threshold
+        self._dr_standby = standby
+        if standby is not None or leaving:
+            self._rewrite_inbound_parks()
+
+    def _rewrite_inbound_parks(self, held: frozenset[str] = frozenset()) -> None:
+        """Write every inbound DR marker again under the current thresholds (vault BACKLOG #3140).
+
+        An idle inbound is marked when start would bind it, or when it holds a marker now or is
+        named in ``held``. That second test keeps the park of an ``auto_start = false`` feed:
+        one a reload parked after an operator start, one :meth:`park_intake` stopped, or one a
+        failed release must park again. A listening inbound, or a name the registry no
+        longer declares, gets none. It reads the registry as it is now, so a feed a reload added,
+        dropped or re-tiered is judged on its current tier."""
+        marked = {name for (kind, name) in self._filtered if kind == "inbound"} | held
+        for name in marked:
+            self._filtered.pop(("inbound", name), None)
+        for name, ic in self.registry.inbound.items():
+            if name in self._sources or not ic.deployed:
+                continue
+            if inbound_listener_starts(ic) or name in marked:
+                self._dr_filters_out(name, ic.priority, kind="inbound")
+
+    def dr_intake_state(self) -> DrIntakeState:
+        """What :meth:`restore_dr_intake` puts back: the DR thresholds, and which inbounds the
+        profile parks. The engine reads it before a release parks intake (vault BACKLOG #3140)."""
+        return DrIntakeState(
+            self._dr_threshold, self._dr_standby, frozenset(self.filtered_inbound())
+        )
+
+    def restore_dr_intake(self, state: DrIntakeState) -> None:
+        """Undo :meth:`park_intake` for a release that failed, so the box is as active as the DR
+        coordinator says (vault BACKLOG #3140). The thresholds come back, and the inbound markers
+        are written again under them, so the scheduler and an alert rule still leave a feed below
+        the threshold down. That includes a feed parked before the release and one a reload
+        parked during it. It errs toward parking: a below-threshold feed an operator started
+        before the release is parked too, when the park stopped it and it is still down. Nothing is bound here. The
+        listeners at or above the threshold that the park unbound come back on the next reload,
+        except an ``auto_start = false`` one, which the reload skips."""
+        self._dr_threshold = state.threshold
+        self._dr_standby = state.standby
+        self._rewrite_inbound_parks(state.parked)
+
+    async def park_intake(self, standby: Priority) -> None:
+        """Make this box a passive standby for intake and unbind every inbound, in one span of the
+        reload lock, for ``POST /dr/release`` (vault BACKLOG #3140). The DR threshold is kept, so
+        the outbounds the profile parks hold their rows through the drain. Run again after the
+        drain, it unbinds a listener an operator started meanwhile, so the release returns with
+        none bound.
+
+        Each inbound it stops gets a marker, even one with ``auto_start = false``, and even when
+        a later stop raises. So if the release fails, :meth:`restore_dr_intake` judges every one
+        of them against the profile."""
+        async with self._reload_lock:
+            self.set_dr_threshold(self._dr_threshold, standby=standby)
+            stopping = frozenset(self._sources)
+            try:
+                for name in list(self.registry.inbound):
+                    await self._stop_inbound_unsafe(name)
+            finally:
+                self._rewrite_inbound_parks(stopping)
 
     def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
 
-        ``False`` when no DR run-profile is active (``_dr_threshold is None``) — every normal deployment,
-        so the start path is byte-identical to before this seam. When a DR profile IS active, records the
+        ``False`` when no DR run-profile is active (``_dr_threshold is None``) and the box is not a
+        passive standby — every normal deployment, so the start path is byte-identical to before
+        this seam. When a DR profile IS active, records the
         reason in ``_filtered`` and returns ``True`` for a below-threshold connection so :meth:`start`
         skips binding/building it. The comparison is on the explicit total order (``rank``), so it is
-        unambiguous: a connection runs iff ``resolved.rank >= threshold.rank``."""
+        unambiguous: a connection runs iff ``resolved.rank >= threshold.rank``.
+
+        On a passive standby every INBOUND is parked, whatever its tier (vault BACKLOG #3140). ADR
+        0048's load balancer moves the VIP to the node that answers, so a passive box that bound a
+        listener would draw the traffic its fence exists to keep off it. The ADR's release leaves
+        the box with no listener bound, which is the state this keeps until an activation."""
+        standby = self._dr_standby
+        if kind == "inbound" and standby is not None:
+            self._filtered[(kind, name)] = (
+                f"DR standby is passive: no listener binds until POST /dr/activate, which binds "
+                f"tier {standby.value} and above (status:filtered, ADR 0048)"
+            )
+            return True
         threshold = self._dr_threshold
         if threshold is None:
             return False
@@ -2725,13 +2838,18 @@ class RegistryRunner:
         # OUTSIDE the wrap on purpose: an unknown name is the caller's 404, not a build failure.
         raise KeyError(name)
 
-    async def start_inbound(self, name: str) -> None:
+    async def start_inbound(self, name: str, *, operator: bool = False) -> None:
         """Start receiving on one inbound connection (no-op if already listening).
 
         Public console/API entrypoint — takes the reload lock so it can't race a concurrent
         reload()/stop() mutating _sources/_workers (review M-10). Internal callers that already hold
-        the lock (start, reload) use :meth:`_start_inbound_unsafe`."""
+        the lock (start, reload) use :meth:`_start_inbound_unsafe`.
+
+        On a passive DR standby only an ``operator`` start binds; an engine door such as the
+        scheduler or an alert rule does nothing (:meth:`_dr_refuses`)."""
         async with self._reload_lock:
+            if self._dr_refuses(name, operator=operator):
+                return
             await self._checked_inbound_start(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
@@ -2755,11 +2873,37 @@ class RegistryRunner:
         async with self._reload_lock:
             await self._stop_inbound_unsafe(name)
 
-    async def restart_inbound(self, name: str) -> None:
-        # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10).
+    async def restart_inbound(self, name: str, *, operator: bool = False) -> None:
+        # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
+        # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
+            if self._dr_refuses(name, operator=operator):
+                return
             await self._stop_inbound_unsafe(name)
             await self._checked_inbound_start(name)
+
+    def _dr_refuses(self, name: str, *, operator: bool) -> bool:
+        """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
+        #3140). The fence is enforced here, at the door, so no engine path binds a listener on a
+        passive box whatever its ``filtered`` marker says; the marker only reports the park. An
+        operator start overrides it, as ADR 0048 Decision 3 says. An unknown or not-deployed name
+        is not refused, so it still raises."""
+        ic = self.registry.inbound.get(name)
+        if operator or ic is None or not ic.deployed:
+            return False
+        if self._dr_standby is None:
+            # The active profile's parks stay with their markers, which the scheduler and the
+            # alert action read: after an operator start the calendar owns such an inbound again
+            # (ADR 0048 Decision 3), and a door refusal here would take that from it.
+            return False
+        if name not in self._sources and inbound_listener_starts(ic):
+            self._dr_filters_out(name, ic.priority, kind="inbound")
+        log.info(
+            "inbound connection %r: engine start or restart not run, because DR parks it; only "
+            "an operator start or POST /dr/activate binds it",
+            name,
+        )
+        return True
 
     def _require_owned_destination(self, name: str) -> None:
         """Refuse an outbound CONTROL for a lane another shard owns (ADR 0073). Without this, a
@@ -3128,18 +3272,18 @@ class RegistryRunner:
         """The lanes whose CA a reload to ``new`` reads: the ones it builds or keeps running, with
         settings resolved. It mirrors the gates of :meth:`_reconcile_outbounds` and of
         :meth:`reload`'s listener restart, read without their side effects. Left out: a lane not
-        deployed, an ``auto_start=False`` lane that is not running, a lane below a DR threshold, an
+        deployed, an ``auto_start=False`` lane that is not running, a lane below a DR threshold (for
+        an inbound on a passive standby, the one its activation applies), an
         ``Ftp`` poller outside its schedule window, and a lane :meth:`_keeps_anchor_failure` keeps
         failed. Each of those is checked when it is built. It is stricter than the reconcile in one
         place: a lane a #122 halt keeps parked is still checked, since asking the halt gate here
         would run its probe, which has side effects."""
-        dr_on = self._dr_threshold is not None
         lanes: list[tuple[Direction, str, Mapping[str, Any]]] = []
         for name, oc in new.outbound.items():
             if (
                 not oc.deployed
                 or (not oc.auto_start and not self._outbound_lane_live(name))
-                or (dr_on and self._below_dr_threshold(oc.priority))
+                or self._below_dr_threshold(oc.priority)
                 or self._keeps_anchor_failure("outbound", name, old, oc)
             ):
                 continue
@@ -3151,7 +3295,7 @@ class RegistryRunner:
                 or not ic.spec.settings.get("tls_ca_file")
                 or not ic.deployed
                 or (not ic.auto_start and ic.name not in old_inbound_names)
-                or (dr_on and self._below_dr_threshold(ic.priority))
+                or self._below_dr_threshold(ic.priority, inbound=True)
                 or (ic.schedule is not None and not ic.schedule.is_active(self._schedule_clock()))
                 or self._keeps_anchor_failure("inbound", ic.name, old, ic, bound=old_inbound_names)
             ):
@@ -4349,8 +4493,9 @@ class RegistryRunner:
                 await self._teardown_unsafe(TeardownReason.SHUTDOWN)
             self._stop.clear()
             if self._dr_threshold is None:
-                # As in reload: with the profile off nothing is parked, and a marker left by a run
-                # under it would otherwise refuse doors until the next reload (vault BACKLOG #3067).
+                # As in reload: with the profile off no outbound is parked, and a marker left by a
+                # run under it would otherwise refuse doors until the next reload (vault BACKLOG
+                # #3067). A passive standby's inbound markers are written again by the loop below.
                 self._filtered.clear()
             # Capture the engine loop so a handler's worker thread can bridge a db_lookup back onto it.
             self._loop = asyncio.get_running_loop()
@@ -4540,6 +4685,15 @@ class RegistryRunner:
                     total,
                     len(self._filtered),
                     ", ".join(f"{k} {n}" for k, n in sorted(self._filtered)) or "(none)",
+                )
+            elif self._dr_standby is not None:
+                # A passive DR standby (vault BACKLOG #3140): say why no listener is up, so an
+                # operator reading the start does not take the quiet box for a broken one.
+                log.warning(
+                    "DR standby is passive: %d inbound listener(s) left unbound until "
+                    "POST /dr/activate, which binds tier %s and above",
+                    len(self.filtered_inbound()),
+                    self._dr_standby.value,
                 )
             if self._failed:
                 log.warning(
@@ -6035,10 +6189,10 @@ class RegistryRunner:
                 new_registry = self.registry
             self.build_check(new_registry)  # raises before any change on a bad connector
             if self._dr_threshold is None:
-                # Only the DR profile writes these, and with it off nothing is parked. The loops
-                # below drop a marker only for a connection that passes the earlier gates, so one
-                # left down by auto_start or deployed would otherwise read "filtered" for good
-                # after a POST /dr/release (vault BACKLOG #3067).
+                # With the profile off no outbound is parked. The loops below drop a marker only
+                # for a connection that passes the earlier gates, so one left down by auto_start or
+                # deployed would otherwise read "filtered" for good after a POST /dr/release (vault
+                # BACKLOG #3067). A passive standby's inbound markers are written again below.
                 self._filtered.clear()
             if not self._running:
                 self.registry = new_registry
@@ -6158,7 +6312,10 @@ class RegistryRunner:
                     # threshold (the profile is a per-run decision read at start/reload), so a
                     # below-threshold inbound stays parked (status:"filtered") and is not re-bound; its
                     # workers below still drain any backlog. No DR profile → byte-identical to before.
+                    # A failed record goes with it, as the schedule branch below drops one: with no
+                    # bind here to clear it, it would hold the status at failed while parked.
                     if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
+                        self._failed.pop(("inbound", ic.name), None)
                         continue
                     self._filtered.pop(("inbound", ic.name), None)
                     # Active-window schedule (#147, ADR 0095): outside its window the calendar owns
