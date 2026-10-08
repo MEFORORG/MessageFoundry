@@ -183,6 +183,7 @@ from messagefoundry.store.store import (
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
+    MessageOrigin,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -387,7 +388,9 @@ _SCHEMA: list[str] = [
         error        TEXT,
         summary      TEXT,
         metadata     TEXT,
-        documents_pruned DOUBLE PRECISION
+        documents_pruned DOUBLE PRECISION,
+        origin       TEXT,
+        origin_actor TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS ix_messages_channel ON messages(channel_id, received_at)",
     "CREATE INDEX IF NOT EXISTS ix_messages_control ON messages(channel_id, control_id)",
@@ -939,6 +942,12 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
 # the IdP step-up refuses as step_up_idp_auth_time_missing.
 _SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"))
+# Vault BACKLOG #2615: the plain origin pair for a pre-existing messages table. Gated, because a bare
+# ADD COLUMN IF NOT EXISTS would hold ACCESS EXCLUSIVE on the hottest table through the batch even when
+# the column is there. In _SCHEMA, so adding it moves _schema_hash() and needs no _MIGRATION_REV bump.
+# NULL on an existing row means the origin was not recorded.
+_SCHEMA.append(_gated_add_column("messages", "origin", "TEXT"))
+_SCHEMA.append(_gated_add_column("messages", "origin_actor", "TEXT"))
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
@@ -2997,12 +3006,14 @@ class PostgresStore:
         metadata: str | None,
         error: str | None,
         now: float,
+        origin: MessageOrigin,
+        origin_actor: str | None = None,
     ) -> None:
         await conn.execute(
             "INSERT INTO messages"
             " (id, channel_id, received_at, source_type, control_id,"
-            "  message_type, raw, status, error, summary, metadata)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "  message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
             mid,
             channel_id,
             now,
@@ -3015,6 +3026,9 @@ class PostgresStore:
             # EF-3: MRN/name is PHI — ciphered at rest like the body
             self._enc(summary, aad=cell_aad("messages", "summary", mid)),
             self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+            # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
+            origin.value,
+            origin_actor,
         )
 
     async def _insert_outbound_row(
@@ -3146,6 +3160,7 @@ class PostgresStore:
                 metadata=child_meta,
                 error=None,
                 now=now,
+                origin=MessageOrigin.REINGRESS,
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created = now
@@ -3267,6 +3282,7 @@ class PostgresStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             for dest_name, payload in deliveries:
                 await self._insert_outbound_row(conn, mid, channel_id, dest_name, payload, now)
@@ -3307,6 +3323,7 @@ class PostgresStore:
                 metadata=metadata,
                 error=error,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             await self._event(conn, mid, event, None, error, now)
         return mid
@@ -3324,6 +3341,8 @@ class PostgresStore:
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
         audit: OperatorAudit[str] | None = None,
+        origin: MessageOrigin = MessageOrigin.PARTNER,
+        origin_actor: str | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001). In one transaction: insert the message
@@ -3355,6 +3374,8 @@ class PostgresStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=origin,
+                origin_actor=origin_actor,
             )
             # ingest-time (ADR 0009) + metrics only; FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created_at = now
@@ -4738,6 +4759,7 @@ class PostgresStore:
                                 else None
                             ),
                             now=now,
+                            origin=MessageOrigin.REINGRESS,
                         )
                         if not peek_failed:
                             # ingest-time (ADR 0009) + metrics only; FIFO orders by seq — ADR 0059.
@@ -6287,6 +6309,7 @@ class PostgresStore:
         body_override: str | None = None,
         now: float | None = None,
         audit: OperatorAudit[ResendOutcome] | None = None,
+        actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
         Mirrors :meth:`MessageStore.resend_to`. Strict-FIFO writer-funnel: takes the per-lane advisory
@@ -6337,6 +6360,7 @@ class PostgresStore:
                     )
                     await self._append_operator_audit(conn, written, audit, outcome)
                     return outcome
+                child_mid: str | None = None
                 if body_override is not None:
                     # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                     # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN row
@@ -6397,6 +6421,8 @@ class PostgresStore:
                         metadata=child_meta,
                         error=None,
                         now=now,
+                        origin=MessageOrigin.OPERATOR_EDIT,
+                        origin_actor=actor,
                     )
                     await self._event(
                         conn, child_mid, "received", None, f"edit-resend from {message_id}", now
@@ -6475,6 +6501,7 @@ class PostgresStore:
                     to_destination=to,
                     from_destination=src_dest,
                     outbox_id=outbox_id,
+                    new_message_id=child_mid,
                 )
                 await self._append_operator_audit(conn, written, audit, outcome)
                 return outcome
@@ -6487,6 +6514,7 @@ class PostgresStore:
         idempotency_key: str,
         now: float | None = None,
         audit: OperatorAudit[ReingressOutcome] | None = None,
+        actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
         fresh, correlated ``RECEIVED`` child message at the origin channel's ingress stage; the origin
@@ -6577,6 +6605,8 @@ class PostgresStore:
                         metadata=child_meta,
                         error=None,
                         now=now,
+                        origin=MessageOrigin.OPERATOR_EDIT,
+                        origin_actor=actor,
                     )
                     # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
                     resubmit_row_id = uuid4().hex

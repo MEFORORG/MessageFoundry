@@ -102,6 +102,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DestinationMetrics,
     InboundMetrics,
+    MessageOrigin,
     OperatorAudit,
     OwnedLanes,
     ReingressOutcome,
@@ -2677,14 +2678,20 @@ class Engine:
         raw: str,
         idempotency_key: str,
         audit: OperatorAudit[ReingressOutcome],
+        actor: str,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-ingress an EDITED body as a fresh
         correlated ``RECEIVED`` message on the ORIGIN's channel, then wake the workers so the router
         drains the new ingress row promptly. The store (:meth:`QueueStore.reingress`) does the idempotent,
         original-immutable, correlated insert; RBAC + step-up are the API's job, and so are the origin
-        inbound's ingress guards (BACKLOG #1911). The original message row is never written."""
+        inbound's ingress guards (BACKLOG #1911). The original message row is never written. ``actor``
+        is the operator, recorded as the child's ``origin_actor`` (vault BACKLOG #2615)."""
         outcome = await self.store.reingress(
-            origin_message_id=message_id, raw=raw, idempotency_key=idempotency_key, audit=audit
+            origin_message_id=message_id,
+            raw=raw,
+            idempotency_key=idempotency_key,
+            audit=audit,
+            actor=actor,
         )
         if (
             outcome.status == "resubmitted"
@@ -2702,6 +2709,7 @@ class Engine:
         source_type: str = "upload",
         metadata: str | None = None,
         audit: OperatorAudit[str],
+        actor: str,
     ) -> str:
         """Inject a fresh ``RECEIVED`` message onto ``channel_id``'s **ingress** stage — the DISTINCT
         inject path for the offline uploaded-logs resend (BACKLOG #125, ADR 0134). It reuses the exact
@@ -2713,9 +2721,16 @@ class Engine:
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
         validation (registered/running), RBAC and the target inbound's ingress guards (BACKLOG
         #1911) are the API's job. The API also builds the ``audit`` row that commits with the message
-        (BACKLOG #2624). Returns the new message id."""
+        (BACKLOG #2624). Returns the new message id. The message's origin is ``operator_upload`` with
+        ``actor`` as its acting user (vault BACKLOG #2615)."""
         mid = await self.store.enqueue_ingress(
-            channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata, audit=audit
+            channel_id=channel_id,
+            raw=raw,
+            source_type=source_type,
+            metadata=metadata,
+            audit=audit,
+            origin=MessageOrigin.OPERATOR_UPLOAD,
+            origin_actor=actor,
         )
         if self._registry_runner is not None and self._registry_runner.running:
             self._registry_runner.notify_work()
@@ -2729,6 +2744,7 @@ class Engine:
         raw: str,
         idempotency_key: str,
         audit: OperatorAudit[ResendOutcome],
+        actor: str,
     ) -> ResendOutcome:
         """Edit-and-resubmit DIRECT power-path (ADR 0090 §9, BACKLOG #153): deliver an EDITED body
         straight to a chosen alternate outbound ``to`` (reusing #123's :meth:`QueueStore.resend_to` with
@@ -2741,6 +2757,7 @@ class Engine:
             idempotency_key=idempotency_key,
             body_override=raw,
             audit=audit,
+            actor=actor,
         )
         if (
             outcome.status == "resent"

@@ -418,11 +418,13 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
+from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
+    MessageOrigin,
     OperatorAudit,
     ReingressOutcome,
     ResendOutcome,
@@ -6064,6 +6066,29 @@ def create_app(
         (``to=None``) this key repeats, or ``None``. Read-only; it queues nothing."""
         return await engine.prior_resend(idempotency_key, message_id=message_id, to=to)
 
+    async def _edit_resend_provenance(
+        engine: Engine, row: Mapping[str, Any], edited: str
+    ) -> dict[str, object]:
+        """What an edit-resend audit row adds so the resend can be proved later (vault BACKLOG #2615).
+
+        ``origin`` repeats the new message's plain ``messages.origin``. ``body_digest`` holds keyed
+        HMAC-SHA256 digests of the ORIGIN message's stored body and of the edited body the operator
+        submitted, under a key derived from the audit key (:func:`audit_body_digests`). In reroute
+        mode the edited body is what re-enters the origin channel; a handler then transforms it, and
+        what a partner receives is that handler's output, which this digest does not cover. Keyed,
+        never a plain hash: a short PHI body is guessable, and this row is kept for good. It is
+        ``None`` when the store has no in-heap key (keyless, or Vault Transit), and ``original`` is
+        ``None`` when retention has already blanked the origin's body. The bodies never enter the row.
+        Off the event loop, since each body may run to the 16 MiB ceiling."""
+        original = row.get("raw")
+        digests = await asyncio.to_thread(
+            audit_body_digests,
+            engine.store.cipher(),
+            original=original if isinstance(original, str) else "",
+            edited=edited,
+        )
+        return {"origin": MessageOrigin.OPERATOR_EDIT.value, "body_digest": digests}
+
     @app.post("/messages/{message_id}/edit-resend", response_model=EditResendResult)
     async def edit_resend_message(
         message_id: ResourceId,
@@ -6082,7 +6107,12 @@ def create_app(
         seam). The ORIGINAL message stays byte-identical (count-and-log) — the resubmit is a new,
         correlated message. Requires ``MESSAGES_EDIT`` step-up (implies ``MESSAGES_VIEW_RAW``); the direct
         path additionally requires access to the alternate outbound's channel. Audited
-        (``message.edit_resend``, actor + original→new correlation) — NEVER the edited body."""
+        (``message.edit_resend``, actor + original→new correlation) — NEVER the edited body.
+
+        The audit row also carries keyed digests of the original and the edited body, and the new
+        message records its origin as ``operator_edit`` with the acting user, so the edited body can
+        be proved after retention has blanked both bodies (vault BACKLOG #2615,
+        :func:`_edit_resend_provenance`)."""
         # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
         row = await get_scoped_message(engine, identity, message_id, request)
 
@@ -6127,6 +6157,8 @@ def create_app(
             )
             client = client_ip(request)
 
+            direct_provenance = await _edit_resend_provenance(engine, row, admitted)
+
             def _direct_audit(direct: ResendOutcome) -> AuditAppend | None:
                 # Committed with the delivery row (BACKLOG #2624); a duplicate records nothing.
                 if direct.status != "resent":
@@ -6141,6 +6173,8 @@ def create_app(
                             "mode": "direct",
                             "to": direct.to_destination,
                             "outbox_id": direct.outbox_id,
+                            "new_message_id": direct.new_message_id,
+                            **direct_provenance,
                         }
                     ),
                     client=client,
@@ -6153,6 +6187,7 @@ def create_app(
                     raw=admitted,
                     idempotency_key=body.idempotency_key,
                     audit=_direct_audit,
+                    actor=identity.username,
                 )
             except ResendError as exc:
                 # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
@@ -6196,6 +6231,7 @@ def create_app(
             detail={"message_id": message_id, "mode": "reroute"},
         )
         client = client_ip(request)
+        reroute_provenance = await _edit_resend_provenance(engine, row, admitted)
 
         def _reroute_audit(outcome: ReingressOutcome) -> AuditAppend | None:
             # Committed with the re-ingress (BACKLOG #2624); a duplicate records nothing.
@@ -6211,6 +6247,7 @@ def create_app(
                         "mode": "reroute",
                         "new_message_id": outcome.new_message_id,
                         "channel_id": outcome.channel_id,
+                        **reroute_provenance,
                     }
                 ),
                 client=client,
@@ -6218,7 +6255,11 @@ def create_app(
 
         try:
             outcome = await engine.edit_resend_reroute(
-                message_id, raw=admitted, idempotency_key=body.idempotency_key, audit=_reroute_audit
+                message_id,
+                raw=admitted,
+                idempotency_key=body.idempotency_key,
+                audit=_reroute_audit,
+                actor=identity.username,
             )
         except ResendError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -6785,6 +6826,11 @@ def create_app(
             detail={"file_id": file_id, "index": body.index, "to": body.to},
         )
         client = client_ip(request)
+        # Vault BACKLOG #2615: the same keyed digest an edit-resend row holds, of the injected body, so
+        # the inject can be proved once retention and the upload's own deletion have taken the bytes.
+        injected_digest = await asyncio.to_thread(
+            audit_body_digests, engine.store.cipher(), injected=admitted
+        )
         # The row commits with the injected message (BACKLOG #2624).
         mid = await engine.inject_message(
             channel_id=body.to,
@@ -6796,10 +6842,18 @@ def create_app(
                 actor=identity.username,
                 channel_id=body.to,
                 detail=json.dumps(
-                    {"file_id": file_id, "index": body.index, "to": body.to, "message_id": new_mid}
+                    {
+                        "file_id": file_id,
+                        "index": body.index,
+                        "to": body.to,
+                        "message_id": new_mid,
+                        "origin": MessageOrigin.OPERATOR_UPLOAD.value,
+                        "body_digest": injected_digest,
+                    }
                 ),
                 client=client,
             ),
+            actor=identity.username,
         )
         return UploadResendResult(
             file_id=file_id, index=body.index, to=body.to, message_id=mid, status="injected"

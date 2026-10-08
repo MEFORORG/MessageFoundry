@@ -1210,6 +1210,63 @@ async def test_edit_resend_reroute_redirects_to_child(engine: Engine, tmp_path: 
     child_row = await engine.store.get_message(child)
     assert child_row is not None and child_row["raw"] == EDITED  # the child carries the edited body
     assert json.loads(child_row["metadata"])["edited_from"] == mid  # correlated to the origin
+    # Vault BACKLOG #2615: the plain origin names the operator who sent it.
+    assert (child_row["origin"], child_row["origin_actor"]) == ("operator_edit", "op")
+
+
+async def test_console_edit_resend_audits_keyed_digests_and_origin(tmp_path: Path) -> None:
+    # Vault BACKLOG #2615: the console route reaches the engine's own handler, so its audit row
+    # carries the same provenance as the JSON route's: the origin and keyed digests of both bodies,
+    # which reproduce from the bodies under the store key.
+    from messagefoundry.store.crypto import generate_key, make_cipher, verify_audit_body_digest
+    from messagefoundry.store.store import MessageStore
+
+    (tmp_path / "in").mkdir(exist_ok=True)
+    store = await MessageStore.open(tmp_path / "keyed.db", cipher=make_cipher(generate_key()))
+    engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
+    try:
+        reg = Registry()
+        reg.add_inbound(
+            InboundConnection(
+                "ch1",
+                ConnectionSpec(
+                    ConnectorType.FILE,
+                    {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+                ),
+                router="r",
+            )
+        )
+        reg.add_router("r", lambda m: [])
+        engine.add_registry(reg)
+        service = await _service(engine)
+        await _add(service, "op", Role.OPERATOR)
+        mid = await _seed(engine)
+        async with _client(engine, service) as c:
+            await _cookie_login(c, "op")
+            await _mint_action(c, f"/ui/messages/{mid}/edit")
+            r = await c.post(
+                f"/ui/messages/{mid}/edit-resend",
+                data={"raw": EDITED, "idempotency_key": "k1", "mode": "reroute"},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+            assert r.status_code == 303
+        [rec] = [a for a in await store.list_audit() if a["action"] == "message_edit_resend"]
+        assert rec["actor"] == "op"
+        detail = json.loads(str(rec["detail"]))
+        assert detail["origin"] == "operator_edit"
+        digest = detail["body_digest"]
+        cipher = store.cipher()
+        kid = digest["key_id"]
+        assert verify_audit_body_digest(cipher, ADT, key_id=kid, digest=digest["original"])
+        assert verify_audit_body_digest(cipher, EDITED, key_id=kid, digest=digest["edited"])
+        assert "DOE^JOHN" not in str(rec["detail"])
+        child = await store.get_message(detail["new_message_id"])
+        assert child is not None and (child["origin"], child["origin_actor"]) == (
+            "operator_edit",
+            "op",
+        )
+    finally:
+        await engine.stop()
 
 
 async def test_edit_resend_direct_redirects_to_origin(engine: Engine, tmp_path: Path) -> None:
@@ -1257,6 +1314,11 @@ async def test_edit_resend_direct_redirects_to_origin(engine: Engine, tmp_path: 
     detail = str(rec[0]["detail"] or "")
     assert '"mode": "direct"' in detail
     assert EDITED not in detail and "DOE^JOHN" not in detail  # the edited body is NEVER audited
+    # Vault BACKLOG #2615: a keyless store records the origin and no digest, never a plain hash.
+    parsed = json.loads(detail)
+    assert parsed["origin"] == "operator_edit" and parsed["body_digest"] is None
+    child = await engine.store.get_message(parsed["new_message_id"])
+    assert child is not None and (child["origin"], child["origin_actor"]) == ("operator_edit", "op")
 
 
 async def test_edit_resend_direct_missing_to_rejects_generic(engine: Engine) -> None:

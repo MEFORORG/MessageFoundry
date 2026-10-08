@@ -82,6 +82,7 @@ from messagefoundry.store.store import (
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
+    MessageOrigin,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -348,6 +349,8 @@ class QueueStore(StoreLifecycle, Protocol):
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
         audit: OperatorAudit[str] | None = None,
+        origin: MessageOrigin = MessageOrigin.PARTNER,
+        origin_actor: str | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the ingress stage (status ``RECEIVED`` +
         one ``stage='ingress'`` queue row) in one transaction — the staged pipeline's ACK-on-receipt
@@ -359,7 +362,10 @@ class QueueStore(StoreLifecycle, Protocol):
         :attr:`supports_streaming_attachments` is True ever receives a non-empty value.
 
         ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
-        message id, commits in the same transaction. A live receipt passes none."""
+        message id, commits in the same transaction. A live receipt passes none.
+
+        ``origin`` and ``origin_actor`` fill the plain ``messages.origin`` pair (vault BACKLOG #2615).
+        A live receipt keeps the default, ``partner``; an operator's inject names itself and the user."""
         ...
 
     async def handoff(
@@ -1048,6 +1054,7 @@ class QueueStore(StoreLifecycle, Protocol):
         body_override: str | None = None,
         now: float | None = None,
         audit: OperatorAudit[ResendOutcome] | None = None,
+        actor: str | None = None,
     ) -> ResendOutcome: ...
 
     async def reingress(
@@ -1058,6 +1065,7 @@ class QueueStore(StoreLifecycle, Protocol):
         idempotency_key: str,
         now: float | None = None,
         audit: OperatorAudit[ReingressOutcome] | None = None,
+        actor: str | None = None,
     ) -> ReingressOutcome: ...
 
     async def replay_dead(
