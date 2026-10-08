@@ -27,8 +27,9 @@ A third rule rides the same hook because only commit-msg sees the message (CLAUD
 
     No line may START with `Co-Authored-By: Claude` (any case) or `Claude-Session:`.
 
-It reads the whole message above git's scissors line, fires on every commit, and runs before any git
-read. Indented or backticked, a body may still quote either trailer.
+It reads the whole message, fires on every commit, and runs before any git read. Indented or
+backticked, a body may still quote either trailer. It is inert on a box until
+``scripts/coord/install-git-hooks.ps1`` re-copies this file into the shared ``.git/hooks``.
 
 Three scoping decisions for the claim rule, each load-bearing:
 
@@ -115,10 +116,8 @@ _COMMENT_LINE = re.compile(r"#(?!\d)")
 # still QUOTE either trailer when it is indented or set in backticks.
 # Whitespace is allowed before the colon because git's trailer parser accepts it there.
 _ATTRIBUTION_TRAILER = re.compile(
-    r"^(?:Co-Authored-By\s*:\s*Claude|Claude-Session\s*:)", re.IGNORECASE
+    r"^(?:Co-Authored-By\s*:\s*Claude\b|Claude-Session\s*:)", re.IGNORECASE
 )
-# `git commit -v` appends the diff below this line. It is not message text, so nothing below it counts.
-_SCISSORS = "# ------------------------ >8 ------------------------"
 
 # A commit touching ONLY these is documentation/ledger work: it may cite an item without implementing it.
 _DOC_PREFIXES = ("docs/", ".github/")
@@ -406,9 +405,9 @@ def _refuse_bare(subject: str, items: list[str], bare: list[str]) -> int:
 def _attribution_trailers(message: str) -> list[tuple[int, str]]:
     """The 1-indexed lines of *message* that carry a trailer section 5 says to omit."""
     hits: list[tuple[int, str]] = []
+    # No scissors handling is needed: every line `git commit -v` writes below the scissors starts
+    # with a diff marker, so the anchored pattern cannot match one.
     for n, line in enumerate(message.splitlines(), 1):
-        if line.startswith(_SCISSORS):
-            break
         if _ATTRIBUTION_TRAILER.match(line):
             hits.append((n, line))
     return hits

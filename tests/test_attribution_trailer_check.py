@@ -73,14 +73,18 @@ def test_a_quoted_trailer_in_the_body_passes(tmp_path: Path, quoted: str) -> Non
     assert proc.returncode == 0, proc.stderr
 
 
-def test_the_diff_below_the_scissors_line_is_not_message_text(tmp_path: Path) -> None:
-    """`git commit -v` appends the diff below the scissors; a trailer there is content, not a trailer."""
+def test_a_human_whose_name_starts_with_claude_is_not_refused(tmp_path: Path) -> None:
+    human = "Co-Authored-By" + ": Claudette Smith <c@example.invalid>"
+    assert _run(tmp_path, f"docs: subject\n\n{human}\n").returncode == 0
+    # Control: the name followed by a word boundary fires.
+    assert _run(tmp_path, f"docs: subject\n\n{_COAUTHOR}\n").returncode == 1
+
+
+def test_a_diff_line_from_commit_verbose_is_not_a_trailer(tmp_path: Path) -> None:
+    """`git commit -v` writes the diff below a scissors line, every line led by a diff marker."""
     scissors = "# ------------------------ >8 ------------------------"
-    proc = _run(tmp_path, f"docs: subject\n\nbody\n{scissors}\n{_COAUTHOR}\n")
+    proc = _run(tmp_path, f"docs: subject\n\nbody\n{scissors}\n+{_COAUTHOR}\n-{_SESSION}\n")
     assert proc.returncode == 0, proc.stderr
-    # Positive control: the same trailer above the scissors fires.
-    proc = _run(tmp_path, f"docs: subject\n\n{_COAUTHOR}\n{scissors}\n")
-    assert proc.returncode == 1
 
 
 def test_the_trailer_rule_fires_before_the_citation_rule(tmp_path: Path) -> None:
