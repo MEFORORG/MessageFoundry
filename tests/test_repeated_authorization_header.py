@@ -136,28 +136,38 @@ def test_optional_identity_answers_a_repeat_as_tokenless(
     assert json.loads(str(row["detail"])) == {"credential": "authorization", "path": "/ai/policy"}
 
 
-async def test_the_logged_path_cannot_forge_a_line(caplog: pytest.LogCaptureFixture) -> None:
-    """Starlette percent-decodes the path, so a server can see a line break in it that a test
-    client would have normalised away. Driven on a hand-built scope: the line carries the path
-    through ``%r`` and bounds its length."""
+@pytest.mark.parametrize("brk", [chr(10), chr(13), chr(13) + chr(10)], ids=["lf", "cr", "crlf"])
+async def test_no_request_value_can_start_a_second_log_line(
+    caplog: pytest.LogCaptureFixture, brk: str
+) -> None:
+    """Starlette percent-decodes the path, and behind a trusted proxy the peer comes from
+    ``X-Forwarded-For``, so either can carry a line break a test client would have normalised
+    away. Driven on a hand-built scope, with the break in BOTH. The line passes each through
+    ``scrub_log_argument`` (CodeQL py/log-injection), and the path is bounded."""
     caplog.set_level("WARNING")
     app = SimpleNamespace(state=SimpleNamespace(auth=None))
+    forged = brk + "API credential refused: forged"
     scope = {
         "type": "http",
         "method": "GET",
         "scheme": "http",
-        "path": "/messages/a" + chr(10) + "API credential refused: forged" + "x" * 1000,
+        "path": "/messages/a" + forged + "x" * 1000,
         "query_string": b"",
         "headers": [],
-        "client": ("192.0.2.9", 1),
+        "client": ("203.0.113.5" + forged, 1),
         "server": ("t", 80),
         "app": app,
     }
     await record_repeated_credential(Request(scope), "authorization")
-    (line,) = _lines(caplog)
-    # The engine's log filter may also strip control characters, so assert only the outcome.
-    assert chr(10) not in line and "forged" in line, line
-    assert len(line) < 400, len(line)
+    (record,) = [r for r in caplog.records if "API credential refused" in r.getMessage()]
+    line = record.getMessage()
+    assert chr(10) not in line and chr(13) not in line, line
+    assert line.count("forged") == 2, "both values are kept, escaped, not dropped"
+    assert len(line) < 500, len(line)
+    # The escaping happens at the call site, so a handler with no scrub filter is safe too.
+    assert all(chr(10) not in str(a) and chr(13) not in str(a) for a in record.args or ()), (
+        record.args
+    )
 
 
 async def test_negotiate_charges_the_sign_in_budget_once_per_repeat(engine: Engine) -> None:

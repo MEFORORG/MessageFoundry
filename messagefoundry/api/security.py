@@ -43,6 +43,7 @@ from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.config.tls_policy import HopDisposition
+from messagefoundry.controlchars import scrub_log_argument
 
 # Imported, not redefined: the cert->principal matchers live in the neutral package-root leaf, which
 # the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. This plane keys by issuer first
@@ -414,7 +415,7 @@ async def record_repeated_credential(conn: Request | WebSocket, credential: str)
     turn the 400 into a 500."""
     client = client_ip(conn)
     # Starlette has already percent-decoded the path, so it can hold a line break or run long.
-    # Bounded for both sinks, and logged with %r so it cannot forge a second log line.
+    # Bounded for both sinks. The log line passes it, and the peer, through scrub_log_argument.
     path = conn.url.path[:_REPEATED_PATH_MAX]
     auth: AuthService | None = getattr(conn.app.state, "auth", None)
     audited = False
@@ -424,11 +425,14 @@ async def record_repeated_credential(conn: Request | WebSocket, credential: str)
             audited = True
         except Exception as exc:  # noqa: BLE001 - fail-soft, as #2051's sink is
             log.warning("repeated-credential audit write failed: %s", safe_exc(exc))
+    # Every request-derived value is scrubbed at the call site for CodeQL py/log-injection;
+    # scrub_log_argument says why. The peer can come from X-Forwarded-For behind a trusted proxy.
+    # The label is one of this module's fixed strings, and `audited` is a bool.
     log.warning(
-        "API credential refused: repeated %s; peer=%s path=%r audited=%s",
-        credential,
-        client or "unknown",
-        path,
+        "API credential refused: repeated %s; peer=%s path=%s audited=%s",
+        scrub_log_argument(credential),
+        scrub_log_argument(client or "unknown"),
+        scrub_log_argument(path),
         audited,
     )
 
