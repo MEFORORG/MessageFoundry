@@ -3034,7 +3034,8 @@ class AuthSettings(_Section):
     # a block-forever operation — AuthService dispatches each LDAP call through a bare asyncio.to_thread
     # with no wait_for, so one wedged DC pinned a thread-pool worker indefinitely instead of failing the
     # login. 10 s each is well above a healthy on-prem DC round trip and well below any human patience
-    # for a login. Both must be > 0: a 0/negative value would restore the unbounded wait.
+    # for a login. Both must be > 0: a 0/negative value would restore the unbounded wait. A value
+    # above 10 s is a LOOSENING that security_loosenings() names while AD is on (vault BACKLOG #2567).
     ad_connect_timeout: float = 10.0  # seconds — bound the LDAP/LDAPS TCP connect
     ad_receive_timeout: float = 10.0  # seconds — bound each LDAP response read (bind + search)
 
@@ -7120,6 +7121,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       looser and 0 is off. A higher floor is stricter, and is not named.
     * ``oidc_callback_floor_exempt_amr`` (BACKLOG #2388) skips the federated floor for a matching
       ``amr``, so any value listed is looser, named while that floor is on.
+    * ``ad_connect_timeout`` and ``ad_receive_timeout`` (vault BACKLOG #2567) bound how long one
+      directory call may hold a worker thread, so a value above its default is looser, named while
+      AD is on. They are timeouts and not rate limits; they sit here because they are read the same
+      way, against the shipped default.
 
     ``[approvals].min_dwell_seconds``, the dual-control approval floor, is another time floor of the
     same kind. It lives in its own section, so :func:`_approvals_loosenings` names it, read the same
@@ -7477,6 +7482,30 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             ),
             off=None,
         )
+
+    # --- the directory timeouts (vault BACKLOG #2567, ASVS 13.1.3). LdapAuthenticator hands them to
+    # every ldap3 Server and Connection, and each directory call runs in a worker thread until it
+    # answers or times out. A longer timeout holds that thread longer, so only a value above the
+    # default is looser. The load refuses 0, a negative, inf and NaN, so there is no off value.
+    # Named only with AD on, as ad_session_recheck_seconds is: with no directory nothing reads them.
+    if auth.ad_enabled:
+        for field, what in (
+            ("ad_connect_timeout", "the LDAP connect timeout"),
+            ("ad_receive_timeout", "the LDAP response-read timeout"),
+        ):
+            value, default = getattr(auth, field), _auth_default(field)
+            if value > default:
+                out.append(
+                    (
+                        field,
+                        # 15 significant digits, so a value just past the default never prints as it.
+                        f"{what} is {value:.15g} s, above the default of {default:g} s, so each "
+                        "directory call (a sign-in, a step-up or a session recheck) to a domain "
+                        "controller that has stopped answering holds a worker thread for up to "
+                        "that long before it fails -- fewer stalled calls are then needed to tie "
+                        "up the thread pool that sign-in shares",
+                    )
+                )
     return out
 
 
@@ -7598,7 +7627,8 @@ def security_loosenings(
     ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
     bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap and OIDC flow-cache
+    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache
+    and AD timeout
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
     (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),

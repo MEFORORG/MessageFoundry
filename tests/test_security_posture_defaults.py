@@ -232,6 +232,38 @@ def test_recheck_at_the_default_with_ad_enabled_is_not_a_loosening() -> None:
     assert "ad_session_recheck_seconds" not in _names(auth=_ad())
 
 
+# --- [auth].ad_connect_timeout / ad_receive_timeout (vault BACKLOG #2567) -----------------------
+
+_AD_TIMEOUTS = ["ad_connect_timeout", "ad_receive_timeout"]
+
+
+@pytest.mark.parametrize("field", _AD_TIMEOUTS)
+def test_an_ad_timeout_above_its_default_is_a_named_loosening(field: str) -> None:
+    """Each timeout is named alone, with its value and the default, at the load's ceiling and just
+    past the default alike."""
+    risks = dict(_pairs(auth=_ad(**{field: 3600.0})))
+    assert "3600 s, above the default of 10 s" in risks[field]
+    assert "worker thread" in risks[field]
+    assert [n for n in risks if n in _AD_TIMEOUTS] == [field]
+    # A value just past the default is named, and never printed as the default itself.
+    assert "is 10.0001 s" in dict(_pairs(auth=_ad(**{field: 10.0001})))[field]
+
+
+@pytest.mark.parametrize("field", _AD_TIMEOUTS)
+@pytest.mark.parametrize("value", [10.0, 9.99, 0.5])
+def test_an_ad_timeout_at_or_below_its_default_is_not_a_loosening(field: str, value: float) -> None:
+    """A shorter timeout fails a stalled directory call sooner, which is stricter."""
+    assert field not in _names(auth=_ad(**{field: value}))
+
+
+@pytest.mark.parametrize("field", _AD_TIMEOUTS)
+def test_an_ad_timeout_without_ad_is_not_a_loosening(field: str) -> None:
+    """CONDITIONAL, like the recheck above: with no directory nothing reads the timeout. The second
+    line is the control that the same value fires once AD is on."""
+    assert field not in _names(auth=AuthSettings(**{field: 3600.0}))  # type: ignore[arg-type]
+    assert field in _names(auth=_ad(**{field: 3600.0}))
+
+
 # --- [auth].admin_new_ip_step_up (BACKLOG #288) ----------------------------------------------
 
 

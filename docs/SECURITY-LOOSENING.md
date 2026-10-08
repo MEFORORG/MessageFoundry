@@ -72,6 +72,7 @@ section reference.
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
+| | `[auth].ad_connect_timeout`, `ad_receive_timeout` | `10` s / `10` s (*conditional* — a loosening only once `ad_enabled`; a timeout above `10` s is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
 | | `[auth].admin_new_ip_step_up` | `true` |
 | | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
 | | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
@@ -98,7 +99,8 @@ section reference.
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
-`[auth].ad_allow_insecure_ldap`, `[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
+`[auth].ad_allow_insecure_ldap`, `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
+`[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
 keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
 `[auth].oidc_callback_floor_exempt_amr`,
@@ -607,6 +609,21 @@ This section is kept rather than deleted, because the claim it used to make is t
   authenticator, and `serve` and `GET /security/posture` name the switch on every boot. No audit row
   is written, as for the other settings-scoped loosenings.
 - **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
+
+### `[auth].ad_connect_timeout` or `ad_receive_timeout` above `10` s **with `ad_enabled`** — a stalled directory call holds a thread longer
+> **Conditional** on `[auth].ad_enabled`, since nothing reads the timeouts with no directory (vault
+> BACKLOG #2567, ASVS 13.1.3). Each is named on its own once it is above `10` s. A shorter timeout
+> fails a stalled call sooner, which is stricter, and is not named. The load refuses `0`, a negative,
+> `inf`, `NaN` and anything above `3600`, so neither has an off value.
+- **What you lose:** each directory call runs in a worker thread until the domain controller answers
+  or the timeout ends. That covers at least a sign-in, a step-up and a session recheck. With a longer
+  timeout, a controller that has stopped answering holds each thread longer. Fewer stalled calls are
+  then needed to tie up the thread pool that sign-in shares.
+- **When acceptable:** a directory reached over a slow link, where `10` s is measured to be too short
+  for a healthy round trip.
+- **Compensating controls:** raise it only as far as the measured round trip needs. Keep the sign-in
+  rate limit on, since it bounds how many calls can start.
+- **Reversible:** yes, immediately — restore `10` (or delete the line) and restart.
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
 > Reported whenever it is `false`. No sign-in condition applies, since no setting turns sign-in off
@@ -1487,6 +1504,7 @@ chapter was not part of the verification above.
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].ad_allow_insecure_ldap` (plain `ldap://` AD bind) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(d) Person or Entity Authentication |
+| `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout` (bound on one directory call) | V13 Configuration (13.1.3) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
 | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` (config-source check downgraded to a warning) | V13 Configuration | **CM-5** Access Restrictions for Change · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold`, `[auth].lockout_max_minutes` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
