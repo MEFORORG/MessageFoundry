@@ -46,7 +46,7 @@ landed.
 4. Developers keep the full IDE layout in the Theia build, with a Steps / Split / Code switch. They
    may also stay on VS Code and `ide/`.
 5. **Typed-only mode.** `paste_block` and a one-line raw `test` stay available by default. A flag on
-   `lens rewrite` (working name `--typed-only`) refuses both with the generic `refused` code. The
+   `lens rewrite`, `--typed-only` (PR 2155 shipped it under that name), refuses both with the generic `refused` code. The
    analyst build always sets it.
 6. **The repository check's reading.** A Steps-only change passes. Any other change passes only with
    approval from a `code:edit` reviewer.
@@ -151,7 +151,7 @@ it, only when the site meets spec section 5.4.**
   2026-10-08; G.7 records what still differs.
   Typed-only mode is off by default, so the developer build and `ide/` keep both hatches. The analyst
   build passes it on every `lens rewrite` call and offers no way to turn it off. The analyst build
-  does not ship until both land with the R1 payloads as refusal tests.
+  does not ship until the lens meets AC-3, with the R1 payloads as refusal tests.
 - **D7 -- The repository check is optional, and the project ships it.** It decides whether a change is
   Steps-only, comparing every `code` row, every control header and each typed row's full statement
   against base by content, allowing only the lens's sanctioned generated shapes, and treating any change outside the def bodies or to

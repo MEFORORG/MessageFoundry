@@ -1499,26 +1499,33 @@ corrects that table's row 5. `set_params` on action, lookup and diagnostic rows 
 **What still differs at `main`.** Each row of that table was re-measured on 2026-10-08 against
 `rewrite_source` at `main` (`8e5f429732`). One difference remains beyond the recorded limits:
 
-- **A row moved below a typed `return` is accepted, in both modes.** G.6 rule 8 refuses it, so the
-  rule is stricter and governs. Take a handler whose `if` guard ends in `return Send("OB", msg)` and
-  whose body ends in `return Send("OB2", msg)`. A `move_row` that swaps a `msg.set(...)` row below
-  the last `return`, or drops a row after either `return`, is accepted with `typed_only=True`. The
-  row would then never run. `_refuse_shifted_code` in `messagefoundry/lens.py` keeps a `return` or
-  `raise` on its own suite path, but nothing checks what lands after one. No test on `main` pins
-  this case.
+- **A row moved below a typed `return` or `raise` is accepted, in both modes.** G.6 rule 8 refuses
+  it, so the rule is stricter and governs. Take a handler whose `if` guard ends in `return
+  Send("OB", msg)` and whose body ends in `return Send("OB2", msg)`. A `move_row` that swaps a
+  `msg.set(...)` row below the last `return`, or drops a row after either `return`, is accepted
+  with `typed_only=True`. So is a swap below a closing `raise ValueError("x")`. The row would then
+  never run. `_refuse_shifted_code` in `messagefoundry/lens.py` keeps a `return` or `raise` on its
+  own suite path. Apart from the fan-out `return sends`, which
+  `test_finding_9_the_scaffold_itself_still_holds` guards, nothing checks what lands after one. No
+  test on `main` pins this case.
 
 The recorded limits, which are not reconciled:
 
 - the static-check bypasses under "Limits of a static check", below;
 - a handler whose message parameter is not named `msg`. An inserted row writes `msg.*` there, so it
-  would raise NameError on every message. Reproduced at `8e5f429732` in both modes; no test pins it;
-- an imported send destination, which cannot be retargeted. The second bullet at the top of G.7
-  refuses it as well, so the two sides agree and the refusal is conservative.
+  would raise NameError on every message. Reproduced at `8e5f429732` in both modes; no test pins it.
 
-Two rows of the table are closed. A Set Field or Add Repetition value that is not text, such as a
-module `NONE = None`, is refused; `test_r11_an_inserted_field_value_must_be_text` and
-`test_r11_set_params_writes_only_text_into_a_field_value` in `tests/test_lens_typed_only_repair.py`
-show it. Row 5, `occurrence=OCC`, was never a difference: G.7 refuses it too.
+Three rows of the table are not open differences:
+
+- Row 4: an imported send destination cannot be retargeted. The second bullet at the top of G.7
+  refuses it as well, so the two sides agree; the table marks it accepted as conservative.
+- Row 1 is closed. A Set Field or Add Repetition value that is not text, such as a module `NONE =
+  None`, is refused; `test_r11_an_inserted_field_value_must_be_text` and
+  `test_r11_set_params_writes_only_text_into_a_field_value` in `tests/test_lens_typed_only_repair.py`
+  show it.
+- Row 5, `occurrence=OCC`, was never a difference: G.7 refuses it too.
+
+Row 2 is the open difference above, and row 3 is the second recorded limit.
 
 **Limits of a static check.** The predicate reads the source and runs nothing, so code that
 reaches module state by a route the source does not spell out can still defeat it. These remain, at
@@ -1555,9 +1562,11 @@ change landed in PR 2155.
   and `x.py:stream`. The walk that tests this criterion SHALL pair every check with a control that
   fires, and a menu read that returns no entries SHALL fail the walk rather than pass it. Spike S-2b
   closed these routes, an upload and a drop of a `.py` into the navigator, and the Windows
-  spellings, on the Electron build. Its report does not name a move or copy of one `.py` over
-  another, and it guards the backend upload endpoint in the page only, so both stay open (Manager
-  decision 2026-10-08, from spike S-2b).
+  spellings, on the Electron build. At least these stay open: `--remote-debugging-port`; the
+  backend upload endpoint, which the spike guards in the page only; `devTools: false`, which needs
+  an `ElectronMainApplication` rebind even though the spike closed the Developer Tools route; the
+  single-instance lock; and a move or copy of one `.py` over another, which its report does not
+  name (Manager decision 2026-10-08, from spike S-2b).
 - [ ] **AC-G2** -- WHEN a file fails `lens parse` in the analyst build, THE SYSTEM SHALL show a
   read-only notice that a developer must fix it, and SHALL NOT open a text editor.
 - [ ] **AC-G3** -- WHILE the editor is the ADR 0208 developer build or the `ide/` extension, THE

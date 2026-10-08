@@ -46,7 +46,7 @@ build is a view over that file. It is not a second authoring format.
 4. **Developers keep the full IDE.** The Theia developer build has a Steps / Split / Code switch.
    Developers may also stay on VS Code and `ide/`.
 5. **Typed-only mode.** `paste_block` and a one-line raw `test` can still write code that runs. A
-   flag on `lens rewrite` (working name `--typed-only`) refuses both with the generic `refused` code.
+   flag on `lens rewrite`, `--typed-only` (PR 2155 shipped it under that name), refuses both with the generic `refused` code.
    It is off by default, so developers and today's IDE keep both. The analyst build always sets it.
 6. **The repository check's reading.** A Steps-only change passes. Any other change passes only with
    approval from a `code:edit` reviewer.
@@ -175,10 +175,9 @@ site's ordinary review is what would catch these (D-C):
   its bindings, such as a row using `occurrence=i` moved out of its For Each loop. G.6 rule 6
   defines dominance. The analyst build would refuse each. It would also refuse, more
   conservatively, any move or delete of a block that holds a Read Field or assigned lookup row. The
-  repository check would not test for an unbound read. Today the lens refuses a delete or move of
-  a Read Field row for this reason (the `read_field` gate in `rewrite_source`,
-  `messagefoundry/lens.py`). That gate keys on `read_field` alone, because it was written for Read
-  Field rows (ADR 0089 row 4, BACKLOG #1505), so it does not yet cover a lookup's `assign_to`.
+  repository check would not test for an unbound read. Since PR 2155, the lens refuses a move that
+  would leave a read unbound in either mode, and under typed-only mode a delete that would. Measured
+  at `main` on 2026-10-08, that covers a lookup's `assign_to` as well as a Read Field row.
   What the lens implementation enforces is recorded by PR 2155's tests (Amendment G, "Where
   the code stands").
 
@@ -365,8 +364,8 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   refuses gets an FR-17 message, and nothing is written.
 - **FR-19.** `code` rows and control headers stay read-only.
 - **FR-20.** IF a delete or move would break the structure rule of ADR 0076 Amendment G, G.6, THEN
-  THE ANALYST BUILD SHALL refuse it (AC-G5). The lens would refuse the same under typed-only mode, as
-  part of the R1 fix. Today `ide/` deletes or moves a whole block from its header row, nested `code`
+  THE ANALYST BUILD SHALL refuse it (AC-G5). The lens refuses the same under typed-only mode since
+  PR 2155, except the case Amendment G, G.7, "What still differs at `main`", names. Today `ide/` deletes or moves a whole block from its header row, nested `code`
   rows included (`isRowDeletable` and `isRowMovable` in `ide/src/stepsModel.ts`).
 - **FR-21. Drag a field.** The drag source SHALL be the sample panel or the schema tree. A drop onto
   a path parameter SHALL issue the same `set_params` edit, byte for byte, as typing that path. A drop
@@ -530,8 +529,8 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
      `Send` and the message argument is `msg`; no `SetState` expression; and a route's `handlers`
      non-empty or `unrouted`. A row that was dynamic at base and is literal at head is not
      Steps-only. The check is per element: a `Send` that was dynamic at base is gone and a literal
-     one appeared in the same Router or Handler (from spike S-4). The R1 fix would also make the lens
-     refuse `set_params` on such a route row (G.7). The lens projects a `Send` with a computed
+     one appeared in the same Router or Handler (from spike S-4). Since PR 2155, the lens also
+     refuses `set_params` on such a route row (G.7). The lens projects a `Send` with a computed
      argument, or a dynamic route, with no typed parameters (`_send_outbounds` and `_route_row` in
      `lens.py`).
 
@@ -690,8 +689,9 @@ The analyst build must also stop a `.py` being **written** without being opened.
 at least an untitled buffer, *Save As* and *Compare* (closed by layer 4), a rename or copy from a
 file that is not a `.py` into a `.py` (closed by a `FileService` rebind), and an upload, a drop into
 the navigator, and a move or copy of one `.py` over another. The spike's `FileService` rebind guards
-only a move or copy from a file that is not a `.py` into a `.py`, and its walk skipped upload. The
-rebind, not a file-operation participant, is the mechanism, because a participant cannot block a
+only a move or copy from a file that is not a `.py` into a `.py`, and its walk skipped upload, so
+the last three were open on the browser build. Spike S-2b, below, closed upload and drop on the
+Electron build. The rebind, not a file-operation participant, is the mechanism, because a participant cannot block a
 move: Theia logs the participant's error and carries on. A shipped build SHALL NOT expose test hooks
 on `window`.
 
@@ -867,7 +867,7 @@ In CI these would start as separate, **non-required** jobs (section 12). Spike S
 |---|---|---|
 | S-1 | Does a native Theia Steps extension render and edit `samples/config`, and how much of `ide/` does it reuse? | Parse, render, edit, undo and Test work in a pinned Theia build; hot-exit is verified or dropped from FR-26; the shared share of `stepsModel.ts` and the `acquireVsCodeApi` shim are measured; the typed-row versus `code`-row share over `samples/config` is recorded; the Theia version and language server are recorded; @theia/playwright runs at that version (section 16). **Met except the Test and language-server legs**, measured on a browser target: branch `claude/theia-spike-s1` at `cd97e6b1b4`, under `theia-spike/`, not merged, on Theia 1.76.0. Hot-exit was dropped (FR-26). Test is open because it needs the D-B generator-spec engine change, which is not built. No language server was recorded. The Electron build is checked by spike S-3 (Manager decision 2026-10-07, after review) |
 | S-2 | Does the analyst build have no text-editor route for `.py`? | A scripted walk of every command, menu and *Open With* entry opens no `.py` in Monaco, and finds no pop-up notification (FR-17). **Met on the browser build and on Electron.** Browser: branch `claude/theia-spike-s2` at `d35ae64158`, under `theia-spike/`, not merged. Electron, spike S-2b: branch `claude/theia-spike-s2b-electron` at `7a1f6ba72e`, on the S-3 installer base with S-2 merged in, not merged. The installed packaged app passed 5 of 5: the walk enumerated 609 commands and ran 237, and found no `.py` text editor and no toast, while the toast control fired. The browser rerun passed 3 of 3. Section 10 lists what S-2b closed and what is still open (Manager decision 2026-10-08, from spike S-2b) |
-| S-3 | Does the analyst build install and run on a managed Windows image? | It installs and runs Test without administrator rights, as the Electron build; installer size and memory use are recorded. It is also the first check of the Electron target, which spike S-1 did not run. Spike S-2b, built on the S-3 installer base, did not reproduce S-3's claim that `NODE_OPTIONS` with `--require` redirects the app (Manager decision 2026-10-08, from spike S-2b) |
+| S-3 | Does the analyst build install and run on a managed Windows image? | It installs and runs Test without administrator rights, as the Electron build; installer size and memory use are recorded. It was planned as the first check of the Electron target, which spike S-1 did not run. Spike S-2b, built on the S-3 installer base, has since run the installed Electron app for S-2's walk; S-3's own pass condition is not recorded here as met. S-2b did not reproduce a claim from the S-3 work that `NODE_OPTIONS` with `--require` redirects the app (Manager decision 2026-10-08, from spike S-2b) |
 | S-4 | The repository check as a CI step on a sample config repository | It meets FR-41, run from a base-ref workflow per section 5.4. **Classifier half met by the spike against FR-41 as it stood then**: branch `claude/theia-spike-s4-steps-only` at `673faa7c60`, `scripts/theia_spike/steps_only.py` with 80 tests in `tests/test_theia_steps_only_spike.py`, not merged. The FR-41 cases added later (the lookup-params, `FhirToken` and value-param cases for `SEEN` and a `code_set` name) are untested. The base-ref workflow half is untested |
 
 ---
@@ -916,7 +916,7 @@ means the finding applies only to a hosted design and is carried to the later AD
 | R34 | note | Not applicable: concerned the review's own inputs | |
 
 **Counts:** 22 addressed (R3 for the desktop only; R8 and R24 by owner ruling), 1 answered by design
-but not landed (R1), 1 partly applicable (R12), 10 not applicable to the desktop phase. The hosted
+whose lens half landed in PR 2155 (R1), 1 partly applicable (R12), 10 not applicable to the desktop phase. The hosted
 ADR inherits R3, R4, R5, R7, R12, R15, R16, R17, R19, R25 and R30.
 
 Three raw findings were refuted in verification and need no action: dual control on reload is
