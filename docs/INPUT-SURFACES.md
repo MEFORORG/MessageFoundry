@@ -35,7 +35,7 @@ and the code disagree, the code is right.
 | [Service settings](#service-settings-are-defined-in-configurationmd) | [CONFIGURATION.md](CONFIGURATION.md) |
 | [The command line](#the-command-line-is-defined-by-its-parser-and-no-prose-page-lists-it) | The parser itself |
 | [The VS Code extension](#the-vs-code-extension-is-a-client-and-the-engine-rule-is-the-control) | The engine rules it calls into |
-| [Web console rows marked `-`](#some-web-console-parameters-have-no-rule) | A generated table; no document defines a structure |
+| [Web console rows marked `-`](#some-web-console-parameters-carry-no-named-rule) | A generated table; no document defines a structure for each |
 
 ---
 
@@ -75,10 +75,12 @@ A text body is any `content_type` that is not binary. Today the binary types are
 A body that passes is committed to the ingress stage. Only then does the sender get a positive
 answer.
 
-**A streaming inbound differs in two ways.** When an `hl7v2` inbound sets a streaming threshold and
-a body is at or over it, check 8 covers the header only. The handler then detaches large embedded
-documents before the commit. That step can refuse the body too, with an `ERROR` row and a negative
-answer.
+**A streaming inbound differs in at least three ways.** First, an inbound that sets its own
+`max_message_bytes` uses that number as the size ceiling in check 7, in place of the engine default
+(`peek_max_bytes`). Second, when a body is at or over the inbound's streaming threshold, check 8
+does not run, even if the inbound turns strict validation on. Only check 7 reads the header.
+Third, the handler then detaches large embedded documents before the commit. That step can refuse
+the body too, with an `ERROR` row and a negative answer.
 [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)
 defines it.
 
@@ -102,8 +104,9 @@ and a reason. Nothing is accepted and then dropped.
 the check. The strict-validation reason is scrubbed, but a bare value from the message can survive
 the scrub.
 
-**One case leaves no message row.** If the handler itself faults, for example when the store is
-down, no check refused the body and no row is written. On MLLP,
+**One case can leave no message row.** If the handler itself faults, for example when the store
+is down, no check refused the body. Usually no row is written. A fault after the commit leaves the
+committed row, so check the message log before you resend by hand. On MLLP,
 `MLLPSource._answer_handler_failure` records a `handler_error` connection event. A sender that
 expects replies gets a negative acknowledgment, and the connection closes.
 
@@ -352,40 +355,37 @@ difference. The file pickers are covered by the file handling and quarantine pol
 
 ---
 
-## Some web console parameters have no rule
+## Some web console parameters carry no named rule
 
 The web console at `/ui` applies the operator API's rules on some routes.
 [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md) says which, and what a refusal looks like.
 
-**For the remaining parameters, no document defines an expected structure.** A generated table
-lists the console's path and query parameters that are text, and the named rule each one carries:
+**For the remaining parameters, no document says what each one must look like.** A generated
+table lists the console's path and query parameters that are text, and the named rule each one
+carries:
 [`packaging/messagefoundry-webconsole/tests/golden/ui_input_rules.txt`](../packaging/messagefoundry-webconsole/tests/golden/ui_input_rules.txt).
-A parameter with none of the console's named rules is marked `-` there. Read that table for the
-current set, not this page.
+Read that table for the current set, not this page.
 
-**The table has two limits.** It does not list a form field sent in a request body, or a parameter
-that is not text. `_input_rule_rows` in
-`packaging/messagefoundry-webconsole/tests/test_golden_surface.py` builds it and states both.
+**A `-` in that table does not mean the input is unchecked.** It means the parameter matches none of
+the rules in the table's own index. That index holds the console's named rules. A `-` parameter can
+still be held to a rule somewhere else. At least these cases exist:
 
-**A `-` does not mean the code holds no bound.** A parameter can carry a bound of its own in its
-route declaration. For example, `m` on the account page has a length bound, and `target` on the
-search page has a fixed pattern. Those bounds are in the route modules under
-[`messagefoundry_webconsole/routes/`](../messagefoundry_webconsole/routes/). No document lists them.
-
-The rows marked `-` include at least these kinds:
-
-| Kind | Examples of parameter names |
+| Where the rule is applied | Example |
 |---|---|
-| An id the engine minted, in a path | `message_id`, `file_id`, `user_id`, `approval_id`, `preset_id`, `session_id`, `role_id` |
-| A connection name in a path or query | `name`, `channel_id`, `destination_name`, `to`, `source` |
-| A filter on an uploaded log | `control_id`, `message_type`, `field_path` |
-| A time bound from a browser form | `received_from`, `received_to` |
-| Other short parameters | `m`, `e`, `next`, `scope`, `outcome`, `target` |
+| An engine type on the route itself | `approval_id` on the approval routes is declared as the API's resource id |
+| An engine request model the handler builds | `to` and `source` on the message resend route; `channel_id` and `destination_name` on the dead-letter replay routes |
+| The store the handler calls | `file_id` is held to its exact shape by `UploadStore` in [`uploads.py`](../messagefoundry/uploads.py) |
+| A parser further in | `field_path` reaches `make_spec` in `store/content_search.py`, which applies the `parse_path` grammar |
+| The console, after parsing | `received_from` and `received_to`, as API-INPUT-VALIDATION.md describes |
+| A bound on the route declaration | `m` on the account page has a length bound; `target` on the search page has a fixed pattern |
 
-The operator API defines a shape for the ids and the connection names. The console does not apply
-that shape on these rows. The two time bounds are a special case: API-INPUT-VALIDATION.md describes
-how the console parses them and then applies the API's time-bound rule.
+**So the table cannot tell you which `-` parameters are open.** To learn what one parameter accepts,
+read its route in
+[`messagefoundry_webconsole/routes/`](../messagefoundry_webconsole/routes/) and follow the value to
+the handler it reaches. No document lists that for each parameter.
 
-This page does not say what each of those parameters should accept. No document records a
-decision on that.
-API-INPUT-VALIDATION.md records the two that carry no rule on purpose, and why.
+**The table has other limits too.** It leaves out at least a form field sent in a request body and a
+parameter that is not text. The docstrings in
+`packaging/messagefoundry-webconsole/tests/test_golden_surface.py` state what it covers.
+
+API-INPUT-VALIDATION.md records the two parameters that carry no rule on purpose, and why.
