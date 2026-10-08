@@ -150,7 +150,8 @@ line still appears, because it lives in the console's main script, which that po
 **In these two configurations those three absences have none of the three answers.** The page does
 not warn, the server does not refuse, and no other control tells you that the browser ignores CSP or
 runs no script. The server-side controls in the tables above still hold. The first configuration is a choice you
-make by setting the variable. That is the whole of the cover.
+make by setting the variable. The second cannot be reached through `messagefoundry serve`, and
+nothing else covers it.
 
 The cookies differ between the two cases:
 
@@ -217,7 +218,7 @@ with its own built-in browser engine, so the browser here is whichever one your 
 ships. The extension declares `engines.vscode ^1.95.0` and states no separate browser floor.
 
 **Every panel that runs a script warns you when that script has not started.** The panel's page
-carries a plain-text banner that is visible by default, and the panel's own script hides it as soon
+carries a plain-text banner that shows by itself one second after the page loads, and the panel's own script hides it as soon
 as it has the VS Code API. The banner needs no script, no stylesheet and no message from the
 extension, so it stays up whenever the script is blocked, fails to load, or stops at that first
 step:

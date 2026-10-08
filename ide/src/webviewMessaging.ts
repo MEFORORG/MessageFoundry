@@ -268,7 +268,7 @@ export const SHAPE_HELPERS = `
 // would have run every panel unchanged. Each now has a plain-text banner in the HTML shell. Neither
 // banner depends on the panel's script, its stylesheet or a message from the host:
 //
-//   * SCRIPT NOT STARTED is VISIBLE by default. `SCRIPT_STARTED_MARK` hides it, and that source is
+//   * SCRIPT NOT STARTED shows by itself, one second after the page loads (a CSS-only delay). `SCRIPT_STARTED_MARK` hides it, and that source is
 //     the statement right after `acquireVsCodeApi()` in the panel's nonced script. So the banner
 //     stays up when the script is blocked, fails to parse, or dies acquiring the API. It does NOT
 //     stay up for a script that starts and throws later; only the Steps view's host-side handshake
@@ -301,6 +301,19 @@ const BANNER_STYLE =
   "background:var(--vscode-inputValidation-warningBackground,transparent)";
 
 /**
+ * How long the script-not-started banner stays invisible after the page loads.
+ *
+ * A healthy panel hides the banner within the same task, but a re-render is a new page, and the
+ * Steps view's script is an external file. Without a delay every re-render could flash a failure
+ * that is not happening, and `role="alert"` could announce it. The delay is pure CSS, so it needs
+ * no script; with inline styles blocked the banner is simply visible at once. `visibility`, never
+ * `display`, so nothing that reads the `hidden` attribute changes meaning.
+ */
+const SCRIPT_BANNER_DELAY_SECONDS = 1;
+const SCRIPT_BANNER_DELAY_STYLE =
+  `visibility:hidden;animation:mf-banner-show 0s linear ${SCRIPT_BANNER_DELAY_SECONDS}s forwards`;
+
+/**
  * The two banners and the CSP canary, as markup for the top of a panel's `<body>`.
  *
  * Every builder that assigns `webview.html` a document with a script embeds this exactly once, and
@@ -310,7 +323,8 @@ const BANNER_STYLE =
  * The `<script>` tag below must stay WITHOUT a nonce. A nonced canary would run under an enforcing
  * engine and raise the warning on every healthy panel.
  */
-export const STARTUP_BANNERS = `<div id="${SCRIPT_BANNER_ID}" role="alert" style="${BANNER_STYLE}">MessageFoundry: this panel's script has not started, so its buttons and fields do nothing. Close the panel and open it again. If this message stays, VS Code is not running the panel's script.</div>
+export const STARTUP_BANNERS = `<style>@keyframes mf-banner-show { to { visibility: visible; } }</style>
+  <div id="${SCRIPT_BANNER_ID}" role="alert" style="${BANNER_STYLE};${SCRIPT_BANNER_DELAY_STYLE}">MessageFoundry: this panel's script has not started, so its buttons and fields do nothing. Close the panel and open it again. If this message stays, VS Code is not running the panel's script.</div>
   <div id="${CSP_BANNER_ID}" role="alert" hidden style="${BANNER_STYLE}">MessageFoundry: VS Code is not enforcing this panel's Content Security Policy, so the panel's defense against injected script is not active. Update VS Code, and treat what this panel shows with care until the message is gone.</div>
   <script>document.getElementById(${JSON.stringify(CSP_BANNER_ID)}).hidden = false;</script>`;
 

@@ -158,6 +158,11 @@ suite("startup banners: what the user sees", () => {
     // The script banner must not start hidden, by attribute or by inline style.
     const scriptBanner = STARTUP_BANNERS.split("</div>")[0];
     assert.ok(!/\shidden[\s>]/.test(scriptBanner) && !/display\s*:\s*none/.test(STARTUP_BANNERS));
+    // It is held back for one second by CSS alone, so a healthy re-render does not flash it. The
+    // keyframes the delay names must ship with it, or the banner would stay invisible for good.
+    const delay = /visibility:hidden;animation:([\w-]+) 0s linear 1s forwards/.exec(scriptBanner);
+    assert.ok(delay, "the script banner has no CSS delay");
+    assert.ok(STARTUP_BANNERS.includes(`@keyframes ${delay[1]} { to { visibility: visible; } }`));
   });
 });
 
@@ -265,10 +270,10 @@ suite("startup banners: every builder that sets a webview's HTML is wired", () =
 
   test("every assignment is a builder that carries the banners, or a named static notice", () => {
     const unwired: string[] = [];
-    const usedNotices = new Set<string>();
+    const usedNotices: string[] = [];
     for (const { rel, callee } of assignments()) {
       if (STATIC_NOTICES[rel] === callee) {
-        usedNotices.add(rel);
+        usedNotices.push(rel);
         continue;
       }
       if (callee === "") {
@@ -283,8 +288,9 @@ suite("startup banners: every builder that sets a webview's HTML is wired", () =
       }
     }
     assert.deepStrictEqual(unwired, []);
-    // Every exception is still in use; a stale one would hide the next unwired builder there.
-    assert.deepStrictEqual([...usedNotices].sort(), Object.keys(STATIC_NOTICES).sort());
+    // Every exception is in use EXACTLY once. Unused, it would hide the next unwired builder in
+    // that file; used twice, a second script-less document has appeared and nobody decided it.
+    assert.deepStrictEqual(usedNotices.sort(), Object.keys(STATIC_NOTICES).sort());
   });
 
   test("every file that embeds the banners has exactly one shell, and its script hides the banner", () => {
