@@ -81,7 +81,7 @@ def _assert_floored(raw: bytes, statuses: list[int]) -> None:
 
 _POST = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
 
-#: (id, sink status, request, the statuses of the header blocks the sink must write).
+#: (sink status, request, the statuses of the header blocks the sink must write).
 _CASES: list[Any] = [
     pytest.param(200, _POST, [200], id="200"),
     pytest.param(400, _POST, [400], id="configured-400"),
@@ -135,13 +135,11 @@ _CASES: list[Any] = [
     pytest.param(200, b"BREW /x HTTP/0.9\r\n\r\n", [501], id="http-0.9-stdlib-501"),
 ]
 
-#: The cases the stdlib would answer with no header block at all.
+#: The cases above that the stdlib would answer with no header block at all, by id.
 _BARE_UNDER_THE_STDLIB = [
-    b"NOT A REQUEST\r\n\r\n",
-    b"GET /x HTTP/3.0\r\nHost: x\r\n\r\n",
-    b"GET /x\r\n\r\n",
-    b"GET /x HTTP/0.9\r\n\r\n",
-    b"BREW /x HTTP/0.9\r\n\r\n",
+    pytest.param(case.values[1], id=case.id)
+    for case in _CASES
+    if case.id in ("stdlib-400-malformed", "stdlib-505-version") or case.id.startswith("http-0.9-")
 ]
 
 
@@ -150,16 +148,16 @@ def _short_read_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(http_sink, "READ_TIMEOUT_SECONDS", 0.3)
 
 
-def _without_the_choke_point(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Remove the sink handler's one header-adding override, leaving the stdlib's."""
+def _without(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
+    """Remove one of the sink handler's overrides, leaving the stdlib's own behaviour there."""
     real = http_sink._handler_for
 
-    def _bare(sink: Any) -> Any:
+    def _stdlib_there(sink: Any) -> Any:
         handler = real(sink)
-        del handler.end_headers
+        delattr(handler, override)
         return handler
 
-    monkeypatch.setattr(http_sink, "_handler_for", _bare)
+    monkeypatch.setattr(http_sink, "_handler_for", _stdlib_there)
 
 
 @pytest.mark.parametrize(("status", "request_bytes", "statuses"), _CASES)
@@ -177,7 +175,7 @@ def test_the_probe_sees_absence_when_the_choke_point_is_removed(
 ) -> None:
     """The control. One override puts the headers on every case above, so removing it must leave
     every case bare, and the assertion the suite relies on must fire."""
-    _without_the_choke_point(monkeypatch)
+    _without(monkeypatch, "end_headers")
     with RestSink(status=status, reply_body=b'{"ok":1}') as sink:
         raw = _exchange(sink.port, request_bytes)
     with pytest.raises(AssertionError, match="lacks x-content-type-options"):
@@ -191,18 +189,15 @@ def test_the_stdlib_alone_answers_these_bare(
     """The control for the HTTP/0.9 half. With the sink's request_version override removed, the
     stdlib answers each of these with no status line, so no header block exists to carry
     anything. With it, each is a floored answer (the cases above)."""
-    real = http_sink._handler_for
-
-    def _stdlib_versioning(sink: Any) -> Any:
-        handler = real(sink)
-        del handler.request_version
-        return handler
-
-    monkeypatch.setattr(http_sink, "_handler_for", _stdlib_versioning)
+    _without(monkeypatch, "request_version")
     with RestSink(reply_body=b'{"ok":1}') as sink:
         raw = _exchange(sink.port, request_bytes)
     assert raw, "the sink wrote nothing, so this says nothing about its form"
     assert _blocks(raw) == [], raw[:80]
+
+
+def test_the_bare_control_covers_five_cases() -> None:
+    assert len(_BARE_UNDER_THE_STDLIB) == 5, [case.id for case in _BARE_UNDER_THE_STDLIB]
 
 
 def test_the_sink_baseline_is_the_engine_listeners() -> None:
