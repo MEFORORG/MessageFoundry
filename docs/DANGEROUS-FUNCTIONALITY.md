@@ -267,8 +267,8 @@ What each form means:
 - **shell string** -- one string that a shell parses and runs.
 
 **What holds the argument-list starts.** Python hands the program and its arguments to the OS
-without a shell, and `tray/actions.py` sets `shell=False` explicitly. That setting does not keep
-`cmd.exe` out of the tray's start; the second item below says why. Where the program is a Windows
+without a shell, and `tray/actions.py` sets `shell=False` explicitly. That setting alone does not
+keep `cmd.exe` out of a start; the second item below says why. Where the program is a Windows
 system tool, the code pins its absolute path under the system directory, so a same-named program
 planted in the working directory cannot run instead. The security lint marks the reviewed sites with
 a `nosec` note naming the rule it answers.
@@ -277,17 +277,19 @@ Two argument-list starts are not pinned that way:
 
 - `checks.py` is a developer tool. It runs `ruff` and `mypy` by bare name, so Windows may find a
   copy in the working directory before the one on `PATH`.
-- `tray/actions.py` opens a folder in VS Code through its `code` command. On Windows that command
-  is a batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`. So a shell does read
-  that start's arguments, one of which is `repo_path` from `tray.toml`. The command is found with
-  `shutil.which`, whose Windows search can include the working directory, so a planted `code.cmd`
-  may win there too. What holds the argument: `open_repo` refuses a `repo_path` holding a character
-  `cmd.exe` would re-read, at least `& | < > ^ % ! ( )`, a double quote, or a control character. It
-  refuses before the start and escapes nothing (BACKLOG #2327). The menu offers the start only
+- `tray/actions.py` opens a folder in VS Code. It finds the `code` command, which on Windows is a
+  batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`, which re-reads the whole
+  command line. So the tray does not start that file where it can avoid it. `resolve_vscode` looks
+  for the editor program beside the command's `bin` folder and starts that, with `repo_path` from
+  `tray.toml` as one argument. No shell reads that start (BACKLOG #2327). Where no such program is
+  found, the batch file is the fallback, and `cmd.exe` cannot be avoided. `open_repo` then refuses
+  the start if `repo_path` or the batch file's own path holds a character `cmd.exe` would re-read.
+  It escapes nothing. [`TRAY.md`](TRAY.md) lists those characters. The menu offers the start only
   when `repo_path` names an existing folder on a local drive letter; `open_repo` does not check
-  that again. Nothing pins which `code` command runs, and `cmd.exe` re-reads that command's own
-  path too, which is not screened. What holds both is that the tray runs as the signed-in user, who
-  owns `tray.toml` and their own `PATH`.
+  that again. Nothing pins which `code` command is found: `shutil.which` can search the working
+  directory on Windows, so a planted `code.cmd` may win, and it would run as the fallback. What
+  holds that is that the tray runs as the signed-in user, who owns `tray.toml` and their own
+  `PATH`.
 
 **What each child is handed.** A process started with no environment of its own gets a copy of the
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the

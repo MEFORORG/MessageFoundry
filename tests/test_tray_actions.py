@@ -66,6 +66,61 @@ def test_resolve_vscode_none_when_absent() -> None:
     assert resolve_vscode(which=lambda _n: None, is_file=lambda _p: False) is None
 
 
+# BACKLOG #2327: `code.cmd` is a batch file, so Windows would run it under cmd.exe. A standard
+# install keeps the editor executable one folder above `bin`, and that is what gets started.
+_INSTALL = "C:\\Program Files (x86)\\Microsoft VS Code"
+
+
+@pytest.mark.parametrize("cli_name", ["code.cmd", "code.CMD", "code.bat"])
+def test_resolve_vscode_returns_the_editor_exe_beside_a_batch_cli(cli_name: str) -> None:
+    exe = f"{_INSTALL}\\Code.exe"
+    resolved = resolve_vscode(
+        which=lambda _n: f"{_INSTALL}\\bin\\{cli_name}", is_file=lambda p: p == exe
+    )
+    assert resolved == exe
+
+
+def test_resolve_vscode_returns_the_editor_exe_for_an_install_dir_fallback() -> None:
+    root = "C:\\Users\\me\\AppData\\Local"
+    resolved = resolve_vscode(
+        which=lambda _n: None,
+        is_file=lambda p: p.startswith(root),
+        expandvars=lambda t: t.replace("%LOCALAPPDATA%", root),
+    )
+    assert resolved == f"{root}\\Programs\\Microsoft VS Code\\Code.exe"
+
+
+def test_resolve_vscode_keeps_a_batch_cli_that_has_no_editor_exe() -> None:
+    # A shim: no `bin` parent, or no executable there. The batch file is the fallback.
+    probed: list[str] = []
+
+    def is_file(path: str) -> bool:
+        probed.append(path)
+        return False
+
+    assert resolve_vscode(which=lambda _n: "C:\\shims\\code.cmd", is_file=is_file) == (
+        "C:\\shims\\code.cmd"
+    )
+    assert probed == []  # not under `bin`, so no executable is guessed at
+    assert resolve_vscode(which=lambda _n: "C:\\x\\bin\\code.cmd", is_file=is_file) == (
+        "C:\\x\\bin\\code.cmd"
+    )
+    assert probed == ["C:\\x\\Code.exe"]
+
+
+@pytest.mark.parametrize("cli", ["C:\\a&b\\code.cmd", "C:\\tools (x86)\\bin\\code.cmd"])
+def test_resolve_vscode_never_uses_a_batch_cli_whose_own_path_cmd_would_reread(cli: str) -> None:
+    # cmd.exe re-reads the batch file's path too, so with no executable to start it is not used.
+    assert resolve_vscode(which=lambda _n: cli, is_file=lambda _p: False) is None
+
+
+def test_resolve_vscode_returns_a_non_batch_cli_as_found() -> None:
+    probed: list[str] = []
+    resolved = resolve_vscode(which=lambda _n: "C:\\a&b\\bin\\code.exe", is_file=probed.append)  # type: ignore[arg-type]
+    assert resolved == "C:\\a&b\\bin\\code.exe"
+    assert probed == []
+
+
 def test_repo_open_available() -> None:
     def available(repo_path: str | None, vscode: str | None, is_dir: bool) -> bool:
         return repo_open_available(
@@ -191,9 +246,46 @@ def test_open_repo_runs_code_with_list_argv() -> None:
     assert calls == [["code.cmd", "C:\\repo"]]
 
 
-# BACKLOG #2327: the `code` CLI is a batch file, so Windows runs it under cmd.exe, which re-reads
-# the argument text. Python's argv quoting escapes none of these, and `%` expands even in quotes.
 # The markers are harmless: nothing here is a command.
+_CMD_SYNTAX_PATHS = ["C:\\a&b", "C:\\Program Files (x86)\\repo", "C:\\a%PATH%b", "C:\\a|b^c!d"]
+
+
+@pytest.mark.parametrize("repo_path", _CMD_SYNTAX_PATHS)
+def test_a_batch_cli_with_an_editor_exe_opens_any_folder_name(repo_path: str) -> None:
+    # End to end over the two seams: resolve the launcher, then open. No cmd.exe is in the launch,
+    # so nothing is screened and the path reaches the runner unmodified, as one argv item.
+    exe = f"{_INSTALL}\\Code.exe"
+    launcher = resolve_vscode(
+        which=lambda _n: f"{_INSTALL}\\bin\\code.cmd", is_file=lambda p: p == exe
+    )
+    assert launcher is not None
+    calls: list[list[str]] = []
+    open_repo(repo_path, launcher, runner=calls.append)
+    assert calls == [[exe, repo_path]]
+
+
+@pytest.mark.parametrize("repo_path", _CMD_SYNTAX_PATHS)
+@pytest.mark.parametrize("launcher", ["C:\\a&b\\Code.exe", "C:\\bin\\code", "C:\\x\\code.EXE"])
+def test_open_repo_screens_nothing_for_a_launcher_that_is_not_a_batch_file(
+    repo_path: str, launcher: str
+) -> None:
+    calls: list[list[str]] = []
+    open_repo(repo_path, launcher, runner=calls.append)
+    assert calls == [[launcher, repo_path]]
+
+
+@pytest.mark.parametrize("launcher", ["C:\\a&b\\code.cmd", "C:\\tools (x86)\\code.BAT"])
+def test_open_repo_refuses_a_batch_launcher_whose_own_path_cmd_would_reread(launcher: str) -> None:
+    calls: list[list[str]] = []
+    with pytest.raises(RepoPathRefused):
+        open_repo("C:\\repo", launcher, runner=calls.append)
+    assert calls == []
+
+
+# The fallback: a batch `code` CLI with no editor executable beside it. Windows runs it under
+# cmd.exe, which re-reads the command line. Python's argv quoting escapes none of these, and `%`
+# expands even in quotes.
+@pytest.mark.parametrize("code_cmd", ["code.cmd", "C:\\shims\\code.CMD", "C:\\shims\\code.bat"])
 @pytest.mark.parametrize(
     "repo_path",
     [
@@ -215,10 +307,10 @@ def test_open_repo_runs_code_with_list_argv() -> None:
         "C:\\with space\\a&b",  # refused even though the space gets the argument quoted
     ],
 )
-def test_open_repo_refuses_a_path_cmd_would_reread(repo_path: str) -> None:
+def test_a_batch_launcher_refuses_a_path_cmd_would_reread(repo_path: str, code_cmd: str) -> None:
     calls: list[list[str]] = []
     with pytest.raises(RepoPathRefused) as excinfo:
-        open_repo(repo_path, "code.cmd", runner=calls.append)
+        open_repo(repo_path, code_cmd, runner=calls.append)
     assert calls == []
     # Fixed text: the path is operator data, so no part of it is echoed.
     assert str(excinfo.value) == str(RepoPathRefused())
@@ -228,7 +320,7 @@ def test_open_repo_refuses_a_path_cmd_would_reread(repo_path: str) -> None:
     "repo_path",
     ["C:\\Users\\me\\Code\\My Estate", "C:\\repo-1_x.y", "D:\\caf\u00e9\\repo", "C:\\a,b;c=d~e+f"],
 )
-def test_open_repo_still_opens_an_ordinary_folder(repo_path: str) -> None:
+def test_a_batch_launcher_still_opens_an_ordinary_folder(repo_path: str) -> None:
     calls: list[list[str]] = []
     open_repo(repo_path, "code.cmd", runner=calls.append)
     assert calls == [["code.cmd", repo_path]]
@@ -259,6 +351,46 @@ def test_the_tray_app_reports_a_refused_repo_path_and_starts_nothing(
     TrayLogScrubFilter().filter(record)
     assert record.getMessage() == body
     assert "secret" not in title + body + caplog.text
+
+
+def test_the_tray_app_starts_the_editor_exe_with_the_path_as_one_argv_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.tray import app as tray_app
+
+    started: list[tuple[object, object]] = []
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda args, **kw: started.append((args, kw.get("shell")))
+    )
+    tray = tray_app.TrayApp.__new__(tray_app.TrayApp)
+    monkeypatch.setattr(tray, "_config", TrayConfig(repo_path="C:\\a&b (x86)"), raising=False)
+    monkeypatch.setattr(tray, "_vscode", "C:\\VS Code\\Code.exe", raising=False)
+    tray._open_repo()
+    assert started == [(["C:\\VS Code\\Code.exe", "C:\\a&b (x86)"], False)]
+
+
+def test_the_tray_app_reports_a_failed_launch_without_any_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The launcher resolved at startup and is gone by the click. The OSError quotes its path.
+    from messagefoundry.redaction import redact
+
+    def _launch_fails(args: list[str], **_kw: object) -> None:
+        raise FileNotFoundError(2, "The system cannot find the file specified", args[0])
+
+    monkeypatch.setattr(subprocess, "Popen", _launch_fails)
+
+    def act(tray: object) -> None:
+        monkeypatch.setattr(tray, "_vscode", "C:\\s3cr3t\\Code.exe", raising=False)
+        tray._open_repo()  # type: ignore[attr-defined]
+
+    title, body, logged = _refused_action_report(
+        monkeypatch, caplog, act, TrayConfig(repo_path="C:\\op\\s3cr3t")
+    )
+    assert body == "Repo not opened: the launch failed"
+    assert logged == "Repo not opened: the launch failed (FileNotFoundError)"
+    assert redact(logged) == logged
+    assert "s3cr3t" not in title + body + caplog.text
 
 
 def _identity(path: str) -> str:

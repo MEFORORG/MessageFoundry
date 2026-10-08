@@ -2,8 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tray actions: open the console, the repo in VS Code, and the service log (ADR 0113 §5/§7).
 
-Side-effecting shells (open a browser tab, spawn ``code``, open a file) kept thin; the resolution
-logic — the exact ``/ui`` URL, whether the ``code`` CLI and repo resolve, whether a log exists — is
+Side-effecting shells (open a browser tab, start VS Code, open a file) kept thin; the resolution
+logic — the exact ``/ui`` URL, whether a VS Code launcher and repo resolve, whether a log exists — is
 pure/injectable so it is unit-testable without launching anything. The tray never opens the bare
 engine URL (FastAPI 404s there — there is no ``/`` route); it always appends ``/ui``.
 """
@@ -32,6 +32,16 @@ _VSCODE_FALLBACKS = (
 )
 _CREATE_NO_WINDOW = 0x08000000  # keep `code`'s launcher from flashing a console window
 
+#: The editor executable a standard install keeps one folder above its ``bin`` folder. The
+#: ``code.cmd`` in ``bin`` starts it by that relative path itself.
+_VSCODE_EXE = "Code.exe"
+#: Suffixes Windows runs under ``cmd.exe``.
+_BATCH_SUFFIXES = frozenset({".cmd", ".bat"})
+#: Characters ``cmd.exe`` reads as syntax in a batch file's command line. Quoting does not make
+#: them all safe: ``%`` expands inside double quotes, and so does ``!`` under delayed expansion.
+#: This is the one place the set is written down; :func:`_cmd_would_reread` adds control characters.
+_CMD_REREAD_CHARS = frozenset('&|<>^%!()"')
+
 
 def console_url(engine_url: str) -> str:
     """The exact monitor-console URL — always ``<engine_url>/ui``, never the bare root."""
@@ -46,20 +56,56 @@ def _is_dir(path: str) -> bool:
     return Path(path).is_dir()
 
 
+def _is_batch_file(path: str) -> bool:
+    """True when Windows would run ``path`` under ``cmd.exe`` (a ``.cmd`` or ``.bat`` file)."""
+    return ntpath.splitext(path)[1].casefold() in _BATCH_SUFFIXES
+
+
+def _cmd_would_reread(text: str) -> bool:
+    """True when ``text`` has a ``cmd.exe`` metacharacter or a control character (CR, LF, ...)."""
+    return has_control_char(text) or any(ch in _CMD_REREAD_CHARS for ch in text)
+
+
+def _launcher_for(cli: str, is_file: Callable[[str], bool]) -> str | None:
+    """The program Open Repo starts for the ``code`` CLI found at ``cli``, or ``None``.
+
+    A batch ``code.cmd`` is replaced by the editor executable beside its ``bin`` folder when that
+    file exists, so ``cmd.exe`` takes no part in the launch (BACKLOG #2327). With no such
+    executable (a shim, or a layout this does not know) the batch file is all there is, and it is
+    used only if ``cmd.exe`` would not re-read its own path. Anything else is returned as found.
+    """
+    if not _is_batch_file(cli):
+        return cli
+    bin_dir = ntpath.dirname(cli)
+    if ntpath.basename(bin_dir).casefold() == "bin":
+        exe = ntpath.join(ntpath.dirname(bin_dir), _VSCODE_EXE)
+        if is_file(exe):
+            return exe
+    return None if _cmd_would_reread(cli) else cli
+
+
 def resolve_vscode(
     *,
     which: Callable[[str], str | None] = shutil.which,
     is_file: Callable[[str], bool] = _is_file,
     expandvars: Callable[[str], str] = os.path.expandvars,
 ) -> str | None:
-    """Locate the ``code`` CLI: PATH first, then the common install locations. ``None`` if absent."""
+    """Locate the program that opens a folder in VS Code. ``None`` if there is none to use.
+
+    The ``code`` CLI is looked up on PATH first, then in the common install locations. Each one
+    found goes through :func:`_launcher_for`, so the result is the editor executable where a
+    standard install has one, and a batch file only as the fallback :func:`open_repo` screens.
+    """
     found = which("code")
-    if found:
-        return found
+    launcher = _launcher_for(found, is_file) if found else None
+    if launcher is not None:
+        return launcher
     for template in _VSCODE_FALLBACKS:
         candidate = expandvars(template)
         if "%" not in candidate and is_file(candidate):
-            return candidate
+            launcher = _launcher_for(candidate, is_file)
+            if launcher is not None:
+                return launcher
     return None
 
 
@@ -112,7 +158,7 @@ def repo_open_available(
     is_dir: Callable[[str], bool] = _is_dir,
     is_remote_drive: Callable[[str], bool] = _is_remote_drive,
 ) -> bool:
-    """True iff Open-Repo is offered: a real directory on a local drive and a resolved ``code`` CLI.
+    """True iff Open-Repo is offered: a real directory on a local drive and a resolved launcher.
 
     Offered is not the same as opened: :func:`open_repo` can still refuse the path, and says why.
 
@@ -169,54 +215,45 @@ def open_console(engine_url: str, *, opener: Callable[[str], object] | None = No
 
 def _run_detached(args: list[str]) -> None:
     creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    # shell=False does not keep cmd.exe out of a `code.cmd` launch; see open_repo().
-    subprocess.Popen(args, shell=False, creationflags=creationflags)  # nosec B603 - argv is the resolved code CLI plus a repo path open_repo() screened (BACKLOG #2327)
-
-
-#: Characters ``cmd.exe`` reads as syntax in a batch file's arguments. Quoting does not make them
-#: all safe: ``%`` expands inside double quotes, and so does ``!`` under delayed expansion.
-_CMD_REREAD_CHARS = frozenset('&|<>^%!()"')
+    # shell=False does not keep cmd.exe out of a batch-file launch; see open_repo().
+    subprocess.Popen(args, shell=False, creationflags=creationflags)  # nosec B603 - argv is the launcher resolve_vscode() chose plus repo_path as one list item; open_repo() screens the batch-file case (BACKLOG #2327)
 
 
 class RepoPathRefused(ValueError):
-    """Open Repo refused ``repo_path``: it has a character ``cmd.exe`` would re-read.
+    """Open Repo refused a batch-file launch that ``cmd.exe`` would re-read.
 
-    The message is fixed text. The path comes from ``tray.toml`` or the service's registry hint, so
-    no part of it is echoed, which matches :class:`ConsoleUrlRefused`.
+    The message is fixed text. ``repo_path`` comes from ``tray.toml`` or the service's registry
+    hint, so no part of it is echoed, which matches :class:`ConsoleUrlRefused`.
     """
 
     def __init__(self) -> None:
         super().__init__(
-            "repo_path has a character the Windows command shell would re-read "
-            "(one of & | < > ^ % ! ( ) or a double quote, or a control character)"
+            "the code launcher is a batch file, and its path or repo_path has a character "
+            "the Windows command shell would re-read"
         )
-
-
-def _cmd_would_reread(text: str) -> bool:
-    """True when ``text`` has a ``cmd.exe`` metacharacter or a control character (CR, LF, ...)."""
-    return has_control_char(text) or any(ch in _CMD_REREAD_CHARS for ch in text)
 
 
 def open_repo(
     repo_path: str,
-    code_cmd: str,
+    launcher: str,
     *,
     runner: Callable[[list[str]], object] = _run_detached,
 ) -> None:
     """Open ``repo_path`` as a folder in VS Code, or raise :class:`RepoPathRefused`.
 
-    The argv is a list and no shell is asked for. That is not enough on Windows: the ``code`` CLI
-    is a batch file, ``code.cmd``, and Windows runs a batch file under ``cmd.exe``, which re-reads
-    the argument text. Python's argv quoting does not escape ``&``, ``|`` or ``%``. So a path with
-    any such character is refused before the launch, and nothing is escaped (BACKLOG #2327).
+    ``launcher`` is what :func:`resolve_vscode` returned. Normally that is the editor executable,
+    which takes the folder as one argv item with no shell, so any folder name opens.
 
-    The refusal is wider than ``cmd.exe`` needs: it also refuses characters that are harmless in
-    some positions, such as parentheses or a quoted ``&``. Only ``repo_path`` is screened;
-    ``code_cmd`` is re-read by ``cmd.exe`` too and is trusted as resolved.
+    The fallback is a batch file, used when no editor executable was found beside it. Windows runs
+    a batch file under ``cmd.exe``, which re-reads the whole command line, and Python's argv
+    quoting does not escape ``&``, ``|`` or ``%``. ``cmd.exe`` cannot be avoided there, so the
+    launch is refused when either string fails :func:`_cmd_would_reread`. Nothing is escaped. That
+    test is wider than ``cmd.exe`` needs: it also refuses characters that are harmless in some
+    positions, such as parentheses or a quoted ``&``.
     """
-    if _cmd_would_reread(repo_path):
+    if _is_batch_file(launcher) and (_cmd_would_reread(repo_path) or _cmd_would_reread(launcher)):
         raise RepoPathRefused
-    runner([code_cmd, repo_path])
+    runner([launcher, repo_path])
 
 
 def _open_path(target: str) -> None:
