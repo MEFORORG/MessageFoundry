@@ -895,9 +895,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         )
 
     def log_forward_failed(self, name: str, *, kind: str, reason: str, count: int = 0) -> None:
-        # BACKLOG #2612: the off-box forwarder did not start, or is losing records. The fixed label
-        # stands in for "connection", as the sink label does for log_write_failed. The kind is in
-        # the detail so the alert row says which of the three it is.
+        # BACKLOG #2612: the off-box forwarder did not start, or is losing records. The caller's
+        # `forwarder:<kind>` label stands in for "connection", as the sink label does for
+        # log_write_failed, so the throttle and the alert row are per kind.
         self._emit(
             {
                 "type": "log_forward_failed",

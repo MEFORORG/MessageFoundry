@@ -184,8 +184,8 @@ class AlertSink(Protocol):
         ...
 
     def log_forward_failed(self, name: str, *, kind: str, reason: str, count: int = 0) -> None:
-        """The **off-box log forwarder** is absent or losing records (BACKLOG #2612). ``name`` is the
-        fixed label ``"forwarder"``. ``kind`` is one of three fixed words. ``not_installed``: a
+        """The **off-box log forwarder** is absent or losing records (BACKLOG #2612). ``name`` is
+        ``forwarder:<kind>``, so each kind is its own alert. ``kind`` is one of three fixed words. ``not_installed``: a
         forwarder was configured and did not start, so this process sends nothing off the host.
         ``dropping``: records were lost since the last look. ``spool_unreadable``: the on-disk
         spool could not be read, so what it holds is kept and not sent. ``reason`` is fixed words
