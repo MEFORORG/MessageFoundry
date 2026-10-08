@@ -2004,6 +2004,12 @@ _ISSUE_ROW_KEYS: Final[Mapping[str, str]] = MappingProxyType(
 #: "this administrator issued the credential", so a refusal written under either would name an issuer
 #: for a credential that was never set. Its detail's ``op`` says which of the three refused.
 CREDENTIAL_ISSUE_REFUSED_ACTION: Final = "auth.credential_issue_refused"
+
+#: The admin routes that refuse the caller's own account, as ``auth.self_target_refused`` names
+#: them in its ``op`` (vault BACKLOG #3260).
+SelfTargetOp = Literal[
+    "password_reset", "mfa_reset", "federated_bind", "federated_unbind", "disable", "delete"
+]
 #: The ``op`` values that row carries, one per issuing operation.
 CredentialIssueOp = Literal["create", "password_reset", "mfa_reset"]
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
@@ -11779,10 +11785,9 @@ class AuthService:
             client=client,
         )
 
-    async def audit_self_target_refused(self, identity: Identity, *, op: str) -> None:
+    async def audit_self_target_refused(self, identity: Identity, *, op: SelfTargetOp) -> None:
         """Audit an administrator route refused because it targets the caller's own account (vault
-        BACKLOG #3260, ASVS 16.3.2). ``op`` names the route: ``password_reset``, ``mfa_reset``,
-        ``federated_bind``, ``federated_unbind``, ``disable`` or ``delete``.
+        BACKLOG #3260, ASVS 16.3.2). ``op`` names the route.
 
         The refusal is an authorization decision of its own. Before this row, the JSON plane kept
         only the step-up gate's ``auth.permission_granted`` for the attempt, and the console plane
