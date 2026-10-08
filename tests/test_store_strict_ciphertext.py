@@ -38,6 +38,7 @@ import pytest
 from messagefoundry.config.settings import (
     ApiSettings,
     ApprovalsSettings,
+    CertMonitorSettings,
     EgressSettings,
     StoreSettings,
     security_loosenings,
@@ -265,6 +266,7 @@ def test_the_setting_ships_off_and_on_is_a_named_loosening() -> None:
                 revocation_attested_hops=(),
                 api=ApiSettings(),
                 approvals=ApprovalsSettings(),
+                cert_monitor=CertMonitorSettings(),
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,

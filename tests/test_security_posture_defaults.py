@@ -32,6 +32,7 @@ from messagefoundry.config.settings import (
     ApiSettings,
     ApprovalsSettings,
     AuthSettings,
+    CertMonitorSettings,
     EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -73,6 +74,7 @@ def _pairs(
     revocation_hops: tuple[str, ...] = (),
     api: ApiSettings | None = None,
     approvals: ApprovalsSettings | None = None,
+    cert_monitor: CertMonitorSettings | None = None,
 ) -> list[tuple[str, str]]:
     """The loosening ``(switch, risk)`` pairs for a settings combination (defaults where not
     overridden)."""
@@ -91,6 +93,7 @@ def _pairs(
         revocation_attested_hops=revocation_hops,
         api=api or ApiSettings(),
         approvals=approvals or ApprovalsSettings(),
+        cert_monitor=cert_monitor or CertMonitorSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
@@ -144,6 +147,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -177,6 +181,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -207,6 +212,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -258,6 +264,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -400,6 +407,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -890,6 +898,45 @@ async def test_posture_route_reports_the_approval_dwell_the_app_was_built_with(
     assert "min_dwell_seconds" not in default and "expiry_hours" not in default
 
 
+# --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4) --------------------
+
+
+def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
+    """BACKLOG #2227: each warn_days = 0 turned its reminder off with only a runner debug line."""
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(warn_days=0),
+            rotation=SecretRotationSettings(warn_days=0),
+        )
+    )
+    assert "cert_expiry reminder" in named["cert_monitor.warn_days"]
+    assert "secret_rotation reminder" in named["secret_rotation.warn_days"]
+    # The control: any value above 0 keeps the reminder on and names nothing.
+    on = _names(
+        cert_monitor=CertMonitorSettings(warn_days=1),
+        rotation=SecretRotationSettings(warn_days=1),
+    )
+    assert "cert_monitor.warn_days" not in on and "secret_rotation.warn_days" not in on
+
+
+async def test_posture_route_reports_the_cert_monitor_the_app_was_given(engine: Engine) -> None:
+    """The route reads [cert_monitor] off app.state, where the managed lifespan stashes it. The
+    default app is the control."""
+
+    async def switches(cert_monitor: CertMonitorSettings | None) -> list[str]:
+        app = create_app(engine, allow_no_auth=True)
+        if cert_monitor is not None:
+            app.state.cert_monitor_settings = cert_monitor
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            resp = await client.get("/security/posture")
+        assert resp.status_code == 200
+        return [entry["switch"] for entry in resp.json()["loosenings"]]
+
+    assert "cert_monitor.warn_days" in await switches(CertMonitorSettings(warn_days=0))
+    assert "cert_monitor.warn_days" not in await switches(None)
+
+
 def test_a_zero_flow_cache_cap_refuses_every_flow() -> None:
     """Ground the direction in FlowCache: 0 is stricter, which is why it is not named."""
     from messagefoundry.auth.oidc.flow import FlowCache, FlowCacheFullError, PendingFlow
@@ -1026,6 +1073,7 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             revocation_attested_hops=(),
             api=_proxied(*entries),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1058,6 +1106,7 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             revocation_attested_hops=(),
             api=_proxied("::/0", "::/0"),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1122,6 +1171,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=_terminated(ack=True),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1814,6 +1864,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1859,6 +1910,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1895,6 +1947,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1928,6 +1981,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

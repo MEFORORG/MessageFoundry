@@ -7583,6 +7583,7 @@ def security_loosenings(
     revocation_attested_hops: Sequence[str],
     api: ApiSettings,
     approvals: ApprovalsSettings,
+    cert_monitor: CertMonitorSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
@@ -7648,6 +7649,12 @@ def security_loosenings(
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
+    ``cert_monitor`` joins them for ``warn_days = 0`` (BACKLOG #2227).
+
+    **The credential reminders (ASVS 6.4.5, BACKLOG #2227).** Two settings each turn one off with no
+    refusal, and each is named here, so the serve-time warning says so: ``[cert_monitor].warn_days =
+    0`` and ``[secret_rotation].warn_days = 0``. ``[auth].initial_password_expiry_hours = 0`` also
+    stops a reminder, and it stays unreported for the reason the paragraph above gives.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -7936,6 +7943,29 @@ def security_loosenings(
                 "its max age plus grace, or one whose age cannot be determined, still starts the "
                 "engine and keeps encrypting PHI at rest, with an alert as the only signal (the same "
                 "key's 2**32-encrypt usage ceiling still refuses unconditionally)",
+            )
+        )
+    # --- the credential reminders (ASVS 6.4.5). BACKLOG #2227: each warn_days = 0 turned its reminder
+    # off with only a debug line from the runner. Owner answer to #2006 (a): a silent weakening keeps
+    # the cell at partial, so each is named here and reaches the serve-time warning and
+    # GET /security/posture.
+    if cert_monitor.warn_days == 0:
+        out.append(
+            (
+                "cert_monitor.warn_days",
+                "[cert_monitor].warn_days = 0 turns the certificate-expiry monitor off -- no "
+                "cert_expiry reminder is raised for any certificate or CRL file the monitor "
+                "watches, so one can reach its expiry with no warning ahead of it, and a service "
+                "caller's client certificate is never flagged as near expiry",
+            )
+        )
+    if secret_rotation.warn_days == 0:
+        out.append(
+            (
+                "secret_rotation.warn_days",
+                "[secret_rotation].warn_days = 0 turns the secret-rotation reminder off -- no "
+                "secret_rotation reminder is raised for the store key or any tracked credential, "
+                "however overdue. The start-time expiry refusals still run",
             )
         )
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to

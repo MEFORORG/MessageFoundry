@@ -1228,6 +1228,9 @@ def _posture_loosenings(
             api=api_settings,
             # BACKLOG #2489: the dual-control dwell and expiry, read off the gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),
+            # BACKLOG #2227: warn_days = 0 is named. The managed lifespan stashes the live section;
+            # an app built without it reports the shipped default, which names nothing.
+            cert_monitor=getattr(state, "cert_monitor_settings", None) or CertMonitorSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
