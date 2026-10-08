@@ -160,13 +160,6 @@ class _CapturingTransport(asyncio.Transport):
     def set_protocol(self, protocol: asyncio.BaseProtocol) -> None:
         self._protocol = protocol
 
-    def get_protocol(self) -> asyncio.BaseProtocol:
-        protocol: asyncio.BaseProtocol = self._protocol
-        return protocol
-
-    def is_reading(self) -> bool:
-        return not self._closing
-
     def pause_reading(self) -> None:
         pass
 
@@ -175,12 +168,6 @@ class _CapturingTransport(asyncio.Transport):
 
     def set_write_buffer_limits(self, high: int | None = None, low: int | None = None) -> None:
         pass
-
-    def get_write_buffer_size(self) -> int:
-        return 0
-
-    def get_write_buffer_limits(self) -> tuple[int, int]:
-        return (0, 0)
 
     def can_write_eof(self) -> bool:
         return False
@@ -295,7 +282,11 @@ def selftest_protocol_floor(http_class: type[Any], ws_class: type[Any] | None) -
             loop.close()
     except Exception as exc:
         # Type only: the message could carry bytes the server was handed.
-        problem = f"the drive raised {type(exc).__name__}"
+        # The cause may be this harness and not the server, so the message points here as well.
+        problem = (
+            f"the drive raised {type(exc).__name__} before a response could be read, in the "
+            "server or in messagefoundry/api/protocol_floor_selftest.py itself"
+        )
         raise floor_unavailable(f"failed its startup self-test: {problem}", problem) from None
     if problems:
         found = "; ".join(problems)

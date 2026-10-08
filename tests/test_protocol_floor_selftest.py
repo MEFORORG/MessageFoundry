@@ -55,10 +55,14 @@ def _refusal(http: type[Any], ws: type[Any] | None) -> str:
     return message
 
 
-def _names_only(message: str, response: str) -> None:
-    """The refusal names ``response`` with every header it lacked, and no other response."""
+def _names(message: str, response: str) -> None:
     for name, _ in PROTOCOL_SECURITY_HEADERS:
         assert f"the {response} lacked {name}" in message, message
+
+
+def _names_only(message: str, response: str) -> None:
+    """The refusal names ``response`` with every header it lacked, and no other response."""
+    _names(message, response)
     for other in _ALL_RESPONSES:
         if other != response:
             assert other not in message, message
@@ -85,8 +89,7 @@ def test_the_unfloored_classes_are_refused_for_every_response() -> None:
     """The vacuity control for the whole check: uvicorn's own classes, with no floor, fail all four."""
     message = _refusal(HttpToolsProtocol, WebSocketProtocol)
     for response in _ALL_RESPONSES:
-        for name, _ in PROTOCOL_SECURITY_HEADERS:
-            assert f"the {response} lacked {name}" in message, message
+        _names(message, response)
 
 
 # --- one hook knocked out per response -----------------------------------------------------------
@@ -108,18 +111,18 @@ def test_a_bare_500_is_refused(http_base: type[Any], monkeypatch: pytest.MonkeyP
     _names_only(_refusal(http, ws), "app-error 500")
 
 
-def test_a_bare_handshake_rejection_is_refused() -> None:
+@pytest.mark.parametrize(
+    ("hook", "response"),
+    [
+        ("write_http_response", "WebSocket handshake rejection"),
+        ("send_500_response", "WebSocket pre-handshake 500"),
+    ],
+)
+def test_a_bare_websocket_answer_is_refused(hook: str, response: str) -> None:
     http, ws = _floored()
     selftest_protocol_floor(http, ws)
-    del ws.write_http_response
-    _names_only(_refusal(http, ws), "WebSocket handshake rejection")
-
-
-def test_a_bare_websocket_500_is_refused() -> None:
-    http, ws = _floored()
-    selftest_protocol_floor(http, ws)
-    del ws.send_500_response
-    _names_only(_refusal(http, ws), "WebSocket pre-handshake 500")
+    delattr(ws, hook)
+    _names_only(_refusal(http, ws), response)
 
 
 def test_one_missing_header_is_named_alone(monkeypatch: pytest.MonkeyPatch) -> None:

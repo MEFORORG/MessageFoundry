@@ -146,7 +146,8 @@ class ProtocolFloorUnavailable(RuntimeError):
     """The server class lacks a hook the protocol header floor needs, so the floor cannot be built.
 
     ``serve`` refuses to start on this. The message names the hook and the installed versions, and
-    :attr:`hook` holds the hook alone."""
+    :attr:`hook` holds the hook alone. From the startup self-test it holds what the test found in
+    place of a hook: each response and the header it lacked."""
 
     hook: str = ""
 
@@ -166,7 +167,7 @@ def floor_unavailable(problem: str, hook: str) -> ProtocolFloorUnavailable:
     refused = ProtocolFloorUnavailable(
         f"the protocol header floor (BACKLOG #1120) {problem} "
         f"(uvicorn {_installed('uvicorn')}, websockets {_installed('websockets')}). The responses "
-        "the server writes below the app would go out without nosniff. Re-read the server's "
+        "the server writes below the app could go out without the floor's headers. Re-read the server's "
         "protocol modules and update messagefoundry/api/protocol_headers.py, or install the uvicorn "
         "and websockets the lock pins"
     )
