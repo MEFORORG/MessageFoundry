@@ -1,9 +1,16 @@
 # Browser support
 
-**The console warns, it never blocks.** Every browser security feature it relies on is
-defense-in-depth. When a browser does not support one, the console keeps working and either shows you
-a warning or falls back to a server-side control that does the same job. This page states which
-features those are and what each absence costs you.
+**When a browser lacks a security feature the console relies on, the product warns you, refuses the
+request, or leans on a control that does not need the browser.** Each row on this page says which of
+the three applies:
+
+- **Warns.** The page shows a message you can read.
+- **Fails closed.** The server refuses the request, or the page does nothing.
+- **Named control.** Something that does not depend on the browser does the same job, and the row
+  names it.
+
+Where a row has none of the three, the row says so in those words. At least one such case is left:
+see [Two configurations turn the warnings off](#two-configurations-turn-the-warnings-off).
 
 It covers the operator UI at `/ui`, the IDE extension's webviews, and at least these engine routes
 outside `/ui` that a browser reaches:
@@ -12,6 +19,9 @@ outside `/ui` that a browser reaches:
   checks the handshake's `Origin` header before it accepts the socket.
 - **The API documentation pages**, served only when you set `[api].expose_docs = true`. They are off
   by default. See [the engine's API pages](#the-engines-api-pages-load-third-party-scripts) below.
+- **The client-network denial page**, served in place of any route when
+  `[security].allowed_client_networks` refuses your address. See
+  [the denial page](#the-client-network-denial-page-needs-no-browser-feature) below.
 
 The engine's other routes serve programs, mostly with JSON. This page makes no claim about what a
 browser does with them.
@@ -25,7 +35,9 @@ browser does with them.
 >   console's code, or in the engine's WebSocket check, has no row, if a row's
 >   **Allowed** or **Refused** verdict stops matching what the code does without that header, if
 >   the opt-out cookie names or the HSTS conditions change, or if the list of IDE webviews or the
->   one with a startup check changes.
+>   one with a host-side startup check changes. It also fails if an IDE panel stops carrying the two
+>   banners quoted below, if their wording here drifts from the code, if the denial page's header
+>   or policy changes, or if FastAPI's API pages gain or lose a no-JavaScript message.
 >
 > Nothing checks the middle column of the request-header table, the API pages' list of what they
 > load, or the IDE table's description of each panel. Those were read or measured when written.
@@ -135,6 +147,11 @@ In both cases the console falls back to the engine's static `script-src 'self'` 
 `Cross-Origin-Opener-Policy`, `Cross-Origin-Resource-Policy` and `Reporting-Endpoints`. The passkey
 line still appears, because it lives in the console's main script, which that policy still runs.
 
+**In these two configurations those three absences have none of the three answers.** The page does
+not warn, the server does not refuse, and no other control tells you that the browser ignores CSP or
+runs no script. The server-side controls in the tables above still hold. The first configuration is a choice you
+make by setting the variable. That is the whole of the cover.
+
 The cookies differ between the two cases:
 
 | Case | Session cookie | Federated sign-in flow cookie |
@@ -174,8 +191,17 @@ What that means for a browser:
 - **Their only CSP is `frame-ancestors 'none'; base-uri 'none'`.** It blocks framing and `<base>`
   injection and nothing else, so no script source is restricted, and the files carry no integrity
   hash. What runs is whatever those hosts serve that day.
-- **They need JavaScript and a route to those hosts.** Without either, the page renders blank, and
-  nothing tells you why.
+- **They need JavaScript and a route to those hosts, and they fail closed without either.** The
+  page then shows no documentation and offers nothing to click. What it tells you differs:
+  - `/redoc` with JavaScript off shows FastAPI's own line, "ReDoc requires Javascript to function."
+    That is a warning.
+  - `/docs` with JavaScript off is a blank page. It has no such line, so nothing tells you why.
+  - Either page with JavaScript on and those hosts unreachable is blank too, with no message.
+
+  A blank page here loses the page's own function. The `/openapi.json` schema the pages read is
+  served the same way with or without JavaScript, so a blank page hides nothing that a direct
+  request would not get. A blank page is still not a warning, and this page does not count it as
+  one.
 - The engine still sends `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and
   `Referrer-Policy: no-referrer` on them, as on every response.
 
@@ -190,32 +216,88 @@ The VS Code extension draws its forms and views as webviews. A webview is a page
 with its own built-in browser engine, so the browser here is whichever one your VS Code release
 ships. The extension declares `engines.vscode ^1.95.0` and states no separate browser floor.
 
-**Only one webview checks that its script started.** The rest have no startup check and no banner. If
-a panel's script does not run, the panel shows whatever the extension rendered into it, and every
-button and field that talks to the extension does nothing.
+**Every panel that runs a script warns you when that script has not started.** The panel's page
+carries a plain-text banner that is visible by default, and the panel's own script hides it as soon
+as it has the VS Code API. The banner needs no script, no stylesheet and no message from the
+extension, so it stays up whenever the script is blocked, fails to load, or stops at that first
+step:
 
-| Webview | Source | What you see if its script does not run |
+> MessageFoundry: this panel's script has not started, so its buttons and fields do nothing. Close
+> the panel and open it again. If this message stays, VS Code is not running the panel's script.
+
+Under the banner, the panel shows whatever the extension rendered into it, and every button and
+field that talks to the extension does nothing. The table says what that is for each panel.
+
+The banner does not cover a script that starts and fails later. **Only one webview also has a
+host-side startup check**: the Steps view, in its row below.
+
+| Webview | Source | What you see under the banner if its script does not run |
 |---|---|---|
 | Home, in the side bar | `home.ts` | The search box and the list of actions. Clicking one does nothing. |
 | Route Wizard | `newRoute.ts` | The heading and the Back, Next and Cancel buttons. Every step's fields stay hidden, because the script is what shows them. |
-| Connection form | `connectionEditor.ts` | The fields, with the Transport and Router lists empty. Save does nothing. |
+| Connection form | `connectionEditor.ts` | The heading "New Connection", even for a connection that already exists, and a form with none of its saved values. The Transport and Router lists are empty, the Settings area has no rows, and the inbound and outbound options both show at once. Save does nothing. |
 | Alert rules | `alertEditor.ts` | The headings and an empty rules table. The Event and Severity lists are empty. |
 | Translation table | `codeSetEditor.ts` | The heading and an empty grid. The row and column buttons do nothing. |
-| `connections.toml` and code-set editors | `configEditors.ts` | The connection form and the translation table above, with the same result. A file outside the config directory gets a one-line text notice instead, rendered with scripts turned off and no CSP, since it has no script to restrict. |
+| `connections.toml` and code-set editors | `configEditors.ts` | The connection form and the translation table above, with the same result. A file outside the config directory gets a one-line text notice instead, rendered with scripts turned off and no CSP, since it has no script to restrict. That notice runs no script, so it carries neither banner. |
 | Security settings | `securityEditor.ts` | The heading and the Save and Close buttons. The form itself is blank, because the script builds it. |
 | Config repo storage | `sourceControl.ts` | The options, with the current choice marked. Save does nothing. |
 | Cookbook | `cookbook.ts` | Every recipe card. Search and Insert do nothing. |
 | Engine setup | `engineSetup.ts` | Every section. Its buttons do nothing. |
 | Wiring map | `wiringMap.ts` | The toolbar and the legend. The graph is blank, because the script draws it. |
 | Test Bench | `testBench.ts` | The toolbar and any results already rendered. Its buttons do nothing. |
-| Steps view | `stepsView.ts` | The rows. **If its script has not reported in within 3 seconds, VS Code shows an error** saying the view's script did not initialize and pointing you to the code view. When it falls back to text, it shows a one-line notice whose CSP allows no script at all. |
+| Steps view | `stepsView.ts` | The rows. **If its script has not reported in within 3 seconds, VS Code shows an error** saying the view's script did not initialize and pointing you to the code view. When it falls back to text, it shows a one-line notice whose CSP allows no script at all, and which carries neither banner. |
 
-**If VS Code's browser engine ignored CSP**, every panel above would look and work the same, and
-nothing would warn you. Each panel that runs a script carries a `<meta>` CSP with `default-src 'none'`
-and a per-render `script-src` nonce. The Steps view also allows scripts from the extension's own
-`media` folder. Without that CSP, script injection into a panel would no longer be blocked. The
-message checks in `ide/src/webviewMessaging.ts` would still reject a message from another origin,
-but they do not stop a script already running inside a panel.
+**If VS Code's browser engine ignored CSP, each of those panels would warn you.** Each panel that
+runs a script carries a `<meta>` CSP with `default-src 'none'` and a per-render `script-src` nonce.
+The Steps view also allows scripts from the extension's own `media` folder. Each such panel also
+carries one small script with no nonce. An engine that enforces the policy must refuse that script.
+An engine that ignores the policy runs it, and it reveals a second banner:
+
+> MessageFoundry: VS Code is not enforcing this panel's Content Security Policy, so the panel's
+> defense against injected script is not active. Update VS Code, and treat what this panel shows
+> with care until the message is gone.
+
+This is the same idea as the console's CSP-enforcement banner above, with one difference. The
+console loads its test script from a file. A webview has nowhere to report a blocked file and most
+panels may load no files at all, so the webview's test script is inline.
+
+What the second banner does not show:
+
+- It proves that the engine blocks an inline script with no nonce. It says nothing about any other
+  part of the policy.
+- It warns, and it does not stop anything. With the policy ignored, script injection into a panel
+  would no longer be blocked. The message checks in `ide/src/webviewMessaging.ts` would still reject
+  a message from another origin, but they do not stop a script already running inside a panel.
+- An enforcing engine logs one blocked-script line per panel in the webview's developer console.
+  That line is the check working.
+
+---
+
+## The client-network denial page needs no browser feature
+
+When `[security].allowed_client_networks` is set and your address is outside it, the engine refuses
+the request before sign-in and before any route runs. This is a block, not a degraded page. At
+least the `/health` probe is exempt from the rule.
+
+The answer has two shapes, and both are a `403` that carries the header
+`X-MessageFoundry-Denied: client-network`:
+
+| Request | What comes back |
+|---|---|
+| A path at or under `/ui`, or any request whose `Accept` header names `text/html` | A plain HTML page: "Blocked: your network is not permitted". It names the address the engine saw and the setting an operator changes. |
+| Anything else | A JSON body with the same message, a `denied` field of `client-network`, and the observed address. |
+
+The page is built to work in a browser that supports nothing beyond HTML:
+
+- It runs no script and loads nothing from outside itself. Its policy is `default-src 'none'` with
+  inline styles allowed, plus `frame-ancestors 'none'` and `base-uri 'none'`. A browser that
+  ignored the policy would have no script on the page to run.
+- A browser that ignored its one inline style block would still show the same text, unstyled.
+- The console's own banners do not appear on it, because the console never serves this response.
+
+A WebSocket handshake from a refused address gets the same `403` where the server supports refusing
+a handshake that way, and a plain close otherwise. The console's dashboard is then the page above,
+since its own page request was refused first.
 
 ---
 
