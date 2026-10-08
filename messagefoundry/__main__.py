@@ -1805,9 +1805,17 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
 
     Its own for the reason :func:`_forward_spool_dir` gives: the spool locks its directory. The
     default root is beside ``--db``, because each engine shard's ``[store].path`` is derived from
-    that flag, so the supervisor's directory lands next to theirs. No shard directory can take
-    the name: those are ``engine`` or start ``shard-``."""
-    return str(_forward_spool_root(settings, db_base) / "supervisor")
+    that flag, so the supervisor's directory lands next to theirs. ``db_base`` is anchored only by
+    ``--project-root`` here, so a base_dir set in the file or the environment is applied too, as
+    each shard's ``serve`` applies it to its own ``[store].path``. No shard directory can take the
+    name: those are ``engine`` or start ``shard-``."""
+    from messagefoundry.config.anchor import resolve_project_root
+
+    store_path = Path(db_base)
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=Path.cwd())
+    if root is not None and not store_path.is_absolute():
+        store_path = root / store_path
+    return str(_forward_spool_root(settings, str(store_path)) / "supervisor")
 
 
 def _start_logging(
@@ -1925,7 +1933,8 @@ def _start_logging(
             "[logging].forward_tls_ca_file to its CA, and [logging].forward_tls_crl_file to a CRL "
             "from that CA (an enforcing instance also refuses verified TLS with no revocation "
             "check). A local agent on 127.0.0.1 does not satisfy it: 16.4.3 asks for a logically "
-            "separate system."
+            "separate system. List the collector in [egress].allowed_syslog as well, or the next "
+            "start check refuses it."
         )
         if enforcing:
             print(
@@ -4686,8 +4695,9 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # BACKLOG #2356: the supervisor forwards its own log lines off-box, as each engine shard does.
     # Before this it logged to stdout only, so a shard crash loop left no copy off the host. It
-    # passes the gates `serve` passes, in the same helper, and refuses the fleet on the same
-    # refusals: every shard would refuse on them too. Placed after the gates above, as in `serve`,
+    # passes the forwarding gates `serve` passes, in the same helper, and refuses the fleet on
+    # the same refusals: every shard would refuse on them too. A refusal printed to stderr here
+    # is still not forwarded; only log records are. Placed after the gates above, as in `serve`,
     # and before the renewal below, so a refused start changes nothing on disk. The logging call
     # is the bare one at the top plus the forwarder. `--env` is what each shard is started with,
     # so it names the environment here as well.

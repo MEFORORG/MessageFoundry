@@ -144,6 +144,28 @@ def test_no_shard_can_be_given_the_supervisor_spool_directory(tmp_path: Path) ->
         assert {Path(own).parent} == {Path(shard).parent for shard in shards}
 
 
+def test_the_supervisor_spool_follows_a_base_dir_set_in_the_settings(tmp_path: Path) -> None:
+    """``--db`` is anchored only by ``--project-root`` in the supervisor. A base_dir from the file
+    or the environment moves each shard's store, so it must move the supervisor's spool too."""
+    from messagefoundry.__main__ import _forward_spool_dir, _supervisor_forward_spool_dir
+    from messagefoundry.config.settings import (
+        EnvironmentsSettings,
+        ServiceSettings,
+        StoreSettings,
+    )
+
+    data = tmp_path / "data"
+    settings = ServiceSettings(environments=EnvironmentsSettings(base_dir=str(data)))
+    own = Path(_supervisor_forward_spool_dir(settings, "mefor.db"))
+    assert own == (data / "log-spool" / "supervisor").resolve()
+    # What a shard's `serve` computes once it has anchored its own relative --db under base_dir.
+    shard = ServiceSettings(store=StoreSettings(path=str(data / "mefor_a.db")))
+    assert Path(_forward_spool_dir(shard, "a")).parent == own.parent
+    # An absolute --db stays put, as it does for the shard.
+    absolute = Path(_supervisor_forward_spool_dir(settings, str(tmp_path / "x" / "mefor.db")))
+    assert absolute == (tmp_path / "x" / "log-spool" / "supervisor").resolve()
+
+
 # --- the same gates, the same refusals ----------------------------------------------------------
 
 _PLAINTEXT_HOP = f'[logging]\nforward_host = "{_REMOTE}"\n'
