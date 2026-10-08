@@ -250,6 +250,27 @@ def _current_user(identity: Identity) -> CurrentUser:
     )
 
 
+_OWN_BINDING = "another administrator must change your own binding"
+
+
+def _is_self(identity: Identity, user_id: str, target: UserRecord | None) -> bool:
+    """Whether an admin route's target is the caller's own account (vault BACKLOG #3259).
+
+    The stored id decides, not only the path's spelling. A store whose id column compares
+    case-insensitively (SQL Server) finds the caller's row from another spelling, and the console's
+    ``/ui/users/{user_id}/`` routes pass the path to these handlers as a plain str, past the JSON
+    plane's ``ResourceId`` pattern."""
+    return user_id == identity.user_id or (target is not None and target.id == identity.user_id)
+
+
+async def _self_target_refused(
+    service: AuthService, identity: Identity, *, op: str, detail: str
+) -> HTTPException:
+    """The 400 for a self-targeted admin route, after its own audit row (vault BACKLOG #3260)."""
+    await service.audit_self_target_refused(identity, op=op)
+    return HTTPException(status.HTTP_400_BAD_REQUEST, detail)
+
+
 def _login_response(
     token: str,
     identity: Identity,
@@ -1182,10 +1203,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         current = await service.store.get_user(user_id)
         if current is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        # The stored id, not the path's spelling: a store whose id column compares case-insensitively
-        # (SQL Server) finds the row from another spelling, and the console seam passes a plain str.
-        if body.disabled and current.id == identity.user_id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot disable your own account")
+        if body.disabled and _is_self(identity, user_id, current):
+            raise await _self_target_refused(
+                service, identity, op="disable", detail="cannot disable your own account"
+            )
         # SEC-015: disabling is a lock-out path equivalent to stripping the admin role, so it carries
         # the same last-admin guard. The guard is inside service.update_user now, in one store
         # transaction with the write (vault BACKLOG #2779); LastAdministratorRefused is mapped below.
@@ -1230,9 +1251,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         target = await service.store.get_user(user_id)
-        # Compared on the stored id as well as the path's, for the reason update_user gives.
-        if user_id == identity.user_id or (target is not None and target.id == identity.user_id):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot delete your own account")
+        if _is_self(identity, user_id, target):
+            raise await _self_target_refused(
+                service, identity, op="delete", detail="cannot delete your own account"
+            )
         if target is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
         # SEC-015: deleting the last enabled admin is the same lock-out path. service.delete_user
@@ -1311,9 +1333,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         BACKLOG #1141 (ASVS 6.4.5): the response also carries ``expires_at``, the instant the login
         gate stops accepting this credential, so the administrator conveying it out-of-band can state
         the deadline. Nothing else on this path ever reaches the holder."""
-        if user_id == identity.user_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "use change-password for your own account"
+        if _is_self(identity, user_id, await service.store.get_user(user_id)):
+            raise await _self_target_refused(
+                service,
+                identity,
+                op="password_reset",
+                detail="use change-password for your own account",
             )
         try:
             issued = await service.admin_reset_password(user_id, actor=identity.username)
@@ -1381,10 +1406,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         #
         # Copied in shape from reset_user_password above, which has carried the same guard since
         # ASVS 6.4.6 -- the two admin routes now refuse the same case the same way.
-        if user_id == identity.user_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                "use the self-service MFA settings for your own account",
+        if _is_self(identity, user_id, await service.store.get_user(user_id)):
+            raise await _self_target_refused(
+                service,
+                identity,
+                op="mfa_reset",
+                detail="use the self-service MFA settings for your own account",
             )
         try:
             issued = await service.admin_reset_mfa(user_id, actor=identity.username)
@@ -1461,9 +1488,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # SELF-EXCLUSION, as the two reset routes above do. Re-pointing or removing your own
         # federated identity ends every session you hold, the calling one included, and on a site
         # where you sign in only through the IdP it can leave the last administrator locked out.
-        if user_id == identity.user_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
+        if _is_self(identity, user_id, await service.store.get_user(user_id)):
+            raise await _self_target_refused(
+                service, identity, op="federated_bind", detail=_OWN_BINDING
             )
         try:
             bound = await service.bind_federated_subject(
@@ -1502,9 +1529,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         method). Its next federated login is refused until it is bound again. The body carries the
         pair the caller saw; a stored pair that differs is refused 409 with nothing changed
         (BACKLOG #2026)."""
-        if user_id == identity.user_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
+        if _is_self(identity, user_id, await service.store.get_user(user_id)):
+            raise await _self_target_refused(
+                service, identity, op="federated_unbind", detail=_OWN_BINDING
             )
         try:
             revoked = await service.unbind_federated_subject(

@@ -11779,6 +11779,24 @@ class AuthService:
             client=client,
         )
 
+    async def audit_self_target_refused(self, identity: Identity, *, op: str) -> None:
+        """Audit an administrator route refused because it targets the caller's own account (vault
+        BACKLOG #3260, ASVS 16.3.2). ``op`` names the route: ``password_reset``, ``mfa_reset``,
+        ``federated_bind``, ``federated_unbind``, ``disable`` or ``delete``.
+
+        The refusal is an authorization decision of its own. Before this row, the JSON plane kept
+        only the step-up gate's ``auth.permission_granted`` for the attempt, and the console plane
+        kept nothing. The API handlers write it, so a console call through the seam writes it too.
+
+        ``user_id`` is the caller's stored id, never the path's spelling: the console passes the
+        path through as a plain str, and an unbounded caller string has no place in the chain. The
+        handlers have no address in hand, so ``client`` is NULL, as on the other admin rows."""
+        await self._audit(
+            "auth.self_target_refused",
+            actor=identity.username,
+            detail=_json({"op": op, "user_id": identity.user_id}),
+        )
+
     async def audit_permission_granted(
         self,
         identity: Identity,
