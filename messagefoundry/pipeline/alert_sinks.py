@@ -1270,6 +1270,12 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # dr_activated instance via _AUTO_RESOLVE (ADR 0044).
         self._record_state({"type": "dr_released", "connection": node}, "info")
 
+    def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
+        # vault BACKLOG #2613: one detector of the audit-stream rule layer fired. `signal` is the
+        # event type, so each detector routes and throttles on its own; the subject stands in for
+        # "connection". A count and a fixed sentence only: never a body, an id or a row's detail.
+        self._emit({"type": signal, "connection": name, "count": count, "detail": detail})
+
     def set_store(self, store: _AlertStateStore | None) -> None:
         """Wire (or clear) the alert-state store (ADR 0044, #56). The lifespan calls this once the store
         is open, since :func:`notifier_from_settings` builds the sink from settings before the store

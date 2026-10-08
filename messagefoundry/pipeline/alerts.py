@@ -610,6 +610,21 @@ class AlertSink(Protocol):
         ``"primary"`` (leadership handed back). No PHI."""
         ...
 
+    # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
+
+    def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
+        """A detector of the audit-stream rule layer fired (vault BACKLOG #2613;
+        :mod:`messagefoundry.pipeline.security_signals`). ``signal`` is the alert event type, one of
+        ``SECURITY_SIGNAL_TYPES``, so each detector routes on its own. ``name`` is the subject that
+        stands in for "connection": ``signin:<client address>``, ``account:<username>``,
+        ``logging:debug`` or ``posture:start``. ``count`` is how many rows tripped it. ``detail`` is
+        a fixed sentence built from counts, a level name or switch names.
+
+        Never a message body, a message id, a typed username or an audit row's detail. None is
+        connection-scoped, so no rule's ``control_action`` fires on one, and nothing resolves
+        one."""
+        ...
+
 
 class LoggingAlertSink:
     """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
@@ -1008,6 +1023,11 @@ class LoggingAlertSink:
     def dr_released(self, node: str, *, role: str) -> None:
         # The inverse (auto-resolve) event; a clean fail-back — logged at INFO, no page.
         log.info("ALERT dr_released: DR box %r released, handed back to %s", node, role)
+
+    # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
+
+    def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
+        log.warning("ALERT %s: %r %s (count %d)", signal, name, detail, count)
 
 
 #: The ``integrity_drift`` subject for a store-cipher refusal (BACKLOG #1169). Its own subject so it
