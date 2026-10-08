@@ -35,10 +35,10 @@ condition that persists. ``intake_resumed``, its auto-resolving inverse, fires o
 from __future__ import annotations
 
 import asyncio
+import binascii
 import contextlib
 import logging
 import time
-import zlib
 
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.pipeline.alerts import (
@@ -139,7 +139,8 @@ def intake_alert_subject(reason: str, node: str | None = None) -> str:
     subject = f"{base}@{node}"
     if len(subject) <= INTAKE_SUBJECT_MAX_LENGTH:
         return subject
-    digest = f"{zlib.crc32(node.encode('utf-8')):0{_NODE_DIGEST_HEX}x}"
+    # binascii, not zlib: the same CRC-32, and this module reads no archive or compressed stream.
+    digest = f"{binascii.crc32(node.encode('utf-8')):0{_NODE_DIGEST_HEX}x}"
     keep = INTAKE_SUBJECT_MAX_LENGTH - len(base) - len("@~") - _NODE_DIGEST_HEX
     return f"{base}@{node[: max(0, keep)]}~{digest}"
 
