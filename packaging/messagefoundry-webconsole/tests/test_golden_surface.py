@@ -33,6 +33,7 @@ from starlette.routing import Mount
 import messagefoundry_webconsole._auth as ui_auth
 import messagefoundry_webconsole.routes._common as ui_common
 from messagefoundry.api import create_app
+from messagefoundry.api.validation import ActionFilter, ActorFilter
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -242,6 +243,14 @@ def _constraint(schema: dict[str, Any]) -> tuple[str | None, int | None]:
     return (schema.get("pattern"), max_length if isinstance(max_length, int) else None)
 
 
+#: The ``api/validation.py`` rules a /ui route annotates its own parameters with, by the name this
+#: table prints. ``/ui/audit/export`` takes the engine export's filter types (BACKLOG #2446).
+_ENGINE_RULES_ON_UI: tuple[tuple[str, Any], ...] = (
+    ("actor filter", ActorFilter),
+    ("action filter", ActionFilter),
+)
+
+
 def _rule_names_by_constraint() -> dict[tuple[str | None, int | None], str]:
     """Every rule ``routes/_common`` defines, indexed by the constraint it actually enforces.
 
@@ -250,17 +259,20 @@ def _rule_names_by_constraint() -> dict[tuple[str | None, int | None], str]:
     carrying that constraint honestly reads ``event kind|status``. Picking a winner would put an
     arbitrary tie-break inside a table whose whole job is to be checkable.
 
-    The join covers only rules ``routes/_common`` OWNS. ``api/validation.py`` ships others that share
-    a constraint with these -- ``ActorFilter`` and ``IdempotencyKey`` are both printable-256, like
-    ``control id`` -- so a /ui parameter annotated with one of THOSE would be reported here under the
-    console's name for that constraint. No such parameter exists today. Widen this index before
-    annotating a /ui parameter with a rule the console does not name.
+    The join covers the rules ``routes/_common`` OWNS plus :data:`_ENGINE_RULES_ON_UI`, the
+    ``api/validation.py`` rules a /ui route annotates directly. ``ActorFilter`` is printable-256,
+    like ``control id``, so ``/ui/audit/export``'s ``actor`` reads ``actor filter|control id``.
+    Before that entry existed it read ``control id`` alone, and its ``action`` read ``-``, which
+    this table defines as carrying no rule (BACKLOG #2446). Add an entry here before annotating a
+    /ui parameter with any other engine rule.
     """
     index: dict[tuple[str | None, int | None], list[str]] = {}
-    for rule in ui_common.FILTER_RULES:
-        schema = _string_schema(rule.adapter.json_schema())
-        assert schema is not None, f"{rule.name} does not resolve to a string schema"
-        index.setdefault(_constraint(schema), []).append(rule.name)
+    named = [(rule.name, rule.adapter) for rule in ui_common.FILTER_RULES]
+    named += [(name, TypeAdapter(alias)) for name, alias in _ENGINE_RULES_ON_UI]
+    for name, adapter in named:
+        schema = _string_schema(adapter.json_schema())
+        assert schema is not None, f"{name} does not resolve to a string schema"
+        index.setdefault(_constraint(schema), []).append(name)
     return {key: "|".join(sorted(names)) for key, names in index.items()}
 
 

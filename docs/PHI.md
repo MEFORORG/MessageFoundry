@@ -870,7 +870,8 @@ address is folded *inside* it), not from a cipher. Its strength is **key-custody
 **Access, per tier — several of these ARE returned by an API, under RBAC:**
 
 - `audit_log.detail` / `client` — `GET /audit` under `audit:read`; `GET /audit/export` under the
-  separate `audit:export`.
+  separate `audit:export`. The web console serves the same two from its cookie session:
+  `/ui/audit` under `audit:read` and `/ui/audit/export` under `audit:export`.
 - `messages.control_id` / `message_type` and `queue.channel_id` — returned on every `MessageSummary`
   (`GET /messages`, `/messages/{id}`, `/dead-letters`, `/messages/search`, `/messages/export`) under
   `messages:read` (detail: `messages:view_raw`) **plus per-channel scope**.

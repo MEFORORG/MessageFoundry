@@ -10452,14 +10452,24 @@ class AuthService:
         """Read access to the backing store for admin list/read endpoints (users + audit)."""
         return self._store
 
-    async def security_events_for(self, username: str, *, limit: int = 100) -> list[dict[str, Any]]:
+    async def security_events_for(
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
+    ) -> list[dict[str, Any]]:
         """The caller's own security-event history (audited ``auth.*`` actions, most-recent-first) for
         ``GET /me/security-events`` — normalized to plain dicts so the API doesn't see backend Row
-        types. PHI-free (the audit ``detail`` carries metadata only)."""
-        rows = await self._store.security_events_for_user(username, limit=limit)
+        types. PHI-free (the audit ``detail`` carries metadata only). ``offset`` pages it,
+        ``until`` keeps rows at or before that ``ts`` so a pager reads one snapshot, and
+        :meth:`count_security_events_for` is its total (BACKLOG #2438)."""
+        rows = await self._store.security_events_for_user(
+            username, limit=limit, offset=offset, until=until
+        )
         return [
             {"ts": float(r["ts"]), "action": str(r["action"]), "detail": r["detail"]} for r in rows
         ]
+
+    async def count_security_events_for(self, username: str, *, until: float | None = None) -> int:
+        """How many rows :meth:`security_events_for` pages through (BACKLOG #2438)."""
+        return await self._store.count_security_events_for_user(username, until=until)
 
     async def _generate_issued_credential(
         self,

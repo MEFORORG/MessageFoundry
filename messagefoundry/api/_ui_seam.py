@@ -300,6 +300,25 @@ from typing import Any
 #: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
 #: signatures changed.
 #:
+#: BACKLOG #2438: the audit, security-event and event-log pages page by ``offset`` against a
+#: total. ``AuditList`` and ``SecurityEventsList`` gained the required ``total``, ``limit`` and
+#: ``offset``; ``CoreHandlers`` gained the required ``connection_event_page``, which returns the new
+#: ``ConnectionEventList``; ``list_audit`` and ``my_security_events`` take the keyword ``offset``.
+#: ``list_connection_events`` is now an unpaged wrapper with the same parameters, so the
+#: connection detail page is unchanged. The digest moved because the DTO surface and
+#: ``CoreHandlers`` grew; a skewed pair fails the handshake.
+#:
+#: BACKLOG #2446: ``AuditList`` gained the required ``withheld``, which the audit page states, and
+#: ``AdminHandlers`` gained the required ``export_audit``, which the new ``/ui/audit/export``
+#: streams from the console session. The digest moved because both grew.
+#:
+#: BACKLOG #2438, the review's repair: each list model gained the snapshot a page was read under.
+#: ``AuditList`` and ``SecurityEventsList`` carry ``as_of``, a timestamp, which ``list_audit`` and
+#: ``my_security_events`` take as a keyword. ``ConnectionEventList`` carries ``before_id``, which
+#: ``connection_event_page`` takes. Without a pin, the grant row each audit read writes made every
+#: page repeat a row. The audit pins are timestamps because an audit row id would count the lock
+#: rows a reader may not see. The digest moved because the DTO surface grew.
+#:
 #: Vault BACKLOG #2460 / #2458: ``CoreHandlers`` gains a required ``resolve_action`` for the
 #: console's resolve of an interrupted release, with ``ApprovalResolveRequest`` and its ``outcome``
 #: values. ``PendingApprovalInfo`` gains ``params``, ``caller_is_requester`` and ``gated``. The
@@ -312,7 +331,7 @@ from typing import Any
 #: Vault BACKLOG #2625: ``AuthService`` gained ``holds_action_step_up``, which the console's
 #: message editor calls to ask for an action-bound proof without spending it, and the console imports
 #: five new step-up action constants, for the resend, edit-resend, upload-resend, purge and reload
-#: lanes (export has no console route). A method the console calls, so a skew would be an
+#: lanes (message export has no console route). A method the console calls, so a skew would be an
 #: AttributeError at request time; it forces a bump. Unnumbered, as above. Re-derived on the tree
 #: merged with vault BACKLOG #3062 (``AuthService.enabled`` removed), which moved the digest on its
 #: own; the value below covers both changes. ``CoreHandlers`` then gained the REQUIRED
@@ -322,12 +341,16 @@ from typing import Any
 #: mount first. Re-derived again on the tree merged with the #2460 / #2458 change above, so the value
 #: below covers #3062, #2460 / #2458 and #2625 together.
 #:
+#: BACKLOG #2438 / #2446 merged with vault BACKLOG #2625: the audit paging and export surface above and the
+#: action-bound step-up surface each moved the digest on its own branch. The value below was
+#: re-derived on the merged tree, so it covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "4250552c8e399e60"
+ENGINE_UI_SEAM: str = "71a8eb514b48d64e"
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,6 +452,10 @@ class CoreHandlers:
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]
+    # The paged event log (BACKLOG #2438): one page and its total, as a ConnectionEventList, under
+    # GET /events' gates. ``list_connection_events`` above stays the unpaged bare-list read the
+    # connection detail page uses.
+    connection_event_page: Callable[..., Awaitable[Any]]
     resolve_action: Callable[..., Awaitable[Any]]
 
 
@@ -469,6 +496,10 @@ class AdminHandlers:
     enroll_mfa: Callable[..., Awaitable[Any]]
     disable_my_mfa: Callable[..., Awaitable[Any]]
     list_audit: Callable[..., Awaitable[Any]]
+    # GET /audit/export (BACKLOG #2446): the console's /ui/audit/export streams it from the cookie
+    # session, so an auditor who signs in only through OIDC, and so holds no bearer, can export.
+    # Its JSON gate is require(AUDIT_EXPORT), and the /ui route asserts the same permission.
+    export_audit: Callable[..., Awaitable[Any]]
     my_security_events: Callable[..., Awaitable[Any]]
     # Sync DTO projections (kept engine-side so the console never imports store.UserRecord — the
     # ``user`` arg stays opaque/Any across the seam).
