@@ -291,3 +291,66 @@ async def test_callback_maps_action_to_runner_restart() -> None:
     sink.connection_stopped("OB_X", detail="boom")
     await _drain(sink)
     assert rr.calls == [("restart_outbound", "OB_X")]
+
+
+# --- BACKLOG #2527: connection_stopped raised under a stand-in key restarts nothing ---------------
+
+
+async def test_a_state_convergence_failure_restarts_nothing() -> None:
+    # Before #2527 the convergence runner raised connection_stopped as "transform-state", which fits
+    # the connection-name grammar, so this valid rule ran restart_inbound("transform-state").
+    from messagefoundry.pipeline.state_convergence import (
+        STATE_CONVERGENCE_ALERT_SUBJECT,
+        StateConvergenceRunner,
+    )
+
+    async def _failing_converge() -> list[str]:
+        raise RuntimeError("decrypt failed")
+
+    cb = _Control()
+    t = _RecordingTransport()
+    rule = AlertRule(event_type="connection_stopped", control_action="restart_inbound")
+    sink = NotifierAlertSink([t], rules=[rule])
+    sink.set_control_callback(cb)
+    runner = StateConvergenceRunner(
+        converge=_failing_converge, interval_seconds=60.0, alert_sink=sink
+    )
+    assert await runner.converge_once() == []
+    await _drain(sink)
+    assert cb.calls == []
+    # The alert itself still fires, under the colon subject.
+    assert [e["connection"] for e in t.events] == [STATE_CONVERGENCE_ALERT_SUBJECT]
+
+
+async def test_a_reference_sync_stand_in_does_not_restart_the_explicit_target() -> None:
+    # Before #2527 this valid rule restarted IB_FEED whenever a reference set failed to sync.
+    from messagefoundry.pipeline.reference_sync import reference_connection_name
+
+    cb = _Control()
+    t = _RecordingTransport()
+    rule = AlertRule(
+        event_type="connection_stopped",
+        control_action="restart_inbound",
+        control_target="IB_FEED",
+    )
+    sink = NotifierAlertSink([t], rules=[rule])
+    sink.set_control_callback(cb)
+    sink.connection_stopped(reference_connection_name("LAB_CODES"), detail="sync failed")
+    await _drain(sink)
+    assert cb.calls == []
+    assert len(t.events) == 1  # the notification still fires
+
+
+async def test_a_real_connection_stopped_still_restarts_the_explicit_target() -> None:
+    # Control arm for the two refusals above: the same rule, a real connection name.
+    cb = _Control()
+    rule = AlertRule(
+        event_type="connection_stopped",
+        control_action="restart_inbound",
+        control_target="IB_FEED",
+    )
+    sink = NotifierAlertSink([_RecordingTransport()], rules=[rule])
+    sink.set_control_callback(cb)
+    sink.connection_stopped("OB_LAB", detail="boom")
+    await _drain(sink)
+    assert cb.calls == [("restart_inbound", "IB_FEED")]

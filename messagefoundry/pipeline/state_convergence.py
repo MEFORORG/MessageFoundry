@@ -36,9 +36,14 @@ from collections.abc import Awaitable, Callable
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 
-__all__ = ["StateConvergenceRunner"]
+__all__ = ["STATE_CONVERGENCE_ALERT_SUBJECT", "StateConvergenceRunner"]
 
 log = logging.getLogger(__name__)
+
+#: The ``connection`` key a convergence failure alert carries. It is not a connection, and the colon
+#: keeps it outside the connection-name grammar, so no alert rule's ``control_action`` can restart a
+#: connection on it (BACKLOG #2527). It read ``transform-state`` before, which fits that grammar.
+STATE_CONVERGENCE_ALERT_SUBJECT = "cluster:transform-state"
 
 
 class StateConvergenceRunner:
@@ -138,6 +143,6 @@ class StateConvergenceRunner:
         # The AlertSink has no state-specific event; reuse connection_stopped as the generic "a named
         # component degraded" signal (never raises — be defensive anyway).
         try:
-            self._alert_sink.connection_stopped("transform-state", detail=detail)
+            self._alert_sink.connection_stopped(STATE_CONVERGENCE_ALERT_SUBJECT, detail=detail)
         except Exception:
             log.warning("transform-state convergence alert sink failed", exc_info=True)

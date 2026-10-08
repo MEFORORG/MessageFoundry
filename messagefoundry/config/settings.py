@@ -4492,12 +4492,16 @@ _ALERT_CONTROL_ACTIONS = frozenset({"restart_inbound", "restart_outbound"})
 #: Some stand-ins fit the connection-name grammar, so a restart aimed at one could hit an unrelated
 #: real connection. The notifier checks the same set at dispatch (``NotifierAlertSink._emit``).
 #:
-#: KNOWN GAPS this set does not close, at least these two. First, two emitters raise
-#: ``connection_stopped`` with a stand-in: ``reference:<name>`` (pipeline/reference_sync.py) and
-#: ``transform-state`` (pipeline/state_convergence.py); the second fits the connection-name grammar.
-#: Second, an allowed event can carry an inbound name or an outbound name, and the two are separate
-#: namespaces. With no control_target, restart_outbound on an inbound's event, or restart_inbound on
-#: an outbound's, aims at whatever connection on the other side shares the bare name.
+#: This set checks the event TYPE only, and an allowed type can still carry a stand-in:
+#: ``reference:<name>`` (pipeline/reference_sync.py) and ``cluster:transform-state``
+#: (pipeline/state_convergence.py) both raise ``connection_stopped``. So the notifier also skips the
+#: action for an event whose ``connection`` key is not a connection name, even at an explicit
+#: control_target (BACKLOG #2527). A stand-in raised under one of these types must keep a colon.
+#:
+#: KNOWN GAP this set does not close: an allowed event can carry an inbound name or an outbound
+#: name, and the two are separate namespaces. With no control_target, restart_outbound on an
+#: inbound's event, or restart_inbound on an outbound's, aims at whatever connection on the other
+#: side shares the bare name.
 _ALERT_CONTROL_EVENT_TYPES = frozenset(
     {
         "connection_stopped",
