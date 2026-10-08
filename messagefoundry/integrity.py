@@ -75,6 +75,8 @@ from importlib import machinery, metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from messagefoundry.audit_write import write_audit_soft
+
 if TYPE_CHECKING:
     from messagefoundry.pipeline.alerts import AlertSink
     from messagefoundry.store.base import Store
@@ -825,11 +827,14 @@ async def _record_and_alert(
     count) so the off-box notifier pages, routable independently of a stalled delivery lane.
 
     Both are best-effort: a failure is logged and never masks the signal — the caller still refuses to
-    start under fail-closed."""
-    try:
-        await store.record_audit("startup_integrity", actor=None, detail=json.dumps(detail))
-    except Exception:  # noqa: BLE001 — audit is best-effort; never mask the integrity signal
-        log.exception("startup integrity: failed to record the startup_integrity audit row")
+    start under fail-closed. ``defects=()``: a raise here would skip the page below (vault BACKLOG
+    #2260)."""
+    await write_audit_soft(
+        lambda: store.record_audit("startup_integrity", actor=None, detail=json.dumps(detail)),
+        log=log,
+        message="startup integrity: failed to record the startup_integrity audit row",
+        defects=(),
+    )
     try:
         alert_sink.integrity_drift(label, reason=reason, drift_count=drift_count)
     except Exception:  # noqa: BLE001 — alerting is best-effort and must never break startup

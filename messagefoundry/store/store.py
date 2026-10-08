@@ -818,6 +818,9 @@ class ResendOutcome:
     to_destination: str
     from_destination: str
     outbox_id: str | None
+    #: The child message an edit-and-resend DIRECT call created (vault BACKLOG #2615); ``None`` for a
+    #: plain resend, which adds a delivery to the same message, and for a duplicate.
+    new_message_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -847,6 +850,26 @@ class ReingressOriginMissing(ResendError):
 #: disjoint from a resend-to-alternate's ``(message_id, <outbound>)`` so the two can never be confused
 #: when a duplicate/conflict is reported, while sharing the one ``resend_log`` UNIQUE gate.
 REINGRESS_TARGET_PREFIX = "@reingress:"
+
+
+class MessageOrigin(StrEnum):
+    """How a ``messages`` row came to exist: the plain ``messages.origin`` column (vault BACKLOG #2615).
+
+    Written once, at insert, and never updated; retention blanks the body columns and leaves it, so a
+    site can still tell an operator-made message from a partner's after the body is gone. The acting
+    user of an operator origin sits beside it in ``messages.origin_actor``. ``NULL`` on a row written
+    before the column existed means "not recorded", never "partner"."""
+
+    #: Taken in by an inbound connection, refused ones included. Usually a partner's message; a timer
+    #: inbound's configured body arrives this way too, so ``partner`` means "through a connection".
+    PARTNER = "partner"
+    #: An operator's edited body, by edit-and-resend (either mode).
+    OPERATOR_EDIT = "operator_edit"
+    #: An operator's injection of one message from an uploaded log file.
+    OPERATOR_UPLOAD = "operator_upload"
+    #: The engine's own hop: a loopback re-ingress or a pass-through child of an earlier message.
+    REINGRESS = "reingress"
+
 
 #: How long an uploader's quota row may go with no activity before the next reserve reclaims its
 #: slots (seconds) — ASVS 2.3.4, BACKLOG #1112. Activity is an applied reserve, a release, or a live
@@ -4826,6 +4849,52 @@ def _append_channel_scope(
         clauses.append("1=0")  # scoped to no channels
 
 
+def _connection_event_where(
+    connection: str | None,
+    kinds: Sequence[str] | None,
+    since: float | None,
+    before_id: int | None,
+    allowed_channels: Sequence[str] | None,
+) -> tuple[str, list[Any]]:
+    """The ``?`` ``WHERE`` text and its bound values for a connection-event page and its extent, so
+    the two read the same set (BACKLOG #2438). SQLite and SQL Server both bind ``?`` and both call
+    this module-level builder, so the per-channel scope is written once for the two of them."""
+    where: list[str] = []
+    params: list[Any] = []
+    if connection is not None:
+        where.append("connection=?")
+        params.append(connection)
+    if kinds:
+        placeholders = ",".join("?" for _ in kinds)
+        where.append(f"kind IN ({placeholders})")
+        params.extend(kinds)
+    if since is not None:
+        where.append("ts>=?")
+        params.append(since)
+    if before_id is not None:
+        where.append("id<?")
+        params.append(before_id)
+    # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
+    # outbound row (which spans channels) — mirrors the connection_metadata/purge boundary that
+    # hides shared-outbound topology. None leaves the read unrestricted.
+    if allowed_channels is not None:
+        where.append("direction='inbound'")
+        _append_channel_scope(where, params, "connection", allowed_channels)
+    return (" WHERE " + " AND ".join(where)) if where else "", params
+
+
+def _security_events_where(username: str, until: float | None) -> tuple[str, list[Any]]:
+    """The ``?`` ``WHERE`` text and values for one user's security-event page and its total (BACKLOG
+    #2438): the ``auth.*`` actions recorded under their own name, at or before ``until`` when a
+    pager pins one. SQLite and SQL Server share it, so the page and its total count one set."""
+    params: list[Any] = [username]
+    clause = " WHERE actor = ? AND action LIKE 'auth.%'"
+    if until is not None:
+        clause += " AND ts <= ?"
+        params.append(until)
+    return clause, params
+
+
 def _dead_target_pairs(rows: Iterable[tuple[Any, Any]]) -> list[tuple[str, str]]:
     """Shape every backend's raw ``list_replay_targets`` rows into one sorted list. Sorting here,
     not in SQL, gives the three backends one order whatever their collation. A pair with a NULL or
@@ -4847,7 +4916,9 @@ CREATE TABLE IF NOT EXISTS messages (
     error        TEXT,
     summary      TEXT,             -- ingest-derived (MRN/name/order) — PHI, cipher-encrypted at rest (EF-3)
     metadata     TEXT,             -- code/operator-attached values — PHI, cipher-encrypted at rest (EF-3)
-    documents_pruned REAL          -- #47/ADR 0042: epoch ts an embedded doc was stripped in place (NULL=never)
+    documents_pruned REAL,         -- #47/ADR 0042: epoch ts an embedded doc was stripped in place (NULL=never)
+    origin       TEXT,             -- vault BACKLOG #2615: MessageOrigin, plain, set at insert, never updated
+    origin_actor TEXT              -- vault BACKLOG #2615: the operator behind an operator origin, else NULL
 );
 CREATE INDEX IF NOT EXISTS ix_messages_channel  ON messages(channel_id, received_at);
 CREATE INDEX IF NOT EXISTS ix_messages_control  ON messages(channel_id, control_id);
@@ -5436,7 +5507,14 @@ _LAST_EVENT_COLUMN = (
 # `documents_pruned` (#47, ADR 0042): a nullable epoch timestamp set when retention strips an embedded
 # document in place (NULL = never pruned / no document was ever present). Orthogonal to `status` — it
 # alters no disposition/count; it is the message-level "evicted vs never present" signal a raw-view reads.
-_MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
+_MESSAGE_MIGRATIONS = {
+    "summary": "TEXT",
+    "metadata": "TEXT",
+    "documents_pruned": "REAL",
+    # vault BACKLOG #2615. NULL on an existing row means the origin was not recorded.
+    "origin": "TEXT",
+    "origin_actor": "TEXT",
+}
 
 # BACKLOG #1909: the account a 0.3.2 preset row belongs to. See MessageStore._migrate_preset_owner.
 _PRESET_OWNER_MATCH = (
@@ -7179,6 +7257,7 @@ class MessageStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             await self._insert_outbound_deliveries(mid, channel_id, deliveries, now)
             # #63 verbosity gate — a routine 'received' row is thinnable; suppressing it does NOT
@@ -7666,6 +7745,8 @@ class MessageStore:
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
         audit: OperatorAudit[str] | None = None,
+        origin: MessageOrigin = MessageOrigin.PARTNER,
+        origin_actor: str | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001 Step A).
@@ -7703,6 +7784,8 @@ class MessageStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=origin,
+                origin_actor=origin_actor,
             )
             # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059).
             ingress_created_at = now
@@ -8166,12 +8249,14 @@ class MessageStore:
         metadata: str | None,
         error: str | None,
         now: float,
+        origin: MessageOrigin,
+        origin_actor: str | None = None,
     ) -> None:
         await self._db.execute(
             "INSERT INTO messages"
             " (id, channel_id, received_at, source_type, control_id,"
-            "  message_type, raw, status, error, summary, metadata)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "  message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 mid,
                 channel_id,
@@ -8185,6 +8270,9 @@ class MessageStore:
                 # EF-3: MRN/name is PHI — ciphered at rest like the body
                 self._enc(summary, aad=cell_aad("messages", "summary", mid)),
                 self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
+                origin.value,
+                origin_actor,
             ),
         )
         self.body_copies += (
@@ -8227,6 +8315,7 @@ class MessageStore:
                 metadata=metadata,
                 error=error,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             # #63 verbosity gate. `event` is 'error' (a compliance-floor event → always kept) or
             # 'filtered' (routine → thinnable). The messages row above records the disposition
@@ -9108,6 +9197,7 @@ class MessageStore:
                 metadata=child_meta,
                 error=None,
                 now=now,
+                origin=MessageOrigin.REINGRESS,
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
             ingress_created = now
@@ -9362,6 +9452,7 @@ class MessageStore:
                         (peek_error or "re-ingress body failed HL7 peek") if peek_failed else None
                     ),
                     now=now,
+                    origin=MessageOrigin.REINGRESS,
                 )
                 # 6. The ingress queue row — UNLESS peek_failed (an ERROR message owes no work).
                 if not peek_failed:
@@ -10192,6 +10283,7 @@ class MessageStore:
         body_override: str | None = None,
         now: float | None = None,
         audit: OperatorAudit[ResendOutcome] | None = None,
+        actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's **stored transformed body** to an ALTERNATE outbound ``to`` (ADR 0090,
         BACKLOG #123). Ships exactly what we sent — the retained ``done``/``cancelled`` outbound
@@ -10223,7 +10315,9 @@ class MessageStore:
         message/target — review #123-4).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
-        commits with the resend (BACKLOG #2624, :data:`OperatorAudit`)."""
+        commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
+        origin ``operator_edit`` with ``actor`` as its ``origin_actor``, and the outcome names it in
+        ``new_message_id`` (vault BACKLOG #2615)."""
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
@@ -10263,6 +10357,7 @@ class MessageStore:
                 await self._append_operator_audit(written, audit, outcome)
                 await self._commit()
                 return outcome
+            child_mid: str | None = None
             if body_override is not None:
                 # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                 # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN
@@ -10330,6 +10425,8 @@ class MessageStore:
                     metadata=child_meta,
                     error=None,
                     now=now,
+                    origin=MessageOrigin.OPERATOR_EDIT,
+                    origin_actor=actor,
                 )
                 await self._event(
                     child_mid, "received", None, f"edit-resend from {message_id}", now
@@ -10413,6 +10510,7 @@ class MessageStore:
                 to_destination=to,
                 from_destination=src_dest,
                 outbox_id=outbox_id,
+                new_message_id=child_mid,
             )
             await self._append_operator_audit(written, audit, outcome)
             await self._commit()
@@ -10426,6 +10524,7 @@ class MessageStore:
         idempotency_key: str,
         now: float | None = None,
         audit: OperatorAudit[ReingressOutcome] | None = None,
+        actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-enter an EDITED body onto the
         ORIGIN message's channel as a **fresh, correlated ``RECEIVED`` child message** at the ingress
@@ -10446,7 +10545,8 @@ class MessageStore:
         on a raise (the whole txn rolls back).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
-        commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`)."""
+        commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
+        ``operator_edit`` with ``actor`` as its ``origin_actor`` (vault BACKLOG #2615)."""
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
@@ -10528,6 +10628,8 @@ class MessageStore:
                     metadata=child_meta,
                     error=None,
                     now=now,
+                    origin=MessageOrigin.OPERATOR_EDIT,
+                    origin_actor=actor,
                 )
                 # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
                 # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
@@ -11135,35 +11237,21 @@ class MessageStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
+        offset: int = 0,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(
             1, min(limit, 1000)
         )  # server-side clamp (a flooded log can't drive an unbounded read)
-        where: list[str] = []
-        params: list[Any] = []
-        if connection is not None:
-            where.append("connection=?")
-            params.append(connection)
-        if kinds:
-            placeholders = ",".join("?" for _ in kinds)
-            where.append(f"kind IN ({placeholders})")
-            params.extend(kinds)
-        if since is not None:
-            where.append("ts>=?")
-            params.append(since)
-        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
-        # outbound row (which spans channels) — mirrors the connection_metadata/purge boundary that
-        # hides shared-outbound topology. None leaves the read unrestricted.
-        if allowed_channels is not None:
-            where.append("direction='inbound'")
-            _append_channel_scope(where, params, "connection", allowed_channels)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
-        params.append(limit)
+        clause, params = _connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        params += [limit, max(offset, 0)]
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
-                f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ?",
+                f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
                 params,
             )
             return [
@@ -11185,6 +11273,28 @@ class MessageStore:
                 )
                 for r in await cur.fetchall()
             ]
+
+    async def connection_event_extent(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        before_id: int | None = None,
+        allowed_channels: Sequence[str] | None,
+    ) -> tuple[int, int]:
+        """The total :meth:`list_connection_events` pages through, and the newest ``id`` in it, or
+        0 when it is empty (BACKLOG #2438). A pager passes that ``id`` plus one back as
+        ``before_id``, so its later pages read the set this one counted while new events arrive."""
+        clause, params = _connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT COUNT(*), MAX(id) FROM connection_event{clause}", params
+            )
+            row = await cur.fetchone()
+        return (int(row[0]), int(row[1] or 0)) if row is not None else (0, 0)
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
     # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
@@ -11657,10 +11767,12 @@ class MessageStore:
         until: float | None = None,
         exclude: AuditExclusion | None = None,
         before_id: int | None = None,
+        offset: int = 0,
     ) -> list[aiosqlite.Row]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
-        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
-        Every value is a bound parameter; see :meth:`_audit_where`."""
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776),
+        or past ``offset`` rows of the filtered set (BACKLOG #2438). Every value is a bound
+        parameter; see :meth:`_audit_where`."""
         where, params = self._audit_where(
             actor=actor,
             action=action,
@@ -11669,17 +11781,17 @@ class MessageStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
+        params += [limit, max(offset, 0)]
         async with self._read() as db:
             cur = await db.execute(
-                f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?", params
+                f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?", params
             )
             return list(await cur.fetchall())
 
     async def count_audit(
         self,
         *,
-        limit: int,
+        limit: int | None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
@@ -11697,12 +11809,18 @@ class MessageStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
+        # Each branch writes its SQL inline rather than in a local variable. The transaction guard
+        # test cannot read a local, and it pins how many SQL arguments it cannot read.
         async with self._read() as db:
-            cur = await db.execute(
-                f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where} ORDER BY id DESC LIMIT ?)",
-                params,
-            )
+            if limit is None:
+                cur = await db.execute(f"SELECT COUNT(*) FROM audit_log{where}", params)
+            else:
+                params.append(limit)
+                cur = await db.execute(
+                    f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where}"
+                    " ORDER BY id DESC LIMIT ?)",
+                    params,
+                )
             row = await cur.fetchone()
             return int(row[0]) if row is not None else 0
 
@@ -11734,18 +11852,30 @@ class MessageStore:
         return [dict(r) for r in rows]
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
     ) -> list[aiosqlite.Row]:
         """A user's own security events (the audited ``auth.*`` actions), most-recent-first — the
         source for ``GET /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes (whose audit
-        ``actor`` is the admin) are delivered out-of-band by email, not shown in this self view."""
+        ``actor`` is the admin) are delivered out-of-band by email, not shown in this self view.
+        ``offset`` pages it, and ``until`` pins the pages to one snapshot (BACKLOG #2438)."""
+        where, params = _security_events_where(username, until)
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT ts, action, detail FROM audit_log "
-                "WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC LIMIT ?",
-                (username, limit),
+                f"SELECT ts, action, detail FROM audit_log{where} ORDER BY id DESC"
+                " LIMIT ? OFFSET ?",
+                (*params, limit, max(offset, 0)),
             )
             return list(await cur.fetchall())
+
+    async def count_security_events_for_user(
+        self, username: str, *, until: float | None = None
+    ) -> int:
+        """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
+        where, params = _security_events_where(username, until)
+        async with self._read() as db:
+            cur = await db.execute(f"SELECT COUNT(*) FROM audit_log{where}", params)
+            row = await cur.fetchone()
+        return int(row[0]) if row is not None else 0
 
     # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
 

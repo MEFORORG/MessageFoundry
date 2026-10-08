@@ -131,6 +131,7 @@ from messagefoundry.api.models import (
     ClusterStepdownResult,
     ConfigProvenance,
     ConnectionEventInfo,
+    ConnectionEventList,
     ConnectionFlagRequest,
     ConnectionMetadata,
     ConnectionRow,
@@ -214,6 +215,7 @@ from messagefoundry.api.multipart import (
     parse_single_file_upload,
 )
 from messagefoundry.api.outlive import OutlivingOperations
+from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
@@ -247,6 +249,7 @@ from messagefoundry.api.tls import GeneratedPairReplaced, record_generated_pair_
 from messagefoundry.api.validation import (
     MAX_EVENT_KINDS,
     MAX_EXPORT_IDS,
+    PAGE_BIND_MAX,
     ConnectionName,
     ControlIdFilter,
     DigestId,
@@ -257,6 +260,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
+from messagefoundry.audit_write import write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -418,11 +422,13 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
+from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
+    MessageOrigin,
     OperatorAudit,
     ReingressOutcome,
     ResendOutcome,
@@ -1443,9 +1449,13 @@ async def _record_reload_audit(
     steps, so the answer says the new graph is live and its row is missing. A released reload
     carries that into ``approval.approved``.
 
-    A cancellation still propagates: it is not a failure of this helper."""
+    A cancellation still propagates: it is not a failure of this helper. The write goes through
+    :func:`~messagefoundry.audit_write.write_audit_soft` with ``defects=()``, because even a defect
+    raised here would misreport a reload that ran (vault BACKLOG #2260)."""
     detail: str | None = None
-    try:
+
+    async def write() -> None:
+        nonlocal detail
         superseded = False
         if loaded is not None:
             state = loaded
@@ -1472,18 +1482,23 @@ async def _record_reload_audit(
             }
         )
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
-    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
-        # Scrubbed at the call site for CodeQL py/log-injection; scrub_log_argument says why.
-        _log.exception(
-            "config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
+
+    written = await write_audit_soft(
+        write,
+        log=_log,
+        message="config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
+        # Scrubbed at the call site for CodeQL py/log-injection; scrub_log_argument says why. Read
+        # on a failure only, so the line carries whatever detail was built before the fault.
+        args=lambda: (
             "loaded at start" if action == "config_loaded" else "reload swapped the graph",
             action,
             _RELOAD_AUDIT_STEP,
             scrub_log_argument(actor),
             None if detail is None else scrub_log_argument(detail),
-        )
-        return [*failed_steps, _RELOAD_AUDIT_STEP]
-    return list(failed_steps)
+        ),
+        defects=(),
+    )
+    return list(failed_steps) if written else [*failed_steps, _RELOAD_AUDIT_STEP]
 
 
 #: The faults ``Engine.reload_detail`` raises when a reload did NOT happen, each with its own answer
@@ -1560,20 +1575,19 @@ async def _audit_refused_reload(
         detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
         status, answer = 422, "invalid configuration"
     row = json.dumps(detail)
-    try:
-        await engine.store.record_audit(action, actor=actor, detail=row, client=client)
-    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
-        # The exc above and this row carry the caller's requested directory, so their arguments
-        # are scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps``
-        # already escaped the row, so the scrub leaves it byte-identical and parseable. The
-        # traceback is not an argument: a caller's chained refusal can still carry the directory
-        # into it, and only the handler's ControlCharScrubFilter escapes that.
-        _log.exception(
-            "a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
-            action,
-            scrub_log_argument(actor),
-            scrub_log_argument(row),
-        )
+    # The exc above and this row carry the caller's requested directory, so their arguments are
+    # scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps`` already
+    # escaped the row, so the scrub leaves it byte-identical and parseable. The traceback is not an
+    # argument: a caller's chained refusal can still carry the directory into it, and only the
+    # handler's ControlCharScrubFilter escapes that. ``defects=()`` keeps the docstring's promise
+    # that this write never raises (vault BACKLOG #2260).
+    await write_audit_soft(
+        lambda: engine.store.record_audit(action, actor=actor, detail=row, client=client),
+        log=_log,
+        message="a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
+        args=lambda: (action, scrub_log_argument(actor), scrub_log_argument(row)),
+        defects=(),
+    )
     return status, answer
 
 
@@ -3785,12 +3799,13 @@ def create_app(
             await _control_guard(engine, identity, name, client)
             anchor_refused = False
             try:
+                # An operator door, so it overrides a passive DR standby (vault BACKLOG #3140).
                 if action == "start":
-                    await rr.start_inbound(name)
+                    await rr.start_inbound(name, operator=True)
                 elif action == "stop":
                     await rr.stop_inbound(name)
                 else:
-                    await rr.restart_inbound(name)
+                    await rr.restart_inbound(name, operator=True)
             except NotDeployedError as exc:
                 # #233 (ADR 0111): start/restart of a not-deployed connection is refused — deploying it
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
@@ -4362,7 +4377,97 @@ def create_app(
             )
         return out
 
-    @app.get("/events", response_model=list[ConnectionEventInfo])
+    async def _admit_event_read(
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        connection: str | None,
+        reveal: int | None,
+    ) -> Sequence[str] | None:
+        """The gates every event-log read passes, and the channel scope it then reads under."""
+        await _admit_reveal(request, identity, reveal)
+        # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
+        # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
+        if connection is not None and not identity.can_access_channel(connection):
+            await _audit_channel_denied(engine, identity, connection, client_ip(request))
+            raise HTTPException(403, "connection is outside your channel scope")
+        return _scope(identity)
+
+    async def _event_infos(
+        rows: Sequence[Any],
+        *,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        reveal: int | None,
+    ) -> list[ConnectionEventInfo]:
+        return await _redact_reasons(
+            [_conn_event_info(r) for r in rows],
+            engine=engine,
+            identity=identity,
+            request=request,
+            reveal=reveal,
+            audit_action="connection_event_reveal",
+        )
+
+    async def _connection_event_page(
+        *,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        connection: str | None,
+        kind: Sequence[str] | None,
+        since: float | None,
+        limit: int,
+        offset: int = 0,
+        before_id: int | None = None,
+        reveal: int | None = None,
+    ) -> ConnectionEventList:
+        """One page of the event log and the total it sits in (BACKLOG #2438): the one body of
+        ``GET /events`` and of the console's ``/ui/events`` page, so both read the same rows under
+        the same gates. The total is counted under the same filters and channel scope as the page,
+        so a scoped caller is told how many events IT can page through and no more.
+
+        Every page is pinned below ``before_id``. A caller that names none gets the newest event's
+        ``id`` plus one, read in the same query as the total, and passes it back with the next
+        offset. Without the pin, events arriving between clicks would shift every row down, and a
+        reveal would re-read a window its event had already left. The pin is an id because each
+        event row already carries its id; ``list_connection_events`` in ``store/base.py`` states
+        where, with more than one writer, it is close rather than exact.
+
+        Called in-process by the console, so every argument is a plain value. ``reveal`` and the
+        redaction of ``reason`` behave as :func:`list_connection_events` states."""
+        scope = await _admit_event_read(request, engine, identity, connection, reveal)
+        where: dict[str, Any] = {
+            "connection": connection,
+            "kinds": kind,
+            "since": since,
+            "allowed_channels": scope,
+        }
+        counted: int | None = None
+        if before_id is None:
+            counted, newest = await engine.store.connection_event_extent(**where)
+            before_id = newest + 1 if newest else None
+        rows = await engine.store.list_connection_events(
+            limit=limit, offset=offset, before_id=before_id, **where
+        )
+        pin = before_id
+
+        async def _count() -> int:
+            if counted is not None:
+                return counted
+            total, _newest = await engine.store.connection_event_extent(before_id=pin, **where)
+            return total
+
+        total = await page_total(len(rows), limit=limit, offset=offset, count=_count)
+        events = await _event_infos(
+            rows, request=request, engine=engine, identity=identity, reveal=reveal
+        )
+        return ConnectionEventList(
+            total=total, limit=limit, offset=offset, before_id=before_id, events=events
+        )
+
+    @app.get("/events", response_model=ConnectionEventList)
     async def list_connection_events(
         request: Request,
         engine: Engine = Depends(_get_engine),
@@ -4371,12 +4476,20 @@ def create_app(
         kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
-        # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
-        # calls this handler in-process, and a call that leaves it out must get None.
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        before_id: int | None = Query(
+            None,
+            ge=1,
+            le=PAGE_BIND_MAX,
+            description="the snapshot pin a previous page returned; omit it on the first page",
+        ),
         reveal: Annotated[int | None, Query(ge=1)] = None,
-    ) -> list[ConnectionEventInfo]:
+    ) -> ConnectionEventList:
         """The Corepoint-style connection/transport event log (#46), newest first. Optionally filtered
         by ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp.
+
+        Paged by ``offset`` against ``total``, under the ``before_id`` snapshot pin (BACKLOG
+        #2438); :func:`_connection_event_page` states why the pin exists.
 
         Not PHI-free: ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives it a
         protection level. The route is gated by ``monitoring:read``, so ``reason`` is gated
@@ -4385,26 +4498,40 @@ def create_app(
         ``messages:view_summary``, charges the PHI-read budget, and is audited as
         ``connection_event_reveal``. The response is served ``no-store``
         (``_NO_STORE_ROUTE_PATHS``)."""
-        await _admit_reveal(request, identity, reveal)
-        # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
-        # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
-        if connection is not None and not identity.can_access_channel(connection):
-            await _audit_channel_denied(engine, identity, connection, client_ip(request))
-            raise HTTPException(403, "connection is outside your channel scope")
-        rows = await engine.store.list_connection_events(
-            connection=connection,
-            kinds=kind,
-            since=since,
-            limit=limit,
-            allowed_channels=_scope(identity),
-        )
-        return await _redact_reasons(
-            [_conn_event_info(r) for r in rows],
+        return await _connection_event_page(
+            request=request,
             engine=engine,
             identity=identity,
-            request=request,
+            connection=connection,
+            kind=kind,
+            since=since,
+            limit=limit,
+            offset=offset,
+            before_id=before_id,
             reveal=reveal,
-            audit_action="connection_event_reveal",
+        )
+
+    async def _ui_connection_events(
+        *,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        connection: str | None,
+        kind: Sequence[str] | None,
+        since: float | None,
+        limit: int,
+        reveal: int | None = None,
+    ) -> list[ConnectionEventInfo]:
+        """The console's unpaged event read, for a connection's detail page: the newest ``limit``
+        events as a bare list, under the gates ``GET /events`` applies, with no total and no pin.
+        The paged ``/ui/events`` page calls :func:`_connection_event_page` instead (BACKLOG
+        #2438)."""
+        scope = await _admit_event_read(request, engine, identity, connection, reveal)
+        rows = await engine.store.list_connection_events(
+            connection=connection, kinds=kind, since=since, limit=limit, allowed_channels=scope
+        )
+        return await _event_infos(
+            rows, request=request, engine=engine, identity=identity, reveal=reveal
         )
 
     @app.get("/connections/{name}/events", response_model=list[ConnectionEventInfo])
@@ -6088,6 +6215,29 @@ def create_app(
         (``to=None``) this key repeats, or ``None``. Read-only; it queues nothing."""
         return await engine.prior_resend(idempotency_key, message_id=message_id, to=to)
 
+    async def _edit_resend_provenance(
+        engine: Engine, row: Mapping[str, Any], edited: str
+    ) -> dict[str, object]:
+        """What an edit-resend audit row adds so the resend can be proved later (vault BACKLOG #2615).
+
+        ``origin`` repeats the new message's plain ``messages.origin``. ``body_digest`` holds keyed
+        HMAC-SHA256 digests of the ORIGIN message's stored body and of the edited body the operator
+        submitted, under a key derived from the audit key (:func:`audit_body_digests`). In reroute
+        mode the edited body is what re-enters the origin channel; a handler then transforms it, and
+        what a partner receives is that handler's output, which this digest does not cover. Keyed,
+        never a plain hash: a short PHI body is guessable, and this row is kept for good. It is
+        ``None`` when the store has no in-heap key (keyless, or Vault Transit), and ``original`` is
+        ``None`` when retention has already blanked the origin's body. The bodies never enter the row.
+        Off the event loop, since each body may run to the 16 MiB ceiling."""
+        original = row.get("raw")
+        digests = await asyncio.to_thread(
+            audit_body_digests,
+            engine.store.cipher(),
+            original=original if isinstance(original, str) else "",
+            edited=edited,
+        )
+        return {"origin": MessageOrigin.OPERATOR_EDIT.value, "body_digest": digests}
+
     @app.post("/messages/{message_id}/edit-resend", response_model=EditResendResult)
     async def edit_resend_message(
         message_id: ResourceId,
@@ -6106,7 +6256,12 @@ def create_app(
         seam). The ORIGINAL message stays byte-identical (count-and-log) — the resubmit is a new,
         correlated message. Requires ``MESSAGES_EDIT`` step-up (implies ``MESSAGES_VIEW_RAW``); the direct
         path additionally requires access to the alternate outbound's channel. Audited
-        (``message.edit_resend``, actor + original→new correlation) — NEVER the edited body."""
+        (``message.edit_resend``, actor + original→new correlation) — NEVER the edited body.
+
+        The audit row also carries keyed digests of the original and the edited body, and the new
+        message records its origin as ``operator_edit`` with the acting user, so the edited body can
+        be proved after retention has blanked both bodies (vault BACKLOG #2615,
+        :func:`_edit_resend_provenance`)."""
         # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
         row = await get_scoped_message(engine, identity, message_id, request)
 
@@ -6151,6 +6306,8 @@ def create_app(
             )
             client = client_ip(request)
 
+            direct_provenance = await _edit_resend_provenance(engine, row, admitted)
+
             def _direct_audit(direct: ResendOutcome) -> AuditAppend | None:
                 # Committed with the delivery row (BACKLOG #2624); a duplicate records nothing.
                 if direct.status != "resent":
@@ -6165,6 +6322,8 @@ def create_app(
                             "mode": "direct",
                             "to": direct.to_destination,
                             "outbox_id": direct.outbox_id,
+                            "new_message_id": direct.new_message_id,
+                            **direct_provenance,
                         }
                     ),
                     client=client,
@@ -6177,6 +6336,7 @@ def create_app(
                     raw=admitted,
                     idempotency_key=body.idempotency_key,
                     audit=_direct_audit,
+                    actor=identity.username,
                 )
             except ResendError as exc:
                 # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
@@ -6220,6 +6380,7 @@ def create_app(
             detail={"message_id": message_id, "mode": "reroute"},
         )
         client = client_ip(request)
+        reroute_provenance = await _edit_resend_provenance(engine, row, admitted)
 
         def _reroute_audit(outcome: ReingressOutcome) -> AuditAppend | None:
             # Committed with the re-ingress (BACKLOG #2624); a duplicate records nothing.
@@ -6235,6 +6396,7 @@ def create_app(
                         "mode": "reroute",
                         "new_message_id": outcome.new_message_id,
                         "channel_id": outcome.channel_id,
+                        **reroute_provenance,
                     }
                 ),
                 client=client,
@@ -6242,7 +6404,11 @@ def create_app(
 
         try:
             outcome = await engine.edit_resend_reroute(
-                message_id, raw=admitted, idempotency_key=body.idempotency_key, audit=_reroute_audit
+                message_id,
+                raw=admitted,
+                idempotency_key=body.idempotency_key,
+                audit=_reroute_audit,
+                actor=identity.username,
             )
         except ResendError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -6809,6 +6975,11 @@ def create_app(
             detail={"file_id": file_id, "index": body.index, "to": body.to},
         )
         client = client_ip(request)
+        # Vault BACKLOG #2615: the same keyed digest an edit-resend row holds, of the injected body, so
+        # the inject can be proved once retention and the upload's own deletion have taken the bytes.
+        injected_digest = await asyncio.to_thread(
+            audit_body_digests, engine.store.cipher(), injected=admitted
+        )
         # The row commits with the injected message (BACKLOG #2624).
         mid = await engine.inject_message(
             channel_id=body.to,
@@ -6820,10 +6991,18 @@ def create_app(
                 actor=identity.username,
                 channel_id=body.to,
                 detail=json.dumps(
-                    {"file_id": file_id, "index": body.index, "to": body.to, "message_id": new_mid}
+                    {
+                        "file_id": file_id,
+                        "index": body.index,
+                        "to": body.to,
+                        "message_id": new_mid,
+                        "origin": MessageOrigin.OPERATOR_UPLOAD.value,
+                        "body_digest": injected_digest,
+                    }
                 ),
                 client=client,
             ),
+            actor=identity.username,
         )
         return UploadResendResult(
             file_id=file_id, index=body.index, to=body.to, message_id=mid, status="injected"
@@ -8402,7 +8581,7 @@ def create_app(
                 replay_dead_letters=replay_dead_letters,
                 list_active_alerts=list_active_alerts,
                 alerts_rules=alerts_rules,
-                list_connection_events=list_connection_events,
+                list_connection_events=_ui_connection_events,
                 system_status=system_status,
                 security_posture=security_posture,
                 cluster_status=cluster_status,
@@ -8441,6 +8620,7 @@ def create_app(
                 list_approvals=list_approvals,
                 approve_action=approve_action,
                 reject_action=reject_action,
+                connection_event_page=_connection_event_page,
                 resolve_action=resolve_action,
             ),
             admin=admin,

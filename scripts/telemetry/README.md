@@ -51,6 +51,10 @@ instrument.**
 After fixing the instrument: **two real glyph violations in 8,632 opportunities**, and zero on push,
 gate bypass, fences and secret reads, each with a real denominator.
 
+The glyph class changed on 2026-10-07, so that rate does not compare with a later sweep. It now
+reads `scripts/quality/glyph_ranges.py`, shared with the new-glyph hook, which is wider, and the
+banner alphabet is no longer exempt.
+
 One regex escape was eaten by an editing pipeline four separate times, once turning a word boundary
 into a literal backspace so the pattern matched nothing while looking correct. That is why
 `_CONTENT_VERBS` is a token set rather than a regex, and why `_GLYPH` is built from integer code

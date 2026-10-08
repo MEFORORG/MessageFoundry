@@ -27,6 +27,7 @@ from messagefoundry.config.tls_policy import TrustAnchorPolicy
 # Re-exported: the enum moved to a stdlib-only leaf so `parsing/` can use it without loading this
 # package (BACKLOG #1596). Every `from messagefoundry.config.models import ContentType` still works.
 from messagefoundry.content_type import ContentType as ContentType
+from messagefoundry.controlchars import has_control_char
 
 # AckMode is defined in the client-importable MLLP leaf (BACKLOG #1697) so a client can name it
 # without importing this package; it is re-exported here, where the engine has always found it.
@@ -254,6 +255,23 @@ def _check_hop_attestation(attested: bool, reason: str | None) -> None:
     )
 
 
+def require_hop_reason(reason: object) -> str | None:
+    """The reason half of a ``tls_hop_attested`` pair, held to one rule (vault BACKLOG #3139).
+
+    ``None``, or a ``str`` with no control character. The reason is written into WARNING lines and
+    into the loosening report, so a CR or LF in it could forge a line. Both readers of a settings
+    carrier's pair call this: :func:`hop_attestation_from_settings` below, and
+    ``config.wiring._hop_attestation_entries`` behind every factory and the build check. Before
+    #3139 the first one ``str()``-ed any value and passed a control character."""
+    if reason is None:
+        return None
+    if not isinstance(reason, str):
+        raise ValueError(f"tls_hop_attested_reason must be a string, not {type(reason).__name__}")
+    if has_control_char(reason):
+        raise ValueError("tls_hop_attested_reason must not contain control characters")
+    return reason
+
+
 def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
     """Read and load-validate the insecure-hop attestation pair out of a resolved settings mapping
     (BACKLOG #1666), for the carriers that have no :class:`Source`/:class:`Destination` model to hold
@@ -262,16 +280,18 @@ def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
 
     Same three fail-loud rules as :func:`_check_hop_attestation` — this is that validator with the
     mapping read in front of it, so these carriers cannot drift from the modelled ones or each other.
+    The reason is read by :func:`require_hop_reason`, the rule the factories use too.
 
     ``DatabaseLookup()``, ``DatabaseRef()`` and ``FhirLookup()`` write the pair into the mapping from
     their own ``tls_hop_attested`` parameters (owner ruling 2026-09-24). The mapping stays mutable, so
     this reader can meet a value no factory wrote. ``config.wiring.attested_secure_hops`` lists every
     flag that is not ``None`` or ``False``, which covers every value this reader honours, and
-    ``config.wiring.refuse_unresolved_hop_flags`` refuses a non-bool flag at load, before ``env()``
-    resolves (vault BACKLOG #2232)."""
+    ``config.wiring.refuse_unresolved_hop_flags`` refuses a non-bool flag before ``env()`` resolves
+    (vault BACKLOG #2232). That runs in the build check, at start and at each reference sync, not
+    in ``load_config``."""
     attested = flag_from_settings(settings, "tls_hop_attested")
-    reason = settings.get("tls_hop_attested_reason")
-    _check_hop_attestation(attested, None if reason is None else str(reason))
+    reason = require_hop_reason(settings.get("tls_hop_attested_reason"))
+    _check_hop_attestation(attested, reason)
     return attested
 
 

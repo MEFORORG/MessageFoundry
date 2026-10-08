@@ -277,3 +277,61 @@ hashed resolution lives in the committed **`uv.lock`** / **`requirements.lock`**
 
 **Build / tooling** — `hatchling` (build backend), Ruff (format + lint, no Black), mypy (strict),
 pytest.
+
+## Declined by design
+
+The root `CLAUDE.md` section 12 carries one line for each entry below and points here. These
+entries moved from that section verbatim on 2026-10-07; only the link targets changed, so they
+resolve from this folder. A section sign in them, such as *§2*, means a `CLAUDE.md` section.
+
+- Don't build **visual / template-driven authoring** (drag-drop transformer, declarative
+  field-mapping) — **declined-by-design (v0.2+)**: code-first Routers/Handlers *are* the
+  differentiator (BACKLOG #26 — closed, so it lives in
+  [the maintainer-internal ledger](BACKLOG.md), not in the
+  live ledger). *Narrow carve-out (2026-07-10, #26 amendment; widened to Routers 2026-08-05 per
+  [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment D, BACKLOG
+  #232):* a **structured Steps view** over real Python Handlers **and Routers** via a typed action
+  vocabulary (BACKLOG #222 — closed, same archive; the router `route` row kind is #232, still open
+  in [`docs/BACKLOG.md`](BACKLOG.md), ADR-gated) is permitted — the
+  carve-out was granted because the `.py` stays the **only artifact and the only execution path**,
+  and that property holds identically for a `@router` (a byte-splice Steps view over a real
+  `@router` projects destination selection from reviewable Python; it introduces no declarative
+  artifact and no second execution path), so naming Routers does not cross the #26 line;
+  declarative logic execution, declarative field-mapping, and drag-drop canvas logic authoring
+  remain declined.
+- Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity —
+  **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
+  (BACKLOG #27 — closed, so it lives in
+  [the maintainer-internal ledger](BACKLOG.md), not in the
+  live ledger; the connector-parity row is [`docs/CONNECTIONS.md`](CONNECTIONS.md)).
+- Don't build **per-key message ordering** — canonically **sequence-keyed lanes** over a **sequence
+  key**; older text writes it `partition_key` or "order-group sharding", both retired by the
+  2026-06-30 naming lock — **declined-by-design (owner ruling 2026-09-20)**: the demand gate closed
+  **unfired**. Its trigger was specifically **one ordered interface exceeding about 60 msg/s**, and
+  the owner has ruled that trigger is not expected to fire. The
+  [ADR 0052](adr/0052-enterprise-scale-target.md) scale target does not imply it — 45M/day
+  across 1,500 connections is about 0.35 events per second per connection, roughly 170x below the
+  one-lane bound, so the target is met by **concentration**, not per-lane speed. **This is not a
+  claim that the feature is impossible or unsound:** it is a real capability with a real cost the
+  owner has decided never to pay. The accepted consequence is that one strictly-ordered feed stays
+  core-bound, and the owner has separately ruled out relaxing order as the alternative, so a feed
+  that outgrows a core is answered by fanning out at source. **The decline does not rest on the
+  purity argument and nothing should:** the 2026-07-09 decline that did was overturned as
+  **invalid**, because purity binds `@router`/`@handler` and not connectors (§2, the reliability
+  invariant; the side-effects half is in
+  [`messagefoundry/CLAUDE.md`](../messagefoundry/CLAUDE.md)). (BACKLOG #3 — closed, so it lives in
+  [the maintainer-internal ledger](BACKLOG.md), not in the
+  live ledger.)
+- Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** — **declined-by-design
+  (2026-08-07)**, three reasons each independently sufficient: no free or open-source
+  5055-conformant **Python** analyser exists (the conformant ecosystem is C/C++/Java/C#/COBOL-
+  weighted), there is no contract counterparty for the clause the standard exists to support (it is
+  written into development and outsourcing contracts; this is OSS on PyPI), and a weakness-**count**
+  score collides with the anti-metric rule in
+  [`docs/Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.1. **The catalogue is a
+  different question and was adopted:** the ASCQM 1.1 weakness list is free from OMG, one bounded
+  pass over it ran under **#1073**, and its findings are **#1089–#1093**. Re-running that pass is
+  legitimate; adopting the score is not. *(#1073 is closed, so it lives in
+  [the maintainer-internal ledger](BACKLOG.md) once archived,
+  not in [`docs/BACKLOG.md`](BACKLOG.md) — a marker here has to outlive its item by
+  construction, so it must not cite only the live file.)*

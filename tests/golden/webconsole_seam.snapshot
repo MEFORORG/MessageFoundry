@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-45f59a24398deceb
+e1657c7766ab48f2
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -77,6 +77,7 @@ set_connection_flag
 list_approvals
 approve_action
 reject_action
+connection_event_page
 resolve_action
 
 ## dataclass messagefoundry.api._ui_seam.AdminHandlers
@@ -105,6 +106,7 @@ change_password
 enroll_mfa
 disable_my_mfa
 list_audit
+export_audit
 my_security_events
 user_summary
 current_user
@@ -209,7 +211,7 @@ messagefoundry.api.auth_models.AdGroupMapEntry: ad_group, role
 messagefoundry.api.auth_models.AdGroupScopeEntry: ad_group, channel
 messagefoundry.api.auth_models.AdGroupScopeMap: entries
 messagefoundry.api.auth_models.AuditEntry: action, actor, channel_id, client, detail, ts
-messagefoundry.api.auth_models.AuditList: entries
+messagefoundry.api.auth_models.AuditList: as_of, entries, limit, offset, total, withheld
 messagefoundry.api.auth_models.ChannelScope: channels, expected_source
 messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, user_id, username
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
@@ -225,7 +227,7 @@ messagefoundry.api.auth_models.PasswordResetResponse: expires_at, must_change_pa
 messagefoundry.api.auth_models.RoleInfo: builtin, description, display_name, id, permissions
 messagefoundry.api.auth_models.RolesUpdateRequest: roles
 messagefoundry.api.auth_models.SecurityEventInfo: action, detail, ts
-messagefoundry.api.auth_models.SecurityEventsList: events
+messagefoundry.api.auth_models.SecurityEventsList: as_of, events, limit, offset, total
 messagefoundry.api.auth_models.UserCreateRequest: display_name, email, roles, username
 messagefoundry.api.auth_models.UserCreatedResponse: auth_provider, channel_scope, channel_scope_source, credential_expires_at, disabled, display_name, email, id, lock_state, must_change_password, notify_email, roles, temp_password, username
 messagefoundry.api.auth_models.UserLockState: failed_attempts, lock_cycles, locked_until, second_step_failed_attempts, second_step_lock_cycles, second_step_locked, second_step_locked_until, sign_in_locked
@@ -249,6 +251,7 @@ messagefoundry.api.models.ClusterStepdownRequest: force
 messagefoundry.api.models.ClusterStepdownResult: force, lease_released, new_leader_eligible, node_id, released_at, was_leader
 messagefoundry.api.models.ConfigProvenance: drift, files, fingerprint, git_head, loaded
 messagefoundry.api.models.ConnectionEventInfo: connection, direction, id, kind, message_id, peer_host, reason, transport, ts
+messagefoundry.api.models.ConnectionEventList: before_id, events, limit, offset, total
 messagefoundry.api.models.ConnectionFlagRequest: direction, flagged
 messagefoundry.api.models.ConnectionRow: alerts_active, backlog_seconds, channel_id, channel_name, delivered_age_seconds, destination, direction, error, errored, flagged, idle_seconds, method, name, owner_shard, paused, peer, port, queue_depth, read, role, simulated, status, toml_managed, waiting_for_reply, written
 messagefoundry.api.models.DbInfo: audit, disk_free_bytes, events, journal_mode, messages, path, size_bytes, synchronous

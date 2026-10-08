@@ -23,6 +23,14 @@ was claimed elsewhere -- and every citation grep since read both items as unbuil
 That rule reads only the subject, so it fires on every commit, documentation included: rewording a
 subject never blocks the work itself.
 
+A third rule rides the same hook because only commit-msg sees the message (CLAUDE.md section 5):
+
+    No line may START with `Co-Authored-By: Claude` (any case) or `Claude-Session:`.
+
+It reads the whole message, fires on every commit, and runs before any git read. Indented or
+backticked, a body may still quote either trailer. It is inert on a box until
+``scripts/coord/install-git-hooks.ps1`` re-copies this file into the shared ``.git/hooks``.
+
 Three scoping decisions for the claim rule, each load-bearing:
 
 * **Subject line only.** A body may reference other items freely -- this very repo's commits routinely
@@ -101,6 +109,15 @@ _SQUASH_SUFFIX = re.compile(r"\s*\(#\d{1,6}\)\"?\s*\Z")
 # a `#1134:` line; after an editor session git strips it AFTER this hook runs. That case refuses a line
 # git will drop, which costs a reword -- the other reading would pass the `-m` case silently.
 _COMMENT_LINE = re.compile(r"#(?!\d)")
+
+# THE ATTRIBUTION TRAILERS CLAUDE.md SECTION 5 SAYS TO OMIT. `.claude/settings.json` turns them off at
+# source, but a session reading a stale or user-scope setting still writes them, and until this rule a
+# Lander caught them by reading commit bodies by hand. Anchored at the start of a line, so a body may
+# still QUOTE either trailer when it is indented or set in backticks.
+# Whitespace is allowed before the colon because git's trailer parser accepts it there.
+_ATTRIBUTION_TRAILER = re.compile(
+    r"^(?:Co-Authored-By\s*:\s*Claude\b|Claude-Session\s*:)", re.IGNORECASE
+)
 
 # A commit touching ONLY these is documentation/ledger work: it may cite an item without implementing it.
 _DOC_PREFIXES = ("docs/", ".github/")
@@ -385,6 +402,34 @@ def _refuse_bare(subject: str, items: list[str], bare: list[str]) -> int:
     return 1
 
 
+def _attribution_trailers(message: str) -> list[tuple[int, str]]:
+    """The 1-indexed lines of *message* that carry a trailer section 5 says to omit."""
+    hits: list[tuple[int, str]] = []
+    # No scissors handling is needed: every line `git commit -v` writes below the scissors starts
+    # with a diff marker, so the anchored pattern cannot match one.
+    for n, line in enumerate(message.splitlines(), 1):
+        if _ATTRIBUTION_TRAILER.match(line):
+            hits.append((n, line))
+    return hits
+
+
+def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
+    rows = "\n".join(f"      line {n}: {_safe_for_message(line, 120)}" for n, line in hits)
+    sys.stderr.write(
+        f"\nMessageFoundry attribution-trailer check\n\n"
+        f"  The message carries a trailer CLAUDE.md section 5 says to omit (standing owner\n"
+        f"  preference). It refuses a line starting 'Co-Authored-By: Claude' or 'Claude-Session:'.\n"
+        f"{rows}\n\n"
+        f"  Delete those lines from the message file, then commit again:\n"
+        f"      git commit -F <file>\n"
+        f"  .claude/settings.json turns both off at source with `attribution`. If your session\n"
+        f"  added one anyway, it is reading a stale or user-scope setting.\n"
+        f"  To QUOTE a trailer in a body, indent it or put it in backticks.\n"
+        f"  This check reads the whole message and fires whatever the commit touches.\n\n"
+    )
+    return 1
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         return 0  # not wired as a commit-msg hook; do nothing rather than guess
@@ -392,6 +437,11 @@ def main() -> int:
         message = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return 0
+
+    # FIRST, and before any git read: it needs only the message, and it fires on every commit.
+    trailers = _attribution_trailers(message)
+    if trailers:
+        return _refuse_trailers(trailers)
 
     subject = _subject(message)
     items, bare = _citations(subject)

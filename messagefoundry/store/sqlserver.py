@@ -170,6 +170,7 @@ from messagefoundry.store.store import (
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
+    MessageOrigin,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -193,9 +194,11 @@ from messagefoundry.store.store import (
     WebAuthnCredential,
     _alert_summary,
     _append_channel_scope,
+    _connection_event_where,
     _dead_target_pairs,
     _opt_float,
     _qmark_cutoff_case,
+    _security_events_where,
     _session_cap_groups,
     _session_live_params,
     _transit_attestation_row,
@@ -637,8 +640,8 @@ _SQL_INSERT_QUEUE_INGRESS: Final[str] = (
 )
 _SQL_INSERT_MESSAGE: Final[str] = (
     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-    " message_type, raw, status, error, summary, metadata)"
-    " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+    " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 _SQL_APPLOCK: Final[str] = (
     "SET NOCOUNT ON;"
@@ -808,6 +811,9 @@ def _insert_message_params(
     error: str | None,
     enc_summary: str | None,
     enc_metadata: str | None,
+    *,
+    origin: MessageOrigin,
+    origin_actor: str | None = None,
 ) -> tuple[Any, ...]:
     return (
         message_id,
@@ -821,6 +827,9 @@ def _insert_message_params(
         error,
         enc_summary,
         enc_metadata,
+        # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
+        origin.value,
+        origin_actor,
     )
 
 
@@ -1622,7 +1631,7 @@ _SCHEMA: list[str] = [
         received_at FLOAT NOT NULL, source_type NVARCHAR(64) NULL, control_id NVARCHAR(256) NULL,
         message_type NVARCHAR(64) NULL, raw NVARCHAR(MAX) NOT NULL, status NVARCHAR(32) NOT NULL,
         error NVARCHAR(MAX) NULL, summary NVARCHAR(MAX) NULL, metadata NVARCHAR(MAX) NULL,
-        documents_pruned FLOAT NULL)""",
+        documents_pruned FLOAT NULL, origin NVARCHAR(32) NULL, origin_actor NVARCHAR(256) NULL)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_channel','IndexID') IS NULL
         CREATE INDEX ix_messages_channel ON messages(channel_id, received_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_control','IndexID') IS NULL
@@ -1746,6 +1755,11 @@ _SCHEMA: list[str] = [
     # existing rows = never pruned; COL_LENGTH-gated like the others so a re-open is a no-op.
     """IF COL_LENGTH('messages','documents_pruned') IS NULL
         ALTER TABLE messages ADD documents_pruned FLOAT NULL""",
+    # Vault BACKLOG #2615: the plain origin pair. NULL on an existing row = the origin was not recorded.
+    """IF COL_LENGTH('messages','origin') IS NULL
+        ALTER TABLE messages ADD origin NVARCHAR(32) NULL""",
+    """IF COL_LENGTH('messages','origin_actor') IS NULL
+        ALTER TABLE messages ADD origin_actor NVARCHAR(256) NULL""",
     # Store-once-deliver-many (L2b): body_ref on a pre-existing queue (NULL = body inline, byte-identical).
     """IF COL_LENGTH('queue','body_ref') IS NULL
         ALTER TABLE queue ADD body_ref NVARCHAR(64) NULL""",
@@ -4986,8 +5000,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-                    " message_type, raw, status, error, summary, metadata)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         mid,
                         channel_id,
@@ -5001,6 +5015,8 @@ class SqlServerStore:
                         # EF-3: MRN/name is PHI — ciphered at rest
                         self._enc(summary, aad=cell_aad("messages", "summary", mid)),
                         self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                        MessageOrigin.PARTNER.value,  # vault BACKLOG #2615: plain by design
+                        None,
                     ),
                 )
                 for dest_name, payload in deliveries:
@@ -5172,6 +5188,7 @@ class SqlServerStore:
                     None,
                     None,
                     self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                    origin=MessageOrigin.REINGRESS,
                 ),
             )
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own queue cell
@@ -5246,6 +5263,7 @@ class SqlServerStore:
                     None,
                     None,
                     self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                    origin=MessageOrigin.REINGRESS,
                 ),
             )
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own queue cell
@@ -5331,6 +5349,8 @@ class SqlServerStore:
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
         audit: OperatorAudit[str] | None = None,
+        origin: MessageOrigin = MessageOrigin.PARTNER,
+        origin_actor: str | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the ingress stage (status RECEIVED + one
         ``stage='ingress'`` queue row holding the raw) in ONE transaction — the staged pipeline's
@@ -5356,8 +5376,8 @@ class SqlServerStore:
                 async with self._cursor(conn) as cur:
                     await cur.execute(
                         "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-                        " message_type, raw, status, error, summary, metadata)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             mid,
                             channel_id,
@@ -5371,6 +5391,8 @@ class SqlServerStore:
                             # EF-3: MRN/name is PHI — ciphered at rest
                             self._enc(summary, aad=cell_aad("messages", "summary", mid)),
                             self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                            origin.value,  # vault BACKLOG #2615: plain by design
+                            origin_actor,
                         ),
                     )
                     # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
@@ -6494,32 +6516,22 @@ class SqlServerStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
+        offset: int = 0,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
-        where: list[str] = []
-        params: list[Any] = [limit]  # TOP (?) is the first placeholder
-        if connection is not None:
-            where.append("connection=?")
-            params.append(connection)
-        if kinds:
-            placeholders = ",".join("?" for _ in kinds)
-            where.append(f"kind IN ({placeholders})")
-            params.extend(kinds)
-        if since is not None:
-            where.append("ts>=?")
-            params.append(since)
-        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
-        # outbound row (which spans channels). Scope placeholders append after TOP/connection/kinds/since,
-        # so positional order with the leading TOP(?) bind is preserved.
-        if allowed_channels is not None:
-            where.append("direction='inbound'")
-            _append_channel_scope(where, params, "connection", allowed_channels)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        # The same ``?`` WHERE text as SQLite, so the per-channel scope lives in one place.
+        clause, params = _connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        # OFFSET/FETCH rather than TOP (?), because TOP cannot skip (BACKLOG #2438). Both binds
+        # follow the WHERE values, in the order their placeholders appear.
         rows = await self._fetchall(
-            "SELECT TOP (?) id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
-            f" FROM connection_event{clause} ORDER BY ts DESC, id DESC",
-            tuple(params),
+            "SELECT id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
+            f" FROM connection_event{clause} ORDER BY ts DESC, id DESC"
+            " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+            (*params, max(offset, 0), limit),
         )
         return [
             ConnectionEvent(
@@ -6538,6 +6550,26 @@ class SqlServerStore:
             )
             for r in rows
         ]
+
+    async def connection_event_extent(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        before_id: int | None = None,
+        allowed_channels: Sequence[str] | None,
+    ) -> tuple[int, int]:
+        """The total :meth:`list_connection_events` pages through, and its newest ``id`` or 0
+        (BACKLOG #2438)."""
+        # The same ``?`` WHERE text as SQLite, so the per-channel scope lives in one place.
+        clause, params = _connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        row = await self._fetchone(
+            f"SELECT COUNT(*) AS n, MAX(id) AS newest FROM connection_event{clause}", tuple(params)
+        )
+        return (int(row["n"]), int(row["newest"] or 0)) if row is not None else (0, 0)
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
     # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
@@ -6929,8 +6961,8 @@ class SqlServerStore:
                     )
                     await cur.execute(
                         "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-                        " message_type, raw, status, error, summary, metadata)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             new_mid,
                             loopback_channel_id,
@@ -6952,6 +6984,8 @@ class SqlServerStore:
                             # EF-3: MRN/name is PHI — ciphered at rest
                             self._enc(summary, aad=cell_aad("messages", "summary", new_mid)),
                             self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                            MessageOrigin.REINGRESS.value,  # vault BACKLOG #2615: plain by design
+                            None,
                         ),
                     )
                     if not peek_failed:
@@ -8028,8 +8062,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-                    " message_type, raw, status, error, summary, metadata)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         mid,
                         channel_id,
@@ -8044,6 +8078,8 @@ class SqlServerStore:
                         # EF-3: MRN/name is PHI — ciphered at rest
                         self._enc(summary, aad=cell_aad("messages", "summary", mid)),
                         self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                        MessageOrigin.PARTNER.value,  # vault BACKLOG #2615: plain by design
+                        None,
                     ),
                 )
                 # `_event` re-scrubs + ciphers the plaintext `error` internally (parity with SQLite).
@@ -9991,6 +10027,7 @@ class SqlServerStore:
         body_override: str | None = None,
         now: float | None = None,
         audit: OperatorAudit[ResendOutcome] | None = None,
+        actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
         Mirrors :meth:`MessageStore.resend_to`. When ``body_override`` is set this is the edit-and-resend
@@ -10058,6 +10095,7 @@ class SqlServerStore:
                         await self._append_operator_audit(cur, written, audit, outcome)
                         await self._commit(conn)
                         return outcome
+                    child_mid: str | None = None
                     if body_override is not None:
                         # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                         # operator's EDITED body to `to` as a NEW, correlated CHILD delivery; the ORIGIN row
@@ -10122,6 +10160,8 @@ class SqlServerStore:
                                 self._enc(
                                     child_meta, aad=cell_aad("messages", "metadata", child_mid)
                                 ),
+                                MessageOrigin.OPERATOR_EDIT.value,  # vault BACKLOG #2615
+                                actor,
                             ),
                         )
                         self.body_copies += 1  # A1: the child messages.raw copy
@@ -10230,6 +10270,7 @@ class SqlServerStore:
                         to_destination=to,
                         from_destination=str(src_dest),
                         outbox_id=outbox_id,
+                        new_message_id=child_mid,
                     )
                     await self._append_operator_audit(cur, written, audit, outcome)
                     await self._commit(conn)
@@ -10248,6 +10289,7 @@ class SqlServerStore:
         idempotency_key: str,
         now: float | None = None,
         audit: OperatorAudit[ReingressOutcome] | None = None,
+        actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
         fresh, correlated ``RECEIVED`` child message at the origin channel's ingress stage; the origin
@@ -10341,6 +10383,8 @@ class SqlServerStore:
                                 self._enc(
                                     child_meta, aad=cell_aad("messages", "metadata", new_mid)
                                 ),
+                                MessageOrigin.OPERATOR_EDIT.value,  # vault BACKLOG #2615
+                                actor,
                             ),
                         )
                         # Hoist the row id so the payload binds to its own queue cell.
@@ -11293,8 +11337,9 @@ class SqlServerStore:
         """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
         Filters are ANDed as bound ``?`` parameters — only the fixed column/operator template is
-        formatted into the SQL, never a value — so a filter value cannot inject. Each caller's
-        ``TOP (?)`` placeholder comes BEFORE this text, so it binds that value ahead of these."""
+        formatted into the SQL, never a value — so a filter value cannot inject. A caller's
+        ``TOP (?)`` placeholder comes BEFORE this text, so it binds that value ahead of these; an
+        ``OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`` comes after it, so those bind behind them."""
         clauses: list[str] = []
         params: list[Any] = []
         if actor is not None:
@@ -11331,10 +11376,12 @@ class SqlServerStore:
         until: float | None = None,
         exclude: AuditExclusion | None = None,
         before_id: int | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
-        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
-        Every value is a bound parameter; see :meth:`_audit_where`."""
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776),
+        or past ``offset`` rows of the filtered set (BACKLOG #2438). Every value is a bound
+        parameter; see :meth:`_audit_where`."""
         where, params = self._audit_where(
             actor=actor,
             action=action,
@@ -11343,13 +11390,19 @@ class SqlServerStore:
             exclude=exclude,
             before_id=before_id,
         )
-        sql = f"SELECT TOP (?) * FROM audit_log{where} ORDER BY id DESC"
-        return await self._fetchall(sql, (limit, *params))
+        # OFFSET/FETCH rather than TOP (?), because TOP cannot skip (BACKLOG #2438). FETCH refuses
+        # a zero row count where TOP (0) returned nothing, so a zero limit keeps that answer here.
+        if limit < 1:
+            return []
+        sql = (
+            f"SELECT * FROM audit_log{where} ORDER BY id DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        )
+        return await self._fetchall(sql, (*params, max(offset, 0), limit))
 
     async def count_audit(
         self,
         *,
-        limit: int,
+        limit: int | None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
@@ -11367,11 +11420,14 @@ class SqlServerStore:
             exclude=exclude,
             before_id=before_id,
         )
-        sql = (
-            f"SELECT COUNT(*) AS n FROM (SELECT TOP (?) id FROM audit_log{where}"
-            " ORDER BY id DESC) t"
-        )
-        row = await self._fetchone(sql, (limit, *params))
+        if limit is None:
+            row = await self._fetchone(f"SELECT COUNT(*) AS n FROM audit_log{where}", tuple(params))
+        else:
+            sql = (
+                f"SELECT COUNT(*) AS n FROM (SELECT TOP (?) id FROM audit_log{where}"
+                " ORDER BY id DESC) t"
+            )
+            row = await self._fetchone(sql, (limit, *params))
         return int(row["n"]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
@@ -11398,16 +11454,30 @@ class SqlServerStore:
         )
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
     ) -> list[dict[str, Any]]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
         /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
-        user only by email, when one can be sent. ``auth/notifications.py`` states the rule."""
+        user only by email, when one can be sent. ``auth/notifications.py`` states the rule.
+        ``offset`` pages it, and ``until`` pins the pages to one snapshot (BACKLOG #2438).
+        FETCH refuses a zero row count, so a zero limit returns nothing here, as the ``TOP (0)`` it
+        replaced did."""
+        if limit < 1:
+            return []
+        where, params = _security_events_where(username, until)
         return await self._fetchall(
-            "SELECT TOP (?) ts, action, detail FROM audit_log "
-            "WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC",
-            (limit, username),
+            f"SELECT ts, action, detail FROM audit_log{where} ORDER BY id DESC"
+            " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+            (*params, max(offset, 0), limit),
         )
+
+    async def count_security_events_for_user(
+        self, username: str, *, until: float | None = None
+    ) -> int:
+        """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
+        where, params = _security_events_where(username, until)
+        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM audit_log{where}", tuple(params))
+        return int(row["n"]) if row is not None else 0
 
     # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
 

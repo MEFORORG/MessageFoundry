@@ -34,7 +34,7 @@ jobs:
           # Stdlib + gh only — no install. Writes the CSV + appends the table to the run summary.
           python scripts/security/vuln_metrics.py --csv vuln-metrics.csv --summary "$GITHUB_STEP_SUMMARY"
       - name: Upload the metrics CSV
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vuln-metrics
           path: vuln-metrics.csv

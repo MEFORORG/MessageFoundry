@@ -375,44 +375,17 @@ an old id can resolve to plausible wrong text rather than to nothing. One comman
 
     git -C <korus clone> show origin/main:roles/LANDER.md | Select-String '^### '
 
-**THE SPECIAL SEAT IS THE OWNER'S, AND IT HAS NO STANDING DUTIES (owner decision 2026-09-16).** It
-exists for work that falls outside the other five, so its instruction is the whole of its scope and
-it has none until the owner gives it one. It does not take a BACKLOG item, a brief, or a red. It is
-an ADDITION -- nothing retired to make room for it -- and it is not a spawn-authorised seat, so the
-ruling below binds it.
-
-**Standing by is its normal state, not a fault in it.** An idle Special session is the owner holding
-one in reserve, and work it finds itself spends that. It announces and declares before its first
-SHARED write rather than on arrival, which is the one point where it parts company with every other
-seat here: the arrival prompt that tells each session to declare is the line this seat alone does
-not act on. The cost of that silence is real and lands on nobody while the seat touches nothing --
-`fleet.ps1` omits it and no peer can forecast a collision with it -- which is why the deferral ends
-at the first shared write and not later. Its card is
-[`docs/roles/special.card.md`](docs/roles/special.card.md); the full playbook is korus
-`roles/SPECIAL.md`, read at `origin/main` like every other playbook.
+**The Special seat is the owner's, and it has no standing duties (owner decision 2026-09-16).** Its
+instruction is its whole scope, and it announces and declares before its first shared write rather
+than on arrival. Its card is [`docs/roles/special.card.md`](docs/roles/special.card.md); the
+playbook is korus `roles/SPECIAL.md`, read at `origin/main`.
 
 **A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
-ruling 2026-09-16).** The owner still starts each Manager in the ordinary case, and a Manager's
-workers are still subagents in its own process rather than spawned sessions. A Manager still needs
-no account roster and still cannot reach another Manager: spawning makes a NEW session, it does not
-address an existing one, so the shape still dissolves the cross-account problem rather than solving
-it.
-
-**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing sends a
-red PR to a seat -- `failure-signal.yml` sets a `ci-red` label that only an advisory daily report
-reads back, and `stalled-prs.yml` reports green-but-unmergeable PRs rather than red ones -- so the
-work stops until somebody happens to look. **CORRECTED 2026-09-26:** this read "a `ci-red` label no
-workflow reads back"; `ci-red-report.yml` (PR 1240) reads it daily into its own run summary. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
-landing means nobody checked it, and a fix written to turn CI green is checked by the very signal it
-was written against.
-
-**SPAWNING SHOULD BE RARE, AND REACHING FOR IT IS WORTH NOTICING.** A Manager's subagents already
-cover almost everything it does, and the load-bearing property is that **a subagent cannot outlive a
-mistake** -- it needs no grant and it dies with its Manager. **A spawned session can outlive one**,
-which is the whole of the added risk. So a spawn is better read as a SIGNAL THAT SOMETHING UPSTREAM
-HAS FAILED -- a seat died with work outstanding, or nobody was alive to take a red -- than as a
-routine tool. Raised by a Manager seat on 2026-09-16, about its own grant, which is the direction
-that argument is most credible from.
+ruling 2026-09-16).** The case it exists for is a PR that needs a fix with no Manager alive. Then
+the Lander spawns a Manager rather than fixing the PR itself, because authoring plus landing means
+nobody checked it. A Manager seat added, the same day, that spawning should be rare: a subagent
+cannot outlive a mistake, and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
+text moved in wave 2*.
 
 The brief is disposable. The BACKLOG item is the record.
 
@@ -433,139 +406,53 @@ gates a merge**, and no seat has to clear one.
    worktree path in the brief. Do not use `-To all`: that path spawns a nested process and may be
    refused. With no address, put the question in your exit report; the Manager carries it into the
    PR body when it opens the PR.
-2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
-   push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at
-   tool-call time and deny the tool call itself. Each one sees only some tools.
-   `collision_gate.ps1`, wired by `scripts/coord/install-coordination.ps1`, sees Write, Edit,
-   MultiEdit and NotebookEdit, and nothing else. `worktree_gate.ps1`, installed to
-   `%USERPROFILE%\.claude\hooks\` by `scripts/worktree/install-gate.ps1`, sees at least those four
-   tools and Bash and PowerShell. On the four edit tools it judges the file being written. On a
-   shell call it judges only git commands, by verb, config key and the repository or worktree they
-   target. **So neither guard intercepts an ordinary shell write, such as a redirect into a
-   file.** The worktree gate's own deny text says a shell route around a denied write still breaks
-   its rule. CI arrives later, when the process is gone.
+2. At least two kinds of refusal reach a Builder while it runs: local git hooks at commit and push
+   time (the live list is `.pre-commit-config.yaml`), and the user-scope PreToolUse guards
+   `collision_gate.ps1` and `worktree_gate.ps1`, which deny the tool call itself. **Neither guard
+   intercepts an ordinary shell write, such as a redirect into a file**, and a shell route around a
+   write the worktree gate denied still breaks its rule. Which tools each guard
+   sees is in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 2*.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
 4. Its process exits when it has pushed and reported. The Manager opens the PR, often one PR for
    several Builders' branches. The worktree stays behind. **A Builder in its own session -- started
    from a chip, or spawned -- is not the Manager's subagent and opens its own PR** (korus
    `roles/MANAGER.md`, *A Builder in its own session opens its own pull request*).
-5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
-   Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
-   which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
-   `echo C:\Temp\demo` prints `C:Tempdemo`, so `pwsh` reports the argument is not a
-   script file, which reads as a missing script rather than a quoting bug. Measured 2026-09-02. This
-   is ordinary POSIX quoting and is **not** BACKLOG #1397, which is the Bash tool unescaping inside
-   a QUOTED heredoc.
-   The **PowerShell tool** does refuse a nested `pwsh`, with `Command spawns a nested PowerShell
-   process which cannot be validated`. That refusal belongs to one tool, not to the harness, and
-   the Bash tool has no such check. **This line previously said a seat cannot declare itself.**
-   That was wrong, and it was self-confirming: a Builder told it cannot declare does not try,
-   renders undeclared, and confirms the rule. Two Builders on one root, 33 minutes apart: the
-   second's brief asked it to declare and the first's did not, and only the second declared. They
-   also differed in task, worktree and grant list, so that is the cause and not a controlled arm.
-   A SessionStart hook (`scripts/hooks/seat-declare-prompt.ps1`) prints a line telling every
-   starting session to declare. **Do not ignore it.** The Manager should still supply seat and goal
-   at dispatch, because no hook will invent a goal, by design: a machine that invents one writes a
-   record that looks declared and says nothing.
+5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02. Quote the Windows
+   path, or the shell eats the backslashes. The PowerShell tool refuses a nested `pwsh`; the Bash
+   tool does not. **This line once said a seat cannot declare itself**, and that was
+   self-confirming: a Builder told it cannot declare does not try. A SessionStart hook tells every
+   starting session to declare; **do not ignore it.** The Manager still supplies seat and goal at
+   dispatch, because a machine-invented goal makes a record that looks declared and says nothing.
+   The measurements are in [`docs/METHOD.md`](docs/METHOD.md).
 
 6. **A brief can be wrong by the time you read it, and nothing will tell you.** Verify it against
-   the tree before you act on it: read the diff of **every PR it names**, at hunk granularity, and
-   re-locate every line number by symbol. **Where the brief and the tree disagree, the tree wins.**
-   ***Do not scope this check to how recently the brief was written.*** Two windows give the same
-   symptom and **the wider one dominates**: a brief goes stale AFTER dispatch, in minutes, and it is
-   written stale because the ITEM it was cut from is stale, over weeks. A Manager seat reported six
-   of eleven briefed items already answered at spawn on 2026-09-04 -- by an ADR accepted before the
-   brief, by work shipped under a different number, by a PR the item itself says not to rebuild.
-   **Attributed, not verified here.** The structural cause is that an item records its own research
-   and nothing records the work that ANSWERS it, so a settled row still reads as current.
-   **Line numbers are navigation aids and never evidence** -- the same seat measured four anchors
-   adrift by 50, 86, 581 and 593 lines in one day, one item with both of its anchors dead.
-   Measured here 2026-09-04, the after-dispatch window: a chip named three drift sites, and minutes
-   later the spawner took item 3 itself and pushed it as `c2f549f42` on PR 837. The receiver read
-   that diff before touching anything, saw both hunks already rewritten, and skipped it. Trusting
-   the brief would have put two PRs on the same two comment blocks, to meet at merge with the Lander
-   resolving prose by hand. **Two of the same brief's other three items also failed to survive a
-   read of their sources**, so one confirmed drift is a reason to re-check the rest, not to correct
-   that line and carry on. ***"The brief is disposable" above says it may be thrown away; it does
-   not say it was true when written.*** **Finding an item already answered is a GOOD outcome** --
-   record it with evidence and stop, rather than building it again. BACKLOG #1448, same family
-   as #1391.
+   the tree, however recently it was written: read the diff of every PR it names, and re-locate every
+   line number by symbol. **Where the brief and the tree disagree, the tree wins.** One confirmed
+   drift is a reason to re-check the rest. An item already answered is a good outcome: record it and
+   stop. BACKLOG #1448; the evidence is in [`docs/METHOD.md`](docs/METHOD.md).
 
 ### The Manager plans, dispatches, and holds the owner's attention
 
 - **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and
   waits for the owner's explicit "go". Point the brief at the relevant existing code; it measurably
   improves the result.
-- One brief per Builder. After about two failed attempts at the same problem, dispatch a fresh Builder
-  with a better brief rather than reuse a poisoned context. A Builder cannot do this. When you are
-  stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.
-- **Your workers die when you do, and that is the one way work is lost here.** A subagent that has
-  not pushed has produced nothing -- not a branch, not a stash, not a file anyone can find later. So
-  every brief ends with push, then report; never "finish and I will push for you", never "hold this
-  until I say". Check before you close the instance. **You open the PR afterwards**, verifying the
-  branch with `git ls-remote --heads origin` rather than trusting the worker's report. You also
-  decide when to open it and which branches it carries; see the batching bullet under *Branch,
-  commit one layer, open the PR*.
-- **Say who else is running, in three fields that are always present, including when the answer is
-  nobody:** who is working, what paths they touch, and **whether they share this worktree.** The
-  third field is the whole of the collision -- two workers given one worktree each reported the
-  other's output as an unexplained intruder, because neither was told the other existed.
-- **Hand down readings, not conclusions.** A worker told what you concluded applies your conclusion,
-  and its own correct evidence loses. That has happened. Mark a conclusion as yours and say what the
-  worker should do if it does not hold.
-- **Announce the files a wave's PRs will CHANGE, never the items' subjects.** A dispatch announce
-  naming three engine modules was read downstream as a collision forecast; the PRs touched
-  `docs/BACKLOG.md` and one test file, and those modules were only what the items were *about*.
-- **If you take back part of a brief you already dispatched, mail the receiver, because you cannot
-  update the chip.** `dismiss_task` withdraws only a chip the user has **not** acted on, so a
-  started one stays live and frozen around your stale text, and no channel carries the correction.
-  Say which item is already done and where it landed. **This binds whichever seat dispatched:** any
-  seat can raise a chip, and in the 2026-09-04 case above the spawner was
-  the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
-  still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
-- **Give each session its own git worktree, and START the session in it.** `scripts/worktree/new.ps1
-  -Name <x>` creates one (cleanup with `remove.ps1`); `spawn.ps1 -Name <x>` creates it *and* opens an
-  editor window on it, which is the entry point to reach for. Each gets an isolated checkout, branch
-  and `.venv` on the same remote and the same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
-  The AI project memory is shared across sessions, so coordinate memory writes.
-- **Never brief a worker to RELOCATE into a worktree -- from a subagent it cannot work.** A
-  subagent's `EnterWorktree` call into a `new.ps1` sibling is **refused outright** (the path is outside
-  `.claude/worktrees/`), so the brief burns the worker's one turn on a call that cannot succeed. From a
-  session the same call instead raises an owner prompt that no `permissions.allow` rule can suppress.
-  Start the session in its worktree (`spawn.ps1`), or dispatch a file-editing subagent with
-  `isolation: worktree` and have it run `pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1`
-  **before its first `pytest`/`mypy`/`ruff` run** -- a managed worktree arrives with no `.venv`, and
-  without one `pytest` dies at import rather than running slowly. The measurements, the cost of that
-  bootstrap, and why not to engineer around the check are stated once in
-  [`docs/WORKTREES.md`](docs/WORKTREES.md) section "Start the session in the worktree".
-- **Put the prompt FIRST when you spawn, or close the flags with `--`.** At least `--allowedTools`,
-  `--disallowedTools`, `--tools`, `--add-dir`, `--mcp-config`, `--betas` and `--file` take lists, so
-  `claude --bg --allowedTools Bash Edit "do the work"` swallows the prompt as a third tool name. The
-  session starts with nothing to do, exits 0, then lists as `state=blocked`, which is also what a
-  real permission block looks like. The lane reads as alive and does nothing.
-- **In the `--allowedTools` FLAG, grant tools by BARE NAME, never scoped to a command.**
-  `--allowedTools Bash PowerShell` works.
-  `--allowedTools "PowerShell(pwsh:*)"` silently disables the PowerShell tool: every command it
-  sends comes back `Command contains malformed syntax that cannot be parsed: pwsh exited with code
-  1: The command line is too long.` Consistent with the tool spawning `pwsh` to test a command
-  against a scoped pattern, and that spawn failing when the inherited environment is near the
-  8191-byte command-line limit. Nobody has read the tool's source, so the mechanism is inferred;
-  the paired test establishes only that the GRANT FORM is causal. An environment block is
-  per-PROCESS, not per-machine: one session measured 8105 bytes, and the size varies with config
-  root, worktree path and inherited `PATH`. A bare grant needs no parse.
-  **The careful spelling is the broken one**, which is why this cost four Builder launches before
-  anyone looked. Measured 2026-09-02, one variable, environment held constant. Bash is unaffected.
-  **The two rule sources are known asymmetrically, so do not generalise:** command-scoping is
-  measured to break BOTH the flag and a `settings.json` rule (a matching `Bash(git add:*)` executed
-  while its `PowerShell` twin died at the parse). A BARE name is measured to work **in the flag
-  only** -- nobody has put a bare tool name in a `settings.json` `permissions.allow` and spawned
-  without a flag. Do not "fix" a config root by bare-naming its rules on the strength of this line.
-  Three refusals that must not be conflated: `malformed syntax ... too long` is the parse dying and
-  says nothing about your rules; `This command requires approval` is a real permission decision;
-  `The term 'X' is not recognized` means the command RAN and the PATH is wrong.
-- Rules a Builder needs belong in the **account's** `settings.json`, outside git.
-  `.claude/settings.json` is tracked, and every worktree carries its own copy from its own branch, so
-  an uncommitted edit to the primary checkout reaches nothing else.
+- The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
+  them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
+  running, what paths they touch, and whether they share the worktree. Hand down readings, not
+  conclusions. Announce the files a wave changes, never the items' subjects.
+- At least these live in this repository. Dispatch a fresh Builder after about two failed attempts;
+  a stuck Builder pushes what is green and reports that the brief needs re-cutting. Whichever seat
+  dispatched, mail the receiver when you take back a brief, because you cannot update a started
+  chip (BACKLOG #1448). Put the prompt first when you spawn. Grant `--allowedTools` by bare name,
+  never scoped to a command; that is measured in the flag only, so do not bare-name a
+  `settings.json` rule on its strength. Rules a Builder needs go in the account's `settings.json`,
+  outside git. The text is in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 2*, and
+  [`docs/WORKTREES.md`](docs/WORKTREES.md).
+- Give each session its own git worktree and start the session in it (`spawn.ps1`). Never brief a
+  worker, subagent or session, to relocate into one; give it `isolation: worktree` and have it run `ensure-venv.ps1`
+  before its first `pytest`, `mypy` or `ruff` run. [`docs/WORKTREES.md`](docs/WORKTREES.md), "Start
+  the session in the worktree", says why. The AI project memory is shared across sessions, so
+  coordinate memory writes.
 - Read a role playbook from the **`MEFORORG/korus`** repository, and read it at `origin/main`
   rather than out of a working tree. Owner ruling 2026-09-04.
 
@@ -605,7 +492,12 @@ gates a merge**, and no seat has to clear one.
   [`.claude/settings.json`](.claude/settings.json), which also drops the `Claude-Session:` trailer.
   Your own session reminder may still tell you to add the trailer. Do not. If one appears in a
   message you are about to commit, your session is reading a stale or user-scope setting, so remove
-  it by hand.
+  it by hand. A local `commit-msg` rule in `scripts/hooks/claim_check.py` refuses a line starting
+  `Co-Authored-By: Claude` or `Claude-Session:`. It is local and skippable, and GitHub's squash can
+  add the trailer anyway, so a clean hook run does not prove a commit on `main` is clean. After that file changes, the
+  installed copy changes only when `pwsh -NoProfile -File scripts\coord\install-git-hooks.ps1` runs
+  again. It copies from the checkout it runs in, so run it from an up-to-date `main`, never a
+  Builder's branch.
 - A long commit message can fail to parse. The harness reported a 1015-byte ceiling when it refused
   one on 2026-09-02; that number is not recorded anywhere in this repository, so treat it as a
   measurement rather than a contract. Write the message to a uniquely-named file **inside your own
@@ -852,93 +744,31 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   discussion, as this rule does below. That is code, not decoration, and it is how you talk about the
   banner alphabet without adopting it.
 
-  **Why this is a correctness rule and not a style preference.** A glyph's meaning is *positional*, and
-  that is invisible to anyone who learns it from examples rather than from its definition. Measured
-  2026-08-04: the backlog's `✅` means "this item is closed" **only** in the leading blockquote — quoted
-  in an item's prose it is narrative. Two parsers of the same file disagreed on exactly that, one
-  reading "the glyph appears in this item" and the other "this item declares closed status", and they
-  **agreed on the current corpus by luck** because no item happens to have the discriminating shape.
-  Words carry their scope in the sentence around them; a bare glyph does not, so it invites
-  presence-equals-meaning reading and hides the ambiguity from review.
+  **Why this is a correctness rule and not a style preference.** A glyph's meaning is
+  *positional*, so a reader who learns it from examples reads presence as meaning, and two parsers
+  of one file once disagreed on exactly that. Emoji also need variation-selector handling in every regex, and
+  they raise `UnicodeEncodeError` on a stock Windows cp1252 console.
 
-  Secondary but real: emoji need variation-selector handling (`️`) in every regex that touches
-  them, and they raise `UnicodeEncodeError` on a stock Windows cp1252 console — which cost four
-  separate failures in one session.
+  **No NEW glyph vocabulary may be introduced anywhere.** The local `new-glyph` pre-commit hook
+  catches part of this. It refuses a staged diff whose added lines carry more glyphs from the hook's
+  banned ranges than the removed lines held. It skips exempt paths, has no CI mirror, and does not
+  read commit messages. The former status glyphs still in the tree are decoration. Removing them is
+  a migration with its own item, so do not sweep them out of files you are editing for another
+  reason.
 
-  **THE ONE HOLDOUT IS RETIRED, AND IT LEFT BY MIGRATION RATHER THAN BY EDIT (BACKLOG #1250).** It was
-  a machine-parsed contract: `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` encoded
-  item status as a banner alphabet, `scripts/docs/backlog_status_check.py` defined it, and
-  `.github/workflows/backlog-hygiene.yml` quoted it. The PARSING went to the maintainer-internal
-  repository on 2026-09-13 with the ledger itself.
+  **Do not delete `.github/workflows/backlog-hygiene.yml`, rename its job, or drop either trigger.**
+  The job's `name:` is a REQUIRED status-check context, and a required context that never reports
+  wedges every pull request. Retiring it is a branch-protection change; read that file's header
+  first.
 
-  **TWO OF THOSE FOUR FILES ARE STILL TRACKED HERE, AND DELETING ONE OF THEM WEDGES EVERY PULL
-  REQUEST.** This paragraph previously read "all four went", which invites a tidier to remove a merge
-  gate. Measured 2026-09-16 with `git ls-files`: `BACKLOG-CLOSED.md` and `backlog_status_check.py` are
-  gone, `docs/BACKLOG.md` is still tracked as a stub, and `.github/workflows/backlog-hygiene.yml` is
-  still tracked **because its `name:` is a REQUIRED status-check context in branch protection**. The
-  job itself is a deliberate no-op that prints why it has nothing to check. Deleting it, renaming it,
-  or dropping either trigger makes the context never report -- and a required context that never
-  reports does not fail, it WEDGES, in the queue and out of it. Retiring it is a branch-protection
-  change, not an in-repo edit. That file's own header is the source of record; read it first.
+  **The warning sign (U+26A0) is not sanctioned (owner ruling 2026-08-14).** Retiring it is BACKLOG
+  #1265, sliced by owner go, and *not* a licence to edit lines outside a ruled slice.
+  `tests/test_operator_docs_no_warning_sign.py` pins each slice.
 
-  **SO NO GLYPH IN THIS REPOSITORY CARRIES MACHINE-PARSED MEANING ANY MORE, AND THE RULE ABOVE IS NOW
-  UNCONDITIONAL HERE.** Nothing reads a status banner; nothing may start.
-
-  **THAT IS NOT THE SAME AS THE GLYPHS BEING GONE, and the difference is the next person's trap.**
-  Measured 2026-09-13, git-tracked files, after the move: the five former status glyphs still appear
-  **557 times across 61 files** — 133 in `docs/FEATURE-MAP.md`, 124 in `docs/CONNECTIONS.md`, 63 in
-  one benchmark status page, and a long tail. Every one of them is now plain decoration, which the
-  rule forbids outright. They were tolerated only because a parser depended on them, and that parser
-  is gone. **Removing them is a migration with its own item, not a doc edit** — the same standing this
-  paragraph used to give the holdout — so do not start sweeping them out of files you are editing for
-  another reason. **No NEW glyph vocabulary may be introduced anywhere.**
-
-  **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
-  is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
-  anywhere; it is decoration, which the rule above forbids outright. Retiring it is **BACKLOG #1265**,
-  a filed migration, sliced by owner go (the 2026-09-30 ruling quoted below is the latest) — *not* a
-  licence to edit lines outside a ruled slice, and not a cp1252 hazard (the cp1252 gate covers
-  `scripts/**/*.py`, which contains none of them).
-
-  **The measured population is recorded here so nobody re-derives the false zero that stalled this
-  question once already. Re-censused over git-tracked files 2026-09-13, after the ledger left: 256
-  occurrences across 67 files** — 172 under `docs/`, 37 in `docs/adr/`, 26 in `harness/`, 8 in
-  `tests/`, 4 in `ide/`, 3 in engine source, 3 at the repository root, 2 in the web console, 1 under
-  `.github/`, and **zero in `scripts/`**. 23 tracked files did not decode and were not counted.
-  **Re-censused 2026-09-30 by codepoint: 223 across 48 files at `a4c42c86e9`, and 161 across 26
-  after the live-docs slice below.** After the `CONFIGURATION.md` slice it read 154 across 24, at
-  `cf9224acca`. The control `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` read 93 each time,
-  and the same 23 undecodable files were skipped. 142 of the 154 sit under `docs/benchmarks/`.
-
-  **The previous figure was 476, and 218 of those left with the ledger rather than being fixed.** That
-  is the whole of the drop: `BACKLOG.md` carried 125 and `BACKLOG-CLOSED.md` 93. A migration is not
-  remediation, and reading the smaller number as progress on #1265 would be wrong.
-
-  Earlier slices were real, and `tests/test_operator_docs_no_warning_sign.py` pins each at zero or
-  at a named ceiling: the five shipped operator docs — `SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`,
-  `DEPLOYMENT.md`, `CONNECTIONS.md`; every top-level `docs/adr/*.md` (PR 1604, 31 sites, with
-  `README.md` finished later); and the live docs plus code comments and docstrings, 62 sites. That
-  last slice rests on the owner ruling of 2026-09-30, given to the batch 183 Manager in session:
-  *"the sweep extends beyond docs/adr/ to live docs and code comments. Dated benchmark and status
-  records are exempt and must be named as exempt. The CLA and license banners are reviewed
-  separately, not in this sweep."* What still carries the glyph is named in that test with its
-  reason: `docs/benchmarks/` and `CHANGELOG.md` as dated records, `CLA.md` and
-  `COMMERCIAL-LICENSE.md` for the owner's separate review, seven glyphs inside user-visible string
-  literals, and test data in `tests/test_ledger_check.py`. `docs/CONFIGURATION.md` and
-  `messagefoundry/config/settings.py` were held until BACKLOG #1504 landed, then swept, 7 sites.
-
-  **Two rows of the filed table were instrument errors, both SDS-3.8, and they are kept because the
-  errors recur.** It read the web console as zero by counting `packaging/`; the console's source is
-  `messagefoundry_webconsole/`. And it had no `harness/` row at all, so 26 occurrences sat outside
-  every bucket while the buckets still printed a confident total.
-
-  **CENSUS THIS POPULATION WITH A POSITIVE CONTROL, AND THE OLD CONTROL IS GONE.** The first attempt
-  ever made returned a false zero off a broken shell escape, and a pattern that finds nothing anywhere
-  is indistinguishable from a clean repo. The control used to be the ledger's own counts; those files
-  are no longer here. Use `docs/FEATURE-MAP.md` and `docs/CONNECTIONS.md`, which carry 133 and 124
-  status glyphs: an instrument that cannot find those proves nothing by returning zero anywhere else.
-  **Do not print a glyph to a Windows console while measuring** — a stock cp1252 terminal raises
-  `UnicodeEncodeError` and kills the run mid-report, which happened during this very census.
+  **Census glyphs with a positive control.** `docs/FEATURE-MAP.md` and `docs/CONNECTIONS.md` carry
+  many, so an instrument that finds none there proves nothing. Do not print a glyph to a cp1252
+  console while measuring. The history and the censuses are in [`docs/METHOD.md`](docs/METHOD.md),
+  *CLAUDE.md text moved in wave 2*.
 - Specs/requirements in **Markdown**, kept consistent across the project.
 - Document each connector/transport and transform with its config schema and an example
   message.
@@ -977,42 +807,15 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   ([ADR 0039](docs/adr/0039-database-tier-sharding-l5.md), L5 — **shelved**). The two axes are different
   (e.g. "cross-shard reads span K stores" is true only of *database* shards; *engine* shards share one
   store), and conflating them causes real errors.
-- **ASVS vocabulary: the SUBJECT is the engine, and the record lives elsewhere — never let the storage
-  location name the thing.** An **ASVS cell** is one requirement's graded row (verdict + reasoning +
-  citations; the scorecard is literally `[[cell]]`). An **anchor** is a citation from a cell to a line
-  of engine code. The **verifier** is `scripts/asvs/scorecard.py` — the INSTRUMENT, not the record.
-  When a cell's anchor points at code that has moved or gone, say **"the cell has a stale anchor"**:
-  the engine is not insecure and the vault is not broken, the *evidence* went stale — usually
-  **because the code got better and the fix deleted the line the anchor quoted**.
-  - **"Elsewhere" is where, and reading it is one command.** The record is
-    `docs/security/asvs-scorecard.toml` in the separate `MessageFoundry-vault` clone, checked out
-    **beside this repository** (the same clone [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md) describes).
-    `docs/security/` is gitignored here, so from an engine checkout `git ls-files docs/security`
-    returns **zero** — the record does not look misplaced, it looks like it does not exist, which is
-    why sessions conclude there is nothing to read. The current score, with **no** engine tree, corpus
-    or network needed, in well under a second:
+- **ASVS vocabulary lives in [`scripts/asvs/CLAUDE.md`](scripts/asvs/CLAUDE.md).** Never say "vault
+  cell", "gate cell" or "vault gate cell"; say "the cell has a stale anchor", and keep that apart
+  from *verifier drift*. The vocabulary is public; cell ids, coverage and gaps stay vaulted, and so
+  does any map pairing cell ids with paths. Quote a number the tool prints only with the ref pair it
+  prints beside it. The current score:
 
-    ```
-    python scripts/asvs/scorecard.py --scorecard <vault>/docs/security/asvs-scorecard.toml --status
-    ```
-
-    A full verify additionally needs `--corpus` and an **explicit `--root`** naming the engine tree.
-    `--root` is REQUIRED in verify mode and `verify` refuses a root that CONTAINS the scorecard:
-    resolving anchors against the repository that stores the record produces a self-consistent, wrong
-    answer, and the vault carries its own tracked copy of `messagefoundry/` for exactly that trap to
-    fall into. **No number this tool prints is a fact without the ref pair it prints beside it** — the
-    `# asvs-verify scorecard=X engine=Y` header is part of the measurement, not decoration.
-  - **Never say "vault cell", "gate cell", or "vault gate cell".** All three name the filing cabinet
-    instead of the subject, and the third also fuses the checker with the checked — a cell exists
-    whether or not any job is running. Measured 2026-08-12: that phrasing sent a reader looking at the
-    vault, where nothing was wrong, for a defect that lived in engine code.
-  - **Keep "verifier" and "verification" apart.** *Verifier drift* = a copy of the tool differs from
-    the engine's. *Stale anchors* = the evidence moved. Different failures with adjacent names; the
-    gate's own comment says the two "are easy to confuse", and instrument drift once made the gate
-    **not run at all** on every matching pull request.
-  - **The VOCABULARY is public; the CONTENT is not.** Cell ids, coverage and gaps stay vaulted — a
-    path-to-cell map enumerates what IS covered over a closed public domain, so it hands out what is
-    NOT by subtraction. Naming the terms discloses nothing; pasting the scorecard does.
+  ```
+  python scripts/asvs/scorecard.py --scorecard <vault>/docs/security/asvs-scorecard.toml --status
+  ```
 
 **Don't**
 - Don't manipulate HL7 with raw string slicing.
@@ -1026,55 +829,22 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 - Don't build a **"channel"/"route" element** (an object, runner, or config surface that bundles
   the graph) — the words are fine as descriptive language, the deployed element is not. Don't
   accept-and-drop a received message.
-- Don't build **visual / template-driven authoring** (drag-drop transformer, declarative
-  field-mapping) — **declined-by-design (v0.2+)**: code-first Routers/Handlers *are* the
-  differentiator (BACKLOG #26 — closed, so it lives in
-  [the maintainer-internal ledger](docs/BACKLOG.md), not in the
-  live ledger). *Narrow carve-out (2026-07-10, #26 amendment; widened to Routers 2026-08-05 per
-  [ADR 0076](docs/adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment D, BACKLOG
-  #232):* a **structured Steps view** over real Python Handlers **and Routers** via a typed action
-  vocabulary (BACKLOG #222 — closed, same archive; the router `route` row kind is #232, still open
-  in [`docs/BACKLOG.md`](docs/BACKLOG.md), ADR-gated) is permitted — the
-  carve-out was granted because the `.py` stays the **only artifact and the only execution path**,
-  and that property holds identically for a `@router` (a byte-splice Steps view over a real
-  `@router` projects destination selection from reviewable Python; it introduces no declarative
-  artifact and no second execution path), so naming Routers does not cross the #26 line;
-  declarative logic execution, declarative field-mapping, and drag-drop canvas logic authoring
-  remain declined.
-- Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity —
-  **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
-  (BACKLOG #27 — closed, so it lives in
-  [the maintainer-internal ledger](docs/BACKLOG.md), not in the
-  live ledger; the connector-parity row is [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
-- Don't build **per-key message ordering** — canonically **sequence-keyed lanes** over a **sequence
-  key**; older text writes it `partition_key` or "order-group sharding", both retired by the
-  2026-06-30 naming lock — **declined-by-design (owner ruling 2026-09-20)**: the demand gate closed
-  **unfired**. Its trigger was specifically **one ordered interface exceeding about 60 msg/s**, and
-  the owner has ruled that trigger is not expected to fire. The
-  [ADR 0052](docs/adr/0052-enterprise-scale-target.md) scale target does not imply it — 45M/day
-  across 1,500 connections is about 0.35 events per second per connection, roughly 170x below the
-  one-lane bound, so the target is met by **concentration**, not per-lane speed. **This is not a
-  claim that the feature is impossible or unsound:** it is a real capability with a real cost the
-  owner has decided never to pay. The accepted consequence is that one strictly-ordered feed stays
-  core-bound, and the owner has separately ruled out relaxing order as the alternative, so a feed
-  that outgrows a core is answered by fanning out at source. **The decline does not rest on the
-  purity argument and nothing should:** the 2026-07-09 decline that did was overturned as
-  **invalid**, because purity binds `@router`/`@handler` and not connectors (§2, the reliability
-  invariant; the side-effects half is in
-  [`messagefoundry/CLAUDE.md`](messagefoundry/CLAUDE.md)). (BACKLOG #3 — closed, so it lives in
-  [the maintainer-internal ledger](docs/BACKLOG.md), not in the
-  live ledger.)
-- Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** — **declined-by-design
-  (2026-08-07)**, three reasons each independently sufficient: no free or open-source
-  5055-conformant **Python** analyser exists (the conformant ecosystem is C/C++/Java/C#/COBOL-
-  weighted), there is no contract counterparty for the clause the standard exists to support (it is
-  written into development and outsourcing contracts; this is OSS on PyPI), and a weakness-**count**
-  score collides with the anti-metric rule in
-  [`docs/Code_Quality_Standards.md`](docs/Code_Quality_Standards.md) §4.1. **The catalogue is a
-  different question and was adopted:** the ASCQM 1.1 weakness list is free from OMG, one bounded
-  pass over it ran under **#1073**, and its findings are **#1089–#1093**. Re-running that pass is
-  legitimate; adopting the score is not. *(#1073 is closed, so it lives in
-  [the maintainer-internal ledger](docs/BACKLOG.md) once archived,
-  not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
-  construction, so it must not cite only the live file.)*
+- Don't build **visual / template-driven authoring** -- **declined-by-design (v0.2+)**, BACKLOG #26.
+  The narrow Steps-view carve-out over real Handlers and Routers stands (2026-07-10, widened
+  2026-08-05 by [ADR 0076](docs/adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment D;
+  BACKLOG #222, #232) because the `.py` stays the only artifact and the only execution path.
+  Declarative logic execution, declarative field-mapping and drag-drop canvas logic authoring remain
+  declined. Reasoning: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), *Declined by design*.
+- Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity --
+  **declined-by-design (v0.2+)**, BACKLOG #27. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+  *Declined by design*.
+- Don't build **per-key message ordering** (sequence-keyed lanes; older text says `partition_key` or
+  "order-group sharding") -- **declined-by-design (owner ruling 2026-09-20)**, BACKLOG #3. One
+  strictly-ordered feed stays core-bound by design, and relaxing order is ruled out too;
+  [ADR 0052](docs/adr/0052-enterprise-scale-target.md) does not imply it, and the decline does not
+  rest on the purity argument. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), *Declined by
+  design*.
+- Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** -- **declined-by-design
+  (2026-08-07)**. The ASCQM catalogue was adopted instead (#1073, findings #1089-#1093). See
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), *Declined by design*.
 

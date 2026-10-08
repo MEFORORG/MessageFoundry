@@ -95,9 +95,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # {outcome}, the console's resolve of an interrupted release.
 # Vault BACKLOG #2625 added one /ui route and no JSON route: GET /ui/messages/{message_id}/resend-done.
 # BACKLOG #2331 added one JSON route: GET /users/{user_id}/federated-identity, users:manage.
+# BACKLOG #2446 added one /ui route and no JSON route: GET /ui/audit/export, audit:export, the
+# engine's audit export streamed from the console session.
 _ROUTES_DEFAULT = 116
 _ROUTES_WITH_DOCS = 120
-_ROUTES_WITH_UI = 242
+_ROUTES_WITH_UI = 243
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -360,6 +362,11 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
     ),
     "AlertsConfig": "sink configuration; credentials never returned",
     "AttachmentInfo": "content_type/id/total_bytes — attachment metadata, never bytes",
+    "ConnectionEventList": (
+        "GET /events envelope: limit/offset/total/before_id + ConnectionEventInfo rows (mapped; "
+        "reason gated, BACKLOG #2443); the envelope's own fields are counts and a row id (BACKLOG "
+        "#2438)"
+    ),
     "DeadLetterList": (
         "envelope: limit/offset/total + DeadLetterRow rows (mapped) + DeadLetterTarget replay "
         "targets + the replayable_in_scope flag"
@@ -943,6 +950,19 @@ def test_route_count_parity_with_the_console_mounted() -> None:
         "the /ui plane's route count changed; update docs/SECURITY.md's counting basis and the "
         "'N routes + one /ui/static mount' statement in the same change."
     )
+    # The prose counts are derived, not pinned: when two branches each add a /ui route, git merges
+    # their identical doc bumps cleanly and leaves every sentence one short while the constant
+    # above is fixed by hand. Only a check against the live rows catches that.
+    rows = _ui_route_rows()
+    console, gated = len(rows), sum(1 for row in rows if row[3] is not None)
+    doc = " ".join(_doc_text().split())
+    for sentence in (
+        f"`create_app(serve_ui=True)` yields {_ROUTES_WITH_UI}",
+        f"({_ROUTES_DEFAULT} + the {console} console routes + the `/ui/static` mount)",
+        f"the `/ui` plane adds **{console} routes + one `/ui/static` mount**",
+        f"{gated} of the {console} carry a gate",
+    ):
+        assert sentence in doc, f"docs/SECURITY.md should read: {sentence}"
 
 
 #: Gate names that appear in the doc but are not the wrapper the introspection reports, because the

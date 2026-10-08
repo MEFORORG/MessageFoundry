@@ -112,6 +112,7 @@ from messagefoundry.transports.rest import (
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
+    revocation_attestation_from_settings,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
@@ -1272,10 +1273,7 @@ class FhirLookupExecutor:
         # the runner. A FhirLookup connection has no Destination to carry it (unlike every other
         # HTTP-family hop), which is why this executor's opener map could not name an internal CA at
         # all. `None` (a direct test build) = the OS trust store, byte-identical.
-        from messagefoundry.transports.smart import (
-            revocation_attestation_from_settings,
-            token_provider_from_settings,
-        )
+        from messagefoundry.transports.smart import token_provider_from_settings
 
         self._base: dict[str, str] = {}
         self._headers: dict[str, dict[str, str]] = {}
@@ -1316,11 +1314,15 @@ class FhirLookupExecutor:
             # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
             # Validated like the DB lookups': a flag written into this mutable dict without its
             # reason is refused here rather than crossing unexplained.
-            attested = hop_attestation_from_settings(s)
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
             # arrives in these settings, mirrored from the spec's typed fields by
             # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
-            lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
+            # Vault BACKLOG #3139: a refusal from either reader names the lookup, as the url checks do.
+            try:
+                attested = hop_attestation_from_settings(s)
+                lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
+            except ValueError as exc:
+                raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
             # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND
             # the SMART token endpoint (None → byte-identical). Bypass resolved per target host (#128).
             proxy = egress_route_from_settings(
@@ -1389,7 +1391,10 @@ class FhirLookupExecutor:
                 # the hop that pulls patient data back. Called AFTER the opener, and handed it, so a
                 # [tls].crl_file that reached THIS lookup's own context relaxes the refusal and a
                 # lookup the CRL never reached keeps it (BACKLOG #2188).
-                rev_attested, rev_reason, _ = revocation_attestation_from_settings(s)
+                try:
+                    rev_attested, rev_reason, _ = revocation_attestation_from_settings(s)
+                except ValueError as exc:
+                    raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
                 refuse_unrevoked_verified_hop(
                     scheme,
                     url,

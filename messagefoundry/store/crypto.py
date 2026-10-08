@@ -125,6 +125,7 @@ AuditMacFn = Callable[[bytes], str]
 
 if TYPE_CHECKING:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.hmac import HMAC
 
 _log = logging.getLogger(__name__)
 
@@ -180,6 +181,17 @@ _AUDIT_MAC_LEN = 32  # bytes — HMAC-SHA256 key
 # additive label, never a silent change to an existing deployment's derived key.
 _ROTATION_FP_INFO = b"mefor/secret-rotation-fingerprint/v1"
 _ROTATION_FP_LEN = 32  # bytes — HMAC-SHA256 key
+
+# HKDF info label for the audit body-digest key (vault BACKLOG #2615). An edit-resend's audit row holds
+# a KEYED digest of the original and the edited body, so a site can show afterwards what was sent once
+# retention has blanked both bodies. Keyed, never a plain hash: a short PHI body (one result value, one
+# name) is guessable, and a plain digest kept forever in the audit log would let anyone holding the log
+# test guesses offline. Its own label, so a digest can never pass for an audit-chain MAC or a
+# rotation fingerprint, and the reverse.
+_BODY_DIGEST_INFO = b"mefor/audit-body-digest/v1"
+_BODY_DIGEST_LEN = 32  # bytes — HMAC-SHA256 key
+#: The algorithm name an audit row records beside each body digest.
+BODY_DIGEST_ALG = "hmac-sha256"
 
 # Per-store data sub-key (ADR 0196, BACKLOG #2070). The cell-bound writer seals under
 # HKDF-SHA256(DEK, salt=None, info=_STORE_DATA_KEY_INFO || store_salt), not under the DEK itself. Each
@@ -632,6 +644,83 @@ def _derive_rotation_fp_key(audit_mac_key: bytes) -> bytes:
         algorithm=hashes.SHA256(), length=_ROTATION_FP_LEN, salt=None, info=_ROTATION_FP_INFO
     )
     return hkdf.derive(audit_mac_key)
+
+
+def _derive_body_digest_key(audit_key: bytes) -> bytes:
+    """The body-digest key derived from one audit-chain key, under its own label."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(), length=_BODY_DIGEST_LEN, salt=None, info=_BODY_DIGEST_INFO
+    )
+    return hkdf.derive(audit_key)
+
+
+def _body_mac(key: bytes, body: str) -> HMAC:
+    """An HMAC-SHA256 context over ``body``, ready to finalize or verify. The ``cryptography`` HMAC
+    this module already uses for HKDF, so its ``verify`` gives the constant-time compare."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives import hmac as crypto_hmac
+
+    mac = crypto_hmac.HMAC(key, hashes.SHA256())
+    # surrogatepass: a body decoded with surrogateescape still digests, rather than raising here.
+    mac.update(body.encode("utf-8", "surrogatepass"))
+    return mac
+
+
+def audit_body_digests(cipher: Cipher, /, **bodies: str) -> dict[str, str | None] | None:
+    """Keyed digests of message bodies for an audit row (vault BACKLOG #2615).
+
+    Returns ``{"alg", "key_id", <name>: <hex or None>, ...}``, one entry per keyword. An empty body,
+    such as one retention has already blanked, digests to ``None`` rather than to the digest of
+    nothing. ``key_id`` is :func:`audit_key_id` of the audit key the digest key was derived from, so
+    :func:`verify_audit_body_digest` can still find that key after a rotation.
+
+    The key is HKDF-SHA256 over the in-heap audit-chain key under ``mefor/audit-body-digest/v1``. So
+    a reader of the audit log who lacks the store key cannot recover or test a body from its digest,
+    and anyone who holds a candidate body and the key can confirm it. The digest is deterministic
+    under one key, so such a reader can still see that two digests match. Returns ``None`` when there is no
+    in-heap key: a keyless store, or a Vault Transit cipher whose audit key never enters the engine.
+    The caller records that as no digest, never as a plain hash.
+
+    The digest outlives a key rotation only while the retired key stays configured: the audit chain's
+    keyed ranges have the same dependency, so keep a retired key for as long as its rows must
+    verify."""
+    reserved = {"alg", "key_id"} & bodies.keys()
+    if reserved:
+        raise ValueError(f"body names {sorted(reserved)} collide with the digest's own fields")
+    audit_key = cipher.audit_mac_key()
+    if audit_key is None:
+        return None
+    key = _derive_body_digest_key(audit_key)
+    out: dict[str, str | None] = {"alg": BODY_DIGEST_ALG, "key_id": audit_key_id(audit_key)}
+    for name, body in bodies.items():
+        out[name] = _body_mac(key, body).finalize().hex() if body else None
+    return out
+
+
+def verify_audit_body_digest(cipher: Cipher, body: str, *, key_id: str, digest: str | None) -> bool:
+    """Whether ``body`` is the body an audit row's ``digest`` was taken of (vault BACKLOG #2615).
+
+    Looks the audit key up by ``key_id`` in the cipher's keyring, so a digest taken before a key
+    rotation still verifies while the retired key is configured. ``False`` for an unknown key id, a
+    keyless cipher, a ``None`` digest (a body retention had already blanked), or a mismatch. The
+    comparison is constant-time."""
+    audit_key = cipher.audit_mac_keyring().get(key_id)
+    if audit_key is None or not body or not isinstance(digest, str):
+        return False
+    try:
+        expected = bytes.fromhex(digest)
+    except ValueError:
+        return False
+    from cryptography.exceptions import InvalidSignature
+
+    try:
+        _body_mac(_derive_body_digest_key(audit_key), body).verify(expected)
+    except InvalidSignature:
+        return False
+    return True
 
 
 def new_store_salt() -> bytes:

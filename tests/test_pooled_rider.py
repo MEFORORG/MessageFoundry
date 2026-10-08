@@ -166,7 +166,7 @@ async def store(request: pytest.FixtureRequest, tmp_path: Path) -> AsyncIterator
     opener = {"sqlite": _open_sqlite, "sqlserver": _open_sqlserver, "postgres": _open_postgres}[
         backend
     ]
-    s = await opener(tmp_path)
+    s: Any = await opener(tmp_path)
     s._test_backend = backend  # tag so a test can branch on backend-specific access
     try:
         yield s

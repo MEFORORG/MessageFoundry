@@ -1261,10 +1261,10 @@ async def test_a_dr_release_checks_a_lane_whose_ca_failure_the_park_ended(
     await runner.start()
     try:
         assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
-        runner.set_dr_threshold(Priority.NORMAL)
+        runner.set_dr_threshold(Priority.NORMAL, standby=None)
         await runner.reload(_outbound_registry(ca, pin, priority=Priority.LOW))
         assert "OUT" not in runner.degraded_outbound()  # parked, and its failed record cleared
-        runner.set_dr_threshold(None)
+        runner.set_dr_threshold(None, standby=None)
         with pytest.raises(WiringError, match=_PIN_MISMATCH):
             await runner.reload(_outbound_registry(ca, pin, priority=Priority.LOW))
 

@@ -46,8 +46,8 @@ ADT = (
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     # A DR box: dr.enabled so the coordinator builds; activate=false so it starts un-activated (the box
-    # comes up serving its full graph; the test activates it, then fails it back). store_settings present
-    # so the cold-seed key seam exists.
+    # comes up passive, with no listener bound, vault BACKLOG #3140; the test activates it, then fails
+    # it back). store_settings present so the cold-seed key seam exists.
     store = await MessageStore.open(tmp_path / "fb.db")
     eng = Engine(
         store,
@@ -94,7 +94,10 @@ async def test_release_drains_then_hands_back(engine: Engine, tmp_path: Path) ->
     await engine.start()
 
     rr = engine.registry_runner
-    assert rr is not None and rr.inbound_running("in_crit")
+    assert rr is not None and not rr.inbound_running("in_crit")  # passive: nothing bound
+    # Serve under the DR profile, through the engine callback the coordinator runs on activation.
+    await engine._dr_activate_profile()
+    assert rr.inbound_running("in_crit")
 
     # Enqueue a message at ingress (as a received inbound message would) — the worker routes + delivers.
     await engine.store.enqueue_ingress(
@@ -108,7 +111,6 @@ async def test_release_drains_then_hands_back(engine: Engine, tmp_path: Path) ->
 
     # Fail back: drain-then-hand-back via the engine's DR-release callback (what POST /dr/release runs).
     # It unbinds intake + drains the staged queue to completion before returning.
-    engine._dr_active = True  # simulate "currently serving under the DR profile"
     await engine._dr_release_drain()
 
     # No listener is bound after the hand-back (no dual-accept window while the VIP moves).
