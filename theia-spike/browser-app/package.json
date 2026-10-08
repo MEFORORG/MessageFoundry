@@ -7,7 +7,7 @@
     "target": "browser",
     "frontend": {
       "config": {
-        "applicationName": "MessageFoundry Steps (spike S-1)",
+        "applicationName": "MessageFoundry Steps (spike S-2)",
         "preferences": {
           "security.workspace.trust.enabled": false
         }
@@ -19,6 +19,7 @@
     "@theia/core": "1.76.0",
     "@theia/editor": "1.76.0",
     "@theia/filesystem": "1.76.0",
+    "@theia/messages": "1.76.0",
     "@theia/monaco": "1.76.0",
     "@theia/navigator": "1.76.0",
     "@theia/preferences": "1.76.0",

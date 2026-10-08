@@ -37,7 +37,7 @@ export interface StepsWidgetOptions {
 /** What the spike records for its own measurement (read by the Playwright smoke test). */
 export interface StepsSpikeEvent {
     at: number;
-    kind: 'render' | 'render-error' | 'edit' | 'edit-refused' | 'undo' | 'redo' | 'webview' | 'unsupported';
+    kind: 'render' | 'render-error' | 'edit' | 'edit-refused' | 'undo' | 'redo' | 'webview' | 'unsupported' | 'panel-message';
     detail?: string;
 }
 
@@ -51,12 +51,36 @@ declare global {
 export class StepsWidget extends BaseWidget implements SaveableSource {
     static readonly FACTORY_ID = 'mf-steps-spike';
 
+    /** Open Steps views, most recently activated last. FR-17 sends a message to the last visible one. */
+    protected static readonly instances: StepsWidget[] = [];
+
+    /** The Steps view a message should land in, or undefined when none is showing. */
+    static panelTarget(): StepsWidget | undefined {
+        const visible = StepsWidget.instances.filter(w => w.isVisible && w.isAttached);
+        return visible[visible.length - 1];
+    }
+
+    /** Set by the analyst module only. A developer build keeps the text-editor controls. */
+    static analystBuild = false;
+
+    protected touch(): void {
+        const list = StepsWidget.instances;
+        const at = list.indexOf(this);
+        if (at !== -1) {
+            list.splice(at, 1);
+        }
+        if (!this.isDisposed) {
+            list.push(this);
+        }
+    }
+
     @inject(StepsWidgetOptions) protected readonly options!: StepsWidgetOptions;
     @inject(StepsLensService) protected readonly lens!: StepsLensService;
     @inject(MonacoTextModelService) protected readonly textModels!: MonacoTextModelService;
 
     protected model: MonacoEditorModel | undefined;
     protected readonly banner = document.createElement('div');
+    protected readonly messages = document.createElement('div');
     protected readonly frame = document.createElement('iframe');
     protected readonly modelDisposables = new DisposableCollection();
     protected assets: { script: string; style: string } | undefined;
@@ -106,7 +130,12 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
         this.frame.style.flex = '1';
         this.frame.style.border = 'none';
         this.frame.style.width = '100%';
-        this.node.append(this.banner, this.frame);
+        // FR-17: messages for the analyst land here, under the banner, not in a pop-up.
+        this.messages.className = 'mf-steps-messages';
+        this.messages.setAttribute('role', 'log');
+        this.messages.setAttribute('aria-live', 'polite');
+        this.messages.style.padding = '0 8px';
+        this.node.append(this.banner, this.messages, this.frame);
         this.toDispose.push(this.modelDisposables);
         this.toDispose.push({
             dispose: () => {
@@ -139,11 +168,43 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
         this.modelDisposables.push(this.model.onDidChangeContent(() => this.scheduleRender()));
         this.modelDisposables.push(this.model.onDirtyChanged(() => this.updateSummary()));
         await this.render();
+        // Registered only once the widget is whole, so a failed initialize leaves nothing behind.
+        this.touch();
+        this.toDispose.push({ dispose: () => this.touch() });
     }
 
     protected onActivateRequest(msg: Message): void {
         super.onActivateRequest(msg);
+        this.touch();
         this.frame.focus();
+    }
+
+    /**
+     * FR-17: show a message in this panel. The newest is on top and the list keeps the last five, so a
+     * burst does not push the steps off screen. Each has a Dismiss button, so nothing needs a pop-up.
+     */
+    showPanelMessage(kind: 'info' | 'warning' | 'error', text: string): void {
+        const item = document.createElement('div');
+        item.className = `mf-steps-message mf-steps-message-${kind}`;
+        item.dataset.kind = kind;
+        item.style.display = 'flex';
+        item.style.gap = '8px';
+        item.style.padding = '2px 0';
+        item.style.color = kind === 'error' ? 'var(--theia-errorForeground)'
+            : kind === 'warning' ? 'var(--theia-editorWarning-foreground)' : 'var(--theia-foreground)';
+        const span = document.createElement('span');
+        span.textContent = text;
+        span.style.flex = '1';
+        const dismiss = document.createElement('button');
+        dismiss.className = 'theia-button secondary';
+        dismiss.textContent = 'Dismiss';
+        dismiss.addEventListener('click', () => item.remove());
+        item.append(span, dismiss);
+        this.messages.prepend(item);
+        while (this.messages.childElementCount > 5) {
+            this.messages.lastElementChild?.remove();
+        }
+        this.record('panel-message', `${kind}: ${text}`.slice(0, 200));
     }
 
     protected scheduleRender(): void {
@@ -284,6 +345,9 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
 <style>${this.themeShim()}</style>
 <style>${this.assets?.style ?? ''}</style>
+${StepsWidget.analystBuild
+        // S-2: the analyst build has no text editor, so the per-row jump-to-line control is hidden (FR-14).
+        ? '<style>button.jump { display: none !important; }</style>' : ''}
 </head><body>
   <div class="bar">
     <span><input id="stepsFilter" type="search" placeholder="Filter steps" /></span>
@@ -292,7 +356,7 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
     <button id="addAction" disabled>Add</button>
     <button id="pickSample">Pick Sample</button>
     <button id="test">Test</button>
-    <button id="openText" class="link">View as Code</button>
+    ${StepsWidget.analystBuild ? '<button id="openText" class="link" hidden></button>' : '<button id="openText" class="link">View as Code</button>'}
   </div>
   ${body}
   ${renderStepsContextMenuHtml()}
@@ -323,10 +387,20 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
                 this.model?.redo();
                 this.record('redo');
                 return;
+            case 'openText':
+            case 'openSource':
+                if (StepsWidget.analystBuild) {
+                    // ide/ opens the text editor here. The analyst build has none (FR-14), and the webview
+                    // controls that post these are hidden, so this is reached only by a forged message.
+                    this.record('unsupported', String(msg.command));
+                    this.showPanelMessage('info', 'Routers and Handlers open in the Steps view only. Ask a developer if the change needs code.');
+                    return;
+                }
+            // falls through: a developer build would open the text editor, which no spike implements yet
             default:
-                // Every other host message (structural ops, Test, pick sample, open text) is outside S-1.
+                // Every other host message (structural ops, Test, pick sample) is outside S-1 and S-2.
                 this.record('unsupported', String(msg.command));
-                this.showBanner(`"${String(msg.command)}" is not part of this spike.`, false);
+                this.showPanelMessage('info', 'That action is not available in this prototype yet.');
         }
     }
 
