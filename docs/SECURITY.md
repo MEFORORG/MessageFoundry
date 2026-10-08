@@ -3890,7 +3890,8 @@ Users are notified of security-relevant changes to their account through **two**
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
-  alert and once per credential per engine process like it. `temporary_credential_expiring` goes to
+  alert and once per credential like it. The holder's reminder audit row is the once-only mark, so
+  a restart inside the warn window sends none of the three again (BACKLOG #2303). `temporary_credential_expiring` goes to
   the holder and states the deadline. `temporary_credential_expiring_issuer` goes to the administrator
   who issued the password and names the account and the deadline. The engine finds that
   administrator from the audit row the create or reset wrote. It skips the administrator's reminder,

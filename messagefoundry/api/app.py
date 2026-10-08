@@ -9134,7 +9134,11 @@ async def _remind_expiring_initial_credentials(
     ``warned`` maps a user id to the deadline already reminded about. A new credential on the same
     account has a new deadline, so it is reminded about again. An entry is dropped once its account
     leaves every window (claimed, lapsed, disabled or deleted), so the map stays as small as the set
-    of live reminders."""
+    of live reminders.
+
+    The map is only a cache. The once-only mark is the holder's reminder audit row (BACKLOG #2303),
+    so an account missing from the map is checked against the store before anything is sent. A
+    restart inside the window therefore sends nothing again."""
     now = time.time() if now is None else now
     live: set[str] = set()
     for user in await auth.store.list_users():
@@ -9145,6 +9149,17 @@ async def _remind_expiring_initial_credentials(
             continue
         live.add(user.id)
         if warned.get(user.id) == deadline:
+            continue
+        try:
+            reminded = await auth.initial_credential_reminded(user, deadline=deadline)
+        except Exception:
+            # Not marked, so the next pass asks again; the accounts after this one still run.
+            _log.exception(
+                "initial credential reminder: could not read whether %s was reminded", user.username
+            )
+            continue
+        if reminded:
+            warned[user.id] = deadline
             continue
         expires = deadline_utc(deadline)
         if expires is None:
