@@ -364,8 +364,9 @@ pure-Python equivalent:
   the call that creates it and an existing file or link is refused. It asks `advapi32` to build
   that list and to resolve an account name to its SID. POSIX needs no `ctypes` for this; it
   creates the file with `O_CREAT | O_EXCL` and mode `0o600`
-- Log path check: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether View Log's
-  drive letter is a mapped network drive, so it can refuse one before opening the file
+- Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
+  of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
+  and again before View Log opens the file, so it can refuse one before touching it
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
   only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and the disaster-recovery takeover hook use it. On Windows it puts

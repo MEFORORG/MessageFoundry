@@ -39,8 +39,13 @@ _VSCODE_EXE = "Code.exe"
 _BATCH_SUFFIXES = frozenset({".cmd", ".bat"})
 #: Characters ``cmd.exe`` reads as syntax in a batch file's command line. Quoting does not make
 #: them all safe: ``%`` expands inside double quotes, and so does ``!`` under delayed expansion.
-#: This is the one place the set is written down; :func:`_cmd_would_reread` adds control characters.
-_CMD_REREAD_CHARS = frozenset('&|<>^%!()"')
+#: ``,`` ``;`` and ``=`` are argument delimiters there: in an unquoted batch-file path they cut
+#: the program name short, so a different file can run. :func:`_cmd_would_reread` adds control
+#: characters. docs/TRAY.md shows operators this set, and a test holds the two together.
+_CMD_REREAD_CHARS = frozenset('&|<>^%!()",;=')
+#: Electron reads this as "run as plain Node, not as the editor". ``code.cmd`` manages it itself;
+#: a direct start of the editor must not inherit it.
+_ELECTRON_RUN_AS_NODE = "ELECTRON_RUN_AS_NODE"
 
 
 def console_url(engine_url: str) -> str:
@@ -57,8 +62,12 @@ def _is_dir(path: str) -> bool:
 
 
 def _is_batch_file(path: str) -> bool:
-    """True when Windows would run ``path`` under ``cmd.exe`` (a ``.cmd`` or ``.bat`` file)."""
-    return ntpath.splitext(path)[1].casefold() in _BATCH_SUFFIXES
+    """True when Windows would run ``path`` under ``cmd.exe`` (a ``.cmd`` or ``.bat`` file).
+
+    Windows drops trailing dots and spaces from a file name, so ``code.cmd.`` is judged without
+    them.
+    """
+    return ntpath.splitext(path.rstrip(". "))[1].casefold() in _BATCH_SUFFIXES
 
 
 def _cmd_would_reread(text: str) -> bool:
@@ -219,8 +228,11 @@ def open_console(engine_url: str, *, opener: Callable[[str], object] | None = No
 
 def _run_detached(args: list[str]) -> None:
     creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    # The child gets the tray's environment, which is the signed-in user's, less the one variable
+    # that would make the editor executable run the folder as a script.
+    env = {k: v for k, v in os.environ.items() if k.upper() != _ELECTRON_RUN_AS_NODE}
     # shell=False does not keep cmd.exe out of a batch-file launch; see open_repo().
-    subprocess.Popen(args, shell=False, creationflags=creationflags)  # nosec B603 - argv is the launcher resolve_vscode() chose plus repo_path as one list item; open_repo() screens the batch-file case (BACKLOG #2327)
+    subprocess.Popen(args, shell=False, creationflags=creationflags, env=env)  # nosec B603 - argv is the launcher resolve_vscode() chose plus repo_path as one list item; open_repo() screens the batch-file case (BACKLOG #2327)
 
 
 class RepoPathRefused(ValueError):

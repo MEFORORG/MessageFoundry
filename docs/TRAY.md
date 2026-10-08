@@ -140,7 +140,7 @@ hands that program the folder as a single argument, with no command shell. So a 
 **The one case where a folder is refused.** Some setups have a `code.cmd` with no `Code.exe` in
 that place, for example a shim from a package manager. `code.cmd` is a batch file, and Windows
 runs a batch file through `cmd.exe`, which reads some characters in the command line as commands.
-Only then, the tray refuses a `repo_path` holding any of `& | < > ^ % ! ( )`, a double quote, or a
+Only then, the tray refuses a `repo_path` holding any of `& | < > ^ % ! ( ) , ; =`, a double quote, or a
 control character. It shows "Repo not opened" and starts nothing. This is wider than `cmd.exe`
 strictly needs. Rename the folder, or open it from VS Code itself. If that `code.cmd`'s own path
 holds one of those characters, the tray does not use it at all.
