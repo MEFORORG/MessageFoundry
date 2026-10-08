@@ -3456,8 +3456,17 @@ def _check_oidc_revocation(
 
 
 #: The name the two retention legs print where ``serve`` would print the environment, when the
-#: settings they read name none. ``serve`` takes it from ``--env``, which ``check`` does not have.
-_UNNAMED_ENVIRONMENT = "named by serve --env"
+#: settings they read name none. ``serve`` can take its own from ``--env``, which ``check`` does
+#: not have, or from a ``MEFOR_AI_ENVIRONMENT`` this command's environment does not hold.
+_UNNAMED_ENVIRONMENT = "not named in the settings check read"
+
+
+def _as_reported(text: str) -> str:
+    """Gate text for a check line. A record that starts ``AUDIT:`` is relabelled ``audit
+    record:``, so a search of CI logs for the record's own prefix does not match a ``check`` run,
+    where nothing started and nothing was audited."""
+    return f"audit record: {text.removeprefix('AUDIT: ')}" if text.startswith("AUDIT: ") else text
+
 
 #: The SKIP text both retention legs give an unresolved production tier.
 _TIER_UNRESOLVED = "the production tier is unresolved; the posture check reports it"
@@ -3469,24 +3478,31 @@ def _retention_posture(settings: ServiceSettings) -> tuple[str, bool, str] | Non
     Neither leg's verdict depends on the environment name or the production tier. Both only word
     the text. So with no active environment in the settings the legs still judge, because a site
     that names its environment only on ``serve --env`` would otherwise get no parity from them.
-    They print :data:`_UNNAMED_ENVIRONMENT` for the name and leave out the word "production",
-    and ``note`` says so on the line, since ``serve`` would print the real name and tier.
+    They print :data:`_UNNAMED_ENVIRONMENT` for the name. The tier is the explicit
+    ``[security].production_instance`` when the settings carry one; with none the word
+    "production" is left out. ``note`` says which on the line, since ``serve`` would print the
+    real name and tier. A leg appends it only to a line that prints the name.
 
     ``None`` when the environment is named but its production tier is unresolved, a custom name
     with no ``[security].production_instance``. ``serve`` stops on that before either retention
     gate, and the ``posture`` leg fails on it."""
     env_name = settings.ai.environment
+    # With a name: the explicit tier, else the built-in name's. With none: the explicit tier only.
+    production = settings.ai.derived_posture()
     if env_name is None:
-        return (
-            _UNNAMED_ENVIRONMENT,
-            False,
-            " [no active environment in the settings check read, so the environment name above "
-            "is a placeholder and the production tier is not known]",
+        placeholder = (
+            " [the settings check read name no environment, so the name above is a placeholder"
         )
-    try:
-        return env_name, settings.ai.require_posture(), ""
-    except ValueError:
+        if production is None:
+            return (
+                _UNNAMED_ENVIRONMENT,
+                False,
+                f"{placeholder} and the production tier is not known]",
+            )
+        return _UNNAMED_ENVIRONMENT, production, f"{placeholder}]"
+    if production is None:
         return None
+    return env_name, production, ""
 
 
 def _check_retention(
@@ -3513,8 +3529,8 @@ def _check_retention(
 
     Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`.
     :func:`_retention_posture` says what it does with no active environment and with an
-    unresolved production tier. The settings are the ones this leg loads, so a start that sets a
-    window on ``serve``'s own command line or in its own environment can still decide
+    unresolved production tier. The settings are the ones this leg loads, so a ``serve`` whose
+    own environment sets a window, or which reads another settings file, can still decide
     differently."""
     from pydantic import ValidationError
 
@@ -3564,7 +3580,8 @@ def _check_retention(
             name,
             ok=True,
             required=True,
-            detail=f"the retention start gate would refuse nothing and write nothing{note}",
+            # No note: this line prints no environment name for it to qualify.
+            detail="the retention start gate would refuse nothing and write nothing",
         )
     return CheckResult(
         name,
@@ -3572,7 +3589,7 @@ def _check_retention(
         required=True,
         detail=(
             "the retention start gate would refuse nothing, and write: "
-            + " | ".join(line.text for line in outcome.lines)
+            + " | ".join(_as_reported(line.text) for line in outcome.lines)
             + note
         ),
     )
@@ -3661,8 +3678,8 @@ def _check_retention_overrides(
             ok=True,
             required=True,
             detail=(
-                "the retention override guard would pass this graph and write: warning: "
-                f"{verdict.report}{note}"
+                "the retention override guard would pass this graph and report: "
+                f"{_as_reported(verdict.report)}{note}"
             ),
         )
     return CheckResult(

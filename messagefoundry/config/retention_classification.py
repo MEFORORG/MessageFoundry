@@ -389,7 +389,6 @@ def evaluate_retention_gate(
     # it deletes live operational data a Handler is still reading. (`purge_search_presets` keys on
     # last use since #306; the 2026-07-30 ruling still covers it.) Since BACKLOG #1967 they are not
     # merely warned either: each needs a window or its own acknowledgement, below.
-    defaulted: list[RetentionWindow] = []
     if not settings.retention.allow_unbounded_phi:
         defaulted = [
             w
@@ -553,8 +552,9 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
 def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None) -> str:
     """The refusal text for ``kept``, the non-empty result of :func:`keep_forever_overrides`.
 
-    Shared by the registry guard and ``connection upsert``, so an edit is refused in the words a
-    reload would use. ``env_name`` is ``None`` where no environment is active."""
+    :func:`judge_keep_forever_overrides` is its one caller, and the registry guard, ``check``,
+    ``supervise`` and ``connection upsert`` reach it through that, so an edit is refused in the
+    words a reload would use. ``env_name`` is ``None`` where no environment is active."""
     where = f" ({env_name!r})" if env_name is not None else ""
     # Only the auto-bounded windows lose a default. Naming them keeps an operator from setting a
     # window on a tier where a window is the wrong answer, such as transform state.

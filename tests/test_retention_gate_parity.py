@@ -302,7 +302,10 @@ def test_check_reaches_serves_verdict_in_serves_words(
         assert leg.detail.startswith(_WRITES)
         written = leg.detail.removeprefix(_WRITES).split(" | ")
         # Each line serve wrote, and no other. The two streams interleave, so compare sorted.
-        assert sorted(written) == sorted(served + audits)
+        # check relabels an AUDIT record, so its own output never reads as an audited start.
+        relabelled = ["audit record: " + a.removeprefix("AUDIT: ") for a in audits]
+        assert sorted(written) == sorted(served + relabelled)
+        assert "AUDIT:" not in leg.detail
 
 
 def test_check_says_so_when_nothing_reads_as_unbounded(tmp_path: Path) -> None:
@@ -342,12 +345,31 @@ def test_check_judges_settings_that_name_no_environment(tmp_path: Path) -> None:
     assert not leg.ok and not leg.skipped
     assert leg.detail.startswith(
         "serve would refuse to start (exit 2): a data-retention window is explicitly disabled "
-        f"for {_BODY} on a PHI instance ('named by serve --env'); refusing to start"
+        f"for {_BODY} on a PHI instance ('not named in the settings check read'); refusing to start"
     )
     assert leg.detail.endswith(
-        "[no active environment in the settings check read, so the environment name above is a "
-        "placeholder and the production tier is not known]"
+        "[the settings check read name no environment, so the name above is a placeholder and "
+        "the production tier is not known]"
     )
+
+    # An explicit tier is in the settings whatever names the environment, so the leg words it.
+    toml.write_text(
+        "security.production_instance = true\nsecurity.delete_message_bodies_after_days = 0\n",
+        encoding="utf-8",
+    )
+    leg = _retention_leg(toml)
+    assert f"for {_BODY} on a production PHI instance ('not named in the settings" in leg.detail
+    assert leg.detail.endswith("so the name above is a placeholder]")
+
+
+def test_a_line_that_prints_no_environment_carries_no_placeholder_note(tmp_path: Path) -> None:
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(
+        "security.delete_message_bodies_after_days = 30\n"
+        "[retention]\ndead_letter_days = 30\nreference_snapshot_days = 30\n",
+        encoding="utf-8",
+    )
+    assert _retention_leg(toml).detail == _SILENT
 
 
 def test_check_skips_on_an_unresolved_production_tier(tmp_path: Path) -> None:

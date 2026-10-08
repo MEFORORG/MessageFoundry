@@ -362,7 +362,7 @@ def test_check_refuses_the_graph_the_guard_refuses_in_the_guards_words(
 @pytest.mark.parametrize(
     ("switch", "written"),
     [
-        ("security.allow_keeping_phi_indefinitely = true\n", "AUDIT: the retention gate"),
+        ("security.allow_keeping_phi_indefinitely = true\n", "audit record: the retention gate"),
         ('security.enforcement = "warn"\n', "a per-connection retention override keeps"),
     ],
 )
@@ -383,8 +383,10 @@ def test_check_passes_and_carries_what_the_guard_would_write(
 
     assert leg.ok and not leg.skipped
     assert leg.detail.startswith(
-        f"the retention override guard would pass this graph and write: warning: {written}"
+        f"the retention override guard would pass this graph and report: {written}"
     )
+    # check relabels the guard's AUDIT line, so its own output never reads as an audited load.
+    assert "AUDIT:" not in leg.detail
     assert "IB_FEED" in leg.detail
     # The leg reports what the guard would write. It writes no AUDIT line or warning of its own.
     assert "AUDIT:" not in capsys.readouterr().err
@@ -410,8 +412,8 @@ def test_check_judges_the_override_when_the_settings_name_no_environment(
     # A site may name its environment only on `serve --env`. The verdict does not depend on it.
     _, leg = _overrides_leg(cfg, "")
     assert not leg.ok and not leg.skipped
-    assert "IB_FEED" in leg.detail and "('named by serve --env')" in leg.detail
-    assert "the environment name above is a placeholder" in leg.detail
+    assert "IB_FEED" in leg.detail and "('not named in the settings check read')" in leg.detail
+    assert "so the name above is a placeholder" in leg.detail
 
 
 def test_check_skips_the_override_leg_where_serve_builds_no_guard(
