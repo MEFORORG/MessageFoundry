@@ -644,6 +644,14 @@ records those accesses (no double-audit). The web console's gates write no grant
 `authorize_ui_ws`, which every same-origin browser `/ws/stats` handshake passes through. BACKLOG #1197
 tracks that gap.
 
+An admin route refused because it targets the caller's own account writes `auth.self_target_refused`
+on both planes (vault BACKLOG #3260). That covers reset-password, reset-mfa, the federated-identity
+bind and unbind, disable and delete. The row names the actor, the route as `op`, and the caller's
+stored id. The guard compares that stored id, not the path's spelling, because the console passes
+the path through as plain text and a case-insensitive store finds the row from another case (vault
+BACKLOG #3259). The `404` that `DELETE /me/sessions/{session_id}` answers for another account's
+session still writes no row of its own.
+
 So on the console, an operator action's own audit row is its only record. **At least these operator
 mutations commit that row in the same transaction as the change they record (vault BACKLOG #2624):**
 message replay, dead-letter replay (inline and released), an inline purge, resend, edit-and-resubmit
@@ -4667,7 +4675,7 @@ Every authentication and authorization event is written to the durable `audit_lo
 user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.logout` /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
-`auth.permission_denied` / `auth.channel_denied`, the 6.3.5 events `auth.account_locked` /
+`auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. PHI access (viewing a raw message or displaying patient summaries) is recorded
