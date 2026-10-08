@@ -481,6 +481,10 @@ three consequences for the AG:
 - CA rotation is make-before-break on every connecting host in both DCs
   ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5.3). Pin the CA, never the leaf.
 
+Every engine VM also needs the host cipher policy for the ODBC hops. The engine cannot enforce it. The
+step is stated once, in
+[`DEPLOY-SERVER-DB.md` section 5.4](DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition).
+
 ---
 
 ## 5. Engine placement & how MessageFoundry clustering composes with the AG
