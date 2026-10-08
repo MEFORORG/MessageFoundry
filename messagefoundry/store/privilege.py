@@ -52,6 +52,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.config.settings import (
     StoreBackend,
     StorePrivilegePosture,
@@ -697,12 +698,16 @@ async def run_store_privilege_preflight(
         detail["require_least_privilege"] = require_least_privilege
         detail["refused"] = refusing
         detail["over_grant_accepted"] = outcome is PreflightOutcome.ACCEPTED
-        try:
-            await store.record_audit(
+        # Best effort, and ``defects=()``: a raise here would mask the refusal below (vault
+        # BACKLOG #2260).
+        await write_audit_soft(
+            lambda: store.record_audit(
                 "store_privilege_preflight", actor=None, detail=json.dumps(detail)
-            )
-        except Exception:  # noqa: BLE001 — auditing is best-effort; never mask the finding
-            log.exception("store privilege preflight: failed to record the audit row")
+            ),
+            log=log,
+            message="store privilege preflight: failed to record the audit row",
+            defects=(),
+        )
 
     if refusing:
         why = refusal_reason(require_least_privilege=require_least_privilege)

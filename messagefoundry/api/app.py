@@ -256,6 +256,7 @@ from messagefoundry.api.validation import (
     ResourceId,
     StatusFilter,
 )
+from messagefoundry.audit_write import write_audit_soft
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -1438,9 +1439,13 @@ async def _record_reload_audit(
     steps, so the answer says the new graph is live and its row is missing. A released reload
     carries that into ``approval.approved``.
 
-    A cancellation still propagates: it is not a failure of this helper."""
+    A cancellation still propagates: it is not a failure of this helper. The write goes through
+    :func:`~messagefoundry.audit_write.write_audit_soft` with ``defects=()``, because even a defect
+    raised here would misreport a reload that ran (vault BACKLOG #2260)."""
     detail: str | None = None
-    try:
+
+    async def write() -> None:
+        nonlocal detail
         superseded = False
         if loaded is not None:
             state = loaded
@@ -1467,18 +1472,23 @@ async def _record_reload_audit(
             }
         )
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
-    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
-        # Scrubbed at the call site for CodeQL py/log-injection; scrub_log_argument says why.
-        _log.exception(
-            "config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
+
+    written = await write_audit_soft(
+        write,
+        log=_log,
+        message="config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
+        # Scrubbed at the call site for CodeQL py/log-injection; scrub_log_argument says why. Read
+        # on a failure only, so the line carries whatever detail was built before the fault.
+        args=lambda: (
             "loaded at start" if action == "config_loaded" else "reload swapped the graph",
             action,
             _RELOAD_AUDIT_STEP,
             scrub_log_argument(actor),
             None if detail is None else scrub_log_argument(detail),
-        )
-        return [*failed_steps, _RELOAD_AUDIT_STEP]
-    return list(failed_steps)
+        ),
+        defects=(),
+    )
+    return list(failed_steps) if written else [*failed_steps, _RELOAD_AUDIT_STEP]
 
 
 #: The faults ``Engine.reload_detail`` raises when a reload did NOT happen, each with its own answer
@@ -1555,20 +1565,19 @@ async def _audit_refused_reload(
         detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
         status, answer = 422, "invalid configuration"
     row = json.dumps(detail)
-    try:
-        await engine.store.record_audit(action, actor=actor, detail=row, client=client)
-    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
-        # The exc above and this row carry the caller's requested directory, so their arguments
-        # are scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps``
-        # already escaped the row, so the scrub leaves it byte-identical and parseable. The
-        # traceback is not an argument: a caller's chained refusal can still carry the directory
-        # into it, and only the handler's ControlCharScrubFilter escapes that.
-        _log.exception(
-            "a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
-            action,
-            scrub_log_argument(actor),
-            scrub_log_argument(row),
-        )
+    # The exc above and this row carry the caller's requested directory, so their arguments are
+    # scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps`` already
+    # escaped the row, so the scrub leaves it byte-identical and parseable. The traceback is not an
+    # argument: a caller's chained refusal can still carry the directory into it, and only the
+    # handler's ControlCharScrubFilter escapes that. ``defects=()`` keeps the docstring's promise
+    # that this write never raises (vault BACKLOG #2260).
+    await write_audit_soft(
+        lambda: engine.store.record_audit(action, actor=actor, detail=row, client=client),
+        log=_log,
+        message="a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
+        args=lambda: (action, scrub_log_argument(actor), scrub_log_argument(row)),
+        defects=(),
+    )
     return status, answer
 
 
