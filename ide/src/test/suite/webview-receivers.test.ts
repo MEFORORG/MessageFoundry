@@ -616,9 +616,10 @@ suite("webview receivers discard a malformed payload and render a well-formed on
 
   test("Security Settings: every retention acknowledgement the engine reports has its own switch", () => {
     // Vault BACKLOG #2280. The keys come from the recorded "security show", not from FIELDS, so a
-    // switch the engine reports and the editor lacks fails here instead of going unrendered.
+    // switch in that recording with no editor entry fails here. The recording does not follow the
+    // engine; tests/test_security_config.py is what reds when the engine gains a switch.
     const keys = Object.keys(SECURITY_SHOW.values).filter((k) => /^allow_keeping_.+_indefinitely$/.test(k));
-    assert.strictEqual(keys.length, 5, "the fixture lost a retention acknowledgement");
+    assert.ok(keys.length >= 5, "the fixture lost a retention acknowledgement");
     const p = security.load();
     const doc = p.window.document;
     p.deliver(variant(STATE_OK, (c) => { for (const k of keys) { c.state.values[k] = true; } }));

@@ -2704,20 +2704,6 @@ def test_status_builder_escapes_and_formats() -> None:
     off = ServiceStatusInfo(enabled=False, state="disabled", service_name="")
     assert "reporting is off" in str(status(sys_status, posture, cluster, nodes, dr, off))
 
-    # Vault BACKLOG #2280: each per-tier retention acknowledgement has its own row. The switches are
-    # read off the engine's classification, so a tier given one there reds here until the page shows
-    # it. A distinct marker per switch proves the row reads ITS key, not a neighbour's.
-    from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
-
-    switches = [w.acknowledged_by for w in PHI_RETENTION_WINDOWS if w.acknowledged_by]
-    assert len(switches) >= 4  # a floor, so an emptied classification cannot pass this vacuously
-    marked = posture.model_copy(update={"security": {s: f"marker-{s}" for s in switches}})
-    acked_html = str(status(sys_status, marked, cluster, nodes, dr, svc))
-    for switch in switches:
-        label = switch.removeprefix("allow_").replace("_", " ")
-        assert f"Allow {label}</td><td>marker-{switch}<" in acked_html, switch
-    assert "marker-" not in html  # the control: an unset switch renders no marker
-
 
 # --- L0b: register_ui_action write-action registry (the extensible step-up allow-list) ---------
 
@@ -7219,7 +7205,7 @@ def _sys_status(*, update: object = None) -> object:
     )
 
 
-def _status_html(sys_status: object) -> str:
+def _status_html(sys_status: object, security: dict[str, object] | None = None) -> str:
     from messagefoundry.api.models import (
         ClusterNodeList,
         ClusterStatus,
@@ -7236,6 +7222,7 @@ def _status_html(sys_status: object) -> str:
         key_id=None,
         require_encryption=False,
         allow_unencrypted_phi=True,
+        security=security or {},
     )
     cluster = ClusterStatus(
         node_id="n1", clustered=False, is_leader=True, role="single-node", config_version=0
@@ -7244,6 +7231,25 @@ def _status_html(sys_status: object) -> str:
     svc = ServiceStatusInfo(enabled=False, state="disabled", service_name="")
     nodes = ClusterNodeList(nodes=[], leader_node_id=None, lease_owner=None, lease_expires_at=None)
     return str(status(sys_status, posture, cluster, nodes, dr, svc))
+
+
+def test_status_page_gives_each_retention_acknowledgement_its_own_row() -> None:
+    """Vault BACKLOG #2280: the posture table showed ``allow_keeping_phi_indefinitely`` only.
+
+    The switches are read off the engine's classification, so a tier given one there reds here
+    until the page shows it. A distinct marker per switch proves each row reads ITS key."""
+    from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
+
+    switches = [w.acknowledged_by for w in PHI_RETENTION_WINDOWS if w.acknowledged_by]
+    assert len(switches) >= 4  # a floor, so an emptied classification cannot pass this vacuously
+    labels = {s: "Allow " + s.removeprefix("allow_").replace("_", " ") for s in switches}
+    sys_status = _sys_status(update=None)
+    marked = _status_html(sys_status, {s: f"marker-{s}" for s in switches})
+    unset = _status_html(sys_status)
+    for switch, label in labels.items():
+        assert f"{label}</td><td>marker-{switch}<" in marked, switch
+        # The control: with no value the row is still there, and shows the dash.
+        assert f"{label}</td><td>—<" in unset, switch
 
 
 def test_status_update_banner() -> None:

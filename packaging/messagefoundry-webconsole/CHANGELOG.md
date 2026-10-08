@@ -22,6 +22,10 @@ this line.**
 
 ### Added
 
+- **The status page shows the four per-tier retention acknowledgements.** The security posture
+  table on `/ui/status` showed `allow_keeping_phi_indefinitely` only. It now also shows the
+  transform-state, search-preset, app-log and backup-archive switches, each on its own row. The
+  table stays read-only. (BACKLOG #2280)
 - **The audit, security-event and event-log pages page past their first window.** `/ui/audit`,
   `/ui/security-events` and `/ui/events` take `limit` and `offset` and draw the shared pager, so
   each says which rows of how many it shows, with Previous and Next links. They used to show only

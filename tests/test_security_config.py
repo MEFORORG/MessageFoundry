@@ -569,6 +569,11 @@ def test_ide_security_editor_risk_mirrors_the_engine_text(
     risk = re.search(r'\brisk\s*:\s*("(?:[^"\\]|\\.)*")', entry.group(0))
     assert risk is not None, f"the {switch} entry has no risk string"
     assert json.loads(risk.group(1)) == dict(_loosenings(sec))[switch]
+    if switch.startswith("allow_"):
+        # An acknowledgement is a bool whose TRUE is the loosening. Without both, the page would
+        # show no warning for the switch, or warn on its secure position.
+        assert re.search(r'\btype\s*:\s*"bool"', entry.group(0)), f"{switch} is not a bool"
+        assert re.search(r"\binsecure\s*:\s*true\b", entry.group(0)), f"{switch}: insecure != true"
 
 
 def test_loosening_warns_and_prod_phi_refuses(
