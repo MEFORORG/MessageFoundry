@@ -41,7 +41,13 @@ export function testBenchScript(token: string): string {
     function isCount(x){ return Number.isSafeInteger(x) && x >= 0; }
     function isBool(x){ return typeof x === 'boolean'; }
     function isObj(x){ return !!x && typeof x === 'object' && !Array.isArray(x); }
-    function isArrOf(x, f){ return Array.isArray(x) && x.every(f); }
+    function isArrOf(x, f){
+      if (!Array.isArray(x)) { return false; }
+      // By index, not every(): every() skips holes, so a sparse array would pass with an element no
+      // check ever saw. Same walk as mfArrOf (webviewMessaging.ts).
+      for (let i = 0; i < x.length; i++) { if (f(x[i]) !== true) { return false; } }
+      return true;
+    }
     const HEX_PAIR = /^[0-9a-f]{2}$/;
 
     function isDiffCell(c){
