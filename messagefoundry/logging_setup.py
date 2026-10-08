@@ -886,8 +886,9 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         self._reclaimed_at_stop = False
         #: Records a network error cost with no spool to keep them (BACKLOG #2612). They are gone.
         self.unsent = 0
-        #: Whether the last send hit a network error. :func:`forwarder_status` reads it.
-        self.send_failing = False
+        #: Whether the last send hit a network error. :func:`forwarder_status` reads it. A deferred
+        #: connect (BACKLOG #1966) starts out failing; the first good send clears it.
+        self.send_failing = getattr(target, "startup_error", None) is not None
 
     def handle(self, record: logging.LogRecord) -> None:
         deadline = self._drain_deadline
@@ -1331,8 +1332,6 @@ def _build_queued_forwarder(
     target.setFormatter(logging.Formatter("%(message)s"))
     records: queue.Queue[Any] = queue.Queue(maxsize=_FORWARD_QUEUE_MAXSIZE)
     listener = _ForwardQueueListener(records, target, spool=spool)
-    # A deferred connect (BACKLOG #1966) starts out failing; the first good send clears it.
-    listener.send_failing = getattr(target, "startup_error", None) is not None
     handler = _ForwardQueueHandler(records, listener)
     handler.setFormatter(_make_formatter(fmt))
     _install_phi_filters(handler)  # near side — see _ForwardQueueHandler for why that is the point

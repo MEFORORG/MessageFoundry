@@ -14,7 +14,6 @@ import asyncio
 import logging
 import queue
 import socket
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -53,8 +52,9 @@ FORWARD = SyslogForward(host="collector.invalid", port=6514, protocol="tcp")
 
 
 @pytest.fixture(autouse=True)
-def _no_network_and_restored_logging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """No name lookup, and the root logger and the module's forwarder state put back afterwards."""
+def _no_network_and_no_forwarder_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No name lookup, and the module's forwarder state put back afterwards. The root logger is
+    restored, and a handler a test added is closed, by conftest's ``_restore_process_logging``."""
 
     def _no_dns(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("a forwarder health test resolved a name")
@@ -62,18 +62,6 @@ def _no_network_and_restored_logging(monkeypatch: pytest.MonkeyPatch) -> Iterato
     monkeypatch.setattr(socket, "getaddrinfo", _no_dns)
     monkeypatch.setattr(logging_setup, "_forward_configured", False)
     monkeypatch.setattr(logging_setup, "_forward_start_failure", "")
-    root = logging.getLogger()
-    saved, level = root.handlers[:], root.level
-    try:
-        yield
-    finally:
-        for handler in root.handlers[:]:
-            root.removeHandler(handler)
-            if handler not in saved:
-                handler.close()
-        for handler in saved:
-            root.addHandler(handler)
-        root.setLevel(level)
 
 
 class _RecordingSink(LoggingAlertSink):
@@ -251,7 +239,7 @@ async def test_a_failed_start_raises_the_alert_once(
     runner = _runner(store, sink)
     for _ in range(3):
         runner._check_log_forwarder()
-    assert sink.forward_failures == [("forwarder", "not_installed", "permanent", 0)]
+    assert sink.forward_failures == [("forwarder:not_installed", "not_installed", "permanent", 0)]
 
 
 async def test_a_rising_drop_count_raises_the_alert_with_no_record_text(
@@ -266,7 +254,7 @@ async def test_a_rising_drop_count_raises_the_alert_with_no_record_text(
         handler.handle(_record(SYNTHETIC_RECORD))
     dropped = handler.dropped
     runner._check_log_forwarder(now=1.0)
-    assert sink.forward_failures == [("forwarder", "dropping", "queue_full", dropped)]
+    assert sink.forward_failures == [("forwarder:dropping", "dropping", "queue_full", dropped)]
     assert "DOE" not in repr(sink.forward_failures) and "PID" not in repr(sink.forward_failures)
 
 
@@ -314,10 +302,10 @@ async def test_a_rise_is_throttled_and_the_throttled_part_is_carried(
     for now in (0.0, 10.0, window + 1, 2 * window + 2, 3 * window + 3, 4 * window + 4, 5 * window):
         runner._check_log_forwarder(now=now)
     assert sink.forward_failures == [
-        ("forwarder", "dropping", "queue_full", 2),
-        ("forwarder", "dropping", "queue_full,collector_unreachable", 5),
-        ("forwarder", "spool_unreadable", "spool_read_failed", 4),
-        ("forwarder", "dropping", "send_error,spool_refused", 2),
+        ("forwarder:dropping", "dropping", "queue_full", 2),
+        ("forwarder:dropping", "dropping", "queue_full,collector_unreachable", 5),
+        ("forwarder:spool_unreadable", "spool_unreadable", "spool_read_failed", 4),
+        ("forwarder:dropping", "dropping", "send_error,spool_refused", 2),
     ]
 
 

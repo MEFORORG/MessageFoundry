@@ -671,7 +671,7 @@ _SHARD_WATCHDOG_INTERVAL_SECONDS = 30.0
 # is exactly a lane that has stopped processing, so this one has to run on its own clock.
 _INFLIGHT_WATCH_INTERVAL_SECONDS = 30.0
 
-# BACKLOG #2612: the fixed label a log_forward_failed alert is keyed on, and the fixed word for each
+# BACKLOG #2612: the label a log_forward_failed alert's key starts with, and the fixed word for each
 # loss counter of logging_setup.ForwarderStatus that rose. Words, so the alert never carries text.
 _LOG_FORWARDER_LABEL = "forwarder"
 _LOG_FORWARD_LOSS_WORDS = (
@@ -9587,15 +9587,12 @@ class RegistryRunner:
             if not status.installed:
                 if status.start_failure and not self._log_forward_start_alerted:
                     self._log_forward_start_alerted = True
-                    self._alert_sink.log_forward_failed(
-                        _LOG_FORWARDER_LABEL, kind="not_installed", reason=status.start_failure
-                    )
+                    self._fire_log_forward("not_installed", status.start_failure)
                 return
             last = self._log_forward_alerted
             if last is None or status.lost < last.lost:
-                last = (
-                    ForwarderStatus()
-                )  # first look, or a rebuilt forwarder whose counts restarted
+                # The first look, or a rebuilt forwarder whose counts restarted.
+                last = ForwarderStatus()
             lost = status.lost - last.lost
             unread = max(0, status.spool_read_errors - last.spool_read_errors)
             now = time.monotonic() if now is None else now
@@ -9609,18 +9606,19 @@ class RegistryRunner:
                     for field, word in _LOG_FORWARD_LOSS_WORDS
                     if getattr(status, field) > getattr(last, field)
                 ]
-                self._alert_sink.log_forward_failed(
-                    _LOG_FORWARDER_LABEL, kind="dropping", reason=",".join(rose), count=lost
-                )
+                self._fire_log_forward("dropping", ",".join(rose), lost)
             if unread:
-                self._alert_sink.log_forward_failed(
-                    _LOG_FORWARDER_LABEL,
-                    kind="spool_unreadable",
-                    reason="spool_read_failed",
-                    count=unread,
-                )
+                self._fire_log_forward("spool_unreadable", "spool_read_failed", unread)
         except Exception:
             log.exception("log forwarder check failed; the next tick retries")
+
+    def _fire_log_forward(self, kind: str, reason: str, count: int = 0) -> None:
+        """Emit ``log_forward_failed`` keyed on ``forwarder:<kind>``. The kind is in the key
+        because the notifier throttles and de-duplicates on it: two kinds raised in one tick
+        would otherwise be one notification and one alert row."""
+        self._alert_sink.log_forward_failed(
+            f"{_LOG_FORWARDER_LABEL}:{kind}", kind=kind, reason=reason, count=count
+        )
 
     async def _check_inflight_strands(self, now: float | None = None) -> None:
         """Page on a row held in flight past the lane's age threshold (BACKLOG #1611 part B, P3-03).

@@ -877,7 +877,8 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 A configured forwarder that does not start never stops the engine. The engine tells you two ways
 (BACKLOG #2612).
 
-- **The `log_forward_failed` alert.** Its `kind` is one of three fixed words. `not_installed`: the
+- **The `log_forward_failed` alert.** It is keyed on `forwarder:<kind>`, and `kind` is one of
+  three fixed words. `not_installed`: the
   forwarder did not start, so this process sends nothing off the host. It fires once per process.
   `dropping`: records were lost since the last look. `spool_unreadable`: the on-disk spool could not
   be read, so its records are held and not sent. The last two fire at most once every five minutes
