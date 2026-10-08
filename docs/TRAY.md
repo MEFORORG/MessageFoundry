@@ -140,13 +140,14 @@ hands that program the folder as a single argument, with no command shell. So a 
 **The one case where a folder is refused.** Some setups have a `code.cmd` with no `Code.exe` in
 that place, for example a shim from a package manager. `code.cmd` is a batch file, and Windows
 runs a batch file through `cmd.exe`, which reads some characters in the command line as commands.
-Only then, the tray refuses a `repo_path` holding any of `& | < > ^ % ! ( ) , ; =`, a double quote, or a
-control character. It shows "Repo not opened" and starts nothing. This is wider than `cmd.exe`
-strictly needs. Rename the folder, or open it from VS Code itself. If that `code.cmd`'s own path
-holds one of those characters, the tray does not use it at all.
+Only then, the tray opens a `repo_path` made of nothing but letters, digits, spaces and
+`\ / : . _ - ~ + @ #`. For any other character, such as `&`, `%`, a comma or a bracket, it shows
+"Repo not opened" and starts nothing. This is wider than `cmd.exe` strictly needs. Rename the
+folder, or open it from VS Code itself. If that `code.cmd`'s own path fails the same test, the
+tray does not use it at all.
 
-If the editor fails to start, the tray shows "Repo not opened: the launch failed" and writes the
-error type to `tray.log`.
+If Windows cannot start the editor program, the tray shows "Repo not opened: the launch failed"
+and writes the error type to `tray.log`. A failure after the program has started is not reported.
 
 The menu item is greyed out and marked "(unavailable)" in at least these cases: no usable `code`
 command was found, the folder does not exist, `repo_path` does not start with a local drive letter, or

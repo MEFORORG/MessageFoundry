@@ -283,8 +283,8 @@ Two argument-list starts are not pinned that way:
   for the editor program beside the command's `bin` folder and starts that, with `repo_path` from
   `tray.toml` as one argument. No shell reads that start (BACKLOG #2327). Where no such program is
   found, the batch file is the fallback, and `cmd.exe` cannot be avoided. `open_repo` then refuses
-  the start if `repo_path` or the batch file's own path holds a character `cmd.exe` would re-read.
-  It escapes nothing. [`TRAY.md`](TRAY.md) lists those characters. The menu offers the start only
+  the start unless `repo_path` and the batch file's own path are made of plain characters only.
+  It escapes nothing. [`TRAY.md`](TRAY.md) lists the characters it allows. The menu offers the start only
   when `repo_path` names an existing folder on a local drive letter; `open_repo` does not check
   that again. Nothing pins which `code` command is found: `shutil.which` can search the working
   directory on Windows, so a planted `code.cmd` may win, and it would run as the fallback. What
@@ -305,7 +305,8 @@ the script only from a checkout. Windows hands that process the user's environme
 process's import path (vault BACKLOG #2852). The relaunch it starts does read the user's
 `PYTHONPATH`, as above. A tray started by hand gets none of the options. Section 3, under
 *Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The other
-starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
+starts in the table hand over the whole environment. One of them leaves two names out: when the
+tray starts VS Code, it drops the two variables VS Code's own launcher manages. `tests/test_child_process_environment.py`
 lists each of those with its reason, and fails a new start whose environment does not come from
 that module.
 

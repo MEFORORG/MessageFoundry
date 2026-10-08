@@ -21,7 +21,6 @@ import webbrowser
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-from messagefoundry.controlchars import has_control_char
 from messagefoundry.tray.config import is_engine_url
 
 # Common VS Code install locations to try if `code` is not on PATH (user + machine installs).
@@ -37,15 +36,16 @@ _CREATE_NO_WINDOW = 0x08000000  # keep `code`'s launcher from flashing a console
 _VSCODE_EXE = "Code.exe"
 #: Suffixes Windows runs under ``cmd.exe``.
 _BATCH_SUFFIXES = frozenset({".cmd", ".bat"})
-#: Characters ``cmd.exe`` reads as syntax in a batch file's command line. Quoting does not make
-#: them all safe: ``%`` expands inside double quotes, and so does ``!`` under delayed expansion.
-#: ``,`` ``;`` and ``=`` are argument delimiters there: in an unquoted batch-file path they cut
-#: the program name short, so a different file can run. :func:`_cmd_would_reread` adds control
-#: characters. docs/TRAY.md shows operators this set, and a test holds the two together.
-_CMD_REREAD_CHARS = frozenset('&|<>^%!()",;=')
-#: Electron reads this as "run as plain Node, not as the editor". ``code.cmd`` manages it itself;
-#: a direct start of the editor must not inherit it.
-_ELECTRON_RUN_AS_NODE = "ELECTRON_RUN_AS_NODE"
+#: Besides letters and digits, the only characters allowed on a batch file's command line.
+#: ``cmd.exe`` re-reads that line, and a list of what it treats as syntax cannot be trusted to be
+#: whole: ``& | < > ^ ( )`` are operators, ``%`` and ``!`` expand even inside double quotes, and
+#: ``, ; =`` and many Unicode spaces cut an unquoted program name short. So the rule names what is
+#: plain instead. docs/TRAY.md shows operators this set, and a test holds the two together.
+_CMD_PLAIN_CHARS = frozenset(" \\/:._-~+@#")
+#: Variables ``code.cmd`` sets or clears before it starts the editor. Inherited by a direct start,
+#: the first makes the editor run the folder as a Node script and the second puts it in its
+#: development mode.
+_EDITOR_ENV_NOT_INHERITED = frozenset({"ELECTRON_RUN_AS_NODE", "VSCODE_DEV"})
 
 
 def console_url(engine_url: str) -> str:
@@ -71,8 +71,11 @@ def _is_batch_file(path: str) -> bool:
 
 
 def _cmd_would_reread(text: str) -> bool:
-    """True when ``text`` has a ``cmd.exe`` metacharacter or a control character (CR, LF, ...)."""
-    return has_control_char(text) or any(ch in _CMD_REREAD_CHARS for ch in text)
+    """True unless ``text`` is only letters, digits and :data:`_CMD_PLAIN_CHARS`.
+
+    An allowlist, so a control character, a quote and a Unicode space all fail without being named.
+    """
+    return not all(ch.isalnum() or ch in _CMD_PLAIN_CHARS for ch in text)
 
 
 def _launcher_for(cli: str, is_file: Callable[[str], bool]) -> str | None:
@@ -228,9 +231,12 @@ def open_console(engine_url: str, *, opener: Callable[[str], object] | None = No
 
 def _run_detached(args: list[str]) -> None:
     creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    # The child gets the tray's environment, which is the signed-in user's, less the one variable
-    # that would make the editor executable run the folder as a script.
-    env = {k: v for k, v in os.environ.items() if k.upper() != _ELECTRON_RUN_AS_NODE}
+    # The child inherits the tray's environment, which is the signed-in user's. A copy is passed
+    # only when one of the editor's own variables has to come out, because a copy of os.environ
+    # carries every name in upper case on Windows.
+    env: dict[str, str] | None = None
+    if any(name.upper() in _EDITOR_ENV_NOT_INHERITED for name in os.environ):
+        env = {k: v for k, v in os.environ.items() if k.upper() not in _EDITOR_ENV_NOT_INHERITED}
     # shell=False does not keep cmd.exe out of a batch-file launch; see open_repo().
     subprocess.Popen(args, shell=False, creationflags=creationflags, env=env)  # nosec B603 - argv is the launcher resolve_vscode() chose plus repo_path as one list item; open_repo() screens the batch-file case (BACKLOG #2327)
 
@@ -245,7 +251,7 @@ class RepoPathRefused(ValueError):
     def __init__(self) -> None:
         super().__init__(
             "the code launcher is a batch file, and its path or repo_path has a character "
-            "the Windows command shell would re-read"
+            "the Windows command shell may re-read"
         )
 
 
@@ -264,8 +270,8 @@ def open_repo(
     a batch file under ``cmd.exe``, which re-reads the whole command line, and Python's argv
     quoting does not escape ``&``, ``|`` or ``%``. ``cmd.exe`` cannot be avoided there, so the
     launch is refused when either string fails :func:`_cmd_would_reread`. Nothing is escaped. That
-    test is wider than ``cmd.exe`` needs: it also refuses characters that are harmless in some
-    positions, such as parentheses or a quoted ``&``.
+    test is an allowlist and is wider than ``cmd.exe`` needs: it also refuses characters that are
+    harmless in some positions, such as parentheses or a comma.
     """
     # resolve_vscode() never returns a batch file whose own path fails the test. The launcher is
     # tested again here because this is the last stop before the start, whoever the caller is.

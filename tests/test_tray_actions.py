@@ -128,7 +128,7 @@ def test_resolve_vscode_goes_on_to_an_install_location_after_an_unusable_path_hi
     "cli", ["C:\\shims\\code.CMD ", "C:\\shims\\code.cmd.", "C:\\x\\code.bat. "]
 )
 def test_a_batch_cli_with_a_trailing_dot_or_space_is_still_a_batch_file(cli: str) -> None:
-    # Windows drops the trailing dot or space and runs the file under cmd.exe all the same.
+    # Windows drops a trailing dot or space from a file name, so the name is judged without it.
     assert resolve_vscode(which=lambda _n: cli, is_file=lambda _p: False) == cli
     calls: list[list[str]] = []
     with pytest.raises(RepoPathRefused):
@@ -136,14 +136,14 @@ def test_a_batch_cli_with_a_trailing_dot_or_space_is_still_a_batch_file(cli: str
     assert calls == []
 
 
-def test_the_tray_doc_lists_the_characters_the_fallback_refuses() -> None:
+def test_the_tray_doc_lists_the_characters_the_fallback_allows() -> None:
     # docs/TRAY.md is where operators read the set; this holds it to the one in the code.
     from messagefoundry.tray import actions as tray_actions
 
     doc = (Path(__file__).resolve().parent.parent / "docs" / "TRAY.md").read_text(encoding="utf-8")
-    start = "holding any of `"
+    start = "letters, digits, spaces and\n`"
     listed = doc[doc.index(start) + len(start) :].split("`", 1)[0].split()
-    assert set(listed) | {'"'} == set(tray_actions._CMD_REREAD_CHARS)
+    assert set(listed) | {" "} == set(tray_actions._CMD_PLAIN_CHARS)
     assert len(listed) == len(set(listed))
 
 
@@ -335,6 +335,10 @@ def test_open_repo_refuses_a_batch_launcher_whose_own_path_cmd_would_reread(laun
         "C:\\a,b",  # `,` `;` `=` are cmd.exe argument delimiters
         "C:\\a;b",
         "C:\\a=b",
+        "C:\\a\u00a0b",  # cmd.exe splits at these Unicode spaces too
+        "C:\\a\u3000b",
+        "C:\\a\u0085b",
+        "C:\\a'b",  # refused because nothing lists it as plain
         "C:\\a\rb",
         "C:\\a\nb",
         "C:\\a\x00b",
@@ -395,25 +399,32 @@ def test_the_tray_app_starts_the_editor_exe_with_the_path_as_one_argv_item(
     from messagefoundry.tray import app as tray_app
 
     started: list[tuple[object, object]] = []
-    envs: list[dict[str, str]] = []
+    envs: list[object] = []
 
     def _popen(args: list[str], **kw: object) -> None:
         started.append((args, kw.get("shell")))
-        env = kw["env"]
-        assert isinstance(env, dict)
-        envs.append(env)
+        envs.append(kw["env"])
 
     monkeypatch.setattr(subprocess, "Popen", _popen)
-    # Inherited, this variable makes the editor executable run the folder as a Node script.
-    monkeypatch.setenv("ELECTRON_RUN_AS_NODE", "1")
-    monkeypatch.setenv("MEFOR_TRAY_TEST_MARKER", "kept")
+    monkeypatch.delenv("ELECTRON_RUN_AS_NODE", raising=False)
+    monkeypatch.delenv("VSCODE_DEV", raising=False)
     tray = tray_app.TrayApp.__new__(tray_app.TrayApp)
     monkeypatch.setattr(tray, "_config", TrayConfig(repo_path="C:\\a&b (x86)"), raising=False)
     monkeypatch.setattr(tray, "_vscode", "C:\\VS Code\\Code.exe", raising=False)
     tray._open_repo()
     assert started == [(["C:\\VS Code\\Code.exe", "C:\\a&b (x86)"], False)]
-    assert "ELECTRON_RUN_AS_NODE" not in {name.upper() for name in envs[0]}
-    assert envs[0]["MEFOR_TRAY_TEST_MARKER"] == "kept"
+    assert envs == [None]  # nothing to drop, so the child inherits the environment untouched
+
+    # Inherited, the first makes the editor executable run the folder as a Node script, and the
+    # second starts it in its development mode. `code.cmd` handles both itself.
+    monkeypatch.setenv("ELECTRON_RUN_AS_NODE", "1")
+    monkeypatch.setenv("VSCODE_DEV", "1")
+    monkeypatch.setenv("MEFOR_TRAY_TEST_MARKER", "kept")
+    tray._open_repo()
+    env = envs[1]
+    assert isinstance(env, dict)
+    assert not {"ELECTRON_RUN_AS_NODE", "VSCODE_DEV"} & {name.upper() for name in env}
+    assert env["MEFOR_TRAY_TEST_MARKER"] == "kept"
 
 
 def test_the_tray_app_reports_a_failed_launch_without_any_path(
