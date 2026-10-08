@@ -162,7 +162,20 @@ suite("startup banners: what the user sees", () => {
     // keyframes the delay names must ship with it, or the banner would stay invisible for good.
     const delay = /visibility:hidden;animation:([\w-]+) 0s linear 1s forwards/.exec(scriptBanner);
     assert.ok(delay, "the script banner has no CSS delay");
-    assert.ok(STARTUP_BANNERS.includes(`@keyframes ${delay[1]} { to { visibility: visible; } }`));
+    const frames = new RegExp(`@keyframes ${delay[1]} \\{ to \\{([^}]*)\\} \\}`).exec(STARTUP_BANNERS);
+    assert.ok(frames, "the keyframes the delay names are missing");
+    assert.ok(/visibility: visible;/.test(frames[1]));
+    // While it waits it takes no room, and the keyframes give back every length it zeroed. A
+    // length left at zero would show a clipped or borderless banner on a panel that needs it.
+    const zeroed = [...scriptBanner.matchAll(/(max-height|padding-top|padding-bottom|border-width|margin):0;/g)];
+    assert.deepStrictEqual(
+      zeroed.map((m) => m[1]),
+      ["max-height", "padding-top", "padding-bottom", "border-width", "margin"],
+    );
+    for (const [, property] of zeroed) {
+      assert.ok(new RegExp(`${property}: [1-9]`).test(frames[1]) || property === "margin", property);
+    }
+    assert.ok(/margin: 0 0 8px;/.test(frames[1]));
   });
 });
 

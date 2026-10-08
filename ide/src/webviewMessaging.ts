@@ -308,10 +308,18 @@ const BANNER_STYLE =
  * that is not happening, and `role="alert"` could announce it. The delay is pure CSS, so it needs
  * no script; with inline styles blocked the banner is simply visible at once. `visibility`, never
  * `display`, so nothing that reads the `hidden` attribute changes meaning.
+ *
+ * While it waits the banner is also COLLAPSED to no height, so a healthy panel is not drawn with a
+ * banner-sized gap that closes when the script runs. The keyframes restore the box. Only lengths
+ * and `visibility` are animated, which every engine in the `engines.vscode` range interpolates.
  */
 const SCRIPT_BANNER_DELAY_SECONDS = 1;
 const SCRIPT_BANNER_DELAY_STYLE =
+  "max-height:0;overflow:hidden;padding-top:0;padding-bottom:0;border-width:0;margin:0;" +
   `visibility:hidden;animation:mf-banner-show 0s linear ${SCRIPT_BANNER_DELAY_SECONDS}s forwards`;
+const SCRIPT_BANNER_KEYFRAMES =
+  "@keyframes mf-banner-show { to { max-height: 40em; padding-top: 6px; padding-bottom: 6px; " +
+  "border-width: 1px; margin: 0 0 8px; visibility: visible; } }";
 
 /**
  * The two banners and the CSP canary, as markup for the top of a panel's `<body>`.
@@ -323,7 +331,7 @@ const SCRIPT_BANNER_DELAY_STYLE =
  * The `<script>` tag below must stay WITHOUT a nonce. A nonced canary would run under an enforcing
  * engine and raise the warning on every healthy panel.
  */
-export const STARTUP_BANNERS = `<style>@keyframes mf-banner-show { to { visibility: visible; } }</style>
+export const STARTUP_BANNERS = `<style>${SCRIPT_BANNER_KEYFRAMES}</style>
   <div id="${SCRIPT_BANNER_ID}" role="alert" style="${BANNER_STYLE};${SCRIPT_BANNER_DELAY_STYLE}">MessageFoundry: this panel's script has not started, so its buttons and fields do nothing. Close the panel and open it again. If this message stays, VS Code is not running the panel's script.</div>
   <div id="${CSP_BANNER_ID}" role="alert" hidden style="${BANNER_STYLE}">MessageFoundry: VS Code is not enforcing this panel's Content Security Policy, so the panel's defense against injected script is not active. Update VS Code, and treat what this panel shows with care until the message is gone.</div>
   <script>document.getElementById(${JSON.stringify(CSP_BANNER_ID)}).hidden = false;</script>`;
