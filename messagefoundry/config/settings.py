@@ -7641,7 +7641,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         for field, what in (
             ("ad_connect_timeout", "the LDAP connect timeout"),
             # auth/ldap.py hands ldap3 this value rounded UP to a whole second.
-            ("ad_receive_timeout", "the LDAP response-read timeout (applied rounded up to 1 s)"),
+            (
+                "ad_receive_timeout",
+                "the LDAP response-read timeout (applied rounded up to a whole second)",
+            ),
         ):
             value, default = getattr(auth, field), _auth_default(field)
             if value > default:

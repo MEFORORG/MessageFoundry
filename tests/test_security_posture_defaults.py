@@ -248,6 +248,10 @@ def test_an_ad_timeout_above_its_default_is_a_named_loosening(field: str) -> Non
     assert "3600.0 s, above the default of 10 s" in risks[field]
     assert "worker thread" in risks[field]
     assert [n for n in risks if n in _AD_TIMEOUTS] == [field]
+    # Only the receive timeout is rounded, and to a WHOLE second: auth/ldap.py applies math.ceil.
+    # The text once said "rounded up to 1 s", which reads as a one-second bound.
+    assert ("rounded up to a whole second" in risks[field]) is (field == "ad_receive_timeout")
+    assert "to 1 s" not in risks[field]
     # A value just past the default is named, and never printed as the default itself. The second
     # is the next float above 10.0, which 15 significant digits would print as "10".
     assert "is 10.0001 s" in dict(_pairs(auth=_ad(**{field: 10.0001})))[field]
