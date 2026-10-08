@@ -802,7 +802,7 @@ seat here: the arrival prompt that tells each session to declare is the line thi
 not act on. The cost of that silence is real and lands on nobody while the seat touches nothing --
 `fleet.ps1` omits it and no peer can forecast a collision with it -- which is why the deferral ends
 at the first shared write and not later. Its card is
-[`docs/roles/special.card.md`](docs/roles/special.card.md); the full playbook is korus
+[`docs/roles/special.card.md`](roles/special.card.md); the full playbook is korus
 `roles/SPECIAL.md`, read at `origin/main` like every other playbook.
 
 **A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
