@@ -1250,16 +1250,23 @@ def _append_send_outbounds(s: ast.stmt) -> list[str] | None:
     return []
 
 
-def _own_scope_nodes(node: ast.AST) -> list[ast.AST]:
+def _own_scope_nodes(node: ast.AST, *, skip_classes: bool = False) -> list[ast.AST]:
     """Every descendant of ``node`` in its OWN scope — recursing through control blocks (if/for/while/
     with/try) but NOT into nested ``def``/``lambda`` scopes (a different scope). Mirrors what the
     partitioner classifies, so accumulator analysis matches the visible rows (a closure-local append is
-    neither a visible send row nor evidence of the handler's own accumulator)."""
+    neither a visible send row nor evidence of the handler's own accumulator).
+
+    ``skip_classes`` also stops at a nested ``class`` body, whose loop targets bind class attributes
+    rather than the handler's names. Comprehensions are still entered (a walrus there binds in the
+    enclosing scope)."""
     out: list[ast.AST] = []
     for child in ast.iter_child_nodes(node):
         out.append(child)
-        if not isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-            out.extend(_own_scope_nodes(child))
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            continue
+        if skip_classes and isinstance(child, ast.ClassDef):
+            continue
+        out.extend(_own_scope_nodes(child, skip_classes=skip_classes))
     return out
 
 
@@ -4621,30 +4628,6 @@ _GLOBALS_ATTRS = frozenset(
 )
 
 
-def _handler_scope_nodes(node: ast.AST) -> list[ast.AST]:
-    """Every descendant of ``node`` in its own scope. Unlike :func:`_own_scope_nodes` it also stops at
-    a nested ``class`` body and a comprehension, since a name bound there is not the handler's."""
-    out: list[ast.AST] = []
-    for child in ast.iter_child_nodes(node):
-        out.append(child)
-        if not isinstance(child, _NESTED_SCOPES):
-            out.extend(_handler_scope_nodes(child))
-    return out
-
-
-#: Nodes that open a scope of their own (:func:`_handler_scope_nodes` does not descend into them).
-_NESTED_SCOPES = (
-    ast.FunctionDef,
-    ast.AsyncFunctionDef,
-    ast.Lambda,
-    ast.ClassDef,
-    ast.ListComp,
-    ast.SetComp,
-    ast.DictComp,
-    ast.GeneratorExp,
-)
-
-
 def _message_scope(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
     tree: ast.Module,
@@ -4672,7 +4655,11 @@ def _message_scope(
     # scope's ``i`` and leaves the handler's ``i`` free, so it may resolve to a module global set from
     # the message (Lander review of 034e441eea). ``bound`` still counts the nested binding, so a name
     # bound in both scopes is not an index either.
-    own_loops = [n for n in _handler_scope_nodes(func) if isinstance(n, ast.For | ast.AsyncFor)]
+    own_loops = [
+        n
+        for n in _own_scope_nodes(func, skip_classes=True)
+        if isinstance(n, ast.For | ast.AsyncFor)
+    ]
     range_targets = [
         n.target.id
         for n in own_loops

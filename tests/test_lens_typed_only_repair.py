@@ -1563,8 +1563,14 @@ def h(msg):
         "    def inner():\n        for i in range(1, 3):\n            pass",
         "    async def inner():\n        for i in range(1, 3):\n            pass",
         "    class Inner:\n        for i in range(1, 3):\n            pass",
+        # The handler's own loop does not count when a nested def also binds ``i``: either a
+        # ``nonlocal`` writer that sets it from the message, or an unrelated loop of its own.
+        "    for i in range(1, 3):\n        pass\n"
+        '    def inner():\n        nonlocal i\n        i = msg.field("PID-5")',
+        "    for i in range(1, 3):\n        pass\n"
+        "    def inner():\n        for i in range(1, 3):\n            pass",
     ],
-    ids=["def", "async-def", "class"],
+    ids=["def", "async-def", "class", "nonlocal-writer", "both-scopes"],
 )
 def test_r15_a_nested_scope_s_loop_does_not_make_the_handler_s_free_name_an_index(
     nested: str,
@@ -1572,6 +1578,15 @@ def test_r15_a_nested_scope_s_loop_does_not_make_the_handler_s_free_name_an_inde
     src = _NESTED_LOOP.format(nested=nested)
     line = len(src.splitlines())
     _refused(src, _edit("set_params", line, params={"to": {"expr": "i"}}), match=REFUSED)
+
+
+def test_r15_the_handler_s_own_loop_index_is_admitted_as_a_destination() -> None:
+    # The same op and payload as the refusals above, so they are attributable to the nested scope.
+    src = _NESTED_LOOP.format(nested="    for i in range(1, 3):\n        pass")
+    line = len(src.splitlines())
+    assert "Send(i, msg)" in rewrite_source(
+        src, _edit("set_params", line, params={"to": {"expr": "i"}})
+    )
 
 
 def test_r15_the_handler_s_own_one_based_loop_still_admits_its_index() -> None:
