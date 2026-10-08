@@ -393,11 +393,6 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_messages_channel ON messages(channel_id, received_at)",
     "CREATE INDEX IF NOT EXISTS ix_messages_control ON messages(channel_id, control_id)",
-    # Vault BACKLOG #2615: the plain origin pair for a pre-existing messages table; a no-op on a fresh
-    # DB. In _SCHEMA for the reason the pending_approvals ADDs below give, so no _MIGRATION_REV bump.
-    # NULL on an existing row means the origin was not recorded.
-    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS origin TEXT",
-    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS origin_actor TEXT",
     """CREATE TABLE IF NOT EXISTS queue (
         id               TEXT PRIMARY KEY,
         message_id       TEXT NOT NULL REFERENCES messages(id),
@@ -946,6 +941,12 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
 # the IdP step-up refuses as step_up_idp_auth_time_missing.
 _SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"))
+# Vault BACKLOG #2615: the plain origin pair for a pre-existing messages table. Gated, because a bare
+# ADD COLUMN IF NOT EXISTS would hold ACCESS EXCLUSIVE on the hottest table through the batch even when
+# the column is there. In _SCHEMA, so adding it moves _schema_hash() and needs no _MIGRATION_REV bump.
+# NULL on an existing row means the origin was not recorded.
+_SCHEMA.append(_gated_add_column("messages", "origin", "TEXT"))
+_SCHEMA.append(_gated_add_column("messages", "origin_actor", "TEXT"))
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python

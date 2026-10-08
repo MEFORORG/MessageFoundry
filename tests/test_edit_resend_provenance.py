@@ -103,8 +103,18 @@ def test_a_digest_still_verifies_after_the_key_rotates() -> None:
 
 
 def test_a_blanked_body_digests_to_none_not_to_the_digest_of_nothing() -> None:
-    got = audit_body_digests(make_cipher(generate_key()), original="", edited=EDITED)
+    cipher = make_cipher(generate_key())
+    got = audit_body_digests(cipher, original="", edited=EDITED)
     assert got is not None and got["original"] is None and got["edited"] is not None
+    # Checking the recorded null is an answer, not a crash.
+    assert isinstance(got["key_id"], str)
+    assert not verify_audit_body_digest(cipher, ADT, key_id=got["key_id"], digest=got["original"])
+    assert not verify_audit_body_digest(cipher, ADT, key_id=got["key_id"], digest="not-hex")
+
+
+def test_a_body_named_like_a_field_is_refused() -> None:
+    with pytest.raises(ValueError, match="collide"):
+        audit_body_digests(make_cipher(generate_key()), key_id=EDITED)
 
 
 # --- the origin column ------------------------------------------------------------------------------

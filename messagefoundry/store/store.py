@@ -853,7 +853,8 @@ class MessageOrigin(StrEnum):
     user of an operator origin sits beside it in ``messages.origin_actor``. ``NULL`` on a row written
     before the column existed means "not recorded", never "partner"."""
 
-    #: Received from a partner through an inbound connection, refused ones included.
+    #: Taken in by an inbound connection, refused ones included. Usually a partner's message; a timer
+    #: inbound's configured body arrives this way too, so ``partner`` means "through a connection".
     PARTNER = "partner"
     #: An operator's edited body, by edit-and-resend (either mode).
     OPERATOR_EDIT = "operator_edit"

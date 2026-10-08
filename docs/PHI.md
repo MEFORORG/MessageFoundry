@@ -1317,21 +1317,29 @@ sent, not only that something was. Two pieces of evidence outlive the bodies:
 | Evidence | Where | What it holds |
 |---|---|---|
 | Body digests | the `message_edit_resend` audit row, `detail.body_digest` | `alg` (`hmac-sha256`), `key_id`, and an `original` and an `edited` digest. `original` is the origin message's stored body; it is `null` when retention had already blanked it |
-| Origin | `messages.origin` and `messages.origin_actor` on the new message, repeated as `detail.origin` | `operator_edit` and the acting user. Partner receipts read `partner`, upload injects `operator_upload`, and the engine's own loopback and pass-through hops `reingress` |
+| Origin | `messages.origin` and `messages.origin_actor` on the new message, repeated as `detail.origin` | `operator_edit` and the acting user. Anything an inbound connection takes in reads `partner`, a timer's configured body included. Upload injects read `operator_upload`, and the engine's own loopback and pass-through hops read `reingress` |
 
 Both modes write the same row: a re-route names the new message in `new_message_id`, and so does a
-direct send. The console's edit-resend reaches the same handler, so it writes the same row.
+direct send. The console's edit-resend reaches the same handler, so it writes the same row. An
+upload inject's `upload.resend` row carries the same kind of digest, of the injected body, as
+`body_digest.injected`.
+
+**What the `edited` digest covers depends on the mode.** A direct send delivers the edited body
+itself, so the digest is of what the partner received. A re-route puts the edited body back on the
+origin channel, where a handler transforms it, so the digest is of what the operator submitted, not
+of the handler's output.
 
 **The digest is keyed, never a plain hash.** A short PHI body, such as one result value or one
 name, can be guessed, and a plain hash kept for good in the audit log would let anyone holding the
 log test guesses offline. The key is HKDF-SHA256 over the in-heap audit-chain key under its own
 label, `mefor/audit-body-digest/v1`, so it never doubles as the chain MAC. `key_id` names the audit
 key it came from, so a digest taken before `rotate-key` still verifies while the retired key is
-configured.
+configured. **Remove a retired key and its digests can no longer be checked.** The audit chain's
+keyed ranges depend on the same key, so keep a retired key for as long as its rows must verify.
 
 **To prove a body afterwards,** hold the candidate body and the store key, and call
 `verify_audit_body_digest` in `store/crypto.py` with the row's `key_id` and digest. A match shows
-that body is the one sent. A reader without the key learns nothing from the digest.
+that body is the one the row describes. A reader without the key learns nothing from the digest.
 
 **A store with no in-heap audit key records no digest.** That is a keyless store, and a
 `vault_transit` store, whose audit key never enters the engine. The row then holds

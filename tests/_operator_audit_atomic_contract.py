@@ -30,7 +30,7 @@ from uuid import uuid4
 import pytest
 
 from messagefoundry.config.models import RetryPolicy
-from messagefoundry.store.store import AuditAppend
+from messagefoundry.store.store import AuditAppend, MessageOrigin
 
 _RAW = (
     "MSH|^~\\&|SEND|FAC|RECV|FAC|20260101000000||ADT^A01|MSG0001|P|2.5\r"
@@ -212,6 +212,23 @@ async def assert_operator_audit_atomic(store: Any) -> None:
         changed=resend_changed,
     )
 
+    # --- resend_to with an edited body: a new child carries the operator (vault BACKLOG #2615)
+    direct_alt = f"OB_D{tag}"
+    direct = await store.resend_to(
+        message_id=done_mid,
+        to=direct_alt,
+        idempotency_key=f"contract-direct-{tag}",
+        body_override=_RAW.replace("DOE^JANE", "DOE^JUNE"),
+        actor="contract-op",
+    )
+    assert direct.status == "resent" and direct.new_message_id is not None
+    direct_child = await store.get_message(direct.new_message_id)
+    assert direct_child is not None
+    assert (direct_child["origin"], direct_child["origin_actor"]) == (
+        MessageOrigin.OPERATOR_EDIT.value,
+        "contract-op",
+    )
+
     # --- reingress: an edited body re-enters the origin channel as a new message
     origin_ch = f"IB_R{tag}"
     origin = await _seed(store, origin_ch, dest, settle=None)
@@ -225,6 +242,16 @@ async def assert_operator_audit_atomic(store: Any) -> None:
 
     async def reingress_changed(outcome: Any) -> None:
         assert outcome.status == "resubmitted" and await count(origin_ch) == 2
+        # Vault BACKLOG #2615: the plain origin pair, on every backend. The seed is a partner's.
+        child = await store.get_message(outcome.new_message_id)
+        assert child is not None
+        assert (child["origin"], child["origin_actor"]) == (
+            MessageOrigin.OPERATOR_EDIT.value,
+            "contract-op",
+        )
+        seeded = await store.get_message(origin)
+        assert seeded is not None
+        assert (seeded["origin"], seeded["origin_actor"]) == (MessageOrigin.PARTNER.value, None)
 
     await _check(
         store,
@@ -235,6 +262,7 @@ async def assert_operator_audit_atomic(store: Any) -> None:
             raw=edited,
             idempotency_key=f"contract-reingress-{tag}",
             audit=audit,
+            actor="contract-op",
         ),
         unchanged=reingress_unchanged,
         changed=reingress_changed,
@@ -248,14 +276,24 @@ async def assert_operator_audit_atomic(store: Any) -> None:
 
     async def inject_changed(new_mid: Any) -> None:
         assert await count(inject_ch) == 1
-        assert (await store.get_message(new_mid)) is not None
+        injected = await store.get_message(new_mid)
+        assert injected is not None
+        assert (injected["origin"], injected["origin_actor"]) == (
+            MessageOrigin.OPERATOR_UPLOAD.value,
+            "contract-op",
+        )
 
     await _check(
         store,
         label="inject",
         channel=inject_ch,
         run=lambda audit: store.enqueue_ingress(
-            channel_id=inject_ch, raw=_RAW, source_type="upload", audit=audit
+            channel_id=inject_ch,
+            raw=_RAW,
+            source_type="upload",
+            audit=audit,
+            origin=MessageOrigin.OPERATOR_UPLOAD,
+            origin_actor="contract-op",
         ),
         unchanged=inject_unchanged,
         changed=inject_changed,

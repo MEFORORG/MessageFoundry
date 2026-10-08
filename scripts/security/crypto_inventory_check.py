@@ -958,18 +958,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #1167 (ASVS 11.2.4): the config-provenance drift compare, via fingerprint_matches.
     # Vault BACKLOG #2371: the SHA-256 of a dialling CA file, via make_lane_anchor_check. It
     # fingerprints the file to tell a repeated refusal from a changed one. A digest, not a key.
-    # Vault BACKLOG #2615: the hash, kdf and mac rows via store.crypto are audit_body_digests. It
-    # derives a key from the audit-chain key by HKDF-SHA256 under its own label, then takes an
-    # HMAC-SHA256 of each body for the edit-resend audit row. Keyed so the digest of a short PHI
-    # body cannot be guessed offline from the audit log. The hash row is audit_key_id, the
-    # non-secret id naming the audit key the digest key came from.
+    # Vault BACKLOG #2615: app.py also runs store.crypto's audit_body_digests (HKDF-SHA256 off the
+    # audit-chain key, then HMAC-SHA256 of each body, for the edit-resend and upload-inject audit
+    # rows). It runs through asyncio.to_thread, a reference this scanner does not follow as a call,
+    # so no operation row names it; the import row above records the dependency.
     "messagefoundry/api/app.py": frozenset(
         {
             "compare:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.auth.trust_anchors",
-            "hash:via messagefoundry.store.crypto",
-            "kdf:via messagefoundry.store.crypto",
-            "mac:via messagefoundry.store.crypto",
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),

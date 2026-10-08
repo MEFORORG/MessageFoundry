@@ -671,7 +671,14 @@ def audit_body_digests(cipher: Cipher, **bodies: str) -> dict[str, str | None] |
     the digest reveals nothing about a body to a reader of the audit log who lacks the store key, and
     anyone who holds a candidate body and the key can confirm it. Returns ``None`` when there is no
     in-heap key: a keyless store, or a Vault Transit cipher whose audit key never enters the engine.
-    The caller records that as no digest, never as a plain hash."""
+    The caller records that as no digest, never as a plain hash.
+
+    The digest outlives a key rotation only while the retired key stays configured: the audit chain's
+    keyed ranges have the same dependency, so keep a retired key for as long as its rows must
+    verify."""
+    reserved = {"alg", "key_id"} & bodies.keys()
+    if reserved:
+        raise ValueError(f"body names {sorted(reserved)} collide with the digest's own fields")
     audit_key = cipher.audit_mac_key()
     if audit_key is None:
         return None
@@ -682,14 +689,15 @@ def audit_body_digests(cipher: Cipher, **bodies: str) -> dict[str, str | None] |
     return out
 
 
-def verify_audit_body_digest(cipher: Cipher, body: str, *, key_id: str, digest: str) -> bool:
+def verify_audit_body_digest(cipher: Cipher, body: str, *, key_id: str, digest: str | None) -> bool:
     """Whether ``body`` is the body an audit row's ``digest`` was taken of (vault BACKLOG #2615).
 
     Looks the audit key up by ``key_id`` in the cipher's keyring, so a digest taken before a key
     rotation still verifies while the retired key is configured. ``False`` for an unknown key id, a
-    keyless cipher, or a mismatch; the comparison is constant-time."""
+    keyless cipher, a ``None`` digest (a body retention had already blanked), or a mismatch. The
+    comparison is constant-time."""
     audit_key = cipher.audit_mac_keyring().get(key_id)
-    if audit_key is None or not body:
+    if audit_key is None or not body or not isinstance(digest, str):
         return False
     try:
         expected = bytes.fromhex(digest)
