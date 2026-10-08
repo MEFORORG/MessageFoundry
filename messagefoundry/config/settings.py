@@ -8001,6 +8001,7 @@ def security_loosenings(
     unverified_db_hops: Sequence[str],
     attested_hops: Sequence[str],
     revocation_attested_hops: Sequence[str],
+    path_form_fhir_hops: Sequence[str],
     api: ApiSettings,
     approvals: ApprovalsSettings,
     cert_monitor: CertMonitorSettings,
@@ -8035,8 +8036,9 @@ def security_loosenings(
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS
     12.3.2), an endpoint ``url`` with a credential in its query string (ASVS 14.2.1), a generic-ODBC
     ``DATABASE`` hop
-    with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
-    ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
+    with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24),
+    ``tls_revocation_attested`` (ADR 0173) and a ``FHIR()`` outbound set to
+    ``update_url_form="path"`` (vault BACKLOG #2571) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
     the engine process (vault BACKLOG #2700), the OBSERVED launch flags and start-up code of its
     interpreter (vault BACKLOG #2701), and
@@ -8133,8 +8135,10 @@ def security_loosenings(
     ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment), and
-    ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24), and
-    ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173). They arrive as
+    ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24),
+    ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173), and
+    ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
+    ``update_url_form="path"`` (vault BACKLOG #2571). They arrive as
     plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
@@ -8142,7 +8146,8 @@ def security_loosenings(
     ``hostname_unchecked_hops``, which walks inbound as well as outbound; ``query_credential_hops``,
     which walks outbound and ``FhirLookup``; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
-    ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``). A caller that
+    ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``;
+    ``path_form_fhir_updates``, which walks outbound and already returns plain names). A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
@@ -8641,6 +8646,21 @@ def security_loosenings(
                 "refusal would apply to those hops it is lifted, so a revoked certificate is caught "
                 "only if that external PKI control works; the attestation never lifts a cleartext "
                 "or verify-off refusal",
+            )
+        )
+    # Vault BACKLOG #2571: the FHIR path-form update, relaxing owner ruling R3 (ASVS 14.2.1). Advisory,
+    # like tls_allow_expired: no gate keys on it. What is in the URL is the resource id, so the
+    # text says where that id is written down and makes no claim about what the id is.
+    if path_form_fhir_hops:
+        named = ", ".join(sorted(path_form_fhir_hops))
+        out.append(
+            (
+                "update_url_form",
+                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form "
+                f"({named}) — each update puts the message's resource id in the request URL, "
+                "so the receiving server's access log, and any proxy log on the path, holds "
+                "it; an id can be a medical record number or another identifier. The shipped "
+                "transaction form keeps the id out of the URL",
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like

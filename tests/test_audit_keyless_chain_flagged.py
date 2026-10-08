@@ -244,6 +244,7 @@ def _loosening_names(audit_chain_unkeyed: bool | None) -> set[str]:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),

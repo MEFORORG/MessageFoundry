@@ -76,6 +76,7 @@ def _pairs(
     db_hops: tuple[str, ...] = (),
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
+    path_form_hops: tuple[str, ...] = (),
     api: ApiSettings | None = None,
     approvals: ApprovalsSettings | None = None,
     cert_monitor: CertMonitorSettings | None = None,
@@ -96,6 +97,7 @@ def _pairs(
         unverified_db_hops=db_hops,
         attested_hops=attested_hops,
         revocation_attested_hops=revocation_hops,
+        path_form_fhir_hops=path_form_hops,
         api=api or ApiSettings(),
         approvals=approvals or ApprovalsSettings(),
         cert_monitor=cert_monitor or CertMonitorSettings(),
@@ -151,6 +153,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -186,6 +189,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -218,6 +222,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -311,6 +316,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -451,6 +457,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -1286,6 +1293,7 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=_proxied(*entries),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -1320,6 +1328,7 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=_proxied("::/0", "::/0"),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -1386,6 +1395,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=_terminated(ack=True),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -1954,6 +1964,58 @@ def test_the_url_query_credential_is_actually_wired() -> None:
     assert "url_query_credential" not in _names()  # control: nothing declared, nothing named
 
 
+def _fhir_update_registry() -> Any:
+    """A graph with one path-form ``FHIR()`` update and one transaction-form update beside it."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, Registry, build_outbound_connection
+
+    reg = Registry()
+    for name, extra in (("OB_PATH", {"update_url_form": "path"}), ("OB_TXN", {})):
+        settings = {"url": "https://fhir.example.org/fhir", "interaction": "update", **extra}
+        reg.add_outbound(
+            build_outbound_connection(
+                name, ConnectionSpec(type=ConnectorType.FHIR, settings=settings)
+            )
+        )
+    return reg
+
+
+def test_the_fhir_path_form_update_is_actually_wired() -> None:
+    """Vault BACKLOG #2571: driven through its reader AND through ``security_loosenings``. The
+    transaction-form connection beside it is the control that must not be named."""
+    from messagefoundry.config.wiring import path_form_fhir_updates
+
+    hops = tuple(path_form_fhir_updates(_fhir_update_registry()))
+    assert hops == ("OB_PATH",)
+    risk = dict(_pairs(path_form_hops=hops))["update_url_form"]
+    assert "OB_PATH" in risk and "OB_TXN" not in risk
+    assert "request URL" in risk
+    assert "update_url_form" not in _names()  # control: nothing declared, nothing named
+
+
+async def test_posture_route_names_a_fhir_path_form_update(engine: Engine) -> None:
+    """``GET /security/posture`` reads the path-form set off the live graph. A graph holding only
+    a transaction-form update names nothing, so the entry comes from the connection's setting."""
+    engine.add_registry(_fhir_update_registry())
+    body = await _posture_body(engine)
+    entry = next(
+        e
+        for e in body["loosenings"]  # type: ignore[union-attr]
+        if e["switch"] == "update_url_form"
+    )
+    assert "OB_PATH" in entry["risk"] and "OB_TXN" not in entry["risk"]
+
+
+async def test_posture_route_does_not_name_a_transaction_form_update(engine: Engine) -> None:
+    """The control for the test above, on a graph with the path-form connection removed."""
+    reg = _fhir_update_registry()
+    del reg.outbound["OB_PATH"]
+    engine.add_registry(reg)
+    body = await _posture_body(engine)
+    assert "update_url_form" not in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+    assert body["loosenings_scope"] is None
+
+
 def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> None:
     """CORRECTED (ASVS 12.3.2 re-read): the entry said the hostname match is "still fully verified"
     for every listed hop. It now conditions that on the hop leaving the name check on."""
@@ -2080,6 +2142,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2127,6 +2190,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2165,6 +2229,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             unverified_db_hops=("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2200,6 +2265,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2809,6 +2875,7 @@ async def test_posture_route_declares_its_scope_when_no_graph_is_loaded(engine: 
     body = await _posture_body(engine)
     assert body["loosenings_scope"] is not None
     assert "cleartext_accepted" in str(body["loosenings_scope"])
+    assert "update_url_form" in str(body["loosenings_scope"])
 
 
 async def test_posture_route_scope_is_none_once_a_graph_is_loaded(engine: Engine) -> None:

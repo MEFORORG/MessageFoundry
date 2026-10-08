@@ -361,6 +361,7 @@ from messagefoundry.config.wiring import (
     expiry_relaxed_hops,
     hostname_unchecked_hops,
     load_config,
+    path_form_fhir_updates,
     query_credential_hops,
     redacted_settings,
     revocation_attested_hops,
@@ -1249,10 +1250,13 @@ def _posture_loosenings(
         db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
         attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
         revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
+        # Vault BACKLOG #2571. This reader returns plain names already.
+        path_form_hops = path_form_fhir_updates(runner.registry)
     else:
         cleartext_hops, expired_hops, hostname_hops, db_hops = [], [], [], []
         query_hops = []
         attested_hops, revocation_hops = [], []
+        path_form_hops = []
     loosenings_scope = (
         None
         if runner is not None
@@ -1260,7 +1264,8 @@ def _posture_loosenings(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-            "tls_revocation_attested declarations are NOT included (see `messagefoundry check`)"
+            "tls_revocation_attested / FHIR update_url_form declarations are NOT included "
+            "(see `messagefoundry check`)"
         )
     )
     pairs = list(
@@ -1277,6 +1282,7 @@ def _posture_loosenings(
             unverified_db_hops=db_hops,
             attested_hops=attested_hops,
             revocation_attested_hops=revocation_hops,
+            path_form_fhir_hops=path_form_hops,
             api=api_settings,
             # BACKLOG #2489: the dual-control dwell and expiry, read off the gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),

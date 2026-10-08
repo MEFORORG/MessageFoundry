@@ -152,6 +152,7 @@ def test_show_declares_that_it_cannot_see_connection_scoped_deviations(
     data = _show(toml, capsys)
     assert data["loosenings_partial"] is False
     assert "cleartext_accepted" in data["loosenings_scope"]
+    assert "update_url_form" in data["loosenings_scope"]
     assert "messagefoundry check" in data["loosenings_scope"]
 
 

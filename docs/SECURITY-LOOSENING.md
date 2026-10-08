@@ -97,7 +97,7 @@ section reference.
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
-| | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening) |
+| | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
@@ -112,14 +112,12 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs` and `[backup].allow_unencrypted` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
-settings at all. They are listed here anyway, and all but `update_url_form` are reported,
-because the rule is *one shipped
+settings at all. They are listed here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]`/`[backup]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
-exactly which surfaces see them, and which cannot). At least one per-connection row is not passed in
-yet: `update_url_form`, whose entry names the two records it does have.
+exactly which surfaces see them, and which cannot).
 
 **One row is not a setting at all.** `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is an environment variable.
 `security_loosenings()` reads it from the environment of the process that renders the report, and
@@ -132,8 +130,7 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one), the connection
 > factories' TLS-shaped parameters (a second floor in the same file censuses the factory signatures,
 > because a per-connection deviation is outside `model_fields`' reach by construction) and the
-> enumerated deviations above, except `update_url_form` (its entry says which records it has).
-> It is
+> enumerated deviations above. It is
 > **not yet** an exhaustive register of every security-relevant
 > switch in every section: `[store].encrypt` / `trust_server_certificate` and
 > `[auth].ad_tls_verify` are gated by their own serve-time refusals and are **not** reported here.
@@ -1205,14 +1202,16 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   sources. Set it on the one connection that needs it.
 - **Compensating controls:** treat the server's access logs as PHI-bearing, with the access control and
   retention that implies, and confirm who can read any proxy log on the path.
-- **It is never silent:** a WARNING at every construction naming the connection, never an id, and a
-  `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it.
+- **It is never silent:** a WARNING at every construction naming the connection, never an id, a
+  `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it, and
+  an `update_url_form` entry in `security_loosenings()`, which `GET /security/posture` shows with
+  the same connection names (vault BACKLOG #2571). The last two read one list.
 - **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
   `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
-  and `[security].enforcement = enforce` does not refuse it. It is **not yet** in
-  `security_loosenings()`, so `GET /security/posture` and the serve-time loosening warning do not name
-  it. The construction WARNING and the `check` line are its only records today; adding it to the
-  registry is owed work.
+  and `[security].enforcement = enforce` does not refuse it. It is not in the
+  serve-time loosening warning, which fires before the graph is loaded, exactly as for
+  `cleartext_accepted`. `messagefoundry security show` and a graphless `GET /security/posture`
+  cannot see it either, and say so in `loosenings_scope`.
 
 ### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
