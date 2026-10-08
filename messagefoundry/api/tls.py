@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
+from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth.trust_anchors import api_client_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import (
@@ -219,18 +220,19 @@ async def record_generated_pair_replacements(
     **A failed write does not stop the engine**, because it cannot undo anything: the pair on disk
     is already the new one, and the next start finds it fresh and reports nothing. So the failure is
     logged at ERROR with the whole record, which keeps the replacement from being silent.
+    ``defects=()`` for the same reason: nothing here may stop the start (vault BACKLOG #2260).
     """
     for event in events:
-        try:
-            await store.record_audit(
-                GENERATED_PAIR_REPLACED, actor=None, detail=event.audit_detail()
-            )
-        except Exception:  # any backend's write failure; logged in full below, never swallowed
-            log.exception(
-                "could not write the %s audit row; the record is: %s",
-                GENERATED_PAIR_REPLACED,
-                event.audit_detail(),
-            )
+        detail = event.audit_detail()
+        await write_audit_soft(
+            # Awaited in this pass, so the late binding B023 warns about cannot bite. A lambda, not
+            # a partial, keeps the lookup of record_audit inside the guard.
+            lambda: store.record_audit(GENERATED_PAIR_REPLACED, actor=None, detail=detail),  # noqa: B023
+            log=log,
+            message="could not write the %s audit row; the record is: %s",
+            args=(GENERATED_PAIR_REPLACED, detail),
+            defects=(),
+        )
 
 
 def _generated_pair(state_dir: Path) -> tuple[Path, Path]:

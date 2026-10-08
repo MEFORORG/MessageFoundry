@@ -636,6 +636,7 @@ _DEK_CITED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_SubkeyDeriver",
         "_derive_audit_mac_key",
         "rotation_fingerprint_key",
+        "_derive_body_digest_key",
         "_WriteKey",
         "generate_key",
         "_secure_zero",

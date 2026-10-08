@@ -28,6 +28,7 @@ import asyncio
 import itertools
 import json
 import logging
+import sqlite3
 import string
 import threading
 import time
@@ -265,13 +266,16 @@ def test_the_docs_carry_the_restart_advice() -> None:
     assert "auth.credential_issue_refused" in section
 
 
+@pytest.mark.parametrize(
+    "fault",
+    # The last two are defects another fail-soft write raises; this one must not (BACKLOG #2260).
+    [sqlite3.OperationalError, sqlite3.ProgrammingError, NotImplementedError],
+)
 async def test_a_failed_refusal_audit_still_answers_with_the_refusal(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fault: type[Exception]
 ) -> None:
     """The refusal row is a record, not the answer. A store that cannot write it must not turn the
     refusal into a different exception, or the route answers 500 and keeps the spent grant."""
-    import sqlite3
-
     store = await MessageStore.open(":memory:")
     try:
         seeding = AuthService(store, AuthSettings(require_mfa=False))
@@ -289,7 +293,7 @@ async def test_a_failed_refusal_audit_still_answers_with_the_refusal(
         service = AuthService(store, _unissuable())
 
         async def failing_audit(*_a: object, **_k: object) -> None:
-            raise sqlite3.OperationalError("synthetic store fault")
+            raise fault("synthetic store fault")
 
         monkeypatch.setattr(service, "_audit", failing_audit)
         with (
@@ -303,7 +307,7 @@ async def test_a_failed_refusal_audit_still_answers_with_the_refusal(
             if r.levelno >= logging.ERROR and CREDENTIAL_ISSUE_REFUSED_ACTION in r.getMessage()
         ]
         assert len(logged) == 1
-        assert logged[0].exc_info is not None and logged[0].exc_info[0] is sqlite3.OperationalError
+        assert logged[0].exc_info is not None and logged[0].exc_info[0] is fault
     finally:
         await store.close()
 

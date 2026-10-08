@@ -532,7 +532,12 @@ async def test_resend_injects_via_enqueue_ingress(engine: Engine, tmp_path: Path
         MessageStatus.ROUTED.value,
         MessageStatus.PROCESSED.value,
     )
-    assert any(a["action"] == "upload.resend" for a in await engine.store.list_audit())
+    [audit] = [a for a in await engine.store.list_audit() if a["action"] == "upload.resend"]
+    # Vault BACKLOG #2615: the origin, the operator and the digest field. This engine is keyless,
+    # so the digest is null, never a plain hash.
+    assert (row["origin"], row["origin_actor"]) == ("operator_upload", "op")
+    detail = json.loads(str(audit["detail"]))
+    assert detail["origin"] == "operator_upload" and detail["body_digest"] is None
 
 
 async def test_resend_unknown_and_not_running_inbound(engine: Engine, tmp_path: Path) -> None:
@@ -566,10 +571,12 @@ async def test_engine_inject_message_creates_received(engine: Engine) -> None:
         raw=ADT,
         source_type="upload",
         audit=lambda new_mid: AuditAppend("upload.resend", actor="op", detail=new_mid),
+        actor="op",
     )
     row = await engine.store.get_message(mid)
     assert row is not None
     assert row["channel_id"] == "in1"
+    assert (row["origin"], row["origin_actor"]) == ("operator_upload", "op")  # vault BACKLOG #2615
     assert row["status"] == MessageStatus.RECEIVED.value
     assert row["source_type"] == "upload"
     [audit] = await engine.store.list_audit(action="upload.resend")

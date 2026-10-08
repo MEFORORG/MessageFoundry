@@ -53,13 +53,13 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _ApprovedDigestMixin,
     enforce_outbound_length_limits,
+    hop_declarations_from_settings,
     http_family_trust_anchor,
     proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
 )
 from messagefoundry.transports.smart import (
     _TokenEndpointProvider,
-    hop_declarations_from_settings,
     smart_auth_configured,
     token_provider_from_settings,
 )

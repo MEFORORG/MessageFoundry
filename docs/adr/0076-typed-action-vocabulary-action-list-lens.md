@@ -1097,7 +1097,7 @@ The bare read and `msg.field("X")` stay admitted. Each reads back as the same `{
 so round-trip totality (E.6.3) holds. Resending such a template's parts rewrites its reads to the
 fallback form, which is how the IDE applies this fix to an older template. Structural inserts
 (`insert_row` and the insert templates) still splice an `{"expr": ...}` verbatim. This note does not
-cover them.
+cover them. *(2026-10-07: Amendment G, Proposed, section G.7 records a pending change to this.)*
 
 **4. Template writes go into value params only.** A templated write is accepted into exactly four
 parameters: `set_field.value`, `add_repetition.value`, `append_to_field.suffix` and
@@ -1214,3 +1214,341 @@ save path, exactly as before.
   `RerenderDebouncer`, and the change path SHALL feed it rather than hold a timer of its own.
 - [ ] **AC-F6** — WHEN our own `lens rewrite` is applying, THE SYSTEM SHALL NOT re-project on the
   resulting document change (the update-loop guard, unchanged).
+
+## Amendment G (2026-10-07) -- PROPOSED -- the analyst build of the Theia editor drops three IDE guardrails for that build only, and a typed-only mode closes two escape hatches (review R1, R9)
+
+**Status: Proposed.** Not accepted; accepting it needs the owner. It edits no text above this heading
+except one: a dated pointer appended to the E.11 sentence about structural inserts, which sends the
+reader to G.7. G.6 and G.7 say where its meaning narrows. It is written for [ADR 0208](0208-a-theia-desktop-app-gives-interface-analysts-a-simpler-steps-only-editor.md),
+which proposes a Theia desktop editor for interface analysts, and for its specification
+[`docs/design/theia-analyst-editor.md`](../design/theia-analyst-editor.md). A review of the
+2026-10-02 drafts of that design found that they removed guardrails this ADR accepted without
+amending it (finding R9). This amendment names each one. It also records the owner's 2026-10-07
+ruling on a typed-only mode for `lens rewrite` (G.6), which narrows this ADR's §5 and ADR 0106 in that
+mode only, and a change to structural inserts (G.7). Both answer finding R1.
+
+### G.1 The clauses this overrides, in the analyst build only
+
+| Clause | Where | In the analyst build |
+|---|---|---|
+| *"Reopen With: Python always available"* | §5, second bullet | Not available. The analyst build has no text editor for `.py` |
+| Degrade to the text editor on a parse failure, with a notice | §3 (the coverage invariant's *"steps aside to the text editor"*), §6 item 6, and the fifth bullet of the original Acceptance Criteria after §6 | Replaced: a read-only notice says a developer must fix the file. No text editor opens |
+| Entry is opt-in: a CodeLens and a command, not the default editor for `.py` | §2, Phase 2 | The Steps view is how the analyst build opens a Router or Handler. There is no other way |
+
+Accepted text elsewhere restates the same guardrails, and the override reaches those restatements
+too: at least D.6 (*"No relaxation of the §5 guardrails"*, which names degrade-to-text-editor for
+`route` edits) and F.3 (*"Reopen With: Python" stands*). Every other clause of D.6 and F.3 stands in
+the analyst build.
+
+**The analyst build also narrows one thing.** Today a whole `if`/`for` block can be deleted or moved
+from its header row, nested `code` rows included. In the analyst build a delete or move that breaks
+the structure rule of G.6 is refused (AC-G5), because it would remove or reorder hand-written Python.
+
+**The `ide/` extension and the developer build of ADR 0208 keep all three guardrails unchanged.** The
+developer build applies no per-user limits (ADR 0208, Manager decision D-A); a user without
+`code:edit` is given the analyst build. Every other clause of this ADR stands in every build.
+
+### G.2 Why each guardrail can go in that build, and what replaces it
+
+- **Opt-in entry** existed because *"Python files broadly belong to the user's Python tooling"*
+  (§2). The analyst build has no Python tooling, so nothing else claims the file.
+- **Reopen With: Python and the text fallback** are the escape route when the lens cannot show
+  something. In the analyst build the escape route is a developer. The cost is real: an analyst is
+  blocked on a file that fails `lens parse` until a developer fixes it. A `code` row stays visible
+  and read-only, so one hand-written line still does not eject the analyst (§4's ladder holds).
+
+### G.3 What stays, and the BACKLOG #26 note
+
+**These do not change in any build:** the `.py` is the only artifact and the only execution path
+(§2); `lens rewrite` is a row-scoped splice (§5); one editor at a time and the update-loop guard
+(§5); live values stay save-gated and redacted (Amendment F, the #225 addendum); static analysis only
+(§5). The analyst build saves through the editor's document model, as §2 Phase 3 describes, so §2's
+save path is not overridden. (The 2026-10-02 drafts' server-side broker would have replaced it. ADR
+0208 defers that design to a later hosted phase.)
+
+**Why the analyst build stays inside the BACKLOG #26 carve-out** (CLAUDE.md section 12). The carve-out
+holds because the `.py` stays the only artifact and the only execution path. The analyst build removes
+routes to the text; it adds no declarative artifact, no interpreter and no canvas. A view that offers
+less of the same file cannot cross a line drawn at a second artifact or a second execution path.
+
+**Bounds, each of which would cross the line:**
+
+- **No mapping artifact.** A Manager decision of 2026-10-07, under the owner's delegation, puts
+  drag-a-field inside the carve-out **only** as entry of a path parameter on a step: the drag produces
+  the same typed `lens rewrite` edit as typing the path, as the field picker already does. A drag that
+  creates a field-to-field mapping, or a step from a mapping gesture, stays declined as field-mapping
+  or canvas authoring.
+- **No step descriptions drawn from comments.** Attaching a comment to the following step is ruled out
+  by A.5 (*"No attachment to a following statement"*) and needs its own amendment.
+- **No stored Steps model**, in either build.
+
+### G.4 §7 is not edited
+
+§7 lists a standalone designer or Theia studio as rejected for now, a parked exit path. ADR 0208
+proposes taking that exit path for analysts. This amendment does not rewrite §7; if ADR 0208 is
+accepted, it is the record that the parked path was taken.
+
+### G.5 A precondition this amendment does not meet
+
+Review finding R1 showed `lens rewrite` accepting arbitrary Python. Two changes to
+`messagefoundry/lens.py` answer it: the typed-only mode of G.6 and the R1 fix of G.7. **Both are
+being built separately, on their own branch, and neither has landed.** Until they do, a typed-row
+edit can carry code, and the analyst build's limit does not hold even inside the editor. ADR 0208
+makes both a condition of shipping the analyst build.
+
+**This amendment is the one statement of both.** ADR 0208 and its specification point here rather
+than restating them.
+
+The four R1 payloads, as the review recorded them:
+
+1. a `paste_block` that splices `subprocess.run(["calc"])` (G.6);
+2. a `template` If whose raw `test` is `__import__('os').system('calc') == 0` (G.6);
+3. an `insert_row` whose value is `{"expr": "__import__('os').system('calc')"}` (G.7);
+4. a `set_params` on a send row whose `to` is an `{"expr": ...}` (G.7).
+
+### G.6 A typed-only mode closes two escape hatches (owner ruling 2026-10-07)
+
+Two hatches write code that runs, and accepted text licenses both:
+
+- **`paste_block`**, the op behind keyboard paste. ADR 0103 names keyboard paste as a verb, and the
+  provenance comment above `_SUPPORTED_OPS` in `messagefoundry/lens.py` places the op under §2
+  Phase 3 v2. No ADR text names `paste_block` itself.
+- **A one-line raw `test`**: a `test` key on an `op: template` edit whose template is `if`, or on an
+  `insert_clause` edit whose clause is `elif`. ADR 0106 section 3, Group 3, names it the
+  *"power-user `test:{expr}` escape hatch"*.
+
+**The templates themselves are not refused.** An `op: template` edit (If, For Each, Filter, Raise,
+Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and is routed through
+`_apply_paste_block` internally. So the refusal sits on the `paste_block` *op* and on the `test`
+*key*, not inside `_apply_paste_block`, or typed templates would be refused too.
+
+**The owner ruled on 2026-10-07 that both close under a typed-only mode, and are otherwise kept.**
+
+- `lens rewrite` would gain a flag, working name `--typed-only`, off by default. Under it, the two
+  hatches above would be refused with the generic `refused` code, and nothing written.
+- **Also under the flag**, a move or delete that breaks the structure rule below would be refused
+  (Manager decision 2026-10-07, after adversarial review, part of the R1 fix).
+- Developers, the `ide/` extension and the ADR 0208 developer build keep the default. The ADR 0208
+  analyst build always sets the flag and offers no way to turn it off.
+
+**The structure rule, stated once here.** ADR 0208, its specification and AC-G5 point to it.
+
+- A *generator-shaped* header is one AST-equal to what the lens emits from literal inputs. A
+  *hand-written* header is any other.
+- A *dynamic* row is a typed, send or route row the lens could not have written: one with a
+  parameter that is not a literal or inert value (G.7), or whose full statement lacks the
+  generator's skeleton (ADR 0208 spec FR-40 item 5a), such as `set_field(<code> or msg, ...)` or
+  `anything.Send(...)`. A dynamic row is hand-written, so it is the developer's code, like a `code`
+  row (G.1).
+- A *binding* is any statement that binds a name a later row reads: a Read Field row, a lookup row
+  with an `assign_to`, a For Each header (its loop index, such as the `i` in `occurrence=i`), and a
+  `code` row that binds a name. Rule 6 protects every kind.
+- A *suite path* is the chain of control headers above a row, each compared by content. An `elif`
+  or `else` suite's path also includes every earlier clause test in its chain, so adding or
+  removing an `elif` ahead of an `else` changes the path of everything under that `else`.
+
+Under the flag, these hold (Manager decision 2026-10-07, after review, which states the rule as an
+invariant rather than a property of the moved row):
+
+1. A move or delete never moves or deletes a `code` row, and never carries one inside a block
+   (rule 5).
+2. After a move or delete, every `code` row keeps its order relative to the other `code` rows, and
+   its suite path.
+3. Every hand-written header keeps its order relative to `code` rows and other hand-written headers,
+   and its suite path.
+4. A dynamic row is never moved or deleted (Manager decision 2026-10-07, after review). It is the
+   developer's code, so the analyst build treats it as G.1 treats a `code` row.
+5. A deleted or moved block takes no hand-written Python with it: no `code` row, no dynamic row, and
+   no hand-written header. A delete of an `if` covers its whole chain: every `elif` test must be
+   generator-shaped too, and no `elif` or `else` body may hold a `code` row or a dynamic row.
+6. Every read of a name stays dominated by that name's bindings: every path from the start of the
+   body to the read passes a binding of the name (Manager decision 2026-10-07, after review).
+   Dominance is over the set of the name's bindings. A binding other than a loop header or a `with`
+   header, earlier in the same suite as the read or earlier in a suite that encloses it, dominates
+   the read. An `if` whose every arm binds the name, with an `else`, dominates a later read; an `if`
+   with an arm that neither binds the name nor leaves the body does not. A loop target (`for x in
+   ...`) does not dominate a read after the loop, because a loop may run zero times. A binding inside
+   a `with` body does not dominate a read after the block (Manager decision 2026-10-07, after
+   review). A For Each header dominates only reads inside its own body, so a row that uses its index,
+   such as `occurrence=i`, may not move out of the loop (Manager decision 2026-10-07, after review).
+   A move of either end, a binding or a reading row, that breaks this is refused, and so is a delete
+   of a binding that leaves a read undominated. Each of those would leave a read unbound, at least
+   whenever a condition is false. A block that holds a Read Field or assigned lookup row is also
+   never moved or deleted; that refusal is conservative, and applies even when every read sits inside
+   the block.
+7. A typed row never moves past at least a `code` row, a dynamic row, a hand-written header or the
+   fan-out `return sends`, and never moves into or out of a typed block that holds a `code` row
+   (Manager decision 2026-10-07, after review). This answers the Lander's PR 2155
+   finding 1. An insert at the same place is still allowed.
+8. A typed `return` or `raise` keeps its whole suite path, top level included: lifted out of its
+   guard, a filter or a raise would run on every message. A typed row never moves below a typed
+   `return` or `raise` in its suite, where it would never run. A row never moves past the fan-out
+   `return sends`, though it may move past `sends = []` (Manager decision 2026-10-07, after review).
+
+A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
+block whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager
+decisions 2026-10-07, from spike S-4, which found that the repository check needs them (ADR 0208 spec
+FR-40).
+
+This narrows, in typed-only mode only, at least: §2 Phase 3 and §5 of this ADR; ADR 0106; the
+*Delete* and *Move* verbs of [ADR 0103](0103-steps-view-row-context-menu.md)'s row menu; and the
+`delete_row` of a whole `if`/`for` block from its header row, which the comment above the
+editable-kind guard in `rewrite_source` (`messagefoundry/lens.py`) calls the ADR 0089 block-cut a
+Steps cut reuses. None of those texts is changed; this amendment is the record. None of it has
+landed.
+
+### G.7 The R1 fix: values a typed edit may write
+
+Amendment E's 2026-09-29 note (E.11, rule 3) records that structural inserts (`insert_row` and the
+insert templates) *"still splice an `{"expr": ...}` verbatim"*, and that the note does not cover
+them. The R1 fix would change that, in every mode, at least as follows:
+
+- An `{"expr": ...}` on an `insert_row` (including its occurrence keywords), on `insert_code_lookup`
+  (including the code-lookup default), or on a send row's `set_params` destination would be refused
+  unless it is **inert**.
+- `set_params` on a send row would overwrite an existing destination only when that slot is a literal
+  or an inert name. A destination computed by code, or held in a handler local, is refused, and so is
+  a destination imported from another module, which cannot be retargeted yet (Manager decision
+  2026-10-07, after review).
+- `assign_to` would refuse `msg`, builtins, reserved names, dunder names, and any name the handler
+  or module already binds or reads.
+- `set_params` on a `route` row whose base `handlers` is not a literal list would be refused
+  (Manager decision 2026-10-07, after adversarial review).
+
+**The inert rule, stated once here.** The lens's own predicate decides what is inert; the list below
+describes it for a reader. **The list is not a gate.** No check, test or requirement may treat it as
+the definition of inert; a checker calls the lens's predicate (Manager decision 2026-10-07, after
+review). The list gives examples of what is admitted; it does not limit the predicate. What binds are
+the ceilings, which the predicate SHALL apply: the name ceiling below,
+and each refusal the bullets state (`%` and `**`, arithmetic on a name that may hold text, an
+`occurrence` or `repetition` below 1, and a Set Field or Add Repetition value that is not text). It
+has one exception to "calls nothing": admitted values call nothing except a bounded `msg.field(...)`
+read and the FHIR value objects `FhirToken(...)` and `FhirRaw(<string literal>)`, named below.
+
+- a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
+- `+` and `-` over numbers and numeric names; `*`, `/` and `//` over number literals only, with a
+  non-zero divisor; never `%` or `**`. Arithmetic takes only names bound to a number, never a name
+  that may hold text (Manager decision 2026-10-07, after review);
+- for an `occurrence` or `repetition` keyword, only a value that is 1 or more on every message:
+  integer arithmetic over literals whose result is 1 or more (so `2 * 3`, but not `1 - 1`), a 1-based
+  loop index (every loop binding it is `range(k, n)` or `range(k, n, step)` with literal `k` and
+  `step` of 1 or more), or that index plus integer-literal arithmetic of 0 or more. `repetition=None`
+  is allowed (Manager decision 2026-10-07, after review). So a name such as `occurrence=OCC`, bound
+  to a module-level number, is refused;
+- for the value of Set Field and Add Repetition, only a value that is text: a string literal, a name
+  or read that may hold text, or a template. At least a number, `None`, a tuple, a list, a set or a
+  dict is refused;
+- a plain name other than `msg`, not a dunder, that cannot hold message content:
+  - a For Each `range` loop index;
+  - a module-level name bound exactly once, to a literal of an immutable type: a `str`, number,
+    `bool` or `None`, a tuple of those, or `frozenset(...)` over a set, tuple or list of those while
+    `frozenset` is the builtin, with nothing in the module mutating it (Manager decision 2026-10-07,
+    after review). So `FROZEN = frozenset({"A", "B"})` is admitted. A name with more than one
+    binding is refused, even when every binding is a literal. *Mutates* covers at least a second
+    binding (a `global` rebind included), a `del`, an augmented assignment, an assignment or `del`
+    through an attribute or subscript of it, and a method call on it or on an attribute of it. A
+    mutable container fails this however it is used: `SEEN = []` plus `SEEN.append(msg["PID-3"])`
+    rebinds nothing, yet `SEEN` then holds message content;
+  - a module-level `NAME = code_set("<literal>")` binding, **only** as `code_lookup`'s `table`
+    argument, and refused everywhere else, value params and lookup params included (Manager decision
+    2026-10-07, after review). The scope is exact: the callee is the bare name `code_set`, and that
+    name is the one imported from `messagefoundry`, not a local `def` or a helper import; the
+    argument is a string literal; the plain form and the annotated form `NAME: CodeSet =
+    code_set("<literal>")` are both admitted; and that statement is `NAME`'s only binding in the
+    module, so a second `code_set` binding is refused too, with nothing rebinding or mutating `NAME`
+    as the bullet above defines *mutates*. Any other way of obtaining a `CodeSet`, such as an import
+    from a helper module, `X.code_set(...)`, `code_set(NAME)` with a non-literal argument, an alias,
+    or a rebound name, is not admitted, so it is refused. The rule fails closed rather than missing
+    those. Value params refuse a
+    `code_set` name because a code set is a table, not a value (the same Manager decision). No engine
+    change is made for this.
+    **What the `table` use leaves.** `code_set` returns the shared active `CodeSet`, whose storage is
+    a plain dict, so a hand-written `code` row can write into it without naming the bound variable:
+    `code_set("lab")._data["k"] = msg["PID-3"]`. A later `code_lookup` could then write one
+    message's data into another message. That cross-message path is a property of hand-written code.
+    The `table` use opens no new write channel, because poisoning the table needs a hand-written
+    `code` row; the analyst build neither adds this path nor closes it (Manager decision
+    2026-10-07, after review);
+  - in value params, lookup-params values and `FhirToken`'s second argument, which may also carry
+    message content, a handler local other than `msg`, and nothing beyond what this list admits
+    elsewhere. A *handler local* is a name the handler itself binds, such as `pid5`, and that no
+    function in the module declares `global`. A `global` name is module state, so it could carry
+    one message's data into the next;
+  - **these bullets are a ceiling, on every path, value params included: the predicate SHALL NOT
+    admit a name beyond a handler local, a For Each `range` index, a module-level name the
+    immutable-literal bullet admits, or a `code_set` name as `code_lookup`'s `table`**
+    (Manager decision 2026-10-07, after review; this reverses
+    the round-6 decision that scoped the ceiling to non-value params);
+- a list, tuple, set or dict built only from inert values, with no splat;
+- in value params only, a bounded field read (`msg.field(...)` taking only `occurrence` and
+  `repetition` keywords) or a `templated` f-string whose every read is one;
+- for lookup `params`, a dict with literal keys and literal or read values, and in a FHIR lookup,
+  `FhirToken(literal, read)` or `FhirRaw(<string literal>)`.
+
+**Where the code stands.** The lens implementation of G.6 and G.7 is PR 2155
+(`messagefoundry/lens.py`). Its tests, `tests/test_lens_no_code_injection.py` and
+`tests/test_lens_typed_only_repair.py`, are the source of record for what the code enforces. Where
+the code and these rules differ, the stricter of the two governs, and each difference is recorded
+with its status on PR 2155 until it is reconciled (Manager decision 2026-10-07, PR 2154 review
+finding 4). The record is [PR 2155, comment
+6049435349](https://github.com/MEFORORG/MessageFoundry/pull/2155#issuecomment-6049435349).
+`set_params` on action, lookup and diagnostic rows already refuses a `dynamic` value (AC-M5).
+
+**Limits of a static check.** The predicate reads the source and runs nothing, so code that
+reaches module state by a route the source does not spell out can still defeat it. These remain, at
+least: `getattr(h, "__globals__")`, `from sys import modules as mm`, and
+`importlib.import_module(__name__)`. Each needs a hand-written `code` row. A deliberate bypass by a
+`code:edit` developer is out of scope (Manager ruling 2026-10-07 on PR 2155, made under the owner's
+delegation).
+
+**A gap in the projection today.** At `origin/main` (`ddf350e1d0`), `_rendered_param_nodes` drops the
+`msg` positional from a typed row's `params`, and `_callee_name` accepts any `X.attr` callee by its
+last name. So `set_field(__import__("os").getcwd() or msg, "PID-5.1", "X")` and `anything.Send("OB",
+msg)` read back as ordinary typed rows whose `params` look unchanged. The Steps view then shows code
+that runs as a typed step. ADR 0208's repository check would close this for itself, once built, by
+comparing each typed row's full statement (spec FR-40 item 5a). Whether the lens should refuse to
+project such a row as typed is open; [PR 2155, comment
+6049435349](https://github.com/MEFORORG/MessageFoundry/pull/2155#issuecomment-6049435349) records it.
+
+That sentence of E.11 is not rewritten; the dated pointer appended to it sends the reader here. The
+change is being built separately and has not landed.
+
+### Acceptance Criteria (Amendment G -- proposed, not ratified)
+
+- [ ] **AC-G1** -- WHILE the editor is the ADR 0208 analyst build, THE SYSTEM SHALL offer no command,
+  menu or link that opens a `.py` file in a text editor, and SHALL offer no route that writes a `.py`
+  without opening one. The routes include at least an untitled buffer, *Save As*, *Compare*, a rename
+  or copy into a `.py`, an upload, a drop into the navigator, and a move or copy of one `.py` over
+  another. (Mechanism: ADR 0208 spec section 10. Spike S-2 closed the first three and a move or copy
+  from a file that is not a `.py` into a `.py`, on the browser build; the rest are open. Manager
+  decision 2026-10-07, from spike S-2.)
+- [ ] **AC-G2** -- WHEN a file fails `lens parse` in the analyst build, THE SYSTEM SHALL show a
+  read-only notice that a developer must fix it, and SHALL NOT open a text editor.
+- [ ] **AC-G3** -- WHILE the editor is the ADR 0208 developer build or the `ide/` extension, THE
+  SYSTEM SHALL keep *Reopen With: Python*, the text-editor fallback and opt-in entry unchanged.
+- [ ] **AC-G4** -- THE analyst build SHALL write a `.py` only through `lens rewrite` output applied
+  to the editor's document, and SHALL store no Steps model.
+- [ ] **AC-G5** -- IF a delete or move in the ADR 0208 analyst build would break the structure rule
+  of G.6, THEN THE SYSTEM SHALL refuse it.
+- [ ] **AC-G6** -- WHILE `lens rewrite` runs in typed-only mode, IF an edit is a `paste_block`, an If
+  `template` or Else If `insert_clause` edit with a `test` key, or a move or delete that breaks the
+  structure rule of G.6, THEN THE SYSTEM SHALL refuse it with the generic `refused` code and write
+  nothing. R1 payloads 1 and 2 (G.5) are refusal tests, and so is a row using `occurrence=i`
+  moved out of its For Each loop (G.6 rule 6). The R1 fix's tests verify this; they land
+  separately.
+- [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL NOT refuse a
+  `paste_block` or a raw `test` for being one; each still passes the checks the lens applies in every
+  mode. Among those, a raw `test` SHALL be one condition on one line, with no `yield` and no `await`
+  outside an `async def` element. THE SYSTEM SHALL accept every typed `template` edit in either mode,
+  subject to G.7.
+- [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite`
+  call.
+- [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`
+  G.7 refuses, or a `set_params` on a route row whose base `handlers` is not a literal list, THEN
+  `lens rewrite` SHALL refuse it, in every mode. R1 payloads 3 and 4 (G.5) are refusal tests, and
+  so are these (the G.7 ceiling), in a module that binds `SEEN = []`, calls `SEEN.append(...)` and
+  binds `NAME = code_set("<literal>")`: `SEEN` as a `checkpoint` label, in a `log_note` template,
+  as a lookup-params value, as `FhirToken("MRN", SEEN)` and in a value param; and `NAME` as a
+  `checkpoint` label, in a `log_note` template, as a lookup-params value, as
+  `FhirToken("MRN", NAME)` and in a value param. So is `NAME` in a value param when some function
+  in the module declares `global NAME`.

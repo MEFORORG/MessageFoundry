@@ -3037,7 +3037,11 @@ does declaring it together with `cleartext_accepted`, which is the opposite clai
 construction. An attested hop is recorded as secure, so a false attestation hides a plaintext hop.
 
 **It is reported.** `messagefoundry check` prints a `tls-hop-attested` line listing every attested hop
-with its reason, and `GET /security/posture` names them in a `tls_hop_attested` loosening. At least
+with its reason, and `GET /security/posture` names them in a `tls_hop_attested` loosening. The `check`
+line shows each reason in quotes, with every quote, control and non-ASCII character escaped. It adds
+`REFUSED` at the end of the entry when the build check rejects the declaration. One case is an
+`env()` flag written into a lookup's settings after its factory ran. The engine never uses that hop.
+The mark comes from the engine, not from the reason, so a reason cannot add it. At least
 the inbound bind gates and the raw-TCP/MLLP hop guard also log a WARNING with the reason when they
 suppress a refusal. Not every cell does: the database weakened-TLS audit line omits the reason, and a
 `DatabaseRef` source writes that same line. So those two reports are the complete record. The risk entry is in
