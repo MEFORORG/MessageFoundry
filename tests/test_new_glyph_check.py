@@ -47,6 +47,10 @@ def repo(tmp_path: Path) -> Path:
     _git(r, "config", "user.email", "t@example.invalid")
     _git(r, "config", "user.name", "T")
     _git(r, "config", "core.autocrlf", "false")
+    # Keep the operator's global config out: no signing prompt, and none of their hooks run here.
+    _git(r, "config", "commit.gpgsign", "false")
+    (r / ".git" / "no-hooks").mkdir()
+    _git(r, "config", "core.hooksPath", str(r / ".git" / "no-hooks"))
     (r / "notes.md").write_text(f"old line with {_NO_ENTRY} already here\n", encoding="utf-8")
     _git(r, "add", "notes.md")
     _git(r, "commit", "-q", "-m", "seed")
@@ -187,6 +191,54 @@ def test_a_backtick_span_in_typescript_is_a_template_literal_and_fires(repo: Pat
     _git(repo, "rm", "-q", "--cached", "ide/src/new.ts")
     _write(repo, "docs/new.md", f"const s = `${{n}} {_BALLOT_X} done`;\n")
     assert _run(repo).returncode == 0
+
+
+@pytest.mark.parametrize("rel", ["scripts/x.ps1", "cmd/x.go", "ci/x.sh"])
+def test_a_backtick_in_code_other_than_python_is_not_a_token(repo: Path, rel: str) -> None:
+    _write(repo, rel, f'Write-Host "`n{_BALLOT_X} All checks failed`n"\n')
+    assert _run(repo).returncode == 1
+
+
+def test_a_row_moved_out_of_a_deleted_file_is_not_new(repo: Path) -> None:
+    _git(repo, "rm", "-q", "notes.md")
+    _write(repo, "elsewhere.md", f"old line with {_NO_ENTRY} already here, and more\n")
+    assert _run(repo).returncode == 0
+
+
+def test_renaming_an_exempt_record_to_a_live_path_is_judged(repo: Path) -> None:
+    """Rename detection is off, so the glyphs arrive at the new path and are judged there."""
+    _write(repo, "docs/benchmarks/RUN.md", f"{_ROCKET} run\nplain\n")
+    _git(repo, "commit", "-q", "-m", "record")
+    _git(repo, "mv", "docs/benchmarks/RUN.md", "docs/LIVE.md")
+    proc = _run(repo)
+    assert proc.returncode == 1
+    assert "docs/LIVE.md:1: U+1F680" in proc.stderr
+    # Control: a rename between two live paths carries its glyph and passes.
+    _git(repo, "mv", "docs/LIVE.md", "docs/benchmarks/RUN.md")
+    _git(repo, "mv", "notes.md", "renamed.md")
+    assert _run(repo).returncode == 0
+
+
+def test_a_merge_reports_only_the_net_count_it_added(repo: Path) -> None:
+    _git(repo, "switch", "-q", "-c", "feature")
+    _write(repo, "f.txt", "feature\n")
+    _git(repo, "commit", "-q", "-m", "feature")
+    _git(repo, "switch", "-q", "main")
+    _write(repo, "a.md", f"row {_BALLOT_X}{_BALLOT_X}\n")
+    _git(repo, "commit", "-q", "-m", "main")
+    _git(repo, "switch", "-q", "feature")
+    _git(repo, "merge", "-q", "--no-commit", "--no-ff", "main")
+    _write(repo, "a.md", f"row {_BALLOT_X}{_BALLOT_X}{_BALLOT_X}\n")
+    proc = _run(repo)
+    assert proc.returncode == 1
+    assert "ADDS 1 glyph" in proc.stderr
+    assert " x3" not in proc.stderr
+
+
+def test_commit_mode_refuses_a_range_with_a_usage_message(repo: Path) -> None:
+    proc = _run(repo, "--commit", "HEAD~1..HEAD")
+    assert proc.returncode == 2
+    assert "needs ONE commit" in proc.stderr
 
 
 def test_a_row_moved_to_another_file_is_not_new(repo: Path) -> None:

@@ -19,9 +19,11 @@ Removing them is a filed migration (BACKLOG #1265), and section 11 says not to s
 file you are editing for another reason. So the check counts NET additions across the commit: each
 banned codepoint on an added line is first matched against the same codepoint on a removed line.
 Editing a status-table row that already carried a check mark passes, and so does moving that row to
-another file; adding a new mark does not. Removed lines in exempt files do not feed that pool, so a
-glyph cannot be laundered out of a dated record into a live doc. The first draft judged every added
-line, and it would have refused all 7 of those commits.
+another file or deleting the old file; adding a new mark does not. Rename detection is OFF, so a
+rename reads as a deletion plus an addition and its glyphs are judged by the new path. A removed
+line in an exempt file feeds no pool, so a glyph cannot be laundered out of a dated record into a
+live doc, by moving a row or by renaming the file. The first draft judged every added line, and it
+would have refused all 7 of those commits.
 
 WHAT IT REFUSES: any codepoint in ``BANNED_RANGES``. That is Miscellaneous Symbols and Dingbats
 (U+2600-27BF), Miscellaneous Symbols and Arrows (U+2B00-2BFF), the emoji planes (U+1F000-1FAFF) and
@@ -30,9 +32,10 @@ are outside every range on purpose: the operator docs carry many arrows legitima
 
 WHAT IT ALLOWS:
 
-* a glyph quoted inside backticks, the token form section 11 permits for naming a glyph. Not in
-  the suffixes ``BACKTICK_IS_CODE`` names: there a backtick span is a template literal or a command
-  substitution, so a glyph inside it is a user-visible string, not a quoted token;
+* a glyph quoted inside backticks, the token form section 11 permits for naming a glyph, but only
+  in the suffixes ``BACKTICK_IS_TOKEN`` names. Elsewhere a backtick is code: a template literal in
+  TypeScript, an escape in PowerShell, a raw string in Go, command substitution in shell. A glyph
+  inside one is user-visible output, not a quoted token;
 * any line under ``EXEMPT_PATHS`` or ``EXEMPT_PREFIXES``. Those are exactly the files
   ``tests/test_operator_docs_no_warning_sign.py`` holds or exempts, and
   ``tests/test_new_glyph_check.py`` fails if the two lists drift apart.
@@ -42,7 +45,12 @@ every report names the codepoint as ``U+XXXX`` and folds the line excerpt to ASC
 
 A MERGE IS JUDGED AGAINST EVERY PARENT. While ``MERGE_HEAD`` exists, a glyph counts as new only if
 it is new against HEAD and against each merged head. Otherwise resolving a conflict with ``main``
-would refuse every glyph ``main`` gained since the branch forked.
+would refuse every glyph ``main`` gained since the branch forked. Each parent yields a net count per
+codepoint, and the smallest of those counts is what the merge added.
+
+ONE KNOWN BLIND SPOT: ``git commit --amend``. Staged mode diffs against HEAD, and a pre-commit hook
+cannot tell that the commit being written replaces it. So an amend judges only what it changes on
+top of the commit it amends.
 
 Usage:
   new_glyph_check.py                 # judge the staged diff (how pre-commit invokes it)
@@ -90,8 +98,9 @@ EXEMPT_PATHS: frozenset[str] = frozenset(
     }
 )
 
-#: Suffixes where a backtick span is executable or user-visible rather than a quoted token.
-BACKTICK_IS_CODE: tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".sh", ".bash")
+#: Suffixes where a backtick span is a quoted token: prose, and Python, whose comments and
+#: docstrings quote tokens that way and whose strings rarely carry a backtick.
+BACKTICK_IS_TOKEN: tuple[str, ...] = (".md", ".markdown", ".rst", ".txt", ".py")
 
 #: One backtick span: a run of backticks, the shortest text, then the same run again.
 _BACKTICK_SPAN = re.compile(r"(`+)(.+?)\1")
@@ -119,11 +128,19 @@ class Finding:
 
 
 @dataclass
-class FileDiff:
-    """One file's side of a ``--unified=0`` diff: added lines and the glyphs its removed lines held."""
+class Diff:
+    """A parsed ``--unified=0`` diff.
 
-    added: list[tuple[int, str]] = field(default_factory=list)
-    removed: Counter[int] = field(default_factory=Counter)
+    ``added`` holds every added line as (path, line number, text). ``pool`` counts the banned
+    codepoints on removed lines of non-exempt files, keyed by the OLD path's exemption.
+    """
+
+    added: list[tuple[str, int, str]] = field(default_factory=list)
+    pool: Counter[int] = field(default_factory=Counter)
+
+    @property
+    def files(self) -> int:
+        return len({p for p, _, _ in self.added})
 
 
 def is_banned(ch: str) -> bool:
@@ -139,11 +156,11 @@ def is_exempt(path: str) -> bool:
 def banned_in(line: str, path: str = "") -> list[int]:
     """Every banned codepoint in *line*, one entry per occurrence.
 
-    Backtick spans are skipped unless *path* has a suffix in :data:`BACKTICK_IS_CODE`.
+    Backtick spans are skipped only when *path* has a suffix in :data:`BACKTICK_IS_TOKEN`.
     """
     if line.isascii():
         return []
-    bare = line if path.lower().endswith(BACKTICK_IS_CODE) else _BACKTICK_SPAN.sub("", line)
+    bare = _BACKTICK_SPAN.sub("", line) if path.lower().endswith(BACKTICK_IS_TOKEN) else line
     return [ord(ch) for ch in bare if is_banned(ch)]
 
 
@@ -158,11 +175,15 @@ def _run_git(*args: str) -> subprocess.CompletedProcess[bytes]:
         raise GitReadError(f"git {' '.join(args[:2])} did not run: {exc}") from exc
 
 
+def _failure(proc: subprocess.CompletedProcess[bytes], what: str) -> GitReadError:
+    lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+    return GitReadError(f"{what} exited {proc.returncode}: {lines[0] if lines else 'no output'}")
+
+
 def _git(*args: str) -> bytes:
     proc = _run_git(*args)
     if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
-        raise GitReadError(f"git {' '.join(args[:2])} exited {proc.returncode}: {err[:1]}")
+        raise _failure(proc, f"git {' '.join(args[:2])}")
     return proc.stdout
 
 
@@ -173,79 +194,74 @@ def _rev_exists(rev: str) -> bool:
         return True
     if proc.returncode == 1 and not proc.stderr.strip():
         return False
-    err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
-    raise GitReadError(f"git rev-parse {rev} exited {proc.returncode}: {err[:1]}")
+    raise _failure(proc, f"git rev-parse {rev}")
 
 
-def _path_from_header(raw: str) -> str | None:
-    """The new-side path from a ``+++`` header, or None for a deletion."""
+def _path_from_header(raw: str, prefix: str) -> str | None:
+    """The path from a ``---`` or ``+++`` header, or None for ``/dev/null``."""
     name = raw[4:].rstrip("\t")
     if name == "/dev/null":
         return None
     if name.startswith('"') and name.endswith('"'):
         name = name[1:-1]
-    return name[2:] if name.startswith("b/") else name
+    return name[len(prefix) :] if name.startswith(prefix) else name
 
 
-def parse_diff(diff: bytes) -> dict[str, FileDiff]:
-    """Parse a ``--unified=0`` diff into a :class:`FileDiff` per new-side path."""
-    files: dict[str, FileDiff] = {}
-    current: FileDiff | None = None
-    path = ""
+def parse_diff(diff: bytes) -> Diff:
+    """Parse a ``--unified=0 --no-renames`` diff into a :class:`Diff`."""
+    out = Diff()
+    old: str | None = None
+    new: str | None = None
     lineno = 0
     in_hunk = False
     for raw_bytes in diff.split(b"\n"):
         raw = raw_bytes.decode("utf-8", "replace").rstrip("\r")
         if raw.startswith("diff --git "):
-            current, in_hunk = None, False
-            continue
-        if not in_hunk and raw.startswith("+++ "):
-            new_path = _path_from_header(raw)
-            path = new_path or ""
-            current = None if new_path is None else files.setdefault(new_path, FileDiff())
+            old = new = None
+            in_hunk = False
             continue
         if not in_hunk and raw.startswith("--- "):
+            old = _path_from_header(raw, "a/")
+            continue
+        if not in_hunk and raw.startswith("+++ "):
+            new = _path_from_header(raw, "b/")
             continue
         hunk = _HUNK.match(raw)
         if hunk:
             in_hunk = True
             lineno = int(hunk.group(1))
             continue
-        if not in_hunk or current is None:
+        if not in_hunk:
             continue
-        if raw.startswith("+"):
-            current.added.append((lineno, raw[1:]))
+        if raw.startswith("+") and new is not None:
+            out.added.append((new, lineno, raw[1:]))
             lineno += 1
-        elif raw.startswith("-"):
-            current.removed.update(banned_in(raw[1:], path))
+        elif raw.startswith("-") and old is not None and not is_exempt(old):
+            out.pool.update(banned_in(raw[1:], old))
         elif raw.startswith(" "):
             lineno += 1  # a context line, which -U0 should not emit; counted so lines stay true
-    return files
+    return out
 
 
-def new_glyphs(files: dict[str, FileDiff]) -> list[Finding]:
+def new_glyphs(diff: Diff) -> list[Finding]:
     """Banned codepoints added beyond what the commit's removed lines held.
 
-    The pool spans every non-exempt file, so a row moved between files is not new. One finding per
-    line and codepoint; :attr:`Finding.count` says how many of that codepoint the line added.
+    The pool spans the whole commit, so a row moved between files is not new. One finding per line
+    and codepoint; :attr:`Finding.count` says how many of that codepoint the line added.
     """
-    pool: Counter[int] = Counter()
-    for path, fd in files.items():
-        if not is_exempt(path):
-            pool.update(fd.removed)
+    pool = Counter(diff.pool)
     found: list[Finding] = []
-    for path, fd in files.items():
+    for path, line, text in diff.added:
         if is_exempt(path):
             continue
-        for line, text in fd.added:
-            fresh: Counter[int] = Counter()
-            for cp in banned_in(text, path):
-                if pool[cp] > 0:
-                    pool[cp] -= 1
-                else:
-                    fresh[cp] += 1
-            for cp, count in fresh.items():
-                found.append(Finding(path, line, cp, text, count))
+        fresh: Counter[int] = Counter()
+        for cp in banned_in(text, path):
+            if pool[cp] > 0:
+                pool[cp] -= 1
+            else:
+                fresh[cp] += 1
+        for cp, count in fresh.items():
+            found.append(Finding(path, line, cp, text, count))
     return found
 
 
@@ -255,10 +271,11 @@ def _diff(base: str, target: str | None) -> bytes:
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
+        "--no-relative",
+        "--no-renames",
         "--unified=0",
         "--src-prefix=a/",
         "--dst-prefix=b/",
-        "-M",
     ]
     if target is None:
         return _git(*args, "--cached", base)
@@ -283,23 +300,31 @@ def collect(target: str | None) -> tuple[list[Finding], int, int]:
     what it judged.
     """
     parents = _parents(target)
-    first_files = parse_diff(_diff(parents[0], target))
-    found = new_glyphs(first_files)
-    lines = sum(len(fd.added) for fd in first_files.values())
+    first = parse_diff(_diff(parents[0], target))
+    found = new_glyphs(first)
     if len(parents) > 1:
-        # A glyph is new only if it is new against every parent.
-        keep = Counter((f.path, f.text, f.codepoint) for f in found)
-        for parent in parents[1:]:
-            other = new_glyphs(parse_diff(_diff(parent, target)))
-            keep &= Counter((f.path, f.text, f.codepoint) for f in other)
-        kept: list[Finding] = []
+        # The merge added, per codepoint, the smallest net count any parent shows. The lines named
+        # are the first parent's, trimmed to that count, preferring a line every parent flags: that
+        # is the one the merge itself wrote, rather than one the other side already had.
+        allowed: Counter[int] = Counter()
         for f in found:
-            key = (f.path, f.text, f.codepoint)
-            if keep[key] > 0:
-                keep[key] -= 1
-                kept.append(f)
+            allowed[f.codepoint] += f.count
+        seen: Counter[tuple[str, str, int]] = Counter()
+        for parent in parents[1:]:
+            net: Counter[int] = Counter()
+            for f in new_glyphs(parse_diff(_diff(parent, target))):
+                net[f.codepoint] += f.count
+                seen[(f.path, f.text, f.codepoint)] += 1
+            allowed &= net
+        ranked = sorted(found, key=lambda f: -seen[(f.path, f.text, f.codepoint)])
+        kept: list[Finding] = []
+        for f in ranked:
+            take = min(f.count, allowed[f.codepoint])
+            if take > 0:
+                allowed[f.codepoint] -= take
+                kept.append(Finding(f.path, f.line, f.codepoint, f.text, take))
         found = kept
-    return found, lines, len(first_files)
+    return found, len(first.added), first.files
 
 
 def _ascii(text: str, limit: int = _EXCERPT_LIMIT) -> str:
@@ -326,7 +351,7 @@ def report(found: list[Finding]) -> str:
         + "\n\n  Fix each line, then stage and commit again:\n"
         "    * in prose or a comment, write the word: DONE, FAILED, WARNING, NOTE, YES, NO;\n"
         "    * to NAME a glyph as a token, quote it in backticks, which this check allows\n"
-        "      (not in .ts/.js/.sh, where a backtick span is a template or a command);\n"
+        "      (only in .md, .rst, .txt and .py; elsewhere a backtick is code);\n"
         "    * in code that must emit one, write an escape such as \\N{WARNING SIGN} or \\u26a0,\n"
         "      so the source stays ASCII.\n"
         "  Only NET additions are judged: editing a line that already carried the glyph passes.\n"
@@ -340,6 +365,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--commit", metavar="REV", help="judge what commit REV added")
     args = parser.parse_args(argv)
     try:
+        if args.commit is not None and not _rev_exists(args.commit):
+            sys.stderr.write(f"new-glyph check: --commit needs ONE commit, not {args.commit!a}\n")
+            return 2
         found, lines, files = collect(args.commit)
     except GitReadError as exc:
         sys.stderr.write(
