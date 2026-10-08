@@ -14,11 +14,12 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import lens
 from messagefoundry.lens import LensRewriteError, rewrite_source
 
 TYPED_ONLY = "typed-only mode"
 REFUSED = "not a value a Steps edit may write"
-BELOW = "below a return or raise"
+NEVER_RUNS = "never runs"
 
 
 def _edit(op: str, line: int, **extra: Any) -> dict[str, Any]:
@@ -99,6 +100,7 @@ def h(msg):
         _edit("delete_row", 4),
         _edit("delete_row", 3),  # the guard holding it
         _edit("delete_row", 10),  # a send whose destination is computed
+        _edit("move_row", 10, direction="up"),
         _edit("delete_row", 7),  # an attribute callee
         _edit("move_row", 7, direction="down"),
         _edit("delete_row", 8),  # a message argument that is not msg
@@ -495,39 +497,29 @@ def h(msg):
 @pytest.mark.parametrize(
     "edit",
     [
+        # A guarded raise lifted out of its guard runs on every message.
+        _edit("move_row", 6, to_line_start=3, to_position="before"),
         # A typed row dropped into a typed block that holds code.
         _edit("move_row", 9, to_line_start=8, to_position="before"),
     ],
-    ids=["into-block-with-code"],
+    ids=["raise-out-of-guard", "into-block-with-code"],
 )
 def test_r2_findings_1_and_6_typed_only_keeps_guards_and_code_blocks(edit: dict[str, Any]) -> None:
     assert rewrite_source(_GUARD, edit) != _GUARD
     _refused(_GUARD, edit, typed_only=True)
 
 
+def test_r2_finding_1_a_raise_reordered_up_its_guard_strands_the_row_it_passes() -> None:
+    # Once a control; G.6 rule 8 now refuses it in typed-only mode (Manager decision 2026-10-08).
+    edit = _edit("move_row", 6, direction="up")
+    assert rewrite_source(_GUARD, edit) != _GUARD
+    _refused(_GUARD, edit, match=NEVER_RUNS, typed_only=True)
+
+
 def test_r2_finding_1_control_a_row_still_moves_in_above_a_guarded_raise() -> None:
-    # A raise reordered up its guard now strands the row below it (G.6 rule 8), so the control is a
-    # typed row moving into the guard above the raise.
     edit = _edit("move_row", 3, to_line_start=6, to_position="before")
     out = rewrite_source(_GUARD, edit, typed_only=True)
     assert '        msg.set("A", "1")\n        raise ValueError("bad")\n' in out
-
-
-@pytest.mark.parametrize(
-    ("src", "edit"),
-    [
-        # Finding 2: a send whose destination is computed, moved up past a row.
-        (_DYN, _edit("move_row", 10, direction="up")),
-        # R2 finding 1: a guarded raise lifted out of its guard runs on every message.
-        (_GUARD, _edit("move_row", 6, to_line_start=3, to_position="before")),
-    ],
-    ids=["dynamic-send-up", "raise-out-of-guard"],
-)
-def test_a_terminal_move_keeps_its_typed_only_reason(src: str, edit: dict[str, Any]) -> None:
-    # Each move also strands a row below the terminal, so the full mode now refuses it by G.6 rule 8,
-    # and typed-only mode still refuses it for the finding's own reason first.
-    _refused(src, edit, match=BELOW)
-    _refused(src, edit, typed_only=True)
 
 
 _COMP = """\
@@ -1620,7 +1612,7 @@ def test_r15_the_handler_s_own_one_based_loop_still_admits_its_index() -> None:
     assert "occurrence=i" in rewrite_source(src, edit)
 
 
-# --- G.6 rule 8: a row moved below a typed return or raise -------------------------------------
+# --- G.6 rule 8: a row that never runs (Lander review of PR 2201) ------------------------------
 
 _TERMINAL = """\
 @handler("H")
@@ -1639,8 +1631,19 @@ def h(msg):
     raise ValueError("x")
 """
 
+_EITHER = """\
+@handler("H")
+def h(msg):
+    msg.set("B", "2")
+    if msg.field("PID-3"):
+        return Send("OB", msg)
+    else:
+        raise ValueError("x")
+"""
 
-@pytest.mark.parametrize("typed_only", [False, True], ids=["full", "typed-only"])
+_SET_PID8 = {"action": "set_field", "params": {"path": "PID-8", "value": "M"}}
+
+
 @pytest.mark.parametrize(
     ("src", "edit"),
     [
@@ -1652,24 +1655,129 @@ def h(msg):
         (_TERMINAL, _edit("move_row", 4, to_line_start=7, to_position="after")),  # after the last
         (_TERMINAL, _edit("move_row", 7, direction="up")),  # the return lifted above a row
         (_RAISE, _edit("move_row", 3, direction="down")),  # swapped below a raise
+        (_EITHER, _edit("move_row", 3, to_line_start=7, to_position="after")),  # finding 1
+        # Finding 2: an insert or template that strands a row, or lands where it never runs.
+        (_TERMINAL, _edit("insert_row", 7, position="after", **_SET_PID8)),
+        (_TERMINAL, _edit("template", 6, position="before", template="filter")),
+        (_TERMINAL, _edit("template", 6, position="before", template="raise", message="x")),
+        (_TERMINAL, _edit("template", 6, position="before", template="send", destination="OB3")),
     ],
-    ids=["swap-return", "drop-guard-return", "drop-last-return", "return-up", "swap-raise"],
+    ids=[
+        "swap-return",
+        "drop-guard-return",
+        "drop-last-return",
+        "return-up",
+        "swap-raise",
+        "below-if-else",
+        "insert-after-return",
+        "filter",
+        "raise",
+        "send",
+    ],
 )
-def test_rule_8_refuses_a_row_moved_below_a_terminal(
-    src: str, edit: dict[str, Any], typed_only: bool
+def test_rule_8_typed_only_refuses_a_row_that_never_runs(src: str, edit: dict[str, Any]) -> None:
+    # G.6 scopes the rule to typed-only mode, so the default mode accepts the edit (decision D1).
+    assert rewrite_source(src, edit) != src
+    _refused(src, edit, match=NEVER_RUNS, typed_only=True)
+
+
+_GUARD_ONLY = _TERMINAL.replace('        return Send("OB", msg)\n', "        pass\n")
+
+
+@pytest.mark.parametrize(
+    ("src", "edit", "expect"),
+    [
+        # A guarded return's block moves past a row; nothing lands below a terminal.
+        (_TERMINAL, _edit("move_row", 3, direction="down"), '    msg.set("B", "2")\n    if msg'),
+        # Into the guard, above its return.
+        (
+            _TERMINAL,
+            _edit("move_row", 6, to_line_start=5, to_position="before"),
+            '        msg.set("B", "2")\n        return Send("OB", msg)\n',
+        ),
+        # An insert above the last return.
+        (
+            _TERMINAL,
+            _edit("insert_row", 7, position="before", **_SET_PID8),
+            '    msg.set("PID-8", "M")\n    return Send("OB2", msg)\n',
+        ),
+        # A filter above the generator's ``pass`` seed: a dead ``pass`` strands no row.
+        (
+            _GUARD_ONLY,
+            _edit("template", 5, position="before", template="filter"),
+            "        return []\n        pass\n",
+        ),
+    ],
+    ids=["guard-block-down", "into-guard", "insert-above-return", "filter-above-pass"],
+)
+def test_rule_8_control_typed_only_accepts_an_edit_that_strands_nothing(
+    src: str, edit: dict[str, Any], expect: str
 ) -> None:
-    _refused(src, edit, match=BELOW, typed_only=typed_only)
+    assert expect in rewrite_source(src, edit, typed_only=True)
 
 
-@pytest.mark.parametrize("typed_only", [False, True], ids=["full", "typed-only"])
-def test_rule_8_control_a_row_moved_above_a_terminal_is_accepted(typed_only: bool) -> None:
-    # Into the guard, above its return: the row still runs whenever the guard holds.
+_DEAD_BLOCK = (
+    _TERMINAL + '    if msg.field("PID-9"):\n        msg.set("C", "3")\n        msg.set("D", "4")\n'
+)
+
+
+def test_rule_8_a_row_moved_out_of_a_dead_block_is_accepted() -> None:
+    # Finding 4: the row starts inside a block below the last return, and moves where it runs.
+    edit = _edit("move_row", 9, to_line_start=6, to_position="before")
+    out = rewrite_source(_DEAD_BLOCK, edit, typed_only=True)
+    assert out.index('msg.set("C", "3")') < out.index('msg.set("B", "2")')
+
+
+def test_rule_8_code_already_dead_does_not_block_another_edit() -> None:
     edit = _edit("move_row", 6, to_line_start=5, to_position="before")
-    out = rewrite_source(_TERMINAL, edit, typed_only=typed_only)
+    out = rewrite_source(_DEAD_BLOCK, edit, typed_only=True)
     assert '        msg.set("B", "2")\n        return Send("OB", msg)\n' in out
 
 
-def test_rule_8_code_already_below_a_terminal_does_not_block_a_move() -> None:
-    src = _TERMINAL + '    msg.set("C", "3")\n'
-    out = rewrite_source(src, _edit("move_row", 6, direction="up"))
-    assert out.index('msg.set("B", "2")') < out.index("if msg.field")
+def _handler(body: str) -> Any:
+    return ast.parse(f"def h(msg):\n{body}").body[0]
+
+
+def test_rule_8_a_dead_copy_cannot_stand_in_for_a_live_row() -> None:
+    # Finding 3: the same text is dead once before and once after, but the live row is now dead.
+    before = _handler(
+        '    if msg.field("A"):\n        msg.set("X", "1")\n    return Send("OB", msg)\n'
+        '    msg.set("X", "1")\n'
+    )
+    after = _handler(
+        '    if msg.field("A"):\n        return Send("OB", msg)\n        msg.set("X", "1")\n'
+        '    msg.set("X", "1")\n'
+    )
+    with pytest.raises(LensRewriteError, match="stranded"):
+        lens._refuse_rows_that_never_run(before, after, LensRewriteError("stranded"))
+
+
+@pytest.mark.parametrize(
+    ("body", "dead"),
+    [
+        ("    for x in y:\n        continue\n        f()\n", True),
+        ("    for x in y:\n        break\n        f()\n", True),
+        ("    while True:\n        g()\n    f()\n", True),
+        ("    while True:\n        if g():\n            break\n    f()\n", False),
+        ("    while True:\n        for x in y:\n            break\n    f()\n", True),
+        ("    for x in y:\n        return 1\n    f()\n", False),  # the loop may not run
+        ("    with c:\n        return 1\n    f()\n", False),  # a context manager may swallow
+        ("    try:\n        return 1\n    except E:\n        raise\n    f()\n", True),
+        ("    if a:\n        return 1\n    f()\n", False),  # no else
+    ],
+    ids=[
+        "continue",
+        "break",
+        "while-true",
+        "while-true-break",
+        "inner-break",
+        "for",
+        "with",
+        "try",
+        "if-no-else",
+    ],
+)
+def test_rule_8_never_falls_through(body: str, dead: bool) -> None:
+    # Finding 5 and decision D3: the call ``f()`` is dead exactly when control cannot reach it.
+    flags = lens._dead_statements(_handler(body))
+    assert flags[(ast.dump(ast.parse("f()").body[0]), 0)] is dead

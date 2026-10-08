@@ -56,7 +56,6 @@ import re
 import unicodedata
 import warnings
 from collections import Counter, deque
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
@@ -2436,6 +2435,10 @@ def _typed_only_refusal(op: str, line_start: int, line_end: int, why: str) -> Le
 
 
 _UNTYPED = "it would move or remove code the Steps view does not show as typed steps"
+_NEVER_RUNS = (
+    "it would leave a row that never runs, below a return, raise, break or continue, or below a "
+    "block that never falls through"
+)
 
 
 def _refuse_untyped_structure(
@@ -2965,12 +2968,12 @@ def _own_scope_bindings(node: ast.AST) -> set[str]:
 
 
 def _refuse_new_unbound_reads(
-    tree: ast.Module, result: str, row: dict[str, Any], role: str, what: str
+    tree: ast.Module, after_tree: ast.Module, row: dict[str, Any], role: str, what: str
 ) -> None:
-    """Refuse a result in which some read of a handler local has lost its binding
+    """Refuse a result (``after_tree``) in which some read of a handler local has lost its binding
     (:func:`_unbound_reads`), comparing the handler before and after."""
     before_func = _element_def(tree, row["_handler"], role)
-    after_func = _element_def(ast.parse(result), row["_handler"], role)
+    after_func = _element_def(after_tree, row["_handler"], role)
     if before_func is None or after_func is None:
         raise LensRewriteError(f"{what} is refused - internal: the handler was not found again")
     local = _handler_locals(before_func) | _handler_locals(after_func)
@@ -2985,36 +2988,87 @@ def _refuse_new_unbound_reads(
         )
 
 
-def _unreachable(stmts: list[ast.stmt]) -> Iterator[str]:
-    """The ``ast.dump`` of each statement that follows a ``return`` or ``raise`` in its own suite.
-    Python never runs one, so a move that adds one strands a row."""
-    dead = False
+_NEVER = "<never falls through>"  # a marker no identifier can equal, for :func:`_bound_after`
+_PASS_KEY = ast.dump(ast.Pass())
+
+
+def _is_terminal(stmt: ast.stmt) -> bool:
+    """Whether control never falls through ``stmt`` to the next statement of its suite.
+
+    A ``return``, ``raise``, ``break`` or ``continue`` never does, nor does a ``while True:`` with no
+    ``break`` of its own. A block never does when every path through it ends in one: the marker
+    :data:`_NEVER` stands for "bound" in :func:`_bound_after`, which already decides which suites a
+    block surely runs to the end of (Manager decision 2026-10-08, after review). So an ``if`` with an
+    ``else`` whose every arm returns or raises is terminal, and a loop or ``with`` never is."""
+    if isinstance(stmt, ast.Return | ast.Raise | ast.Break | ast.Continue):
+        return True
+    if isinstance(stmt, ast.While):
+        test = stmt.test
+        return isinstance(test, ast.Constant) and bool(test.value) and not _breaks(stmt.body)
+    if not isinstance(stmt, _COMPOUND_STMT_TYPES):
+        return False
+    ends = {
+        label: {_NEVER} if any(_is_terminal(s) for s in suite) else set()
+        for label, suite, _ in _suites(stmt)
+    }
+    return _NEVER in _bound_after(stmt, set(), ends)
+
+
+def _breaks(stmts: list[ast.stmt]) -> bool:
+    """Whether ``stmts`` hold a ``break`` of the loop they are the body of."""
     for stmt in stmts:
-        if dead:
-            yield ast.dump(stmt)
-        dead |= isinstance(stmt, ast.Return | ast.Raise)
-        for _, suite, _ in _suites(stmt):
-            yield from _unreachable(suite)
+        if isinstance(stmt, ast.Break):
+            return True
+        if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            continue
+        if isinstance(stmt, ast.For | ast.AsyncFor | ast.While):
+            # A ``break`` in an inner loop's body breaks that loop; one in its ``else`` breaks ours.
+            if _breaks(stmt.orelse):
+                return True
+            continue
+        if any(_breaks(suite) for _, suite, _ in _suites(stmt)):
+            return True
+    return False
 
 
-def _refuse_rows_below_a_terminal(
+def _dead_statements(func: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[tuple[str, int], bool]:
+    """Each statement of ``func``, keyed as :func:`_refuse_shifted_code` matches one (its
+    :func:`_stmt_key` and which occurrence of that key it is), mapped to whether it never runs:
+    a statement after a terminal one in its suite (:func:`_is_terminal`), or inside one that never
+    runs. Keyed by occurrence, not by text alone, so a row moved out of a dead block counts as
+    revived and a dead copy cannot stand in for a live row of the same text (Manager decision
+    2026-10-08, after review)."""
+    seen: Counter[str] = Counter()
+    out: dict[tuple[str, int], bool] = {}
+
+    def visit(stmts: list[ast.stmt], dead: bool) -> None:
+        for stmt in stmts:
+            key = _stmt_key(stmt)
+            out[(key, seen[key])] = dead
+            seen[key] += 1
+            for _, suite, _ in _suites(stmt):
+                visit(suite, dead)
+            dead = dead or _is_terminal(stmt)
+
+    visit(func.body, False)
+    return out
+
+
+def _refuse_rows_that_never_run(
     before_func: ast.FunctionDef | ast.AsyncFunctionDef,
-    result: str,
-    row: dict[str, Any],
-    role: str,
-    what: str,
+    after_func: ast.FunctionDef | ast.AsyncFunctionDef,
+    refusal: LensRewriteError,
 ) -> None:
-    """Refuse a move that leaves a row below a ``return`` or ``raise`` in its suite, where it would
-    never run (ADR 0076 Amendment G, G.6 rule 8). That covers a move past the fan-out ``return
-    sends``. Code already unreachable before the move does not count against it."""
-    after_func = _element_def(ast.parse(result), row["_handler"], role)
-    if after_func is None:
-        raise LensRewriteError(f"{what} is refused - internal: the handler was not found again")
-    if Counter(_unreachable(after_func.body)) - Counter(_unreachable(before_func.body)):
-        raise LensRewriteError(
-            f"{what} is refused - it would put a row below a return or raise in the same block, "
-            "where it would never run; edit it as text"
-        )
+    """Refuse a typed-only result in which a statement that ran before the edit, or one the edit
+    added, never runs: it sits below a ``return``, ``raise``, ``break`` or ``continue``, or below a
+    block that never falls through (ADR 0076 Amendment G, G.6 rule 8). It judges where a row lands,
+    whatever verb put it there, so it covers a move, an insert and a template (Manager decision
+    2026-10-08, after review). That covers a move past the fan-out ``return sends``. A ``pass``
+    does not count: the generator seeds one, and a filter inserted above it strands nothing."""
+    before = _dead_statements(before_func)
+    for (key, n), dead in _dead_statements(after_func).items():
+        if dead and not before.get((key, n), False) and key != _PASS_KEY:
+            raise refusal
 
 
 def _handler_locals(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
@@ -3028,20 +3082,25 @@ def _handler_locals(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
 def _refuse_typed_only_result(
     tree: ast.Module,
     handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
-    result: str,
+    after_tree: ast.Module,
     row: dict[str, Any],
     role: str,
     op: str,
     line_start: int,
     line_end: int,
 ) -> None:
-    """The typed-only postconditions on a move or delete (:func:`_refuse_shifted_code`,
-    :func:`_unbound_reads`). ``result`` has already re-parsed (:func:`_assert_reparses`)."""
-    after_tree = ast.parse(result)
+    """The typed-only postconditions on an edit's result, ``after_tree``. Every edit keeps each row
+    able to run (:func:`_refuse_rows_that_never_run`); a move or delete also keeps the structure
+    (:func:`_refuse_shifted_code`, :func:`_unbound_reads`). A move or delete is judged on the
+    structure first, so its refusal keeps that reason."""
     after_func = _element_def(after_tree, row["_handler"], role)
     refusal = _typed_only_refusal(op, line_start, line_end, _UNTYPED)
     if after_func is None:
         raise refusal
+    stranded = _typed_only_refusal(op, line_start, line_end, _NEVER_RUNS)
+    if op not in ("move_row", "delete_row") or row["kind"] == "note":
+        _refuse_rows_that_never_run(handler_node, after_func, stranded)
+        return
     deleted: set[int] = set()
     if op == "delete_row":
         located = _locate_stmt(handler_node.body, line_start, line_end) or _locate_stmt_by_header(
@@ -3058,11 +3117,12 @@ def _refuse_typed_only_result(
     )
     _refuse_new_unbound_reads(
         tree,
-        result,
+        after_tree,
         row,
         role,
         f"{op} of the rows at lines {line_start}-{line_end} in typed-only mode",
     )
+    _refuse_rows_that_never_run(handler_node, after_func, stranded)
 
 
 def rewrite_module(
@@ -3138,7 +3198,7 @@ def rewrite_source(
     client's coordinates resolve against the v1 partition and a v2 client's against the v2 one.
     ``typed_only`` refuses at least a ``paste_block``, a raw ``test``, and a move or delete of code the
     Steps view does not show as typed (:func:`_refuse_raw_source`, :func:`_refuse_untyped_structure`),
-    and checks a move or delete's result (:func:`_refuse_typed_only_result`). Raises :class:`LensParseError` on a syntax error,
+    and checks every edit's result (:func:`_refuse_typed_only_result`). Raises :class:`LensParseError` on a syntax error,
     :class:`LensRewriteError` on any refusal."""
     op = edit.get("op", "set_params")
     if op not in _SUPPORTED_OPS:
@@ -3288,23 +3348,17 @@ def rewrite_source(
     # Safety gate (gate 3): a real change must re-parse to valid Python, else refuse with zero change. A
     # no-op returns ``src`` unchanged (already parsed above), so it skips the re-parse and stays identical.
     if result != src:
-        _assert_reparses(result, module, before=src)
+        after_tree = _assert_reparses(result, module, before=src)
         if op in ("insert_row", "insert_code_lookup", "move_row"):
             # An inserted value may name a local above its binding, or a loop index outside its
             # loop (review of head 513797260a, finding 3), and a move may carry an
             # ``occurrence=i`` row out of its loop (Manager decision 2026-10-07). Every mode refuses.
             _refuse_new_unbound_reads(
-                tree, result, row, role, f"{op} at lines {line_start}-{line_end}"
+                tree, after_tree, row, role, f"{op} at lines {line_start}-{line_end}"
             )
-        if typed_only and op in ("move_row", "delete_row") and kind != "note":
+        if typed_only:
             _refuse_typed_only_result(
-                tree, handler_node, result, row, role, op, line_start, line_end
-            )
-        if op == "move_row":
-            # A row moved below a return or raise never runs; every mode refuses (G.6 rule 8). It runs
-            # after the typed-only checks, so a typed-only refusal keeps its own reason.
-            _refuse_rows_below_a_terminal(
-                handler_node, result, row, role, f"{op} at lines {line_start}-{line_end}"
+                tree, handler_node, after_tree, row, role, op, line_start, line_end
             )
     return ("\ufeff" + result) if bom else result
 
@@ -3358,7 +3412,7 @@ def _check_to_suite(
         )
 
 
-def _assert_reparses(result: str, module: str, *, before: str | None = None) -> None:
+def _assert_reparses(result: str, module: str, *, before: str | None = None) -> ast.Module:
     """Refuse (with zero change) a rewrite whose output is not valid Python — the VALIDITY half of gate 3.
 
     A last-line defense: every op is engineered to preserve validity, but re-parsing the result and
@@ -3368,14 +3422,16 @@ def _assert_reparses(result: str, module: str, *, before: str | None = None) -> 
     text): :func:`_apply_insert_row` refuses a rendered line over the column limit, and the reindent path
     refuses a depth change that would over-run (:func:`_reindent_block`) or collapse
     (:func:`_has_collapsible_wrapped_stmt`) a line — so the output ``ruff format`` would produce is the
-    output the lens already wrote. Static-only: this parses and compiles (it never imports or executes) the result."""
+    output the lens already wrote. Static-only: this parses and compiles (it never imports or executes) the result.
+    It returns the parse, so the gates after it need not parse the result again."""
     try:
         # `compile` too: it runs nothing, and it refuses what parses but cannot compile -- an
         # `await` in a sync handler, a walrus rebinding a comprehension variable (Theia review R1).
         with warnings.catch_warnings():
             # A SyntaxWarning in code the user already had is not this rewrite's to report.
             warnings.simplefilter("ignore", SyntaxWarning)
-            compile(ast.parse(result), module, "exec", dont_inherit=True)
+            after_tree = ast.parse(result)
+            compile(after_tree, module, "exec", dont_inherit=True)
     except SyntaxError as exc:
         existing = None if before is None else _compile_error(before, module)
         if existing is not None:
@@ -3394,6 +3450,7 @@ def _assert_reparses(result: str, module: str, *, before: str | None = None) -> 
             f"{module}: the rewrite would produce source the parser refuses "
             f"({_refusal_reason(exc)}) - refused (no change made)"
         ) from exc
+    return after_tree
 
 
 def _compile_error(source: str, module: str) -> SyntaxError | None:
