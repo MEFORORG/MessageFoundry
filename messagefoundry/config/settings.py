@@ -96,7 +96,7 @@ from messagefoundry.config.tls_policy import (
     validate_tls_ciphers,
 )
 from messagefoundry.connection_names import is_connection_name
-from messagefoundry.controlchars import has_lone_surrogate
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
@@ -2427,12 +2427,25 @@ class LoggingSettings(_Section):
         # Vault BACKLOG #2375, review round 2. A NUL or an undecodable byte can never name a
         # collector. Before this, one raised out of the #1966 gate, or passed it and then raised
         # out of the forwarder's own socket call, so the start died with a traceback either way.
-        if value is not None and (
-            has_lone_surrogate(value) or any(ord(c) < 0x20 or c == "\x7f" for c in value)
-        ):
+        if value is None:
+            return value
+        if has_lone_surrogate(value) or has_control_char(value):
             raise ValueError(
                 "[logging].forward_host must not contain a control character or an undecodable byte"
             )
+        # The forwarder hands this text to the socket layer, which encodes a host with the
+        # "idna" codec before it resolves or connects. Text that codec refuses raised
+        # UnicodeEncodeError out of the start, since it is not an OSError: at least an empty label
+        # ("a..b"), a label over 63 characters and a C1 control. So the same encoding is tried
+        # here. An IP literal and an ordinary name both pass it. The value is not quoted.
+        try:
+            value.encode("idna")
+        except UnicodeError:
+            raise ValueError(
+                "[logging].forward_host is not a host name the network layer can encode: each "
+                "dot-separated label must be 1 to 63 characters and hold no control or other "
+                "character IDNA prohibits"
+            ) from None
         return value
 
     @field_validator("forward_tls_crl_file")

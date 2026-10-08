@@ -348,9 +348,63 @@ def test_host_text_that_can_name_no_collector_is_refused_at_load(tmp_path: Path,
     """A NUL or an undecodable byte raised out of the gate (review round 1, measured), and once the
     gate tolerated it, out of the forwarder's own socket call (round 2). The load refuses it, and
     the message does not quote the value."""
-    with pytest.raises(ValueError, match="control character or an undecodable byte") as refused:
+    with pytest.raises(ValueError, match="control character or an undecodable byte"):
         _verified(tmp_path, host=host)
-    assert host not in str(refused.value)
+    _assert_the_validator_does_not_echo(host, "control character or an undecodable byte")
+
+
+def _assert_the_validator_does_not_echo(host: str, needle: str) -> None:
+    """The validator's OWN message, read off a direct call. The loaded model strips every input
+    from its errors, so an assertion on that error could never fail; this one can. The control at
+    the end shows the search finds the value when a message does carry it."""
+    with pytest.raises(ValueError) as raw:
+        settings_module.LoggingSettings._check_forward_host(host)
+    message = str(raw.value)
+    assert needle in message
+    assert host not in message and ascii(host) not in message and repr(host) not in message
+    assert host in f"{message} {host}"
+
+
+#: Host text the socket layer's "idna" encoding refuses. Each loaded before and then raised
+#: UnicodeEncodeError out of the start (on main too): an empty label, a leading dot, a label over
+#: 63 characters, a C1 control, and a character IDNA prohibits.
+_IDNA_INVALID_HOSTS = [
+    "siem..corp.test",
+    ".siem",
+    "x" * 64 + ".corp.test",
+    "siem\x85.corp",
+    "​.corp",
+]
+
+
+@pytest.mark.parametrize("host", _IDNA_INVALID_HOSTS)
+def test_a_host_the_network_layer_cannot_encode_is_refused_at_load(
+    tmp_path: Path, host: str
+) -> None:
+    with pytest.raises(UnicodeError):
+        host.encode("idna")  # the premise: this is what the forwarder's socket call would raise
+    with pytest.raises(ValueError, match="not a host name the network layer can encode"):
+        _verified(tmp_path, host=host)
+    _assert_the_validator_does_not_echo(host, "network layer can encode")
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "siem.corp.test",
+        "siem.corp.test.",
+        "x" * 63 + ".corp.test",
+        "bücher.example",
+        "a_b.example",
+        "10.0.0.5",
+        "::1",
+        "fe80::1%eth0",
+        "[2001:db8::1]",
+    ],
+)
+def test_an_encodable_host_still_loads(tmp_path: Path, host: str) -> None:
+    """The control: an ordinary name, an internationalised one and every IP-literal form load."""
+    assert _verified(tmp_path, host=host).forward_host == host
 
 
 @pytest.mark.parametrize("host", _UNUSABLE_HOSTS)
