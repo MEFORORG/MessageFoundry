@@ -8847,9 +8847,14 @@ def _connection(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from messagefoundry.config import connections_edit
+    from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.environments import (
         load_environment_values,
         resolve_values_base_dir,
+    )
+    from messagefoundry.config.retention_classification import (
+        keep_forever_override_refusal,
+        keep_forever_overrides,
     )
     from messagefoundry.config.settings import (
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
@@ -8923,6 +8928,16 @@ def _connection(args: argparse.Namespace) -> int:
             # This command has no --allow-insecure-bind, so pass the settings half serve folds in.
             allow_insecure_bind=insecure_bind_escape(settings),
         )
+        # Vault BACKLOG #2368: a connection's own keep-forever retention override is refused here
+        # as the engine's registry guard refuses it, so an edit a reload would reject is not
+        # written. Refusal only: the guard's warning and AUDIT line belong to a graph load.
+        kept = keep_forever_overrides(registry)
+        if (
+            kept
+            and settings.security.enforcement is SecurityEnforcement.ENFORCE
+            and not settings.retention.allow_unbounded_phi
+        ):
+            raise WiringError(keep_forever_override_refusal(kept, env_name=env_name))
 
     try:
         if args.action == "upsert":

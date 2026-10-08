@@ -10,6 +10,8 @@ them: refuse under enforce, warn under warn, AUDIT once acknowledged.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 from collections.abc import Callable
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import cast
 
 import pytest
 
+from messagefoundry.__main__ import main
 from messagefoundry.config.retention_classification import (
     keep_forever_overrides,
     make_retention_override_guard,
@@ -56,6 +59,11 @@ def _guard(*, acknowledged: bool, enforcing: bool) -> Callable[[Registry], None]
     )
 
 
+def _guard_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The guard's own records. ``caplog`` holds every WARNING of the test, graph load included."""
+    return [r for r in caplog.records if r.name == _LOG.name]
+
+
 def test_only_a_zero_override_is_found(tmp_path: Path) -> None:
     both = _graph(tmp_path / "both", inbound_days=0, outbound_days=0)
     assert keep_forever_overrides(both) == (
@@ -91,7 +99,7 @@ def test_warn_enforcement_warns_instead_of_refusing(
     registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=0)
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
         _guard(acknowledged=False, enforcing=False)(registry)
-    (record,) = caplog.records
+    (record,) = _guard_records(caplog)
     text = record.getMessage()
     assert "IB_FEED" in text and "OB_FEED" in text and not text.startswith("AUDIT:")
 
@@ -103,7 +111,7 @@ def test_an_acknowledged_override_loads_and_is_audited_by_name(
     registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=0)
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
         _guard(acknowledged=True, enforcing=enforcing)(registry)
-    (record,) = caplog.records
+    (record,) = _guard_records(caplog)
     text = record.getMessage()
     assert record.levelno == logging.WARNING and text.startswith("AUDIT:")
     assert "IB_FEED" in text and "OB_FEED" in text and f"{_ACK}=true" in text
@@ -116,11 +124,20 @@ def test_a_graph_with_no_keep_forever_override_is_silent(
     registry = _graph(tmp_path / "cfg", inbound_days=7, outbound_days=None)
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
         _guard(acknowledged=acknowledged, enforcing=True)(registry)
-    assert caplog.records == []
+    assert _guard_records(caplog) == []
 
 
-async def test_a_reload_adding_a_keep_forever_override_is_refused(tmp_path: Path) -> None:
-    """Through the engine's own reload path: the refused graph never goes live."""
+def test_a_negative_override_built_past_the_factories_is_found(tmp_path: Path) -> None:
+    # The factories refuse a negative window, but the purge reads any value <= 0 as keep-forever,
+    # so a registry assembled without them must not slip past the guard.
+    registry = _graph(tmp_path / "cfg", inbound_days=7, outbound_days=None)
+    registry.inbound["IB_FEED"] = dataclasses.replace(registry.inbound["IB_FEED"], messages_days=-1)
+    assert keep_forever_overrides(registry) == ("inbound 'IB_FEED' (messages_days = -1)",)
+
+
+async def test_the_engine_reload_path_runs_the_guard(tmp_path: Path) -> None:
+    """The engine's own reload path raises the guard's refusal. A dry run, so this does not show
+    that a running graph is kept; the engine's reload tests own that ordering."""
     cfg = tmp_path / "cfg"
     _graph(cfg, inbound_days=0, outbound_days=None)
     eng = await Engine.create(
@@ -132,7 +149,6 @@ async def test_a_reload_adding_a_keep_forever_override_is_refused(tmp_path: Path
     try:
         with pytest.raises(WiringError, match="IB_FEED"):
             await eng.reload_detail(cfg, dry_run=True)
-        assert eng.registry_runner is None
     finally:
         await eng.stop()
 
@@ -170,3 +186,49 @@ def test_serve_reads_the_acknowledgement_into_the_guard(
 ) -> None:
     guard = _served_guard(tmp_path, monkeypatch, "security.allow_keeping_phi_indefinitely = true\n")
     guard(_graph(tmp_path / "cfg", inbound_days=0, outbound_days=0))
+
+
+_EDIT_LOGIC = (
+    "from messagefoundry import handler, router\n"
+    "@router('r')\n"
+    "def route(msg):\n"
+    "    return ['h']\n"
+    "@handler('h')\n"
+    "def handle(msg):\n"
+    "    return None\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("service_toml", "accepted"),
+    [
+        ("", False),
+        ("security.allow_keeping_phi_indefinitely = true\n", True),
+        ('security.enforcement = "warn"\n', True),
+    ],
+)
+def test_connection_upsert_refuses_what_an_enforcing_reload_would(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], service_toml: str, accepted: bool
+) -> None:
+    (tmp_path / "logic.py").write_text(_EDIT_LOGIC, encoding="utf-8")
+    svc = tmp_path / "svc.toml"
+    svc.write_text(service_toml, encoding="utf-8")
+    edit = {
+        "direction": "inbound",
+        "name": "IB_FEED",
+        "transport": "mllp",
+        "router": "r",
+        "settings": {"port": 2613},
+        "messages_days": 0,
+    }
+    rc = main(
+        ["connection", "upsert", "--config", str(tmp_path), "--data", json.dumps(edit), "--json"]
+        + ["--service-config", str(svc)]
+    )
+    out = capsys.readouterr().out
+    written = (tmp_path / "connections.toml").exists()
+    if accepted:
+        assert rc == 0 and written
+    else:
+        assert rc == 1 and not written
+        assert "IB_FEED" in out and "allow_keeping_phi_indefinitely" in out

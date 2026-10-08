@@ -3255,7 +3255,9 @@ def _retention_doc_findings(section: str, days: int, auto_bounded: tuple[str, ..
         "rows at **every stage**",
         "Unset or `0`, this global window meets the startup posture gate described above this table",
         "`0` = keep only where that gate allows it",
-        "The gate does not read that override",
+        # Vault BACKLOG #2368: a per-outbound override of 0 is gated at graph load. The row used to
+        # say the gate does not read the override, which was true and was the defect.
+        "An override of `0` meets its own gate, described there",
     ):
         if phrase not in notes:
             findings.append(f"the `{_DEAD_LETTER_WINDOW}` row no longer says {phrase!r}")
@@ -3389,11 +3391,11 @@ def test_retention_gate_reader_detects_a_planted_violation() -> None:
             "null the bodies of **dead-lettered** outbound rows",
             "scopes the purge to outbound rows again",
         ),
-        # The row claiming the gate reads a per-outbound override.
-        "override-gated": (
+        # The retired row: a per-outbound override of 0 that no gate reads (vault BACKLOG #2368).
+        "override-ungated": (
+            "An override of `0` meets its own gate, described there",
             "The gate does not read that override",
-            "The gate refuses on that override too",
-            "does not read that override",
+            "meets its own gate",
         ),
         # A window dropped from the posture paragraph while a table row still names it.
         "window-unnamed": (

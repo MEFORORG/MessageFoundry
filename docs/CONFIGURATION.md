@@ -945,10 +945,15 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 >   graph and names each connection. At startup the engine does not start. On a reload the running
 >   graph stays.
 > - Without it, under `warn`, the engine logs a warning naming each connection and loads the graph.
-> - With it, the engine loads the graph and logs a WARNING-level `AUDIT:` line naming each connection,
->   at every load.
+> - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection,
+>   each time it passes one. A dry-run reload counts.
 >
-> The acknowledgement is read once, at startup. `messagefoundry check` does not run this gate.
+> **That switch is not scoped to one connection.** It also turns off the 30-day default for every
+> unset global window, and it acknowledges every connection's `0`, including one added by a later
+> reload. Before you set it for one feed, set each global window to an explicit number of days.
+>
+> The acknowledgement is read once, at startup. `messagefoundry connection upsert` and `remove` refuse
+> an edit an enforcing engine would refuse. `messagefoundry check` does not run this gate.
 
 > **Backend coverage.** The retention/purge pass is **backend-agnostic** and every PHI purge runs on
 > **all three** backends (SQLite, SQL Server, Postgres). `wal_checkpoint_seconds` and `vacuum_at` are

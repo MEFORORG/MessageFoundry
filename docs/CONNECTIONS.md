@@ -3153,9 +3153,9 @@ two ways as `retry`/`buildup` — **code-first** on `inbound(...)`/`outbound(...
 ### Retention overrides ([ADR 0027](adr/0027-per-connection-retention.md))
 
 Override the global `[retention]` body-null windows per connection. `None` (omitted) = inherit the global
-window; `0` = keep this connection's bodies **forever**; `>0` = days. A `0` needs
-`[security].allow_keeping_phi_indefinitely = true`; without it an enforcing engine refuses the graph.
-See *Per-connection overrides* in [CONFIGURATION.md](CONFIGURATION.md#retention).
+window; `0` = keep this connection's bodies **forever**; `>0` = days. A `0` meets a retention
+gate when the engine loads the graph: see *Per-connection overrides* in
+[CONFIGURATION.md](CONFIGURATION.md#retention).
 
 | Key | Dir | Type | Default | Meaning |
 |-----|-----|------|---------|---------|
