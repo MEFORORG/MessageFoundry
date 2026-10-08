@@ -497,24 +497,14 @@ gates a merge**, and no seat has to clear one.
 
 ### Branch, commit one layer, open the PR
 
-- **"Merge when ready" is the ENQUEUE action here. Arming auto-merge on a branch that would merge
-  WITHOUT the queue stays forbidden, except for the Lander on a repository with no queue.** The
-  Lander's roster row and its 2026-10-07 note say how (owner ruling 2026-10-07). What the button
-  does was settled by **owner ruling 2026-09-05**, given when a seat stopped and asked rather than guess which of the two operations it
-  was: `main` requires a merge queue, so the mutation behind "Merge when ready" adds a queue entry
-  rather than merging on green.
-
-  **WHO may press it changed with the Console's retirement on 2026-09-10: enqueuing and merging are
-  BOTH the Lander's now.** A Manager does not enqueue, and that is not a narrowing of an old
-  permission -- the seat that held it no longer exists, and korus `MANAGER.md` has never granted it.
-  Hand the PR to the Lander once it is open, and leave the queue to it. Reading this bullet's
-  earlier wording as *"the dispatching seat enqueues"* is exactly the Console-by-substitution error
-  §5's retirement paragraph names. **CORRECTED 2026-09-23:** the sentence before it read *"Talk to
-  the Lander before you open a PR"*. Korus `MANAGER.md` retired that pre-open check on 2026-09-18.
-
-  **Dequeue before pushing.** Whether a QUEUED entry drops a later push is unmeasured. The hazard
-  this bullet was written against, and why it is kept rather than deleted, is in
-  [`docs/METHOD.md`](docs/METHOD.md).
+- **"Merge when ready" is the ENQUEUE action here (owner ruling 2026-09-05). Arming auto-merge on a
+  branch that would merge WITHOUT the queue stays forbidden, except for the Lander on a repository
+  with no queue.** The Lander's roster row and its 2026-10-07 note say how (owner ruling
+  2026-10-07). Enqueuing and merging have BOTH been the Lander's since the Console retired on 2026-09-10,
+  so a Manager hands the PR over and leaves the queue to it. **Dequeue before pushing**, because
+  whether a queued entry drops a later push is unmeasured; [`docs/METHOD.md`](docs/METHOD.md),
+  *Auto-merge: the hazard kept*, says why. The full text is in the same file, *CLAUDE.md text moved
+  in wave 3*.
 
 - Work on a feature branch. Which seat opens the PR, and when, is the batching bullet below. Commit
   at logical stops, **one coherent layer per commit**, with clear messages. Direct pushes to `main` stay blocked by the harness.
@@ -550,51 +540,35 @@ gates a merge**, and no seat has to clear one.
   to push. A Builder's final commit message carries the proposed PR title and ledger banner text, so
   the branch is self-describing if the Manager dies before opening it.
 - **THE MANAGER DECIDES WHEN TO CUT A PR, AND ONE PR USUALLY CARRIES A WHOLE WAVE (owner ruling
-  2026-09-23).** A worktree needs its own branch, not its own PR. Each extra PR runs the required
-  suite on `pull_request` and again on `merge_group`, while a feature-branch push runs one small leak
-  scan. So Builders push and stop. The Manager merges the wave's pushed branches in a throwaway
-  worktree, runs the checks once on the combined tree, and opens one PR. It cuts that PR at the
-  first of: every Builder in the wave has reported, five items are ready, or the Manager is about to
-  close. An item gets its own PR when it fixes a red `main`, changes a security control, supersedes
-  an ADR, or must land in order against another open PR. An item that is red or conflicts goes back
-  to a Builder; the Manager never writes that resolution. **No other seat decides this.** A Builder
-  cannot, because it exits first. The Lander owns the PR from the handover on and repairs it like
-  any other, but dropping an item is a re-cut, and re-cuts go back to the Manager. Every other seat
-  opens its own PR and may batch its own work the same way. **"Dispatched by a Manager" means running
-  as its SUBAGENT (owner ruling 2026-09-24).** A Builder in its own session, started from a chip or
-  spawned, has a report that reaches nobody, so it opens its own PR even though a Manager wrote its
-  brief. The steps, the PR
-  body shape and the traps are in korus `roles/MANAGER.md`, *When to cut a pull request*.
+  2026-09-23).** A worktree needs its own branch, not its own PR, so Builders push and stop. **No
+  other seat decides this.** Every other seat opens its own PR and may batch its own work the same
+  way. **"Dispatched by a Manager" means running as its SUBAGENT (owner ruling 2026-09-24).** A
+  Builder in its own session, started from a chip or spawned, opens its own PR. Korus
+  `roles/MANAGER.md` holds the rest, in *When to cut a pull request* and *A Builder in its own
+  session opens its own pull request*.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **The Lander checks for PROOF THAT CODE REVIEW RAN on the
   change (owner ruling 2026-09-29, in session).** Proof is a code-review tag on the PR, such as the
-  Builder's QA line under the `qa` label. Other evidence that code review ran against this change
-  also counts. With proof, the Lander does not need to review the diff. Without it, the Lander sends
-  the change to code review: an `Agent` subagent that runs the `code-review` skill at `xhigh`. The proof must cover the change
-  being merged. A review of an earlier head still counts after a push that only merges `main` in
-  cleanly. A conflict resolution the Lander wrote itself needs its own review. So does a later
-  commit that changes content. Read what the review found, not only that a tag exists: a label
-  records that a step *happened*, not what it found. The Lander posts the review's findings on the
-  PR. A finding that names a defect the merge would ship goes back to the owner for a ruling, as
-  korus `roles/LANDER.md` *4a-quinquies* says. **CORRECTED 2026-09-29:** this bullet read
-  *"Reading a diff before merging it is still the job; no check now asks whether you did."* The
-  owner replaced it because the Builders already run code review.
-- **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
-  `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports
-  `BEHIND` or `DIRTY` in preference to `BLOCKED`, so it hides one blocking reason behind another.
-  Poll the check RUNS for the contexts that are still required, and gate on `mergeable ==
-  CONFLICTING` first: a PR that conflicts *after* its checks ran keeps them passing but stale.
-  BACKLOG #1417 recorded the stale-payload defect and PR 731 was built against a workflow that no
-  longer exists; see that item's 2026-09-04 amendment before acting on either.
+  Builder's QA line under the `qa` label, or other evidence that code review ran against this
+  change. Without it, the Lander sends the change to code review. The proof must cover the change
+  being merged, so a conflict resolution the Lander wrote itself needs its own review. The Lander
+  reads what the review found, and a finding that names a defect the merge would ship goes back to
+  the owner for a ruling. Korus `roles/LANDER.md` *4a-quinquies* holds the rest; the full text is in
+  [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
+- **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
+  verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
+  first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
+  `roles/LANDER.md` section 3 and *7c-ter* cover reading the check runs and the merge itself. The
+  full text, with BACKLOG #1417 and its 2026-09-04 amendment, is in
+  [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
 - Never write the required-context count into a document. `.github/required-contexts.txt` is a
   checked-in claim that can lag the server, so read branch protection for the live set. When the set
   moves, move that file and the pinned count in `tests/test_required_contexts.py` in the same PR, or
   the test leg goes red for everyone.
 - Announcing your own push or merge is a courtesy, not a channel. One line is enough, and no seat may
-  rely on having received it. Never announce a hold, a freeze, or a promise about future state. A
-  2026-08-01 rehearsal of that shape stayed "in force" for hours after its condition had resolved,
-  while `main` moved four times underneath it ([`docs/WORKTREES.md`](docs/WORKTREES.md), "Announcing
-  yourself").
+  rely on having received it. Never announce a hold, a freeze, or a promise about future state.
+  [`docs/METHOD.md`](docs/METHOD.md), *At least six actions break the fleet*, says why; the hook is
+  in [`docs/WORKTREES.md`](docs/WORKTREES.md), "Announcing yourself".
 - **Never grep for the next free ADR number.** Two sessions that both grep pick the *same* number,
   create differently-named files, **merge clean**, and silently corrupt the ledger (it has fired
   three times). Allocate it atomically with `pwsh -NoProfile -File scripts\coord\alloc.ps1

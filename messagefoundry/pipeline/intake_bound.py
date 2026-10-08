@@ -35,6 +35,7 @@ condition that persists. ``intake_resumed``, its auto-resolving inverse, fires o
 from __future__ import annotations
 
 import asyncio
+import binascii
 import contextlib
 import logging
 import time
@@ -53,6 +54,7 @@ from messagefoundry.transports.base import IntakeGate
 __all__ = [
     "DEPTH_REASON",
     "DISK_REASON",
+    "INTAKE_SUBJECT_MAX_LENGTH",
     "PAUSE_EFFECT",
     "IntakeBoundMonitor",
     "depth_resume_at",
@@ -106,12 +108,41 @@ def disk_resume_at(floor_bytes: int) -> int:
     return floor_bytes + floor_bytes // 10
 
 
-def intake_alert_subject(reason: str) -> str:
-    """The alert subject for one bound: ``intake:<reason>``. One per bound, so a drained backlog
-    cannot resolve a low-disk pause. ``intake_paused`` is not connection-scoped, so no rule's
-    ``control_action`` fires on it (BACKLOG #1898). The colon also keeps the subject out of the
-    connection-name grammar, which guards only the default target, never a ``control_target``."""
-    return f"intake:{reason}"
+#: The longest subject :func:`intake_alert_subject` returns. Under the SQL Server store's 256-character
+#: ``alert_instance.connection`` column, with room to spare. ``[cluster].node_id`` has no length limit,
+#: so a node label too long to fit is shortened to a prefix plus a checksum of the whole label.
+INTAKE_SUBJECT_MAX_LENGTH = 200
+
+#: Hex digits of the CRC-32 that stands in for the tail of a node label too long to fit. A checksum,
+#: not a cryptographic digest: the label is the operator's own setting, so it only has to tell two
+#: honest labels apart, never resist a forged one.
+_NODE_DIGEST_HEX = 8
+
+
+def intake_alert_subject(reason: str, node: str | None = None) -> str:
+    """The alert subject for one bound on one engine process: ``intake:<reason>@<node>``, or
+    ``intake:<reason>`` for a lone engine (``node`` None).
+
+    One per bound, so a drained backlog cannot resolve a low-disk pause. One per process too
+    (BACKLOG #2272 defects 4 to 6): every process on a store pauses its own listeners, so each raises
+    and clears only its own alert, and one node's clear cannot resolve another node's pause. ``node``
+    is :attr:`~messagefoundry.pipeline.engine.Engine.instance_identity` (``node:<id>`` or
+    ``shard:<id>``).
+
+    ``intake_paused`` is not connection-scoped, so no rule's ``control_action`` fires on it (BACKLOG
+    #1898). The colon also keeps the subject out of the connection-name grammar, which guards only the
+    default target, never a ``control_target``. The result is at most
+    :data:`INTAKE_SUBJECT_MAX_LENGTH` characters, and the same inputs always give the same subject."""
+    base = f"intake:{reason}"
+    if node is None:
+        return base
+    subject = f"{base}@{node}"
+    if len(subject) <= INTAKE_SUBJECT_MAX_LENGTH:
+        return subject
+    # binascii, not zlib: the same CRC-32, and this module reads no archive or compressed stream.
+    digest = f"{binascii.crc32(node.encode('utf-8')):0{_NODE_DIGEST_HEX}x}"
+    keep = INTAKE_SUBJECT_MAX_LENGTH - len(base) - len("@~") - _NODE_DIGEST_HEX
+    return f"{base}@{node[: max(0, keep)]}~{digest}"
 
 
 class IntakeBoundMonitor:
@@ -119,7 +150,12 @@ class IntakeBoundMonitor:
 
     Not leader-gated. Every node that runs the graph (every engine shard, the active node of an HA
     pair) pauses its own listeners against the one shared backlog. A standby runs the check too, with
-    nothing to pause; the count is capped, so that costs one bounded read per interval."""
+    nothing to pause; the count is capped, so that costs one bounded read per interval.
+
+    ``node`` names this process in its alert subjects (see :func:`intake_alert_subject`), so each
+    process reports only its own gate. ``resolve_on_stop`` is for a process whose ``node`` changes
+    on every start, an unpinned cluster node: its next start reports under a new subject and can
+    never clear the old one, so :meth:`stop` clears it on the way out."""
 
     def __init__(
         self,
@@ -130,9 +166,15 @@ class IntakeBoundMonitor:
         min_free_disk_mb: int = 0,
         check_seconds: float = DEFAULT_CHECK_SECONDS,
         alert_sink: AlertSink | None = None,
+        node: str | None = None,
+        resolve_on_stop: bool = False,
     ) -> None:
         self._store = store
         self._gate = gate
+        # The alert subject per reason, fixed for this monitor's life so a raise and its clear always
+        # name the same instance.
+        self._subjects = {r: intake_alert_subject(r, node) for r in (DEPTH_REASON, DISK_REASON)}
+        self._resolve_on_stop = resolve_on_stop
         # None = no notifier configured. Then nothing is raised: the monitor's own WARNING and INFO
         # lines are the log record, and a LoggingAlertSink would only repeat them.
         self._alert_sink = alert_sink
@@ -147,10 +189,9 @@ class IntakeBoundMonitor:
         backend = getattr(store, "backend", StoreBackend.SQLITE)
         self._store_kind = backend.value if isinstance(backend, StoreBackend) else "unknown"
         # The pause state last reported to the sink, per reason. Empty at first, so the first
-        # measurement of each bound that is paused, or clear of its resume line, reports it. A clear
-        # raises intake_resumed once, which resolves a pause left open by a run that stopped while
-        # paused. A first measurement inside the hysteresis band reports nothing until it leaves the
-        # band (see _sync_alert). After that, only a change is reported.
+        # measurement of each bound reports this process's state. A clear raises intake_resumed once,
+        # which resolves a pause left open by a run that stopped while paused. After that, only a
+        # change is reported.
         self._reported: dict[str, bool] = {}
         # Reasons whose report the sink is refusing: one WARNING per failing streak, not per tick.
         self._sink_failing: set[str] = set()
@@ -198,16 +239,50 @@ class IntakeBoundMonitor:
 
     async def stop(self) -> None:
         """Stop measuring and OPEN the gate. A stopped monitor can no longer see a condition clear,
-        so it must not leave intake paused behind it: that would be a stall with nothing to end it."""
+        so it must not leave intake paused behind it: that would be a stall with nothing to end it.
+
+        No ``intake_resumed`` is raised, because the condition has not cleared, only stopped being
+        watched; the next start reports under the same subject. The exception is ``resolve_on_stop``,
+        a process whose next start uses a different subject: it clears its open pauses here, since
+        nothing else ever will. A process that dies without stopping still leaves them open, for an
+        operator to resolve in the alert list."""
         self._stop.set()
         task, self._task = self._task, None
         if task is not None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        held = set(self._gate.reasons)
         for reason in (DEPTH_REASON, DISK_REASON):
             self._gate.release(reason)
-        # No intake_resumed here: the condition has not cleared, only stopped being watched.
+        if self._resolve_on_stop:
+            for reason in (DEPTH_REASON, DISK_REASON):
+                if reason in held or self._reported.get(reason):
+                    self._report_clear_on_stop(reason)
+
+    def _report_clear_on_stop(self, reason: str) -> None:
+        sink = self._alert_sink
+        if sink is None:
+            return
+        value, limit = self._last_reading.get(reason, (0, 0))
+        try:
+            sink.intake_resumed(
+                self._subjects[reason],
+                reason=reason,
+                value=value,
+                limit=limit,
+                store_kind=self._store_kind,
+            )
+        except Exception:
+            # Broad on purpose, as in _sync_alert: a sink must never raise, and a broken one must not
+            # break the stop. Logged with the cause.
+            log.warning(
+                "intake pause alert for %s could not be cleared at stop; resolve it in the alert list",
+                reason,
+                exc_info=True,
+            )
+            return
+        self._reported[reason] = False
 
     async def _run(self) -> None:
         # Engine.start measures once before the graph comes up, so the loop waits first rather
@@ -259,8 +334,6 @@ class IntakeBoundMonitor:
             return
         self._depth_failing = False
         held = DEPTH_REASON in self._gate.reasons
-        # One predicate for both the release and the alert, so the two cannot disagree.
-        settled = depth <= depth_resume_at(self._max_depth)
         if not held and depth > self._max_depth:
             self._gate.hold(DEPTH_REASON)
             log.warning(
@@ -270,14 +343,14 @@ class IntakeBoundMonitor:
                 PAUSE_EFFECT,
                 depth_resume_at(self._max_depth),
             )
-        elif held and settled:
+        elif held and depth <= depth_resume_at(self._max_depth):
             self._gate.release(DEPTH_REASON)
             self._log_resumed(
                 "the staged backlog drained to %d (resume line %d)",
                 depth,
                 depth_resume_at(self._max_depth),
             )
-        self._sync_alert(DEPTH_REASON, value=depth, limit=self._max_depth, settled=settled)
+        self._sync_alert(DEPTH_REASON, value=depth, limit=self._max_depth)
 
     async def _check_disk(self) -> None:
         assert self._floor_path is not None  # disk_floor_on
@@ -304,8 +377,6 @@ class IntakeBoundMonitor:
         self._disk_failing = False
         held = DISK_REASON in self._gate.reasons
         resume_bytes = disk_resume_at(reading.floor_bytes)
-        # One predicate for both the release and the alert, so the two cannot disagree.
-        settled = reading.free_bytes >= resume_bytes
         if not held and reading.below:
             self._gate.hold(DISK_REASON)
             log.warning(
@@ -318,7 +389,7 @@ class IntakeBoundMonitor:
                 PAUSE_EFFECT,
                 resume_bytes >> 20,
             )
-        elif held and settled:
+        elif held and reading.free_bytes >= resume_bytes:
             self._gate.release(DISK_REASON)
             self._log_resumed(
                 "free space on the SQLite store's volume is back to %s MiB (resume line %d MiB)",
@@ -327,20 +398,18 @@ class IntakeBoundMonitor:
             )
         free_mib = reading.free_mib
         assert free_mib is not None  # free_bytes was measured, checked above
-        self._sync_alert(DISK_REASON, value=free_mib, limit=reading.floor_mib, settled=settled)
+        self._sync_alert(DISK_REASON, value=free_mib, limit=reading.floor_mib)
 
-    def _sync_alert(self, reason: str, *, value: int, limit: int, settled: bool = True) -> None:
+    def _sync_alert(self, reason: str, *, value: int, limit: int) -> None:
         """Report ``reason``'s pause state to the sink: ``intake_paused`` when a pause starts and
         again every :data:`REALERT_SECONDS` while it holds, and ``intake_resumed`` once when it
         clears. A new pause always reports at once, so one that starts soon after the last is never
         held back here; the notifier's own throttle decides whether it pages.
 
-        ``settled`` is False while an unpaused measurement sits inside the hysteresis band, between
-        the resume line and the bound. No clear is reported from there. The alert subject is shared
-        by every node on the store, and another node may still hold its pause in that band, so a
-        restarting node must not resolve it until the band is cleared. The cost falls on a single
-        node that starts inside the band: a pause alert left open by its last run stays open until
-        the measurement leaves the band. A missing page is worse than a late clear.
+        The alert mirrors THIS process's gate, not the store's: the subject names the process, so no
+        other node's pause rides on it (#2272 defects 5 and 6). A process that starts with its gate
+        open therefore reports the clear at once, even inside the hysteresis band between the resume
+        line and the bound, and a pause its own last run left open resolves at its first measurement.
 
         A sink must never raise, but a broken one must not kill the monitor either: that would freeze
         every later release. A failed report is not recorded, so the next measurement the monitor
@@ -358,12 +427,10 @@ class IntakeBoundMonitor:
             # the next outage is logged again.
             self._sink_failing.discard(reason)
             return
-        if not paused and not settled:
-            return
         try:
             emit = sink.intake_paused if paused else sink.intake_resumed
             emit(
-                intake_alert_subject(reason),
+                self._subjects[reason],
                 reason=reason,
                 value=value,
                 limit=limit,
@@ -398,7 +465,7 @@ class IntakeBoundMonitor:
         paused nor clear."""
         last = self._last_reading.get(reason)
         if last is not None and reason in self._gate.reasons:
-            self._sync_alert(reason, value=last[0], limit=last[1], settled=False)
+            self._sync_alert(reason, value=last[0], limit=last[1])
 
     def _log_resumed(self, what: str, *args: object) -> None:
         still = sorted(self._gate.reasons)

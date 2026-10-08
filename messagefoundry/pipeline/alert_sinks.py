@@ -54,6 +54,7 @@ from messagefoundry.config.tls_policy import (
     smtp_login_approved,
 )
 from messagefoundry.connection_names import is_connection_name
+from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
     config_changed_detail,
     crl_expiry_detail,
@@ -804,6 +805,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
         self._store = store
         self._state_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #2272 defect 8: a FIFO lock per "<type>:<connection>" instance key. Each state write
+        # holds its key's lock, so a raise and its clear land in emit order; writes for different keys
+        # stay concurrent. An entry is dropped once no write holds or awaits it.
+        self._state_locks: dict[str, KeyedLock] = {}
         # #143 (ADR 0044 amendment): windowed NOTIFICATION-mute cache — (type:connection) → until-epoch.
         # The synchronous suspend gate _emit consults; in-memory + per-node (the same advisory posture as
         # the _last_sent throttle above). The DURABLE record is alert_instance.suspended_until; this cache
@@ -922,9 +927,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def intake_paused(
         self, name: str, *, reason: str, value: int, limit: int, store_kind: str
     ) -> None:
-        # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>` stands in for "connection",
-        # so each bound is its own instance and throttle key. `detail` is what the instance's reason
-        # column shows, built by the same helper the logging sink uses. The monitor re-raises this
+        # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>[@<process>]` stands in for
+        # "connection", so each bound on each engine process is its own instance and throttle key.
+        # `detail` is what the instance's reason column shows, built by the same helper the logging
+        # sink uses. The monitor re-raises this
         # while a pause holds, and _emit's (type, connection) throttle collapses the repeats, as
         # for queue_buildup. Counts and sizes only: no message content, no PHI.
         self._emit(
@@ -1484,14 +1490,22 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         connection = str(event.get("connection", ""))
         inverse_of = _AUTO_RESOLVE.get(etype)
         coro: Coroutine[Any, Any, Any]
+        # The instance key both writes touch: an upsert's own type, or the failure type a clear resolves.
+        key = f"{inverse_of or etype}:{connection}"
+        # Stamp the row with the emit time: a write may now wait behind a slow one for the same key,
+        # and first_seen / last_seen / resolved_at should say when the condition changed, not when
+        # the store caught up.
+        now = time.time()
         if inverse_of is not None:
             # #143/#81: a resolved condition has nothing left to mute OR escalate — drop the windowed-
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
             # re-open of the SAME key starts un-suspended at the base tier (the durable suspended_until /
             # escalation_tier were on the now-resolved row and never return via list_active).
-            self._suspended.pop(f"{inverse_of}:{connection}", None)
-            self._occurrences.pop(f"{inverse_of}:{connection}", None)
-            coro = store.resolve_alert_instances_for(event_type=inverse_of, connection=connection)
+            self._suspended.pop(key, None)
+            self._occurrences.pop(key, None)
+            coro = store.resolve_alert_instances_for(
+                event_type=inverse_of, connection=connection, now=now
+            )
         else:
             # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
             raw_reason = event.get("detail") or event.get("reason")
@@ -1502,25 +1516,49 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 severity=severity,
                 reason=reason,
                 escalation_tier=escalation_tier,
+                now=now,
             )
+        wrapper = self._run_state(coro, key)
         try:
-            task = asyncio.ensure_future(self._run_state(coro))
+            task = asyncio.ensure_future(wrapper)
         except RuntimeError:
             # No running loop (e.g. an emit on a non-async test path) — the state write is best-effort,
             # so drop it rather than raise into the caller. The notification path is unaffected.
+            # Close both coroutines so neither warns "never awaited".
+            wrapper.close()
             coro.close()
             return
         self._state_tasks.add(task)
-        task.add_done_callback(self._state_tasks.discard)
 
-    @staticmethod
-    async def _run_state(coro: Any) -> None:
+        def _done(t: asyncio.Task[None]) -> None:
+            self._state_tasks.discard(t)
+            # A task cancelled before its first step never reached the await; close the store
+            # coroutine so it does not warn "never awaited". Closing a finished coroutine is a no-op.
+            coro.close()
+
+        task.add_done_callback(_done)
+
+    async def _run_state(self, coro: Coroutine[Any, Any, Any], key: str) -> None:
+        # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
+        # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
+        # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
+        # they queue on the lock in emit order, and a waiter cancelled mid-queue keeps the rest in order.
         try:
-            await coro
+            async with hold_keyed_lock(self._state_locks, key):
+                await coro
         except Exception:
             # The alert-instance write is a side observer: a store error must never wedge a delivery
             # worker or drop the notification. Log metadata only (no event body).
             log.warning("alert-instance state write failed", exc_info=True)
+
+    async def drain_state(self, timeout: float) -> None:
+        """Wait up to ``timeout`` seconds for the alert-instance writes already scheduled. The engine
+        calls it before it closes the store, so a clear raised on the way out (an unpinned cluster
+        node's intake_resumed, BACKLOG #2272) is written rather than lost to the close. A write
+        still running at the deadline is left to fail as before; this never raises."""
+        pending = set(self._state_tasks)
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 

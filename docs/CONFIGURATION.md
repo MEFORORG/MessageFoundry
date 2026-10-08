@@ -1325,7 +1325,15 @@ does `queue_buildup`. That spacing is fixed. The notifier's throttle (`realert_s
 count them. So a cooldown under 300 seconds does not page faster. A second pause soon after the first
 raises at once, but the throttle may hold its page; a later reminder in that pause sends it. With no
 `[alerts]` transport the engine raises no event; its own WARNING line records each pause. Its
-`connection` is `intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert.
+`connection` names the bound and the engine process: `intake:staged_depth@<process>` or
+`intake:disk_floor@<process>`, where `<process>` is `node:<node_id>` on a cluster node or
+`shard:<id>` on an engine shard. A lone engine that owns its store drops the suffix:
+`intake:staged_depth` or `intake:disk_floor`. So each bound on each process is its own alert. Every
+process sharing a store pauses its own listeners, and each one raises and clears only its own
+alert, so one node's clear never resolves another node's pause. The pause is not leader-gated, so
+a cluster standby measures too and raises its own alert while the shared backlog is over the bound,
+even with nothing of its own to pause. A subject longer than 200
+characters keeps a prefix of the process label plus a checksum of the whole label.
 A rule cannot attach a `control_action` to `intake_paused`, because it is not a connection-scoped
 event (see `control_action` in the rule table below).
 
@@ -1337,11 +1345,17 @@ gives the free MiB now. `value` is the measurement taken when the event was rais
 payload carries no message content and no PHI.
 
 Its inverse, `intake_resumed`, pages nobody and cannot be a rule's `event_type`. It resolves the open
-`intake_paused` for the same bound. After a start, the engine also raises it once for each bound that
-is turned off, with `value` and `limit` at 0. It raises it once more for a bound first measured clear
-of its resume line. This clears a pause that an earlier run left open when it stopped. A bound first
-measured between its resume line and its limit reports nothing until it leaves that band, because
-another node on the same store may still be paused there.
+`intake_paused` for the same bound on the same process. After a start, the engine also raises it
+once for each bound that is turned off, with `value` and `limit` at 0. It raises it once more for
+each bound it did not pause at its first measurement, even one between its resume line and its
+limit. This clears a pause that an earlier run of the same process left open when it stopped.
+
+That relies on the process keeping its name across a restart. An engine shard does. A cluster node
+does only when `[cluster].node_id` is pinned; otherwise its id is new on every start. An unpinned
+node therefore clears its own open pause alerts when it stops, since its next start reports under a
+new name. The stop waits up to 5 seconds for that write before it closes the store. An unpinned node
+that crashes while paused, or whose clear does not land in time, leaves its alert open; resolve it
+in the alert list, or pin `[cluster].node_id`.
 
 **`config_changed` says a start loaded different config bytes than the store's baseline** (vault
 BACKLOG #2597). At each start the engine compares its config fingerprint (ADR 0041 D1) with the
