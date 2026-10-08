@@ -25,9 +25,10 @@ same :func:`~messagefoundry.pipeline.intake_bound.process_alert_subject`.
 * ``dropping``: a loss counter rose. The count is :attr:`ForwarderStatus.lost`, a floor on the
   records lost since the process started.
 * ``spool_unreadable``: the on-disk spool could not be read. Held, not lost.
-* ``not_sending``: every pass for a whole re-alert window found the last send failed, and a send
-  has failed since the last alert. Not raised when the same pass raises ``dropping`` for an
-  unreachable collector, which without a spool is every time. A spool keeps the records while
+* ``not_sending``: every pass for a whole re-alert window found
+  :attr:`ForwarderStatus.send_failing` set, and a send has failed since the last alert. Not raised
+  when the same pass raises ``dropping`` for an unreachable collector, which without a spool is
+  the usual case: the two counters are read without a lock. A spool keeps the records while
   it has room; when it is full this fires beside ``dropping``.
 
 Every kind sends a ``count``. Only ``dropping`` puts a number of lost records in it; the other

@@ -1016,7 +1016,7 @@ class LogForwarderInfo(BaseModel):
 
     The pull-side counterpart of the ``log_forward_failed`` alert, read from process memory, so it
     still answers when the collector does not. ``state`` is ``healthy``, ``unconfirmed``,
-    ``degraded`` (the last send failed, the spool cannot be read, or a record was lost since this
+    ``degraded`` (``send_failing`` is set, the spool cannot be read, or a record was lost since this
     process started; the last does not clear while the forwarder runs) or ``not_installed`` (a
     configured forwarder did not start or has stopped, so it sends nothing). What each count
     measures, and what it reads in each state, is stated once, on
@@ -1033,7 +1033,7 @@ class LogForwarderInfo(BaseModel):
     installed: bool
     delivery_confirmed: bool = True  # False over UDP: a failed send is not visible at all
     start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
-    send_failing: bool = False  # the last send hit a network error
+    send_failing: bool = False  # the last send, or a deferred start's connect, hit a network error
     lost: int = 0  # the five loss counts below, added up; a floor
     queued: int = 0  # on the hand-off queue now: a level, not a loss, and not the spool
     queue_dropped: int = 0  # dropped because the hand-off queue was full

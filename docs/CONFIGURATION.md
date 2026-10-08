@@ -904,10 +904,10 @@ about a missing or failing forwarder two ways (BACKLOG #2612).
     floor, because some losses are not counted.
   - `spool_unreadable`: a read of the on-disk spool failed. The spool keeps its records, and
     they are not sent until a read succeeds.
-  - `not_sending`: every check for five minutes found that the last send had failed, and a send
-    has failed since the last alert. A spool keeps the records on disk while it has room. It is
+  - `not_sending`: every check for five minutes found `send_failing` true, and a send has
+    failed since the last alert. A spool keeps the records on disk while it has room. It is
     not raised when the same check raises `dropping` for an unreachable collector. Without a
-    spool that is every time, so page on `dropping` there.
+    spool that is the usual case, so page on both kinds.
 
   The kinds share one window of about five minutes. One check can raise more than one kind.
   After a check raises any, no check raises one again until the window ends. The one exception
@@ -923,7 +923,9 @@ about a missing or failing forwarder two ways (BACKLOG #2612).
   and `spool_read_errors`. The web console's status page has a row for the forwarder. Its health
   indicator turns to warn when the state is `not_installed` or `degraded`.
 
-`degraded` means the last send failed, the last spool read failed, or `lost` is above zero.
+`degraded` means `send_failing` is true, the last spool read failed, or `lost` is above zero.
+`send_failing` is true after a send that failed. It is also true from a start that could not
+connect until the first send that works.
 `lost` never goes down while the forwarder runs, so a loss keeps the state `degraded` for that
 long. If the forwarder then stops, the state reads `not_installed`.
 
@@ -931,8 +933,8 @@ long. If the forwarder then stops, the state reads `not_installed`.
 collector that is down reports no failure, and the engine does not count a UDP send error its own
 host reports either. So a collector that is down looks the same as one that is up. The only
 losses the engine counts are queue and spool losses. `delivery_confirmed` is `false`, a
-forwarder with no fault seen reads `unconfirmed` and never `healthy`, and the console row says
-that delivery is not confirmed. The health indicator does not warn for that alone. Use `tcp` or
+forwarder with no fault seen reads `unconfirmed` and never `healthy`. In the `unconfirmed` and
+`degraded` states the console row says that delivery is not confirmed. The health indicator does not warn for that alone. Use `tcp` or
 `tls` where a silent loss must page.
 
 Neither the alert nor `log_forwarder` on `GET /status` carries a record, the collector's address

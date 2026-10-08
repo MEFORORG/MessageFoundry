@@ -1476,7 +1476,8 @@ class ForwarderStatus:
     #: the UDP handler's own send errors are not read either): ``send_failing``, ``unsent`` and so ``lost`` then stay
     #: at zero while every record is lost on the wire, and only queue and spool losses count.
     delivery_confirmed: bool = True
-    #: Whether the last send hit a network error. A spool keeps the records while it has room.
+    #: Whether the last send hit a network error. Also true from a deferred start, where the
+    #: connect failed, until the first good send. A spool keeps the records while it has room.
     send_failing: bool = False
     #: Sends that hit a network error, whether or not a spool kept the record.
     send_failures: int = 0
@@ -1507,8 +1508,8 @@ class ForwarderStatus:
     def state(self) -> str:
         """``"off"``, ``"not_installed"``, ``"degraded"``, ``"unconfirmed"`` or ``"healthy"``.
 
-        ``degraded`` means the last send failed, the spool cannot be read, or a record was lost
-        since this process started. The last one does not clear while this forwarder runs: the
+        ``degraded`` means :attr:`send_failing` is set, the spool cannot be read, or a record was
+        lost since this process started. The last one does not clear while this forwarder runs: the
         records are still missing at the collector. ``unconfirmed`` is a forwarder with no fault
         seen whose protocol cannot show one (:attr:`delivery_confirmed`), so it is never called
         healthy."""
