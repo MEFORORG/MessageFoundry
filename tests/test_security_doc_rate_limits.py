@@ -1592,7 +1592,8 @@ def test_ui_refusal_is_described_as_the_code_behaves() -> None:
 
     BACKLOG #2144: the write floor's ``Retry-After`` is the limiter's own wait on both surfaces. So
     the code half pins that ``require_ui`` and the JSON gate send the SAME expression, and the doc
-    half pins that no document states the two retired literals.
+    half pins that neither pinned document carries at least the retired wordings listed in
+    ``_RETIRED_WRITE_LITERALS``. Another document, or another wording, is not read.
     """
     src = _CONSOLE_AUTH.read_text(encoding="utf-8-sig")
     write = _ui_refusal(src, "allow_admin_write")

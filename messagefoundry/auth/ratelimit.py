@@ -114,6 +114,9 @@ class SlidingWindowRateLimiter:
         bucket = self._hits[key]  # a per-key gate fired, so the key has hits
         wait = bucket[-1] + self._min_interval - now
         if self._per_key and len(bucket) >= self._per_key:
-            # Room opens when the hit that keeps the count at the budget ages out.
-            wait = max(wait, bucket[len(bucket) - self._per_key] + self._window - now)
+            # Room opens when the hit that keeps the count at the budget ages out. Clamped to the
+            # bucket: a negative budget loads and refuses every hit after a key's first, and its
+            # room opens only when the last hit ages out.
+            blocking = min(max(len(bucket) - self._per_key, 0), len(bucket) - 1)
+            wait = max(wait, bucket[blocking] + self._window - now)
         return max(wait, 0.0)

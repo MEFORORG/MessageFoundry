@@ -345,12 +345,17 @@ from typing import Any
 #: action-bound step-up surface each moved the digest on its own branch. The value below was
 #: re-derived on the merged tree, so it covers both.
 #:
+#: Vault BACKLOG #2144: ``AuthService`` gained ``admin_write_retry_after``, which ``require_ui``
+#: calls to fill the ``Retry-After`` of a throttled ``/ui`` write. A method the console calls, so a
+#: skew would be an AttributeError where the 429 belongs; it forces a bump. Re-derive after any
+#: merge with another seam change.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "71a8eb514b48d64e"
+ENGINE_UI_SEAM: str = "d75f7e274024887d"
 
 
 @dataclass(frozen=True, slots=True)

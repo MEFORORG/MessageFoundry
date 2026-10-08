@@ -272,6 +272,15 @@ def test_limiter_retry_after_is_the_wait_of_the_gate_that_fired(
     clock[0] = 2037.5
     assert counted.retry_after("a") == 0.0
     assert counted.allow("a")
+    # A negative budget loads ([auth].admin_write_rate_limit_per_actor has no lower bound) and
+    # refuses every hit after a key's first. The wait must be a number, not an IndexError that
+    # would turn the 429 into a 500: here, until the one hit ages out.
+    negative = SlidingWindowRateLimiter(per_key=-1, glob=0, window_seconds=37.5)
+    clock[0] = 3000.0
+    assert negative.allow("a")
+    clock[0] = 3010.0
+    assert not negative.allow("a")
+    assert negative.retry_after("a") == 27.5
 
 
 def test_limiter_retry_after_hides_other_keys_when_the_global_budget_is_full(

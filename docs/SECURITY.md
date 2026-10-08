@@ -552,7 +552,9 @@ below 1. When the count refused the write, that is the time until the actor's ol
 leaves the window, so at most `admin_write_rate_limit_window_seconds`, rounded up. When the minimum gap refused
 it, that is the rest of the gap, which rounds up to 1 at the default. The JSON API and the `/ui`
 console send the same value for the same refusal. The limiter has no cross-actor dimension, so the
-value says nothing about any other account. Before this, the JSON API sent a literal `1` and `/ui`
+value depends only on that account's own admitted writes, never on another account's. A second
+session on the same account does read them, as it already could from which writes are refused.
+Before this, the JSON API sent a literal `1` and `/ui`
 a literal `10`, and a client that honoured either would have retried too early.
 
 **The console's refusal differs from the JSON floor's.** `require_ui` writes no WARNING line naming
