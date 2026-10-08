@@ -244,8 +244,8 @@ def test_check_surfaces_the_revocation_attested_set_in_both_directions(tmp_path:
     r = _result(report, "tls-revocation-attested")
     assert r.ok and not r.required and not r.skipped
     assert "2 connection(s)" in r.detail
-    assert "OB_ATTESTED (partner PKI runs OCSP at the edge)" in r.detail
-    assert "inbound:IB_MTLS (site CA publishes a CRL the edge enforces)" in r.detail
+    assert 'OB_ATTESTED ("partner PKI runs OCSP at the edge")' in r.detail
+    assert 'inbound:IB_MTLS ("site CA publishes a CRL the edge enforces")' in r.detail
     assert "PLAIN" not in r.detail
 
 

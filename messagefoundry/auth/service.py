@@ -20,7 +20,6 @@ import logging
 import math
 import os
 import secrets
-import sqlite3
 import time
 import unicodedata
 import urllib.error
@@ -43,6 +42,7 @@ from types import MappingProxyType
 from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
 
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
 from messagefoundry.auth.audit_visibility import (
     ACCOUNT_LOCKED_ACTION,
@@ -170,17 +170,6 @@ def _audit_write_errors() -> tuple[type[Exception], ...]:
     runs the reconciler builds it at construction, so that import never runs on the event loop in
     the middle of a store incident."""
     return (RuntimeError, OSError, CipherError, *store_driver_errors())
-
-
-#: The classes inside :func:`_audit_write_errors` that a reconciler audit write raises rather than
-#: passes over (BACKLOG #2137). ``RuntimeError`` has to stay in that catch,
-#: because the store raises it for its own refusals; ``NotImplementedError`` and ``RecursionError``
-#: are its subclasses that never mean one. ``sqlite3.ProgrammingError`` is a bad statement or bind:
-#: the SQLite store reaches sqlite3 through aiosqlite, which refuses a closed connection with its
-#: own ``ValueError`` first. pyodbc's ``ProgrammingError`` stays caught, because pyodbc raises it
-#: for a closed connection too, and raising that would cost the pass's alerts, the harm BACKLOG
-#: #2137 removed.
-_AUDIT_WRITE_DEFECTS: Final = (NotImplementedError, RecursionError, sqlite3.ProgrammingError)
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -565,6 +554,17 @@ STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — s
 # attribute that affects authentication (ASVS 7.5.1). Bound to its own action and single-use, and
 # MFA-gated, for the same reason `admin_reset_password` is.
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY = "admin_federated_identity"
+# Vault BACKLOG #2625. The routes that inject a message, send a stored body to another partner,
+# export bodies in bulk, cancel queued deliveries or swap the live graph. Each takes a proof bound to
+# its own action, so one live session inside the step-up window is not enough to do any of them.
+# Only these: the rest of the step-up surface keeps the shared window, because a proof per action is
+# a typed password, and an operator replaying dead letters during an incident would type it per message.
+STEP_UP_ACTION_MESSAGE_RESEND = "message_resend"
+STEP_UP_ACTION_MESSAGE_EDIT_RESEND = "message_edit_resend"
+STEP_UP_ACTION_UPLOAD_RESEND = "upload_resend"
+STEP_UP_ACTION_MESSAGE_EXPORT = "message_export"
+STEP_UP_ACTION_CONNECTION_PURGE = "connection_purge"
+STEP_UP_ACTION_CONFIG_RELOAD = "config_reload"
 
 #: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
 #: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
@@ -6951,20 +6951,17 @@ class AuthService:
         on. The log line is then the only record of that row. A per-revocation audit write is not routed through here: that one
         still raises.
 
-        A defect is raised, not passed over (:data:`_AUDIT_WRITE_DEFECTS`).
+        A defect is raised, not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`).
         """
-        try:
-            await self._audit(action, actor="<reconciler>", detail=detail)
-        except _AUDIT_WRITE_DEFECTS:
-            raise
-        except _audit_write_errors():
-            _log.exception(
-                "directory reconcile: the %s audit row could not be written; the pass goes on, "
-                "so its alerts still fire",
-                action,
-            )
-            return False
-        return True
+        return await write_audit_soft(
+            lambda: self._audit(action, actor="<reconciler>", detail=detail),
+            log=_log,
+            message="directory reconcile: the %s audit row could not be written; the pass goes on, "
+            "so its alerts still fire",
+            args=(action,),
+            errors=_audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
 
     async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> bool:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
@@ -8478,6 +8475,19 @@ class AuthService:
         if action in _REFUNDABLE_ACTIONS:
             _SPENT_REFUNDABLE_GRANT.set((id(self), key, deadline))
         return True
+
+    async def holds_action_step_up(self, token: str | None, action: str) -> bool:
+        """Whether the caller holds a live grant bound to ``action``, WITHOUT spending it.
+
+        For a web console page that opens an action rather than performing it (vault BACKLOG
+        #2625): the message editor asks for the proof before the operator types an edit, because a
+        re-auth demanded at submit time re-opens the editor and drops the edit. Only
+        :meth:`has_action_step_up` spends a grant, so this never authorizes the action itself, and
+        it leaves the refund record alone."""
+        if not token:
+            return False
+        deadline = self._action_step_up_grants.get((hash_token(token), action))
+        return deadline is not None and deadline > time.monotonic()
 
     def refund_action_step_up(self, action: str) -> bool:
         """Give back the step-up grant THIS REQUEST spent on ``action``, when the route it opened
@@ -10493,22 +10503,22 @@ class AuthService:
                 detail["user_id"] = user_id
             if roles is not None:
                 detail["roles"] = list(roles)
-            try:
-                await self._audit(
+            # The refusal below is the answer either way, and the traceback says why the row is
+            # missing. ``defects=()``: a defect raised here would replace the refusal, so the route
+            # would answer 500 and keep the spent step-up grant (vault BACKLOG #2260).
+            await write_audit_soft(
+                lambda: self._audit(
                     CREDENTIAL_ISSUE_REFUSED_ACTION,
                     actor=actor,
                     detail=_json(detail),
                     client=client,
-                )
-            except _audit_write_errors():
-                # A store refusal only: a bug in the call above still raises. The refusal below is
-                # the answer either way, and the traceback says why the row is missing.
-                _log.exception(
-                    "could not write the %s audit row for a refused %s by %s",
-                    CREDENTIAL_ISSUE_REFUSED_ACTION,
-                    op,
-                    actor,
-                )
+                ),
+                log=_log,
+                message="could not write the %s audit row for a refused %s by %s",
+                args=(CREDENTIAL_ISSUE_REFUSED_ACTION, op, actor),
+                errors=_audit_write_errors(),
+                defects=(),
+            )
             raise
 
     async def create_local_user(
@@ -11543,9 +11553,9 @@ class AuthService:
         """Write the :data:`CHANNEL_SCOPE_CHANGE_REFUSED_ACTION` row for a refused
         :meth:`set_channel_scope` (BACKLOG #2271). A store that refuses the row is logged at ERROR and
         the refusal still stands, so the caller gets its 409 rather than a 500. A defect is raised,
-        not passed over (:data:`_AUDIT_WRITE_DEFECTS`)."""
-        try:
-            await self._audit(
+        not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`)."""
+        await write_audit_soft(
+            lambda: self._audit(
                 CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
                 actor=actor,
                 detail=_json(
@@ -11558,15 +11568,13 @@ class AuthService:
                         "owner": _effective_scope_source(user),
                     }
                 ),
-            )
-        except _AUDIT_WRITE_DEFECTS:
-            raise
-        except _audit_write_errors():
-            _log.exception(
-                "could not write the %s audit row for a refused save by %s",
-                CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
-                actor,
-            )
+            ),
+            log=_log,
+            message="could not write the %s audit row for a refused save by %s",
+            args=(CHANNEL_SCOPE_CHANGE_REFUSED_ACTION, actor),
+            errors=_audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
 
     async def is_last_enabled_admin(self, user_id: str) -> bool:
         """True iff ``user_id`` is an enabled administrator and the only one remaining.

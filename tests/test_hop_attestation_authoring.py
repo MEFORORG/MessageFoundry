@@ -304,7 +304,7 @@ def test_the_check_line_lists_every_attested_hop(tmp_path: Path) -> None:
     )
     result = _check_hop_attested(tmp_path)
     assert result.ok and not result.required
-    assert f"OB ({REASON})" in result.detail
+    assert f'OB ("{REASON}")' in result.detail
 
     (tmp_path / "ob.py").write_text(
         'from messagefoundry import Tcp, outbound\noutbound("OB", Tcp(host="10.0.0.5", port=5000))\n',

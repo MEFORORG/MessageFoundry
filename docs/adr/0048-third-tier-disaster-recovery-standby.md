@@ -233,8 +233,8 @@ in-flight rows stranded.
 > backing off via the retry policy as the bullet above says. That retry path charged each row a failed attempt,
 > so a finite `max_attempts` dead-lettered rows only for being parked. A release's drain leaves held rows out,
 > and the `dr.release` row records `drained` and `held_on_parked_outbounds`. A box built passive
-> still binds its whole graph, every tier, before activation. That contradicts this ADR's load-balancer fence,
-> which relies on a passive box binding no high-priority listener, and the gap is a recorded defect.
+> then still bound its whole graph, every tier, before activation, against this ADR's load-balancer
+> fence. The amendment for vault BACKLOG #3140, below, closes that.
 >
 > **Decision 1: the activation re-applies the graph the engine is running, not a config dir.** It used to
 > reload the config dir from disk. That put live any bytes edited there since the last approved reload, with
@@ -269,6 +269,19 @@ in-flight rows stranded.
 > A purge of a parked lane is allowed, since the lane is paused and nothing is in flight. For an INBOUND, an
 > operator start still overrides the profile, as `tests/test_connection_scheduler.py` pins. An alert
 > rule's restart of a parked inbound does nothing.
+
+> **Amendment (vault BACKLOG #3140): a passive DR box binds no inbound listener.** A box with
+> `[dr].enabled = true` that is not activated, at start or after `POST /dr/release`, binds no inbound
+> listener of any tier, and each reads `status: "filtered"`. The VIP fence below needs it: the load balancer
+> moves the VIP to the node that answers, so a passive box must answer on nothing. AC-11 already leaves a
+> released box with no listener bound, and this keeps that state across a reload until an activation. A
+> release parks intake before its drain, so no engine door binds a listener while the drain runs. The ADR
+> says nothing of a passive box's outbounds, so they are built as before. A lane the profile parked still
+> comes up on the first reload after a release, as Decision 3 says. The reload and dry-run checks judge the
+> listeners an activation would bind. So a config that activation would refuse is refused before the
+> disaster. An operator start of an inbound still overrides the passive park, as Decision 3 says of the
+> profile, until the next reload or its schedule window's close. An alert rule's restart and the scheduler
+> bind nothing.
 
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 

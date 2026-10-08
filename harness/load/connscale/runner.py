@@ -1224,8 +1224,8 @@ async def _time_reload(poller: EnginePoller) -> tuple[float | None, bool]:
     client = poller.client
     if client is None:
         return None, True
-    # Before the timer starts: the reload route wants a credential proved within the last few
-    # minutes, and proving it inside the timed call would charge a sign-in to the reload.
+    # Before the timer starts: the reload route wants a proof bound to it (vault BACKLOG #2625),
+    # and proving it inside the timed call would charge a re-authentication to the reload.
     await poller.prove_sign_in()
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, time_reload_outcome, client, None)

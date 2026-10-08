@@ -219,9 +219,14 @@ def uploaded_log_detail(
     message_type: str = "",
     control_id: str = "",
     error: str = "",
+    can_resend: bool = True,
 ) -> Markup:
     """Browse one uploaded file's split messages (metadata only), with a per-file resend form (inject a
-    message into a chosen inbound) and a link to the guarded delete."""
+    message into a chosen inbound) and a link to the guarded delete.
+
+    ``can_resend`` is False for a viewer without ``messages:edit``, which a resend needs beside
+    ``files:browse`` (vault BACKLOG #2625). The form is replaced by a sentence saying so, rather
+    than offered and then refused at its confirm page."""
     file_id = result.file_id
     rows = [[m.index, m.message_type, m.control_id, _human_size(m.size)] for m in result.messages]
     note = f"{result.matched} of {result.total_messages} message(s)" + (
@@ -283,7 +288,14 @@ def uploaded_log_detail(
             el("p", text(note), class_="pager"),
             rows_table(["#", "Type", "Control ID", "Size"], rows),
             el("h2", "Resend a message"),
-            resend,
+            resend
+            if can_resend
+            else el(
+                "p",
+                "Resending a message from this file also needs the messages:edit permission, "
+                "which your account does not hold.",
+                class_="muted",
+            ),
             el(
                 "p",
                 el(

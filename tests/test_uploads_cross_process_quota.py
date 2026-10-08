@@ -35,10 +35,14 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 
+from messagefoundry import uploads as uploads_mod
+from messagefoundry.store.base import UPLOAD_RESERVATION_STALE_AFTER
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from messagefoundry.uploads import UploadedFileMeta, UploadQuotaError, UploadStore
@@ -205,8 +209,8 @@ def test_the_reservation_is_released_so_the_next_upload_is_not_locked_out(tmp_pa
 
 def test_a_leaked_reservation_is_reclaimed_once_it_goes_stale(tmp_path: Path) -> None:
     """A process killed between reserve and release leaks its reservation. It must not consume the
-    uploader's budget forever: a reservation that has been continuously outstanding for longer than
-    ``stale_after`` is reset on the next reserve."""
+    uploader's budget forever: a row with no activity for longer than ``stale_after`` is reset on
+    the next reserve."""
 
     async def _run() -> None:
         store = await MessageStore.open(tmp_path / "engine.db")
@@ -232,6 +236,131 @@ def test_a_leaked_reservation_is_reclaimed_once_it_goes_stale(tmp_path: Path) ->
             await store.close()
 
     asyncio.run(_run())
+
+
+@asynccontextmanager
+async def _a_save_held_mid_write(
+    tmp_path: Path,
+) -> AsyncIterator[tuple[MessageStore, UploadStore, asyncio.Future[UploadedFileMeta]]]:
+    """Shard A: a save over a fresh store, held inside its write with its reservation taken. On
+    exit the write is released, the save settles, and its heartbeat is given time to end before
+    the store closes, so a test failure never strands a cancel-resistant write thread."""
+    store = await MessageStore.open(tmp_path / "engine.db")
+    try:
+        uploads = UploadStore(
+            tmp_path / "uploads",
+            make_cipher(generate_key()),
+            max_bytes=4096,
+            max_files_per_user=1,
+            store=store,
+        )
+        entered, gate = threading.Event(), threading.Event()
+        real_encrypt = uploads._encrypt_blob
+
+        def _held(data: bytes, file_id: str) -> str:
+            entered.set()
+            gate.wait(timeout=30)
+            return real_encrypt(data, file_id)
+
+        uploads._encrypt_blob = _held  # type: ignore[method-assign]
+        save = asyncio.ensure_future(
+            uploads.save(data=b"slow\n", filename="a.txt", uploader="alice", uploader_id="u-alice")
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
+            yield store, uploads, save
+        finally:
+            gate.set()
+            await asyncio.gather(save, return_exceptions=True)
+            if uploads._heartbeats:
+                await asyncio.wait(set(uploads._heartbeats), timeout=10)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(("heartbeat", "reclaimed"), [(0.05, False), (3600.0, True)])
+def test_a_slow_save_keeps_its_slot_past_the_staleness_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heartbeat: float, reclaimed: bool
+) -> None:
+    """BACKLOG #2648. Shard A's save is held mid-write for twice the staleness window, and then a
+    sibling shard reserves against a budget of one file. With the heartbeat the sibling sees A's
+    slot and is refused. The 3600 s arm is the control: no touch lands in time, the store reclaims
+    A's live slot, and the sibling's reserve applies, which is the double-book this closes."""
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", heartbeat)
+
+    async def _run() -> bool:
+        async with _a_save_held_mid_write(tmp_path) as (store, uploads, save):
+            await asyncio.sleep(0.6)
+            applied = await store.reserve_upload_quota(
+                "u-alice", files=1, size_bytes=5, max_files=1, max_total_bytes=4096, stale_after=0.3
+            )
+        assert isinstance(save.result(), UploadedFileMeta)
+        assert not uploads._heartbeats, "the heartbeat outlived its save"
+        return applied
+
+    assert asyncio.run(_run()) is reclaimed
+
+
+def test_the_heartbeat_stops_at_its_lifetime_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A save whose write never finishes must not pin the row for as long as the process lives.
+    Past the cap the heartbeat stops with a WARNING, while the save is still held mid-write."""
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_MAX_SECONDS", 0.1)
+
+    async def _run() -> None:
+        async with _a_save_held_mid_write(tmp_path) as (_store, uploads, save):
+            for _ in range(500):
+                if "no longer refreshed" in caplog.text:
+                    break
+                await asyncio.sleep(0.02)
+            assert "no longer refreshed" in caplog.text, "the heartbeat ran past its cap"
+            await asyncio.sleep(0.05)  # the task leaves the set on its done callback
+            assert not uploads._heartbeats
+            assert not save.done()
+
+    with caplog.at_level("WARNING", logger=uploads_mod._log.name):
+        asyncio.run(_run())
+
+
+def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:
+    """BACKLOG #2648. ``since`` is stamped from each writer's own clock. A shard whose clock lags
+    must not age a row a sibling keeps fresh, or the sibling's next reserve reclaims live slots.
+    The row is stamped an hour ahead to stand in for the sibling; a reserve, a release and a touch
+    from this host must all leave that stamp where it is."""
+
+    async def _run() -> None:
+        store = await MessageStore.open(tmp_path / "engine.db")
+        try:
+            assert await store.reserve_upload_quota(
+                "u-alice", files=1, size_bytes=10, max_files=5, max_total_bytes=100
+            )
+            ahead = time.time() + 3600.0
+            await store._db.execute(
+                "UPDATE upload_quota SET since = ? WHERE uploader_id = ?", (ahead, "u-alice")
+            )
+            await store._db.commit()
+            assert await store.reserve_upload_quota(
+                "u-alice", files=1, size_bytes=10, max_files=5, max_total_bytes=100
+            )
+            await store.reserve_upload_quota("u-alice", files=-1, size_bytes=-10)
+            await store.reserve_upload_quota("u-alice", files=0, size_bytes=0)
+            cur = await store._db.execute(
+                "SELECT since FROM upload_quota WHERE uploader_id = ?", ("u-alice",)
+            )
+            row = await cur.fetchone()
+            assert row is not None and float(row[0]) == ahead
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_the_heartbeat_fits_three_times_inside_the_staleness_window() -> None:
+    """The heartbeat interval is written out in ``uploads`` to keep that module a leaf. Pin it to
+    the store's window, so a change to either cannot leave a live save reclaimable."""
+    assert uploads_mod._RESERVATION_HEARTBEAT_SECONDS * 3 <= UPLOAD_RESERVATION_STALE_AFTER
 
 
 def test_an_unbound_upload_store_still_enforces_the_in_process_budget(tmp_path: Path) -> None:

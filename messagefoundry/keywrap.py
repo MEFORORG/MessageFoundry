@@ -33,7 +33,9 @@ does not list (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not t
 encrypted; only a bundle with clear bags and no MAC at all derives nothing from a password, and it
 passes. SSH keys cannot reach an approved derivation at all,
 so the SFTP connector refuses an encrypted one outright (:func:`ssh_key_encrypted`). A database
-driver's own client key (libpq ``sslkey``) is checked as a key file before the driver opens it.
+driver's own client key is checked as a key file before the driver opens it, when ``odbc_params``
+names it with ``sslkey`` and the driver reads that keyword. A key the driver finds by itself is not
+checked, which on psqlODBC is every client key (BACKLOG #2423).
 
 What this does NOT check, so a reader does not assume it: the content cipher inside PBES2 (that is a
 cipher question, not a derivation one), the inside of a PKCS#12 part that is itself encrypted
@@ -474,6 +476,16 @@ _REEXPORT: Final = (
     "unencrypted or approved-wrap PKCS#8 key as PEM files"
 )
 
+#: The remedy for a MAC refused over clear bags (BACKLOG #2456). Such a bundle has one more route,
+#: no MAC at all, and the text says what that route gives up: a file with no MAC has no integrity
+#: check, the same as a PEM key file.
+_CLEAR_BAG_REMEDY: Final = (
+    f"The MAC rule applies even though no bag is encrypted. {_REEXPORT}. Or drop the MAC: openssl "
+    "pkcs12 -export -keypbe NONE -certpbe NONE -nomac -in <cert> -inkey <key> -out <new pfx>. "
+    "A bundle with no MAC has no integrity "
+    "check, so nothing detects a change to the file, as with a PEM key"
+)
+
 
 def _mac_problem(buf: bytes, mac_data: _Tlv) -> str | None:
     """Why a PKCS#12 MacData is refused, or ``None`` for an approved PBMAC1 one.
@@ -572,9 +584,11 @@ def _bags_problem(buf: bytes, safe_contents: _Tlv, depth: int) -> tuple[bool, st
     return encrypted, None
 
 
-def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
-    """``(needs_passphrase, problem)`` for a PKCS#12 bundle: every bag and encrypted part, then its
-    MAC. A bundle needs a passphrase when anything in it is encrypted or it carries a MAC.
+def _pfx_problem(der: bytes) -> tuple[bool, str | None, str]:
+    """``(needs_passphrase, problem, remedy)`` for a PKCS#12 bundle: every bag and encrypted part,
+    then its MAC. A bundle needs a passphrase when anything in it is encrypted or it carries a MAC.
+    ``remedy`` is what the refusal tells the operator to do; it is kept apart from ``problem`` so
+    the text says what is wrong before it says what to do (BACKLOG #2456).
 
     The bundle must be DER this reader can walk. ``cryptography`` falls back to BER, so a BER
     bundle loads there; here it is refused as unreadable rather than passed unchecked."""
@@ -586,7 +600,11 @@ def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
         raise _Malformed
     content_type, content = _content_info(der, parts[1])
     if content_type != _PKCS7_DATA:
-        return True, "is a PKCS#12 bundle protected in a way this engine does not recognise"
+        return (
+            True,
+            "is a PKCS#12 bundle protected in a way this engine does not recognise",
+            _REEXPORT,
+        )
     encrypted = False
     for info in _children(der, _octet_body(der, content)):
         info_type, info_value = _content_info(der, info)
@@ -605,9 +623,9 @@ def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
             if problem is not None:
                 problem = f"has an encrypted part that {problem}"
         else:
-            return True, "holds a PKCS#12 part this engine does not recognise"
+            return True, "holds a PKCS#12 part this engine does not recognise", _REEXPORT
         if problem is not None:
-            return True, problem
+            return True, problem, _REEXPORT
     # A MAC is judged whether or not any bag is encrypted (BACKLOG #1352). To verify it, the loader
     # derives a key from the passphrase and runs the MAC's hash. A PKCS#12-KDF MAC therefore runs a
     # derivation Appendix C does not list, and an MD5 or SHA-1 one runs a disallowed hash. That is
@@ -615,19 +633,17 @@ def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
     # A clear bundle with NO MAC passes. Nothing in it derives a key from a password, just as with
     # an unencrypted PEM key. An encrypted bundle without a MAC is refused.
     if len(parts) == 3:
-        problem = _mac_problem(der, parts[2])
-        if problem is not None and not encrypted:
-            problem = problem.rstrip(".") + (
-                ". The MAC rule applies even though no bag is encrypted. Such a bundle passes with "
-                "a PBMAC1 MAC at the floor, or with no MAC (openssl pkcs12 -export -keypbe NONE "
-                "-certpbe NONE -nomac)"
-            )
+        try:
+            problem = _mac_problem(der, parts[2])
+        except _Malformed:
+            # The bags read, so say it is the MAC this engine cannot read (BACKLOG #2456).
+            problem = "carries a MAC this engine cannot read to check"
         # A MAC is keyed by the passphrase, so a bundle that carries one needs it, like an
         # encrypted one does.
-        return True, problem
+        return True, problem, _REEXPORT if encrypted else _CLEAR_BAG_REMEDY
     if encrypted:
-        return True, "carries no MAC; an encrypted bundle needs a PBMAC1 MAC"
-    return False, None
+        return True, "carries no MAC; an encrypted bundle needs a PBMAC1 MAC", _REEXPORT
+    return False, None, _REEXPORT
 
 
 def pkcs12_wrap_refusal(
@@ -652,15 +668,20 @@ def pkcs12_wrap_refusal(
             "wrap; a certificate bundle is a few kilobytes, so check the path"
         )
     problem: str | None = "is a PKCS#12 bundle this engine cannot read to check its wrap"
-    needs_passphrase = True
+    needs_passphrase, remedy = True, _REEXPORT
     with contextlib.suppress(_Malformed):
-        needs_passphrase, problem = _pfx_problem(pfx)
+        needs_passphrase, problem, remedy = _pfx_problem(pfx)
     if problem is not None:
-        return f"{setting}: the bundle {problem}. It is refused. {_REEXPORT}"
+        return f"{setting}: the bundle {problem}. It is refused. {remedy}"
     if needs_passphrase and not passphrase_given:
+        # An empty passphrase is a passphrase: a caller that can tell it from an unset one passes
+        # passphrase_given=True for it, and the bundle has already met every floor above.
         return (
             f"{setting}: the bundle is encrypted or carries a MAC, and no passphrase is configured "
-            f"for it. It is refused before any library can try to open it. Set {unlock_setting}"
+            f"for it. It is refused before any library can try to open it. Set {unlock_setting}. "
+            f"If the bundle's passphrase is empty, set {unlock_setting} to the empty string. "
+            "PowerShell and cmd cannot set an empty variable, so from those, re-export the bundle "
+            "with a passphrase"
         )
     return None
 

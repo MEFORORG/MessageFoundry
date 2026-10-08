@@ -328,12 +328,29 @@ from typing import Any
 #: that failed to import (BACKLOG #1907), before any digest check runs. The digest records the
 #: alias's values, not its name, so renaming it alone would not move the digest.
 #:
+#: Vault BACKLOG #2625: ``AuthService`` gained ``holds_action_step_up``, which the console's
+#: message editor calls to ask for an action-bound proof without spending it, and the console imports
+#: five new step-up action constants, for the resend, edit-resend, upload-resend, purge and reload
+#: lanes (export has no console route). A method the console calls, so a skew would be an
+#: AttributeError at request time; it forces a bump. Unnumbered, as above. Re-derived on the tree
+#: merged with vault BACKLOG #3062 (``AuthService.enabled`` removed), which moved the digest on its
+#: own; the value below covers both changes. ``CoreHandlers`` then gained the REQUIRED
+#: ``prior_resend``, the read-only repeat lookup the resend and edit-resend routes ask before they
+#: demand a proof. The engine builds ``CoreHandlers``, so a console that calls it against an engine
+#: without it would raise AttributeError at request time; the pinned digest refuses the pair at
+#: mount first. Re-derived again on the tree merged with the #2460 / #2458 change above, so the value
+#: below covers #3062, #2460 / #2458 and #2625 together.
+#:
+#: BACKLOG #2438 / #2446 merged with #2625: the audit paging and export surface above and the
+#: action-bound step-up surface each moved the digest on its own branch. The value below was
+#: re-derived on the merged tree, so it covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1c42b766969ab80a"
+ENGINE_UI_SEAM: str = "71a8eb514b48d64e"
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,12 +387,18 @@ class CoreHandlers:
     restart_connection: Callable[..., Awaitable[Any]]
     replay_message: Callable[..., Awaitable[Any]]
     # Resend a stored body to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500). Its JSON
-    # gate is require_step_up(MESSAGES_RESEND) and NOTHING more: the handler returns ids only and
-    # never a body, so the /ui route in front of it asserts that one permission and passes no
-    # ``phi=``. Copying the edit verbs' MESSAGES_VIEW_RAW + phi=True here would charge the PHI
-    # budget for a route that emits none, and would lock out a role narrowed to resend alone.
+    # gate is require_step_up_action(message_resend, MESSAGES_RESEND) and NOTHING more: the handler
+    # returns ids only and never a body, so the /ui route in front of it asserts that one permission
+    # with the same bound proof and passes no ``phi=``. Copying the edit verbs' MESSAGES_VIEW_RAW +
+    # phi=True here would charge the PHI budget for a route that emits none, and would lock out a
+    # role narrowed to resend alone. Vault BACKLOG #2625 bound the proof on this handler and on
+    # ``edit_resend_message``, ``resend_uploaded_message``, ``purge_connection`` and
+    # ``reload_config``; each /ui route in front of one re-asserts the same action.
     resend_message: Callable[..., Awaitable[Any]]
     edit_resend_message: Callable[..., Awaitable[Any]]  # edit-and-resubmit (ADR 0090 §9, seam v2)
+    # Vault BACKLOG #2625: whether a resend or edit-and-resubmit key repeats a request that
+    # already ran. Read-only. The console asks it before it demands a step-up proof.
+    prior_resend: Callable[..., Awaitable[Any]]
     replay_dead_letters: Callable[..., Awaitable[Any]]
     list_active_alerts: Callable[..., Awaitable[Any]]
     alerts_rules: Callable[..., Awaitable[Any]]

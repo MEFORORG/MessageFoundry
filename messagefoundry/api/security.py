@@ -1388,7 +1388,7 @@ async def _action_step_up_ok(auth: AuthService, token: str | None, action: str) 
 
 
 def require_step_up_action(
-    action: str, *permissions: Permission
+    action: str, *permissions: Permission, proof_in_route: bool = False
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_step_up`, but the step-up must be a fresh proof **bound to** ``action``
     (single-use), not the shared session window (ADR 0077; ASVS 7.5.1 / 8.2.4). Keeps the MFA gate —
@@ -1398,7 +1398,15 @@ def require_step_up_action(
     On a stale/missing grant it 403s with ``X-Step-Up-Required`` **and** ``X-Step-Up-Action: <action>``,
     so the console echoes the action back as ``POST /me/reauth {"purpose": …}``. An ``oidc`` session
     is told the IdP leg instead (:func:`_step_up_refusal`). When the org opts out it falls back to
-    the legacy session-window behaviour."""
+    the legacy session-window behaviour.
+
+    ``proof_in_route=True`` moves the step-up decision into the route. The route must call
+    :func:`spend_step_up_action` before it holds or runs anything. The rest still runs here. That
+    is at least the permissions, pacing, the MFA gate, the new-address check and the
+    factor-binding refusal. Purge and reload use it (vault BACKLOG #2625). A repeat that only
+    rejoins the requester's open dual-control hold then needs a live session window
+    (:func:`step_up_window_live`), and no new proof. ``tests/test_bound_step_up_hold_rejoin.py``
+    pins what each such route may do before its spend."""
     base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
@@ -1429,11 +1437,46 @@ def require_step_up_action(
             # `new_ip` is checked first so a short-circuit leaves the single-use grant UNCONSUMED on a
             # forced-step-up (the grant is only popped when we actually reach the action check).
             new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-            if new_ip or not await _action_step_up_ok(auth, token, action):
+            if proof_in_route:
+                # Every check but the step-up itself. The factor-binding refusal is the one
+                # _action_step_up_ok runs above its fork; it pops nothing, so it can run here as
+                # well as at the spend.
+                if new_ip or await auth.factor_binding_is_blocked(token, action):
+                    raise await _step_up_refusal(auth, token, action)
+            elif new_ip or not await _action_step_up_ok(auth, token, action):
                 raise await _step_up_refusal(auth, token, action)
         return identity
 
     return _gate(dependency, _authentication_of(base))
+
+
+async def spend_step_up_action(request: Request, action: str) -> None:
+    """The proof half of ``require_step_up_action(action, ..., proof_in_route=True)``.
+
+    Spends the caller's single-use grant for ``action``, or reads the session window when the org
+    opted out, and refuses as the dependency would: 403 with ``X-Step-Up-Action``. A route calls it
+    before it holds or runs anything. A refusal the route makes after the spend, such as a 404 or
+    a 409, still costs the proof. With no auth service attached it does nothing, as the dependency
+    does."""
+    auth = get_auth(request)
+    if auth is None:
+        return
+    token = bearer_token(request)
+    if not await _action_step_up_ok(auth, token, action):
+        raise await _step_up_refusal(auth, token, action)
+
+
+async def step_up_window_live(request: Request) -> bool:
+    """Whether the caller's session window is live, read without spending anything.
+
+    Purge and reload ask it before a repeat may rejoin its open hold with no proof (vault BACKLOG
+    #2625). So a proof-free repeat needs what the org opt-out asks of every request, and a session
+    whose window has lapsed goes to the proof instead. True with no auth service attached, as the
+    dependency then checks nothing."""
+    auth = get_auth(request)
+    if auth is None:
+        return True
+    return await auth.has_recent_step_up(bearer_token(request))
 
 
 def require_reauth_only_action(

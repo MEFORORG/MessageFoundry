@@ -96,7 +96,12 @@ CRITICAL_SECRETS: dict[str, str] = {
     "http_auth_password": "HTTP Digest password",
     "tls_key_password": "connector TLS key passphrase (MLLP/DICOM/FTPS)",
     "client_key_password": "SOAP mTLS client-key passphrase",
-    "key_password": "SFTP SSH private-key passphrase (remote-file)",
+    # The SFTP connector refuses any `key_password` (BACKLOG #1352), so no value of it can be rotated.
+    # It stays registered because wiring._SECRET_SETTING_KEYS keeps it, so a value given anyway is
+    # still redacted, and the gate below requires every member that is not a username to be here.
+    # Moving it to _NON_ROTATABLE_SECRET_SETTING_KEYS is not open: that set is pinned to the username
+    # class by tests/test_log_redaction_secret_domain.py (BACKLOG #2423).
+    "key_password": "SFTP key passphrase -- refused at construction, so nothing to rotate",
     "signing_key_password": "DIRECT S/MIME signing-key passphrase (ADR 0085)",
     "private_key": "per-message JWS signing key — PEM material (ADR 0018)",
     "private_key_password": "per-message JWS signing-key passphrase (ADR 0018)",

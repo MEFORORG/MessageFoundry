@@ -18,13 +18,19 @@ the code meets them.
   Comments and processing instructions never reach the tree.
 - When the parser cannot reach a document's root, :func:`_first_element_name` finds it by scanning the
   bytes, skipping comments, processing instructions and declarations. So an SVG cannot escape the
-  sanitizer by making the parser fail first, and an HTML page that merely embeds an ``<svg>`` is not
-  mistaken for one.
+  sanitizer by making the parser fail first.
+- Markup whose root is not ``svg`` but which carries an SVG element anywhere, such as XHTML or an HTML
+  page with an inline ``<svg>``, is refused rather than rewritten (BACKLOG #2391). Rewriting would
+  change the parts that are not SVG, and those are verbatim clinical content.
+- A gzip body, which is what an SVGZ file is, is inflated under the same size bound and vetted like
+  plain bytes. A sanitized SVG inside is served gzipped again (BACKLOG #2391).
 """
 
 from __future__ import annotations
 
+import gzip
 import re
+import zlib
 from typing import Final
 from xml.etree.ElementTree import (  # nosec B405 -- types only; every parse goes through defusedxml
     Element,
@@ -54,6 +60,68 @@ _FIRST_CONTENT_BYTE_RE: Final = re.compile(rb"[^ \t\r\n\x0b\x0c\x00\xef\xbb\xbf\
 #: An element name after ``<``: every byte up to whitespace, ``/`` or ``>``. Bytes rather than a word
 #: class, so a prefix in any encoding compatible with ASCII is taken whole.
 _ELEMENT_NAME_RE: Final = re.compile(rb"[^\s/>]*")
+#: The two leading bytes of every gzip member (RFC 1952). An SVGZ file is a gzipped SVG.
+_GZIP_MAGIC: Final = b"\x1f\x8b"
+#: The most gzip members one body may hold. Each member after the first costs a copy of what remains,
+#: so an unbounded count of tiny members would cost quadratic time.
+_MAX_GZIP_MEMBERS: Final = 16
+#: How much of a gzip body is inflated first, to clear one that is plainly not markup cheaply.
+_GZIP_SNIFF_BYTES: Final = 64 * 1024
+#: Traces of SVG in markup the parser could not read through: an ``svg`` start tag under any prefix
+#: and in any case, the SVG namespace name, or a namespace name spelled with a reference, which can
+#: hide it. Possessive quantifiers, and name classes that exclude ``<`` and ``:``, keep the scan
+#: linear: no run is scanned from more than one start.
+#: The first alternative alone is :data:`_SVG_TAG_RE`: what an HTML parser makes an SVG element
+#: from.
+_SVG_TAG_RE: Final = re.compile(rb"<(?:[^\s/<>!?:&]*+:)?svg(?![^\s/>])", re.IGNORECASE)
+_SVG_TRACE_RE: Final = re.compile(
+    rb"<(?:[^\s/<>!?:&]*+:)?svg(?![^\s/>])"
+    rb"|http://www\.w3\.org/2000/svg"
+    rb"|xmlns(?::[^\s=<>:]*+)?\s*+=\s*+(?:[\"'][^\"'<&]*+)?&(?!(?:quot|apos|amp|lt|gt);)",
+    re.IGNORECASE,
+)
+#: An internal entity could build an SVG element out of bytes the scan above cannot read, since any
+#: byte of a name or a namespace can be a reference. Checked only when the document declares an
+#: entity, since an HTML report may well write ``&#60;`` as text.
+_ENTITY_DECL_RE: Final = re.compile(rb"<!ENTITY", re.IGNORECASE)
+_ENTITY_MARKUP_RE: Final = re.compile(rb"&#0*+60;|&#x0*+3c;|<[^\s/<>!?&]*+&", re.IGNORECASE)
+#: One entity declaration: group 1 is ``%`` for a parameter entity, and group 2 or 3 its quoted value.
+#: The class before the value excludes ``<``, so no run is scanned from two declarations.
+_ENTITY_VALUE_RE: Final = re.compile(
+    rb"<!ENTITY\s++(%?)[^\"'<>]*+(?:\"([^\"]*+)\"|'([^']*+)')", re.IGNORECASE
+)
+#: A reference in an entity value that yields ``<`` or ``&``, from which markup can be built in a
+#: later step.
+_LT_OR_AMP_REF_RE: Final = re.compile(rb"&#0*+(?:60|38);|&#x0*+(?:3c|26);", re.IGNORECASE)
+#: An attribute-list declaration. Its defaults reach every element it names, ``xmlns`` included, with
+#: no ``xmlns=`` written on the element and with the value spelled through references, so the byte
+#: scan cannot rule one out.
+_ATTLIST_DECL_RE: Final = re.compile(rb"<!ATTLIST", re.IGNORECASE)
+#: The escape byte that switches ISO-2022-JP between character sets. ``ESC ( B`` decodes to nothing,
+#: so ``<s ESC ( B vg`` reads as ``<svg`` to a browser while no byte scan sees it. That is the one
+#: stateful encoding a browser decodes; every other one it supports keeps ASCII bytes as ASCII, or
+#: is UTF-16 or UTF-32, which the scans read after removing NUL bytes. Markup holding it is not
+#: well-formed XML, so it reaches only the byte scans, which refuse it.
+_ESC: Final = b"\x1b"
+#: The most steps the root scan may take: one per comment, processing instruction, declaration, quote
+#: or bracket. A real prolog takes a few dozen. Past this the scan stops and the document is treated
+#: as SVG, so it is refused rather than served unread.
+_MAX_ROOT_SCAN_STEPS: Final = 100_000
+#: What the declaration scan stops at: a quote, a bracket of the internal subset, the closing ``>``,
+#: or a comment. Everything between is skipped by the regex engine, not byte by byte.
+_DECL_TOKEN_RE: Final = re.compile(rb"[\"'\[\]>]|<!--")
+
+
+def _entity_may_build_markup(data: bytes) -> bool:
+    """Whether any internal entity in ``data`` could expand to markup. Only a value holding ``<``,
+    directly or through a reference, can make an element, and a parameter entity can assemble one
+    from parts, so either is enough. A text-only entity such as ``&#160;`` is not."""
+    for match in _ENTITY_VALUE_RE.finditer(data):
+        value = match.group(2) or match.group(3) or b""
+        if match.group(1) or b"<" in value or _LT_OR_AMP_REF_RE.search(value):
+            return True
+    return False
+
 
 #: SVG drawing elements that carry no script, no navigation and no external fetch of their own.
 _ALLOWED_ELEMENTS: Final = frozenset(
@@ -155,6 +223,24 @@ class _RootTarget:
         raise _RootFound(tag)
 
 
+class _SvgFound(Exception):
+    """Raised from :class:`_SvgFinder` at the first SVG element."""
+
+
+class _SvgFinder:
+    """A parser target that stops the parse at the first element in the SVG namespace, or named
+    ``svg`` in any namespace or none. It builds no tree, so its memory does not grow with the
+    document."""
+
+    def start(self, tag: str, attrib: dict[str, str]) -> None:
+        ns, local = _split(tag)
+        if ns == SVG_NS or local.casefold() == "svg":
+            raise _SvgFound
+
+    def close(self) -> None:
+        return None
+
+
 def _split(tag: str) -> tuple[str, str]:
     """``{ns}local`` as ``(ns, local)``; an unqualified name has the empty namespace."""
     if tag.startswith("{"):
@@ -169,41 +255,62 @@ def _is_markup(body: bytes) -> bool:
     return first is not None and first.group() == b"<"
 
 
-def _skip_declaration(data: bytes, i: int) -> int:
+class _ScanBudget:
+    """The steps left to the root scan. :meth:`spend` raises :class:`_ScanExhausted` when none are."""
+
+    def __init__(self, steps: int) -> None:
+        self.steps = steps
+
+    def spend(self) -> None:
+        self.steps -= 1
+        if self.steps < 0:
+            raise _ScanExhausted
+
+
+class _ScanExhausted(Exception):
+    """The root scan ran out of steps before it found the root."""
+
+
+def _skip_declaration(data: bytes, i: int, budget: _ScanBudget) -> int:
     """The index just past the ``<!...>`` declaration starting at ``i``, or -1 if it never closes.
 
     Tracks quotes and the internal subset's brackets, and skips comments inside the subset, so a ``>``
-    or a quote inside an entity value or a comment does not end the declaration early."""
-    depth, quote, j, n = 0, 0, i + 2, len(data)
-    while j < n:
-        c = data[j]
-        if quote:
-            if c == quote:
-                quote = 0
-        elif c in b"\"'":
-            quote = c
-        elif data.startswith(b"<!--", j):
-            end = data.find(b"-->", j + 4)
+    or a quote inside an entity value or a comment does not end the declaration early. The regex
+    engine skips the bytes between those tokens, and each token costs one step of ``budget``."""
+    depth, j = 0, i + 2
+    while True:
+        budget.spend()
+        token = _DECL_TOKEN_RE.search(data, j)
+        if token is None:
+            return -1
+        found, j = token.group(), token.end()
+        if found in (b'"', b"'"):
+            end = data.find(found, j)
+            if end < 0:
+                return -1
+            j = end + 1
+        elif found == b"<!--":
+            end = data.find(b"-->", j)
             if end < 0:
                 return -1
             j = end + 3
-            continue
-        elif c == ord("["):
+        elif found == b"[":
             depth += 1
-        elif c == ord("]"):
+        elif found == b"]":
             depth -= 1
-        elif c == ord(">") and depth <= 0:
-            return j + 1
-        j += 1
-    return -1
+        elif depth <= 0:
+            return j
 
 
 def _first_element_name(data: bytes) -> bytes | None:
     """The first element name in ``data`` by a byte scan, or ``None`` if there is none.
 
-    Used only when the parser cannot reach the root. Linear: every step moves forward."""
+    Used only when the parser cannot reach the root. Linear: every step moves forward. Raises
+    :class:`_ScanExhausted` after :data:`_MAX_ROOT_SCAN_STEPS` steps."""
+    budget = _ScanBudget(_MAX_ROOT_SCAN_STEPS)
     i = 0
     while (i := data.find(b"<", i)) >= 0:
+        budget.spend()
         if data.startswith(b"<?", i):
             end = data.find(b"?>", i + 2)
             i = -1 if end < 0 else end + 2
@@ -211,7 +318,7 @@ def _first_element_name(data: bytes) -> bytes | None:
             end = data.find(b"-->", i + 4)
             i = -1 if end < 0 else end + 3
         elif data.startswith(b"<!", i):
-            i = _skip_declaration(data, i)
+            i = _skip_declaration(data, i, budget)
         else:
             match = _ELEMENT_NAME_RE.match(data, i + 1)
             return match.group() if match else b""
@@ -220,11 +327,19 @@ def _first_element_name(data: bytes) -> bytes | None:
     return None
 
 
+def _without_nul(body: bytes) -> bytes:
+    """``body`` less its NUL bytes, so the ASCII patterns see UTF-16 and UTF-32 text. Only a body
+    holding a NUL pays for the copy."""
+    return body.replace(b"\x00", b"") if b"\x00" in body else body
+
+
 def _root_is_svg(body: bytes) -> bool:
     """Whether the markup ``body`` is an SVG document, reading no further than its root start tag.
 
     When the parser cannot reach the root, :func:`_first_element_name` answers instead, since a
-    browser may still read the document as SVG. That fallback compares case-insensitively."""
+    browser may still read the document as SVG. That fallback compares case-insensitively. It
+    answers yes, so the document is refused, when it cannot read the bytes as a browser would: they
+    hold the ISO-2022-JP escape, or the scan runs out of steps."""
     parser = DefusedXMLParser(
         target=_RootTarget(), forbid_dtd=False, forbid_entities=True, forbid_external=True
     )
@@ -234,9 +349,128 @@ def _root_is_svg(body: bytes) -> bool:
         return _split(found.args[0])[1] == "svg"
     except (ParseError, DefusedXmlException, ValueError, LookupError):
         # ValueError and LookupError are pyexpat's answers to an encoding it does not support.
-        name = _first_element_name(body.replace(b"\x00", b""))
+        data = _without_nul(body)
+        if _ESC in data:
+            return True
+        try:
+            name = _first_element_name(data)
+        except _ScanExhausted:
+            return True
         return name is not None and name.rpartition(b":")[2].lower() == b"svg"
     return False
+
+
+def _contains_svg(body: bytes) -> bool:
+    """Whether the markup ``body`` holds an SVG element anywhere below a root that is not ``svg``.
+
+    The refusing parser reads the whole document when it can. When it stops, on an entity declaration,
+    an encoding it does not support or a syntax error, a byte scan decides instead, and it errs toward
+    yes. It answers yes for any trace of SVG, for the ISO-2022-JP escape, for any attribute-list
+    declaration, and for an entity that could expand to markup. Both are linear in the document, and
+    neither expands an entity."""
+    parser = DefusedXMLParser(
+        target=_SvgFinder(), forbid_dtd=False, forbid_entities=True, forbid_external=True
+    )
+    try:
+        parser.feed(body)
+        parser.close()
+    except _SvgFound:
+        return True
+    except (ParseError, DefusedXmlException, ValueError, LookupError):
+        data = _without_nul(body)
+        if _ESC in data or _SVG_TRACE_RE.search(data) or _ATTLIST_DECL_RE.search(data):
+            return True
+        if not _ENTITY_DECL_RE.search(data):
+            return False
+        return bool(_ENTITY_MARKUP_RE.search(data)) or _entity_may_build_markup(data)
+    # Well-formed XML is not the only way the bytes are read. An HTML parser takes ``<!-->`` as an
+    # empty comment and reads no CDATA section or processing instruction, so an ``<svg`` that XML
+    # holds as text there is a live element to it. Only a literal ``<svg`` makes one there: the
+    # namespace parts of the trace add nothing, since expat resolved the namespaces and HTML
+    # ignores them, so a well-formed document that only declares or names the namespace is served.
+    return _SVG_TAG_RE.search(_without_nul(body)) is not None
+
+
+def _gunzip_bounded(body: bytes, limit: int) -> tuple[bytes, bool]:
+    """Inflate the gzip ``body``, keeping at most ``limit + 1`` bytes.
+
+    Returns the bytes inflated and whether they are the whole document; they are not only when the
+    output passes ``limit``. The bound is enforced while inflating, so a small body that inflates to
+    gigabytes costs no more than ``limit`` bytes of work.
+
+    Raises :class:`SvgRejected` for a gzip that is not sound before the bound is reached: a corrupt
+    header or block, a CRC or length check that fails, a member cut short, more than
+    :data:`_MAX_GZIP_MEMBERS` members, or anything but NUL padding after the last member. zlib keeps
+    none of a call's output when the call raises, so there is no partial document to judge, and a
+    reader that skips the trailer check could still show one. A corrupt body is never served."""
+    out = bytearray()
+    rest = body
+    for _ in range(_MAX_GZIP_MEMBERS):
+        inflater = zlib.decompressobj(wbits=31)
+        try:
+            out += inflater.decompress(rest, limit + 1 - len(out))
+        except zlib.error:
+            # The refusal is raised after the except ends, so the zlib error stays off its chain,
+            # as in sanitize_svg (BACKLOG #1796).
+            corrupt = True
+        else:
+            corrupt = False
+        if corrupt:
+            raise SvgRejected("gzip body is corrupt")
+        if len(out) > limit:
+            return bytes(out), False
+        if not inflater.eof:
+            raise SvgRejected("gzip body is cut short")
+        rest = inflater.unused_data
+        if not rest.strip(b"\x00"):
+            return bytes(out), True
+        if not rest.startswith(_GZIP_MAGIC):
+            raise SvgRejected("gzip body has bytes after its last member")
+    raise SvgRejected(f"gzip body has more than {_MAX_GZIP_MEMBERS} members")
+
+
+def _vet_markup(label: str | None, body: bytes) -> bytes:
+    """:func:`sanitize_if_svg` for bytes that are not gzip."""
+    if not _is_markup(body):
+        return body
+    if "svg" in (label or "").casefold() or _root_is_svg(body):
+        return sanitize_svg(body)
+    if _contains_svg(body):
+        raise SvgRejected("document whose root is not svg carries an SVG element")
+    return body
+
+
+def _vet_gzip(label: str | None, body: bytes) -> bytes:
+    """:func:`sanitize_if_svg` for a gzip body. Only markup inside it is the sanitizer's business.
+
+    A body is cleared as not markup only once its first byte past leading noise is seen and is not
+    ``<``. A body that inflates to nothing but whitespace within the bound has not shown that byte,
+    so it is treated as markup: a reader that inflates the rest may find an SVG there. A gzip that is
+    not sound is refused by :func:`_gunzip_bounded` before anything is judged.
+
+    The head is cleared without reading the rest of the body, so damage past the head is not seen.
+    That cannot hide an SVG from a browser: no browser renders a document as SVG when its first
+    byte past that noise is not ``<``. A reader that autodetects EBCDIC could, which is the same
+    assumption :func:`may_be_svg` makes for plain bytes."""
+    head, head_whole = _gunzip_bounded(body, _GZIP_SNIFF_BYTES)
+    first = _FIRST_CONTENT_BYTE_RE.search(head)
+    if first is not None and first.group() != b"<":
+        return body
+    # A body that inflated whole within the head is not inflated a second time.
+    inner, whole = (head, True) if head_whole else _gunzip_bounded(body, _MAX_SVG_BYTES)
+    first = _FIRST_CONTENT_BYTE_RE.search(inner)
+    if first is not None and first.group() != b"<":
+        return body
+    if first is None and whole:
+        return body  # empty, or only whitespace to its end: there is nothing to show
+    if not whole:
+        # Markup that passes the bound cannot be vetted, and a reader may still show the part that
+        # did inflate.
+        raise SvgRejected("gzip markup is larger than the bound")
+    vetted = _vet_markup(label, inner)
+    if vetted is inner:
+        return body
+    return gzip.compress(vetted, mtime=0)
 
 
 def _safe_value(value: str) -> bool:
@@ -370,15 +604,20 @@ def sanitize_svg(body: bytes) -> bytes:
 def may_be_svg(body: bytes) -> bool:
     """A cheap, non-blocking pre-check: ``False`` means :func:`sanitize_if_svg` would return ``body``
     unchanged whatever its label, so the caller can skip the thread hop for a PDF or an image. Only
-    markup can be SVG: no SVG reader renders bytes that do not start with ``<``."""
-    return _is_markup(body)
+    markup can be SVG, and no SVG reader renders bytes that do not start with ``<``. The one
+    exception is gzip, since an SVGZ reader inflates it first."""
+    return body.startswith(_GZIP_MAGIC) or _is_markup(body)
 
 
 def sanitize_if_svg(label: str | None, body: bytes) -> bytes:
-    """``body`` unchanged unless it is SVG, in which case the sanitized copy.
+    """``body`` unchanged unless it carries SVG, in which case the sanitized copy.
+
+    An SVG document is sanitized. Markup whose root is not ``svg`` but which holds an SVG element is
+    refused. A gzip body is judged by what it inflates to, and a sanitized SVG inside it is gzipped
+    again.
 
     Raises :class:`SvgRejected` for SVG that cannot be vetted. Blocking work: run it off the event
     loop."""
-    if may_be_svg(body) and ("svg" in (label or "").casefold() or _root_is_svg(body)):
-        return sanitize_svg(body)
-    return body
+    if body.startswith(_GZIP_MAGIC):
+        return _vet_gzip(label, body)
+    return _vet_markup(label, body)

@@ -813,6 +813,20 @@ class ResendOutcome:
     outbox_id: str | None
 
 
+@dataclass(frozen=True)
+class ResendKeyRecord:
+    """What a ``resend_log`` row records for one idempotency key (ADR 0090 §4), as read back by
+    :meth:`QueueStore.get_resend_record`. ``to_destination`` is the outbound name, or
+    :data:`REINGRESS_TARGET_PREFIX` plus the channel for an edit-and-resubmit re-ingress;
+    ``outbox_id`` is the row (or, for a re-ingress, the child message) the first call created.
+    Ids and names only, never a body."""
+
+    message_id: str
+    to_destination: str
+    from_destination: str
+    outbox_id: str | None
+
+
 class ReingressOriginMissing(ResendError):
     """The origin message named by an edit-and-resubmit re-ingress (:meth:`QueueStore.reingress`,
     ADR 0090 §9 / BACKLOG #153) no longer exists — the store cannot resolve the channel to re-enter
@@ -827,13 +841,12 @@ class ReingressOriginMissing(ResendError):
 #: when a duplicate/conflict is reported, while sharing the one ``resend_log`` UNIQUE gate.
 REINGRESS_TARGET_PREFIX = "@reingress:"
 
-#: How long an upload-quota reservation may stay CONTINUOUSLY outstanding before the next reserve
-#: reclaims it (seconds) — ASVS 2.3.4, BACKLOG #1112. One reservation covers a single
-#: ``UploadStore.save``: a sidecar scan plus an encrypt-and-write bounded by
-#: ``[store].max_upload_bytes`` (25 MiB default), so five minutes is orders of magnitude of slack. It
-#: exists only so a process killed between reserve and release cannot consume an uploader's budget
-#: forever. Defined here (not in ``base``) because ``base`` imports THIS module, never the reverse;
-#: ``base`` re-exports it as the public name. See :meth:`Store.reserve_upload_quota`.
+#: How long an uploader's quota row may go with no activity before the next reserve reclaims its
+#: slots (seconds) — ASVS 2.3.4, BACKLOG #1112. Activity is an applied reserve, a release, or a live
+#: save's heartbeat (BACKLOG #2648), so a save slower than this keeps its slot. The reclaim exists
+#: only so a process killed between reserve and release cannot consume an uploader's budget forever.
+#: Defined here (not in ``base``) because ``base`` imports THIS module, never the reverse; ``base``
+#: re-exports it as the public name. See :meth:`Store.reserve_upload_quota`.
 UPLOAD_RESERVATION_STALE_AFTER = 300.0
 
 #: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). Its
@@ -4982,8 +4995,9 @@ CREATE TABLE IF NOT EXISTS store_salt (
 -- invisible to the sidecar scan that counts everything already on disk. The scan is uncached and so
 -- already fleet-visible; this row is what the per-event-loop `UploadStore._quota_lock` cannot give:
 -- a shard's upload in flight, visible to its siblings. It is not the whole decision; see
--- `uploads.UploadQuotaError` (BACKLOG #1941). `since` is when the current
--- continuously-non-zero streak began, so a reservation leaked by a killed process is reclaimed
+-- `uploads.UploadQuotaError` (BACKLOG #1941). `since` is the row's last activity: an applied
+-- reserve, a release, or a live save's heartbeat (BACKLOG #2648). A row idle that long while
+-- non-zero holds only leaked slots, so a reservation leaked by a killed process is reclaimed
 -- rather than consuming the uploader's budget forever. No PHI: an account id and two counters.
 CREATE TABLE IF NOT EXISTS upload_quota (
     uploader_id    TEXT PRIMARY KEY,
@@ -9914,6 +9928,28 @@ class MessageStore:
             await self._commit()
         return count
 
+    async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None:
+        """The ``resend_log`` row an idempotency key claimed, or ``None`` when the key is unused.
+
+        Read-only. For a caller that answers a repeat of an already-run resend before it asks for
+        anything a first resend needs (vault BACKLOG #2625: the console's step-up proof). Ids and
+        names only, never a body."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
+                " WHERE resend_key=?",
+                (resend_key,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return ResendKeyRecord(
+            message_id=row["message_id"],
+            to_destination=row["to_destination"],
+            from_destination=row["from_destination"] or "",
+            outbox_id=row["outbox_id"],
+        )
+
     async def resend_to(
         self,
         *,
@@ -11773,7 +11809,8 @@ class MessageStore:
                     "UPDATE upload_quota SET"
                     " inflight_files = MAX(0, inflight_files + ?),"
                     " inflight_bytes = MAX(0, inflight_bytes + ?),"
-                    " since = ?"
+                    # Never backwards: a host whose clock lags must not age a live row (#2648).
+                    " since = MAX(since, ?)"
                     " WHERE uploader_id = ?",
                     (int(files), int(size_bytes), now, uploader_id),
                 )
@@ -11793,8 +11830,10 @@ class MessageStore:
                 " CASE WHEN upload_quota.since <= ? THEN 0 ELSE upload_quota.inflight_files END + ?,"
                 " inflight_bytes ="
                 " CASE WHEN upload_quota.since <= ? THEN 0 ELSE upload_quota.inflight_bytes END + ?,"
-                " since = CASE WHEN upload_quota.since <= ? OR upload_quota.inflight_files <= 0"
-                " THEN ? ELSE upload_quota.since END"
+                # Every applied reserve refreshes `since`, as a release does: a live slot joining
+                # an old row must not be reclaimed along with it (BACKLOG #2648). Never backwards,
+                # so a host whose clock lags cannot age a row a sibling keeps fresh.
+                " since = MAX(upload_quota.since, ?)"
                 " WHERE (CASE WHEN upload_quota.since <= ? THEN 0"
                 " ELSE upload_quota.inflight_files END) + ? <= ?"
                 " AND (CASE WHEN upload_quota.since <= ? THEN 0"
@@ -11808,7 +11847,6 @@ class MessageStore:
                     int(files),
                     stale,
                     int(size_bytes),
-                    stale,
                     now,
                     stale,
                     int(files),

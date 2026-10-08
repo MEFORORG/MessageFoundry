@@ -180,6 +180,7 @@ from messagefoundry.store.store import (
     ReingressOutcome,
     ReplyWaitState,
     ResendKeyConflict,
+    ResendKeyRecord,
     ResendOutcome,
     ResendSourceAmbiguous,
     ResendSourceEmpty,
@@ -9954,6 +9955,26 @@ class SqlServerStore:
                 raise
         return int(count)
 
+    async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None:
+        """The ``resend_log`` row an idempotency key claimed, or ``None`` when the key is unused.
+
+        Read-only. For a caller that answers a repeat of an already-run resend before it asks for
+        anything a first resend needs (vault BACKLOG #2625: the console's step-up proof). Ids and
+        names only, never a body."""
+        row = await self._fetchone(
+            "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
+            " WHERE resend_key=?",
+            (resend_key,),
+        )
+        if row is None:
+            return None
+        return ResendKeyRecord(
+            message_id=row["message_id"],
+            to_destination=row["to_destination"],
+            from_destination=row["from_destination"] or "",
+            outbox_id=row["outbox_id"],
+        )
+
     async def resend_to(
         self,
         *,
@@ -11032,13 +11053,14 @@ class SqlServerStore:
                 "UPDATE upload_quota SET"
                 " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
                 " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
-                " since = ?"
+                " since = CASE WHEN since > ? THEN since ELSE ? END"  # never backwards (#2648)
                 " WHERE uploader_id = ?",
                 (
                     int(files),
                     int(files),
                     int(size_bytes),
                     int(size_bytes),
+                    now,
                     now,
                     uploader_id,
                 ),
@@ -11066,8 +11088,8 @@ class SqlServerStore:
                     " t.inflight_bytes ="
                     " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
                     " + s.size_bytes,"
-                    " t.since = CASE WHEN t.since <= s.stale_ts OR t.inflight_files <= 0"
-                    " THEN s.now_ts ELSE t.since END"
+                    # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
+                    " t.since = CASE WHEN t.since > s.now_ts THEN t.since ELSE s.now_ts END"
                     " WHEN NOT MATCHED THEN"
                     " INSERT (uploader_id, inflight_files, inflight_bytes, since)"
                     " VALUES (s.uploader_id, s.files, s.size_bytes, s.now_ts)"

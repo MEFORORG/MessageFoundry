@@ -181,6 +181,16 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     return client
 
 
+def vault_failure_text(exc: BaseException) -> str:
+    """What a catch-all handler on this hop may say about ``exc``: the refusal's own fixed text for
+    a refusal of the hop or its reply, else the type name only (BACKLOG #2318). Shared with
+    ``crypto_transit.py``. The import is lazy so ``store/`` takes no ``transports/`` import at module
+    scope; see :func:`messagefoundry.transports.strict_requests.vault_failure_text`."""
+    from messagefoundry.transports.strict_requests import vault_failure_text as text
+
+    return text(exc)
+
+
 # --- Transit key-TYPE validation (BACKLOG #1166, owner ruling 2026-08-22, ASVS 11.2.3) -------------
 #
 # Every Vault Transit key this product uses is OPERATOR-CHOSEN by name, and the product read its type
@@ -346,9 +356,10 @@ class VaultKeyProvider:
         except Exception as exc:
             # Fail closed on ANY Transit/transport/shape failure. Include ONLY the exception TYPE, never
             # its value — a Transit error can echo ciphertext, and we must never surface key material.
+            # The hop's own fixed-text refusals are kept whole (BACKLOG #2318).
             raise KeyProviderError(
                 f"[store].key_provider={_EXTRA!r} could not envelope-decrypt the store DEK via Vault "
-                f"transit (key {transit_key!r}): {type(exc).__name__}."
+                f"transit (key {transit_key!r}): {vault_failure_text(exc)}."
             ) from exc
         if not isinstance(plaintext, str) or not plaintext:
             raise KeyProviderError(

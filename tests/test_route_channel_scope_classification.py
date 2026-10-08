@@ -50,7 +50,13 @@ from messagefoundry.auth.permissions import (
     CUSTOM_ROLE_FORBIDDEN_PERMISSIONS,
     Permission,
 )
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
+    STEP_UP_ACTION_MESSAGE_EXPORT,
+    STEP_UP_ACTION_MESSAGE_RESEND,
+    AuthService,
+)
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -416,7 +422,18 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
         paths = _scoped_get_paths()
         assert "/messages" in paths and "/channels" in paths, paths  # the walk found the reads
         quiet: set[str] = set()
+
+        def prove(headers: dict[str, str], action: str) -> None:
+            # Export and the two resend lanes take a single-use proof bound to the action (vault
+            # BACKLOG #2625). This probe measures channel scope, so it mints the proof directly
+            # rather than re-authenticating.
+            token = headers["Authorization"].removeprefix("Bearer ")
+            service._grant_action_step_up(hash_token(token), action)
+
         for path in paths:
+            if path == "/messages/export":
+                prove(s, STEP_UP_ACTION_MESSAGE_EXPORT)
+                prove(w, STEP_UP_ACTION_MESSAGE_EXPORT)
             rs = await c.get(path, headers=s, params=query(path, "scoped"))
             rw = await c.get(path, headers=w, params=query(path, "wide"))
             assert rw.status_code == 200, (path, rw.status_code, rw.text[:300])
@@ -441,6 +458,10 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
             "resend": {"to": "OB_X", "idempotency_key": "probe-1"},
             "edit-resend": {"raw": _ADT.format(ctrl="CTRLEDIT"), "idempotency_key": "probe-2"},
         }
+        bound = {
+            "resend": STEP_UP_ACTION_MESSAGE_RESEND,
+            "edit-resend": STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
+        }
         routes = _by_id_message_routes()
         assert len(routes) == 8, routes
         for key in routes:
@@ -449,6 +470,9 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
                 "{attachment_id}", "0" * 64
             )
             body = bodies.get(path.rsplit("/", 1)[-1])
+            if (action := bound.get(path.rsplit("/", 1)[-1])) is not None:
+                prove(s, action)
+                prove(w, action)
             before = await _denials_on_ib_b(engine)
             rs = await c.request(method, path, headers=s, json=body)
             assert rs.status_code == 404, (key, rs.status_code, rs.text[:300])

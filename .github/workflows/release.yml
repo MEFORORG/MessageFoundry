@@ -234,7 +234,7 @@ jobs:
             --vendored-from messagefoundry/_vendor
 
       - name: Hand the Linux SBOM to the signing job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-linux
           path: messagefoundry-sbom.cdx.json
@@ -291,7 +291,7 @@ jobs:
             --vendored-from messagefoundry/_vendor
 
       - name: Hand the Windows SBOM to the signing job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-windows
           path: messagefoundry-sbom-windows.cdx.json
@@ -1166,7 +1166,7 @@ jobs:
         # things -- the leak gate asks where a member sits, the member gate asks what kind of file it
         # is -- so guarding on one and not the other uploads whatever the other one caught.
         if: always() && steps.leak-gate.outcome != 'failure' && steps.member-gate.outcome != 'failure' && steps.toolkit-member-gate.outcome != 'failure' && steps.toolkit-bundle-move.outcome != 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-artifacts
           path: |
@@ -1193,7 +1193,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Hand the PyPI files to the publish job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pypi-engine
           path: |
@@ -1648,7 +1648,7 @@ jobs:
         # always() so a FAILED build still yields something to inspect -- but never an
         # archive the member gate refused, which is what a bare always() did (BACKLOG #1838).
         if: always() && steps.member-gate.outcome != 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: webconsole-artifacts
           path: webconsole-dist/
@@ -1666,7 +1666,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Hand the PyPI files to the publish job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pypi-webconsole
           path: |
@@ -2062,7 +2062,7 @@ jobs:
         # always() so a FAILED build still yields something to inspect -- but never an
         # archive the member gate refused, which is what a bare always() did (BACKLOG #1838).
         if: always() && steps.member-gate.outcome != 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: harness-artifacts
           path: harness-dist/
@@ -2080,7 +2080,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Hand the PyPI files to the publish job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pypi-harness
           path: |

@@ -2481,13 +2481,18 @@ class RevocationHopGuard:
     #: context in :meth:`capture`, never from a global setting.
     crl_checked: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
-    #: (BACKLOG #1498). The default names ``[tls].crl_file``, an egress terminator and a connection's
-    #: ``tls_revocation_attested`` — **all three are inapplicable to a hop that is not a connection**:
-    #: none of the non-connection hops that pass this field (at least the IdP, the syslog forwarder
-    #: and the store) resolves a ``[tls]`` anchor, so ``[tls].crl_file`` never reaches its context,
-    #: and there is no connection to carry the flag. Telling such an operator to set one of them is a
-    #: refusal whose remedy cannot be performed, which is the SDS-3.7 false-premise defect wearing a
-    #: helpful voice. A non-connection hop passes the setting that actually closes its own gate.
+    #: (BACKLOG #1498). The default names ``[tls].crl_file``, an egress terminator and a
+    #: connection's ``tls_revocation_attested`` — **all three are inapplicable to the non-connection
+    #: hops that pass this field**. The ones that do (at least the IdP, the syslog forwarder and the
+    #: store) each load their own CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
+    #: never reaches their contexts, and there is no connection to carry the flag; check any new one
+    #: before relying on this. Telling such an operator to set one of them is a refusal whose remedy
+    #: cannot be performed, which is the SDS-3.7 false-premise defect wearing a helpful voice. A
+    #: non-connection hop passes the setting that actually closes its own gate. Not every
+    #: non-connection hop is outside ``[tls]``: the alerts SMTP sink and the security notifier
+    #: resolve the policy, so ``[tls].crl_file`` does reach their contexts on a verifying,
+    #: non-loopback hop. They build no ``RevocationHopGuard``, so neither the default remediation
+    #: nor this field applies to them.
     ways_across: str | None = None
     #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
     #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
@@ -2649,7 +2654,11 @@ class TrustAnchorPolicy:
     ``[tls]`` onto each :class:`~messagefoundry.config.models.Destination`, and onto each
     :class:`~messagefoundry.config.models.Source` for the FTPS poll (vault BACKLOG #2370), so a
     connector's client-verify context resolves the same anchor at both ``build_check`` and live
-    construction."""
+    construction. Those are not its only receivers. It also reaches at least the
+    ``FhirLookupExecutor`` (``transports/fhir.py``, built by ``pipeline/wiring_runner.py``, #1180),
+    the alerts SMTP sink (``pipeline/alert_sinks.py``) and its test send (``api/app.py``), and the
+    security notifier (``pipeline/security_notify.py``), each through
+    :func:`resolve_trust_anchor`."""
 
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"

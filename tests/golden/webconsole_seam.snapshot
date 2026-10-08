@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-1c42b766969ab80a
+71a8eb514b48d64e
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -36,6 +36,7 @@ restart_connection
 replay_message
 resend_message
 edit_resend_message
+prior_resend
 replay_dead_letters
 list_active_alerts
 alerts_rules
@@ -134,10 +135,15 @@ STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY: attribute: str
 STEP_UP_ACTION_ADMIN_RESET_MFA: attribute: str
 STEP_UP_ACTION_ADMIN_RESET_PASSWORD: attribute: str
 STEP_UP_ACTION_ADMIN_USER_UPDATE: attribute: str
+STEP_UP_ACTION_CONFIG_RELOAD: attribute: str
+STEP_UP_ACTION_CONNECTION_PURGE: attribute: str
+STEP_UP_ACTION_MESSAGE_EDIT_RESEND: attribute: str
+STEP_UP_ACTION_MESSAGE_RESEND: attribute: str
 STEP_UP_ACTION_MFA_CONFIRM: attribute: str
 STEP_UP_ACTION_MFA_DISABLE: attribute: str
 STEP_UP_ACTION_MFA_ENROLL: attribute: str
 STEP_UP_ACTION_SESSION_TERMINATE: attribute: str
+STEP_UP_ACTION_UPLOAD_RESEND: attribute: str
 STEP_UP_ACTION_WEBAUTHN_DELETE: attribute: str
 STEP_UP_ACTION_WEBAUTHN_ENROLL: attribute: str
 
@@ -167,6 +173,7 @@ finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str',
 flag_new_client_ip: (self, token: 'str | None', client_ip: 'str | None', *, path: 'str') -> 'bool'
 has_action_step_up: (self, token: 'str | None', action: 'str') -> 'bool'
 has_recent_step_up: (self, token: 'str | None') -> 'bool'
+holds_action_step_up: (self, token: 'str | None', action: 'str') -> 'bool'
 identity_for_token: (self, token: 'str | None', *, activity: 'bool' = True) -> 'Identity | None'
 kerberos_available: property -> 'bool'
 list_sessions: (self, user_id: 'str') -> 'list[SessionRecord]'

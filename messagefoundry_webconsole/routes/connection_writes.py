@@ -19,6 +19,7 @@ from messagefoundry.api.models import (
 from messagefoundry.api.security import client_ip
 from messagefoundry.api.validation import ConnectionName
 from messagefoundry.auth import Identity, Permission
+from messagefoundry.auth.service import STEP_UP_ACTION_CONNECTION_PURGE
 
 from .. import pages
 from .._auth import (
@@ -26,6 +27,7 @@ from .._auth import (
     register_ui_action,
     require_ui,
     require_ui_step_up,
+    require_ui_step_up_action,
 )
 from ._common import CONNECTION_RULE, refuse
 
@@ -60,18 +62,21 @@ _NOT_A_CONNECTION_NAME = "not applied: not a valid connection name"
 # stale step-up 303s to /ui/reauth and, after re-verification, 303-GET-redirects BACK to it (the
 # ?dest/?scope query is deliberately NOT carried across — the operator re-selects on the fresh
 # page; fail-safe for a destructive op). auto_retry=False so it is never re-POSTed body-less.
+# The re-auth mints the purge grant (vault BACKLOG #2625), which the purge POST then spends.
 register_ui_action(
     r"^/ui/connections/purge-confirm$",
     Permission.MESSAGES_PURGE,
     auto_retry=False,
     unlock=True,
+    action=STEP_UP_ACTION_CONNECTION_PURGE,
     label="Open the queue purge confirmation",
 )
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L3b: outbound queue purge (soft-cancel an outbound's queued deliveries) + the bulk
-    connection-control surface. Purge is step-up-gated (require_ui_step_up → /ui/reauth) +
+    connection-control surface. Purge takes a step-up proof bound to it (require_ui_step_up_action,
+    then /ui/reauth; vault BACKLOG #2625) +
     dual-control (may hold for a second approver) and acts on an OUTBOUND, so a channel-scoped user
     is refused; bulk-control mirrors the per-name control primitive (CONNECTIONS_CONTROL, no
     step-up). The literal bulk paths are registered BEFORE the ``{name}/purge/{scope}`` route so a
@@ -232,19 +237,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_purge_bulk(
         request: Request,
         engine: Any = Depends(deps.get_engine),
+        # Action-bound, as POST /connections/{name}/purge is (vault BACKLOG #2625). One proof covers
+        # the whole batch: it is one operator decision, made on one confirm page.
         identity: Identity = Depends(
-            require_ui_step_up(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_CONNECTION_PURGE,
                 Permission.MESSAGES_PURGE,
                 reauth_next=lambda _r: "/ui/connections/purge-confirm",
             )
         ),
         gate: Any = Depends(deps.get_gate),
     ) -> HTMLResponse:
-        # The body-carrying bulk purge. require_ui_step_up re-asserts MESSAGES_PURGE + the step-up
-        # window (mapping a stale window's re-auth to the confirm UNLOCK page, never a body-less
+        # The body-carrying bulk purge. The gate re-asserts MESSAGES_PURGE + the purge-bound step-up
+        # (mapping a missing proof's re-auth to the confirm UNLOCK page, never a body-less
         # re-POST). Validate the scope BEFORE fan-out (a directly-called purge_connection skips its
         # own Query pattern, so an unvalidated scope would silently become purge-all). Then, per
-        # UNIQUE dest, call purge_connection DIRECTLY (its require_step_up Depends is skipped, so
+        # UNIQUE dest, call purge_connection DIRECTLY (its own gate's Depends is skipped, so
         # the 409 require-quiesced guard + the ApprovalGate dual-control run per dest), capturing
         # PurgeResult / PendingApprovalResponse / HTTPException(403/404/409) — one bad dest never
         # aborts the batch.
@@ -299,7 +307,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(
-            require_ui_step_up(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_CONNECTION_PURGE,
                 Permission.MESSAGES_PURGE,
                 reauth_next=lambda _r: "/ui/connections/purge-confirm",
             )

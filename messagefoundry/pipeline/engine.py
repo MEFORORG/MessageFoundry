@@ -90,11 +90,14 @@ from messagefoundry.pipeline.wiring_runner import (
     TeardownReason,
     check_pt_backend_supported,
     check_reference_backend_supported,
+    refuse_reference_hop_flags,
 )
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
+from messagefoundry.store.crypto import rotation_fingerprint_keys
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
+    REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
     ConnectionMetrics,
     DestinationMetrics,
@@ -102,6 +105,7 @@ from messagefoundry.store.store import (
     OperatorAudit,
     OwnedLanes,
     ReingressOutcome,
+    ResendKeyRecord,
     ResendOutcome,
     parse_audit_anchor,
     read_audit_anchor_file,
@@ -500,6 +504,8 @@ class Engine:
         # AND dr.activate): then the runner binds only connections whose resolved tier rank >=
         # dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the runner
         # → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
+        # A DR box that is not activated passes dr_standby instead, and binds no inbound listener
+        # until it is (vault BACKLOG #3140).
         self._priority_default = priority_default
         self._dr_settings = dr_settings or DrSettings()
         # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
@@ -726,6 +732,17 @@ class Engine:
         threshold is consistently applied across reloads."""
         return self._dr_settings.priority_threshold if self._dr_active else None
 
+    def _dr_standby_threshold(self) -> Priority | None:
+        """``[dr].priority_threshold`` on a DR standby that is not activated, else ``None``. The
+        runner binds no inbound listener while it is set (vault BACKLOG #3140), because ADR 0048's
+        load balancer moves the VIP to the node that answers. It judges the listeners an
+        activation would bind, so a reload here refuses what that activation would refuse."""
+        # Without store settings there is no coordinator (dr_coordinator), so nothing could
+        # activate the box; parking its intake for good would leave it dead, not passive.
+        if self._dr_settings.enabled and not self._dr_active and self._store_settings is not None:
+            return self._dr_settings.priority_threshold
+        return None
+
     @property
     def dr_active(self) -> bool:
         """Whether the engine is running under the DR run-profile this boot (#61, ADR 0048)."""
@@ -778,18 +795,21 @@ class Engine:
         The runner takes its threshold at construction and reads it on every start and reload, so
         a flip of the latch alone parked nothing on a running box (vault BACKLOG #3067). Every
         runtime flip goes through here, so the two cannot disagree. It binds and unbinds nothing:
-        the next reload does."""
+        the next reload does. A release hands the runner the passive standby's threshold, so that
+        reload binds no listener (vault BACKLOG #3140)."""
         self._dr_active = active
         if self._registry_runner is not None:
-            self._registry_runner.set_dr_threshold(self._dr_run_threshold())
+            self._registry_runner.set_dr_threshold(
+                self._dr_run_threshold(), standby=self._dr_standby_threshold()
+            )
 
     async def _dr_activate_profile(self) -> None:
         """Engine callback the DR coordinator runs to BEGIN serving under the DR run-profile (#61, ADR
         0048 step 4): latch the run-profile ON, hand the runner the threshold, and re-apply the
         running graph so the runner binds only connections at/above ``[dr].priority_threshold`` (the
-        rest report ``status:"filtered"``). A reload (not a cold start) so a box already serving its
-        full graph drops to the critical set in place, with in-flight rows preserved (the reload is
-        quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
+        rest report ``status:"filtered"``). A reload (not a cold start) so a passive box, which binds
+        no listener (vault BACKLOG #3140), binds the critical set in place, with in-flight rows
+        preserved (the reload is quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
         from :meth:`_dr_config_drift`.
 
         It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
@@ -911,17 +931,37 @@ class Engine:
         Returns the fields for the ``dr.release`` row: ``depth_left``, the staged-queue depth left
         when the drain ended (vault BACKLOG #2752, finding D-V1); ``held_on_parked_outbounds``, the
         part of it held on outbounds the engine parks; and ``drained``, whether every OTHER row
-        drained (vault BACKLOG #3067). The coordinator records them rather than claiming a drain."""
+        drained (vault BACKLOG #3067). The coordinator records them rather than claiming a drain.
+
+        If any step fails, the coordinator keeps the box active, so the runner's DR thresholds
+        come back and its inbound markers are written again under them (vault BACKLOG #3140).
+        That parks at least each feed below the threshold that the release stopped and left
+        down, even one an operator had started. The listeners at or above the threshold that the park unbound stay
+        down until a reload, their schedule window or an alert rule's restart binds them again;
+        a reload skips an ``auto_start = false`` one."""
         rr = self._registry_runner
         if rr is None:
             # No graph, so nothing to unbind, no worker to drain with and no parked outbound.
             depth = await self.store.in_pipeline_depth()
             self._set_dr_active(False)
             return {"depth_left": depth, "drained": depth == 0, "held_on_parked_outbounds": 0}
-        for name in list(rr.registry.inbound):
-            await rr.stop_inbound(name)  # unbind every listener — no new intake during fail-back
-        rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
-        depth, held = await self._drain_pipeline()
+        # Unbind every listener, as a passive standby, so neither the scheduler nor an alert rule
+        # can bind one while the drain runs (vault BACKLOG #3140). The threshold stays, so the
+        # outbounds the profile parks hold their rows through the drain.
+        standby = self._dr_settings.priority_threshold
+        before = rr.dr_intake_state()
+        try:
+            await rr.park_intake(standby)
+            rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
+            depth, held = await self._drain_pipeline()
+            # Again, for a listener an operator started during the drain: none is bound on return.
+            await rr.park_intake(standby)
+        except BaseException:
+            # The coordinator keeps the box active, so the runner leaves the standby with it. The
+            # profile's markers are written again from the graph as it is now, so the feeds below
+            # the threshold stay parked, and the next reload binds the auto-start ones at or above it.
+            rr.restore_dr_intake(before)
+            raise
         self._set_dr_active(False)
         return {"depth_left": depth, "drained": depth <= held, "held_on_parked_outbounds": held}
 
@@ -1011,6 +1051,7 @@ class Engine:
             intake_gate=self._intake_gate,
             priority_default=self._priority_default,
             dr_threshold=self._dr_run_threshold(),
+            dr_standby=self._dr_standby_threshold(),
             alert_sink=self._alert_sink,
             egress=self._egress_settings,
             hop_posture=self._hop_posture,
@@ -1492,6 +1533,9 @@ class Engine:
             # supports_ingest_stage check it fires on EVERY node (leader or standby) — which also covers
             # the clustered branch, where the reference runner starts on every node before leadership.
             self._check_reference_backend_supported()
+            # Vault BACKLOG #3139: serve runs no build check, so a reference set's raw hop flag is
+            # refused here, before any sync, rather than surfacing later as a failed sync.
+            refuse_reference_hop_flags(self._registry_runner.registry)
             if not self._coordinator.is_clustered():
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
                 # before — byte-identical. The config-drift sweeps + reference materialize + listener
@@ -1603,6 +1647,9 @@ class Engine:
                         # they ride the SAME keyed-MAC fingerprint mechanism as the fixed MEFOR_* classes
                         # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
                         extra_values=self._connector_secret_env_values(),
+                        # BACKLOG #2242: the keys a retired DEK derives, so a DEK rotation re-keys
+                        # the fingerprints instead of reading every class as rotated.
+                        prior_fingerprint_keys=rotation_fingerprint_keys(self.store.cipher()),
                     )
                 except Exception:
                     # A reconcile failure must never take the engine down — the runner still works off the
@@ -2453,6 +2500,7 @@ class Engine:
                 stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
                 priority_default=self._priority_default,
                 dr_threshold=self._dr_run_threshold(),
+                dr_standby=self._dr_standby_threshold(),
                 alert_sink=self._alert_sink,
                 egress=self._egress_settings,
                 hop_posture=self._hop_posture,
@@ -2579,6 +2627,24 @@ class Engine:
         if self._registry_runner is not None and self._registry_runner.running:
             self._registry_runner.notify_work()
         return requeued
+
+    async def prior_resend(
+        self, idempotency_key: str, *, message_id: str, to: str | None
+    ) -> ResendKeyRecord | None:
+        """The record of an already-run request this key repeats, or ``None``.
+
+        A repeat is the SAME request under the same key: a resend of ``message_id`` to the outbound
+        ``to``, or, with ``to=None``, an edit-and-resubmit re-ingress of ``message_id``. An unused key
+        and a key used for a different request (the store's 409 conflict) both answer ``None``, so
+        a caller treats them as a new request. Read-only, and it queues nothing: the web console
+        asks it before it demands a step-up proof, so a double-submit answers "already resent"
+        instead of sending the operator to re-authenticate (vault BACKLOG #2625)."""
+        record = await self.store.get_resend_record(idempotency_key)
+        if record is None or record.message_id != message_id:
+            return None
+        if to is None:
+            return record if record.to_destination.startswith(REINGRESS_TARGET_PREFIX) else None
+        return record if record.to_destination == to else None
 
     async def resend(
         self,

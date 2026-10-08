@@ -966,8 +966,8 @@ apply. What each **adds** over plain `require()`:
 | `require` | 42 | nothing — the ladder itself |
 | `require_paced` | 17 | the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 8 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
-| `require_step_up` | 32 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
-| `require_step_up_action` | 6 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor |
+| `require_step_up` | 25 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up_action` | 13 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
 
@@ -1001,8 +1001,8 @@ The two gates audit differently. Under the default audit setting, `authorize_ws`
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 100, not 97, because BOTH `/messages/export` routes and
-`/messages/{id}/outbound` require two).
+under `create_app()` (they sum to 101, not 97, because BOTH `/messages/export` routes,
+`/messages/{id}/outbound` and `POST /uploads/{id}/resend` require two).
 
 | Constant | Permission | PHI | Routes | Gates |
 |---|---|---|:--:|---|
@@ -1013,7 +1013,7 @@ under `create_app()` (they sum to 100, not 97, because BOTH `/messages/export` r
 | `MESSAGES_VIEW_RAW` | `messages:view_raw` | **PHI** | 6 | the whole message body: `GET /messages/{id}/raw` (BACKLOG #2345), `/attachments/{id}`, `/outbound` (with `messages:view_summary`), `/messages/export`; the single-message open `GET /messages/{id}`, which carries no body; also, with `messages:view_summary`, the per-property switch for the captured-reply `body` |
 | `MESSAGES_REPLAY` | `messages:replay` | | 2 | `POST /dead-letters/replay`, `POST /messages/{id}/replay` |
 | `MESSAGES_RESEND` | `messages:resend` | | 1 | `POST /messages/{id}/resend` — resend a stored body to an **alternate** outbound (ADR 0090) |
-| `MESSAGES_EDIT` | `messages:edit` | **PHI** | 1 | `POST /messages/{id}/edit-resend`. The edited body **is** PHI, so it **implies** `messages:view_raw` **for the built-in roles** — every built-in role granting it also grants view_raw. **Minting** does not enforce that implication and deliberately still does not: `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a custom role holding it alone stays mintable. The **console editor** enforces it at the gate instead (BACKLOG #324) — `GET /ui/messages/{id}/edit` and `POST /ui/messages/{id}/edit-resend` require `messages:view_raw` **as well**, and fail closed on either, because the editor displays the body it edits |
+| `MESSAGES_EDIT` | `messages:edit` | **PHI** | 2 | `POST /messages/{id}/edit-resend`, and `POST /uploads/{id}/resend` beside `files:browse`, because an upload resend injects a message as a reroute does (vault BACKLOG #2625). The edited body **is** PHI, so it **implies** `messages:view_raw` **for the built-in roles** — every built-in role granting it also grants view_raw. **Minting** does not enforce that implication and deliberately still does not: `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a custom role holding it alone stays mintable. The **console editor** enforces it at the gate instead (BACKLOG #324) — `GET /ui/messages/{id}/edit` and `POST /ui/messages/{id}/edit-resend` require `messages:view_raw` **as well**, and fail closed on either, because the editor displays the body it edits |
 | `MESSAGES_EXPORT` | `messages:export` | **PHI** | 2 | `GET`/`POST /messages/export` — the **largest PHI egress surface**; a capability distinct from `view_raw` (bulk ≠ opening one message), and the route requires **both** plus step-up |
 | `MESSAGES_PURGE` | `messages:purge` | | 1 | `POST /connections/{name}/purge` |
 | `CONNECTIONS_CONTROL` | `connections:control` | | 3 | `POST /connections/{name}/start`, `/stop`, `/restart` |
@@ -1031,7 +1031,7 @@ under `create_app()` (they sum to 100, not 97, because BOTH `/messages/export` r
 | `AUDIT_EXPORT` | `audit:export` | | 1 | `GET /audit/export` — the filtered audit-report CSV (BACKLOG #170); distinct from `audit:read` |
 | `LOGS_VIEW` | `logs:view` | **PHI** | 1 | `GET /logs/tail` — the best-effort-redacted application-log tail (residual single-token PHI is possible), so it rides `require_phi_read` and writes a `logs_view` audit row |
 | `FILES_UPLOAD` | `files:upload` | **PHI** | 1 | `POST /uploads` — writes real HL7 PHI at rest |
-| `FILES_BROWSE` | `files:browse` | **PHI** | 4 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` |
+| `FILES_BROWSE` | `files:browse` | **PHI** | 4 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` (with `messages:edit` since vault BACKLOG #2625; a browse-only role reads and cannot inject) |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
 | `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
 | `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches all four (BACKLOG #1982, #2460). Never assignable to a custom role |
@@ -1114,8 +1114,8 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 [`api/app.py`](../messagefoundry/api/app.py) (72 HTTP + 1 WebSocket) and 43 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
 and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 120 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 242
-(116 + the 125 console routes + the `/ui/static` mount). Of the 116: **97 are permission-gated**, 19 are
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 243
+(116 + the 126 console routes + the `/ui/static` mount). Of the 116: **97 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -1234,8 +1234,8 @@ tuple: they act only on the caller's own account.
 | `POST` | `/connections/{name}/test` | `connections:test` | `require_paced` — reachability probe; honors `[egress]`, sends no real data, audited |
 | `POST` | `/connections/{name}/test-credential` | `connections:test` | `require_paced` |
 | `POST` | `/connections/{name}/flag` | `config:deploy` | `require_paced` |
-| `POST` | `/connections/{name}/purge` | `messages:purge` | `require_step_up` — may return **202 + `approval_id`** under dual control |
-| `POST` | `/config/reload` | `config:deploy` | `require_step_up` — the target dir must resolve within an allowed root (see below) |
+| `POST` | `/connections/{name}/purge` | `messages:purge` | `require_step_up_action` (action `connection_purge`, vault BACKLOG #2625) — may return **202 + `approval_id`** under dual control |
+| `POST` | `/config/reload` | `config:deploy` | `require_step_up_action` (action `config_reload`, vault BACKLOG #2625; a `dry_run` takes it too, because the loader executes the config's Python either way) — the target dir must resolve within an allowed root (see below) |
 | `GET` | `/approvals` | `approvals:approve` | `require` |
 | `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_paced` — the requester can never approve their own request |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
@@ -1250,17 +1250,17 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|---|
 | `GET` | `/messages` | `messages:read` | `require_phi_read` | per-property redaction; `messages:view_summary` unlocks `summary`/`error`/`metadata`; per-channel scope |
 | `GET` | `/messages/search` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (a bulk-selecting GET) |
-| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up` | one of the two-permission routes **on the JSON plane** (the console plane has its own — see the [`/ui` route map](#the-ui-console-plane-serve_uitrue)); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models |
+| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`, vault BACKLOG #2625) | one of the two-permission routes **on the JSON plane** (the console plane has its own — see the [`/ui` route map](#the-ui-console-plane-serve_uitrue)); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models |
 | `POST` | `/messages/search` | `messages:read` | `require_step_up` | the needle-bearing sibling of the GET above (BACKLOG #1184): `content`/`field_value` travel in the BODY so they never reach a URL, access log or browser history. Same gate, same shared implementation, so the PHI-read hop and budget are charged identically |
-| `POST` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up` | the needle-bearing sibling of the export GET (BACKLOG #1184); same two permissions, same fail-closed-on-either behaviour, same pre-stream audit — only the criteria's carrier differs |
+| `POST` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`) | the needle-bearing sibling of the export GET (BACKLOG #1184); same two permissions, same fail-closed-on-either behaviour, same pre-stream audit — only the criteria's carrier differs |
 | `GET` | `/messages/{message_id}` | `messages:view_raw` | `require_phi_read` | per-property redaction of the wrapper **and** each nested `OutboxInfo`/`EventInfo`; returns **no body** (BACKLOG #2345); `summary` and `metadata` come back display-masked unless the request passes `reveal_summary=true`, and the `message_view` audit row lists the properties returned complete in `revealed` (BACKLOG #2346); the error text (`error`, each `outbox[].last_error`, each `events[].detail`) comes back as a fixed `****` mask unless the request passes `reveal_errors=true`, a separate act, recorded in `revealed` as `error`, `outbox.last_error` and `events.detail` (BACKLOG #2436) |
 | `GET` | `/messages/{message_id}/raw` | `messages:view_raw` | `require_phi_read` | the raw body, as its own act: writes a `message_body_view` audit row carrying a `surface`. An HTTP caller declares `harness`, `apiclient` or `api` (the default); the engine records `console` itself for the web console's in-process call, and the query parameter does not accept it (BACKLOG #2345) |
 | `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes, audited `attachment_download`; the handler's two 422 refusals (an undecodable stored value, an SVG it cannot sanitize) serve nothing and are audited `attachment_download_refused` with a `reason`; a request-validation 422 never reaches the handler and is not (BACKLOG #2387) |
 | `GET` | `/messages/{message_id}/responses` | `messages:read` | `require_phi_read` | the reply **body** additionally needs `messages:view_raw` **and** `messages:view_summary`, enforced inline at the route; without either, `body` is null |
 | `GET` | `/messages/{message_id}/outbound` | `messages:view_raw` + `messages:view_summary` | `require_phi_read` | the transformed outbound payload; one of the two-permission routes on the JSON plane, and it fails closed on either: a caller missing one gets 403 and an `auth.permission_denied` row. Owner ruling R18 makes this request the reveal act only for a `messages:view_summary` holder. Minting now refuses a custom role holding `messages:view_raw` alone, so this gate is the second line (ASVS 14.2.6, vault BACKLOG #1187) |
 | `POST` | `/messages/{message_id}/replay` | `messages:replay` | `require_step_up` | per-channel scope |
-| `POST` | `/messages/{message_id}/resend` | `messages:resend` | `require_step_up` | per-channel access to **both** the origin's and the alternate outbound's channel |
-| `POST` | `/messages/{message_id}/edit-resend` | `messages:edit` | `require_step_up` | implies `messages:view_raw`; the DIRECT `to` power-path additionally requires per-channel access to the alternate outbound's channel |
+| `POST` | `/messages/{message_id}/resend` | `messages:resend` | `require_step_up_action` (action `message_resend`, vault BACKLOG #2625) | per-channel access to **both** the origin's and the alternate outbound's channel |
+| `POST` | `/messages/{message_id}/edit-resend` | `messages:edit` | `require_step_up_action` (action `message_edit_resend`, vault BACKLOG #2625) | implies `messages:view_raw`; the DIRECT `to` power-path additionally requires per-channel access to the alternate outbound's channel |
 | `GET` | `/dead-letters` | `messages:read` | `require_phi_read` | per-property redaction; per-channel scope |
 | `POST` | `/dead-letters/replay` | `messages:replay` | `require_step_up` | may return **202 + `approval_id`** under dual control |
 
@@ -1281,7 +1281,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/uploads` | `files:browse` | `require` | metadata only — no body, no summary; **owner-scoped** (ASVS 8.2.2) — the caller sees only the files they uploaded unless they hold `files:access_any`; **paged** `limit`/`offset` (50, 1..500 / 0..), the window applied AFTER the owner filter so a page's length can never encode another operator's file count |
 | `GET` | `/uploads/{file_id}/messages` | `files:browse` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (bulk decrypt + split); **owner-only** — another operator's file answers **404**, before the decrypt |
 | `POST` | `/uploads/{file_id}/messages/search` | `files:browse` | `require_step_up` | the needle-bearing sibling of the browse GET (BACKLOG #1184); same owner-only 404 before the decrypt, same bulk PHI-read pacing |
-| `POST` | `/uploads/{file_id}/resend` | `files:browse` | `require_step_up` | per-channel `can_access_channel` check on the target inbound (403) **and** an owner check on the source file (404) |
+| `POST` | `/uploads/{file_id}/resend` | `files:browse` **+** `messages:edit` | `require_step_up_action` (action `upload_resend`) | vault BACKLOG #2625: it injects a message, so `files:browse`, a read, is not enough alone; fails closed on either permission. Per-channel `can_access_channel` check on the target inbound (403) **and** an owner check on the source file (404) |
 | `DELETE` | `/uploads/{file_id}` | `files:delete` | `require_step_up` | destructive, audited; **owner-only** — another operator's file answers **404** and is never unlinked |
 
 > **Object-level authorization for uploaded files (ASVS 8.2.2).** An uploaded file belongs to the
@@ -1379,14 +1379,14 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **124 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **126 routes + one `/ui/static` mount** (federation off,
 the default — the three `/ui/oidc/*` routes, `GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback`,
 and the IdP step-up start `POST /ui/reauth/oidc` are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 115 of the 125 carry a gate; the 10 that do not are the
+**Route → permission map (`/ui` plane).** 116 of the 126 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -1434,15 +1434,15 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/cluster/stepdown` | `cluster:control` | `require_ui_step_up` |
 | `GET` | `/ui/cluster/stepdown-confirm` | `cluster:control`**+**`monitoring:read` | `require_ui_step_up` |
 | `GET` | `/ui/config` | `monitoring:read` | `require_ui` |
-| `POST` | `/ui/config/reload` | `config:deploy` | `require_ui_step_up` |
+| `POST` | `/ui/config/reload` | `config:deploy` | `require_ui_step_up_action` |
 | `GET` | `/ui/connection/{name}` | `monitoring:read` | `require_ui` |
 | `GET` | `/ui/connection/{name}/events/{event_id}/reason` | `monitoring:read`**+**`messages:view_summary` | `require_ui` |
 | `GET` | `/ui/connections` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/connections/bulk-control` | `connections:control` | `require_ui` |
-| `POST` | `/ui/connections/purge-bulk` | `messages:purge` | `require_ui_step_up` |
+| `POST` | `/ui/connections/purge-bulk` | `messages:purge` | `require_ui_step_up_action` |
 | `GET` | `/ui/connections/purge-confirm` | `messages:purge` | `require_ui_step_up` |
 | `POST` | `/ui/connections/{name}/flag` | `config:deploy` | `require_ui` |
-| `POST` | `/ui/connections/{name}/purge/{scope}` | `messages:purge` | `require_ui_step_up` |
+| `POST` | `/ui/connections/{name}/purge/{scope}` | `messages:purge` | `require_ui_step_up_action` |
 | `POST` | `/ui/connections/{name}/restart` | `connections:control` | `require_ui` |
 | `POST` | `/ui/connections/{name}/start` | `connections:control` | `require_ui` |
 | `POST` | `/ui/connections/{name}/stop` | `connections:control` | `require_ui` |
@@ -1463,13 +1463,14 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/messages/{message_id}` | `messages:view_raw` | `require_ui` |
 | `GET` | `/ui/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_ui` |
 | `GET` | `/ui/messages/{message_id}/body` | `messages:view_raw` | `require_ui` |
-| `GET` | `/ui/messages/{message_id}/edit` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up` |
+| `GET` | `/ui/messages/{message_id}/edit` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up_action` |
 | `GET` | `/ui/messages/{message_id}/errors` | `messages:view_raw` | `require_ui` |
-| `POST` | `/ui/messages/{message_id}/edit-resend` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up` |
+| `POST` | `/ui/messages/{message_id}/edit-resend` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up_action` |
 | `GET` | `/ui/messages/{message_id}/parse-tree` | `messages:view_raw` | `require_ui` |
 | `GET` | `/ui/messages/{message_id}/resend-confirm` | `messages:resend` | `require_ui` |
+| `GET` | `/ui/messages/{message_id}/resend-done` | `messages:resend` | `require_ui` |
 | `POST` | `/ui/messages/{message_id}/replay` | `messages:replay` | `require_ui_step_up` |
-| `POST` | `/ui/messages/{message_id}/resend` | `messages:resend` | `require_ui_step_up` |
+| `POST` | `/ui/messages/{message_id}/resend` | `messages:resend` | `require_ui_step_up_action` |
 | `GET` | `/ui/messages/{message_id}/summary` | `messages:view_raw` | `require_ui` |
 | `GET` | `/ui/monitoring` | `monitoring:read` | `require_ui` |
 | `GET` | `/ui/monitoring/live` | `monitoring:read` | `require_ui` |
@@ -1492,8 +1493,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/uploaded-logs/file/{file_id}/filter` | `files:browse` | `require_ui_step_up` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
-| `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui_step_up` |
-| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui_step_up` |
+| `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse`**+**`messages:edit` | `require_ui_step_up_action` |
+| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse`**+**`messages:edit` | `require_ui_step_up` |
 | `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/upload-form` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
@@ -1600,7 +1601,8 @@ else would need its own authorization rule stated here.
    **Both uploaded-logs WRITE divergences are closed**, and are recorded here because the reasoning
    that kept one of them open is worth not re-deriving. `POST /ui/uploaded-logs/file/{file_id}/resend`
    became `require_ui_step_up` in BACKLOG #1227, reached through a body-less confirm step carrying its
-   two parameters in the query. `POST /ui/uploaded-logs/upload` became `require_ui_step_up` in BACKLOG
+   two parameters in the query, and `require_ui_step_up_action` with `messages:edit` beside
+   `files:browse` in vault BACKLOG #2625, as its JSON twin is. `POST /ui/uploaded-logs/upload` became `require_ui_step_up` in BACKLOG
    #1739, matching `POST /uploads`, so a PHI-at-rest write is no longer gated on `files:upload` alone
    on this plane; its re-auth continuation is the unlock form at `GET /ui/uploaded-logs/upload-form`,
    and the multipart body is **lost** across that redirect so the operator re-picks the file — the
@@ -1800,6 +1802,31 @@ promote, a double click, a retrying API client and two such calls racing all lan
 The store makes the check and the insert one serialized step on all three backends. A **different**
 requester always gets a request of their own: the release re-checks the requester's authority, so
 one person's ask must not ride on another person's standing.
+
+**A repeat of an open purge or reload needs no new step-up proof on the JSON plane (vault BACKLOG
+#2625).** `POST /connections/{name}/purge` and `POST /config/reload` take a single-use proof bound to
+their action, listed under [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753).
+Each route looks for the caller's open request first, when the session's step-up window is
+live. If it finds one, it answers the same **202** and writes the same `approval.request_repeated`
+row. It spends no proof, even one the request brought. Every other request needs the proof before
+it is held or run. So a first request, or a different one, still needs it. A purge repeat is
+answered only while the purge would still be held. If the route would now refuse that purge, the
+repeat goes to the proof and then gets the refusal. The rest of the route's gate applies to a
+repeat as well. That is at least the permission, pacing, the second factor, the new-address check
+and the factor-binding refusal. At least these limits apply:
+
+- the lookup and its audit row are two steps. A request approved, rejected or expired between them
+  is still named in the **202**. Nothing new is held or run because of it;
+- the lookup reads the newest 1000 open requests. A repeat of an older one needs a proof, and the
+  store's rule above then joins it;
+- a session inside its window can learn, with no proof, whether it holds an open request matching
+  what it sends. Each match writes an `approval.request_repeated` row naming that session's user.
+  Only its own requests match, and pacing limits how often it can ask;
+- a grant the session minted and did not spend stays live until it expires, as any unspent grant
+  does. A repeat that brought one leaves it unspent;
+- the console's purge and reload ask for a proof on every request. A repeat there goes to re-auth,
+  and joins only when the operator submits it again;
+- a repeat that races the first request's commit may spend a proof and then join.
 
 **A held request cannot be released once dual control stops applying to it.** If an operator turns
 `[approvals].enabled` off, or removes the operation from `[approvals].operations`, a request held
@@ -2182,6 +2209,55 @@ neither `POST /auth/mfa-verify` nor `POST /ui/mfa` asks whether the session alre
 an account holding a TOTP can renew its window with a code alone, with no password, directory
 re-bind or IdP round trip. That renews the window only; it mints no action-bound grant.
 
+**Injection and bulk export take a proof bound to the action (vault BACKLOG #2625).** On a first
+deployment, one live session inside the window, from the same address, would otherwise be enough to
+deliver a fabricated message to a partner or export bodies in bulk. These routes take a single-use
+grant that a step-up mints for that action instead:
+
+| Action | Routes |
+|---|---|
+| `message_resend` | `POST /messages/{id}/resend`, `POST /ui/messages/{id}/resend` |
+| `message_edit_resend` | `POST /messages/{id}/edit-resend`, `POST /ui/messages/{id}/edit-resend` |
+| `upload_resend` | `POST /uploads/{id}/resend`, `POST /ui/uploaded-logs/file/{id}/resend` |
+| `message_export` | `GET` and `POST /messages/export` |
+| `connection_purge` | `POST /connections/{name}/purge`, `POST /ui/connections/purge-bulk`, `POST /ui/connections/{name}/purge/{scope}` |
+| `config_reload` | `POST /config/reload`, a `dry_run` included, and `POST /ui/config/reload` |
+
+A JSON client answers the 403 with `POST /me/reauth`, setting `purpose` to the action the 403 named
+in `X-Step-Up-Action`; the engine client does this itself. The console's re-auth page mints the grant
+when it continues to the action's confirm page, editor or auto-retry. The message editor asks for the
+grant before it opens and the resubmit spends it after its own input checks, so a re-auth no longer
+drops an edit the operator is about to type, and a refusal of the console's own input costs no proof.
+A refusal from the engine handler comes after the spend: the next submit asks again and re-opens the
+editor from the stored body, as an expired grant (300 s by default) does. The console resend checks
+its own input before it spends the proof too. On both, a double-click asks for no second proof.
+The console marks each request it spends a proof on. Only an identical request rides on that mark.
+For a resend that means the same key, target and source. For an edit-resend it means the same key,
+target and edited body. A plain resend whose key already has a `resend_log` row also needs no
+proof, whatever its source, because the store answers it as a duplicate and queues nothing. A
+repeat that arrives while the first request runs waits for it, for two minutes at most. Past that,
+or if the session changed meanwhile, it goes to re-auth. If the handler refused the first,
+the repeat gets the same refusal and runs nothing. The mark goes with that refusal, so the next
+submit asks for a proof again. A refusal of a repeat drops the mark too. A request that ends any
+other way keeps its mark, an error or a cancel by a timeout or a disconnect included. The store may
+already have committed it, and the repeat must then reach the store's duplicate check. The store
+answers a repeat of a committed request as ADR 0090's duplicate. If the first never committed, each
+repeat while the mark lasts (300 s) runs the handler on the proof the first one spent. The key lets
+at most one of them commit, so one proof still gives one delivery at most. A double-clicked resend
+lands on "already resent"; a repeated edit-resend lands on the child the first one made. One grant covers one request, and a bulk purge from the console is one request. The
+grant is keyed on the session and the action, not on a target. The rest of the step-up surface keeps
+the shared window on purpose: a bound proof is a typed password per action, and an operator replaying
+dead letters during an incident would type it per message. `[auth].require_action_step_up = false`
+puts these routes back on the window, as it does every action-bound route.
+
+Under dual control, a JSON purge or reload that repeats the caller's own open request answers with
+that request's id and needs no new proof while the session window is live. [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+states when, and its limits.
+
+Upload resend also needs `messages:edit` beside `files:browse` (vault BACKLOG #2625). It injects a
+message, and `files:browse` is a read. `edit-resend` with a reroute was already the same power under
+`messages:edit`, so no permission or role is new. The built-in Operator holds both.
+
 **On a directory account, the directory must confirm the account before the code is checked (BACKLOG
 #2023).** Before `verify_mfa` renews a directory account's window, it asks the directory about that
 one account. It uses the lookup and the key the reconciliation pass uses, off the event loop. Only a
@@ -2316,7 +2392,7 @@ cannot finish the IdP step-up. It runs in a browser and re-keys the session it s
 [Session inventory](#session-inventory--targeted-revocation-wp-10) says what that costs on the
 action-bound terminate routes.
 
-**Gated operations — 38 route objects** (32 `require_step_up` + 6 action-bound `require_step_up_action`).
+**Gated operations — 38 route objects** (25 `require_step_up` + 13 action-bound `require_step_up_action`).
 The complete set, as enumerated in the [route map](#route--permission-map-engine-api) above:
 
 - **User / role administration** — `POST /users`, `POST /users/directory` (BACKLOG #2021),
@@ -2328,9 +2404,12 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   `PUT` / `DELETE /users/{id}/federated-identity` (`admin_federated_identity`, BACKLOG #1143).
 - **Self-service** — `DELETE /me/mfa` (action-bound `mfa_disable`).
 - **Message / config operations** — `POST /dead-letters/replay`, `POST /messages/{id}/replay`,
-  `POST /messages/{id}/resend`, `POST /messages/{id}/edit-resend`, `POST /connections/{name}/purge`,
-  `POST /config/reload`, `POST /search/presets`.
-- **Uploaded files** — `POST /uploads`, `POST /uploads/{id}/resend`, `DELETE /uploads/{id}`.
+  `POST /search/presets`, and four action-bound routes (vault BACKLOG #2625):
+  `POST /messages/{id}/resend` (`message_resend`), `POST /messages/{id}/edit-resend`
+  (`message_edit_resend`), `POST /connections/{name}/purge` (`connection_purge`) and
+  `POST /config/reload` (`config_reload`).
+- **Uploaded files** — `POST /uploads`, `DELETE /uploads/{id}`, and the action-bound
+  `POST /uploads/{id}/resend` (`upload_resend`).
 - **Cluster control** -- `POST /cluster/stepdown` (BACKLOG #1494).
 - **Disaster recovery** -- `POST /dr/activate` and `POST /dr/release` (vault BACKLOG #2581). A promotion
   runs the operator's takeover hook and binds the priority listeners; a release runs the release
@@ -2339,7 +2418,8 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   step-up gated; this one is, because it closes an approval record on the resolver's word alone.
 - **Bulk-PHI reads** — `GET /messages/search`, `GET /messages/export`, `GET /search/layered`,
   `GET /uploads/{file_id}/messages`, and the body-carrying twins `POST /messages/search`,
-  `POST /messages/export` and `POST /uploads/{file_id}/messages/search` (BACKLOG #1184). These are **reads** and are step-up-gated deliberately, because
+  `POST /messages/export` and `POST /uploads/{file_id}/messages/search` (BACKLOG #1184). The two
+  export routes are action-bound (`message_export`, vault BACKLOG #2625). These are **reads** and are step-up-gated deliberately, because
   they select PHI in bulk; the per-actor write pacing does not apply to them (it is non-GET only), so
   each charges the per-actor **PHI-read** budget explicitly instead.
 

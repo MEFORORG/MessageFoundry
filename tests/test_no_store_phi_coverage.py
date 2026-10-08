@@ -75,7 +75,9 @@ from tests.test_phi_at_rest_inventory import _section, _section_2_levels, _table
 
 #: Qualname prefixes of the auth-dependency closures ``Depends(require_*(...))`` installs on a route.
 _PHI_READ_DEP = "require_phi_read."
-_STEP_UP_DEP = "require_step_up."
+#: Both step-up factories: vault BACKLOG #2625 moved export and purge onto the action-bound one, and
+#: a prefix naming only the window factory stopped seeing export, a bulk PHI read.
+_STEP_UP_DEP = ("require_step_up.", "require_step_up_action.")
 #: The explicit PHI-read declaration a step-up bulk-PHI handler makes in its own body.
 _HOP_NAME = "enforce_phi_read_hop"
 

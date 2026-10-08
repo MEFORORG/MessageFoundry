@@ -79,7 +79,8 @@ def load_pkcs12(
     """Parse a PKCS#12/.pfx bundle into ``(private_key, leaf_cert, additional_cas)``.
 
     Thin wrapper over ``cryptography``'s loader. ``password`` is the bundle passphrase (``None`` for an
-    unencrypted bundle with no MAC); it is used only to decrypt here and is never logged or returned. A wrong
+    unencrypted bundle with no MAC, ``b""`` for an empty passphrase, BACKLOG #2456); it is
+    used only to decrypt here and is never logged or returned. A wrong
     password / malformed bundle raises ``ValueError`` from ``cryptography`` — the CLI scrubs that so the
     passphrase can never leak into stderr/logs.
 

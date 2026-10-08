@@ -30,6 +30,8 @@ from messagefoundry.config.settings import EgressSettings
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtWidgets import QInputDialog  # noqa: E402
+
 from harness import monitor  # noqa: E402
 from harness.monitor import MonitorPanel  # noqa: E402
 from messagefoundry.api import create_managed_app  # noqa: E402
@@ -232,6 +234,84 @@ def test_monitor_panel_builds_disconnected(qapp: Any) -> None:
     panel.shutdown()  # safe to call when never connected
 
 
+class _ReauthClient:
+    """Records what ``reauth`` was given, and refuses it when told to."""
+
+    def __init__(self, refuse: bool = False) -> None:
+        self.refuse = refuse
+        self.passwords: list[str] = []
+
+    def reauth(self, password: str) -> None:
+        self.passwords.append(password)
+        if self.refuse:
+            raise ApiError("re-verification failed", status=403)
+
+
+@pytest.mark.parametrize(
+    ("answer", "refuse", "expected", "restarts"),
+    [
+        (("typed-pw", True), False, True, 1),  # re-proved: the poller moves to the new token
+        (("", False), False, False, 0),  # cancelled: nothing is sent
+        # Refused: the reauth error rises out of the action that asked, so its report names the
+        # real cause, and the poller is left on the untouched old session.
+        (("typed-pw", True), True, None, 0),
+    ],
+)
+def test_the_step_up_handler_re_proves_and_restarts_the_poller(
+    qapp: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: tuple[str, bool],
+    refuse: bool,
+    expected: bool | None,
+    restarts: int,
+) -> None:
+    """Vault BACKLOG #2625: reload and purge take a proof bound to their action, which a sign-in
+    does not mint, so the harness answers the step-up refusal with a masked password prompt. The
+    re-proof rotates the session, so the poller, which holds its own copy of the token, restarts."""
+    panel = MonitorPanel()
+    client = _ReauthClient(refuse=refuse)
+    panel._client = client  # type: ignore[assignment]
+    started: list[int] = []
+    # On the class: an instance patch would leave a bound method in the panel's own dict on undo.
+    monkeypatch.setattr(MonitorPanel, "_stop_poller", lambda self: None)
+    monkeypatch.setattr(MonitorPanel, "_start_poller", lambda self: started.append(1))
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: answer)
+    try:
+        if expected is None:
+            with pytest.raises(ApiError, match="re-verification failed"):
+                panel._step_up()
+        else:
+            assert panel._step_up() is expected
+        assert client.passwords == ([answer[0]] if answer[1] and answer[0] else [])
+        assert len(started) == restarts
+    finally:
+        panel._client = None
+        panel.shutdown()
+
+
+def test_the_step_up_handler_refuses_off_the_gui_thread(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Qt dialog built off the GUI thread can crash the process. Every worker read goes through
+    the handler-less polling client, and this is the second guard: called from any other thread,
+    the handler declines without opening a dialog or sending anything."""
+    panel = MonitorPanel()
+    client = _ReauthClient()
+    panel._client = client  # type: ignore[assignment]
+    monkeypatch.setattr(
+        QInputDialog, "getText", lambda *a, **k: pytest.fail("a dialog opened off the GUI thread")
+    )
+    answers: list[bool] = []
+    worker = threading.Thread(target=lambda: answers.append(panel._step_up()))
+    try:
+        worker.start()
+        worker.join(10)
+        assert answers == [False] and client.passwords == []
+    finally:
+        panel._client = None
+        panel.shutdown()
+
+
 class _MustChangeClient:
     """Answers ``me()`` like an authed engine does before sign-in: a 401."""
 
@@ -347,6 +427,35 @@ def test_a_refused_connect_ends_the_session_the_sign_in_left(
         panel._connect()
         assert client.calls == expected
         assert panel._client is None
+    finally:
+        panel.shutdown()
+
+
+class _SignedInClient(_RefusedClient):
+    """Signed in already (``me`` answers), and its polling client cannot be built."""
+
+    def me(self) -> None:
+        self.calls.append("me")
+
+    def for_polling(self) -> None:
+        self.calls.append("for_polling")
+        raise ApiError("cannot load TLS material")
+
+
+def test_a_connect_whose_polling_client_fails_ends_its_session(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2625 built the message panels' polling client during connect. When that fails,
+    the panel stays disconnected, and the session the sign-in left is ended before the client is
+    dropped, as the must-change refusal does (BACKLOG #2091)."""
+    client = _SignedInClient("tok-live", logout_fails=False)
+    monkeypatch.setattr(monitor, "EngineClient", lambda *args, **kwargs: client)
+    panel = MonitorPanel()
+    try:
+        panel._connect()
+        assert client.calls == ["health", "me", "for_polling", "logout", "close"]
+        assert panel._client is None and panel._poll_client is None
+        assert "cannot load TLS material" in panel._status.text()
     finally:
         panel.shutdown()
 
@@ -516,6 +625,12 @@ def test_monitor_observes_engine(qapp: Any, server: tuple[str, Path]) -> None:
     deadline = time.time() + 60  # ONE budget spanning both waits, not 30s each
     try:
         assert panel._client is not None
+        # Vault BACKLOG #2625: the main client carries a Qt step-up handler, so the message panels,
+        # whose reads run on worker threads, must read through the handler-less polling client.
+        assert panel._poll_client is not None and panel._poll_client is not panel._client
+        assert panel._poll_client._step_up_handler is None
+        assert panel._messages is not None and panel._messages._poll is panel._poll_client
+        assert panel._detail is not None and panel._detail._poll is panel._poll_client
 
         def ctx() -> str:
             """Failure-path only. The status label carries 'poll failed: …' when the background
@@ -530,7 +645,7 @@ def test_monitor_observes_engine(qapp: Any, server: tuple[str, Path]) -> None:
         _spin(qapp, lambda: _has_message(panel, qapp), "delivered message in list", deadline, ctx)
     finally:
         panel.shutdown()
-    assert panel._client is None
+    assert panel._client is None and panel._poll_client is None
 
 
 @pytest.mark.timeout(120)

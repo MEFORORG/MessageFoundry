@@ -33,6 +33,7 @@ GET /ui/messages/{message_id}/edit
 GET /ui/messages/{message_id}/errors
 GET /ui/messages/{message_id}/parse-tree
 GET /ui/messages/{message_id}/resend-confirm
+GET /ui/messages/{message_id}/resend-done
 GET /ui/messages/{message_id}/summary
 GET /ui/mfa
 GET /ui/monitoring

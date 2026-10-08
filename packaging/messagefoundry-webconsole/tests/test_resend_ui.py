@@ -14,10 +14,13 @@ which injects into an INBOUND. Both live in test_webui.py / test_uploaded_logs_u
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlsplit
+from typing import Any
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 import httpx
+import pytest
 from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
@@ -29,6 +32,8 @@ from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection, Registry
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.base import ResendError
+from messagefoundry_webconsole import _auth
 from messagefoundry_webconsole._html import text
 from messagefoundry_webconsole.pages.messages import (
     RESEND_TAIL_WARNING,
@@ -303,13 +308,40 @@ def _registry(tmp_path: Path) -> Registry:
     return reg
 
 
+async def _mint(c: httpx.AsyncClient, mid: str) -> None:
+    """Mint the resend's bound proof the way the console does (vault BACKLOG #2625): a re-auth that
+    continues to the confirm page. The grant names the action, not the target, so one selection
+    serves every target a test posts."""
+    nxt = f"/ui/messages/{mid}/resend-confirm?" + urlencode({"to": "OB2", "source": "archive"})
+    r = await c.post(
+        "/ui/reauth",
+        data={"next": nxt, "password": PW},
+        headers={"Sec-Fetch-Site": "same-origin"},
+    )
+    assert r.status_code == 303 and r.headers["location"] == nxt, r.text
+
+
 async def _post_resend(
-    c: httpx.AsyncClient, mid: str, *, to: str = "OB2", source: str = "archive", key: str = "k1"
+    c: httpx.AsyncClient,
+    mid: str,
+    *,
+    to: str = "OB2",
+    source: str = "archive",
+    key: str = "k1",
+    mint: bool = True,
 ) -> httpx.Response:
-    return await c.post(
+    """POST the resend and, when it completed, follow its 303 to the outcome page, as a browser
+    does (post-redirect-get, vault BACKLOG #2625). Any other answer is returned as it came."""
+    if mint:
+        await _mint(c, mid)
+    posted = await c.post(
         f"/ui/messages/{mid}/resend?to={to}&source={source}&idempotency_key={key}",
         headers={"Sec-Fetch-Site": "same-origin"},
     )
+    location = posted.headers.get("location", "")
+    if posted.status_code == 303 and location.startswith(f"/ui/messages/{mid}/resend-done?"):
+        return await c.get(location)
+    return posted
 
 
 async def test_the_console_resend_queues_a_delivery_and_audits_it(
@@ -442,6 +474,18 @@ async def test_a_target_that_cannot_take_a_delivery_is_reported_as_blocked(
         r = await _post_resend(c, mid, to="OB2")
         assert r.status_code == 400
         assert str(text(RESEND_BLOCKED_NOTICE)) in r.text
+        # Vault BACKLOG #2625: the refusal came after the proof was spent, and left no record of
+        # it, so the same URL again (a Back button, a stale tab) asks for a proof rather than
+        # running on the spent one once the outbound is up.
+        await engine.start()
+        again = await _post_resend(c, mid, to="OB2", mint=False)
+        assert again.status_code == 303 and again.headers["location"].startswith("/ui/reauth?")
+    # The log is not empty (the refusal is audited, with the sign-in and the re-auth), so the
+    # absence of a resend row below is read over real rows, not over nothing.
+    audit = await engine.store.list_audit()
+    assert audit
+    rows = [a for a in audit if a["action"] == "message_resend"]
+    assert rows == []
 
 
 def test_the_409_notice_makes_no_completeness_claim() -> None:
@@ -506,14 +550,14 @@ async def test_the_resend_lane_stands_on_messages_resend_alone(engine: Engine) -
 async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engine: Engine) -> None:
     """A body-carrying POST cannot be auto-retried, and this one is body-LESS only because the
     selection rides the query. So the re-auth is pointed at the CONFIRM page carrying ``to`` and
-    ``source`` -- the operator is not stranded mid-task -- while the stale ``idempotency_key`` is
-    dropped, because the confirm page mints a fresh one and the attempt behind the old key never ran."""
+    ``source`` -- the operator is not stranded mid-task. The ``idempotency_key`` never rides the
+    URL, and is not carried at all: the confirm page mints a fresh one."""
     service = await _service(engine, step_up_max_age=-1)
     await _add(service, "op", Role.OPERATOR.value)
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _login(c, "op")
-        r = await _post_resend(c, mid)
+        r = await _post_resend(c, mid, mint=False)
         assert r.status_code == 303
         location = r.headers["location"]
         assert location.startswith("/ui/reauth?next=")
@@ -522,6 +566,237 @@ async def test_a_stale_step_up_reopens_the_confirm_page_with_the_selection(engin
         params = dict(parse_qsl(urlsplit(nxt).query))
         assert params == {"to": "OB2", "source": "archive"}
         assert "idempotency_key" not in nxt
+
+
+async def test_a_refreshed_outcome_page_sends_nothing(engine: Engine, tmp_path: Path) -> None:
+    """Vault BACKLOG #2625. The resend POST spends a single-use proof, so a refresh that RE-POSTed
+    would meet the gate, not the idempotent handler, and come back through the re-auth to a confirm
+    page with a fresh key. So a completed resend answers 303 to a GET outcome page, and a refresh
+    re-renders that page. The audit row count is the control: one real resend, one row."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        await _mint(c, mid)
+        posted = await c.post(
+            f"/ui/messages/{mid}/resend?to=OB2&source=archive&idempotency_key=k1",
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert posted.status_code == 303
+        done = posted.headers["location"]
+        assert done.startswith(f"/ui/messages/{mid}/resend-done?")
+        for _ in range(2):  # the first view, then the browser's refresh
+            page = await c.get(done)
+            assert page.status_code == 200 and "Resend queued" in page.text
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert len(rows) == 1
+
+
+async def test_a_double_submit_with_one_proof_resends_once_and_says_so(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #2625. A double-click sends two POSTs with the same key and ONE proof. The
+    first spends the proof and queues. The second repeats a resend that already ran, so it asks for
+    no proof: it reaches the idempotent handler and is answered "already resent", with no re-auth
+    in between and nothing queued. The audit count is the control: one real resend, one row."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        await _mint(c, mid)  # the one proof
+        answers = [await _post_resend(c, mid, mint=False) for _ in range(2)]
+        assert answers[0].status_code == 200 and "Resend queued" in answers[0].text
+        assert answers[1].status_code == 200 and "Already resent" in answers[1].text
+        # Control: the repeat really did ride on no proof. A NEW key now has none to spend.
+        fresh = await _post_resend(c, mid, key="k2", mint=False)
+        assert fresh.status_code == 303 and fresh.headers["location"].startswith("/ui/reauth?")
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert len(rows) == 1
+
+
+async def test_two_submits_in_flight_together_ride_one_proof(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """A real double-click: the second POST leaves before the first has committed, so resend_log
+    cannot yet tell it that the key ran. The proof the first spent on that key carries it instead.
+    Both land on the outcome page, one resend is queued, and neither goes to re-auth."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        await _mint(c, mid)  # the one proof
+        answers = await asyncio.gather(*(_post_resend(c, mid, mint=False) for _ in range(2)))
+        assert all(a.status_code == 200 for a in answers), [a.headers for a in answers]
+        assert sum("Resend queued" in a.text for a in answers) == 1
+        assert sum("Already resent" in a.text for a in answers) == 1
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert len(rows) == 1
+
+
+async def test_a_repeat_in_flight_waits_and_takes_the_first_ones_refusal(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2625. A double-click's second POST leaves while the first holds the spent
+    proof, and the handler then refuses the first AFTER the spend. A repeat used to ride that spend
+    and could deliver with no proof of its own. It now waits for the first to settle and is
+    answered with the first one's refusal, without running. The record goes with the refusal, so
+    the same submit again asks for a proof. The engine call count and the audit are the controls."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    entered, release, rider_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def refused_after_the_spend(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        raise ResendError("refused for the test")
+
+    real_await = _auth._SpentForKey.await_settled
+
+    async def noted_await(self: Any, spend: Any) -> bool:
+        rider_waiting.set()
+        return await real_await(self, spend)
+
+    monkeypatch.setattr(engine, "resend", refused_after_the_spend)
+    monkeypatch.setattr(_auth._SpentForKey, "await_settled", noted_await)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        await _mint(c, mid)  # the one proof
+        first = asyncio.create_task(_post_resend(c, mid, mint=False))
+        await entered.wait()  # the first has spent the proof and is inside the handler
+        rider = asyncio.create_task(_post_resend(c, mid, mint=False))
+        await rider_waiting.wait()
+        release.set()
+        answers = await asyncio.gather(first, rider)
+        for answer in answers:
+            assert answer.status_code == 400
+            assert str(text(RESEND_BLOCKED_NOTICE)) in answer.text
+        again = await _post_resend(c, mid, mint=False)
+        assert again.status_code == 303 and again.headers["location"].startswith("/ui/reauth?")
+    assert calls == 1  # neither the repeat nor the resubmit reached the engine
+    audit = await engine.store.list_audit()
+    assert audit
+    rows = [a for a in audit if a["action"] == "message_resend"]
+    assert rows == []
+
+
+async def test_the_same_key_with_another_source_is_no_repeat(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2625. Only an identical request rides. A POST with the same key and target
+    but another source, sent while the first holds the spent proof, is a request of its own: it
+    needs its own proof, so it goes to re-auth at once, without waiting or running."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_resend = engine.resend
+    calls = 0
+
+    async def held(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return await real_resend(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "resend", held)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        await _mint(c, mid)  # the one proof
+        first = asyncio.create_task(_post_resend(c, mid, mint=False))
+        await entered.wait()
+        other = await _post_resend(c, mid, source="other", mint=False)
+        assert other.status_code == 303 and other.headers["location"].startswith("/ui/reauth?")
+        release.set()
+        done = await first
+        assert done.status_code == 200 and "Resend queued" in done.text
+    assert calls == 1
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_resend"]
+    assert len(rows) == 1
+
+
+async def test_a_key_used_for_another_target_is_not_a_repeat(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Only the SAME resend skips the proof. The same key aimed at another outbound is the store's
+    conflict, not a duplicate, so it is spent like any first resend and needs a proof."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        first = await _post_resend(c, mid)
+        assert first.status_code == 200 and "Resend queued" in first.text
+        other = await _post_resend(c, mid, to="OB3", mint=False)
+        assert other.status_code == 303 and other.headers["location"].startswith("/ui/reauth?")
+
+
+async def test_the_outcome_page_echoes_only_connection_names(engine: Engine) -> None:
+    """The resend-done page names a target from its query, so the query must pass the
+    connection-name rule: markup or a space is refused there, not rendered."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        for bad in ({"to": "<b>x</b>"}, {"to": "OB2", "source": "has space"}):
+            r = await c.get(f"/ui/messages/{mid}/resend-done", params=bad)
+            assert r.status_code == 422, (bad, r.status_code)
+        ok = await c.get(f"/ui/messages/{mid}/resend-done", params={"to": "OB2"})
+        assert ok.status_code == 200  # control: a name and no source renders
+
+
+async def test_a_malformed_name_costs_no_proof(engine: Engine) -> None:
+    """The proof is spent after the route's own input check, as on edit-resend, so a name the
+    connection-name rule refuses leaves it for the corrected submit."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        bad = await _post_resend(c, mid, to="9nosuchprefix")
+        assert bad.status_code == 400 and str(text(RESEND_MALFORMED_NOTICE)) in bad.text
+        # No re-mint: the same proof still opens the next submit (it reaches the handler, which
+        # refuses the unregistered target in place rather than the gate sending it to re-auth).
+        again = await _post_resend(c, mid, mint=False)
+        assert again.status_code == 400 and not again.headers.get("location")
+
+
+async def test_a_query_string_key_cannot_preload_the_confirm_page(engine: Engine) -> None:
+    """A crafted link must not set the key: a spent one would make the operator's resend silently
+    do nothing, answered as a duplicate. The confirm page ignores a key in its query and mints one;
+    nothing hands a key to it (vault BACKLOG #2625)."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        page = await c.get(
+            f"/ui/messages/{mid}/resend-confirm",
+            params={"to": "OB2", "source": "archive", "idempotency_key": "planted-key"},
+        )
+        assert page.status_code == 200
+        assert "planted-key" not in page.text
+        assert "idempotency_key=" in page.text  # control: a key was minted
 
 
 async def test_the_longest_accepted_names_still_fit_the_reauth_continuation(
@@ -547,7 +822,7 @@ async def test_the_longest_accepted_names_still_fit_the_reauth_continuation(
     longest = "A" * _RESEND_NAME_MAX
     async with _client(engine, service) as c:
         await _login(c, "op")
-        r = await _post_resend(c, mid, to=longest, source=longest)
+        r = await _post_resend(c, mid, to=longest, source=longest, mint=False)
         assert r.status_code == 303
         follow = await c.get(r.headers["location"])
         # The re-auth page renders; it does not 422 on a `next` this route was willing to build.
