@@ -862,6 +862,10 @@ def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
         if (
             request.method not in {"GET", "HEAD", "OPTIONS"}
             and request.url.path.startswith("/ui")
+            # The console suite's opt-out (its _ui_clients.HEADERLESS_UI_REQUEST). Honoured here
+            # too: one run collects both suites, and this session-scoped wrapper then sits under
+            # the console's own, where it would re-add the header a refusal test left off.
+            and not request.extensions.get("mf_headerless_ui_request")
             and "sec-fetch-site" not in request.headers
             and "origin" not in request.headers
         ):

@@ -28,7 +28,11 @@ Two deliberate departures a reviewer will want to check rather than "fix":
   cross-site ``<form method=post>`` is still ``Sec-Fetch-Mode: navigate``, so the navigate check does
   not stop it. The first version of that split shipped without the assertion and its commit message
   claimed otherwise; this is the correction. A bookmarked or typed navigation is unaffected —
-  ``Sec-Fetch-Site: none`` is not cross-site, and a request carrying neither header raises nothing.
+  ``Sec-Fetch-Site: none`` is not cross-site. A request carrying NEITHER ``Sec-Fetch-Site`` NOR
+  ``Origin`` is refused (BACKLOG #1116, #1124; it used to raise nothing). That includes the GET
+  that runs the POST leg directly when the interstitial is skipped: a browser sends no ``Origin``
+  on a GET navigation, so one that also sends no ``Sec-Fetch-Site`` cannot start a federated
+  sign-in there.
 * **The callback returns 200 + a meta refresh, never a 303.** See :func:`pages.oidc_landing`.
 
 Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter.**
