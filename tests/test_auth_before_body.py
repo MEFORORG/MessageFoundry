@@ -192,8 +192,9 @@ def _fastapi_own_handler(route: APIRoute) -> bool:
 
     It asks the class what it WOULD build. It does not read ``route.app``, the handler that is
     serving, so it cannot tell that a handler was swapped after the route was made. The cases that
-    send requests are what hold that."""
-    name = route.get_route_handler().__qualname__
+    send requests are what hold that. The ``no-store`` stamp on a credential route runs after the
+    endpoint, not in front of the body, so it is looked past (BACKLOG #2372)."""
+    name = inspect.unwrap(route.get_route_handler()).__qualname__
     return name == APIRoute.get_route_handler(route).__qualname__
 
 
