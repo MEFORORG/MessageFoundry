@@ -57,15 +57,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   now answers 409 with an `approval.no_longer_gated` audit row, runs nothing, and leaves the
   request pending for an approver to reject.
 
-### Changed
-- **`tray.log` and the IDE's "MessageFoundry Checks" output now carry UTC time stamps.** A
-  `tray.log` line starts with the engine log's form, `2026-01-02T03:04:05Z`; before, it was local
-  time with no offset. Every line of the Checks output starts with an ISO 8601 UTC instant; before,
-  it carried no time. "Commit baseline anyway" now writes a line there, before it commits, saying
-  the commit hooks were skipped by the user's choice (`git commit --no-verify`). The commit itself
-  is unchanged. The IDE's "MessageFoundry Engine" output is stamped by the editor, in the editor's
-  own format. (vault `BACKLOG #2349`, `BACKLOG #2353`)
-
 ## [0.5.1] — 2026-10-01 — Early Access
 
 ### Changed

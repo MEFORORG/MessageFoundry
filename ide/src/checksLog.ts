@@ -20,16 +20,24 @@ export function writeStamped(
   clock: () => Date = () => new Date(),
 ): void {
   const stamp = clock().toISOString();
-  for (const line of text.split(/\r\n|\r|\n/)) {
-    sink.appendLine(line === "" ? stamp : `${stamp} ${line}`);
-  }
+  const lines = text.split(/\r\n|\r|\n/).map((line) => (line === "" ? stamp : `${stamp} ${line}`));
+  // One write for the block, as before this file existed: check output can run to many lines.
+  sink.appendLine(lines.join("\n"));
 }
 
-/** The record of the one path that commits past a failed required check ("Commit baseline anyway").
+/** The record of the one path that commits past a pre-flight check that did not pass ("Commit
+ *  baseline anyway").
  *
  *  Written BEFORE git runs, so the stamp on it is the time of the user's choice, and it is on the
  *  channel even if the commit then fails. It says in plain words that the hooks were skipped and by
- *  whom, because a stamped line that only said "baseline commit" would not record a bypass. */
-export const BASELINE_BYPASS_RECORD =
-  "--- baseline commit: commit hooks SKIPPED by the user's choice of 'Commit baseline anyway' " +
-  "(git commit --no-verify) after a required check failed; checks are enforced from the next commit ---";
+ *  whom, because a stamped line that only said "baseline commit" would not record a bypass.
+ *
+ *  It gives the pre-flight's exit code and does not say a check "failed": a non-zero code also
+ *  covers a check that could not be started. It makes no claim about later commits either, because
+ *  whether the hook is wired is decided elsewhere. */
+export function baselineBypassRecord(checkExitCode: number): string {
+  return (
+    "--- baseline commit: commit hooks SKIPPED by the user's choice of 'Commit baseline anyway' " +
+    `(git commit --no-verify); the pre-flight 'messagefoundry check' exited with code ${checkExitCode} ---`
+  );
+}

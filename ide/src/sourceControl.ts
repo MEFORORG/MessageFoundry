@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { logChecks, showChecks } from "./checksChannel";
-import { BASELINE_BYPASS_RECORD } from "./checksLog";
+import { baselineBypassRecord } from "./checksLog";
 import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 import { openChannel, postToWebview } from "./webviewMessaging";
@@ -179,13 +179,13 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   notes.push(`hook: ${await scaffoldHook(bin, ws)}`);
   notes.push(`core.hooksPath: ${await wireHooksPath(bin, ws)}`);
 
+  // Logged here, before the prompts below. Every line is time-stamped, so logging these after the
+  // first commit would date the hook install later than the commit it came before.
+  logChecks(["Set Up Version Control & Checks:", ...notes.map((n) => `  • ${n}`)].join("\n"));
+
   await maybeAddRemote(bin, ws);
   await maybeFirstCommit(bin, ws);
 
-  logChecks("Set Up Version Control & Checks:");
-  for (const n of notes) {
-    logChecks(`  • ${n}`);
-  }
   void vscode.window.showInformationMessage("MessageFoundry: version control & checks are set up.");
 }
 
@@ -570,7 +570,7 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   );
   if (choice === "Commit baseline anyway") {
     // Logged before git runs: the stamped line is the timed record of the bypass itself.
-    logChecks(BASELINE_BYPASS_RECORD);
+    logChecks(baselineBypassRecord(chk.code));
     const res = await git(
       bin,
       ["commit", "-m", "Initial commit (MessageFoundry checks enabled)", "--no-verify"],
