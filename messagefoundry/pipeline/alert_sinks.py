@@ -31,7 +31,7 @@ import string
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar
@@ -77,11 +77,20 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-#: #144 (ADR 0128): the injected async connection-control callback the notifier calls when a rule with a
-#: ``control_action`` fires — ``(action, target)`` where ``action`` is ``restart_inbound`` /
-#: ``restart_outbound`` and ``target`` is the connection name. Wired from ``api/app.py`` to the
-#: ``RegistryRunner`` so the sink never imports the runner (ADR 0128 §2).
-ControlCallback = Callable[[str, str], Awaitable[None]]
+
+class ControlCallback(Protocol):
+    """#144 (ADR 0128): the injected async connection-control callback the notifier calls when a rule
+    with a ``control_action`` fires. ``action`` is ``restart_inbound`` / ``restart_outbound`` and
+    ``target`` is the connection name. Wired from ``api/app.py`` to the ``RegistryRunner`` so the sink
+    never imports the runner (ADR 0128 §2).
+
+    ``default_target`` is True when the rule set no ``control_target``, so ``target`` is the event's
+    own bare name. The event does not say which namespace that name came from, and inbound and
+    outbound names are separate namespaces, so the callback must not aim it at the other side
+    (BACKLOG #2528)."""
+
+    def __call__(self, action: str, target: str, *, default_target: bool) -> Awaitable[None]: ...
+
 
 # Bound the in-memory backlog so a wedged transport (unreachable webhook) can't grow without limit;
 # excess events are dropped with a warning rather than stalling the worker that enqueues them.
@@ -1408,9 +1417,12 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     decision.control_action,
                     event["type"],
                 )
+            elif decision.control_target is not None:
+                self._dispatch_control(
+                    decision.control_action, decision.control_target, default_target=False
+                )
             else:
-                target = decision.control_target or subject
-                self._dispatch_control(decision.control_action, target)
+                self._dispatch_control(decision.control_action, subject, default_target=True)
         # #143 (ADR 0044 amendment): the windowed suspend gate — NOTIFICATION-only. The durable instance
         # was already recorded above (AC-3: a suspended alert stays open/counted/visible), and any #144
         # control action already dispatched; a still-active suspend window only mutes the transport enqueue.
@@ -1493,7 +1505,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
-    def _dispatch_control(self, action: str, target: str) -> None:
+    def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
         task, exactly like the ADR 0044 state observer). Synchronous + non-blocking: it only creates the
         task, never awaits the runner, so a slow/hung restart can never stall the worker that emitted the
@@ -1507,7 +1519,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             )
             return
         try:
-            task = asyncio.ensure_future(self._run_control(cb, action, target))
+            task = asyncio.ensure_future(
+                self._run_control(cb, action, target, default_target=default_target)
+            )
         except RuntimeError:
             # No running loop (e.g. a control emit on a non-async test path) — best-effort, drop it rather
             # than raise into the caller. The notification path is unaffected.
@@ -1516,9 +1530,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         task.add_done_callback(self._control_tasks.discard)
 
     @staticmethod
-    async def _run_control(cb: ControlCallback, action: str, target: str) -> None:
+    async def _run_control(
+        cb: ControlCallback, action: str, target: str, *, default_target: bool
+    ) -> None:
         try:
-            await cb(action, target)
+            await cb(action, target, default_target=default_target)
         except Exception:
             # NEVER-RAISE (ADR 0128 §3): a rejected/hung restart (unknown / not-deployed / shard-not-owner
             # connection) must never break alerting or delivery. Swallow + log metadata only (no PHI).

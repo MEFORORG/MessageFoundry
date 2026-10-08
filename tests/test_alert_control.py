@@ -21,14 +21,17 @@ from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
 
 
 class _Control:
-    """Records (action, target) calls; can be told to raise (never-raise contract)."""
+    """Records (action, target) calls, and whether each target was the event's own name; can be
+    told to raise (never-raise contract)."""
 
     def __init__(self, *, fail: bool = False) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.defaults: list[bool] = []
         self.fail = fail
 
-    async def __call__(self, action: str, target: str) -> None:
+    async def __call__(self, action: str, target: str, *, default_target: bool) -> None:
         self.calls.append((action, target))
+        self.defaults.append(default_target)
         if self.fail:
             raise RuntimeError("restart rejected")
 
@@ -40,6 +43,14 @@ class _RecordingTransport:
 
     async def send(self, event: dict[str, Any], **_kw: Any) -> None:
         self.events.append(event)
+
+
+class _FakeRegistry:
+    """The two name tables ``_alert_control_action`` reads from ``RegistryRunner.registry``."""
+
+    def __init__(self, *, inbound: tuple[str, ...], outbound: tuple[str, ...]) -> None:
+        self.inbound = dict.fromkeys(inbound)
+        self.outbound = dict.fromkeys(outbound)
 
 
 async def _drain(sink: NotifierAlertSink) -> None:
@@ -267,6 +278,7 @@ async def test_callback_maps_action_to_runner_restart() -> None:
     class _FakeRunner:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str]] = []
+            self.registry = _FakeRegistry(inbound=(), outbound=("OB_X",))
 
         def inbound_filtered(self, name: str) -> str | None:
             return None
@@ -282,8 +294,10 @@ async def test_callback_maps_action_to_runner_restart() -> None:
     class _FakeEngine:
         registry_runner = rr
 
-    async def _alert_control(action: str, target: str) -> None:
-        await _alert_control_action(cast(Any, _FakeEngine()), action, target)
+    async def _alert_control(action: str, target: str, *, default_target: bool) -> None:
+        await _alert_control_action(
+            cast(Any, _FakeEngine()), action, target, default_target=default_target
+        )
 
     rule = AlertRule(event_type="connection_stopped", control_action="restart_outbound")
     sink = NotifierAlertSink([_RecordingTransport()], rules=[rule])
@@ -354,3 +368,84 @@ async def test_a_real_connection_stopped_still_restarts_the_explicit_target() ->
     sink.connection_stopped("OB_LAB", detail="boom")
     await _drain(sink)
     assert cb.calls == [("restart_inbound", "IB_FEED")]
+
+
+# --- BACKLOG #2528: with no control_target, a bare name never reaches the other side's restart ----
+
+
+async def test_the_sink_says_whether_the_target_is_the_events_own_name() -> None:
+    cb = _Control()
+    rules = [
+        AlertRule(
+            event_type="connection_stopped", connection="OB_*", control_action="restart_outbound"
+        ),
+        AlertRule(
+            event_type="queue_buildup", control_action="restart_inbound", control_target="IB_FEED"
+        ),
+    ]
+    sink = NotifierAlertSink([_RecordingTransport()], rules=rules)
+    sink.set_control_callback(cb)
+    sink.connection_stopped("OB_X", detail="boom")
+    sink.queue_buildup("OB_Y", depth=1, oldest_age_seconds=1.0)
+    await _drain(sink)
+    assert cb.calls == [("restart_outbound", "OB_X"), ("restart_inbound", "IB_FEED")]
+    assert cb.defaults == [True, False]
+
+
+class _RecordingRunner:
+    def __init__(self, *, inbound: tuple[str, ...], outbound: tuple[str, ...]) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.registry = _FakeRegistry(inbound=inbound, outbound=outbound)
+
+    def inbound_filtered(self, name: str) -> str | None:
+        return None
+
+    async def restart_inbound(self, name: str) -> None:
+        self.calls.append(("restart_inbound", name))
+
+    async def restart_outbound(self, name: str) -> None:
+        self.calls.append(("restart_outbound", name))
+
+
+async def _control_action(
+    rr: _RecordingRunner, action: str, target: str, *, default_target: bool
+) -> list[tuple[str, str]]:
+    from messagefoundry.api.app import _alert_control_action
+
+    class _FakeEngine:
+        registry_runner = rr
+
+    await _alert_control_action(
+        cast(Any, _FakeEngine()), action, target, default_target=default_target
+    )
+    return rr.calls
+
+
+@pytest.mark.parametrize(
+    ("action", "own_side", "other_side"),
+    [("restart_inbound", "inbound", "outbound"), ("restart_outbound", "outbound", "inbound")],
+)
+async def test_a_default_target_runs_only_on_its_own_side(
+    action: str, own_side: str, other_side: str
+) -> None:
+    def runner(**sides: tuple[str, ...]) -> _RecordingRunner:
+        return _RecordingRunner(
+            inbound=sides.get("inbound", ()), outbound=sides.get("outbound", ())
+        )
+
+    # Declared on the action's side only: the event came from there, so the restart runs.
+    assert await _control_action(
+        runner(**{own_side: ("FEED",)}), action, "FEED", default_target=True
+    ) == [(action, "FEED")]
+    # Declared on the other side only: before #2528 the bare name was aimed at this side anyway.
+    assert (
+        await _control_action(
+            runner(**{other_side: ("FEED",)}), action, "FEED", default_target=True
+        )
+        == []
+    )
+    # Declared on both sides: the event does not say which one fired, so nothing restarts.
+    both = runner(**{own_side: ("FEED",), other_side: ("FEED",)})
+    assert await _control_action(both, action, "FEED", default_target=True) == []
+    # An explicit control_target names its side through the action, so it still runs.
+    assert await _control_action(both, action, "FEED", default_target=False) == [(action, "FEED")]

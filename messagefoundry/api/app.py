@@ -782,16 +782,45 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
     return identity.can_access_channel(channel_id)
 
 
-async def _alert_control_action(engine: Engine, action: str, target: str) -> None:
+async def _alert_control_action(
+    engine: Engine, action: str, target: str, *, default_target: bool = False
+) -> None:
     """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
 
     Re-reads ``engine.registry_runner`` on each call, so it stays right across a reload that swaps
     the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067); that
     is the rule working as designed, not a failure, so it is logged once here at INFO and nothing
-    else happens. Any other error reaches the notifier, which logs it and never raises."""
+    else happens. Any other error reaches the notifier, which logs it and never raises.
+
+    ``default_target`` means the rule set no ``control_target``, so ``target`` is the event's own
+    bare name, and the event does not say whether that name is an inbound or an outbound. The two
+    are separate namespaces (BACKLOG #2528). So the restart runs only when the name is declared on
+    the action's side and not on the other: then the event can only have come from that side. A
+    name declared on both sides, or only on the other, is skipped with a WARNING that says to set
+    ``control_target``. A config-load refusal cannot do this, because a rule does not know the
+    graph and a reload can change it."""
     rr = engine.registry_runner
     if rr is None:
         return
+    if default_target:
+        wanted = "inbound" if action == "restart_inbound" else "outbound"
+        sides = {
+            side
+            for side, names in (
+                ("inbound", rr.registry.inbound),
+                ("outbound", rr.registry.outbound),
+            )
+            if target in names
+        }
+        if sides != {wanted}:
+            _log.warning(
+                "alert control_action %s for %r skipped: the rule sets no control_target and the "
+                "name is not declared as an %s connection only; set control_target",
+                action,
+                target,
+                wanted,
+            )
+            return
     if action == "restart_inbound":
         if rr.inbound_filtered(target) is not None:
             # An operator start of a parked inbound overrides the profile; a rule is the engine,
@@ -9787,8 +9816,10 @@ def create_managed_app(
             # runner. The sink dispatches this off-worker + never-raise, so exceptions here are logged, not fatal.
             if notifier is not None:
 
-                async def _alert_control(action: str, target: str) -> None:
-                    await _alert_control_action(engine, action, target)
+                async def _alert_control(action: str, target: str, *, default_target: bool) -> None:
+                    await _alert_control_action(
+                        engine, action, target, default_target=default_target
+                    )
 
                 notifier.set_control_callback(_alert_control)
             app.state.engine = engine
