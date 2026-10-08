@@ -183,17 +183,13 @@ class AlertSink(Protocol):
         the existing per-connection stop machinery still sees the stop and names its cause."""
         ...
 
-    def log_forward_failed(self, name: str, *, kind: str, reason: str, count: int = 0) -> None:
-        """The **off-box log forwarder** is absent or losing records (BACKLOG #2612). ``name`` is
-        ``forwarder:<kind>``, so each kind is its own alert. ``kind`` is one of three fixed words. ``not_installed``: a
-        forwarder was configured and did not start, so this process sends nothing off the host.
-        ``dropping``: records were lost since the last look. ``spool_unreadable``: the on-disk
-        spool could not be read, so what it holds is kept and not sent. ``reason`` is fixed words
-        naming the cause, and ``count`` is how many records or reads since the last look.
+    def log_forward_failed(self, name: str, *, reason: str, count: int = 0) -> None:
+        """The **off-box log forwarder** is absent, losing records or not sending (BACKLOG #2612).
+        ``name`` is ``forwarder:<kind>``, so each kind is its own alert; ``reason`` is fixed words
+        naming the cause; ``count`` is a count since the process started. The kinds, and when
+        each fires, are stated once, in ``pipeline/log_forward_watch.py``, which emits this.
 
-        Counts and fixed words only: never a record, a host name or an exception text. Emitted by
-        the ``RegistryRunner``, once per process for ``not_installed`` and at most once per
-        re-alert window for the other two. Each engine shard reports its own forwarder."""
+        Counts and fixed words only: never a record, a host name or an exception text."""
         ...
 
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
@@ -710,10 +706,10 @@ class LoggingAlertSink:
             "" if stopped is None else f"; {stopped} connection(s) stopped",
         )
 
-    def log_forward_failed(self, name: str, *, kind: str, reason: str, count: int = 0) -> None:
+    def log_forward_failed(self, name: str, *, reason: str, count: int = 0) -> None:
         # This default sink LOGS, and stdout still works when the forwarder does not. The line
         # also goes to the forwarder it is about, where it may be the next record lost.
-        log.warning("ALERT log_forward_failed: %s %s (%s; count %d)", name, kind, reason, count)
+        log.warning("ALERT log_forward_failed: %s (%s; count %d)", name, reason, count)
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         log.warning(

@@ -171,8 +171,8 @@ def _log_forwarder_reason(forwarder: LogForwarderInfo | None) -> str | None:
         parts.append(f"{forwarder.lost} record(s) lost since start")
     if forwarder.send_failing:
         parts.append("the collector is not answering")
-    if forwarder.spool_read_errors:
-        parts.append(f"{forwarder.spool_read_errors} spool read(s) failed")
+    if forwarder.spool_read_faulted:
+        parts.append("the on-disk spool cannot be read")
     return "off-box log forwarding is degraded: " + "; ".join(parts)
 
 

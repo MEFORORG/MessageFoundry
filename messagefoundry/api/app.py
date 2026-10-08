@@ -711,7 +711,9 @@ def _log_forwarder_health() -> LogForwarderInfo | None:
         unsent=status.unsent,
         undeliverable=status.undeliverable,
         spool_dropped=status.spool_dropped,
+        spool_skipped=status.spool_skipped,
         spool_read_errors=status.spool_read_errors,
+        spool_read_faulted=status.spool_read_faulted,
     )
 
 

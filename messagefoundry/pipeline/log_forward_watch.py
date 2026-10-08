@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""Page when the off-box log forwarder is absent, losing records, or not sending (BACKLOG #2612).
+
+The forwarder counts its own drops on its own threads, and ``logging_setup`` may not import the
+alert sink. So this watch reads :func:`~messagefoundry.logging_setup.forwarder_status` on a timer
+and turns a reading into a ``log_forward_failed`` alert. The read is memory only: no socket, no
+disk, no store.
+
+**One per engine process, whoever leads.** The forwarder hangs on the process's root logger, so a
+cluster standby and every engine shard has its own, and each watches its own. That is why this is
+an engine maintenance task, like the certificate monitor, and not part of the message graph.
+
+**What fires, and how often.** Four kinds, each its own alert key (``forwarder:<kind>``):
+
+* ``not_installed``: a forwarder was configured and is not attached. Once, until it is attached
+  again. The reason is the start failure's fixed word, or ``stopped`` when it went away later.
+* ``dropping``: a loss counter rose. The count is every record lost since the process started.
+* ``spool_unreadable``: the on-disk spool could not be read. Held, not lost.
+* ``not_sending``: every send has failed for a whole re-alert window. With a spool nothing is
+  lost yet, which is exactly why nothing else would say so.
+
+The last three share one throttle of :data:`REALERT_SECONDS`. The default sink's alert is a log
+line, and a log line is one more record for a forwarder that is already losing them.
+
+The alert carries counts and fixed words only: never a record, a host name or an error text.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import time
+from collections.abc import Callable
+
+from messagefoundry.logging_setup import FORWARD_LOSS_COUNTERS, ForwarderStatus, forwarder_status
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+
+__all__ = ["CHECK_INTERVAL_SECONDS", "REALERT_SECONDS", "LogForwardWatch"]
+
+log = logging.getLogger(__name__)
+
+#: How often the watch reads the forwarder.
+CHECK_INTERVAL_SECONDS = 30.0
+#: The least time between two alerts while a fault stands, and how long sends must keep failing
+#: before ``not_sending`` fires. The same five minutes the queue-buildup alert re-fires on.
+REALERT_SECONDS = 300.0
+
+#: The first part of the alert key. Not a connection name: the key always carries a colon.
+_LABEL = "forwarder"
+
+
+def _restarted(status: ForwarderStatus, last: ForwarderStatus) -> bool:
+    """Whether a count went DOWN since ``last``. Counts only rise in one forwarder, so this is a
+    forwarder that was built again, and its counts are measured from zero."""
+    return status.spool_read_errors < last.spool_read_errors or any(
+        getattr(status, field) < getattr(last, field) for field, _ in FORWARD_LOSS_COUNTERS
+    )
+
+
+class LogForwardWatch:
+    """Reads the forwarder every :data:`CHECK_INTERVAL_SECONDS` and raises ``log_forward_failed``.
+    :meth:`start`/:meth:`stop` run the loop; :meth:`run_once` is one pass, for tests too."""
+
+    def __init__(
+        self,
+        *,
+        alert_sink: AlertSink | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        read: Callable[[], ForwarderStatus] = forwarder_status,
+    ) -> None:
+        self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
+        self._clock = clock
+        self._read = read
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._absent_alerted = False
+        #: The reading the last alert was raised on. A rise is measured from it.
+        self._alerted = ForwarderStatus()
+        self._next_alert = 0.0
+        #: When sends started failing without a break, or ``None`` while one succeeds.
+        self._failing_since: float | None = None
+
+    def start(self) -> None:
+        """Spawn the loop. Its first pass runs at once, so a forwarder that did not start pages at
+        start and not one interval later."""
+        if self._task is not None:
+            return
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        """Signal the loop and await its exit (idempotent)."""
+        self._stop.set()
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.run_once()
+            except Exception:
+                # The state a failed pass did not commit is retried by the next one.
+                log.exception("log forwarder check failed; the next pass retries")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), CHECK_INTERVAL_SECONDS)
+
+    def run_once(self) -> None:
+        """One pass. State moves only AFTER the sink took the alert, so a sink that raises leaves
+        the pass to be tried again."""
+        status = self._read()
+        if not status.configured:
+            return
+        if not status.installed:
+            if not self._absent_alerted:
+                self._fire("not_installed", status.start_failure or "stopped")
+                self._absent_alerted = True
+            return
+        self._absent_alerted = False
+        now = self._clock()
+        if not status.send_failing:
+            self._failing_since = None
+        elif self._failing_since is None:
+            self._failing_since = now
+        last = ForwarderStatus() if _restarted(status, self._alerted) else self._alerted
+        rose = [
+            word
+            for field, word in FORWARD_LOSS_COUNTERS
+            if getattr(status, field) > getattr(last, field)
+        ]
+        unread = status.spool_read_errors > last.spool_read_errors
+        stuck = self._failing_since is not None and now - self._failing_since >= REALERT_SECONDS
+        if not (rose or unread or stuck) or now < self._next_alert:
+            return
+        if rose:
+            self._fire("dropping", ",".join(rose), status.lost)
+        if unread:
+            self._fire("spool_unreadable", "spool_read_failed", status.spool_read_errors)
+        if stuck and not rose:  # with a loss, "dropping" has already said the collector is down
+            self._fire("not_sending", "collector_unreachable")
+        self._alerted = status
+        self._next_alert = now + REALERT_SECONDS
+
+    def _fire(self, kind: str, reason: str, count: int = 0) -> None:
+        # The kind is in the key because the notifier throttles and de-duplicates on it: two
+        # kinds raised in one pass would otherwise be one notification and one alert row.
+        self._alert_sink.log_forward_failed(f"{_LABEL}:{kind}", reason=reason, count=count)
