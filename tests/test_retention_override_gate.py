@@ -10,24 +10,27 @@ them: refuse under enforce, warn under warn, AUDIT once acknowledged.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from messagefoundry.__main__ import _chain_registry_guards, main
+from messagefoundry.checks import CheckReport, CheckResult, run_checks
 from messagefoundry.config.retention_classification import (
     auto_bounded_windows,
     keep_forever_overrides,
     make_retention_override_guard,
 )
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import EgressSettings, StoreBackend
 from messagefoundry.config.wiring import Registry, WiringError, load_config
+from messagefoundry.pipeline import supervisor as supervisor_mod
 from messagefoundry.pipeline.engine import Engine
 from tests.test_cli import _SECURE_ALERTS, _SECURE_RETENTION, _run_secure_serve
 
@@ -328,3 +331,187 @@ def test_connection_upsert_says_which_settings_it_read_when_none_were_named(
     out = capsys.readouterr().out
     assert rc == 1 and "No --service-config was given" in out
     assert "this edit is then checked against that instance's [security] settings" in out
+
+
+# --- check and supervise read the guard's decision (vault BACKLOG #2368 follow-up) ---------------
+
+
+def _overrides_leg(cfg: Path, service_toml: str) -> tuple[CheckReport, CheckResult]:
+    """The ``retention-overrides`` leg for ``cfg`` judged against ``service_toml``."""
+    svc = cfg.parent / "svc.toml"
+    svc.write_text(service_toml, encoding="utf-8")
+    report = run_checks(cfg, run_lint=False, service_config=svc)
+    return report, next(r for r in report.results if r.name == "retention-overrides")
+
+
+def test_check_refuses_the_graph_the_guard_refuses_in_the_guards_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_posture_env(monkeypatch)
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=0)
+    with pytest.raises(WiringError) as refused:
+        _guard(acknowledged=False, enforcing=True)(registry)
+
+    report, leg = _overrides_leg(tmp_path / "cfg", 'ai.environment = "prod"\n')
+
+    assert leg.required and not leg.ok and not leg.skipped
+    assert leg.detail == f"serve would refuse this graph: {refused.value}"
+    assert not report.ok
+
+
+@pytest.mark.parametrize(
+    ("switch", "written"),
+    [
+        ("security.allow_keeping_phi_indefinitely = true\n", "AUDIT: the retention gate"),
+        ('security.enforcement = "warn"\n', "a per-connection retention override keeps"),
+    ],
+)
+def test_check_passes_and_carries_what_the_guard_would_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    switch: str,
+    written: str,
+) -> None:
+    _clear_posture_env(monkeypatch)
+    _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    capsys.readouterr()
+
+    with caplog.at_level(logging.WARNING):
+        _, leg = _overrides_leg(tmp_path / "cfg", 'ai.environment = "prod"\n' + switch)
+
+    assert leg.ok and not leg.skipped
+    assert leg.detail.startswith(f"serve would load this graph and write: warning: {written}")
+    assert "IB_FEED" in leg.detail
+    # The leg reports what the guard would write. It writes no AUDIT line or warning of its own.
+    assert "AUDIT:" not in capsys.readouterr().err
+    assert not [r for r in caplog.records if "retention" in r.getMessage()]
+
+
+def test_check_passes_a_graph_with_no_keep_forever_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_posture_env(monkeypatch)
+    _graph(tmp_path / "cfg", inbound_days=7, outbound_days=None)
+    _, leg = _overrides_leg(tmp_path / "cfg", 'ai.environment = "prod"\n')
+    assert leg.ok and not leg.skipped
+    assert leg.detail == "no connection's own retention override keeps its PHI bodies indefinitely"
+
+
+def test_check_skips_the_override_leg_where_serve_builds_no_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_posture_env(monkeypatch)
+    cfg = tmp_path / "cfg"
+    _graph(cfg, inbound_days=0, outbound_days=None)
+    # No active environment: serve stops before it builds the guard.
+    _, leg = _overrides_leg(cfg, "")
+    assert leg.skipped and leg.detail == "no active environment set"
+    # No settings at all: a bare config dir declares no posture to judge the override against.
+    monkeypatch.chdir(tmp_path)
+    bare = run_checks(cfg, run_lint=False, suppress_service_toml_search=True)
+    assert next(r for r in bare.results if r.name == "retention-overrides").skipped
+
+
+_SUPERVISE_DISCOVERY: dict[str, Any] = {
+    "store_backend": StoreBackend.SQLITE,
+    "db_base": "override.db",
+    "base_port": 18990,
+}
+
+
+@pytest.mark.asyncio
+async def test_supervise_refuses_once_before_it_starts_an_engine_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A graph the guard refuses never reaches a ``Supervisor``, and the exit code is 2."""
+    _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    built: list[object] = []
+    monkeypatch.setattr(supervisor_mod, "Supervisor", lambda specs: built.append(specs))
+
+    def refuse(registry: Registry) -> None:
+        raise WiringError(f"refused: {keep_forever_overrides(registry)}")
+
+    # Control: without a guard, discovery alone would have built the engine shard.
+    assert len(supervisor_mod.discover_shard_specs(str(tmp_path / "cfg"), **_SUPERVISE_DISCOVERY))
+    with caplog.at_level(logging.ERROR, logger=supervisor_mod.__name__):
+        code = await supervisor_mod.supervise(
+            str(tmp_path / "cfg"),
+            install_signal_handlers=False,
+            registry_guard=refuse,
+            **_SUPERVISE_DISCOVERY,
+        )
+
+    assert code == 2
+    assert built == []
+    assert "refused:" in caplog.text and "IB_FEED" in caplog.text
+
+
+def _supervise_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_toml: str
+) -> Callable[[Registry], None]:
+    """The registry guard the ``supervise`` command hands the supervisor, with the fleet stubbed."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.crypto import generate_key
+
+    handed: dict[str, object] = {}
+
+    async def fake_supervise(config: str, **kwargs: object) -> int:
+        handed.update(kwargs)
+        return 0
+
+    _clear_posture_env(monkeypatch)
+    # The at-rest gate comes first in supervise; this test is about the gate after it.
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(service_toml, encoding="utf-8")
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
+    monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: None)
+    args = argparse.Namespace(
+        config=str(tmp_path / "cfg"),
+        db=str(tmp_path / "mefor.db"),
+        base_port=8765,
+        env="prod",
+        service_config=None,
+        project_root=str(tmp_path),
+    )
+    assert cli._supervise(args) == 0
+    return cast("Callable[[Registry], None]", handed["registry_guard"])
+
+
+def test_the_supervise_command_hands_over_a_guard_that_refuses_the_fleet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = _graph(tmp_path / "cfg", inbound_days=None, outbound_days=0)
+    with pytest.raises(WiringError) as engine_refusal:
+        _guard(acknowledged=False, enforcing=True)(registry)
+
+    guard = _supervise_guard(tmp_path, monkeypatch, "")
+
+    with pytest.raises(WiringError) as fleet_refusal:
+        guard(registry)
+    # The engine shard's own refusal, then why the fleet stops. --env names the environment.
+    assert str(fleet_refusal.value) == (
+        f"{engine_refusal.value}. Every engine shard would refuse this graph; refusing to start "
+        "the fleet."
+    )
+    guard(_graph(tmp_path / "ok", inbound_days=None, outbound_days=30))
+
+
+@pytest.mark.parametrize(
+    "switch",
+    ["security.allow_keeping_phi_indefinitely = true\n", 'security.enforcement = "warn"\n'],
+)
+def test_the_supervise_guard_passes_what_an_engine_shard_would_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    switch: str,
+) -> None:
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=0)
+    guard = _supervise_guard(tmp_path, monkeypatch, switch)
+    capsys.readouterr()
+    guard(registry)
+    # Refusal only: the warning and the AUDIT line are each engine shard's to write.
+    assert capsys.readouterr().err == ""

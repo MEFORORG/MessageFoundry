@@ -61,6 +61,8 @@ reads.
 ``retention`` is required too (vault BACKLOG #2280): it FAILS settings the retention start gate
 refuses, an explicit 0 on an auto-bounded PHI window or a warn-only tier with neither a window nor
 its acknowledgement. It calls the function ``serve`` calls, so the refusal reads the same.
+``retention-overrides`` (vault BACKLOG #2368) is its graph half: it FAILS a connection's own
+``messages_days = 0`` or ``dead_letter_days = 0`` that ``serve``'s registry guard refuses.
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
@@ -312,6 +314,16 @@ def run_checks(
         # Required, so the gate refuses what serve refuses, in serve's words.
         _with_source(
             _check_retention(
+                config_dir,
+                service_config=service_config,
+                suppress_search=suppress_service_toml_search,
+            ),
+            env_only,
+        ),
+        # Vault BACKLOG #2368: serve's registry guard refuses a connection's own keep-forever
+        # retention override nobody acknowledged. Required, for the same reason.
+        _with_source(
+            _check_retention_overrides(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
@@ -3534,6 +3546,99 @@ def _check_retention(
         ok=True,
         required=True,
         detail="serve would start and write: " + " | ".join(line.text for line in outcome.lines),
+    )
+
+
+def _check_retention_overrides(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Report the refusal ``serve`` applies to a connection's own keep-forever retention override,
+    at commit/CI time (vault BACKLOG #2368).
+
+    An inbound ``messages_days = 0`` or an outbound ``dead_letter_days = 0`` keeps that
+    connection's PHI bodies forever. ``serve`` hands the engine a registry guard that refuses such
+    a graph under ``enforce`` unless ``[security].allow_keeping_phi_indefinitely`` is set, and this
+    gate passed it. The decision is
+    :func:`~messagefoundry.config.retention_classification.judge_keep_forever_overrides`, the
+    function that guard calls, so for the same graph and switches the two agree and the refusal
+    reads the same.
+
+    A refusal FAILS this leg. Where the guard would report and pass the graph, the acknowledged
+    case and ``enforcement = warn``, the leg passes and its line carries what the guard would
+    write. It writes no AUDIT line itself.
+
+    Required, with the fail-safe SKIPs of :func:`_check_build`: no ``messagefoundry.toml`` and no
+    ``MEFOR_AI_ENVIRONMENT`` → SKIP; a graph that won't load → SKIP (``validate`` reports it);
+    settings that won't load → FAIL (BACKLOG #1318). It also SKIPs with no active environment,
+    because ``serve`` stops there before it builds the guard."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.retention_classification import judge_keep_forever_overrides
+    from messagefoundry.config.settings import SecurityEnforcement
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    name = "retention-overrides"
+    toml, env_only = _settings_source(
+        config_dir, service_config=service_config, suppress_search=suppress_search
+    )
+    if toml is None and not env_only:
+        return CheckResult(
+            name,
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
+        )
+    try:
+        settings = _load_check_settings(toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            name,
+            ok=False,
+            required=True,
+            detail=f"settings did not load: {_settings_error(exc)}",
+        )
+    env_name = settings.ai.environment
+    if env_name is None:
+        return CheckResult(
+            name, ok=True, required=True, skipped=True, detail="no active environment set"
+        )
+    try:
+        # allow_empty: same reason as build-check (BACKLOG #1648). With zero connections there is
+        # no override to judge and the leg passes, which is the honest answer.
+        registry = load_config(config_dir, allow_empty=True)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=True, skipped=True, detail=f"config did not load: {exc}"
+        )
+    verdict = judge_keep_forever_overrides(
+        registry,
+        acknowledged=settings.retention.allow_unbounded_phi,
+        enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+        env_name=env_name,
+    )
+    if verdict.refusal is not None:
+        return CheckResult(
+            name,
+            ok=False,
+            required=True,
+            detail=f"serve would refuse this graph: {verdict.refusal}",
+        )
+    if verdict.report is not None:
+        return CheckResult(
+            name,
+            ok=True,
+            required=True,
+            detail=f"serve would load this graph and write: warning: {verdict.report}",
+        )
+    return CheckResult(
+        name,
+        ok=True,
+        required=True,
+        detail="no connection's own retention override keeps its PHI bodies indefinitely",
     )
 
 

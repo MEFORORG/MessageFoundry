@@ -577,6 +577,53 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
     )
 
 
+@dataclass(frozen=True, slots=True)
+class OverrideVerdict:
+    """What :func:`judge_keep_forever_overrides` decided about one graph."""
+
+    #: :func:`keep_forever_overrides` for the graph. Empty when no override keeps bodies forever.
+    kept: tuple[str, ...]
+    #: Why an enforcing instance refuses the graph, or ``None`` when it does not.
+    refusal: str | None
+    #: The line a graph load reports and still passes the graph: the ``AUDIT:`` line once
+    #: acknowledged, or the same reason as a warning under ``enforcement = warn``. Else ``None``.
+    report: str | None
+
+
+def judge_keep_forever_overrides(
+    registry: Registry, *, acknowledged: bool, enforcing: bool, env_name: str | None
+) -> OverrideVerdict:
+    """Decide a graph's keep-forever overrides: refuse, report, or neither.
+
+    The one decision behind :func:`make_retention_override_guard`, ``messagefoundry check`` and
+    the ``supervise`` pre-check (vault BACKLOG #2368), so those three reach the same verdict in
+    the same words for the same registry and switches. It prints and logs nothing.
+
+    ``acknowledged`` is the loaded ``[security].allow_keeping_phi_indefinitely``. With it the
+    graph passes and :attr:`OverrideVerdict.report` is the ``AUDIT:`` line, on either dial.
+    Without it an enforcing instance refuses, and under ``enforcement = warn`` the reason is
+    reported instead."""
+    kept = keep_forever_overrides(registry)
+    if not kept:
+        return OverrideVerdict(kept=kept, refusal=None, report=None)
+    if acknowledged:
+        return OverrideVerdict(
+            kept=kept,
+            refusal=None,
+            report=(
+                f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a "
+                "graph with per-connection unbounded data retention "
+                f"({BODY_ACKNOWLEDGEMENT_SETTING}=true; {'; '.join(kept)}) -- once that graph is "
+                "live, these connections' PHI message bodies are retained INDEFINITELY (retention "
+                "opt-out override)."
+            ),
+        )
+    reason = keep_forever_override_refusal(kept, env_name=env_name)
+    if enforcing:
+        return OverrideVerdict(kept=kept, refusal=reason, report=None)
+    return OverrideVerdict(kept=kept, refusal=None, report=reason)
+
+
 def make_retention_override_guard(
     *, acknowledged: bool, enforcing: bool, env_name: str, log: logging.Logger
 ) -> Callable[[Registry], None]:
@@ -593,9 +640,11 @@ def make_retention_override_guard(
     It is not a copy of the body-window gate. At least this differs: that gate writes its AUDIT
     line only under ``enforce``, and this guard writes one on either dial.
 
-    It runs only where the engine calls its registry guard. At least these do not:
-    ``Engine.add_registry`` called by an embedder, the DR re-apply path, and
-    ``messagefoundry check``.
+    It runs only where the engine calls its registry guard. At least these do not call it:
+    ``Engine.add_registry`` called by an embedder, and the DR re-apply path.
+    ``messagefoundry check`` and ``supervise`` do not call it either. Each reads the decision it
+    makes, :func:`judge_keep_forever_overrides`, and reports a refusal in its own way; neither
+    writes the AUDIT line.
 
     The AUDIT line is written each time the guard passes such a graph. That includes a dry-run
     reload, and a reload a later check then refuses, so the line says the gate passed the graph and
@@ -608,30 +657,18 @@ def make_retention_override_guard(
     Like the static-credential guard, it judges every graph against the settings the process started
     with: a reload re-reads the graph and never ``[security]``."""
 
-    def report(line: str) -> None:
-        log.warning("%s", line)
-        print(f"warning: {line}", file=sys.stderr)
-
     def guard(registry: Registry) -> None:
-        kept = keep_forever_overrides(registry)
-        if not kept:
-            return
-        if acknowledged:
-            report(
-                f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a "
-                "graph with per-connection unbounded data retention "
-                f"({BODY_ACKNOWLEDGEMENT_SETTING}=true; {'; '.join(kept)}) -- once that graph is "
-                "live, these connections' PHI message bodies are retained INDEFINITELY (retention "
-                "opt-out override)."
-            )
-            return
-        reason = keep_forever_override_refusal(kept, env_name=env_name)
-        if enforcing:
+        verdict = judge_keep_forever_overrides(
+            registry, acknowledged=acknowledged, enforcing=enforcing, env_name=env_name
+        )
+        if verdict.report is not None:
+            log.warning("%s", verdict.report)
+            print(f"warning: {verdict.report}", file=sys.stderr)
+        if verdict.refusal is not None:
             # Imported here: wiring is the heavy end of the config package, and this module is
             # otherwise a leaf the settings model can read.
             from messagefoundry.config.wiring import WiringError
 
-            raise WiringError(reason)
-        report(reason)
+            raise WiringError(verdict.refusal)
 
     return guard

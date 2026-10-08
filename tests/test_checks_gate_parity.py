@@ -602,6 +602,7 @@ _SETTINGS_LEGS = (
     "upstream-hop-ack",
     "oidc-revocation",
     "retention",
+    "retention-overrides",
     "oidc-auth-params",
     "static-credentials",
     "alert-smtp-tls",

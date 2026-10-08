@@ -960,7 +960,11 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > each of those windows to an explicit number of days.
 >
 > The acknowledgement is read once, at startup. `messagefoundry connection upsert` and `remove` refuse
-> an edit an enforcing engine would refuse. `messagefoundry check` does not run this gate.
+> an edit an enforcing engine would refuse. `messagefoundry check` reads the same decision as a
+> required check, `retention-overrides`, so a graph an enforcing engine would refuse fails the check
+> in the same words. `supervise` reads it once before it starts an engine shard, and refuses to start
+> the fleet on a graph each engine shard would refuse. Neither writes the warning or the `AUDIT:`
+> line; those belong to the engine that loads the graph.
 
 > **Backend coverage.** The retention/purge pass is **backend-agnostic** and every PHI purge runs on
 > **all three** backends (SQLite, SQL Server, Postgres). `wal_checkpoint_seconds` and `vacuum_at` are

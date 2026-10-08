@@ -4521,6 +4521,28 @@ def _supervise(args: argparse.Namespace) -> int:
     if not _generated_tls_key_gate(settings, state_dir, enforcing=enforcing):
         return 2
 
+    # Vault BACKLOG #2368: a connection's own keep-forever retention override. Each engine shard's
+    # `serve` refuses the whole graph on it, so the supervisor would only restart them. It is a
+    # graph refusal, so it runs where the supervisor loads the graph, and is reported the way
+    # that load's other refusals are. Refusal only: the warning and the AUDIT line belong to the
+    # engine shards, which each write their own.
+    from messagefoundry.config.retention_classification import judge_keep_forever_overrides
+    from messagefoundry.config.wiring import WiringError
+
+    def refuse_keep_forever_overrides(registry: Registry) -> None:
+        verdict = judge_keep_forever_overrides(
+            registry,
+            acknowledged=settings.retention.allow_unbounded_phi,
+            enforcing=enforcing,
+            # The engine shards take --env; the settings loaded here do not carry it.
+            env_name=args.env if args.env is not None else settings.ai.environment,
+        )
+        if verdict.refusal is not None:
+            raise WiringError(
+                f"{verdict.refusal}. Every engine shard would refuse this graph; refusing to "
+                "start the fleet."
+            )
+
     return run_guarded(
         supervise(
             config,
@@ -4530,6 +4552,7 @@ def _supervise(args: argparse.Namespace) -> int:
             env=args.env,
             service_config=args.service_config,
             project_root=args.project_root,
+            registry_guard=refuse_keep_forever_overrides,
         )
     )
 
