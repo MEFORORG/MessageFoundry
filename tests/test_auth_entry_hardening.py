@@ -236,6 +236,86 @@ async def test_admin_write_gap_zero_admits_back_to_back_writes(
     assert not svc.allow_admin_write("a")  # the count still binds at the thirteenth
 
 
+def test_limiter_retry_after_is_the_wait_of_the_gate_that_fired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #2144: the wait a refusal's Retry-After carries. The count gate waits for the key's
+    # oldest hit to leave the window; the gap gate waits out the gap; both at once wait the longer.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = SlidingWindowRateLimiter(
+        per_key=2, glob=0, window_seconds=37.5, min_interval_seconds=4.0
+    )
+    assert limiter.retry_after("a") == 0.0  # a key with no hits would be admitted now
+    assert limiter.allow("a")
+    clock[0] = 1001.0
+    assert limiter.retry_after("a") == 3.0  # the gap alone: 4.0 less the second gone
+    assert limiter.retry_after("b") == 0.0  # per key
+    clock[0] = 1035.0
+    assert limiter.allow("a")
+    assert limiter.retry_after("a") == 4.0  # both fire; the gap (4.0) outlasts the count (2.5)
+    clock[0] = 1036.0
+    assert limiter.retry_after("a") == 3.0  # still the gap
+    clock[0] = 1039.0
+    assert limiter.retry_after("a") == 0.0
+    # Asking records nothing: the write the wait promised is admitted.
+    assert limiter.allow("a")
+    # The count alone, with no gap to mask it.
+    counted = SlidingWindowRateLimiter(per_key=2, glob=0, window_seconds=37.5)
+    clock[0] = 2000.0
+    assert counted.allow("a")
+    clock[0] = 2010.0
+    assert counted.allow("a")
+    assert counted.retry_after("a") == 27.5
+    clock[0] = 2037.5
+    assert counted.retry_after("a") == 0.0
+    assert counted.allow("a")
+
+
+def test_limiter_retry_after_hides_other_keys_when_the_global_budget_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The true wait on a full global budget is set by when OTHER keys hit. A refused caller gets
+    # the whole window instead, so the header cannot be used to read another caller's timing.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = SlidingWindowRateLimiter(per_key=5, glob=2, window_seconds=60.0)
+    assert limiter.allow("a")
+    clock[0] = 1030.0
+    assert limiter.allow("b")
+    clock[0] = 1031.0
+    assert not limiter.allow("c")
+    assert limiter.retry_after("c") == 60.0  # not the 29 s until a's hit ages out
+
+
+async def test_admin_write_retry_after_is_whole_seconds_rounded_up_and_at_least_one(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    # The shipped defaults: a refusal by the 0.15 s gap rounds up to 1, never 0.
+    svc = AuthService(engine.store, AuthSettings())
+    assert svc.allow_admin_write("a")
+    assert not svc.allow_admin_write("a")
+    assert svc.admin_write_retry_after("a") == 1
+    # The count: 12 writes at one instant fill the default 15 s window, so the wait is all of it.
+    counted = AuthService(engine.store, AuthSettings(admin_write_min_interval_seconds=0))
+    assert all(counted.allow_admin_write("a") for _ in range(12))
+    assert counted.admin_write_retry_after("a") == 15
+    clock[0] += 0.25
+    assert counted.admin_write_retry_after("a") == 15  # 14.75 rounds UP
+    assert counted.admin_write_retry_after("b") == 1  # an actor who is not throttled: the minimum
+    # A disabled limiter refuses nothing; the accessor still answers with a valid header value.
+    off = AuthService(engine.store, AuthSettings(admin_write_rate_limit_enabled=False))
+    assert off.admin_write_retry_after("a") == 1
+
+
 # --- API-INPUT: length + body-size caps --------------------------------------
 
 

@@ -7,6 +7,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **The admin-write `429` now says how long to wait.** Its `Retry-After` was a literal `1` on the
+  JSON API and `10` on the `/ui` console, whatever the window was. A client that honoured either
+  would have retried inside the default 15 s window and been refused again. Both surfaces now send
+  the time until that account's next write would be admitted, in whole seconds, rounded up and
+  never below 1. A client that reads the header as a number needs no change. (vault
+  `BACKLOG #2144`)
 - **An engine that restarts settles the dual-control releases it left `executing`.** The claim now
   records which engine process owns the release, in a new `pending_approvals.claim_owner` column on
   all three store backends. At its next start, before the API serves an approval, that process moves

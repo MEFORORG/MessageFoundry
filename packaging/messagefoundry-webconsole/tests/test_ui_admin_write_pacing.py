@@ -28,7 +28,10 @@ All data here is synthetic.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
+import pytest
 from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
@@ -45,12 +48,13 @@ BUDGET = 4
 
 
 async def _service(engine: Engine, **over: object) -> AuthService:
-    settings = AuthSettings(
-        require_mfa=False,
-        admin_write_rate_limit_per_actor=BUDGET,
-        admin_write_rate_limit_window_seconds=60.0,  # long, so the window cannot refill mid-test
-        **over,  # type: ignore[arg-type]
-    )
+    values: dict[str, object] = {
+        "require_mfa": False,
+        "admin_write_rate_limit_per_actor": BUDGET,
+        "admin_write_rate_limit_window_seconds": 60.0,  # long, so it cannot refill mid-test
+        **over,
+    }
+    settings = AuthSettings(**values)  # type: ignore[arg-type]
     service = AuthService(engine.store, settings)
     await service.initialize()
     return service
@@ -176,3 +180,54 @@ async def test_a_cross_site_write_is_refused_without_spending_the_victims_budget
         # The budget is untouched, so the operator's own next write is still served.
         legit = await c.post(WRITE, headers={"Sec-Fetch-Site": "same-origin"})
         assert legit.status_code != 429, "an off-origin attacker spent the victim's write budget"
+
+
+async def test_the_429_retry_after_is_the_actors_wait_and_matches_the_json_floor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2144. The console sent a literal ``Retry-After: 10`` and the JSON floor a literal
+    ``1``, whatever the window was. Both now send the time until this actor's next write would be
+    admitted, rounded up to whole seconds, so the same refusal reads the same on either surface.
+
+    The window and the gap are not the defaults, so neither retired literal can pass by matching.
+    The limiter's own clock is faked, so no test sleeps and the two surfaces are asked at one instant.
+    """
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    service = await _service(
+        engine,
+        admin_write_rate_limit_per_actor=2,
+        admin_write_rate_limit_window_seconds=37.5,
+        admin_write_min_interval_seconds=2.5,
+        login_rate_limit_enabled=False,
+    )
+    await _add(service, "op", Role.ADMINISTRATOR)
+    same_origin = {"Sec-Fetch-Site": "same-origin"}
+    async with _client(engine, service) as ui, _client(engine, service) as api:
+        await _login(ui)
+        signed_in = await api.post(
+            "/auth/login", json={"username": "op", "password": PW, "provider": "local"}
+        )
+        bearer = {"Authorization": f"Bearer {signed_in.json()['token']}"}
+
+        async def both() -> tuple[httpx.Response, httpx.Response]:
+            """One refused write on each surface, for the same actor at the same instant."""
+            return (
+                await ui.post(WRITE, headers=same_origin),
+                await api.post("/connections/nonexistent/stop", headers=bearer),
+            )
+
+        assert (await ui.post(WRITE, headers=same_origin)).status_code != 429  # t=1000
+        clock[0] += 0.4
+        for refused in await both():  # the gap fired: 2.1 s of 2.5 s left
+            assert (refused.status_code, refused.headers["Retry-After"]) == (429, "3")
+        clock[0] = 1010.0
+        assert (await ui.post(WRITE, headers=same_origin)).status_code != 429  # budget now spent
+        clock[0] = 1020.0
+        for refused in await both():  # the count fired: the t=1000 write leaves at 1037.5
+            assert (refused.status_code, refused.headers["Retry-After"]) == (429, "18")
+        # Honest: a client that waits the 18 s is served.
+        clock[0] = 1038.0
+        assert (await ui.post(WRITE, headers=same_origin)).status_code != 429

@@ -95,3 +95,25 @@ class SlidingWindowRateLimiter:
         :meth:`allow`.
         """
         return self._has_room(key, time.monotonic())
+
+    def retry_after(self, key: str) -> float:
+        """Seconds until an attempt for ``key`` would next be admitted; 0.0 if one would be now.
+
+        The wait a refusal's ``Retry-After`` should carry (BACKLOG #2144). It is the later of the
+        two per-key gates: the key's oldest hit leaving the window, when the count is full, and the
+        gap since the key's last hit. Records nothing.
+
+        A full **global** budget answers with the whole window instead of the true wait. That wait
+        depends on when other keys hit, and a refused caller must not be able to read it.
+        """
+        now = time.monotonic()
+        if self._has_room(key, now):
+            return 0.0
+        if self._global and len(self._global_hits) >= self._global:
+            return self._window
+        bucket = self._hits[key]  # a per-key gate fired, so the key has hits
+        wait = bucket[-1] + self._min_interval - now
+        if self._per_key and len(bucket) >= self._per_key:
+            # Room opens when the hit that keeps the count at the budget ages out.
+            wait = max(wait, bucket[len(bucket) - self._per_key] + self._window - now)
+        return max(wait, 0.0)
