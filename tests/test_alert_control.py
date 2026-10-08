@@ -53,6 +53,11 @@ class _FakeRegistry:
         self.outbound = dict.fromkeys(outbound)
 
 
+def _knows_outbound(registry: _FakeRegistry, draining: tuple[str, ...] = ()) -> Any:
+    # RegistryRunner.knows_outbound: a declared outbound, or a reload-dropped one still draining.
+    return lambda name: name in registry.outbound or name in draining
+
+
 async def _drain(sink: NotifierAlertSink) -> None:
     sink.start()
     await asyncio.sleep(0)
@@ -279,6 +284,7 @@ async def test_callback_maps_action_to_runner_restart() -> None:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str]] = []
             self.registry = _FakeRegistry(inbound=(), outbound=("OB_X",))
+            self.knows_outbound = _knows_outbound(self.registry)
 
         def inbound_filtered(self, name: str) -> str | None:
             return None
@@ -393,9 +399,16 @@ async def test_the_sink_says_whether_the_target_is_the_events_own_name() -> None
 
 
 class _RecordingRunner:
-    def __init__(self, *, inbound: tuple[str, ...], outbound: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        *,
+        inbound: tuple[str, ...],
+        outbound: tuple[str, ...],
+        draining: tuple[str, ...] = (),
+    ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.registry = _FakeRegistry(inbound=inbound, outbound=outbound)
+        self.knows_outbound = _knows_outbound(self.registry, draining)
 
     def inbound_filtered(self, name: str) -> str | None:
         return None
@@ -449,3 +462,19 @@ async def test_a_default_target_runs_only_on_its_own_side(
     assert await _control_action(both, action, "FEED", default_target=True) == []
     # An explicit control_target names its side through the action, so it still runs.
     assert await _control_action(both, action, "FEED", default_target=False) == [(action, "FEED")]
+
+
+async def test_a_draining_outbound_counts_as_an_outbound() -> None:
+    # A reload dropped outbound FEED from the graph but it still drains, so the runner controls it.
+    drained = _RecordingRunner(inbound=(), outbound=(), draining=("FEED",))
+    assert await _control_action(drained, "restart_outbound", "FEED", default_target=True) == [
+        ("restart_outbound", "FEED")
+    ]
+    # And the same reload adding an inbound FEED must not take the draining outbound's event.
+    both = _RecordingRunner(inbound=("FEED",), outbound=(), draining=("FEED",))
+    assert await _control_action(both, "restart_inbound", "FEED", default_target=True) == []
+
+
+async def test_an_unknown_action_with_a_default_target_restarts_nothing() -> None:
+    rr = _RecordingRunner(inbound=("FEED",), outbound=("FEED",))
+    assert await _control_action(rr, "restart_everything", "FEED", default_target=True) == []

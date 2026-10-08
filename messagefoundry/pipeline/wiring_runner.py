@@ -2347,8 +2347,13 @@ class RegistryRunner:
         """Raise :class:`KeyError` for a name that is neither a declared nor a still-draining outbound,
         so the API 404s an unknown connection. A reload-dropped outbound still in ``_destinations`` is
         controllable while it drains."""
-        if name not in self.registry.outbound and name not in self._destinations:
+        if not self.knows_outbound(name):
             raise KeyError(name)
+
+    def knows_outbound(self, name: str) -> bool:
+        """Whether ``name`` is a declared outbound or a reload-dropped one still draining: the set
+        :meth:`_validate_outbound` admits, as a predicate for callers outside the runner."""
+        return name in self.registry.outbound or name in self._destinations
 
     def _mark_outbound_quiesced(self, name: str) -> None:
         """The outbound ``name`` lane has DRAINED to zero in-flight. Set its quiescence Event so

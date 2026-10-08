@@ -782,8 +782,12 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
     return identity.can_access_channel(channel_id)
 
 
+#: Which namespace each alert control action restarts (BACKLOG #2528).
+_CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
+
+
 async def _alert_control_action(
-    engine: Engine, action: str, target: str, *, default_target: bool = False
+    engine: Engine, action: str, target: str, *, default_target: bool
 ) -> None:
     """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
 
@@ -803,14 +807,18 @@ async def _alert_control_action(
     if rr is None:
         return
     if default_target:
-        wanted = "inbound" if action == "restart_inbound" else "outbound"
+        wanted = _CONTROL_ACTION_SIDE.get(action)
+        if wanted is None:
+            _log.warning("alert control_action %s for %r skipped: unknown action", action, target)
+            return
         sides = {
             side
-            for side, names in (
-                ("inbound", rr.registry.inbound),
-                ("outbound", rr.registry.outbound),
+            for side, declared in (
+                ("inbound", target in rr.registry.inbound),
+                # A reload-dropped outbound still draining is an outbound too (#2528 review).
+                ("outbound", rr.knows_outbound(target)),
             )
-            if target in names
+            if declared
         }
         if sides != {wanted}:
             _log.warning(
