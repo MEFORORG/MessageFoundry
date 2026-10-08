@@ -299,8 +299,8 @@ def test_a_rise_is_throttled_and_the_count_is_the_running_total() -> None:
     assert sink.forward_failures == [
         ("forwarder:dropping", "queue_full", 2),
         ("forwarder:dropping", "queue_full,collector_unreachable", 7),
-        ("forwarder:spool_unreadable", "spool_read_failed", 4),
-        ("forwarder:spool_unreadable", "spool_read_failed", 1),
+        ("forwarder:spool_unreadable", "spool_read_failed", 0),
+        ("forwarder:spool_unreadable", "spool_read_failed", 0),
         ("forwarder:dropping", "send_error,spool_refused,spool_damaged", 3),
     ]
 
@@ -315,16 +315,81 @@ def test_two_kinds_in_one_pass_are_two_alerts() -> None:
     ]
 
 
+def _failing(failures: int, **fields: Any) -> ForwarderStatus:
+    return _reading(send_failing=True, send_failures=failures, **fields)
+
+
 def test_sends_failing_for_a_whole_window_raise_not_sending() -> None:
     # With a spool nothing is lost while the collector is down, so no loss count would ever say so.
     sink = _RecordingSink()
-    failing, fine = _reading(send_failing=True), _reading()
-    watch, clock = _watch(sink, readings=[failing, failing, fine, failing, failing, failing])
-    for now in (0.0, 299.0, 300.0, 301.0, 600.0, 601.0):
+    watch, clock = _watch(
+        sink,
+        readings=[
+            _failing(1),
+            _failing(2),
+            _reading(send_failures=2),  # a send got through: the clock starts over
+            _failing(3),
+            _failing(4),
+            _failing(5),  # a whole window without a break: fires
+            _failing(5),  # still flagged, but nothing was sent since: a quiet engine, not a fault
+        ],
+    )
+    for now in (0.0, 299.0, 300.0, 301.0, 600.0, 601.0, 2_000.0):
         clock.now = now
         watch.run_once()
-    # 0 to 299: not yet a window. 300: a send got through, so the clock starts over at 301.
     assert sink.forward_failures == [("forwarder:not_sending", "collector_unreachable", 0)]
+
+
+def test_not_sending_is_not_hidden_by_a_loss_that_names_another_cause() -> None:
+    # A spool that was already full: every window has a rise, and it says "spool_refused", which
+    # does not tell anyone the collector is down.
+    sink = _RecordingSink()
+    watch, clock = _watch(
+        sink,
+        readings=[
+            _failing(1, spool_dropped=1),
+            _failing(9, spool_dropped=4),
+            _failing(12, unsent=1),
+        ],
+    )
+    for now in (0.0, 400.0, 800.0):
+        clock.now = now
+        watch.run_once()
+    assert sink.forward_failures == [
+        ("forwarder:dropping", "spool_refused", 1),
+        ("forwarder:dropping", "spool_refused", 4),
+        ("forwarder:not_sending", "collector_unreachable", 0),
+        # A rebuilt forwarder with no spool: "dropping" names the collector itself, once.
+        ("forwarder:dropping", "collector_unreachable", 1),
+    ]
+
+
+def test_a_forwarder_that_comes_back_starts_its_own_failing_clock() -> None:
+    sink = _RecordingSink()
+    absent = ForwarderStatus(configured=True)
+    watch, clock = _watch(sink, readings=[_failing(1), absent, _failing(1)])
+    for now in (0.0, 30.0, 1_000.0):
+        clock.now = now
+        watch.run_once()
+    assert sink.forward_failures == [("forwarder:not_installed", "stopped", 0)]
+
+
+def test_a_listener_thread_that_has_ended_reads_not_installed() -> None:
+    import threading
+
+    _, listener = _attach(_Collector())
+    ended = threading.Thread(target=lambda: None)
+    ended.start()
+    ended.join()
+    listener._thread = ended
+    try:
+        status = forwarder_status()
+        assert (status.configured, status.installed, status.state) == (True, False, "not_installed")
+        sink = _RecordingSink()
+        _watch(sink)[0].run_once()
+        assert sink.forward_failures == [("forwarder:not_installed", "stopped", 0)]
+    finally:
+        listener._thread = None  # so the fixture's close() has nothing to join
 
 
 def test_a_sink_that_raises_leaves_the_alert_to_be_raised_again() -> None:
@@ -337,16 +402,22 @@ def test_a_sink_that_raises_leaves_the_alert_to_be_raised_again() -> None:
                 raise RuntimeError("sink bug")
             super().log_forward_failed(name, reason=reason, count=count)
 
-    for reading, expected in (
-        (ForwarderStatus(configured=True, start_failure="permanent"), "forwarder:not_installed"),
-        (_reading(queue_dropped=1), "forwarder:dropping"),
+    # not_installed: the very next pass. A rise: after one window, and only once.
+    for reading, times, expected in (
+        (
+            ForwarderStatus(configured=True, start_failure="permanent"),
+            (0.0, 30.0, 60.0),
+            "forwarder:not_installed",
+        ),
+        (_reading(queue_dropped=1), (0.0, 30.0, 400.0), "forwarder:dropping"),
     ):
         sink = _FailsOnce()
-        watch, _ = _watch(sink, readings=[reading, reading, reading])
+        watch, clock = _watch(sink, readings=[reading, reading, reading, reading])
         with pytest.raises(RuntimeError):
             watch.run_once()
-        watch.run_once()
-        watch.run_once()
+        for now in times:
+            clock.now = now
+            watch.run_once()
         assert [name for name, _, _ in sink.forward_failures] == [expected]
 
 
@@ -362,7 +433,8 @@ async def test_the_loop_checks_at_once_survives_a_bad_pass_and_stops() -> None:
     watch.start()
     watch.start()  # idempotent
     await asyncio.sleep(0.05)
-    assert passes == 1  # the first pass ran without waiting an interval, and the loop lived
+    assert passes == 1  # the first pass ran without waiting an interval
+    assert watch._task is not None and not watch._task.done()  # and the loop outlived it
     await watch.stop()
     await watch.stop()
 
