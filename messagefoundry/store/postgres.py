@@ -5169,31 +5169,19 @@ class PostgresStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
+        offset: int = 0,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
-        where: list[str] = []
-        params: list[Any] = []
-        if connection is not None:
-            params.append(connection)
-            where.append(f"connection=${len(params)}")
-        if kinds:
-            placeholders = ",".join(f"${len(params) + i + 1}" for i in range(len(kinds)))
-            params.extend(kinds)
-            where.append(f"kind IN ({placeholders})")
-        if since is not None:
-            params.append(since)
-            where.append(f"ts>=${len(params)}")
-        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
-        # outbound row (which spans channels), matching the SQLite path and the metadata/purge boundary.
-        if allowed_channels is not None:
-            where.append("direction='inbound'")
-            _append_channel_scope_pg(where, params, "connection", allowed_channels)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
-        params.append(limit)
+        clause, params = self._connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        params += [limit, max(offset, 0)]
         rows = await self._pool.fetch(
             "SELECT id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
-            f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ${len(params)}",
+            f" FROM connection_event{clause} ORDER BY ts DESC, id DESC"
+            f" LIMIT ${len(params) - 1} OFFSET ${len(params)}",
             *params,
         )
         return [
@@ -5213,6 +5201,57 @@ class PostgresStore:
             )
             for r in rows
         ]
+
+    async def connection_event_extent(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        before_id: int | None = None,
+        allowed_channels: Sequence[str] | None,
+    ) -> tuple[int, int]:
+        """The total :meth:`list_connection_events` pages through, and its newest ``id`` or 0
+        (BACKLOG #2438)."""
+        clause, params = self._connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        row = await self._fetchone(
+            f"SELECT COUNT(*) AS n, MAX(id) AS newest FROM connection_event{clause}", *params
+        )
+        return (int(row["n"]), int(row["newest"] or 0)) if row is not None else (0, 0)
+
+    @staticmethod
+    def _connection_event_where(
+        connection: str | None,
+        kinds: Sequence[str] | None,
+        since: float | None,
+        before_id: int | None,
+        allowed_channels: Sequence[str] | None,
+    ) -> tuple[str, list[Any]]:
+        """The ``WHERE`` text and its bound ``$N`` values shared by :meth:`list_connection_events`
+        and :meth:`connection_event_extent`, so a page and its total read the same set."""
+        where: list[str] = []
+        params: list[Any] = []
+        if connection is not None:
+            params.append(connection)
+            where.append(f"connection=${len(params)}")
+        if kinds:
+            placeholders = ",".join(f"${len(params) + i + 1}" for i in range(len(kinds)))
+            params.extend(kinds)
+            where.append(f"kind IN ({placeholders})")
+        if since is not None:
+            params.append(since)
+            where.append(f"ts>=${len(params)}")
+        if before_id is not None:
+            params.append(before_id)
+            where.append(f"id<${len(params)}")
+        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
+        # outbound row (which spans channels), matching the SQLite path and the metadata/purge boundary.
+        if allowed_channels is not None:
+            where.append("direction='inbound'")
+            _append_channel_scope_pg(where, params, "connection", allowed_channels)
+        return (" WHERE " + " AND ".join(where)) if where else "", params
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
     # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
@@ -7329,10 +7368,12 @@ class PostgresStore:
         until: float | None = None,
         exclude: AuditExclusion | None = None,
         before_id: int | None = None,
+        offset: int = 0,
     ) -> Sequence[Row]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
-        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
-        Every value is a bound parameter; see :meth:`_audit_where`."""
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776),
+        or past ``offset`` rows of the filtered set (BACKLOG #2438). Every value is a bound
+        parameter; see :meth:`_audit_where`."""
         where, params = self._audit_where(
             actor=actor,
             action=action,
@@ -7341,14 +7382,17 @@ class PostgresStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
-        sql = f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ${len(params)}"
+        params += [limit, max(offset, 0)]
+        sql = (
+            f"SELECT * FROM audit_log{where} ORDER BY id DESC"
+            f" LIMIT ${len(params) - 1} OFFSET ${len(params)}"
+        )
         return await self._fetchall(sql, *params)
 
     async def count_audit(
         self,
         *,
-        limit: int,
+        limit: int | None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
@@ -7366,11 +7410,14 @@ class PostgresStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
-        sql = (
-            f"SELECT COUNT(*) AS n FROM (SELECT id FROM audit_log{where}"
-            f" ORDER BY id DESC LIMIT ${len(params)}) t"
-        )
+        if limit is None:
+            sql = f"SELECT COUNT(*) AS n FROM audit_log{where}"
+        else:
+            params.append(limit)
+            sql = (
+                f"SELECT COUNT(*) AS n FROM (SELECT id FROM audit_log{where}"
+                f" ORDER BY id DESC LIMIT ${len(params)}) t"
+            )
         row = await self._fetchone(sql, *params)
         return int(row["n"]) if row is not None else 0
 
@@ -7395,16 +7442,30 @@ class PostgresStore:
         )
         return [dict(r) for r in rows]
 
-    async def security_events_for_user(self, username: str, *, limit: int = 100) -> Sequence[Row]:
+    async def security_events_for_user(
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
+    ) -> Sequence[Row]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
         /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
-        user only by email, when one can be sent. ``auth/notifications.py`` states the rule."""
+        user only by email, when one can be sent. ``auth/notifications.py`` states the rule.
+        ``offset`` pages it, and ``until`` pins the pages to one snapshot (BACKLOG #2438)."""
+        where, params = _security_events_where_pg(username, until)
+        n = len(params)
         return await self._fetchall(
-            "SELECT ts, action, detail FROM audit_log "
-            "WHERE actor = $1 AND action LIKE 'auth.%' ORDER BY id DESC LIMIT $2",
-            username,
+            f"SELECT ts, action, detail FROM audit_log{where} ORDER BY id DESC"
+            f" LIMIT ${n + 1} OFFSET ${n + 2}",
+            *params,
             limit,
+            max(offset, 0),
         )
+
+    async def count_security_events_for_user(
+        self, username: str, *, until: float | None = None
+    ) -> int:
+        """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
+        where, params = _security_events_where_pg(username, until)
+        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM audit_log{where}", *params)
+        return int(row["n"]) if row is not None else 0
 
     # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
 
@@ -9408,6 +9469,17 @@ def _pg_cutoff_case(
     )  # ELSE — connections with no override use the global window
     sql = f"(CASE {column} {' '.join(whens)} ELSE ${idx}::double precision END)"
     return sql, params, idx + 1
+
+
+def _security_events_where_pg(username: str, until: float | None) -> tuple[str, list[Any]]:
+    """The ``$N`` ``WHERE`` text and values for one user's security-event page and its total
+    (BACKLOG #2438), shared so the two count one set. The SQLite builder states the rule."""
+    params: list[Any] = [username]
+    clause = " WHERE actor = $1 AND action LIKE 'auth.%'"
+    if until is not None:
+        params.append(until)
+        clause += " AND ts <= $2"
+    return clause, params
 
 
 def _append_channel_scope_pg(

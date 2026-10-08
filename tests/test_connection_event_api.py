@@ -65,7 +65,7 @@ async def test_events_newest_first_and_shape(engine: Engine, client: httpx.Async
     await _seed(engine)
     r = await client.get("/events")
     assert r.status_code == 200
-    body = r.json()
+    body = r.json()["events"]
     assert [e["kind"] for e in body] == ["closed", "connection_lost", "established"]
     lost = next(e for e in body if e["kind"] == "connection_lost")
     assert lost["direction"] == "outbound" and lost["transport"] == "mllp"
@@ -78,10 +78,10 @@ async def test_events_filters(engine: Engine, client: httpx.AsyncClient) -> None
     scoped = (await client.get("/connections/IB_A/events")).json()
     assert {e["kind"] for e in scoped} == {"established", "closed"}
     # kind filter
-    by_kind = (await client.get("/events", params={"kind": "connection_lost"})).json()
+    by_kind = (await client.get("/events", params={"kind": "connection_lost"})).json()["events"]
     assert [e["kind"] for e in by_kind] == ["connection_lost"]
     # since filter
-    recent = (await client.get("/events", params={"since": 175.0})).json()
+    recent = (await client.get("/events", params={"since": 175.0})).json()["events"]
     assert [e["kind"] for e in recent] == ["closed"]
     # limit clamp is accepted
     assert (await client.get("/events", params={"limit": 1})).status_code == 200

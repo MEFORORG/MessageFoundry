@@ -211,7 +211,7 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
             "IB_A",
             "IB_B",
         }
-        assert {e["connection"] for e in (await c.get("/events", headers=u)).json()} == {
+        assert {e["connection"] for e in (await c.get("/events", headers=u)).json()["events"]} == {
             "IB_A",
             "IB_B",
             "OB_X",
@@ -230,7 +230,9 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
         # measured non-vacuously by /events and /graph/edges below, where the all-channels control
         # DOES see OB_X and the scoped caller does not.
         assert all(r["destination"] is None for r in conns)
-        assert {e["connection"] for e in (await c.get("/events", headers=s)).json()} == {"IB_A"}
+        assert {e["connection"] for e in (await c.get("/events", headers=s)).json()["events"]} == {
+            "IB_A"
+        }
         sgraph = (await c.get("/graph/edges", headers=s)).json()
         assert not any(n["kind"] == "outbound" for n in sgraph["nodes"]), (
             "a scoped caller must never traverse into a shared outbound"

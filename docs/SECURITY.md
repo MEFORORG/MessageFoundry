@@ -1115,8 +1115,8 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 [`api/app.py`](../messagefoundry/api/app.py) (72 HTTP + 1 WebSocket) and 43 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
 and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 120 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 242
-(116 + the 125 console routes + the `/ui/static` mount). Of the 116: **97 are permission-gated**, 19 are
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 243
+(116 + the 126 console routes + the `/ui/static` mount). Of the 116: **97 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -1380,14 +1380,14 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **125 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **126 routes + one `/ui/static` mount** (federation off,
 the default — the three `/ui/oidc/*` routes, `GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback`,
 and the IdP step-up start `POST /ui/reauth/oidc` are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 115 of the 125 carry a gate; the 10 that do not are the
+**Route → permission map (`/ui` plane).** 116 of the 126 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -1427,6 +1427,7 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/approvals/{approval_id}/reject` | `approvals:approve` | `require_ui` |
 | `POST` | `/ui/approvals/{approval_id}/resolve/{outcome}` | `approvals:approve` | `require_ui_step_up` — the fresh step-up the JSON resolve asks for; the requester can never resolve their own request (BACKLOG #2460) |
 | `GET` | `/ui/audit` | `audit:read` | `require_ui` |
+| `GET` | `/ui/audit/export` | `audit:export` | `require_ui` |
 | `GET` | `/ui/cluster` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/cluster/force-stepdown` | `cluster:control` | `require_ui_step_up` |
 | `GET` | `/ui/cluster/force-stepdown-confirm` | `cluster:control`**+**`monitoring:read` | `require_ui_step_up` |
@@ -4675,8 +4676,8 @@ are never logged** (only ids/counts land in `detail`).
 
 **Lock rows are read only with `users:manage` (owner ruling 2026-09-28, BACKLOG #1131).** The engine
 still writes every lock row (ADR 0197 AC-10), and an Administrator reads them all. A reader without
-`users:manage`, the built-in Auditor included, does not see these rows in `GET /audit`,
-`GET /audit/export` or the console's `/ui/audit`:
+`users:manage`, the built-in Auditor included, does not see these rows in at least `GET /audit`,
+`GET /audit/export`, the console's `/ui/audit` and its `/ui/audit/export`:
 
 | Hidden row | Why a reader could use it |
 |---|---|
@@ -4698,6 +4699,18 @@ never comes back short. The account holder's own `/me/security-events` feed is n
 selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.
+
+**Such a reader is told rows were withheld, and never which (BACKLOG #2446).** `GET /audit` returns
+`withheld: true`, the console's `/ui/audit` says lock entries are left out of its list, count and
+export, and `GET /audit/export` sends `X-Audit-Withheld: true` and records `withheld` in its
+`audit.export` row. Each is decided by the reader's permission alone. It shows whether or not a
+hidden row falls in the range read, so it cannot tell the reader that a lock happened.
+
+**The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
+/audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC
+gets a console cookie and never a bearer. `GET /ui/audit/export` streams the same handler from the
+console session under the same `audit:export` permission, so its CSV, exclusion, `audit.export` row
+and header are that route's.
 
 **The general log no longer names lock events.** `GET /logs/tail` serves the application log to
 `logs:view`, which the built-in Operator holds without `users:manage`, so the ruling reaches it too:

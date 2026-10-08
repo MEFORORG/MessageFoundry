@@ -151,7 +151,9 @@ def test_the_live_api_scope_still_surfaces_the_unjudged_candidate() -> None:
     """
     proc = run()
     assert proc.returncode == 0, proc.stderr
-    assert "security_events_for(arg0=...)" in proc.stdout, proc.stdout
+    # The leading "] " keeps this from matching ``count_security_events_for(arg0=...)``, which the
+    # screen also prints. Without it, the route's own call could vanish and this would stay green.
+    assert "] security_events_for(arg0=...)" in proc.stdout, proc.stdout
     assert "audit-label site(s) excluded as correct" in proc.stdout
 
 
@@ -206,7 +208,8 @@ def test_an_unjudged_site_makes_the_step_FAIL(tmp_path: Path) -> None:
     proc = _run("--baseline", str(thinned))
     assert proc.returncode == 1, f"an unjudged site did not fail the step:\n{proc.stdout}"
     assert "NEW UNJUDGED SITE" in proc.stdout
-    assert "security_events_for" in proc.stdout
+    # The full key, so the count sibling's key cannot satisfy it.
+    assert "auth_routes.py::security_events_for::arg0" in proc.stdout
 
 
 def test_without_a_baseline_it_stays_ADVISORY() -> None:

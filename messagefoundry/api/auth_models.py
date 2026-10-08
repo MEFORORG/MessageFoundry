@@ -487,7 +487,26 @@ class AuditEntry(BaseModel):
 
 
 class AuditList(BaseModel):
+    """One page of the audit trail (BACKLOG #2438). ``total`` counts every row the caller may read
+    under the same filters, so ``offset`` and ``limit`` place this page within it.
+
+    ``withheld`` is True when the caller's permissions leave a class of rows out of this listing
+    and its total: the lock rows a reader without ``users:manage`` does not see (BACKLOG #1131,
+    #2446). It is a fact about the CALLER, not about this page. It is True whether or not any such
+    row falls in the filtered range, so it cannot tell a reader whether a lock happened.
+
+    ``as_of`` is the snapshot the page was read under: only rows whose ``ts`` is at or before it.
+    A reader passes it back with the next ``offset``, so rows written after the first page, such
+    as the grant row ``GET /audit`` itself writes, neither repeat a row across pages nor move the
+    total. It is a timestamp and never a row id, because an id would count the rows the caller may
+    not see (:mod:`messagefoundry.api.paging`). It is None only when the listing was empty."""
+
     entries: list[AuditEntry]
+    total: int
+    limit: int
+    offset: int
+    as_of: float | None
+    withheld: bool
 
 
 class SimpleMessage(BaseModel):
@@ -520,4 +539,11 @@ class SecurityEventInfo(BaseModel):
 
 
 class SecurityEventsList(BaseModel):
+    """One page of the caller's own security events (BACKLOG #2438), placed within ``total`` as
+    :class:`AuditList` places its page, and pinned to ``as_of`` as that page is."""
+
     events: list[SecurityEventInfo]
+    total: int
+    limit: int
+    offset: int
+    as_of: float | None

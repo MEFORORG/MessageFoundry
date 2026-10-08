@@ -76,3 +76,6 @@ auth_routes.py::create_directory_account::arg0
 # Named as a subject, not a number, because no number is allocated for it: "the self-service
 # security-events view scopes on a reassignable username and audit_log has no immutable actor id".
 auth_routes.py::security_events_for::arg0
+# BACKLOG #2438: the same feed's total, for its pager. Same WHERE clause, so the same instance and
+# the same reason it stays: it counts exactly the rows the line above reads, no more.
+auth_routes.py::count_security_events_for::arg0

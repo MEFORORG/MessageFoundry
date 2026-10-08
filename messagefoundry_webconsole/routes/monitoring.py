@@ -10,6 +10,8 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
 
 from messagefoundry.api._ui_seam import UiDeps
+from messagefoundry.api.models import ConnectionEventList
+from messagefoundry.api.validation import PAGE_BIND_MAX
 from messagefoundry.auth import Identity, Permission
 
 from .. import pages
@@ -42,6 +44,11 @@ register_ui_action(
     unlock=True,
     label="View the reason for an event",
 )
+
+
+#: The event log's default page size (BACKLOG #2438). It pages by ``offset`` against a total, so
+#: this sizes a page and caps nothing.
+EVENTS_PAGE = 100
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -114,9 +121,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # across one form is what BACKLOG #1740 avoided here.
         connection: str | None = Query(None, max_length=256),
         kind: str | None = Query(None, max_length=64),
+        limit: int = Query(EVENTS_PAGE, ge=1, le=1000),
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        before_id: int | None = Query(None, ge=1, le=PAGE_BIND_MAX),
     ) -> HTMLResponse:
         return await _events_page(
-            request, engine, identity, connection=connection, kind=kind, reveal=None
+            request,
+            engine,
+            identity,
+            connection=connection,
+            kind=kind,
+            limit=limit,
+            offset=offset,
+            before_id=before_id,
+            reveal=None,
         )
 
     # The per-event reveal (BACKLOG #2443), on the terms ui_alert_reason gives. It carries the
@@ -132,9 +150,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
         connection: str | None = Query(None, max_length=256),
         kind: str | None = Query(None, max_length=64),
+        limit: int = Query(EVENTS_PAGE, ge=1, le=1000),
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        before_id: int | None = Query(None, ge=1, le=PAGE_BIND_MAX),
     ) -> HTMLResponse:
         return await _events_page(
-            request, engine, identity, connection=connection, kind=kind, reveal=event_id
+            request,
+            engine,
+            identity,
+            connection=connection,
+            kind=kind,
+            limit=limit,
+            offset=offset,
+            before_id=before_id,
+            reveal=event_id,
         )
 
     async def _events_page(
@@ -144,6 +173,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         *,
         connection: str | None,
         kind: str | None,
+        limit: int,
+        offset: int,
+        before_id: int | None,
         reveal: int | None,
     ) -> HTMLResponse:
         # L6b (#75 parity): expose the JSON handler's event-kind filter (a single kind from
@@ -160,11 +192,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if refusal is not None:
             # No rows: the filter was never applied, and a table under a refusal banner would read
             # as the result of the filter the operator typed.
+            empty = ConnectionEventList(
+                total=0, limit=limit, offset=offset, before_id=before_id, events=[]
+            )
             return HTMLResponse(
-                pages.events([], connection=conn, kind=evt_kind, error=refusal), status_code=400
+                pages.events(empty, connection=conn, kind=evt_kind, error=refusal), status_code=400
             )
         kinds = [kind] if kind else None
-        rows = await core.list_connection_events(
+        data = await core.connection_event_page(
             engine=engine,
             identity=identity,
             # blank_to_none: the handler's channel guard runs on any value that is not None,
@@ -173,11 +208,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             connection=blank_to_none(connection),
             kind=kinds,
             since=None,
-            limit=100,
+            limit=limit,
+            offset=offset,
+            before_id=before_id,
             request=request,
             reveal=reveal,
         )
-        return HTMLResponse(pages.events(rows, connection=conn, kind=evt_kind, revealed=reveal))
+        return HTMLResponse(pages.events(data, connection=conn, kind=evt_kind, revealed=reveal))
 
     async def _flow_data(request: Request, engine: Any, identity: Identity) -> tuple[Any, Any]:
         """Fetch the two read-only monitoring:read sources for the Flow & trends page (BACKLOG #76):
