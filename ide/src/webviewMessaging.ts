@@ -334,13 +334,17 @@ const SCRIPT_BANNER_KEYFRAMES =
 export const STARTUP_BANNERS = `<style>${SCRIPT_BANNER_KEYFRAMES}</style>
   <div id="${SCRIPT_BANNER_ID}" role="alert" style="${BANNER_STYLE};${SCRIPT_BANNER_DELAY_STYLE}">MessageFoundry: this panel's script has not started, so its buttons and fields do nothing. Close the panel and open it again. If this message stays, VS Code is not running the panel's script.</div>
   <div id="${CSP_BANNER_ID}" role="alert" hidden style="${BANNER_STYLE}">MessageFoundry: VS Code is not enforcing this panel's Content Security Policy, so the panel's defense against injected script is not active. Update VS Code, and treat what this panel shows with care until the message is gone.</div>
-  <script>document.getElementById(${JSON.stringify(CSP_BANNER_ID)}).hidden = false;</script>`;
+  <script>document.getElementById(${embedJson(CSP_BANNER_ID)}).hidden = false;</script>`;
 
 /**
  * Inline script source that hides the script-not-started banner.
  *
  * Place it right after `acquireVsCodeApi()`, so a script that dies acquiring the API leaves the
  * banner up. A block, so its `const` cannot collide with a panel's own names.
+ *
+ * The id goes in through `embedJson`, as every value this module writes into a script does. A bare
+ * `JSON.stringify` leaves `<` unescaped, so a value could close the script tag it sits in. The id
+ * is a constant today; the escape is what keeps that from being an assumption.
  */
 export const SCRIPT_STARTED_MARK = `
-    { const mfBanner = document.getElementById(${JSON.stringify(SCRIPT_BANNER_ID)}); if (mfBanner) { mfBanner.hidden = true; } }`;
+    { const mfBanner = document.getElementById(${embedJson(SCRIPT_BANNER_ID)}); if (mfBanner) { mfBanner.hidden = true; } }`;

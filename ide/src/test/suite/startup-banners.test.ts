@@ -149,10 +149,17 @@ suite("startup banners: what the user sees", () => {
   });
 
   test("the canary is un-nonced, and the banners need no script or stylesheet to read", () => {
-    const scripts = STARTUP_BANNERS.match(/<script[^>]*>/g) ?? [];
+    // Parsed, not pattern-matched: a parser finds a script element however its tag is spelled.
+    // Scripts are off here, so nothing in the markup runs.
+    const parsed = new JSDOM(`<!DOCTYPE html><body>${STARTUP_BANNERS}</body>`).window;
+    openWindows.push(parsed);
+    const scripts = [...parsed.document.querySelectorAll("script")] as DomNode[];
     // Exactly one script, with no attribute at all. A nonce here would run the canary under an
     // enforcing engine and raise the warning on every healthy panel.
-    assert.deepStrictEqual(scripts, ["<script>"]);
+    assert.deepStrictEqual(
+      scripts.map((s) => s.getAttributeNames()),
+      [[]],
+    );
     assert.ok(STARTUP_BANNERS.includes(`id="${SCRIPT_BANNER_ID}" role="alert" style=`));
     assert.ok(STARTUP_BANNERS.includes(`id="${CSP_BANNER_ID}" role="alert" hidden style=`));
     // The script banner must not start hidden, by attribute or by inline style.
