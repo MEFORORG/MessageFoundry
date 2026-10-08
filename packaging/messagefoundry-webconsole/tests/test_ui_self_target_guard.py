@@ -3,10 +3,8 @@
 """Vault BACKLOG #3259 and #3260: the console's self-target refusals, by stored id, each audited.
 
 Six admin routes refuse the caller's own account: reset-password, reset-mfa, federated link and
-unlink, disable and delete. The console's ``/ui/users/{user_id}/`` routes call the API handlers
-through the seam with the path as a plain str, past the JSON plane's ``ResourceId`` pattern. So a
-store whose id column compares case-insensitively (SQL Server) finds the caller's row from an
-upper-cased spelling. #3259 is that bypass: four of the six guards compared only the path.
+unlink, disable and delete. #3259 is the case-spelling bypass of four of those guards;
+``api.auth_routes._refuse_if_self`` states why the console reaches it and the JSON plane does not.
 
 The default SQLite test store compares case-sensitively, where a naive test gets a 404 "no such
 user" whether or not the fix is in. So ``get_user`` is wrapped to fold case first, as a
@@ -123,3 +121,19 @@ async def test_each_self_target_refusal_is_by_stored_id_and_audited(
     assert after is not None and before is not None
     assert (after.disabled, after.oidc_subject) == (before.disabled, before.oidc_subject)
     assert after.password_hash == before.password_hash, "a refused reset changed the credential"
+
+
+@pytest.mark.parametrize("op", ["password_reset", "mfa_reset"])
+async def test_another_accounts_id_in_another_case_is_not_a_self_target(
+    engine: Engine, root: tuple[httpx.AsyncClient, AuthService, str], op: str
+) -> None:
+    """The control for the stored-id branch: an upper-cased id that resolves to ANOTHER account is
+    not the caller's, so the reset goes through and no refusal row is written."""
+    c, service, _me = root
+    other = await provision(service, "viewer1", [Role.VIEWER.value])
+    suffix = {"password_reset": "/reset-password", "mfa_reset": "/reset-mfa"}[op]
+    url = f"/ui/users/{other.upper()}{suffix}"
+    await mint_bound_proof(c, url)
+    r = await c.post(url, headers=SAME_ORIGIN)
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    assert await engine.store.list_audit(action="auth.self_target_refused", limit=10) == []

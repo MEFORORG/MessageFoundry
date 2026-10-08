@@ -61,6 +61,12 @@ this line.**
 
 ### Security
 
+- **The user page's self-target refusals are audited, with your address.** Reset-password,
+  reset-mfa, link, unlink, disable and delete now pass the request to the engine's handler. The
+  engine refuses your own account by its stored id too, and writes `auth.self_target_refused`.
+  The seam digest did not move, because it records handler names and not their parameters. A
+  console without this change would get a TypeError from those six against this engine. (vault
+  BACKLOG #3259, #3260)
 - **Resend, edit-resend, upload resend, queue purge and config reload each take a proof bound to
   that action.** A fresh session window no longer reaches them. Each needs a re-authentication made
   for it, which it spends. The re-auth page mints that proof when it continues to the action's
