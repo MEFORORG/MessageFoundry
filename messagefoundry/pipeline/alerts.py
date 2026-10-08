@@ -46,7 +46,9 @@ INTAKE_DISK_REASON = "disk_floor"
 
 #: How often an emitter raises a condition that persists again: ``queue_buildup``, ``message_stall``
 #: and ``saturation`` in ``wiring_runner``, and ``intake_paused`` in ``intake_bound``. One value, so
-#: the reminder cadences cannot drift apart (BACKLOG #2272).
+#: the emitters' cadences cannot drift apart (BACKLOG #2272). It does not set the notifier's own
+#: cooldown, ``[alerts].realert_seconds``, which an operator can raise; a cooldown longer than this
+#: throttles some reminders, by that operator's choice.
 REMINDER_SECONDS = 300.0
 
 

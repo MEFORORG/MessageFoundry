@@ -366,6 +366,46 @@ async def test_the_reminder_window_starts_after_the_sink_returns(
     assert sink.stamps[1] - sink.stamps[0] >= intake_bound.REALERT_SECONDS
 
 
+async def test_the_real_notifier_pages_every_reminder_when_its_stamp_lands_late(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2272 defect 3, against the real ``NotifierAlertSink`` throttle. Its monotonic clock and the
+    monitor's are one fake clock, and its first call stamps half a second late. Every reminder the
+    monitor raises must page: none may land inside the notifier's own cooldown."""
+    import time as real_time
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline import alert_sinks
+
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        alert_sinks, "time", SimpleNamespace(monotonic=lambda: clock[0], time=real_time.time)
+    )
+
+    class _LateFirstStamp(NotifierAlertSink):
+        delay = 0.5
+
+        def intake_paused(self, name: str, **kw: Any) -> None:
+            clock[0] += self.delay
+            self.delay = 0.0
+            super().intake_paused(name, **kw)
+
+    transport = _RecordingTransport("webhook")
+    sink = _LateFirstStamp([transport], realert_seconds=intake_bound.REALERT_SECONDS)
+    monitor, _gate = _monitor(_FakeStore(depth=50), sink, max_staged_depth=10)
+    await monitor.check_once()
+    for _ in range(3):
+        clock[0] += 0.25
+        await monitor.check_once()
+    clock[0] = 1000.0 + intake_bound.REALERT_SECONDS
+    for _ in range(4):
+        await monitor.check_once()
+        clock[0] += 0.25
+    await _drain_transports(sink)
+    assert [e["type"] for e in transport.events] == ["intake_paused", "intake_paused"]
+
+
 def test_an_intake_pause_rule_cannot_carry_a_control_action() -> None:
     """#2272 defect 7, closed by #1898. A pause raised before the control callback is wired cannot
     miss an action, because no rule on ``intake_paused`` may carry one."""
