@@ -128,9 +128,9 @@ At least these parts of the engine read the host's wall clock:
 
 | What | Where | What a wrong clock would do |
 |---|---|---|
-| Session expiry | `messagefoundry/auth/service.py` | A session's expiry is stamped from `time.time()`, and each request checks it and the idle timeout against the same clock. A forward step would end sessions early. A backward step revokes the session, because validation fails closed. A steady offset on one host does not move expiry by itself. |
+| Session expiry | `messagefoundry/auth/service.py` | A session's expiry is stamped from `time.time()`, and each request checks it and the idle timeout against the same clock. A forward step would end sessions early. A backward step past a session's last use revokes it, because validation fails closed. A smaller backward step would stretch the idle and absolute windows by the step. |
 | TOTP codes | `messagefoundry/auth/totp.py`, called from `messagefoundry/auth/service.py` | A code covers a 30-second step (`DEFAULT_PERIOD`). The engine passes `[auth].totp_skew_steps` as the tolerance, and its default is `0`: only the current step verifies. So any offset would refuse correct codes for part of each step, and an offset of 30 seconds would refuse all of them. [CONFIGURATION.md](CONFIGURATION.md) owns that key. |
-| OIDC sign-in | `messagefoundry/auth/oidc/claims.py` | The engine checks a token's `exp`, `iat` and `nbf` against the host clock, with `[auth].oidc_clock_skew_seconds` of grace: 60 by default, 300 at most. Past that grace, federated sign-in would fail. |
+| OIDC sign-in | `messagefoundry/auth/oidc/claims.py` | The engine checks a token's `exp`, `iat` and `nbf` against the host clock, with `[auth].oidc_clock_skew_seconds` of grace: 60 by default, 300 at most. Past that grace, federated sign-in would fail. At least the `auth_time` plus `max_age` check has no grace, so a smaller offset can refuse a sign-in too. |
 | Log time stamps | `messagefoundry/logging_setup.py` | Each log line carries a UTC stamp made from the host clock. A wrong clock would put the engine's lines out of order against a collector's and against other hosts'. |
 | Retention | `messagefoundry/pipeline/retention.py` | The retention pass works out its cutoffs from the wall clock. A clock that jumps forward would purge rows before their window has passed. |
 | Certificate expiry warnings | `messagefoundry/pipeline/cert_expiry.py` | The monitor counts the days a certificate has left from the host clock, so its warning would come early or late. |
@@ -139,8 +139,10 @@ At least these parts of the engine read the host's wall clock:
 ### This page sets no drift number
 
 The engine has no single tolerance, so this page does not invent one. The numbers above are the
-ones the code and its settings hold. The tightest is TOTP: with the default of zero steps of
-tolerance, every second of offset costs a second of each code's life.
+ones the code and its settings hold. For sign-in the tightest is TOTP: with the default of zero
+steps of tolerance, every second of offset costs a second of each code's life. The start-up check
+below is tighter still where it is turned on: it calls a difference over 2 seconds skewed, by
+default.
 
 ### Check it on Windows
 
@@ -159,7 +161,8 @@ A healthy host answers like this:
 - `/query /status` shows `Leap Indicator: 0(no warning)`, a `Source` that matches the first command,
   and a recent `Last Successful Sync Time`.
 
-At least these answers mean the clock is **not** disciplined:
+Where the Windows Time service is the host's time agent, at least these answers mean the clock
+is **not** disciplined:
 
 - `The service has not been started. (0x80070426)`. The Windows Time service is stopped.
 - A source of `Local CMOS Clock` or `Free-running System Clock`. The host follows only its own
@@ -180,7 +183,8 @@ that peer before any listener starts. It warns when the difference passes
 refuses to start. It is off by default, because the engine cannot pick a time reference for you.
 The keys are in [CONFIGURATION.md, `[logging]`](CONFIGURATION.md#logging).
 
-That check runs once, at start. It does not replace a time service on the host.
+That check runs once, at start. It does not replace a time service on the host. It sends an SNTP
+query to the peer, so the host must be able to reach the peer on UDP port 123.
 
 ## Databases (message store)
 

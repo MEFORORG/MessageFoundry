@@ -757,6 +757,26 @@ def _row_naming(token: str, section: str | None = None) -> str:
     return rows[0]
 
 
+def _cells(row: str) -> list[str]:
+    """The cells of one table row."""
+    return row.strip().strip("|").split("|")
+
+
+def test_every_inventory_row_has_the_headers_cell_count() -> None:
+    """A row one cell too wide shifts every later fact a column right, and the last is dropped.
+
+    Row 17 shipped that way for one commit with this file green: the sensitive-data cell did not
+    render. No cell of this table may hold a literal pipe, so a plain split counts cells.
+    """
+    section = _inventory_section()
+    width = len(_header_cells(section))
+    rows = _inventory_rows(section)
+    assert width >= 8 and len(rows) >= 17, f"read {width} header cells and {len(rows)} rows"
+    wrong = {_cells(row)[0].strip()[:30]: len(_cells(row)) for row in rows}
+    wrong = {name: count for name, count in wrong.items() if count != width}
+    assert not wrong, f"inventory rows whose cell count is not the header's {width}: {wrong}"
+
+
 def test_the_tray_file_sink_has_an_inventory_row() -> None:
     """It ships in the wheel and writes a file, so it has a row, with its real posture.
 
