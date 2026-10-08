@@ -113,7 +113,10 @@ _COMMENT_LINE = re.compile(r"#(?!\d)")
 # source, but a session reading a stale or user-scope setting still writes them, and until this rule a
 # Lander caught them by reading commit bodies by hand. Anchored at the start of a line, so a body may
 # still QUOTE either trailer when it is indented or set in backticks.
-_ATTRIBUTION_TRAILER = re.compile(r"^(?:Co-Authored-By:\s*Claude|Claude-Session:)", re.IGNORECASE)
+# Whitespace is allowed before the colon because git's trailer parser accepts it there.
+_ATTRIBUTION_TRAILER = re.compile(
+    r"^(?:Co-Authored-By\s*:\s*Claude|Claude-Session\s*:)", re.IGNORECASE
+)
 # `git commit -v` appends the diff below this line. It is not message text, so nothing below it counts.
 _SCISSORS = "# ------------------------ >8 ------------------------"
 

@@ -39,7 +39,15 @@ def _run(tmp_path: Path, message: str) -> subprocess.CompletedProcess[str]:
 
 @pytest.mark.parametrize(
     "trailer",
-    [_COAUTHOR, _COAUTHOR.lower(), _COAUTHOR.upper(), _SESSION, "co-authored-by:Claude"],
+    [
+        _COAUTHOR,
+        _COAUTHOR.lower(),
+        _COAUTHOR.upper(),
+        _SESSION,
+        "co-authored-by:Claude",
+        "Co-Authored-By" + " : Claude <noreply@anthropic.com>",
+        "Claude-Session" + " : x",
+    ],
 )
 def test_the_trailer_is_refused_and_the_line_is_named(tmp_path: Path, trailer: str) -> None:
     proc = _run(tmp_path, f"docs: a plain subject\n\nSome body.\n\n{trailer}\n")
@@ -77,7 +85,12 @@ def test_the_diff_below_the_scissors_line_is_not_message_text(tmp_path: Path) ->
 
 def test_the_trailer_rule_fires_before_the_citation_rule(tmp_path: Path) -> None:
     """It needs no git and no claim, so a message the claim gate would also refuse names it first."""
-    proc = _run(tmp_path, f"fix: a thing (#1318)\n\n{_SESSION}\n")
+    subject = "fix: a thing (#1318, #1320)"
+    # Control: this subject alone is refused by the citation rule, so the assertion below can fail.
+    alone = _run(tmp_path, f"{subject}\n")
+    assert alone.returncode == 1
+    assert "claim gate" in alone.stderr.lower()
+    proc = _run(tmp_path, f"{subject}\n\n{_SESSION}\n")
     assert proc.returncode == 1
     assert "attribution-trailer check" in proc.stderr
-    assert "claim gate" not in proc.stderr
+    assert "claim gate" not in proc.stderr.lower()
