@@ -673,9 +673,10 @@ async def test_a_restart_inside_the_window_sends_nothing_again() -> None:
         await store.close()
 
 
-async def test_a_failed_mark_read_skips_that_account_and_the_next_pass_reminds(
+async def test_a_failed_mark_read_still_reminds_and_does_not_stop_the_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A duplicate is the cheap failure, a credential that lapses with nobody told the costly."""
     store, service = await _service()
     try:
         alice, _ = await _issue(service, "alice")
@@ -691,15 +692,11 @@ async def test_a_failed_mark_read_skips_that_account_and_the_next_pass_reminds(
         monkeypatch.setattr(service, "initial_credential_reminded", _flaky)
         sink = _RecordingSink()
         warned: dict[str, float] = {}
-        await _remind_expiring_initial_credentials(
-            service, sink, lead=24 * _HOUR, warned=warned, now=deadline - _HOUR
-        )
-        assert [e["name"] for e in sink.events] == ["user:bob"]
-
-        monkeypatch.setattr(service, "initial_credential_reminded", real)
-        await _remind_expiring_initial_credentials(
-            service, sink, lead=24 * _HOUR, warned=warned, now=deadline - _HOUR
-        )
-        assert [e["name"] for e in sink.events] == ["user:bob", "user:alice"]
+        for _ in range(2):
+            await _remind_expiring_initial_credentials(
+                service, sink, lead=24 * _HOUR, warned=warned, now=deadline - _HOUR
+            )
+        # Each once: the in-process map still holds alice after the first pass.
+        assert sorted(e["name"] for e in sink.events) == ["user:alice", "user:bob"]
     finally:
         await store.close()

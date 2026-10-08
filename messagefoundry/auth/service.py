@@ -2013,8 +2013,9 @@ _ISSUE_ROW_PAGE: Final = 200
 #: recipient as the actor, so the reminder shows in that account's ``/me/security-events`` feed.
 _REMINDER_HOLDER_ACTION: Final = "auth.temporary_credential_expiring"
 _REMINDER_ISSUER_ACTION: Final = "auth.temporary_credential_expiring_issuer"
-#: BACKLOG #2303: how many of an account's holder-reminder rows :meth:`initial_credential_reminded`
-#: reads. Since the mark persists, one credential writes one such row, so a page this size is ample.
+#: BACKLOG #2303: how many of an account's newest holder-reminder rows
+#: :meth:`initial_credential_reminded` reads. Each credential writes about one such row, and the
+#: current credential's is the newest, so a page this size is ample.
 _REMINDER_MARK_PAGE: Final = 50
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
@@ -11022,16 +11023,14 @@ class AuthService:
         The mark is the holder's ``auth.temporary_credential_expiring`` row, which
         :meth:`remind_expiring_initial_credential` writes before any notice. A row counts only when
         its detail names this account's id and this exact deadline, so a new credential on the same
-        account is reminded about again. Rows written before the credential was issued are not read.
-        A failed read raises, and the caller then sends nothing for this account on that pass.
+        account is reminded about again. No time bound is applied: the id and the deadline already
+        pin the credential, and a bound would compare two processes' clocks. A failed read raises;
+        the caller then reminds, so a store fault costs a duplicate rather than a missed reminder.
 
-        The rows are found by the holder's current username. An account renamed after its reminder
-        is not matched, and is reminded once more."""
+        The rows are found by the holder's current username, newest first. An account renamed after
+        its reminder is not matched, and is reminded once more."""
         rows = await self._store.list_audit(
-            action=_REMINDER_HOLDER_ACTION,
-            actor=user.username,
-            since=user.password_changed_at,
-            limit=_REMINDER_MARK_PAGE,
+            action=_REMINDER_HOLDER_ACTION, actor=user.username, limit=_REMINDER_MARK_PAGE
         )
         for row in rows:
             try:
