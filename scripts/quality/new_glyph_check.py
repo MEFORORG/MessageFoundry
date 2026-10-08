@@ -7,14 +7,21 @@ glyph vocabulary may be introduced anywhere. Until this hook the rule was held b
 Measured 2026-10-07 over the last 200 first-parent commits on ``main``: 7 commits staged 12 added
 lines carrying a glyph, for example U+26D4 in ``docs/ASVS-ASSESSMENT-METHOD.md`` and U+2717 in
 ``harness/reconcile/report.py``. Every one of them edited a line that already carried that glyph,
-so the NET count below was zero. The hook holds that zero mechanically from here.
+so the NET count below was zero. This hook holds that zero for every commit that runs hooks.
+
+IT IS LOCAL ONLY, AND THAT IS A REAL GAP. A commit made by the sequencer (rebase, cherry-pick), a
+``--no-verify`` commit and a clone that never ran ``pre-commit install`` all skip it, and no CI step
+mirrors it: a step in a required job is a merge-gate change, which needs the owner.
+``tests/test_gate_ci_mirror_parity.py`` records it under ``_LOCAL_ONLY`` for that reason.
 
 WHAT IT READS: THE STAGED DIFF, NOT WHOLE FILES. Hundreds of glyphs already sit in tracked files.
 Removing them is a filed migration (BACKLOG #1265), and section 11 says not to sweep them out of a
-file you are editing for another reason. So the check counts NET additions per file: each banned
-codepoint on an added line is first matched against the same codepoint on a removed line of that
-file. Editing a status-table row that already carried a check mark passes; adding a new mark does
-not. The first draft judged every added line, and it would have refused all 7 of those commits.
+file you are editing for another reason. So the check counts NET additions across the commit: each
+banned codepoint on an added line is first matched against the same codepoint on a removed line.
+Editing a status-table row that already carried a check mark passes, and so does moving that row to
+another file; adding a new mark does not. Removed lines in exempt files do not feed that pool, so a
+glyph cannot be laundered out of a dated record into a live doc. The first draft judged every added
+line, and it would have refused all 7 of those commits.
 
 WHAT IT REFUSES: any codepoint in ``BANNED_RANGES``. That is Miscellaneous Symbols and Dingbats
 (U+2600-27BF), Miscellaneous Symbols and Arrows (U+2B00-2BFF), the emoji planes (U+1F000-1FAFF) and
@@ -23,7 +30,9 @@ are outside every range on purpose: the operator docs carry many arrows legitima
 
 WHAT IT ALLOWS:
 
-* a glyph quoted inside backticks, the token form section 11 permits for naming a glyph;
+* a glyph quoted inside backticks, the token form section 11 permits for naming a glyph. Not in
+  the suffixes ``BACKTICK_IS_CODE`` names: there a backtick span is a template literal or a command
+  substitution, so a glyph inside it is a user-visible string, not a quoted token;
 * any line under ``EXEMPT_PATHS`` or ``EXEMPT_PREFIXES``. Those are exactly the files
   ``tests/test_operator_docs_no_warning_sign.py`` holds or exempts, and
   ``tests/test_new_glyph_check.py`` fails if the two lists drift apart.
@@ -81,6 +90,9 @@ EXEMPT_PATHS: frozenset[str] = frozenset(
     }
 )
 
+#: Suffixes where a backtick span is executable or user-visible rather than a quoted token.
+BACKTICK_IS_CODE: tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".sh", ".bash")
+
 #: One backtick span: a run of backticks, the shortest text, then the same run again.
 _BACKTICK_SPAN = re.compile(r"(`+)(.+?)\1")
 
@@ -103,6 +115,7 @@ class Finding:
     line: int
     codepoint: int
     text: str
+    count: int = 1
 
 
 @dataclass
@@ -123,21 +136,30 @@ def is_exempt(path: str) -> bool:
     return path in EXEMPT_PATHS or path.startswith(EXEMPT_PREFIXES)
 
 
-def banned_in(line: str) -> list[int]:
-    """Every banned codepoint in *line* outside backtick spans, one entry per occurrence."""
-    bare = _BACKTICK_SPAN.sub("", line)
+def banned_in(line: str, path: str = "") -> list[int]:
+    """Every banned codepoint in *line*, one entry per occurrence.
+
+    Backtick spans are skipped unless *path* has a suffix in :data:`BACKTICK_IS_CODE`.
+    """
+    if line.isascii():
+        return []
+    bare = line if path.lower().endswith(BACKTICK_IS_CODE) else _BACKTICK_SPAN.sub("", line)
     return [ord(ch) for ch in bare if is_banned(ch)]
 
 
-def _git(*args: str) -> bytes:
+def _run_git(*args: str) -> subprocess.CompletedProcess[bytes]:
     try:
-        proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
-            ["git", "-c", "core.quotepath=off", *args],
+        return subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+            ["git", "-c", "core.quotepath=off", "-c", "diff.interHunkContext=0", *args],
             capture_output=True,
             timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GitReadError(f"git {' '.join(args[:2])} did not run: {exc}") from exc
+
+
+def _git(*args: str) -> bytes:
+    proc = _run_git(*args)
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
         raise GitReadError(f"git {' '.join(args[:2])} exited {proc.returncode}: {err[:1]}")
@@ -145,11 +167,14 @@ def _git(*args: str) -> bytes:
 
 
 def _rev_exists(rev: str) -> bool:
-    try:
-        _git("rev-parse", "-q", "--verify", f"{rev}^{{commit}}")
-    except GitReadError:
+    """Whether *rev* names a commit. Exit 1 means it does not; any other failure raises."""
+    proc = _run_git("rev-parse", "-q", "--verify", f"{rev}^{{commit}}")
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1 and not proc.stderr.strip():
         return False
-    return True
+    err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+    raise GitReadError(f"git rev-parse {rev} exited {proc.returncode}: {err[:1]}")
 
 
 def _path_from_header(raw: str) -> str | None:
@@ -166,6 +191,7 @@ def parse_diff(diff: bytes) -> dict[str, FileDiff]:
     """Parse a ``--unified=0`` diff into a :class:`FileDiff` per new-side path."""
     files: dict[str, FileDiff] = {}
     current: FileDiff | None = None
+    path = ""
     lineno = 0
     in_hunk = False
     for raw_bytes in diff.split(b"\n"):
@@ -174,8 +200,11 @@ def parse_diff(diff: bytes) -> dict[str, FileDiff]:
             current, in_hunk = None, False
             continue
         if not in_hunk and raw.startswith("+++ "):
-            path = _path_from_header(raw)
-            current = None if path is None else files.setdefault(path, FileDiff())
+            new_path = _path_from_header(raw)
+            path = new_path or ""
+            current = None if new_path is None else files.setdefault(new_path, FileDiff())
+            continue
+        if not in_hunk and raw.startswith("--- "):
             continue
         hunk = _HUNK.match(raw)
         if hunk:
@@ -188,34 +217,49 @@ def parse_diff(diff: bytes) -> dict[str, FileDiff]:
             current.added.append((lineno, raw[1:]))
             lineno += 1
         elif raw.startswith("-"):
-            current.removed.update(banned_in(raw[1:]))
+            current.removed.update(banned_in(raw[1:], path))
+        elif raw.startswith(" "):
+            lineno += 1  # a context line, which -U0 should not emit; counted so lines stay true
     return files
 
 
 def new_glyphs(files: dict[str, FileDiff]) -> list[Finding]:
-    """Banned codepoints added beyond what the same file's removed lines held.
+    """Banned codepoints added beyond what the commit's removed lines held.
 
-    One finding per line and codepoint, so a line with three new marks of one kind reads once.
+    The pool spans every non-exempt file, so a row moved between files is not new. One finding per
+    line and codepoint; :attr:`Finding.count` says how many of that codepoint the line added.
     """
+    pool: Counter[int] = Counter()
+    for path, fd in files.items():
+        if not is_exempt(path):
+            pool.update(fd.removed)
     found: list[Finding] = []
     for path, fd in files.items():
         if is_exempt(path):
             continue
-        pool = Counter(fd.removed)
         for line, text in fd.added:
-            fresh: list[int] = []
-            for cp in banned_in(text):
+            fresh: Counter[int] = Counter()
+            for cp in banned_in(text, path):
                 if pool[cp] > 0:
                     pool[cp] -= 1
                 else:
-                    fresh.append(cp)
-            for cp in dict.fromkeys(fresh):
-                found.append(Finding(path, line, cp, text))
+                    fresh[cp] += 1
+            for cp, count in fresh.items():
+                found.append(Finding(path, line, cp, text, count))
     return found
 
 
 def _diff(base: str, target: str | None) -> bytes:
-    args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--unified=0", "-M"]
+    args = [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--unified=0",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "-M",
+    ]
     if target is None:
         return _git(*args, "--cached", base)
     return _git(*args, base, target)
@@ -267,19 +311,22 @@ def report(found: list[Finding]) -> str:
     rows = []
     for f in found:
         name = unicodedata.name(chr(f.codepoint), "UNNAMED")
+        times = f" x{f.count}" if f.count > 1 else ""
         rows.append(
-            f"  {_ascii(f.path, 200)}:{f.line}: U+{f.codepoint:04X} {name}\n"
+            f"  {_ascii(f.path, 200)}:{f.line}: U+{f.codepoint:04X} {name}{times}\n"
             f"      line: {_ascii(f.text)}"
         )
+    total = sum(f.count for f in found)
     return (
         "\nMessageFoundry new-glyph check\n\n"
-        f"  This commit ADDS {len(found)} glyph or emoji codepoint(s). CLAUDE.md section 11 forbids\n"
+        f"  This commit ADDS {total} glyph or emoji codepoint(s). CLAUDE.md section 11 forbids\n"
         "  them in prose, comments and code: a glyph's meaning is invisible to grep and to a screen\n"
         "  reader, and it raises UnicodeEncodeError on a stock cp1252 console.\n\n"
         + "\n".join(rows)
         + "\n\n  Fix each line, then stage and commit again:\n"
         "    * in prose or a comment, write the word: DONE, FAILED, WARNING, NOTE, YES, NO;\n"
-        "    * to NAME a glyph as a token, quote it in backticks, which this check allows;\n"
+        "    * to NAME a glyph as a token, quote it in backticks, which this check allows\n"
+        "      (not in .ts/.js/.sh, where a backtick span is a template or a command);\n"
         "    * in code that must emit one, write an escape such as \\N{WARNING SIGN} or \\u26a0,\n"
         "      so the source stays ASCII.\n"
         "  Only NET additions are judged: editing a line that already carried the glyph passes.\n"

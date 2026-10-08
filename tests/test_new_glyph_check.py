@@ -12,10 +12,12 @@ the thing under test, and it would raise UnicodeEncodeError on a stock cp1252 co
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -178,13 +180,90 @@ def test_git_failure_fails_closed(tmp_path: Path) -> None:
     assert "NOT checked" in proc.stderr
 
 
+def test_a_backtick_span_in_typescript_is_a_template_literal_and_fires(repo: Path) -> None:
+    _write(repo, "ide/src/new.ts", f"const s = `${{n}} {_BALLOT_X} done`;\n")
+    assert _run(repo).returncode == 1
+    # Control: the same backtick span in Markdown is the permitted token form.
+    _git(repo, "rm", "-q", "--cached", "ide/src/new.ts")
+    _write(repo, "docs/new.md", f"const s = `${{n}} {_BALLOT_X} done`;\n")
+    assert _run(repo).returncode == 0
+
+
+def test_a_row_moved_to_another_file_is_not_new(repo: Path) -> None:
+    (repo / "notes.md").write_text("old line gone\n", encoding="utf-8")
+    _write(repo, "moved.md", f"old line with {_NO_ENTRY} already here\n")
+    _git(repo, "add", "notes.md")
+    assert _run(repo).returncode == 0
+    # Control: a SECOND copy in the destination is one more than the commit removed.
+    _write(repo, "moved.md", f"old line with {_NO_ENTRY} already here\nagain {_NO_ENTRY}\n")
+    proc = _run(repo)
+    assert proc.returncode == 1
+    assert "moved.md:2: U+26D4" in proc.stderr
+
+
+def test_a_glyph_removed_from_an_exempt_file_does_not_pay_for_a_new_one(repo: Path) -> None:
+    _write(repo, "CHANGELOG.md", f"{_ROCKET} release\n")
+    _git(repo, "commit", "-q", "-m", "changelog")
+    (repo / "CHANGELOG.md").write_text("release\n", encoding="utf-8")
+    _git(repo, "add", "CHANGELOG.md")
+    _write(repo, "docs/live.md", f"{_ROCKET} launched\n")
+    proc = _run(repo)
+    assert proc.returncode == 1
+    assert "docs/live.md:1: U+1F680" in proc.stderr
+
+
+def test_diff_prefix_settings_do_not_break_the_exemptions(repo: Path) -> None:
+    """``diff.mnemonicPrefix`` rewrites ``b/`` to ``i/``; the hook pins its own prefixes."""
+    _git(repo, "config", "diff.mnemonicPrefix", "true")
+    _write(repo, "CHANGELOG.md", f"{_BALLOT_X} release\n")
+    assert _run(repo).returncode == 0
+    _write(repo, "docs/other.md", f"{_BALLOT_X} release\n")
+    proc = _run(repo)
+    assert proc.returncode == 1
+    assert "docs/other.md:1: U+2717" in proc.stderr
+
+
+def test_line_numbers_survive_inter_hunk_context(repo: Path) -> None:
+    body = "".join(f"line {n}\n" for n in range(1, 11))
+    _write(repo, "c.md", body)
+    _git(repo, "commit", "-q", "-m", "c")
+    _git(repo, "config", "diff.interHunkContext", "5")
+    lines = body.splitlines()
+    lines[1] = "line 2 edited"
+    lines[6] = f"line 7 {_BALLOT_X}"
+    _write(repo, "c.md", "\n".join(lines) + "\n")
+    proc = _run(repo)
+    assert proc.returncode == 1
+    assert "c.md:7: U+2717" in proc.stderr
+
+
+def test_the_report_counts_every_occurrence_and_is_pure_ascii() -> None:
+    """stderr uses backslashreplace on any console, so only an in-process check proves ASCII."""
+    hook = _load_hook()
+    finding = hook.Finding("docs/x.md", 3, 0x2705, f"{chr(0x2705)} {chr(0x2705)} {chr(0x2705)}", 3)
+    text = hook.report([finding])
+    assert text.isascii()
+    assert "ADDS 3 glyph" in text
+    assert "U+2705 WHITE HEAVY CHECK MARK x3" in text
+
+
+def _load_hook() -> Any:
+    spec = importlib.util.spec_from_file_location("new_glyph_check", _CHECK)
+    assert spec is not None and spec.loader is not None
+    hook = importlib.util.module_from_spec(spec)
+    # A dataclass resolves its module through sys.modules while the class body runs.
+    sys.modules[spec.name] = hook
+    try:
+        spec.loader.exec_module(hook)
+    finally:
+        del sys.modules[spec.name]
+    return hook
+
+
 def test_the_exempt_list_mirrors_the_warning_sign_guard() -> None:
     """One list of exemptions, read from the guard that owns it; drift here is a silent widening."""
-    sys.path.insert(0, str(_CHECK.parent))
-    try:
-        import new_glyph_check as hook
-    finally:
-        sys.path.pop(0)
+    hook = _load_hook()
+    assert hook.EXEMPT_PATHS, "no exempt paths parsed -- the equality below would be vacuous"
     assert set(hook.EXEMPT_PATHS) == set(_HELD)
     assert tuple(hook.EXEMPT_PREFIXES) == tuple(_DATED_RECORDS)
 

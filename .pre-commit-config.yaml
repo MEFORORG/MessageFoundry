@@ -239,7 +239,7 @@ repos:
       # together. `pre-commit run --all-files` stages nothing, so there it passes having judged
       # nothing; run `new_glyph_check.py --commit <rev>` to judge a commit that already exists.
       - id: new-glyph
-        name: new glyph or emoji (added lines only)
+        name: new glyph or emoji (net additions, staged diff)
         entry: python scripts/quality/new_glyph_check.py
         language: system
         pass_filenames: false
