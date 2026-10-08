@@ -23,6 +23,15 @@ any ``Transfer-Encoding``, ``411`` for a body method with no length, and ``408``
 body does not arrive within :data:`READ_TIMEOUT_SECONDS`. For the first three it answers, then
 discards what the peer still sends, up to a bound, so a peer that writes its whole body before
 reading sees the refusal rather than a reset.
+
+Every answer carries :data:`BASELINE_RESPONSE_HEADERS`: ``nosniff``, a framing and ``<base>``
+policy, and the rest of the engine listener's baseline (ASVS 3.4.3, 3.4.4 and 3.4.6; BACKLOG #1120).
+That includes the answers the stdlib handler writes before the sink's own code runs, such as its
+``400`` for a malformed request line and its ``501`` for a method the sink does not serve. The
+handler's ``end_headers`` adds them, and the stdlib closes every header block through that one
+method. Nothing is answered in HTTP/0.9 form, which has no header block: the stdlib would use it
+for an HTTP/0.9 request and for its own ``400`` and ``505`` on a bad request version, and the sink
+answers those in HTTP/1.0 form instead.
 """
 
 from __future__ import annotations
@@ -38,13 +47,37 @@ from typing import ClassVar
 from harness.sinks import LOOPBACK, Record, Sink
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
-__all__ = ["LOOPBACK", "REDACTED", "REDACTED_HEADERS", "HttpSink", "check_status"]
+__all__ = [
+    "BASELINE_RESPONSE_HEADERS",
+    "LOOPBACK",
+    "REDACTED",
+    "REDACTED_HEADERS",
+    "HttpSink",
+    "check_status",
+]
 
 _log = logging.getLogger(__name__)
 
 #: Headers whose VALUES are credentials. Their presence is recorded; their value never is.
 REDACTED_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie", "x-api-key"})
 REDACTED = "<redacted>"
+
+#: The browser-safety baseline on every answer. The values are the engine HTTP listener's own
+#: (``_BASELINE_RESPONSE_HEADERS`` in ``messagefoundry/transports/http_listener.py``).
+#:
+#: This is a COPY, and the dependency rule forces it: the harness is a client and may not import
+#: ``messagefoundry.transports`` (``tests/test_dependency_boundaries.py``). The API's header floor is
+#: not the source either, since importing it would pull Starlette into the harness process.
+#: ``tests/test_harness_http_headers.py`` imports both constants and asserts they are equal, which is
+#: the one place a divergence turns red. Do not "fix" the copy by importing across the boundary.
+#:
+#: ``Strict-Transport-Security`` is absent on purpose: the sink is cleartext on loopback.
+BASELINE_RESPONSE_HEADERS: tuple[tuple[str, str], ...] = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Frame-Options", "DENY"),
+    ("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'"),
+)
 
 #: How long one socket read may wait, so a peer that declares more than it sends cannot hold a
 #: handler thread (or a stop) open.
@@ -163,6 +196,29 @@ def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002  (stdlib name)
             return  # silenced: a request line can carry a message-derived path
+
+        def end_headers(self) -> None:
+            # The one place the baseline is added. The stdlib ends every header block it writes
+            # here: this handler's answers, send_error's, and the interim 100 Continue. So an
+            # answer written before _serve runs (a malformed request, an unknown method) is
+            # covered without naming it.
+            for name, value in BASELINE_RESPONSE_HEADERS:
+                self.send_header(name, value)
+            super().end_headers()
+
+        # The stdlib writes an answer in HTTP/0.9 form whenever request_version reads "HTTP/0.9":
+        # a bare body, with no status line and no header block for end_headers to add to. That is
+        # also the value it STARTS each parse with, so its own 400 for a bad request version and
+        # its 505 would go out bare. Storing "HTTP/1.0" in its place, wherever the stdlib assigns
+        # it, means every answer has a header block. Only the answer's form changes; the request
+        # is served and recorded as before.
+        @property
+        def request_version(self) -> str:
+            return self._request_version
+
+        @request_version.setter
+        def request_version(self, value: str) -> None:
+            self._request_version = "HTTP/1.0" if value == "HTTP/0.9" else value
 
         def _serve(self) -> None:
             meta: dict[str, str] = {
