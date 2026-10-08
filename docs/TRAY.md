@@ -121,9 +121,12 @@ nothing.
 4. The file exists, and the path it resolves to passes the same tests. A shortcut (`.lnk`) is never
    followed; a symbolic link is judged by what it points at.
 
-To read a log that lives on a share, copy it to a local drive first. One gap is left: resolving a
-local symbolic link that points at a share contacts that share before the tray refuses it. Planting
-one needs write access to the log's own folder.
+The menu applies tests 1 and 2 as well, each time it is built. A `log_path` that fails either one
+greys out "View Service Log", and the tray does not check whether that file exists.
+
+To read a log that lives on a share, copy it to a local drive first. One gap is left: checking for
+or resolving a local symbolic link that points at a share contacts that share before the tray
+refuses it. Planting one needs write access to the log's own folder.
 
 **"Open Repo in VS Code" opens the wrong folder?** By default `repo_path` falls back to the *engine
 service's* install directory (its NSSM `AppDirectory`). To open your own config/conversion estate
@@ -134,6 +137,11 @@ runs a batch file through `cmd.exe`, which reads some characters in the folder p
 So the tray refuses a `repo_path` holding any of `& | < > ^ % ! ( )`, a double quote, or a control
 character. It shows "Repo not opened" and starts nothing. Rename the folder, or open it from VS
 Code itself.
+
+The menu item is also greyed out, marked "(unavailable)", unless `repo_path` starts with a local
+drive letter and that drive is not a mapped network drive. The tray judges this from the text of
+the path and the local drive list, and only then checks that the folder exists. So a `repo_path`
+on a share is never contacted. A local link that points at a share is the same gap as for the log.
 
 ## Why the icon is named "MessageFoundry Tray"
 

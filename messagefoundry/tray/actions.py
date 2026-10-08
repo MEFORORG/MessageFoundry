@@ -21,6 +21,7 @@ import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.tray.config import is_engine_url
 
 # Common VS Code install locations to try if `code` is not on PATH (user + machine installs).
@@ -62,19 +63,79 @@ def resolve_vscode(
     return None
 
 
+#: A local drive path: a drive letter, a colon, then a separator. Nothing else is a local path.
+_LOCAL_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
+
+_DRIVE_REMOTE = 4  # GetDriveTypeW's DRIVE_REMOTE: a mapped network drive
+
+
+def _is_remote_drive(path: str) -> bool:
+    """True when ``path``'s drive letter is a mapped network drive (``GetDriveTypeW``).
+
+    It reads the local drive table and sends nothing to the server. Off Windows the tray does not
+    run, so the answer there is False.
+    """
+    if sys.platform != "win32":
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+    kernel32.GetDriveTypeW.restype = ctypes.c_uint
+    return bool(kernel32.GetDriveTypeW(path[:2] + "\\") == _DRIVE_REMOTE)
+
+
+def _is_local_drive_path(path: str) -> bool:
+    """True when ``path`` has the shape of a path on a local drive letter.
+
+    The shape is an allowlist, so every remote form fails it without a list of its own: a UNC path
+    (``\\\\host\\share``, ``//host/share``), a WebDAV path (``\\\\host@SSL\\DavWWWRoot``), and the
+    device and extended forms (``\\\\?\\UNC\\...``, ``\\\\?\\C:\\...``, ``\\\\.\\...``). So do a
+    relative path, a drive-relative one (``C:x.log``), a rooted one with no drive (``\\logs``), and
+    the ``shell:``, ``file:`` and ``https:`` forms the OS opener would launch.
+    """
+    return _LOCAL_DRIVE_PATH.match(path) is not None
+
+
+def _on_a_local_drive(path: str, is_remote_drive: Callable[[str], bool]) -> bool:
+    """True when ``path`` is on a local drive letter that is not a mapped network drive.
+
+    It judges the string and the local drive table only, so it sends nothing to any host. Every
+    file-system probe of a configured path runs behind it (BACKLOG #2086, #2332).
+    """
+    return _is_local_drive_path(path) and not is_remote_drive(path)
+
+
 def repo_open_available(
     repo_path: str | None,
     vscode: str | None,
     *,
     is_dir: Callable[[str], bool] = _is_dir,
+    is_remote_drive: Callable[[str], bool] = _is_remote_drive,
 ) -> bool:
-    """True iff Open-Repo can work: a real directory and a resolved ``code`` CLI."""
-    return bool(repo_path) and vscode is not None and is_dir(repo_path or "")
+    """True iff Open-Repo can work: a real directory on a local drive and a resolved ``code`` CLI.
+
+    The menu calls this on every build, so the path is screened by :func:`_on_a_local_drive`
+    before ``is_dir`` touches it. A UNC or mapped-drive ``repo_path`` is never probed.
+    """
+    if not repo_path or vscode is None:
+        return False
+    return _on_a_local_drive(repo_path, is_remote_drive) and is_dir(repo_path)
 
 
-def log_available(log_path: str | None, *, is_file: Callable[[str], bool] = _is_file) -> bool:
-    """True iff a service log file is known and present."""
-    return bool(log_path) and is_file(log_path or "")
+def log_available(
+    log_path: str | None,
+    *,
+    is_file: Callable[[str], bool] = _is_file,
+    is_remote_drive: Callable[[str], bool] = _is_remote_drive,
+) -> bool:
+    """True iff a service log file is known, on a local drive, and present.
+
+    The menu calls this on every build, so the path gets the same no-touch screen
+    :func:`open_log` applies before ``is_file`` touches it (BACKLOG #2332). A UNC, device,
+    relative or mapped-drive ``log_path`` is never probed, and View Log would refuse it anyway.
+    """
+    if not log_path:
+        return False
+    return _on_a_local_drive(log_path, is_remote_drive) and is_file(log_path)
 
 
 class ConsoleUrlRefused(ValueError):
@@ -105,8 +166,7 @@ def open_console(engine_url: str, *, opener: Callable[[str], object] | None = No
 
 def _run_detached(args: list[str]) -> None:
     creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    # No shell is asked for, but Windows still runs a batch file such as `code.cmd` under cmd.exe,
-    # which re-reads the argument text. open_repo() refuses a path cmd.exe would re-read first.
+    # shell=False does not keep cmd.exe out of a `code.cmd` launch; see open_repo().
     subprocess.Popen(args, shell=False, creationflags=creationflags)  # nosec B603 - argv is the resolved code CLI plus a repo path open_repo() screened (BACKLOG #2327)
 
 
@@ -131,7 +191,7 @@ class RepoPathRefused(ValueError):
 
 def _cmd_would_reread(text: str) -> bool:
     """True when ``text`` has a ``cmd.exe`` metacharacter or a control character (CR, LF, ...)."""
-    return any(ch in _CMD_REREAD_CHARS or ch < " " or ch == "\x7f" for ch in text)
+    return has_control_char(text) or any(ch in _CMD_REREAD_CHARS for ch in text)
 
 
 def open_repo(
@@ -191,38 +251,6 @@ def _viewable_name(path: str) -> bool:
     return ntpath.splitext(name)[1].casefold() in _VIEWABLE_LOG_SUFFIXES
 
 
-#: A local drive path: a drive letter, a colon, then a separator. Nothing else is a local path.
-_LOCAL_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
-
-_DRIVE_REMOTE = 4  # GetDriveTypeW's DRIVE_REMOTE: a mapped network drive
-
-
-def _is_remote_drive(path: str) -> bool:
-    """True when ``path``'s drive letter is a mapped network drive (``GetDriveTypeW``).
-
-    It reads the local drive table and sends nothing to the server. Off Windows the tray does not
-    run, so the answer there is False.
-    """
-    if sys.platform != "win32":
-        return False
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
-    kernel32.GetDriveTypeW.restype = ctypes.c_uint
-    return bool(kernel32.GetDriveTypeW(path[:2] + "\\") == _DRIVE_REMOTE)
-
-
-def _is_local_drive_path(path: str) -> bool:
-    """True when ``path`` has the shape of a path on a local drive letter.
-
-    The shape is an allowlist, so every remote form fails it without a list of its own: a UNC path
-    (``\\\\host\\share``, ``//host/share``), a WebDAV path (``\\\\host@SSL\\DavWWWRoot``), and the
-    device and extended forms (``\\\\?\\UNC\\...``, ``\\\\?\\C:\\...``, ``\\\\.\\...``). So do a
-    relative path, a drive-relative one (``C:x.log``), a rooted one with no drive (``\\logs``), and
-    the ``shell:``, ``file:`` and ``https:`` forms the OS opener would launch.
-    """
-    return _LOCAL_DRIVE_PATH.match(path) is not None
-
-
 def open_log(
     log_path: str,
     *,
@@ -249,11 +277,7 @@ def open_log(
     Residual: resolving a local symlink that points at a UNC path reaches that host before the
     resolved target is refused. Planting one needs write access to the log's own directory.
     """
-    if (
-        not _is_local_drive_path(log_path)
-        or not _viewable_name(log_path)
-        or is_remote_drive(log_path)
-    ):
+    if not _viewable_name(log_path) or not _on_a_local_drive(log_path, is_remote_drive):
         raise LogPathRefused
     # The refusal is raised outside the handler, so the OSError (which quotes the path) is not
     # chained onto it (tests/test_from_none_is_not_redaction.py).
@@ -264,9 +288,8 @@ def open_log(
         target = None
     if (
         target is None
-        or not _is_local_drive_path(target)
         or not _viewable_name(target)
-        or is_remote_drive(target)
+        or not _on_a_local_drive(target, is_remote_drive)
         or not is_file(target)
     ):
         raise LogPathRefused

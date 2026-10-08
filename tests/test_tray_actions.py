@@ -8,7 +8,6 @@ import logging
 import os
 import subprocess
 import sys
-import types
 import webbrowser
 from collections.abc import Callable
 from pathlib import Path
@@ -68,18 +67,26 @@ def test_resolve_vscode_none_when_absent() -> None:
 
 
 def test_repo_open_available() -> None:
-    assert repo_open_available("C:\\repo", "code.cmd", is_dir=lambda _p: True) is True
-    assert repo_open_available("C:\\repo", None, is_dir=lambda _p: True) is False  # no code CLI
-    assert (
-        repo_open_available("C:\\repo", "code.cmd", is_dir=lambda _p: False) is False
-    )  # not a dir
-    assert repo_open_available(None, "code.cmd", is_dir=lambda _p: True) is False  # no path
+    def available(repo_path: str | None, vscode: str | None, is_dir: bool) -> bool:
+        return repo_open_available(
+            repo_path, vscode, is_dir=lambda _p: is_dir, is_remote_drive=_never_remote
+        )
+
+    assert available("C:\\repo", "code.cmd", True) is True
+    assert available("C:\\repo", None, True) is False  # no code CLI
+    assert available("C:\\repo", "code.cmd", False) is False  # not a dir
+    assert available(None, "code.cmd", True) is False  # no path
 
 
 def test_log_available() -> None:
-    assert log_available("C:\\log.txt", is_file=lambda _p: True) is True
-    assert log_available("C:\\log.txt", is_file=lambda _p: False) is False
-    assert log_available(None, is_file=lambda _p: True) is False
+    assert (
+        log_available("C:\\log.txt", is_file=lambda _p: True, is_remote_drive=_never_remote) is True
+    )
+    assert (
+        log_available("C:\\log.txt", is_file=lambda _p: False, is_remote_drive=_never_remote)
+        is False
+    )
+    assert log_available(None, is_file=lambda _p: True, is_remote_drive=_never_remote) is False
 
 
 def test_open_console_opens_ui_url() -> None:
@@ -204,6 +211,7 @@ def test_open_repo_runs_code_with_list_argv() -> None:
         "C:\\a\nb",
         "C:\\a\x00b",
         "C:\\a\x1ab",
+        "C:\\a\x7fb",
         "C:\\with space\\a&b",  # quoting the argument does not make it safe to hand over
     ],
 )
@@ -213,8 +221,6 @@ def test_open_repo_refuses_a_path_cmd_would_reread(repo_path: str) -> None:
         open_repo(repo_path, "code.cmd", runner=calls.append)
     assert calls == []
     # Fixed text: the path is operator data, so no part of it is echoed.
-    assert "a&b" not in str(excinfo.value)
-    assert "C:\\" not in str(excinfo.value)
     assert str(excinfo.value) == str(RepoPathRefused())
 
 
@@ -231,26 +237,28 @@ def test_open_repo_still_opens_an_ordinary_folder(repo_path: str) -> None:
 def test_the_tray_app_reports_a_refused_repo_path_and_starts_nothing(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from messagefoundry.tray.app import TrayApp
+    from messagefoundry.redaction import redact
 
     started: list[object] = []
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: started.append(a))
-    notes: list[str] = []
-    app = TrayApp.__new__(TrayApp)
-    app._config = TrayConfig(repo_path="C:\\a&b")
-    app._vscode = "code.cmd"
-    app._shell = types.SimpleNamespace(request_notify=lambda t, b: notes.append(b))  # type: ignore[assignment]
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.tray.app"):
-        app._open_repo()
+
+    def act(tray: object) -> None:
+        monkeypatch.setattr(tray, "_vscode", "code.cmd", raising=False)
+        tray._open_repo()  # type: ignore[attr-defined]
+
+    title, body, logged = _refused_action_report(
+        monkeypatch, caplog, act, TrayConfig(repo_path="C:\\secret&b")
+    )
+
     assert started == []
-    line = f"Repo not opened: {RepoPathRefused()}"
-    assert notes == [line]
-    assert [r.getMessage() for r in caplog.records] == [line]
-    assert "a&b" not in line
+    assert body == f"Repo not opened: {RepoPathRefused()}"
+    assert logged == body
     # tray.log runs the engine's redactor, which must not eat the operator's line (BACKLOG #2092).
-    record = logging.LogRecord("messagefoundry.tray", logging.WARNING, __file__, 1, line, (), None)
+    assert redact(logged) == logged
+    record = logging.LogRecord("messagefoundry.tray", logging.WARNING, __file__, 1, body, (), None)
     TrayLogScrubFilter().filter(record)
-    assert record.getMessage() == line
+    assert record.getMessage() == body
+    assert "secret" not in title + body + caplog.text
 
 
 def _identity(path: str) -> str:
@@ -319,29 +327,29 @@ class _Probes:
 # BACKLOG #2086: a remote target is refused on the configured string alone, so no probe runs and
 # nothing reaches the host. Opening one would send the user's NTLM credentials to it, and open
 # content that host controls.
-@pytest.mark.parametrize(
-    "log_path",
-    [
-        # UNC, both separators and mixed.
-        "\\\\host\\share\\service.log",
-        "//host/share/service.log",
-        "\\/host/share/service.log",
-        "/\\host\\share\\service.log",
-        "\\\\192.0.2.10\\share\\service.log",
-        # WebDAV through the redirector.
-        "\\\\host@SSL\\DavWWWRoot\\service.log",
-        "\\\\host@SSL@443\\DavWWWRoot\\service.log",
-        "\\\\host\\DavWWWRoot\\service.log",
-        "\\\\host@80\\share\\service.log",
-        # Extended-length and device paths, remote and local alike.
-        "\\\\?\\UNC\\host\\share\\service.log",
-        "\\\\?\\C:\\logs\\service.log",
-        "\\\\.\\C:\\logs\\service.log",
-        "\\\\.\\UNC\\host\\share\\service.log",
-        "\\\\.\\pipe\\service.log",
-        "//?/UNC/host/share/service.log",
-    ],
-)
+_REMOTE_PATHS = [
+    # UNC, both separators and mixed.
+    "\\\\host\\share\\service.log",
+    "//host/share/service.log",
+    "\\/host/share/service.log",
+    "/\\host\\share\\service.log",
+    "\\\\192.0.2.10\\share\\service.log",
+    # WebDAV through the redirector.
+    "\\\\host@SSL\\DavWWWRoot\\service.log",
+    "\\\\host@SSL@443\\DavWWWRoot\\service.log",
+    "\\\\host\\DavWWWRoot\\service.log",
+    "\\\\host@80\\share\\service.log",
+    # Extended-length and device paths, remote and local alike.
+    "\\\\?\\UNC\\host\\share\\service.log",
+    "\\\\?\\C:\\logs\\service.log",
+    "\\\\.\\C:\\logs\\service.log",
+    "\\\\.\\UNC\\host\\share\\service.log",
+    "\\\\.\\pipe\\service.log",
+    "//?/UNC/host/share/service.log",
+]
+
+
+@pytest.mark.parametrize("log_path", _REMOTE_PATHS)
 def test_open_log_refuses_a_remote_target_before_any_probe(log_path: str) -> None:
     probes = _Probes()
     opened: list[str] = []
@@ -370,6 +378,72 @@ def test_open_log_refuses_a_mapped_network_drive_before_resolving_it() -> None:
         )
     assert opened == []
     assert probes.calls == ["is_remote_drive"]
+
+
+# BACKLOG #2332: the menu asks these two on every build, so they must screen the configured string
+# the way open_log does, before any probe. A relative or drive-relative path is screened out too.
+_NOT_ON_A_LOCAL_DRIVE = [
+    *_REMOTE_PATHS,
+    "logs\\service.log",
+    "C:service.log",
+    "\\logs\\service.log",
+]
+
+
+@pytest.mark.parametrize("log_path", _NOT_ON_A_LOCAL_DRIVE)
+def test_log_available_never_probes_a_path_off_a_local_drive(log_path: str) -> None:
+    probes = _Probes()
+    available = log_available(
+        log_path, is_file=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == []
+
+
+def test_log_available_never_probes_a_mapped_network_drive() -> None:
+    probes = _Probes(remote=True)
+    available = log_available(
+        "Z:\\logs\\service.log", is_file=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == ["is_remote_drive"]
+
+
+def test_log_available_probes_a_local_path_after_the_screen() -> None:
+    probes = _Probes()
+    available = log_available(
+        "C:\\logs\\service.log", is_file=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is True
+    assert probes.calls == ["is_remote_drive", "is_file"]
+
+
+@pytest.mark.parametrize("repo_path", _NOT_ON_A_LOCAL_DRIVE)
+def test_repo_open_available_never_probes_a_path_off_a_local_drive(repo_path: str) -> None:
+    probes = _Probes()
+    available = repo_open_available(
+        repo_path, "code.cmd", is_dir=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == []
+
+
+def test_repo_open_available_never_probes_a_mapped_network_drive() -> None:
+    probes = _Probes(remote=True)
+    available = repo_open_available(
+        "Z:\\repo", "code.cmd", is_dir=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == ["is_remote_drive"]
+
+
+def test_repo_open_available_probes_nothing_without_a_code_cli() -> None:
+    probes = _Probes()
+    available = repo_open_available(
+        "C:\\repo", None, is_dir=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == []
 
 
 @pytest.mark.parametrize(
