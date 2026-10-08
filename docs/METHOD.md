@@ -31,8 +31,8 @@ once, usually one per account, and what binds them is the repository they share.
 
 **The case spawning exists for is a PR that needs a fix with no Manager alive**, which nothing else
 resolves: workflows label and report a red PR, but none sends it to a seat (see "Nothing tells
-anyone your PR is waiting" below). `CLAUDE.md` section 5 carries the reasoning and the two spelling
-hazards. This replaced a rule reading *"NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE"*,
+anyone your PR is waiting" below). The reasoning is under *CLAUDE.md text moved in wave 2* below,
+and the two spelling hazards are in [`WORKTREES.md`](WORKTREES.md). This replaced a rule reading *"NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE"*,
 true when written and false by 2026-09-16.
 
 **The grant below is LIVE again, and the measurements are kept because they still apply.** It gated
@@ -66,6 +66,8 @@ Manager, Process Improvement and ASVS Tracker. **An eighth went on 2026-09-05**,
 `reviewed` label and `review-gate.yml`; it is deliberately unnamed, here and everywhere else in this
 repository, by owner instruction 2026-09-16. **The CONSOLE went on 2026-09-10, and the Manager above
 replaces it.** If a document names one, that document is stale.
+*Count note, 2026-10-07:* the blocks under *Retired CLAUDE.md notices* call the Console the eighth,
+because that file never counted the unnamed seat; the note at the head of that section says the same.
 
 **A Manager is not a renamed Console, and substituting one for the other is the measured failure
 this retirement was written to stop.** A Console's workers were separate sessions across several
@@ -472,6 +474,9 @@ exit 0 in 38.8 seconds; every root measured that day without them was refused. E
 prove a spawn worked, because a prompt swallowed by a list-taking flag exits 0 too (see the dispatch
 bullet below), so check what the child did. **What binds a Manager's workers instead is the
 tool-grant spelling, and the careful spelling is the broken one** -- same bullet.
+*Since 2026-10-07 both bullets this paragraph points at are in [`WORKTREES.md`](WORKTREES.md):
+"Put the prompt first, or a list-valued flag eats it and the lane dies quietly" and "Grant tools by
+bare name in the `--allowedTools` flag".*
 
 ### The korus playbooks: the pointer moved and the thing it pointed at did not
 
@@ -751,3 +756,238 @@ resolve or to hand over.**
 touches code in this repository or the vault, does the Lander resolve it under korus 4c-quinquies,
 or does this file's Must-not clause stand and the pull request route elsewhere -- and which applies
 until you answer?* Whoever asks it should paste the two verbatim sentences above and nothing else.
+
+## CLAUDE.md text moved in wave 2, kept verbatim
+
+These blocks moved out of the root `CLAUDE.md` on 2026-10-07, in a second pass after the section
+above, word for word. The reason is the same: `CLAUDE.md` loads into every session, and each block
+binds only one seat or one kind of work. `CLAUDE.md` keeps a short form of the rules in them that it
+still states, and points here. Link targets were changed so they resolve from `docs/`.
+
+Read each block as `CLAUDE.md` at `d62308d8be`. There, *above*, *below*, *this file*, *this
+section* and a bare section number mean `CLAUDE.md` and its sections, not this page. Where a block
+and `CLAUDE.md` now disagree, `CLAUDE.md` wins.
+
+### The Manager's dispatch rules, from section 5
+
+From *The Manager plans, dispatches, and holds the owner's attention*. The `--allowedTools`
+bullet went to [`WORKTREES.md`](WORKTREES.md), beside the prompt-first section. The bullets
+korus `roles/MANAGER.md` already carries were not copied: push then report, the three
+who-else-is-running fields, readings not conclusions, and announcing files rather than subjects.
+Nor were the prompt-first, own-worktree and never-relocate bullets, which `WORKTREES.md` states in
+its sections on putting the prompt first, creating a worktree and starting the session in it.
+
+- One brief per Builder. After about two failed attempts at the same problem, dispatch a fresh Builder
+  with a better brief rather than reuse a poisoned context. A Builder cannot do this. When you are
+  stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.
+- **If you take back part of a brief you already dispatched, mail the receiver, because you cannot
+  update the chip.** `dismiss_task` withdraws only a chip the user has **not** acted on, so a
+  started one stays live and frozen around your stale text, and no channel carries the correction.
+  Say which item is already done and where it landed. **This binds whichever seat dispatched:** any
+  seat can raise a chip, and in the 2026-09-04 case above the spawner was
+  the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
+  still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
+- Rules a Builder needs belong in the **account's** `settings.json`, outside git.
+  `.claude/settings.json` is tracked, and every worktree carries its own copy from its own branch, so
+  an uncommitted edit to the primary checkout reaches nothing else.
+
+### The Special seat and the spawn grant, from section 5
+
+From the notes under the section 5 roster. `CLAUDE.md` keeps the roster row, a short form of each
+ruling, and pointers to korus `roles/SPECIAL.md` and `docs/roles/special.card.md`.
+
+**THE SPECIAL SEAT IS THE OWNER'S, AND IT HAS NO STANDING DUTIES (owner decision 2026-09-16).** It
+exists for work that falls outside the other five, so its instruction is the whole of its scope and
+it has none until the owner gives it one. It does not take a BACKLOG item, a brief, or a red. It is
+an ADDITION -- nothing retired to make room for it -- and it is not a spawn-authorised seat, so the
+ruling below binds it.
+
+**Standing by is its normal state, not a fault in it.** An idle Special session is the owner holding
+one in reserve, and work it finds itself spends that. It announces and declares before its first
+SHARED write rather than on arrival, which is the one point where it parts company with every other
+seat here: the arrival prompt that tells each session to declare is the line this seat alone does
+not act on. The cost of that silence is real and lands on nobody while the seat touches nothing --
+`fleet.ps1` omits it and no peer can forecast a collision with it -- which is why the deferral ends
+at the first shared write and not later. Its card is
+[`docs/roles/special.card.md`](roles/special.card.md); the full playbook is korus
+`roles/SPECIAL.md`, read at `origin/main` like every other playbook.
+
+**A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
+ruling 2026-09-16).** The owner still starts each Manager in the ordinary case, and a Manager's
+workers are still subagents in its own process rather than spawned sessions. A Manager still needs
+no account roster and still cannot reach another Manager: spawning makes a NEW session, it does not
+address an existing one, so the shape still dissolves the cross-account problem rather than solving
+it.
+
+**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing sends a
+red PR to a seat -- `failure-signal.yml` sets a `ci-red` label that only an advisory daily report
+reads back, and `stalled-prs.yml` reports green-but-unmergeable PRs rather than red ones -- so the
+work stops until somebody happens to look. **CORRECTED 2026-09-26:** this read "a `ci-red` label no
+workflow reads back"; `ci-red-report.yml` (PR 1240) reads it daily into its own run summary. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
+landing means nobody checked it, and a fix written to turn CI green is checked by the very signal it
+was written against.
+
+**SPAWNING SHOULD BE RARE, AND REACHING FOR IT IS WORTH NOTICING.** A Manager's subagents already
+cover almost everything it does, and the load-bearing property is that **a subagent cannot outlive a
+mistake** -- it needs no grant and it dies with its Manager. **A spawned session can outlive one**,
+which is the whole of the added risk. So a spawn is better read as a SIGNAL THAT SOMETHING UPSTREAM
+HAS FAILED -- a seat died with work outstanding, or nobody was alive to take a red -- than as a
+routine tool. Raised by a Manager seat on 2026-09-16, about its own grant, which is the direction
+that argument is most credible from.
+
+### A Builder gets one turn, items 2, 5 and 6, from section 5
+
+`CLAUDE.md` keeps items 1, 3 and 4 whole and a short form of each of these three. The full items
+follow.
+
+2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
+   push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at
+   tool-call time and deny the tool call itself. Each one sees only some tools.
+   `collision_gate.ps1`, wired by `scripts/coord/install-coordination.ps1`, sees Write, Edit,
+   MultiEdit and NotebookEdit, and nothing else. `worktree_gate.ps1`, installed to
+   `%USERPROFILE%\.claude\hooks\` by `scripts/worktree/install-gate.ps1`, sees at least those four
+   tools and Bash and PowerShell. On the four edit tools it judges the file being written. On a
+   shell call it judges only git commands, by verb, config key and the repository or worktree they
+   target. **So neither guard intercepts an ordinary shell write, such as a redirect into a
+   file.** The worktree gate's own deny text says a shell route around a denied write still breaks
+   its rule. CI arrives later, when the process is gone.
+
+<!-- list break: keeps the CLAUDE.md item number -->
+
+5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
+   Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
+   which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
+   `echo C:\Temp\demo` prints `C:Tempdemo`, so `pwsh` reports the argument is not a
+   script file, which reads as a missing script rather than a quoting bug. Measured 2026-09-02. This
+   is ordinary POSIX quoting and is **not** BACKLOG #1397, which is the Bash tool unescaping inside
+   a QUOTED heredoc.
+   The **PowerShell tool** does refuse a nested `pwsh`, with `Command spawns a nested PowerShell
+   process which cannot be validated`. That refusal belongs to one tool, not to the harness, and
+   the Bash tool has no such check. **This line previously said a seat cannot declare itself.**
+   That was wrong, and it was self-confirming: a Builder told it cannot declare does not try,
+   renders undeclared, and confirms the rule. Two Builders on one root, 33 minutes apart: the
+   second's brief asked it to declare and the first's did not, and only the second declared. They
+   also differed in task, worktree and grant list, so that is the cause and not a controlled arm.
+   A SessionStart hook (`scripts/hooks/seat-declare-prompt.ps1`) prints a line telling every
+   starting session to declare. **Do not ignore it.** The Manager should still supply seat and goal
+   at dispatch, because no hook will invent a goal, by design: a machine that invents one writes a
+   record that looks declared and says nothing.
+
+<!-- list break: keeps the CLAUDE.md item number -->
+
+6. **A brief can be wrong by the time you read it, and nothing will tell you.** Verify it against
+   the tree before you act on it: read the diff of **every PR it names**, at hunk granularity, and
+   re-locate every line number by symbol. **Where the brief and the tree disagree, the tree wins.**
+   ***Do not scope this check to how recently the brief was written.*** Two windows give the same
+   symptom and **the wider one dominates**: a brief goes stale AFTER dispatch, in minutes, and it is
+   written stale because the ITEM it was cut from is stale, over weeks. A Manager seat reported six
+   of eleven briefed items already answered at spawn on 2026-09-04 -- by an ADR accepted before the
+   brief, by work shipped under a different number, by a PR the item itself says not to rebuild.
+   **Attributed, not verified here.** The structural cause is that an item records its own research
+   and nothing records the work that ANSWERS it, so a settled row still reads as current.
+   **Line numbers are navigation aids and never evidence** -- the same seat measured four anchors
+   adrift by 50, 86, 581 and 593 lines in one day, one item with both of its anchors dead.
+   Measured here 2026-09-04, the after-dispatch window: a chip named three drift sites, and minutes
+   later the spawner took item 3 itself and pushed it as `c2f549f42` on PR 837. The receiver read
+   that diff before touching anything, saw both hunks already rewritten, and skipped it. Trusting
+   the brief would have put two PRs on the same two comment blocks, to meet at merge with the Lander
+   resolving prose by hand. **Two of the same brief's other three items also failed to survive a
+   read of their sources**, so one confirmed drift is a reason to re-check the rest, not to correct
+   that line and carry on. ***"The brief is disposable" above says it may be thrown away; it does
+   not say it was true when written.*** **Finding an item already answered is a GOOD outcome** --
+   record it with evidence and stop, rather than building it again. BACKLOG #1448, same family
+   as #1391.
+
+### The glyph rule's reasoning, history and census, from section 11
+
+From the first bullet of section 11. `CLAUDE.md` keeps the rule, a short form of its reasoning, the
+backticked-token exception, the `backlog-hygiene.yml` warning, the ban on new glyph vocabulary, the
+U+26A0 ruling and the positive-control rule.
+
+  **Why this is a correctness rule and not a style preference.** A glyph's meaning is *positional*, and
+  that is invisible to anyone who learns it from examples rather than from its definition. Measured
+  2026-08-04: the backlog's `✅` means "this item is closed" **only** in the leading blockquote — quoted
+  in an item's prose it is narrative. Two parsers of the same file disagreed on exactly that, one
+  reading "the glyph appears in this item" and the other "this item declares closed status", and they
+  **agreed on the current corpus by luck** because no item happens to have the discriminating shape.
+  Words carry their scope in the sentence around them; a bare glyph does not, so it invites
+  presence-equals-meaning reading and hides the ambiguity from review.
+
+  Secondary but real: emoji need variation-selector handling (`️`) in every regex that touches
+  them, and they raise `UnicodeEncodeError` on a stock Windows cp1252 console — which cost four
+  separate failures in one session.
+
+  **THE ONE HOLDOUT IS RETIRED, AND IT LEFT BY MIGRATION RATHER THAN BY EDIT (BACKLOG #1250).** It was
+  a machine-parsed contract: `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` encoded
+  item status as a banner alphabet, `scripts/docs/backlog_status_check.py` defined it, and
+  `.github/workflows/backlog-hygiene.yml` quoted it. The PARSING went to the maintainer-internal
+  repository on 2026-09-13 with the ledger itself.
+
+  **TWO OF THOSE FOUR FILES ARE STILL TRACKED HERE, AND DELETING ONE OF THEM WEDGES EVERY PULL
+  REQUEST.** This paragraph previously read "all four went", which invites a tidier to remove a merge
+  gate. Measured 2026-09-16 with `git ls-files`: `BACKLOG-CLOSED.md` and `backlog_status_check.py` are
+  gone, `docs/BACKLOG.md` is still tracked as a stub, and `.github/workflows/backlog-hygiene.yml` is
+  still tracked **because its `name:` is a REQUIRED status-check context in branch protection**. The
+  job itself is a deliberate no-op that prints why it has nothing to check. Deleting it, renaming it,
+  or dropping either trigger makes the context never report -- and a required context that never
+  reports does not fail, it WEDGES, in the queue and out of it. Retiring it is a branch-protection
+  change, not an in-repo edit. That file's own header is the source of record; read it first.
+
+  **SO NO GLYPH IN THIS REPOSITORY CARRIES MACHINE-PARSED MEANING ANY MORE, AND THE RULE ABOVE IS NOW
+  UNCONDITIONAL HERE.** Nothing reads a status banner; nothing may start.
+
+  **THAT IS NOT THE SAME AS THE GLYPHS BEING GONE, and the difference is the next person's trap.**
+  Measured 2026-09-13, git-tracked files, after the move: the five former status glyphs still appear
+  **557 times across 61 files** — 133 in `docs/FEATURE-MAP.md`, 124 in `docs/CONNECTIONS.md`, 63 in
+  one benchmark status page, and a long tail. Every one of them is now plain decoration, which the
+  rule forbids outright. They were tolerated only because a parser depended on them, and that parser
+  is gone. **Removing them is a migration with its own item, not a doc edit** — the same standing this
+  paragraph used to give the holdout — so do not start sweeping them out of files you are editing for
+  another reason. **No NEW glyph vocabulary may be introduced anywhere.**
+
+  **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
+  is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
+  anywhere; it is decoration, which the rule above forbids outright. Retiring it is **BACKLOG #1265**,
+  a filed migration, sliced by owner go (the 2026-09-30 ruling quoted below is the latest) — *not* a
+  licence to edit lines outside a ruled slice, and not a cp1252 hazard (the cp1252 gate covers
+  `scripts/**/*.py`, which contains none of them).
+
+  **The measured population is recorded here so nobody re-derives the false zero that stalled this
+  question once already. Re-censused over git-tracked files 2026-09-13, after the ledger left: 256
+  occurrences across 67 files** — 172 under `docs/`, 37 in `docs/adr/`, 26 in `harness/`, 8 in
+  `tests/`, 4 in `ide/`, 3 in engine source, 3 at the repository root, 2 in the web console, 1 under
+  `.github/`, and **zero in `scripts/`**. 23 tracked files did not decode and were not counted.
+  **Re-censused 2026-09-30 by codepoint: 223 across 48 files at `a4c42c86e9`, and 161 across 26
+  after the live-docs slice below.** After the `CONFIGURATION.md` slice it read 154 across 24, at
+  `cf9224acca`. The control `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` read 93 each time,
+  and the same 23 undecodable files were skipped. 142 of the 154 sit under `docs/benchmarks/`.
+
+  **The previous figure was 476, and 218 of those left with the ledger rather than being fixed.** That
+  is the whole of the drop: `BACKLOG.md` carried 125 and `BACKLOG-CLOSED.md` 93. A migration is not
+  remediation, and reading the smaller number as progress on #1265 would be wrong.
+
+  Earlier slices were real, and `tests/test_operator_docs_no_warning_sign.py` pins each at zero or
+  at a named ceiling: the five shipped operator docs — `SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`,
+  `DEPLOYMENT.md`, `CONNECTIONS.md`; every top-level `docs/adr/*.md` (PR 1604, 31 sites, with
+  `README.md` finished later); and the live docs plus code comments and docstrings, 62 sites. That
+  last slice rests on the owner ruling of 2026-09-30, given to the batch 183 Manager in session:
+  *"the sweep extends beyond docs/adr/ to live docs and code comments. Dated benchmark and status
+  records are exempt and must be named as exempt. The CLA and license banners are reviewed
+  separately, not in this sweep."* What still carries the glyph is named in that test with its
+  reason: `docs/benchmarks/` and `CHANGELOG.md` as dated records, `CLA.md` and
+  `COMMERCIAL-LICENSE.md` for the owner's separate review, seven glyphs inside user-visible string
+  literals, and test data in `tests/test_ledger_check.py`. `docs/CONFIGURATION.md` and
+  `messagefoundry/config/settings.py` were held until BACKLOG #1504 landed, then swept, 7 sites.
+
+  **Two rows of the filed table were instrument errors, both SDS-3.8, and they are kept because the
+  errors recur.** It read the web console as zero by counting `packaging/`; the console's source is
+  `messagefoundry_webconsole/`. And it had no `harness/` row at all, so 26 occurrences sat outside
+  every bucket while the buckets still printed a confident total.
+
+  **CENSUS THIS POPULATION WITH A POSITIVE CONTROL, AND THE OLD CONTROL IS GONE.** The first attempt
+  ever made returned a false zero off a broken shell escape, and a pattern that finds nothing anywhere
+  is indistinguishable from a clean repo. The control used to be the ledger's own counts; those files
+  are no longer here. Use `docs/FEATURE-MAP.md` and `docs/CONNECTIONS.md`, which carry 133 and 124
+  status glyphs: an instrument that cannot find those proves nothing by returning zero anywhere else.
+  **Do not print a glyph to a Windows console while measuring** — a stock cp1252 terminal raises
+  `UnicodeEncodeError` and kills the run mid-report, which happened during this very census.
