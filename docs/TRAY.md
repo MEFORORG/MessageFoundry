@@ -77,7 +77,7 @@ came up, stopped unexpectedly, went unreachable), rate-limited so a crash-loop c
 
 - **Open Monitor Console** — opens `<engine_url>/ui` in your browser (disabled, with a hint, when the
   console isn't enabled — set `[security].serve_web_console = true` in the service settings).
-- **Open Repo in VS Code** — opens the engine repo folder via the `code` CLI.
+- **Open Repo in VS Code** — opens the engine repo folder in VS Code, found through the `code` CLI.
 - **Start / Stop / Restart Service** — drives the NSSM service; **Stop** and **Restart** ask for
   confirmation first (they halt message flow), then raise a single Windows **UAC prompt**. Cancelling
   the prompt is handled cleanly ("Action cancelled"). No standing admin rights are granted.
@@ -121,13 +121,40 @@ nothing.
 4. The file exists, and the path it resolves to passes the same tests. A shortcut (`.lnk`) is never
    followed; a symbolic link is judged by what it points at.
 
-To read a log that lives on a share, copy it to a local drive first. One gap is left: resolving a
-local symbolic link that points at a share contacts that share before the tray refuses it. Planting
-one needs write access to the log's own folder.
+The menu applies tests 1 and 2 as well, each time it is built. A `log_path` that fails either one
+greys out "View Service Log", and the tray does not check whether that file exists.
+
+To read a log that lives on a share, copy it to a local drive first. One gap is left: checking for
+or resolving a local symbolic link that points at a share contacts that share before the tray
+refuses it. Planting one needs write access to the log's own folder.
 
 **"Open Repo in VS Code" opens the wrong folder?** By default `repo_path` falls back to the *engine
 service's* install directory (its NSSM `AppDirectory`). To open your own config/conversion estate
 instead, set `repo_path` in `tray.toml` (edit it via the menu) and restart the tray.
+
+**How "Open Repo in VS Code" starts the editor.** The tray finds the `code` command, then starts
+the editor program itself: `Code.exe`, one folder above the `bin` folder that holds `code.cmd`. It
+hands that program the folder as a single argument, with no command shell. So a folder under
+`C:\Program Files (x86)`, or one with `&` or `%` in its name, opens like any other.
+
+**The one case where a folder is refused.** Some setups have a `code.cmd` with no `Code.exe` in
+that place, for example a shim from a package manager. `code.cmd` is a batch file, and Windows
+runs a batch file through `cmd.exe`, which reads some characters in the command line as commands.
+Only then, the tray opens a `repo_path` made of nothing but letters, digits, spaces and
+`\ / : . _ - ~ + @ #`. For any other character, such as `&`, `%`, a comma or a bracket, it shows
+"Repo not opened" and starts nothing. This is wider than `cmd.exe` strictly needs. Rename the
+folder, or open it from VS Code itself. If that `code.cmd`'s own path fails the same test, the
+tray does not use it at all.
+
+If Windows cannot start the editor program, the tray shows "Repo not opened: the launch failed"
+and writes the error type to `tray.log`. A failure after the program has started is not reported.
+
+The menu item is greyed out and marked "(unavailable)" in at least these cases: no usable `code`
+command was found, the folder does not exist, `repo_path` does not start with a local drive letter, or
+that drive is a mapped network drive. The tray judges the last two from the text of the path and
+the local drive list, and only then checks that the folder exists. So the menu does not contact a
+`repo_path` that names a share. A local link that points at a share is not caught: the menu's
+check follows it, and VS Code then opens the share.
 
 ## Why the icon is named "MessageFoundry Tray"
 

@@ -1123,8 +1123,8 @@ def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Ide
     surface (BACKLOG #193, ASVS 2.4.2) — but WITHOUT the MFA / step-up window. For the mutating admin
     routes that warrant paced throttling yet not a full step-up re-proof, for example connection
     start/stop/restart and statistics reset. docs/SECURITY.md lists the set. A
-    non-GET request from an actor over the per-actor rate is refused early with 429 + Retry-After: 1
-    (logged, not silent) before the identity is returned. Reuses the SAME #193 limiter as
+    non-GET request from an actor over the per-actor rate is refused early with 429 + a Retry-After
+    naming that actor's wait (logged, not silent) before the identity is returned. Reuses the SAME #193 limiter as
     :func:`require_step_up` via :func:`_enforce_admin_write_pacing`, so pacing coverage is uniform
     across both gates. The embedding/no-auth path is unaffected (no per-actor identity to key on).
 
@@ -1441,10 +1441,13 @@ def enforce_phi_read_pacing(request: Request, identity: Identity) -> None:
 def _enforce_admin_write_pacing(request: Request, auth: AuthService, identity: Identity) -> None:
     """Per-actor anti-automation pacing on the state-changing admin surface (BACKLOG #193, ASVS
     2.4.2). NON-GET only, so a read is never paced; consulted only when auth is enabled (the caller
-    guards that). A throttled write is logged (not silent) and refused early with 429 + Retry-After:
-    1 BEFORE any further work. Shared by :func:`require_step_up` (the sensitive step-up surface) and
-    :func:`require_paced` (the state-changing surface that needs pacing WITHOUT a step-up re-proof),
-    so both gates key on the SAME per-actor limiter (one bucket per actor)."""
+    guards that). A throttled write is logged (not silent) and refused early with 429 BEFORE any
+    further work. Its Retry-After is the actor's own wait until the next write would be admitted,
+    in whole seconds (:meth:`AuthService.admin_write_retry_after`, BACKLOG #2144); the console's
+    ``require_ui`` sends the same value. Shared by at least :func:`require_step_up` (the sensitive
+    step-up surface), :func:`require_step_up_action` and :func:`require_paced` (the state-changing
+    surface that needs pacing WITHOUT a step-up re-proof), so every gate that calls it keys on the
+    SAME per-actor limiter (one bucket per actor)."""
     if request.method != "GET" and not auth.allow_admin_write(identity.user_id):
         log.warning(
             "admin-write throttled (anti-automation): actor=%s path=%s",
@@ -1454,7 +1457,7 @@ def _enforce_admin_write_pacing(request: Request, auth: AuthService, identity: I
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "too many requests; please slow down",
-            headers={"Retry-After": "1"},
+            headers={"Retry-After": str(auth.admin_write_retry_after(identity.user_id))},
         )
 
 

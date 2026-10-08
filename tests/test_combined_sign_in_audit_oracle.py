@@ -263,6 +263,7 @@ class _FakeNotifier:
 _HIDDEN_LOCK_ACTIONS = (
     "auth.account_locked",
     "auth.lock_notice",
+    "auth.lock_notice_undelivered",
     "auth.login_locked",
     "auth.admin_unlocked",
 )
@@ -714,7 +715,8 @@ def test_the_exclusion_binds_every_value_in_placeholder_order() -> None:
     for n, value in enumerate(params[1:], start=2):
         assert f"${n}" in text, (n, value, text)
     assert "locked" not in text and "auth." not in text, "a value reached the SQL text"
-    assert params[1:5] == sorted(HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.actions)
+    actions = HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.actions
+    assert params[1 : 1 + len(actions)] == sorted(actions)
 
 
 # --- The general log, which the ruling reaches too (Manager decision 2026-09-28) -----------------

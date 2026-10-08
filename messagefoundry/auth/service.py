@@ -2013,6 +2013,10 @@ _ISSUE_ROW_PAGE: Final = 200
 #: recipient as the actor, so the reminder shows in that account's ``/me/security-events`` feed.
 _REMINDER_HOLDER_ACTION: Final = "auth.temporary_credential_expiring"
 _REMINDER_ISSUER_ACTION: Final = "auth.temporary_credential_expiring_issuer"
+#: BACKLOG #2303: how many of an account's newest holder-reminder rows
+#: :meth:`initial_credential_reminded` reads. Each credential writes about one such row, and the
+#: current credential's is the newest, so a page this size is ample.
+_REMINDER_MARK_PAGE: Final = 50
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -2594,6 +2598,20 @@ class AuthService:
         if self._admin_write_limiter is None:
             return True
         return self._admin_write_limiter.allow(actor)
+
+    def admin_write_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value, in whole seconds, for an admin write just refused for ``actor``.
+
+        The wait until this actor's next write would be admitted: the rest of the window when the
+        count fired, or the rest of the gap when the minimum interval did. Rounded UP and never
+        below 1, so a client that waits this long is admitted by THIS process's limiter, provided
+        the account makes no other write meanwhile. The limiter is in-process, so another engine
+        shard keeps its own count. It reflects this actor's own
+        writes only; the limiter has no cross-actor dimension (BACKLOG #2144). The JSON API and the
+        ``/ui`` console both send this value, so the same refusal reads the same on either."""
+        if self._admin_write_limiter is None:
+            return 1
+        return max(1, math.ceil(self._admin_write_limiter.retry_after(actor)))
 
     def attach_security_notifier(self, notifier: SecurityNotifier | None) -> None:
         """Wire the out-of-band notice channel after construction (BACKLOG #2081).
@@ -10990,11 +11008,12 @@ class AuthService:
         that it stops working at ``deadline`` (ASVS 6.4.5, BACKLOG #2007).
 
         The API lifespan's reminder pass calls this once per credential, beside its ``[alerts]``
-        operator reminder, and its ``warned`` map is what keeps each notice to one per credential per
-        engine process. A restart inside the warn window therefore reminds again, as the operator
-        alert does; a mark that outlived the process would be a second once-only mechanism. This
-        method keeps no state of its own and makes one attempt: a failed read is logged and not
-        retried, because a retry would repeat the notices that did go out. It never has the
+        operator reminder. The holder's audit row below is the once-only mark for all three
+        reminders, and it outlives the process (BACKLOG #2303): the pass asks
+        :meth:`initial_credential_reminded` before it sends, so a restart inside the warn window
+        reminds nobody again. That row is written before any notice, so a crash after it loses a
+        reminder rather than repeating one. This method makes one attempt: a failed read is logged
+        and not retried, because a retry would repeat the notices that did go out. It never has the
         password, so no notice can carry it.
 
         The holder's notice goes to the account's own ``notify_email``. The issuer's goes to the
@@ -11050,6 +11069,35 @@ class AuthService:
             email=issuer.notify_email,
             detail={"expires_at": deadline, "holder": user.username},
         )
+
+    async def initial_credential_reminded(self, user: UserRecord, *, deadline: float) -> bool:
+        """Whether the reminders for ``user``'s credential expiring at ``deadline`` already went out,
+        from this engine process or an earlier one (BACKLOG #2303).
+
+        The mark is the holder's ``auth.temporary_credential_expiring`` row, which
+        :meth:`remind_expiring_initial_credential` writes before any notice. A row counts only when
+        its detail names this account's id and this exact deadline, so a new credential on the same
+        account is reminded about again. No time bound is applied: the id and the deadline already
+        pin the credential, and a bound would compare two processes' clocks. A failed read raises;
+        the caller then reminds, so a store fault costs a duplicate rather than a missed reminder.
+
+        The rows are found by the holder's current username, newest first. An account renamed after
+        its reminder is not matched, and is reminded once more."""
+        rows = await self._store.list_audit(
+            action=_REMINDER_HOLDER_ACTION, actor=user.username, limit=_REMINDER_MARK_PAGE
+        )
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(detail, dict)
+                and detail.get("user_id") == user.id
+                and detail.get("expires_at") == deadline
+            ):
+                return True
+        return False
 
     async def _temporary_credential_issuer(self, user: UserRecord) -> tuple[UserRecord | None, str]:
         """The account that issued ``user``'s current temporary password and can still act on a

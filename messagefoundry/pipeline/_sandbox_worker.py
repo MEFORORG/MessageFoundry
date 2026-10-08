@@ -209,8 +209,21 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
     except SandboxError as exc:
         return False, None, "denied", str(exc)
     except Exception as exc:  # noqa: BLE001 — a handler raise is content, reported not crashed
-        return False, None, "error", f"{type(exc).__name__}: {exc}"
+        return False, None, "error", _error_text(exc)
     return True, result, "", ""
+
+
+def _error_text(exc: BaseException) -> str:
+    """``Type: message`` for an error reported across the process boundary. A Unicode error's str()
+    names the character or byte it failed on (vault BACKLOG #3185), and mode=off renders it from its
+    attributes, so this boundary must too. Never raises: the error's own __str__ may, and so may the
+    import after untrusted config has run, and either would kill the worker mid-report."""
+    try:
+        from messagefoundry.redaction import safe_exc  # cached: logging_setup imported it at load
+
+        return safe_exc(exc) if isinstance(exc, UnicodeError) else f"{type(exc).__name__}: {exc}"
+    except Exception:  # noqa: BLE001 — the class name is all that is left to report
+        return type(exc).__name__
 
 
 def _respond(registry: Any, req: Any, code_sets: Any) -> bytes:
@@ -271,7 +284,7 @@ def main() -> int:
         _install_import_guard(boot.forbidden)
     except Exception as exc:  # noqa: BLE001 — report a bootstrap failure, do not crash silently
         try:  # noqa: SIM105
-            _write_frame(stdout, codec.encode_bootfail(f"{type(exc).__name__}: {exc}"))
+            _write_frame(stdout, codec.encode_bootfail(_error_text(exc)))
         except (OSError, SandboxError):
             pass
         return 1

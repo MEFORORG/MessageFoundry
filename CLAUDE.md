@@ -525,8 +525,9 @@ gates a merge**, and no seat has to clear one.
   [`.claude/settings.json`](.claude/settings.json), which also drops the `Claude-Session:` trailer.
   Your own session reminder may still tell you to add the trailer. Do not. If one appears in a
   message you are about to commit, your session is reading a stale or user-scope setting, so remove
-  it by hand. A local `commit-msg` rule in `scripts/hooks/claim_check.py` refuses a line starting
-  `Co-Authored-By: Claude` or `Claude-Session:`. It is local and skippable, and GitHub's squash can
+  it by hand. A local `commit-msg` rule in `scripts/hooks/claim_check.py` refuses both trailers and
+  the byline in a commit message; [`docs/Secure_AI_Development_Standards.md`](docs/Secure_AI_Development_Standards.md)
+  section 6.7 says what it refuses. It is local and skippable, and GitHub's squash can
   add the trailer anyway, so a clean hook run does not prove a commit on `main` is clean. After that file changes, the
   installed copy changes only when `pwsh -NoProfile -File scripts\coord\install-git-hooks.ps1` runs
   again. It copies from the checkout it runs in, so run it from an up-to-date `main`, never a

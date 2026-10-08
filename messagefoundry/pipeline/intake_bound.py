@@ -40,7 +40,12 @@ import logging
 import time
 
 from messagefoundry.config.settings import StoreBackend
-from messagefoundry.pipeline.alerts import INTAKE_DEPTH_REASON, INTAKE_DISK_REASON, AlertSink
+from messagefoundry.pipeline.alerts import (
+    INTAKE_DEPTH_REASON,
+    INTAKE_DISK_REASON,
+    REMINDER_SECONDS,
+    AlertSink,
+)
 from messagefoundry.pipeline.retention import read_disk_floor, sqlite_store_file
 from messagefoundry.store import Store
 from messagefoundry.transports.base import IntakeGate
@@ -48,6 +53,7 @@ from messagefoundry.transports.base import IntakeGate
 __all__ = [
     "DEPTH_REASON",
     "DISK_REASON",
+    "PAUSE_EFFECT",
     "IntakeBoundMonitor",
     "depth_resume_at",
     "disk_resume_at",
@@ -68,10 +74,21 @@ DEFAULT_CHECK_SECONDS = 1.0
 #: How long one probe may take before it counts as failed. A hung read must not freeze the loop.
 PROBE_TIMEOUT_SECONDS = 10.0
 
-#: While a pause holds, ``intake_paused`` fires again at most this often per bound: the same
-#: reminder spacing as ``queue_buildup`` (``wiring_runner._BUILDUP_REALERT_SECONDS``). Without it a
-#: one-second measurement loop would write an alert-state row every second.
-REALERT_SECONDS = 300.0
+#: While a pause holds, ``intake_paused`` fires again at most this often per bound: the reminder
+#: spacing ``queue_buildup`` uses too, from one shared constant. Without it a one-second measurement
+#: loop would write an alert-state row every second.
+REALERT_SECONDS = REMINDER_SECONDS
+
+#: What a pause does to each inbound family, shared by both pause WARNINGs (BACKLOG #2324). A dimse
+#: inbound refuses only a NEW association (``transports/dicom.py``,
+#: ``_refuse_association_while_paused``); one already open runs until its peer releases it, which is
+#: the contract ``docs/CONFIGURATION.md`` states. Not a ``%`` template: it is passed as an argument.
+PAUSE_EFFECT = (
+    "The tcp, x12, http and mllp inbounds stop reading; the dimse inbounds refuse new associations, "
+    "and an association already open keeps running until it ends; the timer, file, remotefile and "
+    "database inbounds skip their tick (docs/CONFIGURATION.md). Nothing already received is dropped "
+    "or NAKed."
+)
 
 #: The reminder clock, a module name so a test can move it without moving the event loop's.
 _monotonic = time.monotonic
@@ -121,6 +138,9 @@ class IntakeBoundMonitor:
         self._alert_sink = alert_sink
         # Per reason, the earliest monotonic time a held pause may raise intake_paused again.
         self._next_realert: dict[str, float] = {}
+        # Per reason, the (value, limit) of the last measurement that succeeded. A reminder raised
+        # while the probe keeps failing carries it, since there is no newer reading.
+        self._last_reading: dict[str, tuple[int, int]] = {}
         # The payload's store_kind. A store with no ``backend`` attribute is SQLite, as in
         # sqlite_store_file. A backend that is present but not a StoreBackend (None, or a future
         # backend) is "unknown"; sqlite_store_file already keeps the disk floor off for it.
@@ -235,6 +255,7 @@ class IntakeBoundMonitor:
                     "as it was until a read succeeds",
                     exc_info=True,
                 )
+            self._remind_unmeasured(DEPTH_REASON)
             return
         self._depth_failing = False
         held = DEPTH_REASON in self._gate.reasons
@@ -244,10 +265,9 @@ class IntakeBoundMonitor:
             self._gate.hold(DEPTH_REASON)
             log.warning(
                 "intake PAUSED: more than [inbound].max_staged_depth=%d staged messages (ingress + "
-                "routed). The tcp, x12, http, mllp, dimse and timer inbounds stop reading and the "
-                "file, remotefile and database pollers skip their poll (docs/CONFIGURATION.md); "
-                "nothing already received is dropped or NAKed. Intake resumes at %d.",
+                "routed). %s Intake resumes at %d.",
                 self._max_depth,
+                PAUSE_EFFECT,
                 depth_resume_at(self._max_depth),
             )
         elif held and settled:
@@ -279,6 +299,7 @@ class IntakeBoundMonitor:
                     "the pause state is left as it was until a probe succeeds",
                     exc_info=failure,
                 )
+            self._remind_unmeasured(DISK_REASON)
             return
         self._disk_failing = False
         held = DISK_REASON in self._gate.reasons
@@ -289,14 +310,12 @@ class IntakeBoundMonitor:
             self._gate.hold(DISK_REASON)
             log.warning(
                 "intake PAUSED: %s MiB free on the volume holding the SQLite store (%s), below the "
-                "[retention].min_free_disk_mb floor of %d MiB. The tcp, x12, http, mllp, dimse and "
-                "timer inbounds stop reading and the file, remotefile and database pollers skip "
-                "their poll (docs/CONFIGURATION.md); nothing already received is dropped or NAKed. "
-                "Intake resumes at %d MiB free. Free disk space or move the store to a larger "
-                "volume.",
+                "[retention].min_free_disk_mb floor of %d MiB. %s Intake resumes at %d MiB free. "
+                "Free disk space or move the store to a larger volume.",
                 reading.free_mib,
                 reading.probed,
                 reading.floor_mib,
+                PAUSE_EFFECT,
                 resume_bytes >> 20,
             )
         elif held and settled:
@@ -327,6 +346,7 @@ class IntakeBoundMonitor:
         every later release. A failed report is not recorded, so the next measurement the monitor
         takes retries it, with that measurement's value. A monitor with both bounds off measures
         only once, at start, so it does not retry. With no sink there is nothing to report."""
+        self._last_reading[reason] = (value, limit)
         sink = self._alert_sink
         if sink is None:
             return
@@ -340,10 +360,6 @@ class IntakeBoundMonitor:
             return
         if not paused and not settled:
             return
-        if paused:
-            # Spaced from the ATTEMPT, so a sink that refuses a reminder is not called again every
-            # second. A refused pause edge is still retried at once: _reported was not set for it.
-            self._next_realert[reason] = now + REALERT_SECONDS
         try:
             emit = sink.intake_paused if paused else sink.intake_resumed
             emit(
@@ -353,7 +369,9 @@ class IntakeBoundMonitor:
                 limit=limit,
                 store_kind=self._store_kind,
             )
+            raised = True
         except Exception:
+            raised = False
             if reason not in self._sink_failing:
                 self._sink_failing.add(reason)
                 log.warning(
@@ -361,9 +379,26 @@ class IntakeBoundMonitor:
                     reason,
                     exc_info=True,
                 )
+        if paused:
+            # Spaced from the ATTEMPT, so a sink that refuses a reminder is not called again every
+            # second. A refused pause edge is still retried at once: _reported was not set for it.
+            # Read AFTER the call returns (#2272): the notifier stamps its own cooldown inside the
+            # call, so a window measured from before it could close a moment early and land the
+            # next reminder inside that cooldown, where it is throttled for a whole interval.
+            self._next_realert[reason] = _monotonic() + REALERT_SECONDS
+        if not raised:
             return
         self._sink_failing.discard(reason)
         self._reported[reason] = paused
+
+    def _remind_unmeasured(self, reason: str) -> None:
+        """Keep reminding about a held pause while its probe fails (#2272). The gate stays held, so
+        intake stays paused, and silence would read as a pause that ended. The reminder carries the
+        last reading taken. A pause that is not held reports nothing: an unmeasured bound is neither
+        paused nor clear."""
+        last = self._last_reading.get(reason)
+        if last is not None and reason in self._gate.reasons:
+            self._sync_alert(reason, value=last[0], limit=last[1], settled=False)
 
     def _log_resumed(self, what: str, *args: object) -> None:
         still = sorted(self._gate.reasons)

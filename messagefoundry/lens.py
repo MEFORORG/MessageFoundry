@@ -450,7 +450,9 @@ def parse_module(path: str | Path, *, contract: int = CONTRACT_V1) -> list[dict[
     try:
         source = p.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        unreadable = f"{p}: cannot read ({exc})"
+        from messagefoundry.redaction import codec_safe_str  # here: lens is otherwise stdlib only
+
+        unreadable = f"{p}: cannot read ({codec_safe_str(exc)})"
     else:
         # posix slashes keep the emitted contract (and the committed L3 fixtures) OS-neutral.
         return parse_source(source, module=p.as_posix(), contract=contract)
@@ -3051,7 +3053,9 @@ def rewrite_module(
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError too, so a non-UTF-8 module is the documented LensParseError rather than
         # an escape; raised after the handler, since its .object is the whole file (BACKLOG #2085).
-        unreadable = f"{p}: cannot read ({exc})"
+        from messagefoundry.redaction import codec_safe_str  # here: lens is otherwise stdlib only
+
+        unreadable = f"{p}: cannot read ({codec_safe_str(exc)})"
     else:
         return rewrite_source(
             source, edit, module=p.as_posix(), contract=contract, typed_only=typed_only

@@ -280,9 +280,7 @@ def _encode_declared(raw: str, ic: InboundConnection) -> bytes:
     encoding = ingress_encoding(ic)
     try:
         return raw.encode(encoding)
-    except UnicodeEncodeError as exc:
-        reason = f"encode error ({encoding}): {exc.reason} at position {exc.start}"
-    except LookupError as exc:
+    except (UnicodeEncodeError, LookupError) as exc:
         reason = f"encode error ({encoding}): {safe_exc(exc)}"
     raise IngressGuardError(reason, phase="decode")
 
