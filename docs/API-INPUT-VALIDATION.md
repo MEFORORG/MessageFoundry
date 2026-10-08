@@ -102,6 +102,9 @@ shape in the table above. The route then splits the value and applies two more r
 1. At most 8 ids may be layered. A longer list gets a 400.
 2. Each id must name a preset the caller owns. Any other id gets a 404.
 
+How the named presets must agree with each other is a combined rule. It is under
+[Rules over two or more items](#rules-over-two-or-more-items).
+
 ### Notification address
 
 The engine sends an account's security notices to its notification address. At least these four
@@ -174,6 +177,68 @@ for the issuer and up to 255 for the subject. They need no shape rule, because t
 compares them with the stored pair. A pair that differs gets a 409 and nothing changes.
 
 There is no issuer field to send. The service binds under the issuer `[auth].oidc_issuer` names.
+
+---
+
+## Rules over two or more items
+
+**Some rules read two or more items together.** Each item can pass its own rule and the request can
+still be refused, because the items do not fit each other. ASVS 2.1.2 calls these combined data
+items.
+
+**The table lists at least the combined rules a search of the code found. It is not a complete
+list.** How the search ran, and what it could miss, is below the table.
+
+| Surface | Items | Rule | When the rule is broken |
+|---|---|---|---|
+| API | `content` and `field_path`, on a content search | Send exactly one. A blank value counts as not sent. | 400 |
+| API | `field_value`, on a content search | The engine reads it only beside `field_path`. Beside `content` it is ignored. | Nothing is refused |
+| API | `content` and `field_path`, in the criteria on `POST /search/presets` | Send one or neither. Both together are refused. | 400 |
+| API | The presets named in `presets`, on `GET /search/layered` | Exactly one preset carries a content term. | 400 |
+| API | The same presets | Two presets that both set `channel_id`, `status`, `message_type` or `control_id` must set the same value. | 400 |
+| API | `to` and `reroute`, on `POST /messages/{message_id}/edit-resend` | With `to`, the engine delivers to that outbound and ignores `reroute`. Without `to`, `reroute` must be true. | 400 |
+| Console | `new_password` and `new_password2`, on `POST /ui/account/password` | The two values must be equal. | 400, and the form comes back empty with the reason |
+
+Where each rule lives:
+
+- **Content search.** `make_spec`, in
+  [`messagefoundry/store/content_search.py`](../messagefoundry/store/content_search.py). The API
+  calls it wherever it takes a content search, `GET /messages/search` among them. The console's
+  search form calls the same API handler, so it gets the same rule.
+- **Layered search.** `_compose_preset_layers`, in
+  [`messagefoundry/api/app.py`](../messagefoundry/api/app.py). A content term is a `content` value
+  or a `field_path` saved in a preset.
+- **Edit and resubmit.** The route itself, in the same file.
+- **Password confirmation.** The console route, in
+  [`messagefoundry_webconsole/routes/account.py`](../messagefoundry_webconsole/routes/account.py).
+  The API's own password change takes `current_password` and `new_password` and has no second
+  copy to compare. The comparison belongs to the console form alone.
+
+**A rule that compares one item with stored state is not listed here.** Examples are the federated
+pair a caller expects, and an idempotency key used twice. Those are under
+[Items checked a second time](#items-checked-a-second-time-behind-the-route).
+
+**The search found no rule that compares the two ends of a time range.** `received_from` and
+`received_to` are each checked alone, and so are `since` and `until`.
+
+### How the search ran
+
+The search read three places: the request models under `messagefoundry/api/`, the console routes
+under `messagefoundry_webconsole/routes/`, and the command-line handling in
+`messagefoundry/__main__.py`. It looked for three things.
+
+1. A validator declared on a whole request model. The API and console models declare none, so every
+   rule above sits in a route, a service or a store helper.
+2. Refusal text holding words such as "exactly one", "both", "either", "mutually exclusive",
+   "match", "conflict" and "only valid with".
+3. A direct comparison of two request fields or two form fields.
+
+A rule worded another way, or one built from a helper the search did not open, would not be found.
+
+The command-line rules the search found are in the
+[User Guide](USER-GUIDE.md#command-options-that-depend-on-each-other). Combined checks on message
+payloads are in [HL7-VALIDATION.md](HL7-VALIDATION.md), under Tier 3, and the User Guide says what
+exists for payloads that are not HL7.
 
 ---
 
