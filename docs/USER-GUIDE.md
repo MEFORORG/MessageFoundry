@@ -214,7 +214,7 @@ The complete procedure — least-privilege accounts, locking down the config/log
 
 ### Command options that depend on each other
 
-Some `messagefoundry` commands refuse a set of options that do not fit together. Each option is valid alone; the rule is about the combination. The table lists at least the rules a search of the command-line code found. It is not a complete list, so run a command with `--help` for its own options.
+Some `messagefoundry` commands refuse a set of options that do not fit together. The rule is about the combination, not about one option's value. The table lists at least the rules a search of the command-line code found. It is not a complete list, so run a command with `--help` for its own options.
 
 | Command | Options | Rule | When the rule is broken |
 |---|---|---|---|
@@ -222,9 +222,8 @@ Some `messagefoundry` commands refuse a set of options that do not fit together.
 | `impact` | `--apply` | Valid only with `--rename-to`. | An error message and a non-zero exit |
 | `audit-verify` | `--expected-anchor` and `--expected-anchor-file` | Never both, because they carry the same anchor. Neither is required. | The argument parser refuses the command |
 | `serve` | `--shard` and the `[cluster].enabled` setting | Engine sharding cannot run with active-passive clustering. | An error message and exit code 2 |
-| `service install` | `--env` | Required for the `install` action. | An error message and exit code 2 |
 
-All five rules are in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py). The rules for the engine's API and the web console are in [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md#rules-over-two-or-more-items), which also says how the search ran.
+All four rules are in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py). The table leaves out a rule that one action needs one option, such as `service install` needing `--env`. The rules for the engine's API and the web console are in [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md#rules-over-two-or-more-items), which also says how the search ran.
 
 ---
 
