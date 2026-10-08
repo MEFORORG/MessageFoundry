@@ -118,20 +118,35 @@ _COMMENT_LINE = re.compile(r"#(?!\d)")
 # still QUOTE any of them when it is indented, blockquoted or set in backticks.
 #
 # Three arms; docs/Secure_AI_Development_Standards.md section 6.7 is the prose statement of them.
-# The `Co-Authored-By:` arm reads only the text before any `<`, and skips a `Claude` glued to the word
-# before it (`Jean-Claude`, `a.claude`) or part of an address (`claude@x`), so a human's email never
-# counts. The byline's optional lead is built with chr(): no non-cp1252 literal, and no `\N{}` escape
-# for an old PATH python to choke on.
 # Whitespace is allowed before the colon because git's trailer parser accepts it there.
-_BYLINE_LEAD = f"(?:{chr(0x1F916)}{chr(0xFE0F)}?\\s*)?"
-_ATTRIBUTION_TRAILER = re.compile(
-    r"^(?:"
-    r"Co-Authored-By\s*:[^<\n]*?(?<![\w.@+-])Claude\b(?![\w.+-]*@)"
-    r"|Claude-Session\s*:"
-    rf"|{_BYLINE_LEAD}Generated\s+with\s+\[?Claude\s+Code\b"
-    r")",
+#
+# The `Co-Authored-By:` arm is two steps, so an email is never read BY CONSTRUCTION rather than by a
+# character class: take the text before any `<`, drop every whitespace token holding an `@`, and
+# refuse when a remaining token holds `Claude` as a word not glued to the word before it
+# (`Jean-Claude`, `a.claude`).
+_COAUTHOR_LINE = re.compile(r"^Co-Authored-By\s*:(?P<rest>.*)", re.IGNORECASE)
+_CLAUDE_WORD = re.compile(r"(?<![\w.-])Claude\b", re.IGNORECASE)
+# The byline has a fixed shape: the name in a markdown link, or the bare name ending the line. That
+# keeps prose such as "Generated with Claude Code's help" out. Its optional U+1F916 lead (and U+FE0F)
+# is built with chr() so this file carries no non-cp1252 literal for the console gate to flag.
+_BYLINE_LEAD = "(?:" + chr(0x1F916) + chr(0xFE0F) + r"?\s*)?"
+_ATTRIBUTION_LINE = re.compile(
+    r"^(?:Claude-Session\s*:"
+    r"|" + _BYLINE_LEAD + r"Generated\s+with\s+(?:\[Claude\s+Code\]\(|\[?Claude\s+Code\]?\s*$))",
     re.IGNORECASE,
 )
+
+
+def _is_attribution_line(line: str) -> bool:
+    """True if *line* starts with an attribution line CLAUDE.md section 5 says to omit."""
+    if _ATTRIBUTION_LINE.match(line):
+        return True
+    coauthor = _COAUTHOR_LINE.match(line)
+    if coauthor is None:
+        return False
+    name = coauthor.group("rest").split("<", 1)[0]
+    return any(_CLAUDE_WORD.search(tok) for tok in name.split() if "@" not in tok)
+
 
 # A commit touching ONLY these is documentation/ledger work: it may cite an item without implementing it.
 _DOC_PREFIXES = ("docs/", ".github/")
@@ -423,8 +438,9 @@ def _attribution_trailers(message: str) -> list[tuple[int, str]]:
     # with a diff marker, so the anchored pattern cannot match one.
     # Split on "\n" only, as git does. str.splitlines() also breaks on U+2028, form feed and others,
     # so it would see a line start git does not, and number lines differently from the editor.
+    # main() reads the file without newline translation, so a lone "\r" is not a line break either.
     for n, line in enumerate(message.split("\n"), 1):
-        if _ATTRIBUTION_TRAILER.match(line):
+        if _is_attribution_line(line):
             hits.append((n, line))
     return hits
 
@@ -452,7 +468,9 @@ def main() -> int:
     if len(sys.argv) < 2:
         return 0  # not wired as a commit-msg hook; do nothing rather than guess
     try:
-        message = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+        # Bytes, then decode: read_text's universal newlines would turn a lone "\r" into a line break
+        # that git does not see.
+        message = Path(sys.argv[1]).read_bytes().decode("utf-8", errors="replace")
     except OSError:
         return 0
 

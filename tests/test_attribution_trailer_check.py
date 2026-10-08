@@ -11,9 +11,11 @@ a detector that cannot be shown firing proves nothing by staying quiet.
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -57,6 +59,7 @@ def _run(tmp_path: Path, message: str) -> subprocess.CompletedProcess[str]:
         # without U+FE0F). Built with escapes so this file never carries the glyph itself.
         "Generated with" + " [Claude Code](https://claude.com/claude-code)",
         "Generated with" + " Claude Code",
+        "Generated with" + " [Claude Code]",
         "generated WITH" + " claude code",
         "\U0001f916 Generated with" + " [Claude Code](https://claude.com/claude-code)",
         "\U0001f916\N{VARIATION SELECTOR-16} Generated with"
@@ -86,6 +89,22 @@ _BYLINE = "\U0001f916 Generated with" + " [Claude Code](https://claude.com/claud
 _ANTHROPIC = "Co-authored-by" + ": Anthropic Claude <noreply@anthropic.com>"
 
 
+def _load_hook() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("claim_check_under_test", _CHECK)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_HOOK = _load_hook()
+
+
+def _refused_in_process(line: str) -> bool:
+    """The firing twins run in-process: one interpreter, not one per case."""
+    return bool(_HOOK._is_attribution_line(line))
+
+
 @pytest.mark.parametrize(
     "quoted",
     [
@@ -105,8 +124,7 @@ def test_a_quoted_trailer_in_the_body_passes(tmp_path: Path, quoted: str) -> Non
     proc = _run(tmp_path, f"docs: a plain subject\n\nThe hook refuses this:\n{quoted}\n")
     assert proc.returncode == 0, proc.stderr
     # Control: the same line unquoted, at column 0, fires.
-    bare = quoted.strip().strip("`").removeprefix("> ")
-    assert _run(tmp_path, f"docs: a plain subject\n\n{bare}\n").returncode == 1
+    assert _refused_in_process(quoted.strip().strip("`").removeprefix("> "))
 
 
 _CO = "Co-Authored-By" + ": "
@@ -118,7 +136,7 @@ _CO = "Co-Authored-By" + ": "
         # Each silent line is paired with the nearest line its own arm refuses.
         (_CO + "Claudette Smith <c@example.invalid>", _CO + "Claude Smith <c@example.invalid>"),
         (_CO + "Jean-Claude Smith <jc@example.invalid>", _CO + "Jean Claude Smith"),
-        # The email is never read, bracketed or not.
+        # The email is never read, bracketed or not, whatever its local part holds.
         (
             _CO + "A Person <claude.fan@example.invalid>",
             _CO + "Claude <claude.fan@example.invalid>",
@@ -127,26 +145,43 @@ _CO = "Co-Authored-By" + ": "
         (_CO + "claude@anthropic.com", _CO + "Claude claude@anthropic.com"),
         (_CO + "A Person claude.fan@example.invalid", _CO + "A Claude claude.fan@example.invalid"),
         (_CO + "A Person (claude@x.invalid)", _CO + "Claude (claude@x.invalid)"),
+        (_CO + "A Person claude~bot@example.invalid", _CO + "Claude claude~bot@example.invalid"),
+        (_CO + "A Person claude%x@example.invalid", _CO + "Claude claude%x@example.invalid"),
+        # The byline has a fixed shape, so prose that starts with the same words passes.
         ("Generated with" + " a script, not Claude Code", "Generated with" + " Claude Code"),
         ("Generated with" + " Claudette Code", "Generated with" + " [Claude Code]"),
         ("Regenerated with" + " Claude Code", "Generated with" + " Claude Code"),
+        (
+            "Generated with" + " Claude Code's help, then reviewed by hand.",
+            "Generated with" + " Claude Code  ",
+        ),
     ],
 )
 def test_a_human_or_lookalike_is_not_refused(tmp_path: Path, human: str, twin: str) -> None:
     proc = _run(tmp_path, f"docs: subject\n\n{human}\n")
     assert proc.returncode == 0, proc.stderr
-    assert _run(tmp_path, f"docs: subject\n\n{twin}\n").returncode == 1
+    assert _refused_in_process(twin)
 
 
-def test_a_unicode_line_separator_does_not_start_a_line(tmp_path: Path) -> None:
-    """Git splits a message on newline only, so a U+2028 mid-line is not a line start."""
-    proc = _run(tmp_path, f"docs: subject\n\nFixed it{chr(0x2028)}{_COAUTHOR}\n")
+@pytest.mark.parametrize("separator", [chr(0x2028), chr(13), chr(12)])
+def test_only_a_newline_starts_a_line(tmp_path: Path, separator: str) -> None:
+    """Git splits a message on newline only. U+2028, a lone CR or a form feed is mid-line."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_bytes(f"docs: subject\n\nFixed it{separator}{_COAUTHOR}\n".encode())
+    proc = subprocess.run(
+        [sys.executable, str(_CHECK), str(msg)],
+        cwd=tmp_path,
+        capture_output=True,
+        encoding="utf-8",
+        errors="backslashreplace",
+        timeout=60,
+    )
     assert proc.returncode == 0, proc.stderr
     assert _run(tmp_path, f"docs: subject\n\nFixed it\n{_COAUTHOR}\n").returncode == 1
 
 
 def test_the_byline_is_refused_without_a_traceback(tmp_path: Path) -> None:
-    """The U+1F916 lead reaches stderr unescaped, and the report still completes."""
+    """The U+1F916 lead reaches stderr, raw or escaped by platform, and the report completes."""
     proc = _run(tmp_path, f"docs: subject\n\nbody\n\n{_BYLINE}\n")
     assert proc.returncode == 1, proc.stderr
     assert "Traceback" not in proc.stderr
