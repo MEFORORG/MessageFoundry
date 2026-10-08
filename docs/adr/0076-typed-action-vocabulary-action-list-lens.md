@@ -1378,8 +1378,8 @@ invariant rather than a property of the moved row):
    the block.
 7. A typed row never moves past at least a `code` row, a dynamic row, a hand-written header or the
    fan-out `return sends`, and never moves into or out of a typed block that holds a `code` row
-   (Manager decision 2026-10-07, after review). This answers
-   the Lander's PR 2155 finding 1. An insert at the same place is still allowed.
+   (Manager decision 2026-10-07, after review). This answers the Lander's PR 2155
+   finding 1. An insert at the same place is still allowed.
 8. A typed `return` or `raise` keeps its whole suite path, top level included: lifted out of its
    guard, a filter or a raise would run on every message. A typed row never moves below a typed
    `return` or `raise` in its suite, where it would never run. A row never moves past the fan-out
@@ -1418,9 +1418,11 @@ them. The R1 fix would change that, in every mode, at least as follows:
 **The inert rule, stated once here.** The lens's own predicate decides what is inert; the list below
 describes it for a reader. **The list is not a gate.** No check, test or requirement may treat it as
 the definition of inert; a checker calls the lens's predicate (Manager decision 2026-10-07, after
-review). The list is a lower bound: the predicate admits at least these. It has one ceiling, the
-name ceiling below, and one exception to "calls nothing": admitted values call nothing
-except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...)` and
+review). The list is a lower bound: the predicate admits at least these. It has ceilings, which the
+predicate SHALL apply: the name ceiling below, and each refusal the bullets state (`%` and `**`,
+arithmetic on a name that may hold text, an `occurrence` or `repetition` below 1, and a Set Field or
+Add Repetition value that is not text). It has one exception to "calls nothing": admitted values call
+nothing except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...)` and
 `FhirRaw(<string literal>)`, named below.
 
 - a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
@@ -1434,7 +1436,8 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
   is allowed (Manager decision 2026-10-07, after review). So a name such as `occurrence=OCC`, bound
   to a module-level number, is refused;
 - for the value of Set Field and Add Repetition, only a value that is text: a string literal, a name
-  or read that may hold text, or a template. A number, `None`, a tuple or a list is refused;
+  or read that may hold text, or a template. At least a number, `None`, a tuple, a list, a set or a
+  dict is refused;
 - a plain name other than `msg`, not a dunder, that cannot hold message content:
   - a For Each `range` loop index;
   - a module-level name bound exactly once, to a literal of an immutable type: a `str`, number,
@@ -1485,7 +1488,7 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
 **Where the code stands.** The lens implementation of G.6 and G.7 is PR 2155
 (`messagefoundry/lens.py`). Its tests, `tests/test_lens_no_code_injection.py` and
 `tests/test_lens_typed_only_repair.py`, are the source of record for what the code enforces. Where
-the code and these rules differ, PR 2155's comments record each difference and its status.
+the code and these rules differ, the difference is to be recorded on PR 2155, with its status.
 `set_params` on action, lookup and diagnostic rows already refuses a `dynamic` value (AC-M5).
 
 **Limits of a static check.** The predicate reads the source and runs nothing, so code that
@@ -1495,13 +1498,13 @@ least: `getattr(h, "__globals__")`, `from sys import modules as mm`, and
 `code:edit` developer is out of scope (Manager ruling 2026-10-07 on PR 2155, made under the owner's
 delegation).
 
-**A gap in the projection today.** At `origin/main` (`ddf350e1d0`),
-`_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
-accepts any `X.attr` callee by its last name. So `set_field(__import__("os").getcwd() or msg,
-"PID-5.1", "X")` and `anything.Send("OB", msg)` read back as ordinary typed rows whose `params` look
-unchanged. The Steps view then shows code that runs as a typed step. ADR 0208's repository check
-would close this for itself, once built, by comparing each typed row's full statement (spec FR-40
-item 5a). Whether the lens should refuse to project such a row as typed is recorded on PR 2155.
+**A gap in the projection today.** At `origin/main` (`ddf350e1d0`), `_rendered_param_nodes` drops the
+`msg` positional from a typed row's `params`, and `_callee_name` accepts any `X.attr` callee by its
+last name. So `set_field(__import__("os").getcwd() or msg, "PID-5.1", "X")` and `anything.Send("OB",
+msg)` read back as ordinary typed rows whose `params` look unchanged. The Steps view then shows code
+that runs as a typed step. ADR 0208's repository check would close this for itself, once built, by
+comparing each typed row's full statement (spec FR-40 item 5a). Whether the lens should refuse to
+project such a row as typed is open, and not yet recorded on PR 2155.
 
 That sentence of E.11 is not rewritten; the dated pointer appended to it sends the reader here. The
 change is being built separately and has not landed.

@@ -178,7 +178,8 @@ site's ordinary review is what would catch these (D-C):
   a Read Field row for this reason (the `read_field` gate in `rewrite_source`,
   `messagefoundry/lens.py`). That gate keys on `read_field` alone, because it was written for Read
   Field rows (ADR 0089 row 4, BACKLOG #1505), so it does not yet cover a lookup's `assign_to`.
-  What the lens implementation enforces is recorded by PR 2155's tests (Amendment G, G.7).
+  What the lens implementation enforces is recorded by PR 2155's tests (Amendment G, "Where
+  the code stands").
 
 **What already gates what runs, under both:** a change reaches a running engine only when someone with
 `config:deploy` reloads it, under the existing step-up and the site's `[approvals]` dual control. That
