@@ -2477,7 +2477,8 @@ def _builtin_render(arg: Any, kind: type[Any], fresh: list[Any]) -> str | None:
         body = "{" + ", ".join(f"{k!r}: {v!r}" for k, v in _pairs(fresh)) + "}"
         if own is dict.__repr__:
             return body
-        if own is OrderedDict.__repr__:
+        # A subclass's repr reads through its own keys() and __getitem__, so _own_render prints it.
+        if own is OrderedDict.__repr__ and kind is OrderedDict:
             return f"{kind.__name__}({body})"
         if own is defaultdict.__repr__:
             return f"{kind.__name__}({_factory_repr(arg)}, {body})"

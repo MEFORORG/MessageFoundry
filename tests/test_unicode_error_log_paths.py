@@ -716,6 +716,53 @@ def test_a_mapping_subclass_holding_a_unicode_error_still_answers_through_its_ow
     assert record.getMessage() == f"*** {redaction.safe_exc(err)}"
 
 
+class _MaskedOrdered(collections.OrderedDict[str, object]):
+    """Masks one key in its own lookup. On 3.14 an OrderedDict subclass's repr reads through it."""
+
+    def __getitem__(self, key: str) -> object:
+        return "***" if key == "hidden" else super().__getitem__(key)
+
+
+@pytest.mark.parametrize("chain", ["engine", "tray"])
+def test_an_ordered_dict_subclass_holding_a_unicode_error_prints_through_its_own_lookup(
+    chain: str,
+) -> None:
+    # The rebuild printed it from raw storage, so the masked value reached the log.
+    err = _encode_error()
+    arg = _MaskedOrdered(hidden="planted-hidden-3185", e=err)
+    plain = _MaskedOrdered(hidden="planted-hidden-3185")
+    assert (
+        "planted-hidden-3185" not in _record("%s %s", (plain, 1)).getMessage()
+    )  # what main prints
+    record = _record("%s %s", (arg, 1))
+    _chain_filter(chain).filter(record)
+    text = record.getMessage()
+    assert "planted-hidden-3185" not in text
+    assert "'hidden': '***'" in text
+    _assert_encode_safe(text)
+
+
+class _KeysHidden(collections.OrderedDict[str, object]):
+    """Lists one key only. On 3.14 an OrderedDict subclass's repr reads its own keys()."""
+
+    def keys(self) -> Any:
+        return [key for key in collections.OrderedDict.keys(self) if key != "hidden"]
+
+
+@pytest.mark.parametrize("chain", ["engine", "tray"])
+def test_an_ordered_dict_subclass_that_hides_a_key_from_its_own_keys_still_hides_it(
+    chain: str,
+) -> None:
+    # The rebuild printed it from raw storage, past the subclass's own keys().
+    plain = _KeysHidden(hidden="planted-hidden-3185", e="stand-in")
+    assert "planted-hidden-3185" not in _record("%s %s", (plain, 1)).getMessage()  # main
+    record = _record("%s %s", (_KeysHidden(hidden="planted-hidden-3185", e=_encode_error()), 1))
+    _chain_filter(chain).filter(record)
+    text = record.getMessage()
+    assert "planted-hidden-3185" not in text
+    _assert_encode_safe(text)
+
+
 def _recursive_list() -> list[object]:
     loop: list[object] = [1, "two"]
     loop.append(loop)
