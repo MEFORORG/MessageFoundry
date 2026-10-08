@@ -300,6 +300,13 @@ _TLS_HANDSHAKE_TIMEOUT = 10.0
 # for it, and on uvloop it can; see stop().
 _TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
 
+# Seconds between two `tls_handshake_failed` connection events from one listener (vault BACKLOG
+# #2613). Failed handshakes are logged at DEBUG only, so before #2613 nothing an operator reads
+# showed them. One event per window, carrying the count since the last one, records a flood without
+# letting a peer that fails handshakes as fast as it connects fill the connection_event table.
+# Per listener, not per peer: the peer's address is the caller's choice.
+_TLS_FAILURE_EVENT_SECONDS = 60.0
+
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
 #: consumers of it are a log line, a dead-letter row's ``last_error`` and an alert, each of which
@@ -1862,6 +1869,16 @@ class MLLPSource(SourceConnector):
         # True while this listener runs TLS handshakes itself, after its own checks (BACKLOG #1606);
         # set at start() from the running loop, see `_upgrades_tls_itself`.
         self._upgrade_tls = False
+        #: Failed TLS handshakes this listener has seen, since it was built (vault BACKLOG #2613).
+        #: Counted only where the listener runs the handshake itself (`_upgrades_tls_itself`).
+        self.tls_handshake_failures = 0
+        # The count already reported in a `tls_handshake_failed` event, and when that event went.
+        self._tls_failures_reported = 0
+        self._tls_failure_event_at: float | None = None
+        # The latest failure's peer and cause, the trailing event's timer, and its task.
+        self._tls_last: tuple[str | None, str] = (None, "")
+        self._tls_flush: asyncio.TimerHandle | None = None
+        self._tls_flush_tasks: set[asyncio.Task[None]] = set()
         # The in-flight frame slots, `max_inflight_frames` of them; None when the bound is off.
         # Built at start() rather than here, so a slot a straggler from the previous run never
         # gave back cannot shrink the restarted listener's budget. Each holder releases the
@@ -1995,6 +2012,12 @@ class MLLPSource(SourceConnector):
                 writer.get_extra_info("peername"),
                 safe_exc(exc),
             )
+            # Not counted: stop() aborting a handshake, and a peer that hung up before finishing
+            # one, which is what a load balancer's TCP health check does. A reset is how the
+            # Windows Proactor reports that hang-up. A TLS error and the handshake bound count.
+            hung_up = isinstance(exc, ConnectionResetError | BrokenPipeError)
+            if not self._stopping and not hung_up:
+                await self._note_tls_failure(_peer_host(writer), type(exc).__name__)
             return False
         except AttributeError:
             if not _lost_its_transport(writer):
@@ -2005,9 +2028,57 @@ class MLLPSource(SourceConnector):
                 "TLS connection on MLLP from %s closed during its handshake",
                 raw.get_extra_info("peername"),
             )
+            # Not counted, for the reason the OSError arm above gives: stop() closing a socket lands
+            # here, and so does a peer that hangs up cleanly.
             return False
         reader._transport = writer.transport  # type: ignore[attr-defined]  # see the docstring
         return True
+
+    async def _note_tls_failure(self, peer_host: str | None, cause: str) -> None:
+        """Count one failed handshake, and emit a throttled ``tls_handshake_failed`` event (#2613).
+
+        The first failure emits at once. Later ones inside :data:`_TLS_FAILURE_EVENT_SECONDS` are
+        held, and one trailing event at the window's end reports how many, so a burst is one row
+        with its size. stop() reports what is still held. An event for one failure names its peer;
+        an event for several names none, since they may come from many peers. ``cause`` is an
+        exception class name, never the peer's bytes. A handshake past its bound counts, as a
+        ``ConnectionAbortedError``."""
+        self.tls_handshake_failures += 1
+        self._tls_last = (peer_host, cause)
+        now = time.monotonic()
+        last = self._tls_failure_event_at
+        if last is None or now - last >= _TLS_FAILURE_EVENT_SECONDS:
+            await self._report_tls_failures()
+        elif self._tls_flush is None:
+            self._tls_flush = asyncio.get_running_loop().call_later(
+                last + _TLS_FAILURE_EVENT_SECONDS - now, self._flush_tls_failures
+            )
+
+    def _cancel_tls_flush(self) -> None:
+        if self._tls_flush is not None:
+            self._tls_flush.cancel()
+            self._tls_flush = None
+
+    def _flush_tls_failures(self) -> None:
+        """The trailing event's timer: report the held failures on a tracked task."""
+        self._tls_flush = None
+        task = asyncio.get_running_loop().create_task(self._report_tls_failures())
+        self._tls_flush_tasks.add(task)
+        task.add_done_callback(self._tls_flush_tasks.discard)
+
+    async def _report_tls_failures(self) -> None:
+        """Emit one ``tls_handshake_failed`` for the failures not yet reported, if there are any."""
+        since = self.tls_handshake_failures - self._tls_failures_reported
+        if since <= 0:
+            return
+        self._tls_failures_reported = self.tls_handshake_failures
+        self._tls_failure_event_at = time.monotonic()
+        peer_host, cause = self._tls_last
+        await self._emit_event(
+            "tls_handshake_failed",
+            peer_host=peer_host if since == 1 else None,
+            reason=f"{since} failed handshake(s) since the last event; last cause {cause}",
+        )
 
     async def _handle_bounded(self, message: bytes) -> str | None:
         """Run the inbound handler inside one of this listener's in-flight slots, if the bound is on
@@ -2095,7 +2166,15 @@ class MLLPSource(SourceConnector):
                     await asyncio.gather(*still_running, return_exceptions=True)
             self._clients.clear()
             self._client_tasks.clear()
+            # Vault BACKLOG #2613: report the handshake failures a trailing event still held, once
+            # no handshake can add to them. `_emit_event` is fail-soft, so this cannot fail stop().
+            self._cancel_tls_flush()
+            if self._tls_flush_tasks:
+                await asyncio.gather(*self._tls_flush_tasks, return_exceptions=True)
+            await self._report_tls_failures()
         finally:
+            # Again here, so a stop() cancelled above leaves no timer to fire after it.
+            self._cancel_tls_flush()
             # Clear the per-host tables with them, in a `finally` so a stop() cancelled or failing
             # anywhere above still clears them (vault BACKLOG #2847), as the raw-TCP, X12 and HTTP
             # listeners already did. A client task the runner ABANDONS when a stop() overruns

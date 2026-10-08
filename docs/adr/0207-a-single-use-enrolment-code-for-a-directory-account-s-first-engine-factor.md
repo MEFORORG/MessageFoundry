@@ -236,7 +236,9 @@ change.
   credential is already written, so the factor is enrolled and the holder proves it at the next
   sign-in. Both fail closed, and both are stated so nobody mistakes them for defects.
 - **Never in plaintext at rest, never in a log, never in a URL.** Each reply that carries it sends
-  `Cache-Control: no-store` through `_no_store_reply`, as the MFA reset reply already does.
+  `Cache-Control: no-store` because its response model subclasses `CredentialReply`, as the MFA
+  reset reply already does. (Until BACKLOG #2372 this read "through `_no_store_reply`", the
+  per-route dependency that change retired.)
 
 ### 4. Who issues it, and how it reaches the holder
 

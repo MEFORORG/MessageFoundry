@@ -4473,6 +4473,15 @@ _ALERT_EVENT_TYPES = frozenset(
         # recorded one. Keyed `config:<12 hex>`, which no connection can be named, so it is not in
         # _ALERT_CONTROL_EVENT_TYPES below.
         "config_changed",
+        # vault BACKLOG #2613: the security-signal rule layer over the audit stream. Each detector
+        # has its own type; pipeline/security_signals.py SECURITY_SIGNAL_TYPES mirrors this block, and
+        # a test pins that each is here. None is connection-scoped.
+        "signin_failure_burst",
+        "access_denied_burst",
+        "body_view_burst",
+        "bulk_export",
+        "log_level_debug",
+        "posture_loosened",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,
@@ -4800,6 +4809,24 @@ class AlertsSettings(_Section):
     # Re-alert throttle: the same (event, connection) won't re-notify more often than this, so a
     # flapping lane can't spam the channel.
     realert_seconds: float = 300.0
+
+    # --- security signals (vault BACKLOG #2613) ------------------------------------------------
+    # A rule layer over the audit stream (pipeline/security_signals.py) raises an alert when a count
+    # below is reached inside security_window_seconds. On by default. A count of 0 switches that one
+    # detector off; security_signals=false switches the whole layer off, the DEBUG and posture
+    # detectors included. The defaults are set high on purpose: a page nobody acts on teaches an
+    # operator to ignore the channel. docs/CONFIGURATION.md [alerts] lists each one.
+    security_signals: bool = True
+    security_window_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    # Refused sign-ins from ONE client address. Keyed on the address, never the typed username.
+    security_signin_failures: int = Field(default=20, ge=0)
+    # auth.permission_denied + auth.channel_denied + auth.mfa_denied for ONE account.
+    security_denials: int = Field(default=20, ge=0)
+    # Stored-body reads by ONE account: message_body_view, outbound.read, response.read and
+    # attachment_download rows.
+    security_body_views: int = Field(default=100, ge=0)
+    # Messages selected by ONE account's messages_export calls, summed over the window.
+    security_export_messages: int = Field(default=5000, ge=0)
 
     # Secure-by-default (#188, ASVS 6.3.5/6.3.7): out-of-band security-event notifications are required
     # by default. `serve` refuses to start under [security].enforcement=enforce (warns under

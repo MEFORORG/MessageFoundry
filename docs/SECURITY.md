@@ -180,7 +180,8 @@ the route takes a body.
   dependency ahead of a gate. The engine adds no route through `include_router`, and every gated
   engine HTTP route keeps its gate at the top level. The third shape is present. Every route carries
   `refuse_undeclared_route`, described below, which never refuses a route that has a gate. Some
-  routes carry others, such as `_no_store_reply` in `messagefoundry/api/auth_routes.py`. An
+  routes carry others, such as `no_store_reply` in `messagefoundry/api/security.py`, which the
+  same route class adds to every route returning a `CredentialReply` (BACKLOG #2372). An
   embedder who adds routes in one of those ways must check them.
 - The gate itself does not change. After the body is read it runs in full, as before: sign-in
   again, then the password and factor checks, the permission check and its audit rows, pacing and
@@ -2593,6 +2594,15 @@ declared (proxy not sending `X-Forwarded-Proto`, or its peer IP not matched by `
 Settings validation refuses `trusted_proxies` without either posture (BACKLOG #2055), so no
 forwarded scheme can reach the cookie decision while `exposure_protected` is false.
 
+**Known gap: a planted session cookie would lock a browser out (BACKLOG #2454).** The console
+refuses a request that carries its session cookie twice with `400`, and the default
+`__Host-mf_session` name cannot be planted from another host. The opt-out names can be. Under
+`MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING` the cookie is `__Secure-mf_session`, and on a cleartext
+origin it is `mf_session`. Either way a sibling host could set a copy for the parent domain. The
+browser would then send two copies once the console had set its own cookie, and the console
+would answer `400` on every page, sign-in included, until the planted cookie is cleared. No mitigation is built; the cookie names are
+listed in [BROWSER-SUPPORT.md](BROWSER-SUPPORT.md#two-configurations-turn-the-warnings-off).
+
 **Browser AD login (L5b).** The browser AD **password** sign-in is **retired** (BACKLOG #1137).
 `/ui/login` has no provider selector. Its only form is local username and password, and Windows SSO
 and OIDC appear as links when available (`kerberos_available`, `oidc_available`). A POST that still carries `provider=ad` is charged to the
@@ -4265,7 +4275,7 @@ for a token, so it is not a sign-in leg.
 
 ### The documented protection set (ASVS 6.1.1)
 
-Nine controls defend the authentication surface against automated attack. Each is named with its
+Ten controls defend the authentication surface against automated attack. Each is named with its
 threshold, the switch that disables it, and — the part that matters for "not disabled or bypassable" —
 **what is left when it is off**.
 
@@ -4280,6 +4290,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 7 | **Federated pending-flow bound** (`FlowCache.put`, **reject-when-full**) | flooding the OIDC start legs to exhaust engine memory or deny federated sign-in and step-up. The sign-in start is `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its 3.7.3 interstitial is skipped, because that GET then runs the POST leg and stages a flow; with the interstitial shown, the default, the GET stages nothing — see the [Route → limiter map](#route--limiter-map). The step-up start is `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages its flow in the **same** cache, so a flood on either start fills it for both | 16 pending flows per client IP, 512 engine-wide, 300 s TTL. It **rejects** rather than evicts — evict-oldest would turn a start-leg flood into a login DoS for legitimate users | **none** — and `oidc_flow_cache_max = 0` is not an opt-out either: `put` refuses at `len(entries) >= global_cap`, so `0` rejects **every** federated sign-in and IdP step-up (`FlowCacheFullError` on the first flow, an OIDC denial of service). No validator floors it; treat it as a security-relevant value | limiter 2 on the sign-in start, which charges `allow_login_attempt` first; limiter 3 on the step-up start, which charges `allow_reauth_attempt` first |
 | 8 | **WebAuthn pending-ceremony bound** (`ChallengeCache.put`) | flooding passkey registration/assertion ceremonies | 16 pending ceremonies per **user** (evicts that *same* user's oldest, so one principal can never deny another's), 4096 engine-wide (**refuses** with a cause-naming `ChallengeCacheFullError`), 120 s TTL | none | limiter 3 where the console charges it — `POST /ui/reauth/webauthn` (`ui_reauth_webauthn`, the assertion **finish** leg), plus `POST /ui/reauth` (`ui_reauth`) and `POST /ui/mfa` (`ui_mfa_submit`), whose code and password error re-renders re-stage fresh assertion options after the route has already charged `allow_reauth_attempt`. One `POST /ui/reauth` branch is the exception: its passkey-first refusal for a passkey-only session re-stages options **before** the limiter and charges nothing. The routes that *stage* a ceremony — the thing `ChallengeCache.put` actually bounds — charge no **auth-surface** limiter, but they are not unpaced: `POST /ui/account/webauthn/enroll` and `POST /ui/account/webauthn/verify` charge the per-actor **admin-write floor** (`allow_admin_write`, non-GET only, in `require_ui` — see 2.1.3 below). `GET /ui/reauth` and `GET /ui/mfa`, which re-stage fresh assertion options on **every** render, charge nothing at all, because that floor is non-GET only. There this bound plus cookie-holder-only reachability is all there is |
 | 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — no validator floor, so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
+| 10 | **Repeated-credential audit budget** (`allow_repeated_credential_audit`) | an unauthenticated caller growing `audit_log` by sending a repeated `Authorization` header or session cookie, which is refused before any credential is read (BACKLOG #2454) | > 10 `auth.repeated_credential` rows per client IP **or** > 60 across all clients, per 60 s. Its own budget: it never draws on, or exhausts, limiter 2. A flood from many addresses can spend the global 60, and other refusals in that window then get the line and no row | *the same* `[auth].login_rate_limit_enabled` | the refusal is unchanged: every repeat is still a `400` and a WARNING line. Only the row loses its bound, so with the switch off every refusal writes one |
 
 **Control 1 bounds the lock; it bounds the campaign only where the owner has a way past it
 (ADR 0197).** Each lock releases itself, and the next run to the threshold sets the next one. What
@@ -4696,6 +4707,38 @@ reasons are in `messagefoundry/auth/audit_visibility.py`.
 export, and `GET /audit/export` sends `X-Audit-Withheld: true` and records `withheld` in its
 `audit.export` row. Each is decided by the reader's permission alone. It shows whether or not a
 hidden row falls in the range read, so it cannot tell the reader that a lock happened.
+
+**Six audit signals also raise an operator alert (vault BACKLOG #2613).** A small rule layer
+(`messagefoundry/pipeline/security_signals.py`) watches the audit stream and raises one alert type
+per detector through the `[alerts]` notifier, or the log when no transport is set. It is on by
+default. What each one counts is stated once, in the `[alerts]` table of `docs/CONFIGURATION.md`.
+
+| Alert | Setting | Subject |
+|---|---|---|
+| `signin_failure_burst` | `security_signin_failures` | `signin:<address>` |
+| `access_denied_burst` | `security_denials` | `account:<username>` |
+| `body_view_burst` | `security_body_views` | `account:<username>` |
+| `bulk_export` | `security_export_messages` | `account:<username>` |
+| `log_level_debug` | none | `logging:debug` |
+| `posture_loosened` | none | `posture:start` |
+
+The layer is an observer on the off-box audit tee, which at least `record_audit` and every
+in-transaction audit append call after their commit. So it adds no commit and no store read to the
+request path. A row the tee misses, such as one whose commit a cancellation follows, is missed here
+too. It holds its counts in memory, so a restart starts them again, and an engine shard counts only
+its own rows. Past five subjects alerting from one detector inside one window, it raises under one
+shared `<prefix>:*` subject, so a spread of addresses cannot open an alert, and send a page, per
+address. The notifier still keeps a little state per subject that did alert, as it does for every
+alert key. An alert carries a count and a fixed sentence. It never carries a message body, a message
+id, an audit row's detail or a typed username, which can be a password typed into the wrong box. The
+sign-in detector counts `auth.login_failed`, which is written once per refused local sign-in in every
+lock state, and leaves out the withheld directory lock refusal, so its count does not reveal a lock.
+**An account lock raises no alert**, by the 2026-09-28 ruling above: the alert list is readable
+under `monitoring:diagnose`, and a lock alert there would show lock state to a reader the ruling
+withholds it from. **Switching the layer off is not yet reported as a posture loosening**:
+`[alerts].security_signals = false`, or a threshold of `0`, is absent from
+`GET /security/posture`. Nor does `posture_loosened` fire on a start whose `config_loaded` row
+records its loosenings as unknown, such as one a cluster convergence reload superseded.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC

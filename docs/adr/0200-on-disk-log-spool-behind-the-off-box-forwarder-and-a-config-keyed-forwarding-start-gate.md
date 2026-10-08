@@ -114,3 +114,57 @@ the gate being keyed on configuration and not on the collector.
   2-second figure was costed against something else and does not apply to it.
 - Not built here: the shard supervisor and the sandbox child still have no forwarder path, and the
   collector-separation probe (every resolved address is this host's) stays unbuilt. #1199 names them.
+
+## Follow-ups (BACKLOG #2278, #2279), 2026-10-08
+
+The two review rounds of the build left findings open. This section records what each became. It
+changes no decision above.
+
+**Built.**
+
+- **A read fault is reported as a read fault (#2278).** A spool read that fails for a reason other
+  than a missing file keeps every segment, as before. The listener now logs a WARNING naming the
+  directory and the count, at most once a minute. The "spool is full" warning says when a
+  standing read fault may be what filled the spool. No unreadable segment is retired: that would
+  delete undelivered records. While the fault stands, newer records are sent ahead of the
+  unreadable ones, so replay order is not kept across a read fault.
+- **Entries are written as UTF-8.** The default JSON escaping wrote six bytes for each non-ASCII
+  character, which filled the cap early. The format version is unchanged, because a version 1
+  reader already decodes both forms. An entry holding a lone surrogate keeps the escaped form.
+- **A sent segment whose delete failed stays counted against the cap.** The listener tries the
+  delete again after 1 second, doubling to 60 seconds, and `close` tries once more. The "spool is
+  full" warning names such segments, and so does a WARNING at close when one remains. One still on
+  disk at the next start is replayed whole, because nothing on disk marks it as sent. So the
+  "up to one segment twice" limit above is a floor for a spool whose deletes fail.
+- **A full disk leaves no empty segments.** A failed write removes the empty segment it started and
+  hands its sequence number back.
+- **A start whose forwarder cannot be built removes the directories and lock file that start
+  created.** It never removes a directory that was already there, or one holding a segment, and
+  it logs a WARNING naming segments an earlier run left. A spool that cannot be opened, other
+  than one another process holds, names them too.
+- **A spool that is turned off warns once at start when old segments remain.** It never deletes
+  them: they are undelivered evidence, and a delete cannot be undone.
+- **Records still queued at the drain deadline and moved to the spool are reported once**, at
+  INFO, with their count.
+
+**Stands by design.**
+
+- **A TLS handshake failure that is not a failed certificate check is deferred to the spool.** Only
+  a failed verification is certain to be a configuration fault. A "not yet valid" certificate is
+  what a host sees before its clock syncs at boot, and a reset or timed-out handshake is what a
+  collector that is restarting looks like. Treating either as permanent would turn the forwarder
+  off for the life of the process over a fault that clears on its own. The cost is that a
+  permanent fault of an unlisted kind is retried with backoff and never reported at ERROR.
+- **The spool lock is held if the listener thread outlives its join.** The thread owns the spool,
+  so closing the spool under a thread that may still append would race. The thread is a daemon and
+  the operating system releases the lock when the process exits. Until then a second
+  `configure_logging` in the same process runs without a spool and says so.
+
+**Still open on #2279.**
+
+- Tests resolve `siem.invalid` over live DNS. A process-wide stub cannot reach the serve
+  subprocesses those tests start.
+- The lock helper is duplicated in four modules. `log_spool.py` is in the start-up import budget,
+  so sharing it is a design question.
+- A lone surrogate can still be lost at send time by a caller that puts raw text into `LogSpool`.
+  The engine's own path spells it as text before the queue, so it does not arise there.

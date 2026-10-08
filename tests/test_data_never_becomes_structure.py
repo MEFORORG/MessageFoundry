@@ -276,6 +276,9 @@ def test_the_lint_gives_no_leaf_advice_without_a_leaf_finding(tmp_path: Path) ->
 LENS_SOURCE = """\
 from messagefoundry import handler, set_field
 
+# An expression source must name an inert module literal (Manager decision 2026-10-07).
+src_path = "PID-3"
+
 
 @handler("H")
 def h(msg):

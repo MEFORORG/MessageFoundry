@@ -43,12 +43,12 @@ from pydantic import BaseModel
 from messagefoundry.api import create_app
 from messagefoundry.api import security as api_security
 from messagefoundry.api.app import _get_engine
-from messagefoundry.api.auth_routes import _no_store_reply
 from messagefoundry.api.auth_routes import _service as _service_guard
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
     before_body_of,
     mark_route_gate,
+    no_store_reply,
     refuse_undeclared_route,
     require,
     require_phi_read,
@@ -286,7 +286,7 @@ async def test_every_dependency_ahead_of_a_gate_is_accounted_for(engine: Engine)
     dependencies read and found unable to refuse. A new kind fails here until someone reads it."""
     # refuse_undeclared_route runs ahead of every route's own dependencies, but it refuses only a
     # route with no gate, and every route this loop reads has one (vault BACKLOG #2604).
-    cannot_refuse = {_no_store_reply, refuse_undeclared_route}
+    cannot_refuse = {no_store_reply, refuse_undeclared_route}
     app = create_app(engine, auth=await _service(engine), serve_ui=True, oidc_enabled=True)
     marked: set[object] = set()
     skipped: set[object] = set()

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 import webbrowser
 from collections.abc import Callable
@@ -16,6 +17,7 @@ import pytest
 from messagefoundry.tray.actions import (
     ConsoleUrlRefused,
     LogPathRefused,
+    RepoPathRefused,
     console_url,
     log_available,
     open_console,
@@ -24,6 +26,8 @@ from messagefoundry.tray.actions import (
     repo_open_available,
     resolve_vscode,
 )
+from messagefoundry.tray.config import TrayConfig
+from messagefoundry.tray.logscrub import TrayLogScrubFilter
 
 
 def test_console_url_appends_ui_and_strips_slash() -> None:
@@ -62,19 +66,115 @@ def test_resolve_vscode_none_when_absent() -> None:
     assert resolve_vscode(which=lambda _n: None, is_file=lambda _p: False) is None
 
 
+# BACKLOG #2327: `code.cmd` is a batch file, so Windows would run it under cmd.exe. A standard
+# install keeps the editor executable one folder above `bin`, and that is what gets started.
+_INSTALL = "C:\\Program Files (x86)\\Microsoft VS Code"
+
+
+@pytest.mark.parametrize("cli_name", ["code.cmd", "code.CMD", "code.bat"])
+def test_resolve_vscode_returns_the_editor_exe_beside_a_batch_cli(cli_name: str) -> None:
+    exe = f"{_INSTALL}\\Code.exe"
+    resolved = resolve_vscode(
+        which=lambda _n: f"{_INSTALL}\\bin\\{cli_name}", is_file=lambda p: p == exe
+    )
+    assert resolved == exe
+
+
+def test_resolve_vscode_returns_the_editor_exe_for_an_install_dir_fallback() -> None:
+    root = "C:\\Users\\me\\AppData\\Local"
+    resolved = resolve_vscode(
+        which=lambda _n: None,
+        is_file=lambda p: p.startswith(root),
+        expandvars=lambda t: t.replace("%LOCALAPPDATA%", root),
+    )
+    assert resolved == f"{root}\\Programs\\Microsoft VS Code\\Code.exe"
+
+
+def test_resolve_vscode_keeps_a_batch_cli_that_has_no_editor_exe() -> None:
+    # A shim: no `bin` parent, or no executable there. The batch file is the fallback.
+    probed: list[str] = []
+
+    def is_file(path: str) -> bool:
+        probed.append(path)
+        return False
+
+    assert resolve_vscode(which=lambda _n: "C:\\shims\\code.cmd", is_file=is_file) == (
+        "C:\\shims\\code.cmd"
+    )
+    assert probed == []  # not under `bin`, so no executable is guessed at
+    assert resolve_vscode(which=lambda _n: "C:\\x\\bin\\code.cmd", is_file=is_file) == (
+        "C:\\x\\bin\\code.cmd"
+    )
+    assert probed == ["C:\\x\\Code.exe"]
+
+
+@pytest.mark.parametrize("cli", ["C:\\a&b\\code.cmd", "C:\\tools (x86)\\bin\\code.cmd"])
+def test_resolve_vscode_never_uses_a_batch_cli_whose_own_path_cmd_would_reread(cli: str) -> None:
+    # cmd.exe re-reads the batch file's path too, so with no executable to start it is not used.
+    assert resolve_vscode(which=lambda _n: cli, is_file=lambda _p: False) is None
+
+
+def test_resolve_vscode_goes_on_to_an_install_location_after_an_unusable_path_hit() -> None:
+    root = "C:\\Users\\me\\AppData\\Local"
+    resolved = resolve_vscode(
+        which=lambda _n: "C:\\a&b\\code.cmd",
+        is_file=lambda p: p.startswith(root),
+        expandvars=lambda t: t.replace("%LOCALAPPDATA%", root),
+    )
+    assert resolved == f"{root}\\Programs\\Microsoft VS Code\\Code.exe"
+
+
+@pytest.mark.parametrize(
+    "cli", ["C:\\shims\\code.CMD ", "C:\\shims\\code.cmd.", "C:\\x\\code.bat. "]
+)
+def test_a_batch_cli_with_a_trailing_dot_or_space_is_still_a_batch_file(cli: str) -> None:
+    # Windows drops a trailing dot or space from a file name, so the name is judged without it.
+    assert resolve_vscode(which=lambda _n: cli, is_file=lambda _p: False) == cli
+    calls: list[list[str]] = []
+    with pytest.raises(RepoPathRefused):
+        open_repo("C:\\a&b", cli, runner=calls.append)
+    assert calls == []
+
+
+def test_the_tray_doc_lists_the_characters_the_fallback_allows() -> None:
+    # docs/TRAY.md is where operators read the set; this holds it to the one in the code.
+    from messagefoundry.tray import actions as tray_actions
+
+    doc = (Path(__file__).resolve().parent.parent / "docs" / "TRAY.md").read_text(encoding="utf-8")
+    start = "letters, digits, spaces and\n`"
+    listed = doc[doc.index(start) + len(start) :].split("`", 1)[0].split()
+    assert set(listed) | {" "} == set(tray_actions._CMD_PLAIN_CHARS)
+    assert len(listed) == len(set(listed))
+
+
+def test_resolve_vscode_returns_a_non_batch_cli_as_found() -> None:
+    probed: list[str] = []
+    resolved = resolve_vscode(which=lambda _n: "C:\\a&b\\bin\\code.exe", is_file=probed.append)  # type: ignore[arg-type]
+    assert resolved == "C:\\a&b\\bin\\code.exe"
+    assert probed == []
+
+
 def test_repo_open_available() -> None:
-    assert repo_open_available("C:\\repo", "code.cmd", is_dir=lambda _p: True) is True
-    assert repo_open_available("C:\\repo", None, is_dir=lambda _p: True) is False  # no code CLI
-    assert (
-        repo_open_available("C:\\repo", "code.cmd", is_dir=lambda _p: False) is False
-    )  # not a dir
-    assert repo_open_available(None, "code.cmd", is_dir=lambda _p: True) is False  # no path
+    def available(repo_path: str | None, vscode: str | None, is_dir: bool) -> bool:
+        return repo_open_available(
+            repo_path, vscode, is_dir=lambda _p: is_dir, is_remote_drive=_never_remote
+        )
+
+    assert available("C:\\repo", "code.cmd", True) is True
+    assert available("C:\\repo", None, True) is False  # no code CLI
+    assert available("C:\\repo", "code.cmd", False) is False  # not a dir
+    assert available(None, "code.cmd", True) is False  # no path
 
 
 def test_log_available() -> None:
-    assert log_available("C:\\log.txt", is_file=lambda _p: True) is True
-    assert log_available("C:\\log.txt", is_file=lambda _p: False) is False
-    assert log_available(None, is_file=lambda _p: True) is False
+    assert (
+        log_available("C:\\log.txt", is_file=lambda _p: True, is_remote_drive=_never_remote) is True
+    )
+    assert (
+        log_available("C:\\log.txt", is_file=lambda _p: False, is_remote_drive=_never_remote)
+        is False
+    )
+    assert log_available(None, is_file=lambda _p: True, is_remote_drive=_never_remote) is False
 
 
 def test_open_console_opens_ui_url() -> None:
@@ -179,6 +279,178 @@ def test_open_repo_runs_code_with_list_argv() -> None:
     assert calls == [["code.cmd", "C:\\repo"]]
 
 
+# The markers are harmless: nothing here is a command.
+_CMD_SYNTAX_PATHS = ["C:\\a&b", "C:\\Program Files (x86)\\repo", "C:\\a%PATH%b", "C:\\a|b^c!d"]
+
+
+@pytest.mark.parametrize("repo_path", _CMD_SYNTAX_PATHS)
+def test_a_batch_cli_with_an_editor_exe_opens_any_folder_name(repo_path: str) -> None:
+    # End to end over the two seams: resolve the launcher, then open. No cmd.exe is in the launch,
+    # so nothing is screened and the path reaches the runner unmodified, as one argv item.
+    exe = f"{_INSTALL}\\Code.exe"
+    launcher = resolve_vscode(
+        which=lambda _n: f"{_INSTALL}\\bin\\code.cmd", is_file=lambda p: p == exe
+    )
+    assert launcher is not None
+    calls: list[list[str]] = []
+    open_repo(repo_path, launcher, runner=calls.append)
+    assert calls == [[exe, repo_path]]
+
+
+@pytest.mark.parametrize("repo_path", _CMD_SYNTAX_PATHS)
+@pytest.mark.parametrize("launcher", ["C:\\a&b\\Code.exe", "C:\\bin\\code", "C:\\x\\code.EXE"])
+def test_open_repo_screens_nothing_for_a_launcher_that_is_not_a_batch_file(
+    repo_path: str, launcher: str
+) -> None:
+    calls: list[list[str]] = []
+    open_repo(repo_path, launcher, runner=calls.append)
+    assert calls == [[launcher, repo_path]]
+
+
+@pytest.mark.parametrize("launcher", ["C:\\a&b\\code.cmd", "C:\\tools (x86)\\code.BAT"])
+def test_open_repo_refuses_a_batch_launcher_whose_own_path_cmd_would_reread(launcher: str) -> None:
+    calls: list[list[str]] = []
+    with pytest.raises(RepoPathRefused):
+        open_repo("C:\\repo", launcher, runner=calls.append)
+    assert calls == []
+
+
+# The fallback: a batch `code` CLI with no editor executable beside it. Windows runs it under
+# cmd.exe, which re-reads the command line. Python's argv quoting escapes none of these, and `%`
+# expands even in quotes.
+@pytest.mark.parametrize("code_cmd", ["code.cmd", "C:\\shims\\code.CMD", "C:\\shims\\code.bat"])
+@pytest.mark.parametrize(
+    "repo_path",
+    [
+        "C:\\a&b",
+        "C:\\a|b",
+        "C:\\a<b",
+        "C:\\a>b",
+        "C:\\a^b",
+        "C:\\a%PATH%b",
+        "C:\\a!b",
+        "C:\\a(b",
+        "C:\\a)b",
+        'C:\\a"b',
+        "C:\\a,b",  # `,` `;` `=` are cmd.exe argument delimiters
+        "C:\\a;b",
+        "C:\\a=b",
+        "C:\\a\u00a0b",  # cmd.exe splits at these Unicode spaces too
+        "C:\\a\u3000b",
+        "C:\\a\u0085b",
+        "C:\\a'b",  # refused because nothing lists it as plain
+        "C:\\a\rb",
+        "C:\\a\nb",
+        "C:\\a\x00b",
+        "C:\\a\x1ab",
+        "C:\\a\x7fb",
+        "C:\\with space\\a&b",  # refused even though the space gets the argument quoted
+    ],
+)
+def test_a_batch_launcher_refuses_a_path_cmd_would_reread(repo_path: str, code_cmd: str) -> None:
+    calls: list[list[str]] = []
+    with pytest.raises(RepoPathRefused) as excinfo:
+        open_repo(repo_path, code_cmd, runner=calls.append)
+    assert calls == []
+    # Fixed text: the path is operator data, so no part of it is echoed.
+    assert str(excinfo.value) == str(RepoPathRefused())
+
+
+@pytest.mark.parametrize(
+    "repo_path",
+    ["C:\\Users\\me\\Code\\My Estate", "C:\\repo-1_x.y", "D:\\caf\u00e9\\repo", "C:\\a~b+c@d#e"],
+)
+def test_a_batch_launcher_still_opens_an_ordinary_folder(repo_path: str) -> None:
+    calls: list[list[str]] = []
+    open_repo(repo_path, "code.cmd", runner=calls.append)
+    assert calls == [["code.cmd", repo_path]]
+
+
+def test_the_tray_app_reports_a_refused_repo_path_and_starts_nothing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from messagefoundry.redaction import redact
+
+    started: list[object] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: started.append(a))
+
+    def act(tray: object) -> None:
+        monkeypatch.setattr(tray, "_vscode", "code.cmd", raising=False)
+        tray._open_repo()  # type: ignore[attr-defined]
+
+    title, body, logged = _refused_action_report(
+        monkeypatch, caplog, act, TrayConfig(repo_path="C:\\secret&b")
+    )
+
+    assert started == []
+    assert body == f"Repo not opened: {RepoPathRefused()}"
+    assert logged == body
+    # tray.log runs the engine's redactor, which must not eat the operator's line (BACKLOG #2092).
+    assert redact(logged) == logged
+    record = logging.LogRecord("messagefoundry.tray", logging.WARNING, __file__, 1, body, (), None)
+    TrayLogScrubFilter().filter(record)
+    assert record.getMessage() == body
+    assert "secret" not in title + body + caplog.text
+
+
+def test_the_tray_app_starts_the_editor_exe_with_the_path_as_one_argv_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.tray import app as tray_app
+
+    started: list[tuple[object, object]] = []
+    envs: list[object] = []
+
+    def _popen(args: list[str], **kw: object) -> None:
+        started.append((args, kw.get("shell")))
+        envs.append(kw["env"])
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    monkeypatch.delenv("ELECTRON_RUN_AS_NODE", raising=False)
+    monkeypatch.delenv("VSCODE_DEV", raising=False)
+    tray = tray_app.TrayApp.__new__(tray_app.TrayApp)
+    monkeypatch.setattr(tray, "_config", TrayConfig(repo_path="C:\\a&b (x86)"), raising=False)
+    monkeypatch.setattr(tray, "_vscode", "C:\\VS Code\\Code.exe", raising=False)
+    tray._open_repo()
+    assert started == [(["C:\\VS Code\\Code.exe", "C:\\a&b (x86)"], False)]
+    assert envs == [None]  # nothing to drop, so the child inherits the environment untouched
+
+    # Inherited, the first makes the editor executable run the folder as a Node script, and the
+    # second starts it in its development mode. `code.cmd` handles both itself.
+    monkeypatch.setenv("ELECTRON_RUN_AS_NODE", "1")
+    monkeypatch.setenv("VSCODE_DEV", "1")
+    monkeypatch.setenv("MEFOR_TRAY_TEST_MARKER", "kept")
+    tray._open_repo()
+    env = envs[1]
+    assert isinstance(env, dict)
+    assert not {"ELECTRON_RUN_AS_NODE", "VSCODE_DEV"} & {name.upper() for name in env}
+    assert env["MEFOR_TRAY_TEST_MARKER"] == "kept"
+
+
+def test_the_tray_app_reports_a_failed_launch_without_any_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The launcher resolved at startup and is gone by the click. The OSError quotes its path.
+    from messagefoundry.redaction import redact
+
+    def _launch_fails(args: list[str], **_kw: object) -> None:
+        raise FileNotFoundError(2, "The system cannot find the file specified", args[0])
+
+    monkeypatch.setattr(subprocess, "Popen", _launch_fails)
+
+    def act(tray: object) -> None:
+        monkeypatch.setattr(tray, "_vscode", "C:\\s3cr3t\\Code.exe", raising=False)
+        tray._open_repo()  # type: ignore[attr-defined]
+
+    title, body, logged = _refused_action_report(
+        monkeypatch, caplog, act, TrayConfig(repo_path="C:\\op\\s3cr3t")
+    )
+    assert body == "Repo not opened: the launch failed"
+    assert logged == "Repo not opened: the launch failed (FileNotFoundError)"
+    assert redact(logged) == logged
+    assert "s3cr3t" not in title + body + caplog.text
+
+
 def _identity(path: str) -> str:
     return path
 
@@ -245,29 +517,29 @@ class _Probes:
 # BACKLOG #2086: a remote target is refused on the configured string alone, so no probe runs and
 # nothing reaches the host. Opening one would send the user's NTLM credentials to it, and open
 # content that host controls.
-@pytest.mark.parametrize(
-    "log_path",
-    [
-        # UNC, both separators and mixed.
-        "\\\\host\\share\\service.log",
-        "//host/share/service.log",
-        "\\/host/share/service.log",
-        "/\\host\\share\\service.log",
-        "\\\\192.0.2.10\\share\\service.log",
-        # WebDAV through the redirector.
-        "\\\\host@SSL\\DavWWWRoot\\service.log",
-        "\\\\host@SSL@443\\DavWWWRoot\\service.log",
-        "\\\\host\\DavWWWRoot\\service.log",
-        "\\\\host@80\\share\\service.log",
-        # Extended-length and device paths, remote and local alike.
-        "\\\\?\\UNC\\host\\share\\service.log",
-        "\\\\?\\C:\\logs\\service.log",
-        "\\\\.\\C:\\logs\\service.log",
-        "\\\\.\\UNC\\host\\share\\service.log",
-        "\\\\.\\pipe\\service.log",
-        "//?/UNC/host/share/service.log",
-    ],
-)
+_REMOTE_PATHS = [
+    # UNC, both separators and mixed.
+    "\\\\host\\share\\service.log",
+    "//host/share/service.log",
+    "\\/host/share/service.log",
+    "/\\host\\share\\service.log",
+    "\\\\192.0.2.10\\share\\service.log",
+    # WebDAV through the redirector.
+    "\\\\host@SSL\\DavWWWRoot\\service.log",
+    "\\\\host@SSL@443\\DavWWWRoot\\service.log",
+    "\\\\host\\DavWWWRoot\\service.log",
+    "\\\\host@80\\share\\service.log",
+    # Extended-length and device paths, remote and local alike.
+    "\\\\?\\UNC\\host\\share\\service.log",
+    "\\\\?\\C:\\logs\\service.log",
+    "\\\\.\\C:\\logs\\service.log",
+    "\\\\.\\UNC\\host\\share\\service.log",
+    "\\\\.\\pipe\\service.log",
+    "//?/UNC/host/share/service.log",
+]
+
+
+@pytest.mark.parametrize("log_path", _REMOTE_PATHS)
 def test_open_log_refuses_a_remote_target_before_any_probe(log_path: str) -> None:
     probes = _Probes()
     opened: list[str] = []
@@ -296,6 +568,72 @@ def test_open_log_refuses_a_mapped_network_drive_before_resolving_it() -> None:
         )
     assert opened == []
     assert probes.calls == ["is_remote_drive"]
+
+
+# BACKLOG #2332: the menu asks these two on every build, so they must screen the configured string
+# the way open_log does, before any probe. A relative or drive-relative path is screened out too.
+_NOT_ON_A_LOCAL_DRIVE = [
+    *_REMOTE_PATHS,
+    "logs\\service.log",
+    "C:service.log",
+    "\\logs\\service.log",
+]
+
+
+@pytest.mark.parametrize("log_path", _NOT_ON_A_LOCAL_DRIVE)
+def test_log_available_never_probes_a_path_off_a_local_drive(log_path: str) -> None:
+    probes = _Probes()
+    available = log_available(
+        log_path, is_file=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == []
+
+
+def test_log_available_never_probes_a_mapped_network_drive() -> None:
+    probes = _Probes(remote=True)
+    available = log_available(
+        "Z:\\logs\\service.log", is_file=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == ["is_remote_drive"]
+
+
+def test_log_available_probes_a_local_path_after_the_screen() -> None:
+    probes = _Probes()
+    available = log_available(
+        "C:\\logs\\service.log", is_file=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is True
+    assert probes.calls == ["is_remote_drive", "is_file"]
+
+
+@pytest.mark.parametrize("repo_path", _NOT_ON_A_LOCAL_DRIVE)
+def test_repo_open_available_never_probes_a_path_off_a_local_drive(repo_path: str) -> None:
+    probes = _Probes()
+    available = repo_open_available(
+        repo_path, "code.cmd", is_dir=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == []
+
+
+def test_repo_open_available_never_probes_a_mapped_network_drive() -> None:
+    probes = _Probes(remote=True)
+    available = repo_open_available(
+        "Z:\\repo", "code.cmd", is_dir=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == ["is_remote_drive"]
+
+
+def test_repo_open_available_probes_nothing_without_a_code_cli() -> None:
+    probes = _Probes()
+    available = repo_open_available(
+        "C:\\repo", None, is_dir=probes.is_file, is_remote_drive=probes.is_remote_drive
+    )
+    assert available is False
+    assert probes.calls == []
 
 
 @pytest.mark.parametrize(
