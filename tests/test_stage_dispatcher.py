@@ -645,6 +645,55 @@ def _make(
     return d
 
 
+async def _pending_lanes(store: Any, lanes: list[str]) -> list[str]:
+    """The given lanes that still hold a PENDING ingress row, read from the store."""
+    owned = set(lanes)
+    return [lane for lane, _ in await store.list_fifo_lanes(Stage.INGRESS.value) if lane in owned]
+
+
+async def _drain_to_quiescence(
+    d: StageDispatcher, store: Any, lanes: list[str], mc: ManualClock, *, budget: float = 30.0
+) -> bool:
+    """Kick the dispatcher until it is idle AND the store holds no PENDING row in ``lanes``.
+
+    Each round KICKS (notify_work re-arms STOPPED/PARKED lanes; advancing the clock EVERY round makes
+    every backed-off head due, so a RETRY re-pended mid-drain cannot strand behind a frozen park timer;
+    the sweep discovers re-pends), then waits for a QUIET idle (no re-ready during the poll, so it
+    converges instead of re-queueing every lane faster than one settle can drain them).
+
+    DISPATCHER STATE ALONE IS NOT QUIESCENCE. A claim can come back EMPTY for a lane whose due row is
+    still PENDING: a head the server store's lock probe skipped, or a whole chunk aborted on a lock
+    timeout (BACKLOG #1270). That lane drops to IDLE, and in production the periodic sweep re-readies
+    it. Here the periodic sweep is off; the only sweeps are this loop's own and the immediate one
+    notify_work requests. So an idle reading after the last of them would end the drain with the row
+    unclaimed. The store read below sends it round again instead.
+
+    ONLY CONTENTION EXCUSES IT. A round that ends idle with rows pending and NO new head skip or
+    lock-timeout abort is a lane the dispatcher stranded by itself (a lost wake), which the next
+    round's sweep would hide. That raises instead of retrying."""
+
+    def _idle() -> bool:
+        return d.processing_lanes == 0 and all(d.phase(x) in (None, _LanePhase.IDLE) for x in lanes)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    while loop.time() < deadline:
+        contended_before = d.claim_head_skips + d.claim_lock_timeouts
+        d.notify_work()
+        mc.advance(1_000_000.0)
+        await d._run_sweep_once()
+        if not await _wait_until(_idle, timeout=3.0, required=False):
+            continue
+        pending = await _pending_lanes(store, lanes)
+        if not pending:
+            return True
+        assert d.claim_head_skips + d.claim_lock_timeouts > contended_before, (
+            f"idle with rows pending in {pending} and no claim contention this round: the"
+            " dispatcher stranded the lane, not the store"
+        )
+    return False
+
+
 def _first_occurrence_order(
     records: list[_Dispatch], lane: str, index_of: dict[str, int]
 ) -> list[int]:
@@ -1017,41 +1066,93 @@ async def test_busy_violation_soak_200_lanes(store: Any) -> None:
                 gate.set()  # release the held lanes partway through
             await _settle(rounds=2)
 
-        # Force-drain to quiescence. Each round KICKS (notify_work re-arms STOPPED/PARKED lanes;
-        # advancing the clock EVERY round makes every backed-off head due — a RETRY re-pended mid-drain
-        # parks at clock()+backoff, so the clock must keep moving or its tail strands behind a frozen
-        # park timer; the sweep discovers re-pends), then lets the claimer drain the re-armed lanes to
-        # IDLE via a QUIET poll (no re-ready during the poll, so it actually converges instead of the
-        # notify_work treadmill re-queueing all 200 lanes faster than one settle can drain them). A
-        # retry that fires during the quiet poll simply parks and is picked up by the next kick; retry
-        # budgets are finite (each row retries once), so this terminates.
+        # Force-drain to quiescence (see _drain_to_quiescence). A retry that fires during the quiet
+        # poll simply parks and is picked up by the next kick; retry budgets are finite (each row
+        # retries once), so this terminates.
         gate.set()
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 30.0
-        drained = False
-
-        def _quiescent() -> bool:
-            return d.processing_lanes == 0 and all(
-                d.phase(x) in (None, _LanePhase.IDLE) for x in lanes
-            )
-
-        while loop.time() < deadline:
-            d.notify_work()
-            mc.advance(1_000_000.0)
-            await d._run_sweep_once()
-            if await _wait_until(_quiescent, timeout=3.0, required=False):
-                drained = True
-                break
-        assert drained, "soak did not reach quiescence"
+        drained = await _drain_to_quiescence(d, store, lanes, mc)
+        contention = (
+            f"claim head skips={d.claim_head_skips}, lock-timeout aborts={d.claim_lock_timeouts}"
+        )
+        assert drained, (
+            f"soak did not reach quiescence; still pending: {await _pending_lanes(store, lanes)}"
+            f" ({contention})"
+        )
 
         # --- invariants ---
         assert d.busy_violations == 0
         assert stub.concurrency_violations == 0
         dispatched = {r.message_id for r in stub.records}
-        assert dispatched == set(index_of)  # every seeded row was dispatched
+        assert dispatched == set(index_of), (  # every seeded row was dispatched
+            f"never dispatched: {sorted(set(index_of) - dispatched)} ({contention})"
+        )
         for lane, mids in seeded.items():
             order = _first_occurrence_order(stub.records, lane, index_of)
             assert order == list(range(len(mids)))  # per-lane FIFO on first dispatch
+    finally:
+        await d.stop()
+
+
+async def test_drain_does_not_read_a_head_skipped_lane_as_drained(store: Any) -> None:
+    """The soak's drain must not end on a claim that came back EMPTY with work still pending.
+
+    The 200-lane soak failed once on the SQL Server 2025 leg (PR 2154, run 37685784939) with three
+    rows never dispatched, no WARNING logged, and both busy and concurrency counters at zero. Its drain
+    then judged quiescence from dispatcher state alone. A server store's claim can return a lane EMPTY
+    because its lock probe skipped a held head, or abort a chunk on a lock timeout (BACKLOG #1270).
+    The lane goes IDLE with the row still PENDING; production's periodic sweep re-readies it, and the
+    soak turns that sweep off.
+
+    THE CONTROL: after the skip, the dispatcher reads idle while the store still holds the row. That
+    is the state the old drain accepted as done. While the head stays contended, a drain must report
+    NOT drained, however many rounds it gets; the old drain reported done on its first idle round.
+    (A single skip is not enough to show it: inside one round this loop's sweep, notify_work's
+    immediate sweep and the dirty bit re-ready the lane several times, so a bounded number of skips
+    is absorbed before the round ends.)"""
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    lane = "IB_DRAIN_SKIPPED"
+    shim = _ClaimShim(store, lane, mode="head_skip_once", times=0)  # armed by hand below
+    d = _make(shim, stub, {lane}, clock=mc)
+    await d.start()
+    try:
+        assert await _wait_until(lambda: d.phase(lane) is _LanePhase.IDLE)  # no rows yet: EMPTY
+        [mid] = await _seed(store, lane, [100.0])
+        shim._remaining = 10**9  # the head stays contended until disarmed
+        d.mark_ready(lane)
+        assert await _wait_until(lambda: d.claim_head_skips >= 1)
+        assert await _wait_until(lambda: d.phase(lane) is _LanePhase.IDLE)
+        assert d.processing_lanes == 0 and stub.records == []
+        assert await _pending_lanes(store, [lane]) == [lane], "the skipped row is still PENDING"
+        assert not await _drain_to_quiescence(d, store, [lane], mc, budget=1.0), (
+            "a drain reported done while every claim of the lane's head was being skipped"
+        )
+        assert stub.records == []
+        shim._remaining = 0  # contention clears
+        assert await _drain_to_quiescence(d, store, [lane], mc)
+        assert [r.message_id for r in stub.records] == [mid]
+    finally:
+        await d.stop()
+
+
+async def test_drain_refuses_an_idle_lane_with_work_and_no_contention(store: Any) -> None:
+    """The other half of the drain's contract: rows pending after an idle round are excused ONLY by
+    claim contention. A claim that returns a plain EMPTY (no head-skip marker, no lock-timeout abort)
+    for a lane whose head is due is the dispatcher, or the store, losing the row, and the drain must
+    say so rather than go round again and let the next sweep hide it."""
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    lane = "IB_DRAIN_STRANDED"
+    shim = _ClaimShim(store, lane, mode="empty_block_once", times=0)  # armed by hand below
+    d = _make(shim, stub, {lane}, clock=mc)
+    await d.start()
+    try:
+        assert await _wait_until(lambda: d.phase(lane) is _LanePhase.IDLE)  # no rows yet: EMPTY
+        await _seed(store, lane, [100.0])
+        shim._remaining = 10**9  # every claim of the lane reads EMPTY, with no cause named
+        with pytest.raises(AssertionError, match="no claim contention this round"):
+            await _drain_to_quiescence(d, store, [lane], mc, budget=1.0)
+        assert stub.records == [] and d.claim_head_skips == 0 and d.claim_lock_timeouts == 0
     finally:
         await d.stop()
 
