@@ -7,6 +7,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { BASELINE_BYPASS_RECORD, writeStamped } from "./checksLog";
 import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 import { openChannel, postToWebview } from "./webviewMessaging";
@@ -65,10 +66,18 @@ exec "$PY" -m messagefoundry check --config __CONFIG_DIR__ --messages __MESSAGES
 
 const DISMISS_KEY = "messagefoundry.scPromptDismissed";
 
+// A plain channel on purpose: the editor stamps nothing on it, so `log` below is the ONLY writer and
+// it stamps every line in UTC (vault BACKLOG #2349, #2353). Never call `appendLine` on it directly;
+// source-control-log.test.ts fails on a write that goes around `log`.
 let channel: vscode.OutputChannel | undefined;
 function out(): vscode.OutputChannel {
   channel ??= vscode.window.createOutputChannel("MessageFoundry Checks");
   return channel;
+}
+
+/** Write to the Checks channel. Each line of `text` gets its own UTC time stamp. */
+function log(text: string): void {
+  writeStamped(out(), text);
 }
 
 // Setup writes a commit hook that runs the folder's own `.venv` interpreter on every later commit,
@@ -186,9 +195,9 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   await maybeAddRemote(bin, ws);
   await maybeFirstCommit(bin, ws);
 
-  out().appendLine("Set Up Version Control & Checks:");
+  log("Set Up Version Control & Checks:");
   for (const n of notes) {
-    out().appendLine(`  • ${n}`);
+    log(`  • ${n}`);
   }
   void vscode.window.showInformationMessage("MessageFoundry: version control & checks are set up.");
 }
@@ -519,12 +528,10 @@ function renderRepoStorageHtml(webview: vscode.Webview, current: string): string
 }
 
 function logResult(label: string, res: { stdout: string; stderr: string }): void {
-  out().appendLine(label);
-  if (res.stdout.trim()) {
-    out().appendLine(res.stdout.trim());
-  }
-  if (res.stderr.trim()) {
-    out().appendLine(res.stderr.trim());
+  for (const part of [label, res.stdout.trim(), res.stderr.trim()]) {
+    if (part) {
+      log(part);
+    }
   }
 }
 
@@ -545,7 +552,7 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   }
   await git(bin, ["add", "-A"], ws);
 
-  out().appendLine("--- pre-flight: messagefoundry check ---");
+  log("--- pre-flight: messagefoundry check ---");
   const chk = await run(["check", "--config", configDir(), "--messages", messageSetsDir()], ws);
   logResult("", chk);
 
@@ -575,12 +582,14 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
     "Cancel",
   );
   if (choice === "Commit baseline anyway") {
+    // Logged before git runs: the stamped line is the timed record of the bypass itself.
+    log(BASELINE_BYPASS_RECORD);
     const res = await git(
       bin,
       ["commit", "-m", "Initial commit (MessageFoundry checks enabled)", "--no-verify"],
       ws,
     );
-    logResult("--- baseline commit (seed, checks enforced from the next commit) ---", res);
+    logResult(`--- baseline commit (hooks skipped): git exit code ${res.code} ---`, res);
     if (res.code === 0) {
       void vscode.window.showInformationMessage(
         "MessageFoundry: baseline committed. Checks are active for your next commit — fix the flagged items in 'MessageFoundry Checks' before then.",
