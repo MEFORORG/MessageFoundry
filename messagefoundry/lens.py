@@ -56,6 +56,7 @@ import re
 import unicodedata
 import warnings
 from collections import Counter, deque
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
@@ -2984,6 +2985,38 @@ def _refuse_new_unbound_reads(
         )
 
 
+def _unreachable(stmts: list[ast.stmt]) -> Iterator[str]:
+    """The ``ast.dump`` of each statement that follows a ``return`` or ``raise`` in its own suite.
+    Python never runs one, so a move that adds one strands a row."""
+    dead = False
+    for stmt in stmts:
+        if dead:
+            yield ast.dump(stmt)
+        dead |= isinstance(stmt, ast.Return | ast.Raise)
+        for _, suite, _ in _suites(stmt):
+            yield from _unreachable(suite)
+
+
+def _refuse_rows_below_a_terminal(
+    before_func: ast.FunctionDef | ast.AsyncFunctionDef,
+    result: str,
+    row: dict[str, Any],
+    role: str,
+    what: str,
+) -> None:
+    """Refuse a move that leaves a row below a ``return`` or ``raise`` in its suite, where it would
+    never run (ADR 0076 Amendment G, G.6 rule 8). That covers a move past the fan-out ``return
+    sends``. Code already unreachable before the move does not count against it."""
+    after_func = _element_def(ast.parse(result), row["_handler"], role)
+    if after_func is None:
+        raise LensRewriteError(f"{what} is refused - internal: the handler was not found again")
+    if Counter(_unreachable(after_func.body)) - Counter(_unreachable(before_func.body)):
+        raise LensRewriteError(
+            f"{what} is refused - it would put a row below a return or raise in the same block, "
+            "where it would never run; edit it as text"
+        )
+
+
 def _handler_locals(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     """The names ``func`` binds, less any it declares ``global`` or ``nonlocal``."""
     declared = {
@@ -3266,6 +3299,12 @@ def rewrite_source(
         if typed_only and op in ("move_row", "delete_row") and kind != "note":
             _refuse_typed_only_result(
                 tree, handler_node, result, row, role, op, line_start, line_end
+            )
+        if op == "move_row":
+            # A row moved below a return or raise never runs; every mode refuses (G.6 rule 8). It runs
+            # after the typed-only checks, so a typed-only refusal keeps its own reason.
+            _refuse_rows_below_a_terminal(
+                handler_node, result, row, role, f"{op} at lines {line_start}-{line_end}"
             )
     return ("\ufeff" + result) if bom else result
 

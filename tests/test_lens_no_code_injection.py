@@ -898,7 +898,7 @@ def test_a_for_header_with_an_unrenderable_segment_is_a_clean_refusal() -> None:
             "line_end": 12,
             "op": "move_row",
             "to_line_start": 9,
-            "to_position": "before",
+            "to_position": "after",
         },
     ],
     ids=["swap-with-code", "drop-into-untyped-if"],
@@ -957,11 +957,14 @@ def test_typed_only_delete_walks_the_whole_chain(line: int, ok: bool) -> None:
             rewrite_source(_CHAINS, edit, typed_only=True)
 
 
-def test_typed_only_moves_a_typed_raise_row() -> None:
+@pytest.mark.parametrize("typed_only", [False, True])
+def test_a_typed_raise_row_never_moves_above_a_row(typed_only: bool) -> None:
+    # A raise moved up its suite strands what it passes (ADR 0076 G.6 rule 8), in both modes.
     rows = parse_source(_CHAINS)[0]["rows"]
     last = next(r for r in rows if r["line_start"] == 24)
     edit = {"line_start": 24, "line_end": last["line_end"], "op": "move_row", "direction": "up"}
-    assert rewrite_source(_CHAINS, edit, typed_only=True) != _CHAINS
+    with pytest.raises(LensRewriteError, match="below a return or raise"):
+        rewrite_source(_CHAINS, edit, typed_only=typed_only)
 
 
 def test_the_cli_typed_only_flag_refuses_moving_a_code_row(tmp_path: Path) -> None:
