@@ -655,14 +655,6 @@ audit chain on a first deployment. A config reload is not in this set: its graph
 is written, as [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
 describes.
 
-An admin route refused because it targets the caller's own account writes `auth.self_target_refused`
-on both planes (vault BACKLOG #3260). That covers reset-password, reset-mfa, the federated-identity
-bind and unbind, disable and delete. The row names the actor, the route as `op`, the caller's stored
-id and the caller's address. The guard refuses when the path's spelling OR the stored id matches the
-caller. The stored id is the half that matters on the console, which passes the path through as
-plain text, so a case-insensitive store finds the caller's row from another case (vault BACKLOG
-#3259). The `404` that `DELETE /me/sessions/{session_id}` answers for another account's session
-still writes no row of its own.
 That is the shipped default as of BACKLOG #1277 (2026-09-02). Until then the grant audit was **scoped**
 to the sensitive / state-changing / config / user-mgmt permission set (`_GRANT_AUDIT_PERMISSIONS` in
 `api/security.py`) on non-GET requests only, on the ground that console polling and the `/ws/stats` feed
@@ -671,6 +663,14 @@ server-rendered in-process and gates on its own cookie-world check — and on `/
 gate `authorize_ws` fires once per *handshake*. Setting `[security].audit_all_authorization_decisions = false` restores the scoped
 behaviour and is reported as a loosening; the volume it trades away is one row per authenticated request
 per `require()`-gated route, on the JSON API.
+
+An admin route that refuses the caller's own account writes `auth.self_target_refused` on both
+planes (vault BACKLOG #3260). The routes are reset-password, reset-mfa, the federated-identity
+bind and unbind, disable and delete. The row names the actor, the route as `op`, the caller's
+stored id and the caller's address. The guard refuses when the path's spelling or the stored id
+matches the caller (vault BACKLOG #3259); `_refuse_if_self` in `api/auth_routes.py` says why the
+stored id matters on the console. The `404` that `DELETE /me/sessions/{session_id}` answers for
+another account's session still writes no row of its own.
 
 **Delegated identity & admin device posture (#193 sibling; ASVS 13.2.1 / 13.3.2 / 8.4.2 — the delegation
 boundary).** Three controls whose enforcement is largely the deploying organization's to provide.
