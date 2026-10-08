@@ -622,7 +622,7 @@ jobs:
         # if: always() + if-no-files-found: ignore so whichever SBOM(s) generated are retained even if a
         # sibling generator failed. SHA-pinned for supply-chain integrity, matching ci.yml's upload pin.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-cyclonedx
           path: |
@@ -688,7 +688,7 @@ jobs:
           ./sbomqs.exe compliance --ntia sbom-python-windows.cdx.json || true
       - name: Upload the Windows SBOM artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-cyclonedx-windows
           path: sbom-python-windows.cdx.json
@@ -759,7 +759,7 @@ jobs:
           trivy image --no-progress --format cyclonedx --output sbom-image.cdx.json messagefoundry:scan
           python3 scripts/security/sbom_finalize.py sbom-image.cdx.json --phase build
       - name: Upload the image SBOM
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-container-image
           path: sbom-image.cdx.json

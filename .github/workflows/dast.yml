@@ -156,7 +156,7 @@ jobs:
             --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the receipts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         # if: always() so the receipts survive the run that needs them most — the failing one.
         if: always()
         with:
@@ -233,7 +233,7 @@ jobs:
             --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the ingress receipts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: dast-ingress-receipts
