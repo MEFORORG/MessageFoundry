@@ -565,6 +565,17 @@ STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — s
 # attribute that affects authentication (ASVS 7.5.1). Bound to its own action and single-use, and
 # MFA-gated, for the same reason `admin_reset_password` is.
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY = "admin_federated_identity"
+# Vault BACKLOG #2625. The routes that inject a message, send a stored body to another partner,
+# export bodies in bulk, cancel queued deliveries or swap the live graph. Each takes a proof bound to
+# its own action, so one live session inside the step-up window is not enough to do any of them.
+# Only these: the rest of the step-up surface keeps the shared window, because a proof per action is
+# a typed password, and an operator replaying dead letters during an incident would type it per message.
+STEP_UP_ACTION_MESSAGE_RESEND = "message_resend"
+STEP_UP_ACTION_MESSAGE_EDIT_RESEND = "message_edit_resend"
+STEP_UP_ACTION_UPLOAD_RESEND = "upload_resend"
+STEP_UP_ACTION_MESSAGE_EXPORT = "message_export"
+STEP_UP_ACTION_CONNECTION_PURGE = "connection_purge"
+STEP_UP_ACTION_CONFIG_RELOAD = "config_reload"
 
 #: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
 #: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
@@ -8518,6 +8529,19 @@ class AuthService:
         if action in _REFUNDABLE_ACTIONS:
             _SPENT_REFUNDABLE_GRANT.set((id(self), key, deadline))
         return True
+
+    async def holds_action_step_up(self, token: str | None, action: str) -> bool:
+        """Whether the caller holds a live grant bound to ``action``, WITHOUT spending it.
+
+        For a web console page that opens an action rather than performing it (vault BACKLOG
+        #2625): the message editor asks for the proof before the operator types an edit, because a
+        re-auth demanded at submit time re-opens the editor and drops the edit. Only
+        :meth:`has_action_step_up` spends a grant, so this never authorizes the action itself, and
+        it leaves the refund record alone."""
+        if not token:
+            return False
+        deadline = self._action_step_up_grants.get((hash_token(token), action))
+        return deadline is not None and deadline > time.monotonic()
 
     def refund_action_step_up(self, action: str) -> bool:
         """Give back the step-up grant THIS REQUEST spent on ``action``, when the route it opened

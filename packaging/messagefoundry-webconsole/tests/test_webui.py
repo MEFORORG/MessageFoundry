@@ -343,6 +343,7 @@ async def test_ui_body_reads_audit_as_console_body_views(engine: Engine) -> None
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")  # a fresh login counts as a recent step-up, for the editor
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         bare = await c.get(f"/ui/messages/{mid}")
         assert bare.status_code == 200 and "ADT^A01|MSG1" not in bare.text
         assert f'href="/ui/messages/{mid}/body"' in bare.text  # the act is offered, not taken
@@ -1021,6 +1022,7 @@ async def test_message_edit_page_renders_copy_editor(engine: Engine) -> None:
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")  # a fresh login counts as a recent step-up
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         r = await c.get(f"/ui/messages/{mid}/edit")
         assert r.status_code == 200
         body = r.text
@@ -1047,6 +1049,7 @@ async def test_message_edit_page_escapes_xss(engine: Engine) -> None:
     mid = await _seed(engine, raw=XSS_RAW, control_id="X1")
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         r = await c.get(f"/ui/messages/{mid}/edit")
         assert r.status_code == 200
         assert "<script>alert(1)</script>" not in r.text
@@ -1125,6 +1128,7 @@ async def test_edit_editor_opens_for_a_custom_role_holding_both(engine: Engine) 
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "editor")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         r = await c.get(f"/ui/messages/{mid}/edit")
         assert r.status_code == 200
         assert 'id="edit-raw"' in r.text
@@ -1141,6 +1145,7 @@ async def test_edit_editor_charges_the_phi_read_budget(engine: Engine) -> None:
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         assert (await c.get(f"/ui/messages/{mid}/edit")).status_code == 200
         r = await c.get(f"/ui/messages/{mid}/edit")
         assert r.status_code == 429
@@ -1158,6 +1163,7 @@ async def test_edit_resend_reject_path_charges_the_phi_read_budget(engine: Engin
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         body = {"raw": "", "idempotency_key": "k1", "mode": "reroute"}
         same_origin = {"Sec-Fetch-Site": "same-origin"}
         r = await c.post(f"/ui/messages/{mid}/edit-resend", data=body, headers=same_origin)
@@ -1191,6 +1197,7 @@ async def test_edit_resend_reroute_redirects_to_child(engine: Engine, tmp_path: 
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         r = await c.post(
             f"/ui/messages/{mid}/edit-resend",
             data={"raw": EDITED, "idempotency_key": "k1", "mode": "reroute"},
@@ -1238,6 +1245,7 @@ async def test_edit_resend_direct_redirects_to_origin(engine: Engine, tmp_path: 
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         r = await c.post(
             f"/ui/messages/{mid}/edit-resend",
             data={"raw": EDITED, "idempotency_key": "k1", "mode": "direct", "to": "OB2"},
@@ -1260,6 +1268,7 @@ async def test_edit_resend_direct_missing_to_rejects_generic(engine: Engine) -> 
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         r = await c.post(
             f"/ui/messages/{mid}/edit-resend",
             data={"raw": EDITED, "idempotency_key": "k1", "mode": "direct", "to": ""},
@@ -1280,6 +1289,7 @@ async def test_edit_resend_phi_safe_reject_no_pydantic_echo(engine: Engine) -> N
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")  # vault BACKLOG #2625
         r = await c.post(
             f"/ui/messages/{mid}/edit-resend",
             data={"raw": "", "idempotency_key": "k1", "mode": "reroute"},
@@ -2895,6 +2905,7 @@ async def test_purge_after_login_stepup_reaches_handler(engine: Engine) -> None:
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/connections/purge-confirm")  # vault BACKLOG #2625
         r = await c.post(
             "/ui/connections/OB_X/purge/all", headers={"Sec-Fetch-Site": "same-origin"}
         )
@@ -2995,6 +3006,7 @@ async def test_console_purge_writes_the_connection_purge_row(
     await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")  # a fresh login is a recent step-up
+        await _mint_action(c, "/ui/connections/purge-confirm")  # vault BACKLOG #2625
         assert await engine.store.list_audit(action="connection_purge") == []  # control
         r = await c.post(
             "/ui/connections/out1/purge/all", headers={"Sec-Fetch-Site": "same-origin"}
@@ -7829,6 +7841,7 @@ async def test_purge_bulk_per_dest_409_unknown_and_scope(engine: Engine, tmp_pat
     await _wait_quiesced(engine, "out1")
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/connections/purge-confirm")  # vault BACKLOG #2625
         r = await _post_pairs(
             c,
             "/ui/connections/purge-bulk",
@@ -7839,6 +7852,8 @@ async def test_purge_bulk_per_dest_409_unknown_and_scope(engine: Engine, tmp_pat
         assert "409" in r.text  # out2 running -> require-stopped, per-dest, batch not aborted
         assert "404" in r.text  # nope unknown -> captured, not fatal
         # Bad scope 404s BEFORE any fan-out (a directly-called purge_connection skips its own pattern).
+        # The batch above spent its proof, so this one needs its own (vault BACKLOG #2625).
+        await _mint_action(c, "/ui/connections/purge-confirm")
         bad = await _post_pairs(
             c, "/ui/connections/purge-bulk", [("scope", "wat"), ("dest", "out1")]
         )
@@ -7861,6 +7876,7 @@ async def test_purge_bulk_dual_control_aggregates_pending(engine: Engine, tmp_pa
     )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/connections/purge-confirm")  # vault BACKLOG #2625
         r = await _post_pairs(c, "/ui/connections/purge-bulk", [("scope", "all"), ("dest", "out1")])
         assert r.status_code == 200
         assert (
@@ -7877,6 +7893,7 @@ async def test_purge_bulk_refuses_a_markup_dest(engine: Engine) -> None:
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/connections/purge-confirm")  # vault BACKLOG #2625
         r = await _post_pairs(
             c, "/ui/connections/purge-bulk", [("scope", "all"), ("dest", "<script>x</script>")]
         )

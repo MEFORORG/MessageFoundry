@@ -58,9 +58,14 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _service(engine: Engine) -> AuthService:
+async def _service(engine: Engine, *, bound: bool = False) -> AuthService:
+    # ``bound`` keeps the shipped default, an export proof bound to the action (vault BACKLOG #2625).
+    # The other tests here are about what an export selects and records, so they keep the window.
     service = AuthService(
-        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0, require_mfa=False, require_action_step_up=bound
+        ),
     )
     await service.initialize()
     return service
@@ -130,13 +135,41 @@ async def _seed(engine: Engine) -> tuple[str, str]:
 
 
 async def test_export_requires_step_up(engine: Engine) -> None:
+    """A fresh login's window does not reach an export: it takes a proof bound to the export, spent
+    by the one request it opens (vault BACKLOG #2625)."""
+    service = await _service(engine, bound=True)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    await _seed(engine)
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        # POST, because a needle-selected save-all sends its criteria in the body (BACKLOG #1184);
+        # the gate is the same on both shapes.
+        blocked = await c.post("/messages/export", headers=_auth(token), json={"content": "JANE"})
+        assert blocked.status_code == 403
+        assert blocked.headers.get("X-Step-Up-Required") == "1"
+        assert blocked.headers.get("X-Step-Up-Action") == "message_export"
+        r = await c.post(
+            "/me/reauth",
+            json={"password": PW, "purpose": "message_export"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        token = r.json()["token"]
+        ok = await c.post("/messages/export", headers=_auth(token), json={"content": "JANE"})
+        assert ok.status_code == 200, ok.text
+        # Single use: the next export asks again, before any body streams.
+        again = await c.post("/messages/export", headers=_auth(token), json={"content": "JANE"})
+        assert again.status_code == 403
+        assert again.headers.get("X-Step-Up-Action") == "message_export"
+
+
+async def test_export_keeps_the_window_under_the_org_opt_out(engine: Engine) -> None:
+    """``[auth].require_action_step_up = false`` puts the export back on the session window."""
     service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
     await _seed(engine)
     async with _client(engine, service) as c:
         token = await _login(c, "op")
-        # Fresh login is within the step-up window → export works. POST, because a needle-selected
-        # save-all now sends its criteria in the body (BACKLOG #1184); the gate is the same on both.
         ok = await c.post("/messages/export", headers=_auth(token), json={"content": "JANE"})
         assert ok.status_code == 200, ok.text
         # Back-date the step-up window → refused with the step-up signal, before any body streams.
@@ -262,7 +295,11 @@ async def test_export_charges_the_per_actor_phi_read_budget(engine: Engine) -> N
     so without an explicit admission charge one actor could stream far more bodies per minute here than
     the per-actor budget allows through ``/messages``. It must draw from the SAME bucket."""
     service = AuthService(
-        engine.store, AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=2)
+        # The PHI-read budget is the subject; the export keeps the window (vault BACKLOG #2625).
+        engine.store,
+        AuthSettings(
+            require_mfa=False, phi_read_rate_limit_per_actor=2, require_action_step_up=False
+        ),
     )
     await service.initialize()
     await _add_user(service, "op", [Role.OPERATOR.value])
@@ -285,7 +322,11 @@ async def test_export_throttled_at_admission_writes_no_audit_and_streams_nothing
     """The charge is at ADMISSION — before selection — so a refused export does no store work and
     cannot leave a ``messages_export`` row claiming bodies that were never streamed."""
     service = AuthService(
-        engine.store, AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=1)
+        # The PHI-read budget is the subject; the export keeps the window (vault BACKLOG #2625).
+        engine.store,
+        AuthSettings(
+            require_mfa=False, phi_read_rate_limit_per_actor=1, require_action_step_up=False
+        ),
     )
     await service.initialize()
     await _add_user(service, "op", [Role.OPERATOR.value])

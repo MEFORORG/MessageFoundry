@@ -68,7 +68,9 @@ class Permission(str, Enum):  # noqa: UP042
     # routes also require step-up + the PHI-read hop guard (like content search); FILES_DELETE is a
     # destructive, audited cleanup. None is granted for free.
     FILES_UPLOAD = "files:upload"  # import an external message file (writes PHI at rest)
-    FILES_BROWSE = "files:browse"  # list/browse/resend an uploaded file's messages (PHI read)
+    # list/browse an uploaded file's messages (PHI read). Resending one also needs messages:edit,
+    # because a resend injects a message (vault BACKLOG #2625).
+    FILES_BROWSE = "files:browse"
     FILES_DELETE = "files:delete"  # delete an uploaded file from the server (destructive)
     # Object-level override for the uploaded-file subsystem (ASVS 8.2.2). Uploaded files are OWNER-ONLY:
     # `files:browse`/`files:delete` reach only the files the caller uploaded. The channel axis cannot do

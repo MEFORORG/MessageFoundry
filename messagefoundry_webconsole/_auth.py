@@ -11,6 +11,7 @@ a JSON-API credential and SameSite is never the sole CSRF defense for the JSON A
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -80,6 +81,11 @@ __all__ = [
     "session_token",
     "set_oidc_flow_cookie",
     "set_session_cookie",
+    "spend_ui_action_step_up",
+    "ActionSpend",
+    "RepeatRefused",
+    "proof_spent_for",
+    "settle_ui_action_step_up",
 ]
 
 COOKIE_NAME = "mf_session"
@@ -1211,10 +1217,13 @@ def require_ui_reauth_only(
     return mark_route_gate(dependency)
 
 
-async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: str) -> bool:
+async def _ui_action_step_up_ok(
+    auth: AuthService, token: str | None, action: str, *, spend: bool = True
+) -> bool:
     """The /ui step-up decision for a per-action lane (ADR 0077), mirroring
     ``api.security._action_step_up_ok``: when action-binding is enforced (default) a fresh single-use
-    grant BOUND to ``action`` (consumed here); when the org opted out
+    grant BOUND to ``action`` (consumed here, or only checked with ``spend=False``, vault BACKLOG
+    #2625); when the org opted out
     (``[auth].require_action_step_up = false``) the legacy session-window recency. Uses only PUBLIC
     ``AuthService`` members, so no cross-package private import is needed.
 
@@ -1224,25 +1233,53 @@ async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: st
     if await auth.factor_binding_is_blocked(token, action):
         return False
     if auth.action_step_up_required:
-        return await auth.has_action_step_up(token, action)
+        if spend:
+            return await auth.has_action_step_up(token, action)
+        return await auth.holds_action_step_up(token, action)
     return await auth.has_recent_step_up(token)
 
 
 def require_ui_step_up_action(
     action: str,
     *permissions: Permission,
+    phi: bool = False,
     reauth_next: Callable[[Request], str] | None = None,
+    spend: bool = True,
+    repeat: Callable[[Request], Awaitable[bool]] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_ui_step_up`, but the step-up must be a fresh proof **bound to** ``action``
     (single-use, ADR 0077 / ASVS 7.5.1), not the shared session window. Keeps the MFA gate — used for
-    the durable-takeover browser factor ops (**disable-MFA**, **webauthn-delete**). Falls back to the
-    session window under ``[auth].require_action_step_up = false``. ``new_ip`` is checked FIRST so a
-    forced new-IP step-up short-circuits and leaves the single-use grant UNCONSUMED (mirrors
-    ``api.security.require_step_up_action``)."""
+    the durable-takeover browser factor ops (**disable-MFA**, **webauthn-delete**) and, since vault
+    BACKLOG #2625, the injection and bulk lanes (resend, edit-resend, upload resend, purge, reload).
+    Falls back to the session window under ``[auth].require_action_step_up = false``. ``new_ip`` is
+    checked FIRST so a forced new-IP step-up short-circuits and leaves the single-use grant
+    UNCONSUMED (mirrors ``api.security.require_step_up_action``).
+
+    ``phi`` forwards to :func:`require_ui` exactly as :func:`require_ui_step_up`'s does.
+
+    ``spend=False`` asks only that the grant is HELD, and leaves it for a later request to spend.
+    It is for a page that opens an action without performing it, so the operator proves who they
+    are before doing work a re-auth would throw away. The route that performs the action must
+    still spend it, either through its own gate or through :func:`spend_ui_action_step_up`.
+
+    ``repeat`` answers whether the request repeats one this session spent its proof on, still
+    running or kept, or one the store already holds (vault BACKLOG #2625). It does not wait. A
+    repeat passes the gate without a proof, and the route's :func:`spend_ui_action_step_up` then
+    waits for the first request and decides: ride on it, answer with its refusal, or spend a proof.
+    Only with ``spend=False``, so nothing acts here; and only while action binding is on, with the
+    factor-binding refusal still applied first. Under the org opt-out the session window is checked
+    as on any other request. Without it, a double-click spent the proof on the first submit and
+    sent the second to re-authenticate, onto a confirm page with a fresh key. :class:`_SpentForKey`
+    says which repeats ride, and why one proof still lets at most one request commit."""
+    if repeat is not None and spend:
+        raise ValueError("repeat needs spend=False: the route must spend the proof itself")
     # mfa_refusal, NOT allow_mfa_pending: the base's gate refuses and audits a pending session, and
     # the hook only points it at /ui/reauth with the continuation. See require_ui_step_up for why.
     base = require_ui(
-        *permissions, mfa_refusal=_reauth_refusal(reauth_next), new_address_check=False
+        *permissions,
+        phi=phi,
+        mfa_refusal=_reauth_refusal(reauth_next),
+        new_address_check=False,
     )
 
     async def dependency(request: Request) -> Identity:
@@ -1256,11 +1293,226 @@ def require_ui_step_up_action(
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-        if new_ip or not await _ui_action_step_up_ok(auth, token, action):
+        if new_ip:
             raise _reauth_redirect(request, nxt)
-        return identity
+        if await _ui_action_step_up_ok(auth, token, action, spend=spend):
+            return identity
+        # Asked only once the proof is missing, and after it rather than before: a second POST in
+        # flight can find the proof gone because the first just spent it, and the first's spend is
+        # what marks this one as its repeat. The route decides what the repeat does (see above).
+        # The factor-binding refusal still applies first.
+        if (
+            repeat is not None
+            and auth.action_step_up_required
+            and not await auth.factor_binding_is_blocked(token, action)
+            and await repeat(request)
+        ):
+            return identity
+        raise _reauth_redirect(request, nxt)
 
     return mark_route_gate(dependency)
+
+
+#: How long a kept spend record outlives the request that made it. Not a security window: a
+#: record is kept only for a request the handler did not refuse, and the proof it spent still lets
+#: at most one request commit (see :class:`_SpentForKey`). It just lets a quick repeat skip the
+#: prompt.
+_SPENT_FOR_KEY_TTL_SECONDS = 300.0
+#: Bound on the spend records held at once. Fail-safe: a dropped record makes its repeat ask again.
+_SPENT_FOR_KEY_MAX = 4096
+#: How long a repeat waits for the request it repeats, the engine's default request timeout. The
+#: console's own bound, because it may be mounted where no request timeout runs. Fail-safe: a
+#: repeat that gives up is sent to re-auth, and never takes over the running request's record.
+_SPENT_FOR_KEY_WAIT_SECONDS = 120.0
+
+
+class RepeatRefused(Exception):
+    """Raised by :func:`spend_ui_action_step_up` for a repeat that waited on the request it repeats,
+    when the handler refused that request. The route answers with ``refusal``, the first request's
+    own refusal, so the repeat queues nothing and shows what the first one would have shown."""
+
+    def __init__(self, refusal: HTTPException) -> None:
+        super().__init__(refusal.status_code)
+        self.refusal = refusal
+
+
+@dataclass(eq=False)
+class ActionSpend:
+    """One request's spend of an action-bound proof. Opaque to callers:
+    :func:`spend_ui_action_step_up` returns it, and :func:`settle_ui_action_step_up` closes it."""
+
+    entry: tuple[str, str, str]
+    #: No expiry while the request runs; set when it settles without a refusal.
+    deadline: float = float("inf")
+    settled: asyncio.Event = field(default_factory=asyncio.Event)
+    #: ``None`` while the request runs; ``True`` once it settled without a refusal.
+    kept: bool | None = None
+    #: The handler's refusal, for a repeat that was waiting on this request.
+    refusal: HTTPException | None = None
+
+
+class _SpentForKey:
+    """Which requests a session spent an action-bound proof on (vault BACKLOG #2625). The caller
+    names each request from everything it carries: the idempotency key, what the key acts on, and
+    the rest of the request (the source, or the edited body), so only an identical request, a
+    double-click, is a repeat. In memory, so a second POST in flight beside the first finds the
+    spend before the first one's write commits.
+
+    A record is made just before the proof is spent, and a repeat that finds one still running
+    WAITS for it to settle. If the handler refused it, the repeat is answered with that same
+    refusal and the record is dropped, so the next submit asks for a proof again; a refusal of any
+    request riding on a record drops it too. A request that ends any other way keeps its record:
+    an error, or a cancel by a timeout or a disconnect, may come after the store committed, and a
+    repeat must then reach the store's duplicate check rather than a re-auth. If the store had not
+    committed, each repeat in the record's lifetime runs the handler on the proof that request
+    spent, and the idempotency key lets at most one of them commit. Keyed by the session's token
+    hash; bounded and TTL'd."""
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[tuple[str, str, str], ActionSpend] = OrderedDict()
+
+    def live(self, token: str, action: str, name: str) -> ActionSpend | None:
+        """The record for ``name``, still running or kept and unexpired, or ``None``."""
+        spend = self._entries.get((hash_token(token), action, name))
+        if spend is None or (spend.kept is not None and spend.deadline <= time.monotonic()):
+            return None
+        return spend
+
+    def claim(self, token: str, action: str, name: str) -> ActionSpend:
+        """A new running record for ``name``. Called only when :meth:`live` found none."""
+        now = time.monotonic()
+        spend = ActionSpend((hash_token(token), action, name))
+        self._entries.pop(spend.entry, None)
+        self._entries[spend.entry] = spend
+        # Kept records sit in settle order with one TTL, so the expired ones are at the front. A
+        # running record has no expiry and stops the sweep; the size bound still applies.
+        while self._entries and next(iter(self._entries.values())).deadline <= now:
+            self._entries.popitem(last=False)
+        while len(self._entries) > _SPENT_FOR_KEY_MAX:
+            # The oldest settled record first, so a request still running keeps its record.
+            victim = next((k for k, v in self._entries.items() if v.kept is not None), None)
+            del self._entries[victim if victim is not None else next(iter(self._entries))]
+        return spend
+
+    def settle(
+        self, spend: ActionSpend, *, refused: bool, refusal: HTTPException | None = None
+    ) -> None:
+        if refused and self._entries.get(spend.entry) is spend:
+            del self._entries[spend.entry]
+        if spend.kept is not None:  # settled already; only a refusal's drop above still applies
+            return
+        spend.kept = not refused
+        if refused and refusal is not None:
+            # A copy without the traceback, which would hold the route's frame (an edited body
+            # among its locals) for as long as the record lives.
+            spend.refusal = HTTPException(refusal.status_code, refusal.detail, refusal.headers)
+        else:
+            spend.deadline = time.monotonic() + _SPENT_FOR_KEY_TTL_SECONDS
+            if self._entries.get(spend.entry) is spend:
+                self._entries.move_to_end(spend.entry)
+        spend.settled.set()
+
+    async def await_settled(self, spend: ActionSpend) -> bool:
+        """Wait for a running request to settle; ``False`` if it did not within the bound."""
+        try:
+            await asyncio.wait_for(spend.settled.wait(), _SPENT_FOR_KEY_WAIT_SECONDS)
+        except TimeoutError:
+            return False
+        return True
+
+
+_SPENT_FOR_KEY = _SpentForKey()
+
+
+def proof_spent_for(request: Request, action: str, name: str) -> bool:
+    """Whether this session spent its ``action`` proof on the request named ``name``, and that
+    request is still running or settled without a refusal. Does not wait: a gate uses it to let a
+    repeat reach its route, where :func:`spend_ui_action_step_up` waits and decides."""
+    token = session_token(request)
+    if not token:
+        return False
+    return _SPENT_FOR_KEY.live(token, action, name) is not None
+
+
+def settle_ui_action_step_up(
+    spend: ActionSpend | None, *, refused: bool, refusal: HTTPException | None = None
+) -> None:
+    """Close out what :func:`spend_ui_action_step_up` returned. ``refused=True``, with the
+    handler's ``refusal``, drops the record, so the next submit asks for a proof again, and answers
+    any repeat waiting on it with that refusal. ``refused=False`` keeps it, so a quick repeat rides
+    on it. A route settles a refusal in its ``except`` and settles again in ``finally``; only the
+    first verdict counts. No-op for ``None``."""
+    if spend is not None:
+        _SPENT_FOR_KEY.settle(spend, refused=refused, refusal=refusal)
+
+
+async def _rider_still_allowed(
+    auth: AuthService, token: str, action: str, identity: Identity | None
+) -> bool:
+    """Re-check, after a wait, what the gate checked before it: the session is live, it resolves
+    to the same identity (roles, permissions and channel scope unchanged), its second factor is
+    satisfied, and no factor-binding block has been raised since."""
+    fresh = await auth.identity_for_token(token, activity=False)
+    return (
+        fresh is not None
+        and (identity is None or fresh == identity)
+        and await auth.mfa_satisfied(token)
+        and not await auth.factor_binding_is_blocked(token, action)
+    )
+
+
+async def spend_ui_action_step_up(
+    request: Request,
+    action: str,
+    *,
+    reauth_next: Callable[[Request], str],
+    key: str | None = None,
+    identity: Identity | None = None,
+) -> ActionSpend | None:
+    """Spend the grant a ``spend=False`` gate let through, just before the action runs (vault
+    BACKLOG #2625). A route takes this split when it checks its own input first: a refusal of that
+    input then costs the operator no proof. Sends the browser to ``/ui/reauth`` when the grant is
+    gone, for instance spent by a second tab. ``reauth_next`` is the gate's own, so both refusals
+    land on one page. No-op with no auth service, as the gate is, and under the org opt-out,
+    where there is no grant and the gate has already checked the window on this request.
+
+    With ``key``, the name of the request (see :class:`_SpentForKey`), a repeat of a request
+    already running waits for it. It rides on one that settled without a refusal, and raises
+    :class:`RepeatRefused` for one the handler refused. Returns what the caller must settle with
+    :func:`settle_ui_action_step_up`, in a ``finally`` so every way out settles it: this request's
+    own spend, or the record it rides on. ``None`` with no ``key`` and under the opt-out. A caller
+    passing ``key`` must catch :class:`RepeatRefused`. ``identity`` is the one the gate resolved; a
+    repeat that waited goes to re-auth unless its session still resolves to it."""
+    auth = get_auth(request)
+    if auth is None or not auth.action_step_up_required:
+        return None
+    token = session_token(request)
+    if key is None or not token:
+        if not await _ui_action_step_up_ok(auth, token, action):
+            raise _reauth_redirect(request, reauth_next(request))
+        return None
+    while (current := _SPENT_FOR_KEY.live(token, action, key)) is not None:
+        if current.kept is None:
+            settled = await _SPENT_FOR_KEY.await_settled(current)
+            if not settled or not await _rider_still_allowed(auth, token, action, identity):
+                raise _reauth_redirect(request, reauth_next(request))
+            if not current.kept:
+                if current.refusal is not None:
+                    raise RepeatRefused(current.refusal)
+                continue  # its own spend failed; look again, and spend a proof if none is left
+        return current  # rides on a request the handler did not refuse
+    # Claimed BEFORE the spend, with no await between the look above and here, so a second POST
+    # arriving while this one spends waits for it rather than racing it for the one proof.
+    spend = _SPENT_FOR_KEY.claim(token, action, key)
+    try:
+        ok = await _ui_action_step_up_ok(auth, token, action)
+    except BaseException:
+        _SPENT_FOR_KEY.settle(spend, refused=True)
+        raise
+    if not ok:
+        _SPENT_FOR_KEY.settle(spend, refused=True)
+        raise _reauth_redirect(request, reauth_next(request))
+    return spend
 
 
 def require_ui_reauth_only_action(

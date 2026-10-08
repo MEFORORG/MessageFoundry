@@ -194,6 +194,7 @@ from messagefoundry.store.store import (
     ReingressOutcome,
     ReplyWaitState,
     ResendKeyConflict,
+    ResendKeyRecord,
     ResendOutcome,
     ResendSourceAmbiguous,
     ResendSourceEmpty,
@@ -6256,6 +6257,26 @@ class PostgresStore:
             await self._append_operator_audit(conn, written, audit, count)
         return count
 
+    async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None:
+        """The ``resend_log`` row an idempotency key claimed, or ``None`` when the key is unused.
+
+        Read-only. For a caller that answers a repeat of an already-run resend before it asks for
+        anything a first resend needs (vault BACKLOG #2625: the console's step-up proof). Ids and
+        names only, never a body."""
+        row = await self._fetchone(
+            "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
+            " WHERE resend_key=$1",
+            resend_key,
+        )
+        if row is None:
+            return None
+        return ResendKeyRecord(
+            message_id=row["message_id"],
+            to_destination=row["to_destination"],
+            from_destination=row["from_destination"] or "",
+            outbox_id=row["outbox_id"],
+        )
+
     async def resend_to(
         self,
         *,
@@ -7578,7 +7599,7 @@ class PostgresStore:
                 "UPDATE upload_quota SET"
                 " inflight_files = GREATEST(0, inflight_files + $2),"
                 " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
-                " since = $4"
+                " since = GREATEST(since, $4)"  # never backwards (BACKLOG #2648)
                 " WHERE uploader_id = $1",
                 uploader_id,
                 int(files),
@@ -7598,8 +7619,8 @@ class PostgresStore:
             " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
             " inflight_bytes ="
             " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
-            " since = CASE WHEN upload_quota.since <= $5 OR upload_quota.inflight_files <= 0"
-            " THEN $4 ELSE upload_quota.since END"
+            # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
+            " since = GREATEST(upload_quota.since, $4)"
             " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
             " ELSE upload_quota.inflight_files END) + $2 <= $6"
             " AND (CASE WHEN upload_quota.since <= $5 THEN 0"

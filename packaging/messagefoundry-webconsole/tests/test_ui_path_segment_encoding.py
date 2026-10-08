@@ -433,6 +433,8 @@ def test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read() 
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/errors"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/parse-tree"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/resend-confirm"),
+        # Vault BACKLOG #2625: the resend outcome page (post-redirect-get).
+        ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/resend-done"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/summary"),
         (
             "GET",

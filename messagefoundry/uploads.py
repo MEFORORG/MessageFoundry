@@ -29,6 +29,7 @@ import asyncio
 import base64
 import contextlib
 import contextvars
+import functools
 import hashlib
 import json
 import logging
@@ -37,7 +38,7 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from stat import S_ISREG
@@ -93,8 +94,21 @@ _ORPHAN_MIN_AGE_SECONDS = 3600.0
 # finish (BACKLOG #2263). It is per call, so a save cancelled during a slow reserve can wait up to
 # two bounds. A healthy statement takes well under a second. The bound exists so a stuck store
 # cannot hold ``_quota_lock``, and the request's cancellation, indefinitely. Past it the call is
-# logged and left running (UploadStore._leave_running).
+# logged and left running (UploadStore._leave_running). The save-time prune reuses the same bound for
+# its audit rows after a cancelled upload (UploadStore._run_to_completion, BACKLOG #2261).
 _LEDGER_CANCEL_WAIT_SECONDS = 5.0
+
+# How often a save that holds a cross-shard reservation touches the ledger row, so a slow save keeps
+# its slot past ``store.base.UPLOAD_RESERVATION_STALE_AFTER`` (300 s) instead of having it reclaimed
+# by a sibling shard's reserve (BACKLOG #2648). A third of that window, which leaves room for touches
+# that are slow as well as one that fails. Written out rather than imported to keep this module a
+# leaf; a test pins the ratio.
+_RESERVATION_HEARTBEAT_SECONDS = 100.0
+# How long a save keeps touching its row at most. A write that never finishes would otherwise pin
+# the row, and any leaked slot in it, for as long as the process lives. Past this the heartbeat
+# stops with a WARNING, and the row goes stale unless other activity keeps it fresh. A write is
+# bounded by ``max_upload_bytes`` (512 MiB at most), so an hour is far past any healthy save.
+_RESERVATION_HEARTBEAT_MAX_SECONDS = 3600.0
 
 # How much of a refused plaintext sidecar the quota reads to find the uploader it bills (BACKLOG
 # #2322). A sidecar the engine wrote is a few hundred bytes. Past this the owner counts as unknown.
@@ -210,14 +224,32 @@ class UploadQuotaError(UploadError):
       waits for, and the late release that pays back a reserve left running. A cancelled reserve
       is logged whether or not a save was still waiting for it.
       **IT DOES NOT SELF-HEAL UNCONDITIONALLY, and an earlier version of this line said it did.**
-      The release statement sets ``since = <now>`` **unconditionally** (its own comment: "Never
-      conditional: refusing a release would strand the reservation it is paying back"), so every
-      *subsequent* release by the same uploader pushes the staleness clock forward. **It self-heals
-      only while that uploader is otherwise IDLE.** A uploader who keeps uploading successfully can
-      hold a leaked slot indefinitely, and the reserve path's own staleness reset never fires for it.
-    * **A reclaimed live reservation.** If one uploader keeps reservations continuously outstanding
-      for longer than that window, the staleness reset zeroes a row that was legitimately non-zero,
-      which restores the N-1 bound above for that window. Never worse than the pre-#1112 behaviour.
+      Every release, every applied reserve and every live save's heartbeat sets the row's
+      ``since`` to now, never backwards (BACKLOG #2648), and the row holds one clock for all of its
+      slots. **So a leaked slot self-heals only once that uploader is otherwise IDLE** for the whole
+      window, with no bound while activity continues. Any reserve, release or heartbeat for that
+      uploader, from any shard, keeps it alive. A host whose clock runs ahead holds it longer by the
+      skew, with no cap: the stamp never moves backwards, so one write from a host a year ahead
+      holds a slot leaked later for a year. A cap read from the writer's own clock cannot tell that
+      stamp from a fresh one seen by a host that lags, and the lagging host would then reset a
+      sibling's live slots, so the server-clock fix below is the one that closes it.
+    * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a row with no activity
+      for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow one.
+      Every applied reserve moves the row's clock, and a live save touches it every
+      ``_RESERVATION_HEARTBEAT_SECONDS`` (:meth:`UploadStore._start_heartbeat`), so a slow save
+      keeps its slot. A live slot is still reclaimed in at least these cases: its holder lands no
+      touch for the whole window while it is alive (a suspended process or VM, an event loop
+      starved for minutes, or a store this shard cannot reach while a sibling can); its save
+      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; or the holder's host clock lags a sibling's
+      by a large part of the window. ``since`` is stamped from the writer's ``time.time()`` and
+      compared against the reader's, and the stamp never moves backwards, so a lagging host can no
+      longer age a row a sibling keeps fresh, but a row only it touches still looks old to the
+      sibling. A sibling then counts neither that file nor its slot, and the holder's later release
+      erases a sibling's slot, so the undercount lasts until the ledger next drains to zero. That
+      restores the N-1 bound above while it lasts, never worse than the pre-#1112 behaviour. The
+      window is accepted. The skew case alone could be closed inside the existing statements, by
+      stamping and comparing with the database server's clock. The rest needs one ledger row per
+      reservation, a store-contract change across three backends.
 
     The ledger is checked and paid back around the write, not in the same transaction as it, because
     the body lives on the filesystem rather than in the store. The ordering above is what stands in
@@ -509,7 +541,12 @@ class UploadQuotaLedger(Protocol):
     Declared here as a structural protocol rather than importing ``store.base.Store``, so this module
     stays a leaf (see the module docstring). Every backend's ``Store`` satisfies it structurally —
     see :meth:`messagefoundry.store.base.Store.reserve_upload_quota` and
-    :meth:`~messagefoundry.store.base.Store.upload_quota_in_flight` for the full contract."""
+    :meth:`~messagefoundry.store.base.Store.upload_quota_in_flight` for the full contract.
+
+    **A release of zero files and zero bytes is a touch, and the heartbeat depends on it (BACKLOG
+    #2648).** It must take the release path and move the row's clock forward, changing no count.
+    An implementation that skipped a zero-delta release would silently leave every slow save
+    reclaimable."""
 
     async def reserve_upload_quota(
         self,
@@ -561,7 +598,8 @@ class UploadStore:
         # concurrent uploads each read a stale count and double-book the budget. Serialising the whole
         # build-and-write (not just the check) is what makes it atomic — releasing between them is the
         # race. The throughput cost is acceptable here and nowhere near the data plane: this is the
-        # operator diagnostic-upload surface, and each pass is bounded by max_bytes.
+        # operator diagnostic-upload surface. Each pass is one sidecar scan plus a write bounded by
+        # max_bytes.
         #
         # This lock is an asyncio.Lock, so it is per-event-loop and therefore PER-PROCESS. Engine
         # sharding is the built, shipped, default scaling axis and nothing partitions uploads_dir per
@@ -569,9 +607,13 @@ class UploadStore:
         # cross-process half: one atomic row on the ONE unified store every shard already shares.
         self._quota_lock = asyncio.Lock()
         self._ledger = store
-        # Ledger calls a cancelled save stopped waiting for (BACKLOG #2263), held until they finish:
-        # the loop holds a Task only weakly. See _leave_running.
+        # Ledger calls a cancelled save stopped waiting for (BACKLOG #2263), and save-time sweeps a
+        # cancelled upload stopped waiting for (#2261), held until they finish: the loop holds a
+        # Task only weakly. See _hold.
         self._stragglers: set[asyncio.Future[Any]] = set()
+        # Live saves' reservation heartbeats (BACKLOG #2648), held for the same reason. Each ends
+        # once its save sets the stop Event. See _start_heartbeat.
+        self._heartbeats: set[asyncio.Future[None]] = set()
         # Body name -> ((mtime_ns, size), decodes as text). Checking a body means reading it whole,
         # and every save's quota scan asks, so a body that has not changed is not read twice.
         self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
@@ -977,7 +1019,10 @@ class UploadStore:
                 reserved = await self._reserve_across_shards(
                     uploader_id=uploader_id, uploader=uploader, size=len(data)
                 )
+                stop_heartbeat = asyncio.Event()
                 try:
+                    if reserved:
+                        self._start_heartbeat(uploader_id, stop_heartbeat)
                     in_flight = (
                         await self._ledger.upload_quota_in_flight(uploader_id)
                         if self._ledger is not None
@@ -985,6 +1030,7 @@ class UploadStore:
                     )
                     return await _to_thread_to_completion(_build_and_write, in_flight)
                 finally:
+                    stop_heartbeat.set()
                     if reserved:
                         await self._release_across_shards(uploader_id=uploader_id, size=len(data))
         except asyncio.CancelledError:
@@ -1105,6 +1151,44 @@ class UploadStore:
             return False
         return reserve.result()
 
+    def _start_heartbeat(self, uploader_id: str, stop: asyncio.Event) -> None:
+        """Touch this save's ledger row every ``_RESERVATION_HEARTBEAT_SECONDS`` until ``stop`` is
+        set, so a slow save keeps its slot (BACKLOG #2648; :class:`UploadQuotaError` states the
+        residual). The touch is a release of zero files and zero bytes: it changes no count and only
+        moves the row's clock. So a touch that lands after the save's release is harmless, and
+        ``stop`` is a signal, never a wait. A failed touch is logged and the next one tried."""
+        ledger = self._ledger
+        if ledger is None:
+            return
+
+        async def _beat() -> None:
+            deadline = time.monotonic() + _RESERVATION_HEARTBEAT_MAX_SECONDS
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(stop.wait(), _RESERVATION_HEARTBEAT_SECONDS)
+                except TimeoutError:
+                    if time.monotonic() >= deadline:
+                        _log.warning(
+                            "an upload by %s is still writing after %gs; its cross-shard "
+                            "reservation is no longer refreshed and may be reclaimed",
+                            uploader_id,
+                            _RESERVATION_HEARTBEAT_MAX_SECONDS,
+                        )
+                        return
+                    try:
+                        await ledger.reserve_upload_quota(uploader_id, files=0, size_bytes=0)
+                    except Exception:  # noqa: BLE001 — a missed touch must not fail the upload
+                        _log.warning(
+                            "could not refresh the cross-shard upload reservation for %s; it may "
+                            "be reclaimed if the upload outlasts the staleness window",
+                            uploader_id,
+                            exc_info=True,
+                        )
+
+        task = asyncio.ensure_future(_beat())
+        self._heartbeats.add(task)
+        task.add_done_callback(self._heartbeats.discard)
+
     def _leave_running(
         self, fut: asyncio.Future[Any], *, what: str, uploader_id: str, size: int
     ) -> None:
@@ -1118,23 +1202,37 @@ class UploadStore:
             uploader_id,
             _LEDGER_CANCEL_WAIT_SECONDS,
         )
-        self._stragglers.add(fut)
 
         def _done(done: asyncio.Future[Any]) -> None:
-            self._stragglers.discard(done)
             if what == "reserve":
                 if self._reserve_took_a_slot(done, uploader_id):
-                    late = asyncio.ensure_future(
-                        self._release_across_shards(uploader_id=uploader_id, size=size)
+                    self._hold(
+                        asyncio.ensure_future(
+                            self._release_across_shards(uploader_id=uploader_id, size=size)
+                        )
                     )
-                    self._stragglers.add(late)
-                    late.add_done_callback(self._stragglers.discard)
             elif done.cancelled():
                 _log.warning(
                     "the cross-shard upload release for %s was cancelled before it finished; "
                     "its slot is not paid back",
                     uploader_id,
                 )
+
+        self._hold(fut, _done)
+
+    def _hold(
+        self,
+        fut: asyncio.Future[Any],
+        on_done: Callable[[asyncio.Future[Any]], None] | None = None,
+    ) -> None:
+        """Keep ``fut`` referenced in ``_stragglers`` until it finishes, then call ``on_done``.
+        The loop holds a Task only weakly, so a task nobody awaits any more must be held here."""
+        self._stragglers.add(fut)
+
+        def _done(done: asyncio.Future[Any]) -> None:
+            self._stragglers.discard(done)
+            if on_done is not None:
+                on_done(done)
 
         fut.add_done_callback(_done)
 
@@ -1188,11 +1286,9 @@ class UploadStore:
         an earlier wait already absorbed. A release still running at the bound is logged and left
         to finish on its own, which pays the slot back if it succeeds.
 
-        A reservation that is never released is reclaimed once the row goes stale — **but only while
-        that uploader is otherwise IDLE.** This statement sets ``since = <now>`` unconditionally, so
-        each later release by the same uploader restarts the staleness clock and a leaked slot can
-        survive indefinitely under continued activity. See
-        :meth:`messagefoundry.store.base.Store.reserve_upload_quota`."""
+        A reservation that is never released is reclaimed once the row goes stale, **but only once
+        that uploader is otherwise IDLE**: this release, like every applied reserve and heartbeat,
+        restarts the row's staleness clock. :class:`UploadQuotaError` states the residual."""
         ledger = self._ledger
         if ledger is None:
             return
@@ -1559,6 +1655,7 @@ class UploadStore:
         now: float | None = None,
         retention_days: int | None = None,
         abort: threading.Event | None = None,
+        tally: _SweepTally | None = None,
     ) -> PruneResult:
         """Age-based retention sweep (ASVS 5.2.4): delete every (blob, meta) pair whose ``uploaded_at`` is
         older than ``retention_days`` (default: the configured ``retention_days``), then sweep the write
@@ -1579,15 +1676,18 @@ class UploadStore:
         ``abort`` stops the pass early without losing track of what it already deleted (BACKLOG #2065;
         :meth:`UploadRetentionRunner.stop` says why cancelling is not enough). The pass checks it before
         the scan and before each pair, then skips the orphan sweep and returns the pairs it did delete.
-        A pair is never half-deleted by an abort."""
+        A pair is never half-deleted by an abort.
+
+        ``tally`` records, as the pass goes, each pair it removes and the pair it is removing. The
+        retention runner uses it to name the files a timed-out stop loses (:class:`_SweepTally`)."""
         days = self._retention_days if retention_days is None else max(1, int(retention_days))
         at = time.time() if now is None else now
         cutoff = at - days * _SECONDS_PER_DAY
 
         stop = abort if abort is not None else threading.Event()
+        sweep = tally if tally is not None else _SweepTally()
 
         def _prune() -> PruneResult:
-            pruned: list[UploadedFileMeta] = []
             # Checked before the scan too: the scan decrypts every sidecar, which is wasted on a stop.
             metas = [] if stop.is_set() else self._scan_metas_sync()
             due = [meta for meta in metas if meta.uploaded_at < cutoff]
@@ -1599,54 +1699,178 @@ class UploadStore:
                     if held.expired(cutoff, at)
                 ]
             for meta in due:
-                if stop.is_set():
+                if not sweep.begin(meta, stop):
                     break
-                # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
+                removed = False
                 try:
-                    blob_path, meta_path = self._paths(meta.file_id)
-                except UploadPathError:
-                    continue
-                # A refused unlink must not raise out of the loop: that would drop `pruned`, and with
-                # it the audit rows for every pair already deleted.
-                #
-                # The BODY goes first, and a pair is reported exactly when THIS pass removed its body,
-                # because the body is the PHI the audit row records the deletion of. Sidecar-first
-                # reported a pair whose body unlink was refused and left the body on disk, and it
-                # opened a window where a body with no sidecar is exactly what a concurrent pass's
-                # orphan sweep takes. Body-first keeps the sidecar in place until the body is gone,
-                # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
-                # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
-                # can overlap), so only its leftover sidecar is cleared, with no second report.
-                try:
-                    blob_path.unlink()
-                except FileNotFoundError:
-                    with contextlib.suppress(OSError):
-                        meta_path.unlink(missing_ok=True)
-                    continue
-                except OSError as exc:
-                    _log.warning(
-                        "uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc
-                    )
-                    continue
-                pruned.append(meta)
-                # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
-                # body gone and clears the sidecar without reporting the pair again.
-                try:
-                    meta_path.unlink(missing_ok=True)
-                except OSError as exc:
-                    _log.warning(
-                        "uploaded-logs prune removed the body of %s but not its sidecar; the next "
-                        "pass will clear it: %s",
-                        meta.file_id,
-                        exc,
-                    )
+                    removed = self._prune_pair_sync(meta)
+                finally:
+                    sweep.end(removed)
+            pruned = list(sweep.removed)
             if stop.is_set():
                 return PruneResult(pruned=pruned)
-            return PruneResult(pruned=pruned, orphans_removed=self._sweep_orphans_sync(now=at))
+            # The orphan sweep runs AFTER the deletions, so a failure in it must not raise out of
+            # here: that would drop `pruned`, and with it the audit rows (BACKLOG #2261).
+            try:
+                orphans = self._sweep_orphans_sync(now=at, abort=stop)
+            except Exception:  # noqa: BLE001 — logged; a raise would drop the pass's audit rows
+                # ERROR, as the runner logged this before the catch moved here.
+                _log.exception("uploaded-logs orphan sweep failed; will retry next pass")
+                orphans = 0
+            return PruneResult(pruned=pruned, orphans_removed=orphans)
 
         return await asyncio.to_thread(_prune)
 
-    def _sweep_orphans_sync(self, *, now: float) -> int:
+    def _prune_pair_sync(self, meta: UploadedFileMeta) -> bool:
+        """Remove one aged pair for :meth:`prune_expired`; True when THIS call removed its body.
+
+        Never raises: a raise would drop the pass's list, and with it the audit rows for every
+        pair already deleted. ``_paths`` resolves the path, which can touch the filesystem, so an
+        ``OSError`` there leaves the pair for the next pass like a refused unlink does."""
+        # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
+        try:
+            blob_path, meta_path = self._paths(meta.file_id)
+        except UploadPathError:
+            return False
+        except OSError as exc:
+            _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
+            return False
+        # The BODY goes first, and a pair is reported exactly when THIS pass removed its body,
+        # because the body is the PHI the audit row records the deletion of. Sidecar-first
+        # reported a pair whose body unlink was refused and left the body on disk, and it
+        # opened a window where a body with no sidecar is exactly what a concurrent pass's
+        # orphan sweep takes. Body-first keeps the sidecar in place until the body is gone,
+        # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
+        # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
+        # can overlap), so only its leftover sidecar is cleared, with no second report.
+        try:
+            blob_path.unlink()
+        except FileNotFoundError:
+            with contextlib.suppress(OSError):
+                meta_path.unlink(missing_ok=True)
+            return False
+        except OSError as exc:
+            _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
+            return False
+        # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
+        # body gone and clears the sidecar without reporting the pair again.
+        try:
+            meta_path.unlink(missing_ok=True)
+        except OSError as exc:
+            _log.warning(
+                "uploaded-logs prune removed the body of %s but not its sidecar; the next "
+                "pass will clear it: %s",
+                meta.file_id,
+                exc,
+            )
+        return True
+
+    async def prune_and_audit(
+        self,
+        audit: Callable[[UploadedFileMeta], Awaitable[None]] | None,
+        *,
+        now: float | None = None,
+        abort: threading.Event | None = None,
+        tally: _SweepTally | None = None,
+    ) -> PruneResult:
+        """One :meth:`prune_expired` pass, then one ``audit`` call per pruned file.
+
+        The shared body of the retention runner and the save-time sweep. A failed audit call is
+        logged and the rest still run, so one bad row never costs the others. ``tally`` is
+        :meth:`prune_expired`'s, and also counts each audit call once it returns or raises."""
+        result = await self.prune_expired(now=now, abort=abort, tally=tally)
+        if audit is not None:
+            for meta in result.pruned:
+                try:
+                    await audit(meta)
+                except Exception:  # noqa: BLE001 — logged; one bad row must not cost the rest
+                    # ERROR: the file is gone and this was its only record, the level every other
+                    # upload.prune audit gap logs at.
+                    _log.exception(
+                        "uploaded-logs prune audit failed for %s; it has no upload.prune audit row",
+                        meta.file_id,
+                    )
+                if tally is not None:
+                    tally.audited += 1
+        return result
+
+    async def prune_on_save(
+        self, audit: Callable[[UploadedFileMeta], Awaitable[None]]
+    ) -> PruneResult:
+        """The save-time sweep: :meth:`prune_and_audit` that a cancelled caller cannot cut short
+        (BACKLOG #2261).
+
+        The request deadline cancels the upload route, and a cancel used to drop the result naming
+        what the sweep's thread had deleted, so no ``upload.prune`` row was written for those files.
+        The thread kept deleting with nobody left to audit it. This is the retention runner's
+        treatment (#2065): a cancel sets the sweep's ``abort``, so it stops at its next file, and
+        the rows for what it removed are still written. See :meth:`_run_to_completion` for the wait.
+
+        A sweep that then fails, or that shutdown cancels, is logged as the retention runner's stop
+        logs one, from a :class:`_SweepTally`: an ERROR naming each removed file with no row yet,
+        or a WARNING when no row is lost (BACKLOG #2264)."""
+        abort = threading.Event()
+        tally = _SweepTally()
+
+        def _late(task: asyncio.Future[Any]) -> None:
+            if task.cancelled():
+                why = "was cancelled before it finished"
+            elif task.exception() is not None:
+                why = "failed after its request was cancelled"
+            else:
+                return
+            _log_unaudited(
+                f"the save-time upload prune {why}",
+                tally,
+                exc=None if task.cancelled() else task.exception(),
+            )
+
+        return await self._run_to_completion(
+            self.prune_and_audit(audit, abort=abort, tally=tally),
+            what="the save-time upload prune",
+            on_cancel=lambda: tally.abort(abort),
+            on_late=_late,
+        )
+
+    async def _run_to_completion[T](
+        self,
+        coro: Coroutine[Any, Any, T],
+        *,
+        what: str = "a task run to completion",
+        on_cancel: Callable[[], None] | None = None,
+        on_late: Callable[[asyncio.Future[Any]], None] | None = None,
+    ) -> T:
+        """Run ``coro`` as its own task, so a cancellation of the caller does not cut it short.
+
+        The task is outside the caller's cancel scope, so the request deadline does not reach its
+        awaits. A cancelled caller calls ``on_cancel`` first, then waits up to
+        ``_LEDGER_CANCEL_WAIT_SECONDS`` for the task, then the cancellation propagates. A task
+        still running at that bound is logged, naming it by ``what``, and held until it finishes.
+        Once the caller is cancelled, ``on_late`` is given the finished task, since the
+        cancellation is what propagates and nothing else reads its outcome; without one, a failure
+        is logged at ERROR. Without a cancellation, the task's result or exception is the caller's.
+
+        The task itself can be cancelled too, by a loop shutdown, while its caller is not. That
+        surfaces here as the same ``CancelledError``, so ``on_cancel`` runs again on this path: a
+        sweep's thread outlives its task, and must still be told to stop."""
+        task = asyncio.create_task(coro)
+        try:
+            return await _wait_to_completion(
+                task, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS, on_cancel=on_cancel
+            )
+        except asyncio.CancelledError:
+            if on_cancel is not None:
+                on_cancel()  # idempotent; covers a cancel of the task itself (see above)
+            if not task.done():
+                _log.warning(
+                    "%s did not finish within %gs of its caller's cancellation; it was left running",
+                    what,
+                    _LEDGER_CANCEL_WAIT_SECONDS,
+                )
+            self._hold(task, on_late or functools.partial(_log_late_failure, what=what))
+            raise
+
+    def _sweep_orphans_sync(self, *, now: float, abort: threading.Event | None = None) -> int:
         """Remove the write leftovers no other pass can reach, and return how many went (BACKLOG #1678).
 
         Two shapes, both meaning a write that started and never landed: a ``.<id>.<suffix>.<tag>.tmp``
@@ -1674,15 +1898,26 @@ class UploadStore:
         write, bounded by ``max_bytes`` — has been stalled for longer than the floor could have its temp
         removed underneath it. Its ``os.replace`` then raises and its ``save`` fails cleanly: nothing is
         published half-written, nothing is left behind, and the operator retries. An hour against a
-        25 MiB default bound is far outside that window."""
+        25 MiB default bound is far outside that window.
+
+        ``abort`` is :meth:`prune_expired`'s, checked before each entry. The pass's audit rows are
+        written only once this returns, so a slow sweep over a large dir must not hold them past a
+        stop (BACKLOG #2264). An aborted sweep returns what it removed so far; the next one resumes."""
+        stop = abort if abort is not None else threading.Event()
         root = self._root
-        if not root.is_dir():
+        if stop.is_set() or not root.is_dir():
             return 0
         cutoff = now - _ORPHAN_MIN_AGE_SECONDS
         # A sidecar is the listing key, so an id with one is reachable and this pass is not about it.
-        reachable = {fid for fid, _ in self._iter_sidecars()}
+        reachable: set[str] = set()
+        for fid, _ in self._iter_sidecars():
+            if stop.is_set():
+                return 0  # nothing removed yet; the listing alone can be long on a large dir
+            reachable.add(fid)
         removed = 0
         for entry in root.iterdir():
+            if stop.is_set():
+                break
             name = entry.name
             stem = name[: -len(_BLOB_SUFFIX)] if name.endswith(_BLOB_SUFFIX) else ""
             if _ORPHAN_TMP_RE.match(name):
@@ -1722,10 +1957,68 @@ _DEFAULT_PRUNE_INTERVAL_SECONDS = 3600.0
 
 # How long ``UploadRetentionRunner.stop`` waits for a sweep already in flight to finish and write its
 # audit rows. The sweep stops at its next file once asked, so this bounds a hung filesystem call, a
-# sidecar scan already under way, and the audit writes for what the sweep had deleted. It sits well
-# under NSSM's 15 s graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1),
-# because the runner stops FIRST in the API lifespan's teardown and engine.stop() still has to run.
+# sidecar scan already under way, and the audit writes for what the sweep had deleted. The runner
+# stops FIRST in the API lifespan's teardown, and engine.stop() still has to run after it.
+#
+# It shares NSSM's 15 s graceful-stop window (AppStopMethodConsole in
+# scripts/service/install-service.ps1) with uvicorn's connection drain, which runs BEFORE the
+# lifespan teardown. ``serve`` passes uvicorn no ``timeout_graceful_shutdown``, so that drain has no
+# bound: a request still open at Ctrl+C can use up the window before this wait starts. A shorter
+# bound here would not fix that, and would cost audit rows on a slow disk, so 5 s stands. The fix is
+# to bound the drain where ``serve`` calls ``uvicorn.run``.
 _DEFAULT_STOP_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass
+class _SweepTally:
+    """How far one sweep got. Two readers: :meth:`UploadRetentionRunner.stop` when it times out,
+    and :meth:`UploadStore.prune_on_save` when a sweep its request stopped waiting for is cancelled
+    or fails. Both read it through :func:`_log_unaudited`.
+
+    ``removed`` lists each pair the sweep's thread removed, in the order it is audited, and
+    ``removing`` is the pair it is removing now. ``audited`` counts audit calls that returned or
+    raised; a raised call is counted because :meth:`UploadStore.prune_and_audit` already logs it.
+    So ``unaudited()`` names every removed file whose row has not been written. It also names the
+    pair in progress, which may turn out not to be removed, and a row whose interrupted write may
+    still land, so it can name more than are lost, never fewer.
+
+    The abort check and the ``removing`` mark are one step under ``lock``, and so is the stop's
+    ``abort.set()``. A thread that passed the check is therefore already visible to the stop.
+    Each sweep, the runner's and the save-time one alike, gets its own tally, so a thread a
+    timed-out stop left running never writes into the next sweep's."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    removed: list[UploadedFileMeta] = field(default_factory=list)
+    removing: UploadedFileMeta | None = None
+    audited: int = 0
+
+    def begin(self, meta: UploadedFileMeta, abort: threading.Event) -> bool:
+        """In the sweep's thread: mark ``meta`` as being removed, unless ``abort`` is set."""
+        with self.lock:
+            if abort.is_set():
+                return False
+            self.removing = meta
+            return True
+
+    def end(self, removed: bool) -> None:
+        """In the sweep's thread: the pair :meth:`begin` marked is settled."""
+        with self.lock:
+            if removed and self.removing is not None:
+                self.removed.append(self.removing)
+            self.removing = None
+
+    def abort(self, abort: threading.Event) -> None:
+        """Set ``abort`` so that no :meth:`begin` straddles it."""
+        with self.lock:
+            abort.set()
+
+    def unaudited(self) -> list[str]:
+        """The ``file_id`` of each removed, or being removed, file with no audit row yet."""
+        with self.lock:
+            ids = [m.file_id for m in self.removed[self.audited :]]
+            if self.removing is not None:
+                ids.append(self.removing.file_id)
+            return ids
 
 
 class UploadRetentionRunner:
@@ -1754,16 +2047,20 @@ class UploadRetentionRunner:
         # The sweep's worker thread reads this one; an asyncio.Event is not thread-safe.
         self._abort = threading.Event()
         self._task: asyncio.Task[None] | None = None
+        self._tally = _SweepTally()  # the sweep in flight, or the last one
 
     def start(self) -> None:
         """Spawn the supervised prune loop (idempotent)."""
         if self._task is not None:
             return
-        self._stop.clear()
+        # A fresh event, not a clear(), for the same reason as _abort below: a loop a stop() is
+        # still waiting on holds the old one, and clearing it would keep that loop sweeping beside
+        # the new one, each replacing the tally the other's stop() reads.
+        self._stop = asyncio.Event()
         # A fresh event, not a clear(): a sweep thread a timed-out stop() left running still holds
         # the old one, and clearing it would let that thread resume deleting with nobody to audit.
         self._abort = threading.Event()
-        self._task = asyncio.create_task(self._run())
+        self._task = asyncio.create_task(self._run(self._stop))
         _log.info(
             "uploaded-logs retention prune enabled: older than %d days, every %gs",
             self._store.retention_days,
@@ -1781,8 +2078,9 @@ class UploadRetentionRunner:
 
         A sweep can outlast that bound: one stuck filesystem call, the sidecar scan or orphan sweep
         already under way, or the audit writes for a long list of deletions. The task is then
-        cancelled and the loss is logged as an ERROR. The loss covers every file the sweep deleted
-        and had not yet audited, not only what it deletes afterwards.
+        cancelled. When the sweep had started deleting a file it had not yet audited, that loss is
+        logged as an ERROR. It covers every such file, not only one whose unlink is still running.
+        A sweep that had no such file loses no row, so it is logged as a WARNING instead.
 
         This never raises into the caller's teardown. If the caller is itself cancelled while
         waiting, the sweep is cancelled the same way and this returns, as it did before #2065, so the
@@ -1793,8 +2091,10 @@ class UploadRetentionRunner:
         if task is None:
             return
         # Stop the sweep in flight, which holds THIS event, then give the runner a fresh one. Left
-        # set, it made every later run_once() prune nothing, silently.
-        self._abort.set()
+        # set, it made every later run_once() prune nothing, silently. The tally is kept in a local:
+        # a start() during the wait below replaces self._tally with the next sweep's.
+        tally = self._tally
+        tally.abort(self._abort)
         self._abort = threading.Event()
         try:
             # shield: a timeout must not cancel the task mid-audit; the branches below decide that.
@@ -1804,47 +2104,47 @@ class UploadRetentionRunner:
             why = f"did not finish within {self._stop_timeout:g}s of shutdown"
         except asyncio.CancelledError:
             why = "was still running when shutdown itself was cancelled"
-        _log.error(
-            "uploaded-logs retention sweep %s; cancelling it. A file it deleted and had not yet "
-            "audited, or deletes after this point, has no upload.prune audit row",
-            why,
-        )
+        # Read before the cancel. Every id is logged, since these lines are the only record of them.
+        if self._audit is None:
+            _log.warning(
+                "uploaded-logs retention sweep %s; cancelling it. The runner has no audit "
+                "callback, so it owed no upload.prune row",
+                why,
+            )
+        else:
+            _log_unaudited(f"uploaded-logs retention sweep {why}; cancelling it", tally)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    async def _run(self) -> None:
+    async def _run(self, stop: asyncio.Event) -> None:
         # One isolated sweep per interval; an error in a pass is logged and the loop continues (a prune
-        # must never take the engine down). Cooperatively cancellable via _stop.
-        while not self._stop.is_set():
+        # must never take the engine down). Cooperatively cancellable via ``stop``, this loop's own.
+        while not stop.is_set():
             try:
-                await self.run_once()
+                # The loop's sweep alone owns self._tally, so a direct run_once() never hides it.
+                self._tally = _SweepTally()
+                await self._sweep(self._tally)
             except Exception:
                 _log.exception("uploaded-logs retention prune failed; will retry next interval")
-            await self._sleep(self._interval)
-
-    async def _sleep(self, delay: float) -> None:
-        try:  # noqa: SIM105 — wake immediately on stop so shutdown isn't held by the interval
-            await asyncio.wait_for(self._stop.wait(), delay)
-        except TimeoutError:
-            pass
+            try:  # noqa: SIM105 — wake immediately on stop so shutdown isn't held by the interval
+                await asyncio.wait_for(stop.wait(), self._interval)
+            except TimeoutError:
+                pass
 
     async def run_once(self, now: float | None = None) -> PruneResult:
-        """Run one prune sweep for ``now`` (default: the injected clock), auditing each pruned file. The
-        audit callback (contractually) never raises, but be defensive — one bad audit call must not abort
-        the remaining prunes. The pass's orphan count rides back in the result; it is logged by the sweep
-        and carries no metadata to audit (see :class:`PruneResult`)."""
-        result = await self._store.prune_expired(
-            now=self._clock() if now is None else now, abort=self._abort
+        """One :meth:`UploadStore.prune_and_audit` pass for ``now`` (default: the injected clock).
+        The pass's orphan count rides back in the result; it is logged by the sweep and carries no
+        metadata to audit (see :class:`PruneResult`)."""
+        return await self._sweep(None, now)
+
+    async def _sweep(self, tally: _SweepTally | None, now: float | None = None) -> PruneResult:
+        return await self._store.prune_and_audit(
+            self._audit,
+            now=self._clock() if now is None else now,
+            abort=self._abort,
+            tally=tally,
         )
-        for meta in result.pruned:
-            if self._audit is None:
-                continue
-            try:
-                await self._audit(meta)
-            except Exception:
-                _log.warning("uploaded-logs prune audit failed for %s", meta.file_id, exc_info=True)
-        return result
 
 
 def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
@@ -1869,9 +2169,11 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     A bare ``to_thread`` re-raises a cancellation at once while its thread keeps running. ``save``
     then pays its cross-shard reservation back and drops ``_quota_lock`` while the file is still
     being written, so a sibling can read the ledger and scan the disk and count neither. That breaks
-    the premise :class:`UploadQuotaError`'s ordering argument rests on. The write is bounded by
-    ``max_bytes``, so the wait is too. Further cancellations while waiting are absorbed, and a
-    ``CancelledError`` is raised once the thread is done.
+    the premise :class:`UploadQuotaError`'s ordering argument rests on. The save's thread runs the
+    quota's sidecar scan and then the write. The write is bounded by ``max_bytes``. The scan is
+    bounded by the number of sidecars in the dir, which per-uploader quotas cap for each uploader
+    but nothing caps overall. The wait is as long as both. Further cancellations while waiting are
+    absorbed, and a ``CancelledError`` is raised once the thread is done.
 
     The wait is on the executor's own Future, never on a Task wrapping ``to_thread``. ``asyncio.run``
     cancels every pending TASK at shutdown, so a Task here would be cancelled out from under the
@@ -1882,7 +2184,55 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     return await _wait_to_completion(loop.run_in_executor(None, ctx.run, func, arg))
 
 
-async def _wait_to_completion[T](fut: asyncio.Future[T], *, cancel_bound: float | None = None) -> T:
+def _log_late_failure(task: asyncio.Future[Any], *, what: str) -> None:
+    """Log the failure of a :meth:`UploadStore._run_to_completion` task whose caller was cancelled
+    and passed no ``on_late``, since nothing else will read it. A cancelled task (shutdown) is
+    logged too, since it stopped short of what it was run to finish."""
+    if task.cancelled():
+        _log.error("%s was cancelled after its caller was cancelled", what)
+    elif (exc := task.exception()) is not None:
+        _log.error("%s failed after its caller was cancelled", what, exc_info=exc)
+
+
+# How many file_ids one audit-gap line names. A first sweep after a long outage can remove
+# thousands of pairs, and one line that long is handled badly by log shippers and NSSM's rotated
+# stdout. Every id is still logged, over as many lines as it takes: those lines are their only record.
+_UNAUDITED_IDS_PER_LINE = 50
+
+
+def _log_unaudited(what: str, tally: _SweepTally, *, exc: BaseException | None = None) -> None:
+    """Log what a sweep that stopped short of its audit rows lost, from its ``tally`` (BACKLOG
+    #2264). An ERROR names each removed file with no row yet, :data:`_UNAUDITED_IDS_PER_LINE` to a
+    line; a sweep that lost no row logs a WARNING. ``what`` says what happened to the sweep."""
+    lost = tally.unaudited()
+    if not lost:
+        _log.warning(
+            "%s. It had removed no aged pair it had not audited, so no upload.prune row is lost",
+            what,
+            exc_info=exc,
+        )
+        return
+    for first in range(0, len(lost), _UNAUDITED_IDS_PER_LINE):
+        chunk = lost[first : first + _UNAUDITED_IDS_PER_LINE]
+        # An audit write the cancel interrupts may still land, so "may".
+        _log.error(
+            "%s. %d file(s) it removed, or was removing, may have no upload.prune audit row "
+            "(%d to %d): %s",
+            what,
+            len(lost),
+            first + 1,
+            first + len(chunk),
+            ", ".join(chunk),
+            exc_info=exc if first == 0 else None,
+        )
+
+
+async def _wait_to_completion[T](
+    fut: asyncio.Future[T],
+    *,
+    cancel_bound: float | None = None,
+    on_cancel: Callable[[], None] | None = None,
+) -> T:
     """Await ``fut``; on a cancellation, wait for it to finish, then raise ``CancelledError``.
 
     The shared body of :func:`_to_thread_to_completion` and the cross-shard ledger calls (BACKLOG
@@ -1895,10 +2245,10 @@ async def _wait_to_completion[T](fut: asyncio.Future[T], *, cancel_bound: float 
     caller already logs is logged twice.
 
     ``cancel_bound`` limits the wait after a cancellation, in seconds; ``None`` waits as long as it
-    takes, which the bounded file write needs. A ledger call waits on the store, which may not be
-    bounded at all. At the bound this raises with ``fut`` still running, and the caller decides
-    what to do with it. Under an anyio scope, the scope cancels again on every loop pass, so the
-    wait costs CPU, and the bound limits that too.
+    takes, which the save's thread needs, since a thread cannot be stopped. A ledger call waits on
+    the store, which may not be bounded at all. At the bound this raises with ``fut`` still
+    running, and the caller decides what to do with it. Under an anyio scope, the scope cancels
+    again on every loop pass, so the wait costs CPU, and the bound limits that too.
 
     **A caller already cancelled at entry gets the bound as well.** That is a ``finally`` running
     after an earlier wait absorbed the cancellation: the release after a cancelled write. Without
@@ -1910,6 +2260,8 @@ async def _wait_to_completion[T](fut: asyncio.Future[T], *, cancel_bound: float 
     already = task is not None and task.cancelling() > 0
     cancelled = False
     deadline = None if not already or cancel_bound is None else loop.time() + cancel_bound
+    if already and on_cancel is not None:
+        on_cancel()  # the caller is already on its way out, so ask the work to stop now
     while not fut.done():
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
@@ -1919,6 +2271,8 @@ async def _wait_to_completion[T](fut: asyncio.Future[T], *, cancel_bound: float 
         except asyncio.CancelledError:
             if not (cancelled or already) and cancel_bound is not None:
                 deadline = loop.time() + cancel_bound
+            if not (cancelled or already) and on_cancel is not None:
+                on_cancel()  # once, at the first cancellation: a sweep's abort (BACKLOG #2261)
             cancelled = True
     if cancelled:
         if not fut.cancelled():
