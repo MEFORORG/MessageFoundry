@@ -465,9 +465,15 @@ _SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
 
 def _serve(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: str = "", *, forwarding: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: str = "",
+    *,
+    forwarding: bool,
+    host: str | None = None,
 ) -> int:
-    """A prod-PHI serve with every OTHER gate pre-cleared, so only forwarding decides it."""
+    """A prod-PHI serve with every OTHER gate pre-cleared, so only forwarding decides it. ``host``
+    replaces the verified collector's name, for a test that needs an IP-literal one."""
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import (
         PHI_GATE_PROVISIONS_TOML,
@@ -480,6 +486,8 @@ def _serve(
     setenv_retention_windows(monkeypatch)
     if forwarding:
         setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path))
+    if host is not None:
+        monkeypatch.setenv("MEFOR_LOGGING_FORWARD_HOST", host)
     (tmp_path / "messagefoundry.toml").write_text(
         PHI_GATE_PROVISIONS_TOML + extra, encoding="utf-8"
     )
@@ -527,6 +535,56 @@ def test_serve_starts_with_verified_forwarding_to_a_collector_that_is_down(
     captured = capsys.readouterr()
     assert "ASVS 16.4.3" not in captured.err
     assert "failed permanently" in captured.out  # the collector really was unreachable
+
+
+_NO_ROUTE_HOST = "192.0.2.10"  # a documentation address no host holds
+_FAIL_OPEN_LINE = "no source address for [logging].forward_host"
+
+
+def _serve_with_a_failing_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> tuple[int, str, str]:
+    """An enforcing serve whose collector is an IP literal the OS will not route to, so the REAL
+    own-address probe fails open. Every connect to that address is refused, the forwarder's
+    included, so the test waits on no timeout. Returns the exit code, stdout and stderr."""
+
+    class _Unroutable(socket.socket):
+        def connect(self, address: Any) -> None:
+            if address[0] == _NO_ROUTE_HOST:
+                raise OSError("network is unreachable")
+            super().connect(address)
+
+    monkeypatch.setattr(socket, "socket", _Unroutable)
+    code = _serve(tmp_path, monkeypatch, forwarding=True, host=_NO_ROUTE_HOST)
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_a_fail_open_pass_is_recorded_by_the_configured_log_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR 0200 Amendment A calls the WARNING the record of a fail-open pass. The gate runs before
+    ``configure_logging``, so logged there it reached bare stderr only. ``serve`` now writes it
+    twice, as it does the #1989 static-credential lines: to stderr where the gate runs, and again
+    through the handlers ``configure_logging`` installs. Standard output is such a handler here,
+    and the app log file and the off-box forwarder hang off the same root logger."""
+    code, out, err = _serve_with_a_failing_probe(tmp_path, monkeypatch, capsys)
+    assert code == 0  # fail-open: the start still succeeds
+    assert f"warning: the OS gave {_FAIL_OPEN_LINE}" in err  # where the gate ran
+    assert _FAIL_OPEN_LINE in out  # after configure_logging, through its handler
+    assert out.count(_FAIL_OPEN_LINE) == 1  # recorded once there, not once per handler pass
+    assert _NO_ROUTE_HOST not in "".join(
+        line for line in (out + err).splitlines() if _FAIL_OPEN_LINE in line
+    )
+
+
+def test_a_start_whose_probe_answers_records_no_fail_open_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: the same start with a collector given by name runs no probe and logs no line."""
+    assert _serve(tmp_path, monkeypatch, forwarding=True) == 0
+    captured = capsys.readouterr()
+    assert _FAIL_OPEN_LINE not in captured.out + captured.err
 
 
 def test_serve_under_warn_warns_instead_of_refusing(
