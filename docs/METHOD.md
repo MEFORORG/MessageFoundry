@@ -31,8 +31,8 @@ once, usually one per account, and what binds them is the repository they share.
 
 **The case spawning exists for is a PR that needs a fix with no Manager alive**, which nothing else
 resolves: workflows label and report a red PR, but none sends it to a seat (see "Nothing tells
-anyone your PR is waiting" below). `CLAUDE.md` section 5 carries the reasoning and the two spelling
-hazards. This replaced a rule reading *"NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE"*,
+anyone your PR is waiting" below). The reasoning is under *CLAUDE.md text moved in wave 2* below,
+and the two spelling hazards are in [`WORKTREES.md`](WORKTREES.md). This replaced a rule reading *"NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE"*,
 true when written and false by 2026-09-16.
 
 **The grant below is LIVE again, and the measurements are kept because they still apply.** It gated
@@ -761,8 +761,8 @@ until you answer?* Whoever asks it should paste the two verbatim sentences above
 
 These blocks moved out of the root `CLAUDE.md` on 2026-10-07, in a second pass after the section
 above, word for word. The reason is the same: `CLAUDE.md` loads into every session, and each block
-binds only one seat or one kind of work. `CLAUDE.md` keeps the lines that change what a reader does
-and points here.
+binds only one seat or one kind of work. `CLAUDE.md` keeps a short form of the rules in them that it
+still states, and points here. Link targets were changed so they resolve from `docs/`.
 
 Read each block as `CLAUDE.md` at `d62308d8be`. There, *above*, *below*, *this file*, *this
 section* and a bare section number mean `CLAUDE.md` and its sections, not this page. Where a block
@@ -774,6 +774,8 @@ From *The Manager plans, dispatches, and holds the owner's attention*. The `--al
 bullet went to [`WORKTREES.md`](WORKTREES.md), beside the prompt-first section. The bullets
 korus `roles/MANAGER.md` already carries were not copied: push then report, the three
 who-else-is-running fields, readings not conclusions, and announcing files rather than subjects.
+Nor were the prompt-first, own-worktree and never-relocate bullets, which `WORKTREES.md` states in
+its sections on putting the prompt first, creating a worktree and starting the session in it.
 
 - One brief per Builder. After about two failed attempts at the same problem, dispatch a fresh Builder
   with a better brief rather than reuse a poisoned context. A Builder cannot do this. When you are
@@ -835,7 +837,8 @@ that argument is most credible from.
 
 ### A Builder gets one turn, items 2, 5 and 6, from section 5
 
-`CLAUDE.md` keeps item 1 whole and a short form of each of these three. The full items follow.
+`CLAUDE.md` keeps items 1, 3 and 4 whole and a short form of each of these three. The full items
+follow.
 
 2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
    push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at

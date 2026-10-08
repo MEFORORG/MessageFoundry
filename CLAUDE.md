@@ -381,9 +381,10 @@ than on arrival. Its card is [`docs/roles/special.card.md`](docs/roles/special.c
 playbook is korus `roles/SPECIAL.md`, read at `origin/main`.
 
 **A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
-ruling 2026-09-16).** The case it exists for is a PR that needs a fix with no Manager alive. A
-Manager seat added, the same day, that spawning should be rare: a subagent cannot outlive a mistake,
-and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
+ruling 2026-09-16).** The case it exists for is a PR that needs a fix with no Manager alive. Then
+the Lander spawns a Manager rather than fixing the PR itself, because authoring plus landing means
+nobody checked it. A Manager seat added, the same day, that spawning should be rare: a subagent
+cannot outlive a mistake, and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
 text moved in wave 2*.
 
 The brief is disposable. The BACKLOG item is the record.
@@ -406,9 +407,10 @@ gates a merge**, and no seat has to clear one.
    refused. With no address, put the question in your exit report; the Manager carries it into the
    PR body when it opens the PR.
 2. At least two kinds of refusal reach a Builder while it runs: local git hooks at commit and push
-   time (the live list is `.pre-commit-config.yaml`), and user-scope PreToolUse guards that deny the
-   tool call itself. **Neither guard intercepts an ordinary shell write, such as a redirect into a
-   file**, and a shell route around a denied write still breaks the rule. Which tools each guard
+   time (the live list is `.pre-commit-config.yaml`), and the user-scope PreToolUse guards
+   `collision_gate.ps1` and `worktree_gate.ps1`, which deny the tool call itself. **Neither guard
+   intercepts an ordinary shell write, such as a redirect into a file**, and a shell route around a
+   write the worktree gate denied still breaks its rule. Which tools each guard
    sees is in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 2*.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
 4. Its process exits when it has pushed and reported. The Manager opens the PR, often one PR for
@@ -418,8 +420,10 @@ gates a merge**, and no seat has to clear one.
 5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02. Quote the Windows
    path, or the shell eats the backslashes. The PowerShell tool refuses a nested `pwsh`; the Bash
    tool does not. **This line once said a seat cannot declare itself**, and that was
-   self-confirming: a Builder told it cannot declare does not try. The Manager still supplies seat
-   and goal at dispatch. The measurements are in [`docs/METHOD.md`](docs/METHOD.md).
+   self-confirming: a Builder told it cannot declare does not try. A SessionStart hook tells every
+   starting session to declare; **do not ignore it.** The Manager still supplies seat and goal at
+   dispatch, because a machine-invented goal makes a record that looks declared and says nothing.
+   The measurements are in [`docs/METHOD.md`](docs/METHOD.md).
 
 6. **A brief can be wrong by the time you read it, and nothing will tell you.** Verify it against
    the tree, however recently it was written: read the diff of every PR it names, and re-locate every
@@ -432,19 +436,20 @@ gates a merge**, and no seat has to clear one.
 - **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and
   waits for the owner's explicit "go". Point the brief at the relevant existing code; it measurably
   improves the result.
-- The rest of the Manager's dispatch rules bind only that seat, and korus `roles/MANAGER.md` carries
-  them, read at `origin/main`: every brief ends with push, then report; a brief names who else is
-  running, what paths they touch, and whether they share the worktree; hand down readings, not
-  conclusions; announce the files a wave changes, never the items' subjects.
+- The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
+  them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
+  running, what paths they touch, and whether they share the worktree. Hand down readings, not
+  conclusions. Announce the files a wave changes, never the items' subjects.
 - At least these live in this repository. Dispatch a fresh Builder after about two failed attempts;
   a stuck Builder pushes what is green and reports that the brief needs re-cutting. Whichever seat
   dispatched, mail the receiver when you take back a brief, because you cannot update a started
   chip (BACKLOG #1448). Put the prompt first when you spawn. Grant `--allowedTools` by bare name,
-  never scoped to a command. Rules a Builder needs go in the account's `settings.json`, outside
-  git. The text is in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 2*, and
+  never scoped to a command; that is measured in the flag only, so do not bare-name a
+  `settings.json` rule on its strength. Rules a Builder needs go in the account's `settings.json`,
+  outside git. The text is in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 2*, and
   [`docs/WORKTREES.md`](docs/WORKTREES.md).
 - Give each session its own git worktree and start the session in it (`spawn.ps1`). Never brief a
-  subagent to relocate into one; give it `isolation: worktree` and have it run `ensure-venv.ps1`
+  worker, subagent or session, to relocate into one; give it `isolation: worktree` and have it run `ensure-venv.ps1`
   before its first `pytest`, `mypy` or `ruff` run. [`docs/WORKTREES.md`](docs/WORKTREES.md), "Start
   the session in the worktree", says why. The AI project memory is shared across sessions, so
   coordinate memory writes.
@@ -735,17 +740,18 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   banner alphabet without adopting it.
 
   **Why this is a correctness rule and not a style preference.** A glyph's meaning is
-  *positional*, so a reader who learns it from examples misreads it, and two parsers of one file
-  once disagreed on exactly that. Emoji also need variation-selector handling in every regex, and
+  *positional*, so a reader who learns it from examples reads presence as meaning, and two parsers
+  of one file once disagreed on exactly that. Emoji also need variation-selector handling in every regex, and
   they raise `UnicodeEncodeError` on a stock Windows cp1252 console.
 
   **No NEW glyph vocabulary may be introduced anywhere.** The former status glyphs still in the tree
   are decoration. Removing them is a migration with its own item, so do not sweep them out of files
   you are editing for another reason.
 
-  **Do not delete or rename `.github/workflows/backlog-hygiene.yml`, or drop either trigger.** Its
-  `name:` is a REQUIRED status-check context, and a required context that never reports wedges every
-  pull request. Retiring it is a branch-protection change; read that file's header first.
+  **Do not delete `.github/workflows/backlog-hygiene.yml`, rename its job, or drop either trigger.**
+  The job's `name:` is a REQUIRED status-check context, and a required context that never reports
+  wedges every pull request. Retiring it is a branch-protection change; read that file's header
+  first.
 
   **The warning sign (U+26A0) is not sanctioned (owner ruling 2026-08-14).** Retiring it is BACKLOG
   #1265, sliced by owner go, and *not* a licence to edit lines outside a ruled slice.
@@ -796,7 +802,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 - **ASVS vocabulary lives in [`scripts/asvs/CLAUDE.md`](scripts/asvs/CLAUDE.md).** Never say "vault
   cell", "gate cell" or "vault gate cell"; say "the cell has a stale anchor", and keep that apart
   from *verifier drift*. The vocabulary is public; cell ids, coverage and gaps stay vaulted, and so
-  does any map pairing cell ids with paths. The current score:
+  does any map pairing cell ids with paths. Quote a number the tool prints only with the ref pair it
+  prints beside it. The current score:
 
   ```
   python scripts/asvs/scorecard.py --scorecard <vault>/docs/security/asvs-scorecard.toml --status
