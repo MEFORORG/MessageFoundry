@@ -7605,6 +7605,80 @@ def reminder_silencing_rules(alerts: AlertsSettings) -> list[tuple[str, tuple[st
     return out
 
 
+def _reminder_lead(
+    switch: str, value: int, default: int, off: str, late: str
+) -> list[tuple[str, str]]:
+    """One reminder's ``warn_days`` entry: ``off`` at 0, ``late`` (formatted with the value and the
+    default) below the shipped default, nothing at or above it."""
+    if value == 0:
+        return [(switch, off)]
+    if value < default:
+        return [(switch, late.format(value=value, default=default))]
+    return []
+
+
+def _reminder_loosenings(
+    cert_monitor: CertMonitorSettings,
+    secret_rotation: SecretRotationSettings,
+    alerts: AlertsSettings,
+) -> list[tuple[str, str]]:
+    """The credential-reminder weakenings :func:`security_loosenings` names (ASVS 6.4.5).
+
+    BACKLOG #2227: each ``warn_days = 0`` turned its reminder off with only a debug line from the
+    runner. A lead shorter than the shipped default is named too, as BACKLOG #1131 names a limit
+    looser than its default: a reminder one day ahead leaves no time to renew. Each section's
+    ``check_interval_seconds`` also delays a reminder and is NOT named here.
+
+    BACKLOG #2008 step 4: an ``[[alerts.rules]]`` entry that can send a reminder to no transport
+    (:func:`reminder_silencing_rules`)."""
+    out = _reminder_lead(
+        "cert_monitor.warn_days",
+        cert_monitor.warn_days,
+        CertMonitorSettings.model_fields["warn_days"].default,
+        "[cert_monitor].warn_days = 0 turns the certificate-expiry monitor off -- no "
+        "cert_expiry reminder is raised for any certificate or CRL file the monitor watches, so "
+        "one can reach its expiry with no warning ahead of it, and a service caller's client "
+        "certificate is never flagged as near expiry",
+        "[cert_monitor].warn_days = {value}, shorter than the default of {default} -- a "
+        "certificate or CRL file the monitor watches, and a service caller's client certificate, "
+        "is first flagged only {value} day(s) before it expires, which may leave too little time "
+        "to renew it",
+    )
+    # Not "no secret_rotation alert at all". On a store that tracks the key, under enforce, at least
+    # the start-time expiry checks still raise one (reconcile_rotation_meta,
+    # enforce_store_key_expiry, enforce_secret_expiry), whatever warn_days is. On a keyless or vault_transit store
+    # they find nothing to check. What warn_days = 0 removes is the periodic runner.
+    out += _reminder_lead(
+        "secret_rotation.warn_days",
+        secret_rotation.warn_days,
+        SecretRotationSettings.model_fields["warn_days"].default,
+        "[secret_rotation].warn_days = 0 turns the periodic secret-rotation reminder off -- "
+        "nothing reminds anyone ahead of a due date, or later while a secret runs overdue. The "
+        "start-time expiry checks are the only source of a secret_rotation alert left: they run "
+        "only under enforcement = enforce, and find something only on a store that tracks its "
+        "key",
+        "[secret_rotation].warn_days = {value}, shorter than the default of {default} -- a "
+        "secret is first flagged only {value} day(s) before it is due, which may leave too "
+        "little time to rotate it",
+    )
+    silencing = reminder_silencing_rules(alerts)
+    if silencing:
+        # ", " between rules and "/" between types: the serve warning joins whole entries with
+        # "; ", so an entry must not use that separator inside itself.
+        named = ", ".join(f"{label} matches {'/'.join(types)}" for label, types in silencing)
+        out.append(
+            (
+                "alerts.rules",
+                f"{len(silencing)} [[alerts.rules]] entr{'y' if len(silencing) == 1 else 'ies'} "
+                f"can send a credential reminder to no transport ({named}) -- mute = true, "
+                "transports = [], or an escalate tier with transports = [] records the reminder "
+                "but notifies nobody, so a temporary password, certificate or secret can reach "
+                "its deadline with no one told",
+            )
+        )
+    return out
+
+
 def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
@@ -7643,7 +7717,9 @@ def security_loosenings(
     (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
+    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
+    leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
+    ``[[alerts.rules]]`` entry that can silence a reminder (#2227, #2008), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS
     12.3.2), an endpoint ``url`` with a credential in its query string (ASVS 14.2.1), a generic-ODBC
     ``DATABASE`` hop
@@ -7687,17 +7763,18 @@ def security_loosenings(
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
-    ``cert_monitor`` joins them for ``warn_days = 0`` (BACKLOG #2227).
+    ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227).
 
     **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
     settings silence one or more of them with no refusal, and each is named here, so the serve-time
     warning says so: ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` at ``0`` or
     below their defaults, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
-    transport (:func:`reminder_silencing_rules`). Not every way is named.
-    ``[auth].initial_password_expiry_hours = 0`` also stops a reminder and is unreported, as the
-    paragraph above records. ``[alerts].security_notifications_required = false`` with no recipient
-    sends every reminder to the log alone; serve audits that waiver, and this registry does not
-    list it.
+    transport (:func:`_reminder_loosenings`). Not every way is named.
+    ``[auth].initial_password_expiry_hours = 0`` also stops a reminder and is unreported. The
+    paragraph above gives the reason as a new required parameter, and that premise no longer
+    holds: ``auth`` is already a parameter here, so naming it is one more arm, owed and not built.
+    ``[alerts].security_notifications_required = false`` with no recipient sends every reminder to
+    the log alone; serve audits that waiver, and this registry does not list it.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -7988,71 +8065,10 @@ def security_loosenings(
                 "key's 2**32-encrypt usage ceiling still refuses unconditionally)",
             )
         )
-    # --- the credential reminders (ASVS 6.4.5). BACKLOG #2227: each warn_days = 0 turned its reminder
-    # off with only a debug line from the runner. BACKLOG #2008 step 4: so did an alert rule that sends
-    # a reminder event nowhere. Owner answer to #2006 (a): a silent weakening keeps the cell at
-    # partial, so each is named here and reaches the serve-time warning and GET /security/posture.
-    # A lead shorter than the shipped default is named too, as #1131 names a limit looser than its
-    # default: a reminder one day ahead leaves no time to renew.
-    cert_default = CertMonitorSettings.model_fields["warn_days"].default
-    if cert_monitor.warn_days == 0:
-        out.append(
-            (
-                "cert_monitor.warn_days",
-                "[cert_monitor].warn_days = 0 turns the certificate-expiry monitor off -- no "
-                "cert_expiry reminder is raised for any certificate or CRL file the monitor "
-                "watches, so one can reach its expiry with no warning ahead of it, and a service "
-                "caller's client certificate is never flagged as near expiry",
-            )
-        )
-    elif cert_monitor.warn_days < cert_default:
-        out.append(
-            (
-                "cert_monitor.warn_days",
-                f"[cert_monitor].warn_days = {cert_monitor.warn_days}, shorter than the default "
-                f"of {cert_default} -- a certificate or CRL file is first flagged only "
-                f"{cert_monitor.warn_days} day(s) before it expires, which may leave too little "
-                "time to renew it",
-            )
-        )
-    rotation_default = SecretRotationSettings.model_fields["warn_days"].default
-    if secret_rotation.warn_days == 0:
-        # Not "no alert at all": under enforce, an expired store key and an opted-in expired class
-        # still raise an enforced alert at start (reconcile_rotation_meta, enforce_store_key_expiry,
-        # enforce_secret_expiry), whatever warn_days is. What goes is the periodic reminder.
-        out.append(
-            (
-                "secret_rotation.warn_days",
-                "[secret_rotation].warn_days = 0 turns the periodic secret-rotation reminder off "
-                "-- no secret_rotation alert is raised ahead of a due date or while a secret runs "
-                "overdue. Only the start-time checks under enforcement = enforce still alert: a "
-                "store key past its grace, and an expired class listed in "
-                "enforce_secret_expiry_classes",
-            )
-        )
-    elif secret_rotation.warn_days < rotation_default:
-        out.append(
-            (
-                "secret_rotation.warn_days",
-                f"[secret_rotation].warn_days = {secret_rotation.warn_days}, shorter than the "
-                f"default of {rotation_default} -- a secret is first flagged only "
-                f"{secret_rotation.warn_days} day(s) before it is due, which may leave too little "
-                "time to rotate it",
-            )
-        )
-    silencing = reminder_silencing_rules(alerts)
-    if silencing:
-        named = "; ".join(f"{label}: {', '.join(types)}" for label, types in silencing)
-        out.append(
-            (
-                "alerts.rules",
-                f"{len(silencing)} [[alerts.rules]] entr{'y' if len(silencing) == 1 else 'ies'} "
-                f"can send a credential reminder to no transport ({named}) -- mute = true, "
-                "transports = [], or an escalate tier with transports = [] records the reminder "
-                "but notifies nobody, so a temporary password, certificate or secret can reach "
-                "its deadline with no one told",
-            )
-        )
+    # --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4). Owner answer to
+    # #2006 (a): a silent weakening keeps the cell at partial. _reminder_loosenings says what each
+    # entry covers.
+    out.extend(_reminder_loosenings(cert_monitor, secret_rotation, alerts))
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to
     # reconcile against, so 0 is not a weaker choice, it is the only meaningful one.
     if auth.ad_enabled and not auth.ad_session_recheck_seconds:

@@ -910,9 +910,9 @@ def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
         )
     )
     assert "cert_expiry reminder" in named["cert_monitor.warn_days"]
-    assert "no secret_rotation alert" in named["secret_rotation.warn_days"]
+    assert "periodic secret-rotation reminder off" in named["secret_rotation.warn_days"]
     # Not "however overdue": under enforce the start-time checks still alert, and the text says so.
-    assert "start-time checks" in named["secret_rotation.warn_days"]
+    assert "start-time expiry checks are the only source" in named["secret_rotation.warn_days"]
     # The control: the shipped leads, and longer ones, name nothing.
     for cert, rotation in ((30, 14), (90, 60)):
         on = _names(
@@ -993,9 +993,26 @@ def test_the_silencing_entry_names_each_rule_and_quotes_its_id() -> None:
     )
     risk = named["alerts.rules"]
     assert risk.startswith("2 [[alerts.rules]] entries")
-    assert "rules[1] (id 'quiet\\ncerts'): cert_expiry" in risk
-    assert "rules[2]: initial_credential_expiring, cert_expiry, secret_rotation" in risk
+    assert "rules[1] (id 'quiet\\ncerts') matches cert_expiry, " in risk
+    assert "rules[2] matches initial_credential_expiring/cert_expiry/secret_rotation" in risk
     assert "\n" not in risk
+    # The serve warning joins whole entries with "; ", so the entry must not use it inside itself.
+    assert "; " not in risk
+
+
+def test_the_reminder_event_types_are_rule_targetable_and_emitted() -> None:
+    """The silencing check names rules by these types, so each must be one a rule can match and
+    one the notifier actually emits. A renamed type would make the check under-report silently."""
+    from messagefoundry.config.settings import (
+        _ALERT_EVENT_TYPES,
+        CREDENTIAL_REMINDER_EVENT_TYPES,
+    )
+    from messagefoundry.pipeline import alert_sinks
+
+    source = Path(alert_sinks.__file__).read_text(encoding="utf-8")
+    for event_type in CREDENTIAL_REMINDER_EVENT_TYPES:
+        assert event_type in _ALERT_EVENT_TYPES, event_type
+        assert f'"type": "{event_type}"' in source, event_type
 
 
 async def test_posture_route_reports_the_cert_monitor_the_app_was_given(engine: Engine) -> None:

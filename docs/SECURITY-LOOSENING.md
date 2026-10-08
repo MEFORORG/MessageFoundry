@@ -575,14 +575,17 @@ value below the shipped default (`30` and `14` days) is named too, as the sign-i
 than theirs: a reminder one day ahead leaves no time to renew.
 - **What you lose:** the renewal reminder, or the time it gives. At `0`, the cert monitor raises no
   `cert_expiry` alert for any certificate or CRL file it watches, and a service caller's client
-  certificate is never flagged as near expiry. At `0`, the rotation reminder raises no
-  `secret_rotation` alert ahead of a due date or while a secret runs overdue. Before this entry, each
-  showed only as a debug line from its runner.
-- **What you keep:** the start-time checks under `enforcement = enforce`, whatever `warn_days` is. A
-  store key past `store_key_max_age_days + enforce_grace_days` still raises an enforced alert and
-  refuses to start under `enforce_store_key_expiry`, and an expired class listed in
-  `enforce_secret_expiry_classes` does the same. The `[alerts]` recipient gate also counts each
-  reminder separately, so turning one off does not hide the others.
+  certificate is never flagged as near expiry. At `0`, the periodic rotation reminder is off:
+  nothing reminds anyone ahead of a due date, or later while a secret runs overdue. Before this
+  entry, each showed only as a debug line from its runner.
+- **What you keep:** at least the start-time expiry checks, whatever `warn_days` is, and only where
+  they can run. Under `enforcement = enforce`, on a store that tracks its key, a store key past
+  `store_key_max_age_days + enforce_grace_days`, or of an age that cannot be determined, raises a
+  `secret_rotation` alert and refuses to start under `enforce_store_key_expiry`. An expired class
+  listed in `enforce_secret_expiry_classes` does the same. On a keyless or `vault_transit` store
+  these checks find nothing, so with `warn_days = 0` no `secret_rotation` alert of any kind fires
+  there. The `[alerts]` recipient gate counts each reminder separately, so turning one off does not
+  hide the others. A longer `check_interval_seconds` also delays a reminder, and it is not named.
 - **When acceptable:** an instance where something outside the engine tracks the same certificates or
   secrets and reminds a person in time.
 - **Compensating controls:** that outside tracker, and a calendar entry per credential.
@@ -604,7 +607,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Compensating controls:** route the reminder events to a transport somebody reads, ahead of the
   silencing rule, since the first matching rule wins. The entry stays listed even so, because the check
   reads each rule alone.
-- **Reversible:** yes. Remove the rule, narrow its `event_type`, or give it a transport, and restart.
+- **Reversible:** yes. Remove the rule or narrow its `event_type`, and restart. Giving it a transport
+  is not enough on its own: `mute = true` sends nothing whatever `transports` holds, and an
+  `escalate` tier with `transports = []` overrides the base rule once it is reached.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating
 > **Conditional**, like `allowed_client_networks`. With no directory to reconcile against, `0` is not a
