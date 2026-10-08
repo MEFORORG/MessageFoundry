@@ -117,11 +117,13 @@ def test_the_supervisor_spool_is_its_own_directory_beside_the_shards(
 
 def test_no_shard_can_be_given_the_supervisor_spool_directory(tmp_path: Path) -> None:
     from messagefoundry.__main__ import _forward_spool_dir, _supervisor_forward_spool_dir
-    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.settings import LoggingSettings, ServiceSettings, StoreSettings
 
     db = str(tmp_path / "messagefoundry.db")
     for spool_dir in (None, str(tmp_path / "spool")):
-        settings = ServiceSettings(store={"path": db}, logging={"forward_spool_dir": spool_dir})
+        settings = ServiceSettings(
+            store=StoreSettings(path=db), logging=LoggingSettings(forward_spool_dir=spool_dir)
+        )
         own = _supervisor_forward_spool_dir(settings, db)
         shards = {_forward_spool_dir(settings, shard) for shard in (None, "supervisor", "a")}
         assert own not in shards and len(shards) == 3
