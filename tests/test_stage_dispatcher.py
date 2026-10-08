@@ -651,6 +651,37 @@ async def _pending_lanes(store: Any, lanes: list[str]) -> list[str]:
     return [lane for lane, _ in await store.list_fifo_lanes(Stage.INGRESS.value) if lane in owned]
 
 
+def _pause_state(d: StageDispatcher, lanes: list[str]) -> list[str]:
+    """Lanes paused, or carrying a pause that has not landed yet (``pause_pending``)."""
+    return [
+        x
+        for x in lanes
+        if d.paused(x) or ((st := d._states.get(x)) is not None and st.pause_pending)
+    ]
+
+
+def _not_idle(d: StageDispatcher, lanes: list[str]) -> list[tuple[str, str]]:
+    """Each lane not IDLE, with its phase: the diagnostic a drain timeout must carry."""
+    return [(x, p.name) for x in lanes if (p := d.phase(x)) not in (None, _LanePhase.IDLE)]
+
+
+async def _resume_all(d: StageDispatcher, lanes: list[str], *, rounds: int = 200) -> bool:
+    """Resume every lane until none is paused AND none carries a pending pause.
+
+    ``paused()`` reads only the PAUSED phase. A lane paused while CLAIMING or PROCESSING carries
+    ``pause_pending`` instead, and reads not paused. Resuming only the lanes ``paused()`` names misses
+    it, and it lands in PAUSED later, where notify_work deliberately leaves it: a drain then never goes
+    quiet. So resume EVERY lane each round. resume_lane cancels a pending pause, re-arms a PAUSED lane,
+    and is a no-op on any other."""
+    for _ in range(rounds):
+        for x in lanes:
+            d.resume_lane(x)
+        await _settle(rounds=2)
+        if not _pause_state(d, lanes):
+            return True
+    return False
+
+
 async def _drain_to_quiescence(
     d: StageDispatcher, store: Any, lanes: list[str], mc: ManualClock, *, budget: float = 30.0
 ) -> bool:
@@ -1153,6 +1184,45 @@ async def test_drain_refuses_an_idle_lane_with_work_and_no_contention(store: Any
         with pytest.raises(AssertionError, match="no claim contention this round"):
             await _drain_to_quiescence(d, store, [lane], mc, budget=1.0)
         assert stub.records == [] and d.claim_head_skips == 0 and d.claim_lock_timeouts == 0
+    finally:
+        await d.stop()
+
+
+async def test_resume_all_cancels_a_pause_that_has_not_landed(store: Any) -> None:
+    """The pause/resume soak failed once on the SQL Server 2022 leg (PR 2154, run 37707903019): its
+    drain never went quiet. Its resume loop resumed only the lanes ``paused()`` named. A lane paused
+    mid-PROCESSING carries ``pause_pending`` and reads not paused, so the loop skipped it, and the lane
+    reached PAUSED after the loop ended. A slower store keeps a lane in flight longer, which widens
+    the window.
+
+    THE CONTROL: the lane is pinned in PROCESSING, paused, and reads not paused, which is the case
+    the old loop could not see. Released without a resume, it lands PAUSED."""
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    lane, other = "IB_PAUSE_IN_FLIGHT", "IB_PAUSE_LANDS"
+    [mid] = await _seed(store, lane, [100.0])
+    await _seed(store, other, [100.0])
+    gate, gate_other = asyncio.Event(), asyncio.Event()
+    stub.gate(lane, gate)
+    stub.gate(other, gate_other)
+    d = _make(store, stub, {lane, other}, clock=mc)
+    await d.start()
+    try:
+        assert await _wait_until(
+            lambda: all(d.phase(x) is _LanePhase.PROCESSING for x in (lane, other))
+        )
+        for x in (lane, other):
+            d.pause_lane(x)
+        assert not d.paused(lane) and _pause_state(d, [lane]) == [lane], "pending, not PAUSED"
+        # The control: with no resume, the pending pause lands once the episode ends.
+        gate_other.set()
+        assert await _wait_until(lambda: d.paused(other))
+        # The fix: resume every lane, so the in-flight pause is cancelled before it lands.
+        assert await _resume_all(d, [lane, other])
+        gate.set()
+        assert await _drain_to_quiescence(d, store, [lane, other], mc)
+        assert not d.paused(lane) and not d.paused(other)
+        assert mid in {r.message_id for r in stub.records}
     finally:
         await d.stop()
 
@@ -2732,35 +2802,13 @@ async def test_pause_resume_soak_busy_violations(store: Any) -> None:
             assert d.busy_violations == 0  # the one-consumer-per-lane invariant holds every step
             assert stub.concurrency_violations == 0
 
-        # Resume EVERY lane that is (or has just become) paused — settle between rounds so a lane that
-        # only just reached PAUSED (a pause_pending that quiesced) is resumed too (resume_lane no-ops on
-        # a not-yet-PAUSED lane). Then force-drain to quiescence (mirrors the main soak's kick loop).
-        for _ in range(6):
-            await _settle(rounds=2)
-            still = [x for x in lanes if d.paused(x)]
-            if not still:
-                break
-            for x in still:
-                d.resume_lane(x)
-        assert not any(d.paused(x) for x in lanes)
-
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 30.0
-        drained = False
-
-        def _quiescent() -> bool:
-            return d.processing_lanes == 0 and all(
-                d.phase(x) in (None, _LanePhase.IDLE) for x in lanes
-            )
-
-        while loop.time() < deadline:
-            d.notify_work()
-            mc.advance(1_000_000.0)
-            await d._run_sweep_once()
-            if await _wait_until(_quiescent, timeout=3.0, required=False):
-                drained = True
-                break
-        assert drained, "pause/resume soak did not reach quiescence"
+        # Resume EVERY lane, then force-drain to quiescence (see _resume_all, _drain_to_quiescence).
+        assert await _resume_all(d, lanes), f"lanes still paused: {_pause_state(d, lanes)}"
+        drained = await _drain_to_quiescence(d, store, lanes, mc)
+        assert drained, (
+            f"pause/resume soak did not reach quiescence; not idle: {_not_idle(d, lanes)}"
+            f"; still pending: {await _pending_lanes(store, lanes)}"
+        )
 
         assert d.busy_violations == 0
         assert stub.concurrency_violations == 0
