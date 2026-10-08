@@ -22,6 +22,7 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.redaction import log_timestamp
 
 __all__ = [
@@ -855,11 +856,15 @@ class LoggingAlertSink:
         )
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        # Scrubbed at the call site for CodeQL py/log-injection (alert 207); scrub_log_argument
+        # says why. The scrub runs over ``repr``, which has escaped the log alphabet already, so
+        # the two quoted values read as ``%r`` wrote them. Scrubbing first and then formatting with
+        # ``%r`` would double each backslash.
         log.warning(
-            "ALERT administrator_granted: %r was given the Administrator role (%s) by %r",
-            name,
-            via,
-            granted_by,
+            "ALERT administrator_granted: %s was given the Administrator role (%s) by %s",
+            scrub_log_argument(repr(name)),
+            scrub_log_argument(via),
+            scrub_log_argument(repr(granted_by)),
         )
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
