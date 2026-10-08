@@ -7567,6 +7567,44 @@ def oidc_second_factor_claim_exception(auth: AuthSettings) -> str:
     return ""
 
 
+#: The alert event types that carry a credential reminder (ASVS 6.4.5): an unclaimed temporary
+#: password near its deadline, a certificate near expiry, a secret due for rotation. Each is a member
+#: of ``_ALERT_EVENT_TYPES``, so a rule can name it.
+CREDENTIAL_REMINDER_EVENT_TYPES: tuple[str, ...] = (
+    "initial_credential_expiring",
+    "cert_expiry",
+    "secret_rotation",
+)
+
+
+def reminder_silencing_rules(alerts: AlertsSettings) -> list[tuple[str, tuple[str, ...]]]:
+    """Each ``[[alerts.rules]]`` entry that can send a credential reminder to no transport, as
+    ``(label, reminder event types it can match)`` (BACKLOG #2008 step 4, ASVS 6.4.5).
+
+    A rule silences a matching event when it sets ``mute = true`` or ``transports = []``, or when an
+    escalate tier sets ``transports = []`` and the occurrence count reaches it
+    (``NotifierAlertSink._apply_escalation``). A rule that sets ``min_depth`` or
+    ``min_oldest_seconds`` never matches a reminder event (``AlertRuleSet._matches``), so it is
+    skipped.
+
+    **It reads each rule alone, and so it can over-report.** A rule whose connection glob or schedule
+    excludes every reminder, or one that an earlier rule always shadows (first match wins), is still
+    listed. That errs toward naming a rule that silences nothing over missing one that silences a
+    reminder. The label is the rule's position, plus its ``id`` quoted with ``repr`` so a control
+    character in it cannot reach the log raw."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for i, rule in enumerate(alerts.rules):
+        if rule.min_depth is not None or rule.min_oldest_seconds is not None:
+            continue
+        types = tuple(t for t in CREDENTIAL_REMINDER_EVENT_TYPES if rule.event_type in ("any", t))
+        if not types:
+            continue
+        if rule.mute or rule.transports == [] or any(t.transports == [] for t in rule.escalate):
+            label = f"rules[{i}]" if rule.id is None else f"rules[{i}] (id {rule.id!r})"
+            out.append((label, types))
+    return out
+
+
 def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
@@ -7651,10 +7689,12 @@ def security_loosenings(
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
     ``cert_monitor`` joins them for ``warn_days = 0`` (BACKLOG #2227).
 
-    **The credential reminders (ASVS 6.4.5, BACKLOG #2227).** Two settings each turn one off with no
-    refusal, and each is named here, so the serve-time warning says so: ``[cert_monitor].warn_days =
-    0`` and ``[secret_rotation].warn_days = 0``. ``[auth].initial_password_expiry_hours = 0`` also
-    stops a reminder, and it stays unreported for the reason the paragraph above gives.
+    **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** Three settings each
+    silence one or more of them with no refusal, and each is named here, so the serve-time warning
+    says so: ``[cert_monitor].warn_days = 0``, ``[secret_rotation].warn_days = 0``, and an
+    ``[[alerts.rules]]`` entry that can send a reminder event to no transport
+    (:func:`reminder_silencing_rules`). ``[auth].initial_password_expiry_hours = 0`` is the fourth
+    way to stop a reminder, and it stays unreported for the reason the paragraph above gives.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -7946,9 +7986,9 @@ def security_loosenings(
             )
         )
     # --- the credential reminders (ASVS 6.4.5). BACKLOG #2227: each warn_days = 0 turned its reminder
-    # off with only a debug line from the runner. Owner answer to #2006 (a): a silent weakening keeps
-    # the cell at partial, so each is named here and reaches the serve-time warning and
-    # GET /security/posture.
+    # off with only a debug line from the runner. BACKLOG #2008 step 4: so did an alert rule that sends
+    # a reminder event nowhere. Owner answer to #2006 (a): a silent weakening keeps the cell at
+    # partial, so each is named here and reaches the serve-time warning and GET /security/posture.
     if cert_monitor.warn_days == 0:
         out.append(
             (
@@ -7966,6 +8006,19 @@ def security_loosenings(
                 "[secret_rotation].warn_days = 0 turns the secret-rotation reminder off -- no "
                 "secret_rotation reminder is raised for the store key or any tracked credential, "
                 "however overdue. The start-time expiry refusals still run",
+            )
+        )
+    silencing = reminder_silencing_rules(alerts)
+    if silencing:
+        named = "; ".join(f"{label}: {', '.join(types)}" for label, types in silencing)
+        out.append(
+            (
+                "alerts.rules",
+                f"{len(silencing)} [[alerts.rules]] entr{'y' if len(silencing) == 1 else 'ies'} "
+                f"can send a credential reminder to no transport ({named}) -- mute = true, "
+                "transports = [], or an escalate tier with transports = [] records the reminder "
+                "but notifies nobody, so a temporary password, certificate or secret can reach "
+                "its deadline with no one told",
             )
         )
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to

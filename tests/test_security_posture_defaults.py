@@ -919,6 +919,70 @@ def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
     assert "cert_monitor.warn_days" not in on and "secret_rotation.warn_days" not in on
 
 
+def _rules(*rules: dict[str, object]) -> AlertsSettings:
+    return AlertsSettings.model_validate({"rules": list(rules)})
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        pytest.param({"event_type": "any", "mute": True}, id="catch-all-mute"),
+        pytest.param({"event_type": "cert_expiry", "transports": []}, id="no-transport"),
+        pytest.param(
+            {"event_type": "secret_rotation", "escalate": [{"after_count": 2, "transports": []}]},
+            id="escalate-tier-to-nowhere",
+        ),
+        pytest.param(
+            {"event_type": "initial_credential_expiring", "connection": "a*", "mute": True},
+            id="glob-scoped-mute",
+        ),
+    ],
+)
+def test_a_rule_that_can_silence_a_reminder_is_a_named_loosening(rule: dict[str, object]) -> None:
+    """BACKLOG #2008 step 4: what ASVS 6.4.5's trigger 1 names. The rule decision sends a matching
+    reminder to no transport, after the recipient gate has passed, and nothing said so."""
+    named = dict(_pairs(alerts=_rules(rule)))
+    assert "rules[0]" in named["alerts.rules"]
+    assert "to no transport" in named["alerts.rules"]
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        pytest.param({"event_type": "connection_stopped", "mute": True}, id="other-event"),
+        pytest.param(
+            {"event_type": "any", "min_depth": 5, "mute": True}, id="depth-rule-never-matches"
+        ),
+        pytest.param({"event_type": "any", "transports": ["email"]}, id="routes-somewhere"),
+        pytest.param(
+            {"event_type": "cert_expiry", "escalate": [{"after_count": 2, "severity": "critical"}]},
+            id="tier-keeps-transports",
+        ),
+    ],
+)
+def test_a_rule_that_cannot_silence_a_reminder_is_not_named(rule: dict[str, object]) -> None:
+    assert "alerts.rules" not in _names(alerts=_rules(rule))
+
+
+def test_the_silencing_entry_names_each_rule_and_quotes_its_id() -> None:
+    """Every silencing rule is named, by position and by its id. The id is operator text, so it is
+    quoted with repr and a control character in it never reaches the log raw."""
+    named = dict(
+        _pairs(
+            alerts=_rules(
+                {"event_type": "connection_stopped", "mute": True},
+                {"event_type": "cert_expiry", "mute": True, "id": "quiet\ncerts"},
+                {"event_type": "any", "transports": []},
+            )
+        )
+    )
+    risk = named["alerts.rules"]
+    assert risk.startswith("2 [[alerts.rules]] entries")
+    assert "rules[1] (id 'quiet\\ncerts'): cert_expiry" in risk
+    assert "rules[2]: initial_credential_expiring, cert_expiry, secret_rotation" in risk
+    assert "\n" not in risk
+
+
 async def test_posture_route_reports_the_cert_monitor_the_app_was_given(engine: Engine) -> None:
     """The route reads [cert_monitor] off app.state, where the managed lifespan stashes it. The
     default app is the control."""

@@ -2998,8 +2998,8 @@ def test_serve_either_reminder_alone_needs_a_recipient(
 def test_serve_warns_when_a_credential_reminder_is_silenced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # BACKLOG #2227 (ASVS 6.4.5): each warn_days = 0 is named in the serve-time loosening WARNING,
-    # which goes to stdout.
+    # BACKLOG #2227 and #2008 step 4 (ASVS 6.4.5): each way to silence a reminder past the
+    # recipient gate is named in the serve-time loosening WARNING, which goes to stdout.
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
@@ -3007,12 +3007,13 @@ def test_serve_warns_when_a_credential_reminder_is_silenced(
         + _SECURE_RETENTION
         + _CERT_REMINDER_OFF
         + _ROTATION_REMINDER_OFF
-        + _SECURE_ALERTS,
+        + _SECURE_ALERTS
+        + '[[alerts.rules]]\nevent_type = "initial_credential_expiring"\nmute = true\n',
     )
     assert rc == 0
     out = capsys.readouterr().out
     assert "posture loosened from the secure defaults" in out
-    for switch in ("cert_monitor.warn_days", "secret_rotation.warn_days"):
+    for switch in ("cert_monitor.warn_days", "secret_rotation.warn_days", "alerts.rules"):
         assert switch in out, switch
 
 

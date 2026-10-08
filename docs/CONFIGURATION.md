@@ -1423,6 +1423,14 @@ connection = "OB_LOADTEST"
 transports = []   # suppress every event for this connection
 ```
 
+> **A rule that can send a credential reminder to no transport is named at every start** (BACKLOG
+> #2008, ASVS 6.4.5). That is a rule whose `event_type` is `any`, `initial_credential_expiring`,
+> `cert_expiry` or `secret_rotation`, with `mute = true`, `transports = []`, or an `escalate` tier
+> with `transports = []`. The serve-time loosening warning and `GET /security/posture` list it as
+> `alerts.rules`. The check reads each rule alone, so the last example above is named too: its
+> `connection` glob decides whether a reminder ever matches it, and the check does not try to tell.
+> Give such a rule an `event_type` other than `any` to keep it off the list.
+
 > A rule routing to a transport that isn't configured (e.g. `transports = ["email"]` with a webhook
 > but no SMTP settings) is rejected at startup, so a typo can't silently black-hole an alert.
 > **That check has one gap worth knowing, because the recipes below sit in it:** it lives inside the
