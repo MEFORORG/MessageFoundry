@@ -827,3 +827,60 @@ which is the whole of the added risk. So a spawn is better read as a SIGNAL THAT
 HAS FAILED -- a seat died with work outstanding, or nobody was alive to take a red -- than as a
 routine tool. Raised by a Manager seat on 2026-09-16, about its own grant, which is the direction
 that argument is most credible from.
+
+### A Builder gets one turn, items 2, 5 and 6, from section 5
+
+`CLAUDE.md` keeps item 1 whole and a short form of each of these three. The full items follow.
+
+2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
+   push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at
+   tool-call time and deny the tool call itself. Each one sees only some tools.
+   `collision_gate.ps1`, wired by `scripts/coord/install-coordination.ps1`, sees Write, Edit,
+   MultiEdit and NotebookEdit, and nothing else. `worktree_gate.ps1`, installed to
+   `%USERPROFILE%\.claude\hooks\` by `scripts/worktree/install-gate.ps1`, sees at least those four
+   tools and Bash and PowerShell. On the four edit tools it judges the file being written. On a
+   shell call it judges only git commands, by verb, config key and the repository or worktree they
+   target. **So neither guard intercepts an ordinary shell write, such as a redirect into a
+   file.** The worktree gate's own deny text says a shell route around a denied write still breaks
+   its rule. CI arrives later, when the process is gone.
+5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
+   Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
+   which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
+   `echo C:\Temp\demo` prints `C:Tempdemo`, so `pwsh` reports the argument is not a
+   script file, which reads as a missing script rather than a quoting bug. Measured 2026-09-02. This
+   is ordinary POSIX quoting and is **not** BACKLOG #1397, which is the Bash tool unescaping inside
+   a QUOTED heredoc.
+   The **PowerShell tool** does refuse a nested `pwsh`, with `Command spawns a nested PowerShell
+   process which cannot be validated`. That refusal belongs to one tool, not to the harness, and
+   the Bash tool has no such check. **This line previously said a seat cannot declare itself.**
+   That was wrong, and it was self-confirming: a Builder told it cannot declare does not try,
+   renders undeclared, and confirms the rule. Two Builders on one root, 33 minutes apart: the
+   second's brief asked it to declare and the first's did not, and only the second declared. They
+   also differed in task, worktree and grant list, so that is the cause and not a controlled arm.
+   A SessionStart hook (`scripts/hooks/seat-declare-prompt.ps1`) prints a line telling every
+   starting session to declare. **Do not ignore it.** The Manager should still supply seat and goal
+   at dispatch, because no hook will invent a goal, by design: a machine that invents one writes a
+   record that looks declared and says nothing.
+
+6. **A brief can be wrong by the time you read it, and nothing will tell you.** Verify it against
+   the tree before you act on it: read the diff of **every PR it names**, at hunk granularity, and
+   re-locate every line number by symbol. **Where the brief and the tree disagree, the tree wins.**
+   ***Do not scope this check to how recently the brief was written.*** Two windows give the same
+   symptom and **the wider one dominates**: a brief goes stale AFTER dispatch, in minutes, and it is
+   written stale because the ITEM it was cut from is stale, over weeks. A Manager seat reported six
+   of eleven briefed items already answered at spawn on 2026-09-04 -- by an ADR accepted before the
+   brief, by work shipped under a different number, by a PR the item itself says not to rebuild.
+   **Attributed, not verified here.** The structural cause is that an item records its own research
+   and nothing records the work that ANSWERS it, so a settled row still reads as current.
+   **Line numbers are navigation aids and never evidence** -- the same seat measured four anchors
+   adrift by 50, 86, 581 and 593 lines in one day, one item with both of its anchors dead.
+   Measured here 2026-09-04, the after-dispatch window: a chip named three drift sites, and minutes
+   later the spawner took item 3 itself and pushed it as `c2f549f42` on PR 837. The receiver read
+   that diff before touching anything, saw both hunks already rewritten, and skipped it. Trusting
+   the brief would have put two PRs on the same two comment blocks, to meet at merge with the Lander
+   resolving prose by hand. **Two of the same brief's other three items also failed to survive a
+   read of their sources**, so one confirmed drift is a reason to re-check the rest, not to correct
+   that line and carry on. ***"The brief is disposable" above says it may be thrown away; it does
+   not say it was true when written.*** **Finding an item already answered is a GOOD outcome** --
+   record it with evidence and stop, rather than building it again. BACKLOG #1448, same family
+   as #1391.
