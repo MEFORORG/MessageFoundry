@@ -91,7 +91,7 @@ async def store(request: pytest.FixtureRequest, tmp_path: Path) -> AsyncIterator
         pytest.skip("set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* env) to run the SQL Server case")
     if backend == "postgres" and not _POSTGRES_ON:
         pytest.skip("set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env) to run the Postgres case")
-    s = await _OPENERS[backend](tmp_path / "fifo_idx.db")
+    s: Any = await _OPENERS[backend](tmp_path / "fifo_idx.db")
     s._test_backend = backend
     s._test_path = tmp_path / "fifo_idx.db"  # for reopen (SQLite); server reopens via settings
     try:
@@ -208,7 +208,7 @@ async def _reopen(store: Any) -> Any:
     """Re-open the SAME underlying DB (triggering _migrate / _ensure_schema again) and return the new
     handle, tagged for the helpers. The caller owns closing it."""
     backend = store._test_backend
-    fresh = await _OPENERS_NO_CLEAN[backend](store._test_path)
+    fresh: Any = await _OPENERS_NO_CLEAN[backend](store._test_path)
     fresh._test_backend = backend
     fresh._test_path = store._test_path
     return fresh
