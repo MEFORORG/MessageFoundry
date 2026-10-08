@@ -555,9 +555,11 @@ gates a merge**, and no seat has to clear one.
   the owner for a ruling. Korus `roles/LANDER.md` *4a-quinquies* holds the rest; the full text is in
   [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
-  verdict, because it hides one blocking reason behind another. Korus `roles/LANDER.md` section 3
-  and *7c-ter* say how to read the rest. The full text, with BACKLOG #1417 and its 2026-09-04
-  amendment, is in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
+  verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
+  first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
+  `roles/LANDER.md` section 3 and *7c-ter* cover reading the check runs and the merge itself. The
+  full text, with BACKLOG #1417 and its 2026-09-04 amendment, is in
+  [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
 - Never write the required-context count into a document. `.github/required-contexts.txt` is a
   checked-in claim that can lag the server, so read branch protection for the live set. When the set
   moves, move that file and the pinned count in `tests/test_required_contexts.py` in the same PR, or
