@@ -685,15 +685,32 @@ def assert_same_origin(request: Request) -> None:
     (by design — a must-change-confined session must be able to revoke itself, ASVS 7.4.4) and so has
     no other request-provenance control.
 
-    A request carrying NEITHER header **fails closed** with 403 (BACKLOG #1116, #1124). It used to
+    A WRITE carrying NEITHER header **fails closed** with 403 (BACKLOG #1116, #1124). It used to
     pass, on the reasoning that a browser attaches one of the two to every cross-site POST. That is an
     assumption about the browser, and nothing told the operator when it did not hold. No shipped
     first-party client posts to ``/ui`` without a browser, so the refusal costs a conforming client
     nothing; a script that drives ``/ui`` must send ``Origin``.
+
+    **A GET keeps the rule it had before that item, and must.** The one GET that reaches this check
+    is ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in navigation. Owner rulings
+    R4 and R4b of 2026-09-28 hold that a sign-in GET is never blocked for missing fetch metadata. So
+    on a GET an absent, empty or unknown ``Sec-Fetch-Site`` raises nothing by itself; ``cross-site``,
+    ``same-site`` and a non-matching ``Origin`` are still refused there, as they were.
     """
+    site = request.headers.get("sec-fetch-site")
+    if request.method == "GET":
+        # The pre-#1116 rule, unchanged. "GET" and nothing wider, to match require_ui's own
+        # definition of a write (``request.method != "GET"``).
+        if site is not None:
+            assert_not_cross_site(request)
+            return
+        origin = request.headers.get("origin")
+        if origin and not _origin_matches(request.app.state, origin, request.headers.get("host")):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-origin request rejected")
+        return
     # An EMPTY Sec-Fetch-Site names no provenance, so it is absence, as an empty Origin is below. A
     # present value this code does not know (anything but cross-site/same-site) still passes here.
-    if request.headers.get("sec-fetch-site"):
+    if site:
         assert_not_cross_site(request)
         return
     origin = request.headers.get("origin")

@@ -225,7 +225,8 @@ async def test_each_fetch_metadata_rows_absence_verdict_matches_the_middleware()
 
 def _fake_request(headers: dict[str, str]) -> Any:
     state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
-    return SimpleNamespace(headers=headers, app=SimpleNamespace(state=state))
+    # A POST: the row is the form-POST row, and the check keeps its earlier rule on a GET.
+    return SimpleNamespace(method="POST", headers=headers, app=SimpleNamespace(state=state))
 
 
 def test_the_form_post_origin_rows_absence_verdict_matches_assert_same_origin() -> None:

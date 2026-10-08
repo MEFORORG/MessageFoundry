@@ -74,7 +74,10 @@ this line.**
   cross-site control in a browser that sends neither header. A current browser sends
   `Sec-Fetch-Site` on every request, so the console's pages are unaffected there. A browser without
   `Sec-Fetch-Site` should be treated as unable to sign in; `docs/BROWSER-SUPPORT.md` says why. A
-  script that drives `/ui` must now send `Origin`. The CSP report sink `/ui/csp-report` still accepts a report with neither. No seam
+  script that drives `/ui` must now send `Origin`. The CSP report sink `/ui/csp-report` still
+  accepts a report with neither. The refusal is for writes. Three sign-in GETs are deliberately not
+  blocked for missing fetch metadata, under owner rulings R4 and R4b of 2026-09-28: `GET /ui/sso`,
+  `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped. No seam
   change. (BACKLOG #1116, #1124)
 - **Resend, edit-resend, upload resend, queue purge and config reload each take a proof bound to
   that action.** A fresh session window no longer reaches them. Each needs a re-authentication made

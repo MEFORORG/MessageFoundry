@@ -56,10 +56,11 @@ def _client(**policy: Any) -> TestClient:
     oidc_routes.register(app, deps)
     app.state.auth = _FakeAuth()
     app.state.public_origin = ""  # start leg bails before the IdP; we assert on the interstitial
-    # A browser's own request names its provenance. Without this default every start-leg request
+    # A browser's own request names its provenance. Without this default every start-leg POST
     # here is refused for carrying neither Sec-Fetch-Site nor Origin (BACKLOG #1116, #1124), and a
-    # test asserting only "not the interstitial" or "not 405" would pass on that 403. A test that
-    # sends its own Sec-Fetch-Site replaces this one.
+    # test asserting only "not 405" would pass on that 403. A test that sends its own
+    # Sec-Fetch-Site replaces this one. The GET is not refused for that; the console suite's
+    # test_ui_login_gets_not_blocked.py drives it with neither header.
     return TestClient(app, follow_redirects=False, headers={"Sec-Fetch-Site": "same-origin"})
 
 
