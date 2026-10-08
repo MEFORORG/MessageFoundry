@@ -1789,9 +1789,203 @@ def _forward_spool_dir(settings: ServiceSettings, shard: str | None) -> str:
 
     A per-shard subdirectory in both cases: the spool takes an exclusive lock on its directory, so
     engine shards sharing one would leave all but the first without a spool."""
-    base = settings.logging.forward_spool_dir
-    root = Path(base) if base else Path(settings.store.path).resolve().parent / "log-spool"
+    root = _forward_spool_root(settings, settings.store.path)
     return str(root / (f"shard-{shard}" if shard else "engine"))
+
+
+def _forward_spool_root(settings: ServiceSettings, store_path: str) -> Path:
+    """The directory the per-process spool directories sit in: ``[logging].forward_spool_dir``, or
+    ``log-spool`` beside ``store_path``."""
+    base = settings.logging.forward_spool_dir
+    return Path(base) if base else Path(store_path).resolve().parent / "log-spool"
+
+
+def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> str:
+    """The supervisor process's own spool directory, beside its engine shards' (BACKLOG #2356).
+
+    Its own for the reason :func:`_forward_spool_dir` gives: the spool locks its directory. The
+    default root is beside ``--db``, because each engine shard's ``[store].path`` is derived from
+    that flag, so the supervisor's directory lands next to theirs. No shard directory can take
+    the name: those are ``engine`` or start ``shard-``."""
+    return str(_forward_spool_root(settings, db_base) / "supervisor")
+
+
+def _start_logging(
+    settings: ServiceSettings,
+    *,
+    env_name: str | None,
+    enforcing: bool,
+    spool_dir: str,
+    configure: Callable[[SyslogForward | None], bool],
+) -> int | None:
+    """Pass the off-box forwarding gates, then install this process's log handlers.
+
+    Returns the exit code of a refused start, or ``None`` once logging is configured. One body for
+    ``serve`` and ``supervise`` (BACKLOG #2356), so the supervisor process cannot forward past a
+    gate an engine process refuses, and both print the same refusal. ``spool_dir`` is this process's
+    own spool directory (:func:`_forward_spool_dir`); the spool locks it.
+
+    ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
+    passed (``None`` with no collector). It stays at the call site because level, format and the
+    application-log file are the caller's, and it runs only after every gate here has passed."""
+    from messagefoundry.config.settings import (
+        SyslogProtocol,
+        forward_hop_disposition,
+        forwarding_gate_refusal,
+        hop_posture_from_ai,
+    )
+    from messagefoundry.config.tls_policy import HopDisposition, InsecureHopRefused
+    from messagefoundry.keywrap import KeyWrapRefused
+
+    # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
+    # so evidence survives a host compromise. PHI redaction + control-char scrubbing apply to the
+    # forwarded stream exactly as to stdout (configure_logging installs the same filters on both).
+    # Derived once and used twice below: by the #200 forward_hop_disposition gate, and (BACKLOG #1498,
+    # ADR 0173 §4.3) threaded onto SyslogForward so the forwarder's own revocation guard can key on it.
+    # That handler is built outside the connectors' active_hop_posture scope, so the posture cannot be
+    # read ambiently there and has to travel with the target.
+    _forward_posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    log_forward = (
+        SyslogForward(
+            host=settings.logging.forward_host,
+            port=settings.logging.forward_port,
+            protocol=settings.logging.forward_protocol.value,
+            fmt=settings.logging.forward_format.value,
+            # Native TLS-syslog (ADR 0080): applied only when protocol == "tls"; unused otherwise.
+            tls_ca_file=settings.logging.forward_tls_ca_file,
+            tls_verify=settings.logging.forward_tls_verify,
+            tls_client_cert=settings.logging.forward_tls_client_cert,
+            tls_crl_file=settings.logging.forward_tls_crl_file,
+            hop_posture=_forward_posture,
+            # BACKLOG #1966 (ADR 0200): the on-disk spool, one directory per process.
+            spool_dir=spool_dir,
+            spool_max_bytes=settings.logging.forward_spool_max_bytes,
+        )
+        if settings.logging.forward_enabled and settings.logging.forward_host
+        else None
+    )
+    # #200 (ADR 0092) residual: the forwarder was the ONE egress path with no posture gate — its
+    # plaintext-UDP default shipped the (best-effort redacted, still sensitive) log + audit evidence stream
+    # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
+    # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
+    # Loopback (the ADR 0080 local-agent deployment) passes THIS hop check, though the BACKLOG #1966
+    # forwarding gate below refuses it under enforce; no instance is exempt as synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
+    # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
+    # [logging].forward_hop_attested, which lets the hop through silently under either dial.
+    if log_forward is not None:
+        _forward_hop = forward_hop_disposition(settings.logging, _forward_posture)
+        # Name WHY the hop is unprotected: a plaintext protocol, or tls with verification opted out
+        # (encrypted but unauthenticated => MITM-able). Both land on the gradient.
+        _forward_why = (
+            "certificate verification is disabled (forward_tls_verify=false)"
+            if settings.logging.forward_protocol is SyslogProtocol.TLS
+            else f"forward_protocol={settings.logging.forward_protocol.value!r} is plaintext"
+        )
+        if _forward_hop is HopDisposition.REFUSE:
+            print(
+                "error: [logging] off-box forwarding to "
+                f"{settings.logging.forward_host}:{settings.logging.forward_port} is not a verified-TLS "
+                f"hop ({_forward_why}) — the log/audit evidence stream would cross the network "
+                f"unprotected on a PHI instance under [security].enforcement=enforce ({env_name!r}). "
+                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file and "
+                "[logging].forward_tls_crl_file (ADR 0080) and a TLS port such as 6514. Attesting "
+                "the hop ([logging].forward_hop_attested) clears this check only; a PHI instance "
+                "under enforce still refuses to start without verified TLS to a separate collector "
+                "(BACKLOG #1966).",
+                file=sys.stderr,
+            )
+            return 2
+        if _forward_hop is HopDisposition.WARN:
+            # Crossed, but never silent — the point of the fix. WARNING surfaces via the root
+            # lastResort handler even though configure_logging has not run yet.
+            logging.getLogger(__name__).warning(
+                "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
+                "evidence stream crosses the network unprotected on a PHI instance. Set "
+                "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
+                "(ADR 0080) to a collector on another host.",
+                settings.logging.forward_host,
+                settings.logging.forward_port,
+                _forward_why,
+            )
+    # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
+    # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
+    # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
+    # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
+    # ONLY: it opens no socket and resolves no name, so a collector that is down cannot hold a
+    # clinical message path from starting through this gate. It keys on forwarding, not on the
+    # spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not this gate.
+    # Placed BEFORE configure_logging, beside the #200 hop gate, so a refused start opens no spool
+    # and contacts no collector.
+    _forwarding_gap = forwarding_gate_refusal(settings.logging)
+    if _forwarding_gap is not None:
+        _forwarding_fix = (
+            "Set [logging].forward_host to a collector on another host, "
+            "[logging].forward_protocol='tls', [logging].forward_port to its TLS syslog port "
+            "(6514 by convention; the default 514 is the plaintext port), "
+            "[logging].forward_tls_ca_file to its CA, and [logging].forward_tls_crl_file to a CRL "
+            "from that CA (an enforcing instance also refuses verified TLS with no revocation "
+            "check). A local agent on 127.0.0.1 does not satisfy it: 16.4.3 asks for a logically "
+            "separate system."
+        )
+        if enforcing:
+            print(
+                f"error: a PHI instance ({env_name!r}) must forward its logs off-box over verified "
+                f"TLS to a collector that is not on this host, and {_forwarding_gap}; refusing to "
+                f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
+            f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
+            f"{_forwarding_fix}",
+            file=sys.stderr,
+        )
+
+    try:
+        forwarder_live = configure(log_forward)
+    except OSError as exc:
+        # FAIL CLOSED at configuration time: the operator named an application-log path this process
+        # cannot open. Starting anyway is precisely the silent blindness #122 exists to end, so refuse
+        # — and say so on stderr, since the log we would normally warn on is the thing that failed.
+        print(
+            f"error: [logging].file ({settings.logging.file!r}) cannot be opened for writing: {exc}. "
+            "The engine refuses to start rather than run unable to log (BACKLOG #122, ADR 0162); fix "
+            "the path/permissions, or unset [logging].file to run stdout-only.",
+            file=sys.stderr,
+        )
+        return 2
+    except InsecureHopRefused as exc:
+        # BACKLOG #1498 (ADR 0173 §4.3): the TLS forwarder's own revocation guard refused, inside
+        # _build_tls_context where the finished context (and hence its CRL flag) exists. Rendered here
+        # as a clean exit 2 rather than a traceback, matching the #200 forward-hop refusal above.
+        #
+        # stderr because that is where every other serve-gate refusal goes and it is unfiltered by the
+        # log level and the PHI/credential filters. NOT because no handler exists: by the time this
+        # raises, configure_logging HAS installed the stdout and file handlers and published the write
+        # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
+        # which would have misled anyone reasoning about the guard's WARN arm at the same site.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyWrapRefused as exc:
+        # BACKLOG #1352 / #1171: [logging].forward_tls_client_cert holds a weakly wrapped or an
+        # encrypted key (that setting takes no passphrase). A clean exit 2, like the refusal above;
+        # the text names the setting and the fix, never the key.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if forwarder_live and log_forward is not None:
+        # Only announce forwarding when configure_logging actually installed the handler. With the
+        # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
+        # deferred and installed. A permanent failure (bad certificate, unresolvable name) is skipped
+        # at ERROR either way (BACKLOG #1966). This line must not contradict any of those.
+        logging.getLogger(__name__).info(
+            "off-box log forwarding enabled -> %s:%d (%s, %s)",
+            log_forward.host,
+            log_forward.port,
+            log_forward.protocol,
+            log_forward.fmt,
+        )
+    return None
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -1817,16 +2011,11 @@ def _serve(args: argparse.Namespace) -> int:
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         LogWriteFailurePolicy,
         StoreBackend,
-        SyslogProtocol,
-        forward_hop_disposition,
-        hop_posture_from_ai,
         insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
     )
     from messagefoundry.config.tls_policy import (
-        HopDisposition,
-        InsecureHopRefused,
         in_process_tls_revocation_refused,
         proxy_mtls_declared_but_unverified,
         tls_revocation_attested,
@@ -2275,113 +2464,6 @@ def _serve(args: argparse.Namespace) -> int:
         print(f"error: {PRODUCTION_DEBUG_REFUSED}", file=sys.stderr)
         return 2
 
-    # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
-    # so evidence survives a host compromise. PHI redaction + control-char scrubbing apply to the
-    # forwarded stream exactly as to stdout (configure_logging installs the same filters on both).
-    # Derived once and used twice below: by the #200 forward_hop_disposition gate, and (BACKLOG #1498,
-    # ADR 0173 §4.3) threaded onto SyslogForward so the forwarder's own revocation guard can key on it.
-    # That handler is built outside the connectors' active_hop_posture scope, so the posture cannot be
-    # read ambiently there and has to travel with the target.
-    _forward_posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
-    log_forward = (
-        SyslogForward(
-            host=settings.logging.forward_host,
-            port=settings.logging.forward_port,
-            protocol=settings.logging.forward_protocol.value,
-            fmt=settings.logging.forward_format.value,
-            # Native TLS-syslog (ADR 0080): applied only when protocol == "tls"; unused otherwise.
-            tls_ca_file=settings.logging.forward_tls_ca_file,
-            tls_verify=settings.logging.forward_tls_verify,
-            tls_client_cert=settings.logging.forward_tls_client_cert,
-            tls_crl_file=settings.logging.forward_tls_crl_file,
-            hop_posture=_forward_posture,
-            # BACKLOG #1966 (ADR 0200): the on-disk spool, one directory per engine shard.
-            spool_dir=_forward_spool_dir(settings, getattr(args, "shard", None)),
-            spool_max_bytes=settings.logging.forward_spool_max_bytes,
-        )
-        if settings.logging.forward_enabled and settings.logging.forward_host
-        else None
-    )
-    # #200 (ADR 0092) residual: the forwarder was the ONE egress path with no posture gate — its
-    # plaintext-UDP default shipped the (best-effort redacted, still sensitive) log + audit evidence stream
-    # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
-    # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
-    # Loopback (the ADR 0080 local-agent deployment) passes THIS hop check, though the BACKLOG #1966
-    # forwarding gate below refuses it under enforce; no instance is exempt as synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
-    # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
-    # [logging].forward_hop_attested, which lets the hop through silently under either dial.
-    if log_forward is not None:
-        _forward_hop = forward_hop_disposition(settings.logging, _forward_posture)
-        # Name WHY the hop is unprotected: a plaintext protocol, or tls with verification opted out
-        # (encrypted but unauthenticated => MITM-able). Both land on the gradient.
-        _forward_why = (
-            "certificate verification is disabled (forward_tls_verify=false)"
-            if settings.logging.forward_protocol is SyslogProtocol.TLS
-            else f"forward_protocol={settings.logging.forward_protocol.value!r} is plaintext"
-        )
-        if _forward_hop is HopDisposition.REFUSE:
-            print(
-                "error: [logging] off-box forwarding to "
-                f"{settings.logging.forward_host}:{settings.logging.forward_port} is not a verified-TLS "
-                f"hop ({_forward_why}) — the log/audit evidence stream would cross the network "
-                f"unprotected on a PHI instance under [security].enforcement=enforce ({env_name!r}). "
-                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file and "
-                "[logging].forward_tls_crl_file (ADR 0080) and a TLS port such as 6514. Attesting "
-                "the hop ([logging].forward_hop_attested) clears this check only; a PHI instance "
-                "under enforce still refuses to start without verified TLS to a separate collector "
-                "(BACKLOG #1966).",
-                file=sys.stderr,
-            )
-            return 2
-        if _forward_hop is HopDisposition.WARN:
-            # Crossed, but never silent — the point of the fix. WARNING surfaces via the root
-            # lastResort handler even though configure_logging has not run yet.
-            logging.getLogger(__name__).warning(
-                "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
-                "evidence stream crosses the network unprotected on a PHI instance. Set "
-                "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
-                "(ADR 0080) to a collector on another host.",
-                settings.logging.forward_host,
-                settings.logging.forward_port,
-                _forward_why,
-            )
-    # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
-    # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
-    # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
-    # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
-    # ONLY: it opens no socket and resolves no name, so a collector that is down cannot hold a
-    # clinical message path from starting through this gate. It keys on forwarding, not on the
-    # spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not this gate.
-    # Placed BEFORE configure_logging, beside the #200 hop gate, so a refused start opens no spool
-    # and contacts no collector.
-    from messagefoundry.config.settings import forwarding_gate_refusal
-
-    _forwarding_gap = forwarding_gate_refusal(settings.logging)
-    if _forwarding_gap is not None:
-        _forwarding_fix = (
-            "Set [logging].forward_host to a collector on another host, "
-            "[logging].forward_protocol='tls', [logging].forward_port to its TLS syslog port "
-            "(6514 by convention; the default 514 is the plaintext port), "
-            "[logging].forward_tls_ca_file to its CA, and [logging].forward_tls_crl_file to a CRL "
-            "from that CA (an enforcing instance also refuses verified TLS with no revocation "
-            "check). A local agent on 127.0.0.1 does not satisfy it: 16.4.3 asks for a logically "
-            "separate system."
-        )
-        if enforcing:
-            print(
-                f"error: a PHI instance ({env_name!r}) must forward its logs off-box over verified "
-                f"TLS to a collector that is not on this host, and {_forwarding_gap}; refusing to "
-                f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
-                file=sys.stderr,
-            )
-            return 2
-        print(
-            f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
-            f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
-            f"{_forwarding_fix}",
-            file=sys.stderr,
-        )
-
     # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
     # `file` unset (the default) leaves this None and the engine stdout-only, exactly as before; the
     # guard still wraps stdout, so the two-stage roll/stop applies either way.
@@ -2394,55 +2476,21 @@ def _serve(args: argparse.Namespace) -> int:
         if settings.logging.file is not None
         else None
     )
-    try:
-        forwarder_live = configure_logging(
+    _logging_refused = _start_logging(
+        settings,
+        env_name=env_name,
+        enforcing=enforcing,
+        spool_dir=_forward_spool_dir(settings, getattr(args, "shard", None)),
+        configure=lambda forward: configure_logging(
             settings.logging.level,
             fmt=settings.logging.format.value,
-            forward=log_forward,
+            forward=forward,
             log_file=_log_file,
             stop_on_write_failure=settings.logging.on_write_failure is LogWriteFailurePolicy.STOP,
-        )
-    except OSError as exc:
-        # FAIL CLOSED at configuration time: the operator named an application-log path this process
-        # cannot open. Starting anyway is precisely the silent blindness #122 exists to end, so refuse
-        # — and say so on stderr, since the log we would normally warn on is the thing that failed.
-        print(
-            f"error: [logging].file ({settings.logging.file!r}) cannot be opened for writing: {exc}. "
-            "The engine refuses to start rather than run unable to log (BACKLOG #122, ADR 0162); fix "
-            "the path/permissions, or unset [logging].file to run stdout-only.",
-            file=sys.stderr,
-        )
-        return 2
-    except InsecureHopRefused as exc:
-        # BACKLOG #1498 (ADR 0173 §4.3): the TLS forwarder's own revocation guard refused, inside
-        # _build_tls_context where the finished context (and hence its CRL flag) exists. Rendered here
-        # as a clean exit 2 rather than a traceback, matching the #200 forward-hop refusal above.
-        #
-        # stderr because that is where every other serve-gate refusal goes and it is unfiltered by the
-        # log level and the PHI/credential filters. NOT because no handler exists: by the time this
-        # raises, configure_logging HAS installed the stdout and file handlers and published the write
-        # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
-        # which would have misled anyone reasoning about the guard's WARN arm at the same site.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except KeyWrapRefused as exc:
-        # BACKLOG #1352 / #1171: [logging].forward_tls_client_cert holds a weakly wrapped or an
-        # encrypted key (that setting takes no passphrase). A clean exit 2, like the refusal above;
-        # the text names the setting and the fix, never the key.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    if forwarder_live and log_forward is not None:
-        # Only announce forwarding when configure_logging actually installed the handler. With the
-        # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
-        # deferred and installed. A permanent failure (bad certificate, unresolvable name) is skipped
-        # at ERROR either way (BACKLOG #1966). This line must not contradict any of those.
-        logging.getLogger(__name__).info(
-            "off-box log forwarding enabled -> %s:%d (%s, %s)",
-            log_forward.host,
-            log_forward.port,
-            log_forward.protocol,
-            log_forward.fmt,
-        )
+        ),
+    )
+    if _logging_refused is not None:
+        return _logging_refused
 
     # BACKLOG #1989: the static-credential gate's settings-half audit lines, written to stderr where
     # the gate ran above and logged again here, so they reach the handlers and forwarder
@@ -4516,12 +4564,17 @@ def _supervise(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.supervisor import supervise
 
+    # Stdout first, so nothing below runs with no handler. Once the settings are read and the
+    # gates ahead of it have passed, `_start_logging` installs the handlers again, with the off-box
+    # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
     # The supervisor has no API and builds no loosening list, so its own reading is reported here.
     # Each shard reports its own through `serve`.
+    security_lines: list[tuple[str, str]] = []
     remote_debug = remote_debug_loosening(remote_debug_posture())
     if remote_debug is not None:
+        security_lines.append(remote_debug)
         logging.getLogger(__name__).warning(
             "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
         )
@@ -4576,6 +4629,7 @@ def _supervise(args: argparse.Namespace) -> int:
         )
         return 2
     for startup_entry in startup_loosenings(startup):
+        security_lines.append(startup_entry)
         logging.getLogger(__name__).warning(
             "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *startup_entry
         )
@@ -4612,6 +4666,33 @@ def _supervise(args: argparse.Namespace) -> int:
 
     if not _store_key_file_gate(settings, enforcing=enforcing):
         return 2
+
+    # BACKLOG #2356: the supervisor forwards its own log lines off-box, as each engine shard does.
+    # Before this it logged to stdout only, so a shard crash loop left no copy off the host. It
+    # passes the gates `serve` passes, in the same helper, and refuses the fleet on the same
+    # refusals: every shard would refuse on them too. Placed after the gates above, as in `serve`,
+    # and before the renewal below, so a refused start changes nothing on disk. The logging call
+    # is the bare one at the top plus the forwarder. `--env` is what each shard is started with,
+    # so it names the environment here as well.
+    logging_refused = _start_logging(
+        settings,
+        env_name=args.env or settings.ai.environment,
+        enforcing=enforcing,
+        spool_dir=_supervisor_forward_spool_dir(settings, db_base),
+        configure=lambda forward: configure_logging("INFO", forward=forward),
+    )
+    if logging_refused is not None:
+        return logging_refused
+    if settings.logging.forward_enabled and settings.logging.forward_host:
+        # The readings above were logged before a forwarder existed. Log them once more so the
+        # off-box copy has them; with no collector configured this writes nothing.
+        for security_line in security_lines:
+            logging.getLogger(__name__).warning(
+                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
+                "forwarder.)",
+                *security_line,
+            )
+
     try:
         state_dir = _renew_api_tls_before_spawning(settings, db_base)
     except KeylessAuditChainRefused as exc:  # #1916: a named key the provider did not resolve
