@@ -1457,7 +1457,8 @@ FORWARD_LOSS_COUNTERS = (
 class ForwarderStatus:
     """A point-in-time reading of the off-box log forwarder. Counts and fixed words only: never a
     record, a host name or an exception text. Every count but ``queued`` is since this process
-    started, and every count reads zero while no forwarder is attached.
+    started. Every count reads zero while :attr:`installed` is false, whatever was counted before:
+    that covers a listener thread that ended with the handler still queuing.
 
     One reading per process. Under engine shards each ``serve --shard`` process has its own
     forwarder, so each reports its own."""
@@ -1475,7 +1476,7 @@ class ForwarderStatus:
     #: the UDP handler's own send errors are not read either): ``send_failing``, ``unsent`` and so ``lost`` then stay
     #: at zero while every record is lost on the wire, and only queue and spool losses count.
     delivery_confirmed: bool = True
-    #: Whether the last send hit a network error. With a spool the records are kept meanwhile.
+    #: Whether the last send hit a network error. A spool keeps the records while it has room.
     send_failing: bool = False
     #: Sends that hit a network error, whether or not a spool kept the record.
     send_failures: int = 0
@@ -1499,7 +1500,7 @@ class ForwarderStatus:
 
     @property
     def lost(self) -> int:
-        """Records that will not reach the collector, as a floor."""
+        """Records that will not reach the collector, as a floor: the five counted causes only."""
         return sum(getattr(self, field) for field, _ in FORWARD_LOSS_COUNTERS)
 
     @property
@@ -1507,9 +1508,10 @@ class ForwarderStatus:
         """``"off"``, ``"not_installed"``, ``"degraded"``, ``"unconfirmed"`` or ``"healthy"``.
 
         ``degraded`` means the last send failed, the spool cannot be read, or a record was lost
-        since this process started. The last one does not clear while this forwarder stays
-        attached: the records are still missing at the collector. ``unconfirmed`` is a forwarder with no fault seen whose
-        protocol cannot show one (:attr:`delivery_confirmed`), so it is never called healthy."""
+        since this process started. The last one does not clear while this forwarder runs: the
+        records are still missing at the collector. ``unconfirmed`` is a forwarder with no fault
+        seen whose protocol cannot show one (:attr:`delivery_confirmed`), so it is never called
+        healthy."""
         if not self.configured:
             return "off"
         if not self.installed:

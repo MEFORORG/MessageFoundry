@@ -1017,10 +1017,11 @@ class LogForwarderInfo(BaseModel):
     The pull-side counterpart of the ``log_forward_failed`` alert, read from process memory, so it
     still answers when the collector does not. ``state`` is ``healthy``, ``unconfirmed``,
     ``degraded`` (the last send failed, the spool cannot be read, or a record was lost since this
-    process started; the last does not clear while the forwarder stays attached) or
-    ``not_installed`` (a configured forwarder did not start or has stopped, so it sends nothing).
-    Every count but ``queued`` is since this process started. Under engine shards each process has its own forwarder, and this is the one
-    that answered.
+    process started; the last does not clear while the forwarder runs) or ``not_installed`` (a
+    configured forwarder did not start or has stopped, so it sends nothing). What each count
+    measures, and what it reads in each state, is stated once, on
+    :class:`~messagefoundry.logging_setup.ForwarderStatus`. Under engine shards each process has
+    its own forwarder, and this is the one that answered.
 
     **A UDP forwarder is never ``healthy``.** No failed send is counted over UDP, so the engine cannot see
     a record lost on the wire. ``delivery_confirmed`` is then ``False``, a forwarder with no fault
@@ -1034,7 +1035,7 @@ class LogForwarderInfo(BaseModel):
     start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
     send_failing: bool = False  # the last send hit a network error
     lost: int = 0  # the five loss counts below, added up; a floor
-    queued: int = 0  # on the in-memory hand-off queue now; the spool is not counted
+    queued: int = 0  # on the hand-off queue now: a level, not a loss, and not the spool
     queue_dropped: int = 0  # dropped because the hand-off queue was full
     unsent: int = 0  # a network error cost them, with no spool to keep them
     undeliverable: int = 0  # dropped for a send error that was not a network error

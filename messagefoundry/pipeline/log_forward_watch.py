@@ -22,15 +22,18 @@ same :func:`~messagefoundry.pipeline.intake_bound.process_alert_subject`.
   stays absent: the notifier's cooldown, suspend and escalation all assume a standing fault is
   emitted again. The reason is the start failure's fixed word, or ``stopped`` when it went away
   later.
-* ``dropping``: a loss counter rose. The count is every record lost since the process started.
+* ``dropping``: a loss counter rose. The count is :attr:`ForwarderStatus.lost`, a floor on the
+  records lost since the process started.
 * ``spool_unreadable``: the on-disk spool could not be read. Held, not lost.
-* ``not_sending``: sends have failed without a break for a whole re-alert window, and are still
-  failing. With a spool nothing is lost yet, which is exactly why nothing else would say so.
+* ``not_sending``: every pass for a whole re-alert window found the last send failed, and a send
+  has failed since the last alert. Not raised when the same pass raises ``dropping`` for an
+  unreachable collector, which without a spool is every time. A spool keeps the records while
+  it has room; when it is full this fires beside ``dropping``.
 
 Every kind sends a ``count``. Only ``dropping`` puts a number of lost records in it; the other
-three send ``0``, which says nothing about losses.
+kinds send ``0``, which says nothing about losses.
 
-All four share one throttle: after any kind fires, none fires for :data:`REALERT_SECONDS`. The
+All of them share one throttle: after any kind fires, none fires for :data:`REALERT_SECONDS`. The
 one exception is the first pass that finds the forwarder absent, which fires whatever the
 throttle says. The default sink's alert is a log line, and a log line is one more record for a
 forwarder that is already losing them.
