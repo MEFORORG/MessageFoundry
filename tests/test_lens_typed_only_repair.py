@@ -1402,3 +1402,103 @@ def test_r11_a_code_lookup_default_must_be_text(default: Any, ok: bool) -> None:
     else:
         with pytest.raises(LensRewriteError, match="not text"):
             rewrite_source(_TEXT, edit)
+
+
+# --- review of 2558f17928..1d7340b2d6 -----------------------------------------------------------
+
+
+def _text_insert(body: str, expr: str) -> tuple[str, dict[str, Any]]:
+    src = f'@handler("H")\ndef h(msg):\n{body}    msg.set("A", "1")\n    return Send("OB", msg)\n'
+    line = len(src.splitlines()) - 1
+    edit = _edit(
+        "insert_row",
+        line,
+        position="before",
+        action="add_repetition",
+        params={"path": "PID-3", "value": {"expr": expr}},
+    )
+    return src, edit
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '    v = "a"\n    import json as v\n',
+        '    v = "a"\n    from os import sep as v\n',
+        '    v = "a"\n\n    def v():  # type: ignore[no-untyped-def]\n        pass\n\n',
+    ],
+    ids=["import-as", "from-import", "nested-def"],
+)
+def test_r12_finding_1_any_other_binding_drops_a_text_local(body: str) -> None:
+    src, edit = _text_insert(body, "v")
+    with pytest.raises(LensRewriteError, match="not text"):
+        rewrite_source(src, edit)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '    v = msg.field("PID-5") or ""\n',
+        '    v = msg.field("OBX-5", occurrence=2)\n',
+    ],
+    ids=["field-or-empty", "field-occurrence"],
+)
+def test_r12_finding_2_an_admitted_field_read_binds_a_text_local(body: str) -> None:
+    src, edit = _text_insert(body, "v")
+    assert 'msg.add_repetition("PID-3", v)' in rewrite_source(src, edit)
+
+
+def test_r12_finding_2_a_for_each_read_binds_a_text_local() -> None:
+    src = (
+        '@handler("H")\ndef h(msg):\n'
+        '    for i in range(1, msg.count_segments("OBX") + 1):\n'
+        '        v = msg.field("OBX-5", occurrence=i)\n'
+        '        msg.set("A", "1")\n'
+        '    return Send("OB", msg)\n'
+    )
+    edit = _edit(
+        "insert_row",
+        5,
+        position="before",
+        action="add_repetition",
+        params={"path": "PID-3", "value": {"expr": "v"}},
+    )
+    assert 'msg.add_repetition("PID-3", v)' in rewrite_source(src, edit)
+
+
+# --- Lander review of 2558f17928: findings A and B ---------------------------------------------
+
+_GLOBAL_I = """\
+i = ""
+
+
+def stash(msg):  # type: ignore[no-untyped-def]
+    global i
+    i = msg.field("PID-5")
+
+
+@handler("H")
+def h(msg):
+    for i in range(1, 3):
+        pass
+    return Send("OB", msg)
+"""
+
+_GLOBAL_RANGE = """\
+def rebind(msg):  # type: ignore[no-untyped-def]
+    global range
+    range = lambda *a: [msg.field("PID-5")]
+
+
+@handler("H")
+def h(msg):
+    for i in range(1, 3):
+        pass
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize("src", [_GLOBAL_I, _GLOBAL_RANGE], ids=["global-index", "global-range"])
+def test_r13_a_loop_index_that_may_carry_text_is_not_a_destination(src: str) -> None:
+    line = len(src.splitlines())
+    _refused(src, _edit("set_params", line, params={"to": {"expr": "i"}}), match=REFUSED)

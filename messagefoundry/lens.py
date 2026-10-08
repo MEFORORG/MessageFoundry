@@ -4665,9 +4665,14 @@ def _message_scope(
         and not _is_one_based_range(n.iter)
     }
     module_names, star = _module_bound_names(tree)
-    if star or "range" in bound or "range" in module_names:
-        loop_indexes = set()
     globals_ = {name for n in ast.walk(tree) if isinstance(n, ast.Global) for name in n.names}
+    # A ``global range`` in any function can rebind the builtin from inside that function, which
+    # :func:`_module_bound_names` does not see (Lander review of 2558f17928, finding B).
+    if star or "range" in bound or "range" in module_names or "range" in globals_:
+        loop_indexes = set()
+    # A ``global``-declared index is module state, so it may carry one message's text into the next
+    # (Lander review of 2558f17928, finding A).
+    loop_indexes -= globals_
     locals_ = frozenset((set(bound) - loop_indexes) | globals_ | {"msg"})
     literals = _inert_module_literals(tree)
     if extra_inert is not None:
@@ -4686,15 +4691,20 @@ def _message_scope(
         frozenset(set(bound) - loop_indexes - globals_ - {"msg"}),
         frozenset(
             {n for n, kind in unshadowed.items() if kind == "text"}
-            | (_text_locals(func) - globals_ - {"msg"})
+            | (_text_locals(func, frozenset(loop_indexes - zero_based)) - globals_ - {"msg"})
         ),
     )
 
 
-def _text_locals(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+def _text_locals(
+    func: ast.FunctionDef | ast.AsyncFunctionDef, loop_indexes: frozenset[str]
+) -> set[str]:
     """The handler names every binding of which is ``NAME = <text>``: a string literal, an f-string
-    or a ``msg`` read (``pid5 = msg.field("PID-5")``). Any other binding of the name, such as a
-    lookup result, a loop target or an augmented assignment, leaves it out."""
+    or an admitted message read (:func:`_is_field_read`, so ``msg.field("X", occurrence=i)`` in a
+    For-Each counts; ``loop_indexes`` are the 1-based indexes it may name). Any other binding of the
+    name, such as a lookup result, a loop target, an import, a nested ``def`` or an augmented
+    assignment, leaves it out (review of 1d7340b2d6, findings 1 and 2)."""
+    reads = _Scope(frozenset(), frozenset(), loop_indexes, loop_indexes=loop_indexes)
     text: dict[str, bool] = {}
     for n in ast.walk(func):
         if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
@@ -4702,14 +4712,13 @@ def _text_locals(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
             is_text = (
                 (isinstance(v, ast.Constant) and isinstance(v.value, str))
                 or isinstance(v, ast.JoinedStr)
-                or _is_bounded_message_read(v)
-                or _is_empty_fallback_read(v)
+                or _is_field_read(v, scope=reads)
             )
             name = n.targets[0].id
             text[name] = text.get(name, True) and is_text
-    stores = Counter(
-        n.id for n in ast.walk(func) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-    )
+    # Every binding of every kind, not only plain-name stores: ``import json as v`` or ``def v()``
+    # rebinds ``v`` as surely as an assignment does.
+    stores = Counter(_bound_names(func))
     assigns = Counter(
         n.targets[0].id
         for n in ast.walk(func)
@@ -4738,7 +4747,8 @@ def _is_one_based_range(node: ast.expr) -> bool:
 
 
 def _literal_kind(node: ast.expr, *, frozenset_ok: bool) -> str | None:
-    """``"number"``, ``"code_set"`` or ``"other"`` for a literal of an immutable type, else None.
+    """``"number"``, ``"text"`` (a ``str``), ``"code_set"`` or ``"other"`` for a literal of an
+    immutable type, else None.
 
     Admitted, as ADR 0076 G.7 words the ceiling: a ``str``, ``int``, ``float``, ``bool`` or ``None``
     constant, a sign on a number, a tuple of those scalars, ``frozenset(...)`` over a set, tuple or
@@ -4872,14 +4882,16 @@ def _root_name(node: ast.expr) -> str | None:
 
 def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
     """Every module-level name that cannot carry message content, mapped to its kind: ``"number"``,
-    ``"code_set"`` (when any binding is a ``code_set`` capture) or ``"other"``.
+    ``"text"`` (a ``str``), ``"code_set"`` (when any binding is a ``code_set`` capture) or
+    ``"other"``.
 
     Manager decision 2026-10-07 (Lander review of PR 2155, finding 7; PR 2154 F6). A name qualifies
     only when it has exactly ONE binding at module scope, ``NAME = <literal>`` of an immutable type
     (:func:`_literal_kind`), and nothing in the module mutates it: no attribute call on it, no
     attribute or subscript store or delete through it, no augmented assignment. This function does
     not look at ``global`` declarations: a function that rebinds the name through ``global`` is
-    caught by its caller, :func:`_message_scope`, which removes every ``global``-declared name. So ``SEEN = []``
+    caught by its caller, :func:`_message_scope`, which leaves every ``global``-declared name out
+    of each name set it admits, loop indexes included. So ``SEEN = []``
     never qualifies: ``SEEN.append(msg.field("PID-3"))`` fills it from the message. A star import,
     or any route :func:`_reaches_globals` knows, leaves no name inert. That check is a deny list:
     hand-written code that deliberately rebinds a global by a route it does not know is outside its
