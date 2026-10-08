@@ -23,6 +23,8 @@ catch it. This module makes that a build failure, modelled on
 * **Recorded exemptions stay recorded.** The TOTP seed and the WebAuthn credential are not env vars or
   connector settings, so they are not in :data:`CRITICAL_SECRETS`. Each has a schedule row that says it
   has no calendar cadence and why (BACKLOG #1931), pinned by :data:`EXEMPT_FROM_CALENDAR_ROTATION`.
+  The MFA recovery codes have a row too, which says no ruling covers them yet and claims no exemption
+  (BACKLOG #2225), pinned by :data:`WEIGHED_WITHOUT_A_RULING`.
 
 This guards the *definition/enumeration* only. It does **not** assert the engine force-rotates or hard-
 expires anything — that stays operator- / secret-manager-driven by design (session tokens are the one
@@ -492,15 +494,38 @@ EXEMPT_FROM_CALENDAR_ROTATION: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 
 
-def _exempt_row_problems(section: str) -> list[str]:
-    """Every way the exempt rows in ``section`` fall short, or ``[]`` (self-testable)."""
+#: Second-factor material WEIGHED in the schedule but covered by no ruling yet (BACKLOG #2225). Same
+#: shape as above. Its cadence cell must say so. It must also NOT say "exempt". The 2026-09-27 ruling
+#: names TOTP seeds only, and an exemption here would extend it. When the owner rules, move the entry
+#: to :data:`EXEMPT_FROM_CALENDAR_ROTATION`, or give the row a cadence. Do it in that same change. Once
+#: this dict is empty, delete its real-doc test. The self-tests pin their own rows, so they hold.
+WEIGHED_WITHOUT_A_RULING: dict[str, tuple[str, tuple[str, ...]]] = {
+    "MFA recovery codes": (
+        "users.totp_recovery_codes",
+        ("no calendar cadence", "no ruling", "BACKLOG #2225"),
+    ),
+}
+
+#: What an unruled row's cadence cell must not say. The bare word, on purpose: a cell that needs it,
+#: even as "not exempt", is one to re-read against the ruling before the pin is loosened.
+_UNRULED_FORBIDDEN = ("exempt",)
+
+
+def _schedule_row_problems(
+    section: str,
+    pins: dict[str, tuple[str, tuple[str, ...]]],
+    *,
+    forbidden: tuple[str, ...] = (),
+) -> list[str]:
+    """Every way the pinned rows in ``section`` fall short, or ``[]`` (self-testable). A cadence
+    cell must carry each of its phrases and none of ``forbidden``."""
     rows = [
         [cell.strip() for cell in line.strip().strip("|").split("|")]
         for line in section.splitlines()
         if line.lstrip().startswith("|")
     ]
     problems: list[str] = []
-    for label, (token, phrases) in EXEMPT_FROM_CALENDAR_ROTATION.items():
+    for label, (token, phrases) in pins.items():
         matches = [row for row in rows if row and _whole_token_present(token, row[0])]
         if len(matches) != 1:
             problems.append(
@@ -512,7 +537,24 @@ def _exempt_row_problems(section: str) -> list[str]:
         missing = [phrase for phrase in phrases if phrase.lower() not in cadence]
         if missing:
             problems.append(f"{label}: cadence cell {row[1:2]!r} lacks {missing}")
+        present = [phrase for phrase in forbidden if phrase.lower() in cadence]
+        if present:
+            problems.append(f"{label}: cadence cell {row[1:2]!r} must not say {present}")
     return problems
+
+
+def _exempt_row_problems(
+    section: str, pins: dict[str, tuple[str, tuple[str, ...]]] = EXEMPT_FROM_CALENDAR_ROTATION
+) -> list[str]:
+    """:func:`_schedule_row_problems` for the rows a ruling or a recorded reason exempts."""
+    return _schedule_row_problems(section, pins)
+
+
+def _unruled_row_problems(
+    section: str, pins: dict[str, tuple[str, tuple[str, ...]]] = WEIGHED_WITHOUT_A_RULING
+) -> list[str]:
+    """:func:`_schedule_row_problems` for the unruled rows, which must not claim an exemption."""
+    return _schedule_row_problems(section, pins, forbidden=_UNRULED_FORBIDDEN)
 
 
 def test_second_factor_exemptions_are_recorded_in_the_rotation_schedule() -> None:
@@ -530,7 +572,15 @@ def test_second_factor_exemptions_are_recorded_in_the_rotation_schedule() -> Non
 
 
 def test_exempt_row_guard_self_test() -> None:
-    """Non-vacuity: the guard clears a complete pair of rows and names each defect it exists for."""
+    """Non-vacuity: the guard clears a complete pair of rows and names each defect it exists for. It
+    pins its own pair, so a later entry in EXEMPT_FROM_CALENDAR_ROTATION does not break it."""
+    pins: dict[str, tuple[str, tuple[str, ...]]] = {
+        "totp": ("users.totp_secret", ("no calendar cadence", "exempt", "owner ruling 2026-09-27")),
+        "webauthn": (
+            "webauthn_credentials",
+            ("no calendar cadence", "exempt", "not a backend secret"),
+        ),
+    }
     totp = (
         "| TOTP seed, `users.totp_secret` | **No calendar cadence: exempt** (owner ruling 2026-09-27)"
         " | why |"
@@ -539,15 +589,48 @@ def test_exempt_row_guard_self_test() -> None:
         "| WebAuthn, a `webauthn_credentials` row | No calendar cadence: exempt (not a backend secret)"
         " | why |"
     )
-    assert _exempt_row_problems("\n".join((totp, webauthn))) == []
-    dropped = _exempt_row_problems(webauthn)
+    assert _exempt_row_problems("\n".join((totp, webauthn)), pins) == []
+    dropped = _exempt_row_problems(webauthn, pins)
     assert len(dropped) == 1 and "found 0" in dropped[0]
     annual = totp.replace("No calendar cadence: exempt", "Annually")
-    reworded = _exempt_row_problems("\n".join((annual, webauthn)))
+    reworded = _exempt_row_problems("\n".join((annual, webauthn)), pins)
     assert len(reworded) == 1 and "exempt" in reworded[0]
     # The token counts only in the FIRST cell: a row that merely mentions it in its notes is not the row.
     elsewhere = "| Session tokens | Automatic | unlike `users.totp_secret` |"
-    assert "found 0" in _exempt_row_problems("\n".join((elsewhere, webauthn)))[0]
+    assert "found 0" in _exempt_row_problems("\n".join((elsewhere, webauthn)), pins)[0]
     # A look-alike token that merely STARTS with the pinned one is not the row either (whole-token match).
     lookalike = "| Staged seed, `users.totp_secret_staged` | No calendar cadence: exempt | x |"
-    assert "found 0" in _exempt_row_problems("\n".join((lookalike, webauthn)))[0]
+    assert "found 0" in _exempt_row_problems("\n".join((lookalike, webauthn)), pins)[0]
+
+
+def test_recovery_codes_are_weighed_in_the_rotation_schedule_without_a_borrowed_exemption() -> None:
+    """BACKLOG #2225: the recovery-code row exists, says no ruling covers it, and claims no exemption.
+
+    Mutation: delete the row. Red: "expected ONE schedule row naming 'users.totp_recovery_codes',
+    found 0". Mutation: rewrite its cadence as "No calendar cadence: exempt (owner ruling 2026-09-27)".
+    Red: the cell lacks "no ruling" and must not say "exempt"."""
+    assert WEIGHED_WITHOUT_A_RULING, "no unruled rows left: delete this test with the empty dict"
+    problems = _unruled_row_problems(_rotation_schedule_section())
+    assert not problems, (
+        "docs/ASVS-L2-PHASE0-CHANGES.md rotation schedule no longer records the MFA recovery codes "
+        f"as weighed with no ruling yet (BACKLOG #2225): {problems}. Restore the row, or, if the owner "
+        "has ruled, move the entry to EXEMPT_FROM_CALENDAR_ROTATION in the same change."
+    )
+
+
+def test_unruled_row_guard_self_test() -> None:
+    """Non-vacuity: the guard clears the unruled row and refuses a borrowed exemption. It pins its
+    own row, so moving the live entry out of WEIGHED_WITHOUT_A_RULING does not break it."""
+    pins: dict[str, tuple[str, tuple[str, ...]]] = {
+        "codes": ("users.totp_recovery_codes", ("no calendar cadence", "no ruling"))
+    }
+    codes = (
+        "| Recovery codes, `users.totp_recovery_codes` | No calendar cadence, and no ruling covers"
+        " them yet (BACKLOG #2225) | why |"
+    )
+    assert _unruled_row_problems(codes, pins) == []
+    assert "found 0" in _unruled_row_problems("| Session tokens | Automatic | x |", pins)[0]
+    borrowed = codes.replace("and no ruling covers them yet", "exempt (owner ruling 2026-09-27)")
+    lacks, says = _unruled_row_problems(borrowed, pins)
+    assert lacks.endswith("lacks ['no ruling']")
+    assert says.endswith("must not say ['exempt']")
