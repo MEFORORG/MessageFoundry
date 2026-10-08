@@ -34,6 +34,14 @@ before the value reaches a database query, a filesystem path, a log line or a CS
 | Control id | Printable text, no control characters, up to 256 characters | `control_id`, and `actor` on the audit routes |
 | HL7 field path | A three-character segment id, a field number, then optional component and subcomponent numbers, such as `PID-3` or `PID-5.1` | `field_path` |
 | Email address | One `@`, a local part with no spaces, and a dotted domain, up to 254 characters | `recipient_override` |
+| Idempotency key | Printable text, no control characters, 1 to 256 characters | `idempotency_key` on `POST /messages/{message_id}/resend` and `POST /messages/{message_id}/edit-resend` |
+| Audit action filter | Printable text, no control characters, up to 128 characters | `action` on `GET /audit` and `GET /audit/export` |
+| Display label | Printable text, no control characters, up to 128 characters | `name` on `POST /search/presets` |
+| Filesystem path | Printable text, no control characters, up to 4096 characters | `config_dir` on `POST /config/reload`, and `archive` on `POST /dr/activate` |
+| Layered preset ids | Resource ids joined by single commas with no spaces, up to 1024 characters in all | `presets` on `GET /search/layered` |
+
+The email-address row covers `recipient_override` only. The account email fields follow a different
+rule, set out under [Items checked a second time](#items-checked-a-second-time-behind-the-route).
 
 "Printable text, no control characters" means every character except the C0 range, DEL, and the C1
 range. In practice: no NUL, no tab, no carriage return, no line feed.
@@ -45,6 +53,127 @@ group mapping, and a counter-reset request, may carry at most 1000 entries.
 **Which words and codes exist is not decided here.** The role names, the permission catalog and the
 status vocabulary belong to the engine. These rules decide only the shape a value may take, so a
 value that could not be a member is refused early and one that merely does not exist gets a 404.
+
+---
+
+## Items checked a second time, behind the route
+
+**Some items pass two checks: the request model first, then the service the route calls.** The model
+refuses with a 422. The service refuses with a 400, unless a line below gives another code. The
+table above gives the first check for five of these items. This section gives the whole rule for
+each, and names the code that holds it.
+
+### Idempotency key
+
+The client mints this value, so the client chooses its alphabet. The engine asks only for printable
+text of 1 to 256 characters. The field is required on both routes, and the model is the only check.
+
+A key the engine has seen before for the same request is not an error. The engine answers
+`duplicate` and queues nothing new. The same key on a different request gets a 409.
+
+### Audit action filter
+
+`action` narrows the audit list to one event name, such as `user.updated`. The rule is printable
+text of up to 128 characters. The model is the only check, and a name no event carries returns an
+empty list.
+
+### Preset name
+
+`name` on `POST /search/presets` is a label the operator types. The rule is printable text of up to
+128 characters. A name the caller already uses replaces that preset. It is not refused.
+
+### DR archive path
+
+`archive` on `POST /dr/activate` names a file on the standby. The model checks the shape: printable
+text of up to 4096 characters. **The control is the second check, which confines the path.**
+
+1. The path must lie under the directory `[dr].seed_dir` names.
+2. With `[dr].seed_dir` unset, a request may name no archive at all.
+
+A refused path aborts the activation with a 422. Every such refusal carries the same message, which
+names the setting and no part of the path. The rule is in `DrCoordinator._confine_request_archive`, in
+[`messagefoundry/pipeline/dr.py`](../messagefoundry/pipeline/dr.py).
+
+### Layered preset ids
+
+`presets` on `GET /search/layered` is one value holding several resource ids. The model checks the
+shape in the table above. The route then splits the value and applies two more rules.
+
+1. At most 8 ids may be layered. A longer list gets a 400.
+2. Each id must name a preset the caller owns. Any other id gets a 404.
+
+### Notification address
+
+The engine sends an account's security notices to its notification address. At least these four
+fields can set one:
+
+| Field | Route |
+|---|---|
+| `email` (required) | `POST /users` |
+| `email` | `POST /me/notify-email` |
+| `notify_email` | `PATCH /users/{user_id}` |
+| `notify_email` | `POST /users/directory` |
+
+The model allows up to 256 characters. The service then strips the spaces around the value and
+requires one plain mailbox. That means all of these:
+
+1. The value is not blank.
+2. It has exactly one `@`, with text on both sides.
+3. Every character is printable, and none is whitespace.
+4. It holds none of `,` `;` `<` `>` `"` `(` `)` `[` `]` `:` `\`.
+5. The whole address is at most 254 characters, and the part before the `@` is at most 64.
+6. The part before the `@` is letters, digits and ``#$&'*+-^_`{}~``, in runs split by single dots.
+   It does not start with a hyphen.
+7. The domain is shaped like a host name with at least two labels. The exact rule is
+   `domain_shape_problem`, in [`messagefoundry/domainshape.py`](../messagefoundry/domainshape.py).
+8. Python's `email.utils.parseaddr` reads the address back unchanged.
+
+Rules 1 to 4 are `_require_single_mailbox` and `_is_single_mailbox`, in
+[`messagefoundry/auth/service.py`](../messagefoundry/auth/service.py). Rules 5 to 8 are
+`envelope_address_problem`, in
+[`messagefoundry/transports/email.py`](../messagefoundry/transports/email.py). That function is the
+rule the mail sender applies to every recipient, so an address accepted here can be sent to.
+
+Three routes add a rule of their own:
+
+- `PATCH /users/{user_id}` leaves the address alone when `notify_email` is omitted. An explicit
+  `null` gets a 400, because the address can be changed but not cleared. A value equal to the stored
+  address is accepted without a second check.
+- `POST /users/directory` requires `notify_email` when the directory supplies no usable address, and
+  refuses it when the directory supplies one.
+- `POST /me/notify-email` fills a missing address only. An account that already has a different one
+  gets a 409.
+
+### User email
+
+`email` on `PATCH /users/{user_id}` is the profile address. It does not move the notification
+address.
+
+**This field has a length rule and no shape rule.** The model allows up to 256 characters. Neither
+the model nor the service checks what the characters are, so the engine stores the value as sent.
+Omitting the field keeps the stored value, and an explicit `null` clears it.
+
+`email` on `POST /users` is a different case. It seeds the notification address as well, so it takes
+the whole notification-address rule above.
+
+### Federated subject
+
+`subject` on `PUT /users/{user_id}/federated-identity` is the `sub` value the identity provider
+issues for the account.
+
+1. The model requires 1 to 255 characters.
+2. The service requires printable ASCII with no space at the start or the end. A space inside the
+   value is allowed.
+
+The engine matches this value exactly against a verified token, so a stray space would make a
+binding nobody could present. The second rule is in `AuthService.bind_federated_subject`.
+
+The same route, and `DELETE` on the same path, also take `expected_issuer` and `expected_subject`.
+Both keys are required and each may be `null`. They carry a length rule only: up to 256 characters
+for the issuer and up to 255 for the subject. They need no shape rule, because the engine only
+compares them with the stored pair. A pair that differs gets a 409 and nothing changes.
+
+There is no issuer field to send. The service binds under the issuer `[auth].oidc_issuer` names.
 
 ---
 
@@ -84,7 +213,9 @@ That rule costs one capability, and this page states it rather than hiding it: a
 longer span an HL7 segment separator, because that separator is a carriage return. The console's
 search box is a single-line input, so no shipped client could send one.
 
-**Two items keep a rule that is not a pattern, and the pattern in front of them does not replace it.**
+**At least three items keep a rule that is not a pattern, and the pattern in front of them does not
+replace it.** The first two are below. The third is the DR archive path, under
+[Items checked a second time](#items-checked-a-second-time-behind-the-route).
 
 1. A reload `config_dir` is confined by an allow-list, because the loader executes Python from that
    directory. The shape rule adds the NUL a path check can be truncated by. **The allow-list is still
