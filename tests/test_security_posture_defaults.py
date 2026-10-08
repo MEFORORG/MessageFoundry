@@ -2577,6 +2577,16 @@ async def test_posture_route_reads_the_docs_switch_off_the_app_in_both_direction
     body = await _posture_body(engine, static_credential_settings=stashed)
     assert "expose_docs" not in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
 
+    # The other direction: settings that say the docs are OFF, beside an app built with them ON.
+    # The docs are served, so the read-out names them.
+    app = create_app(engine, allow_no_auth=True, expose_docs=True)
+    app.state.static_credential_settings = ServiceSettings(api=ApiSettings(expose_docs=False))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        assert (await client.get("/openapi.json")).status_code == 200
+        named = [e["switch"] for e in (await client.get("/security/posture")).json()["loosenings"]]
+    assert "expose_docs" in named
+
 
 def test_the_backup_cleartext_flag_is_documented_as_not_yet_reported() -> None:
     """``[backup].allow_unencrypted`` lets a keyless instance write a cleartext archive, and the

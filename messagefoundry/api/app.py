@@ -2648,7 +2648,7 @@ def create_app(
             "create_app: allow_no_auth=True was passed beside an auth service; pass the opt-in "
             "only with no service, since a service always requires sign-in"
         )
-    # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
+    # The interactive docs (at least /docs and /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
     #

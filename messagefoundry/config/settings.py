@@ -1233,7 +1233,9 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
-    expose_docs: bool = False  # serve /docs, /redoc, /openapi.json (off by default; widens surface)
+    # Serve the API documentation routes, at least /docs, /redoc and /openapi.json, with no sign-in.
+    # Off by default; on, it widens the surface and security_loosenings() names it (#2385).
+    expose_docs: bool = False
     # Serve the same-origin browser ops console under /ui (ADR 0065, BACKLOG #75). On by default (ADR
     # 0143 — the console is the operator UI, effectively core); disable with [security].serve_web_console=
     # false (a surface-reducing opt-out). When on, the engine mounts /ui + /ui/static and accepts an
