@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from messagefoundry.controlchars import has_control_char
@@ -96,16 +96,20 @@ def resolve_vscode(
     found goes through :func:`_launcher_for`, so the result is the editor executable where a
     standard install has one, and a batch file only as the fallback :func:`open_repo` screens.
     """
-    found = which("code")
-    launcher = _launcher_for(found, is_file) if found else None
-    if launcher is not None:
-        return launcher
-    for template in _VSCODE_FALLBACKS:
-        candidate = expandvars(template)
-        if "%" not in candidate and is_file(candidate):
-            launcher = _launcher_for(candidate, is_file)
-            if launcher is not None:
-                return launcher
+
+    def found_clis() -> Iterator[str]:  # lazy: a usable PATH hit probes no install location
+        on_path = which("code")
+        if on_path:
+            yield on_path
+        for template in _VSCODE_FALLBACKS:
+            candidate = expandvars(template)
+            if "%" not in candidate and is_file(candidate):
+                yield candidate
+
+    for cli in found_clis():
+        launcher = _launcher_for(cli, is_file)
+        if launcher is not None:
+            return launcher
     return None
 
 
@@ -251,6 +255,8 @@ def open_repo(
     test is wider than ``cmd.exe`` needs: it also refuses characters that are harmless in some
     positions, such as parentheses or a quoted ``&``.
     """
+    # resolve_vscode() never returns a batch file whose own path fails the test. The launcher is
+    # tested again here because this is the last stop before the start, whoever the caller is.
     if _is_batch_file(launcher) and (_cmd_would_reread(repo_path) or _cmd_would_reread(launcher)):
         raise RepoPathRefused
     runner([launcher, repo_path])
