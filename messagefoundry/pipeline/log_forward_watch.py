@@ -23,9 +23,12 @@ same :func:`~messagefoundry.pipeline.intake_bound.process_alert_subject`.
   emitted again. The reason is the start failure's fixed word, or ``stopped`` when it went away
   later.
 * ``dropping``: a loss counter rose. The count is every record lost since the process started.
-* ``spool_unreadable``: the on-disk spool could not be read. Held, not lost, so no count.
+* ``spool_unreadable``: the on-disk spool could not be read. Held, not lost.
 * ``not_sending``: sends have failed without a break for a whole re-alert window, and are still
   failing. With a spool nothing is lost yet, which is exactly why nothing else would say so.
+
+Every kind sends a ``count``. Only ``dropping`` puts a number of lost records in it; the other
+three send ``0``, which says nothing about losses.
 
 All four share one throttle: after any kind fires, none fires for :data:`REALERT_SECONDS`. The
 one exception is the first pass that finds the forwarder absent, which fires whatever the

@@ -1456,7 +1456,8 @@ FORWARD_LOSS_COUNTERS = (
 @dataclass(frozen=True, slots=True)
 class ForwarderStatus:
     """A point-in-time reading of the off-box log forwarder. Counts and fixed words only: never a
-    record, a host name or an exception text. Every count is since this process started.
+    record, a host name or an exception text. Every count but ``queued`` is since this process
+    started, and every count reads zero while no forwarder is attached.
 
     One reading per process. Under engine shards each ``serve --shard`` process has its own
     forwarder, so each reports its own."""
@@ -1478,7 +1479,8 @@ class ForwarderStatus:
     send_failing: bool = False
     #: Sends that hit a network error, whether or not a spool kept the record.
     send_failures: int = 0
-    #: Records waiting on the hand-off queue right now. A level, not a loss.
+    #: Records on the in-memory hand-off queue right now. A level, not a loss. Records waiting in
+    #: the on-disk spool are not in it, and no field here counts them.
     queued: int = 0
     #: Records dropped because the hand-off queue was full.
     queue_dropped: int = 0
@@ -1505,8 +1507,8 @@ class ForwarderStatus:
         """``"off"``, ``"not_installed"``, ``"degraded"``, ``"unconfirmed"`` or ``"healthy"``.
 
         ``degraded`` means the last send failed, the spool cannot be read, or a record was lost
-        since this process started. The last one does not clear until a restart: the records are
-        still missing at the collector. ``unconfirmed`` is a forwarder with no fault seen whose
+        since this process started. The last one does not clear while this forwarder stays
+        attached: the records are still missing at the collector. ``unconfirmed`` is a forwarder with no fault seen whose
         protocol cannot show one (:attr:`delivery_confirmed`), so it is never called healthy."""
         if not self.configured:
             return "off"

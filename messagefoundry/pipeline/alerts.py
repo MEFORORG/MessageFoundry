@@ -187,7 +187,8 @@ class AlertSink(Protocol):
         """The **off-box log forwarder** is absent, losing records or not sending (BACKLOG #2612).
         ``name`` is ``forwarder:<kind>``, with ``@node:<node_id>`` or ``@shard:<id>`` appended where
         several engine processes share the store, so each kind on each process is its own alert.
-        ``reason`` is fixed words naming the cause; ``count`` is a count since the process started.
+        ``reason`` is fixed words naming the cause. ``count`` is the records lost since the process
+        started on the ``dropping`` kind, and ``0`` on every other kind.
         The kinds, and when each fires: ``pipeline/log_forward_watch.py``, which emits this.
 
         Counts, fixed words and this process's own label only: never a record, the collector's

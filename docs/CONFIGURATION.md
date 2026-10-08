@@ -886,52 +886,60 @@ about a missing or failing forwarder two ways (BACKLOG #2612).
   same 200-character cap. An `[[alerts.rules]]` rule matches its `connection` glob against the
   whole key, so where a suffix applies write `forwarder:not_installed*`; a rule on the bare
   `forwarder:not_installed` matches a lone engine only. On a cluster node with no pinned
-  `[cluster].node_id` the suffix holds this engine's own host name and process id, and it goes to
-  every alert transport with the key. The engine checks every 30 seconds, and `kind` is a fixed
-  word, at least one of these.
-  - `not_installed`: the forwarder is not attached, so this process sends nothing off the host.
-    It fires when the engine first finds it absent, then again about every five minutes while it
-    stays absent. The reason is `permanent` or `transient` for a failed start, or `stopped`.
-  - `dropping`: a loss count rose. The reason names which, and the count is every record lost
-    since the process started.
-  - `spool_unreadable`: the on-disk spool could not be read, so its records are held and not sent.
-    It carries no count.
-  - `not_sending`: sends have kept failing for five minutes. With a spool nothing is lost yet.
+  `[cluster].node_id` the suffix holds this engine's own host name and process id, and they go
+  wherever the key goes.
 
-  The four kinds share one five-minute window: after any of them fires, none fires again until
-  it ends. The one exception is the first check that finds the forwarder absent.
-  Nothing closes the alert when the forwarder recovers; resolve it by hand. A cluster node keeps
+  Every alert carries a reason in fixed words and a `count`. The count is a number of lost
+  records on `dropping` only. The other kinds always send `0`, and that `0` says nothing about
+  losses. The engine checks at start and then every 30 seconds. `kind` is a fixed word, at least
+  one of these.
+  - `not_installed`: no forwarder is attached, or its sending thread has ended, so the forwarder
+    sends nothing. It fires on the first check that finds the forwarder absent, then again about
+    every five minutes while it stays absent. The reason is `permanent` or `transient` for a
+    failed start, or `stopped`.
+  - `dropping`: a loss count rose. The reason names which, and `count` is `lost` from the status
+    field below: every record lost since the process started.
+  - `spool_unreadable`: a read of the on-disk spool failed. The spool keeps its records, and
+    they are not sent until a read succeeds.
+  - `not_sending`: every check for five minutes found that the last send had failed, and a send
+    has failed since the last alert. With a spool, the records are kept on disk while it has room.
+
+  The four kinds share one window of about five minutes. One check can raise more than one kind.
+  After a check raises any, no check raises one again until the window ends. The one exception
+  is the first check that finds the forwarder absent.
+  With an `[alerts]` notifier the alert has a row in the alert list. Nothing closes that row when
+  the forwarder recovers; resolve it by hand. A cluster node keeps
   its name across a restart only when `[cluster].node_id` is pinned. An unpinned node gets a new
   id on every start, so a fault that outlasts a restart opens a new alert beside the old one.
 - **`log_forwarder` on `GET /status`.** It is `null` when no forwarder is configured. Otherwise
-  `state` is `healthy`, `unconfirmed`, `degraded` or `not_installed`, beside `delivery_confirmed`,
-  `send_failing`, `spool_read_faulted` and the counts: `lost`, `queued`, `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped`,
-  `spool_skipped` and `spool_read_errors`. The web console's status page shows the same reading,
-  and its health indicator turns to warn.
+  `state` is `healthy`, `unconfirmed`, `degraded` or `not_installed`. Beside it are `installed`,
+  `start_failure`, `delivery_confirmed`, `send_failing`, `spool_read_faulted` and the counts:
+  `lost`, `queued`, `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped`, `spool_skipped`
+  and `spool_read_errors`. The web console's status page has a row for the forwarder. Its health
+  indicator turns to warn when the state is `not_installed` or `degraded`.
 
-`degraded` means the last send failed, the spool cannot be read, or a record was lost since the
-process started. A loss keeps the state `degraded` until a restart, because the records are still
-missing at the collector.
+`degraded` means the last send failed, the last spool read failed, or `lost` is above zero.
+`lost` never goes down while the forwarder stays attached, so a loss keeps the state `degraded`
+for that long. If the forwarder then stops, the state reads `not_installed`.
 
 **Over UDP the engine cannot see a lost record.** UDP is the default protocol. A UDP send to a
 collector that is down reports no failure, and the engine does not count a UDP send error its own
-host reports either. So a collector that is down looks the same as one that is up, and the alert
-and the status row report queue and spool losses only. `delivery_confirmed` is `false`, a
+host reports either. So a collector that is down looks the same as one that is up, and the only
+losses the engine counts are queue and spool losses. `delivery_confirmed` is `false`, a
 forwarder with no fault seen reads `unconfirmed` and never `healthy`, and the console row says
-that delivery is not confirmed. The health indicator does not warn for it. Use `tcp` or `tls`
-where a silent loss must page.
+that delivery is not confirmed. The health indicator does not warn for that alone. Use `tcp` or
+`tls` where a silent loss must page.
 
 Neither the alert nor `log_forwarder` on `GET /status` carries a record, the collector's address
 or an error text. The status field holds counts, true-or-false flags and fixed words. The alert
-holds its key and fixed reason words, and a `dropping` alert adds the count of records lost. The
-count in the alert list is a different number: how many times that alert has fired. The key
-carries the process suffix where one applies. The alert item above says what the suffix is, and
-what it holds on an unpinned cluster node.
+holds its key, its reason words and its `count`. The count in the alert list is a different
+number: how many times the engine has raised that alert.
 
-`queued` is what waits now. Every other count runs from the start of the process, and they all
-read zero while the forwarder is not attached. Each engine process has its own forwarder and
-watches its own: every engine shard, and a cluster standby too. `GET /status` reports the process
-that answered.
+`queued` is how many records sit on the in-memory hand-off queue right now. It does not count
+records waiting in the on-disk spool, and no field does. Every other count runs from the start of
+the process. While the forwarder is not attached, every count reads zero. Each engine process has
+its own forwarder and watches its own: every engine shard, and a cluster standby too.
+`GET /status` reports the process that answered.
 
 ### `[retention]`
 Enforced by the engine's retention/purge task ([pipeline/retention.py](../messagefoundry/pipeline/retention.py)).
