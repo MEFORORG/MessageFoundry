@@ -1494,16 +1494,17 @@ An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-r
 `aioodbc`, via the `[sqlserver]` extra (`pip install 'messagefoundry[sqlserver]'`), **lazily imported**
 (SQLite-only installs unaffected). It has **two dialects** (#66):
 
-**Host precondition for the `sqlserver` dialect and `db_lookup`:** the engine cannot set TLS cipher
-suites on an ODBC hop, so the operator sets the host cipher policy. The step is stated once, in
-[`DEPLOY-SERVER-DB.md` section 5.4](DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition).
-
 - **`dialect="sqlserver"`** (default) — the **SQL Server preset** over the Microsoft ODBC Driver 18.
   **Status: production / supported** — the live aioodbc round-trip is exercised by the CI SQL Server
   service-container job.
 - **`dialect="generic"`** — a **generic ODBC path** for another ODBC-reachable database (PostgreSQL,
   MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
   and name it in `odbc_driver`; see [*Generic ODBC*](#generic-odbc-postgresql--mysql) below.
+
+**Host precondition for every SQL Server ODBC hop** (this connector, `DatabasePoll(...)`,
+`db_lookup` and `DatabaseRef(...)`): the engine cannot set TLS cipher suites on an ODBC hop, so the
+operator sets the host cipher policy. The step is stated once, in
+[`DEPLOY-SERVER-DB.md` section 5.4](DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition).
 
 (The SQL Server *store* backend is a **separate** layer, also production; the connector doesn't depend on
 it.) The **inbound** direction is the DB poll source below (`DatabasePoll(...)`).

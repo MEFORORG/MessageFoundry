@@ -568,15 +568,20 @@ update the pin in lockstep — pin the **CA**, not the leaf, to keep rotations m
 setting that policy is the operator's job.** This step is the operator runbook precondition that owner
 ruling R3 of 2026-09-28 attached to those hops (ASVS 11.3.5, BACKLOG #2379).
 
-It covers three hops, all through the Microsoft ODBC Driver 18 for SQL Server:
+It applies to every hop that goes through the Microsoft ODBC Driver 18 for SQL Server. The ruling
+names the first three below. The engine has at least these:
 
 | Hop | Where it is configured |
 |---|---|
-| The SQL Server message store | `[store].type = "sqlserver"` |
+| The SQL Server message store | `[store].backend = "sqlserver"` |
 | The DATABASE connector (`Database(...)`, `DatabasePoll(...)`, `sqlserver` dialect) | [`CONNECTIONS.md`](CONNECTIONS.md) |
 | `db_lookup` (`DatabaseLookup(...)`) | [`CONNECTIONS.md`](CONNECTIONS.md) |
+| The `DatabaseRef(...)` reference sync | [`CONNECTIONS.md`](CONNECTIONS.md) |
 
-**The policy to set on every host that would run one of these hops:**
+A host that only runs a CLI command against the SQL Server store, such as
+`messagefoundry store provision-schema`, opens the same kind of hop. Treat it as an engine host.
+
+**The policy to set wherever one of these hops would run:**
 
 1. Allow only AEAD cipher suites at TLS 1.2. An AEAD suite has `GCM`, `CCM` or `CHACHA20_POLY1305`
    in its name. A CBC suite is not AEAD.
@@ -584,10 +589,10 @@ It covers three hops, all through the Microsoft ODBC Driver 18 for SQL Server:
 
 TLS 1.3 suites are all AEAD, so TLS 1.3 needs no suite change for this step.
 
-The engine's own approved list is narrower: it also leaves out the AES-128-GCM suites at TLS 1.2. That
-list is stated once, under `tls_ciphers` in [`CONFIGURATION.md`](CONFIGURATION.md). The examples below
-match it. The ruling does not decide whether this host policy must also drop AES-128, so AEAD-only is
-the floor and matching the engine's list is the stricter choice.
+AEAD-only is the floor this step asks for. The engine's own approved list is narrower, and it is
+stated once, under `tls_ciphers` in [`CONFIGURATION.md`](CONFIGURATION.md). The ruling does not decide
+whether this host policy must match that list. The Linux example below stays inside it. The Windows
+check tests only the floor.
 
 **Why the engine does not do this itself.** The native driver terminates TLS, so no Python-side TLS
 context exists for the engine to narrow or check
@@ -596,7 +601,7 @@ context exists for the engine to narrow or check
 would not notice a host that still allows a CBC suite. The owner declined a startup check that reads
 the host policy, so nothing in the engine would warn about a missed step.
 
-**How far each statement below is proven.** Each one carries one of three labels:
+**How far the statements below are proven.** The load-bearing ones carry one of three labels:
 
 - **Measured**: run for this step on 2026-10-08, with the result stated.
 - **Vendor-documented**: taken from the vendor's documentation and not run for this step.
@@ -609,22 +614,20 @@ engine's reading, recorded in [ADR 0078](adr/0078-certificate-revocation-posture
 **unmeasured** for cipher suites: nobody has captured this driver's handshake on Windows before and
 after a policy change.
 
-**Set the suites (vendor-documented).** Microsoft documents three supported routes in
+**1. Set the suites (vendor-documented).** Microsoft documents three supported routes in
 [Manage TLS](https://learn.microsoft.com/en-us/windows-server/security/tls/manage-tls): Group Policy,
 MDM and the TLS PowerShell module. It says editing the cipher-suite registry order directly is not
 supported.
 
 - Group Policy: **Computer Configuration > Administrative Templates > Network > SSL Configuration
   Settings > SSL Cipher Suite Order**. Enable it and list only AEAD suites.
-- Or PowerShell, once for each suite name the check below prints:
+- Or PowerShell, once for each suite name that check 1 below prints:
 
   ```powershell
   Disable-TlsCipherSuite -Name 'TLS_RSA_WITH_AES_256_CBC_SHA'
   ```
 
-Microsoft states that a change to the cipher suite order takes effect on the next boot.
-
-**Turn TLS 1.0 and 1.1 off for the client role (vendor-documented).** Microsoft's
+**2. Turn TLS 1.0 and 1.1 off for the client role (vendor-documented).** Microsoft's
 [TLS registry settings](https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings)
 page gives the key: a DWORD named `Enabled` with value `0` under the version's `Client` subkey. These
 hops are TLS clients, so `Client` is the subkey that matters here. From an elevated PowerShell:
@@ -632,21 +635,25 @@ hops are TLS clients, so `Client` is the subkey that matters here. From an eleva
 ```powershell
 foreach ($v in 'TLS 1.0', 'TLS 1.1') {
     $key = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$v\Client"
-    New-Item -Path $key -Force | Out-Null
+    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
     New-ItemProperty -Path $key -Name Enabled -Value 0 -PropertyType DWord -Force | Out-Null
 }
 ```
 
-These commands were **not run** for this step. Microsoft states that an application or service may
-need a restart before a protocol change reaches it, so restart the engine service afterwards.
+The `Test-Path` guard matters. Without it, `New-Item -Force` would replace a key that already exists
+and drop the values a hardening baseline put there. The commands in steps 1 and 2 are
+**vendor-documented** only. They were not run for this step.
 
-**Check it.** Both checks read state and change nothing.
+**3. Reboot the host (vendor-documented).** Microsoft states: "Changes to the TLS cipher suite order
+take effect on the next boot." Restarting the engine service is not enough for the suite change.
+
+**4. Check it, after the reboot.** Both checks read state and change nothing.
 
 ```powershell
-# 1. Suites: every enabled suite that is not AEAD. A healthy host prints nothing.
+# Check 1, suites: every enabled suite that is not AEAD. A healthy host prints nothing.
 (Get-TlsCipherSuite).Name | Where-Object { $_ -notmatch 'GCM|CCM|CHACHA20_POLY1305' }
 
-# 2. Protocols: a healthy host prints 0 twice.
+# Check 2, protocols: a healthy host prints 0 twice.
 foreach ($v in 'TLS 1.0', 'TLS 1.1') {
     $key = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$v\Client"
     (Get-ItemProperty -Path $key -Name Enabled -ErrorAction SilentlyContinue).Enabled
@@ -661,13 +668,18 @@ Keep check 1 in the form shown. **Measured** on the same host, in PowerShell 7.6
 5.1: piping `Get-TlsCipherSuite` straight into `Where-Object Name -NotMatch ...` did not filter by
 name. One spelling of it printed nothing on that unconfigured host, which reads as healthy.
 
-**What the Windows check does not prove.** It reads the host's SChannel list. It does not read what the
-driver negotiated. A healthy answer is evidence about the driver only as far as the SChannel reading
-above holds.
+**What the Windows checks do not prove.**
+
+- They read the host's stored SChannel settings. They do not read what the driver negotiated. A
+  healthy answer is evidence about the driver only as far as the SChannel reading above holds.
+- Before the reboot, check 1 may already print nothing while SChannel still uses the old suites. That
+  is **unmeasured**, so run the checks after the reboot.
+- Check 1 tests the AEAD floor only. Suites it passes can still lie outside the engine's approved
+  list. To match that list, use the Group Policy route and list those suites by name.
 
 #### Linux: the host OpenSSL configuration binds the driver (measured)
 
-**Measured: the host OpenSSL configuration decides which suites and versions the driver offers.** An
+**Measured: the OpenSSL configuration decides which suites and versions the driver offers.** An
 earlier reading held that the driver might use a suite list of its own. On the rig below, it did not.
 
 The rig: Microsoft ODBC Driver 18 for SQL Server (`libmsodbcsql-18.6.so.2.1`), on Ubuntu 22.04 with OpenSSL 3.0.2,
@@ -676,7 +688,7 @@ where a client lists every suite and version it will accept. The listener answer
 pre-login step, so the default `Encrypt=yes` path was recorded as well as `Encrypt=strict`. Both paths
 gave the same result in every row.
 
-| Host setting, in `[system_default_sect]` of `/etc/ssl/openssl.cnf` | Suites the driver offered | Versions the driver offered |
+| Setting, in `[system_default_sect]` of `/etc/ssl/openssl.cnf` | Suites the driver offered | Versions the driver offered |
 |---|---|---|
 | Stock file (`CipherString = DEFAULT:@SECLEVEL=2`) | 30, of which 16 are not AEAD | TLS 1.3, TLS 1.2 |
 | The policy below | 6, all AEAD | TLS 1.3, TLS 1.2 |
@@ -686,24 +698,37 @@ gave the same result in every row.
 The control: `openssl s_client` on the same host sent the same suites and versions as the driver in
 every row. The setting was therefore live for OpenSSL itself, and the driver followed it.
 
-**Set it (measured on Ubuntu 22.04).** In `/etc/ssl/openssl.cnf`, under `[system_default_sect]`:
+**Set it (measured on Ubuntu 22.04).** In `/etc/ssl/openssl.cnf`, under `[system_default_sect]`,
+replace the existing `CipherString` line with these three lines:
 
 ```ini
-CipherString = ECDHE+AESGCM+AES256:ECDHE+CHACHA20
+CipherString = ECDHE+AESGCM+AES256:ECDHE+CHACHA20:@SECLEVEL=2
 Ciphersuites = TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
 MinProtocol = TLSv1.2
 ```
 
-Then restart the engine service, so the driver reads the file again.
+Replace the line, do not add a second one: OpenSSL would take the last `CipherString` in the section.
+Keep the `@SECLEVEL=2` part, which the stock line carried. Then restart the engine service, so the
+driver reads the file again.
 
-**Check it (measured).** Run this as the account the engine runs as, with the same environment:
+**Check it (measured).** Run both lines as the account the engine runs as, with the same environment:
 
 ```bash
-openssl ciphers -s -v | grep -v -c AEAD
+openssl ciphers -s -v | grep -c .        # every suite on offer: must be above 0
+openssl ciphers -s -v | grep -v -c AEAD  # suites that are not AEAD: must be 0
 ```
 
-A healthy host prints `0`. On the rig, the stock file printed `16` and the policy above printed `0`.
-Under that policy, `openssl ciphers -s -v` listed exactly the six suites the driver then offered.
+On the rig, the stock file printed `30` then `16`, and the policy above printed `6` then `0`. Under
+that policy, `openssl ciphers -s -v` listed exactly the six suites the driver then offered.
+
+The first line is the control. A host with no `openssl` command printed `0` for it on the rig, and it
+would print `0` for the second line too. So a `0` on the second line means nothing unless the first
+line is above `0`.
+
+**In a container, the file inside the image is the one that binds.** The project's `runtime-sqlserver`
+image (`docker/Dockerfile`) carries its own `/etc/ssl/openssl.cnf`. Editing the node's file would not
+reach it. Set the policy in the image, and run the check inside the running container. This is
+**unmeasured**: the rig did not use that image or its Debian base.
 
 **Keep `OPENSSL_CONF` out of the service environment**, unless the file it names carries this policy
 too. That variable replaces the system file for the driver (measured, last table row).
@@ -743,7 +768,7 @@ too. That variable replaces the system file for the driver (measured, last table
       runtime login holds row access only (§1.1/§1.2). **Or** `[store].schema_management = "auto"` is
       set on purpose and the runtime login holds the DDL grant.
 - [ ] SQL Server: RCSI enabled (by `provision-schema`, or pre-enabled by a DBA).
-- [ ] SQL Server over ODBC: the host cipher policy is set and checked on every engine host
+- [ ] SQL Server over ODBC: the host cipher policy is set and checked wherever an ODBC hop would run
       ([section 5.4](#54-host-cipher-policy-for-the-odbc-hops-operator-precondition)). The engine
       cannot enforce it.
 - [ ] Source store drained (`in_pipeline → 0`) before cutover — greenfield, no in-place migration.
