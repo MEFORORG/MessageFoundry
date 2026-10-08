@@ -1418,12 +1418,12 @@ them. The R1 fix would change that, in every mode, at least as follows:
 **The inert rule, stated once here.** The lens's own predicate decides what is inert; the list below
 describes it for a reader. **The list is not a gate.** No check, test or requirement may treat it as
 the definition of inert; a checker calls the lens's predicate (Manager decision 2026-10-07, after
-review). The list is a lower bound: the predicate admits at least these. It has ceilings, which the
-predicate SHALL apply: the name ceiling below, and each refusal the bullets state (`%` and `**`,
-arithmetic on a name that may hold text, an `occurrence` or `repetition` below 1, and a Set Field or
-Add Repetition value that is not text). It has one exception to "calls nothing": admitted values call
-nothing except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...)` and
-`FhirRaw(<string literal>)`, named below.
+review). The list gives examples of what is admitted; it does not limit the predicate. What binds are
+the ceilings, which the predicate SHALL apply: the name ceiling below,
+and each refusal the bullets state (`%` and `**`, arithmetic on a name that may hold text, an
+`occurrence` or `repetition` below 1, and a Set Field or Add Repetition value that is not text). It
+has one exception to "calls nothing": admitted values call nothing except a bounded `msg.field(...)`
+read and the FHIR value objects `FhirToken(...)` and `FhirRaw(<string literal>)`, named below.
 
 - a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
 - `+` and `-` over numbers and numeric names; `*`, `/` and `//` over number literals only, with a
@@ -1488,7 +1488,10 @@ nothing except a bounded `msg.field(...)` read and the FHIR value objects `FhirT
 **Where the code stands.** The lens implementation of G.6 and G.7 is PR 2155
 (`messagefoundry/lens.py`). Its tests, `tests/test_lens_no_code_injection.py` and
 `tests/test_lens_typed_only_repair.py`, are the source of record for what the code enforces. Where
-the code and these rules differ, the difference is to be recorded on PR 2155, with its status.
+the code and these rules differ, the stricter of the two governs, and each difference is recorded
+with its status on PR 2155 until it is reconciled (Manager decision 2026-10-07, PR 2154 review
+finding 4). The record is [PR 2155, comment
+6049435349](https://github.com/MEFORORG/MessageFoundry/pull/2155#issuecomment-6049435349).
 `set_params` on action, lookup and diagnostic rows already refuses a `dynamic` value (AC-M5).
 
 **Limits of a static check.** The predicate reads the source and runs nothing, so code that
@@ -1504,7 +1507,8 @@ last name. So `set_field(__import__("os").getcwd() or msg, "PID-5.1", "X")` and 
 msg)` read back as ordinary typed rows whose `params` look unchanged. The Steps view then shows code
 that runs as a typed step. ADR 0208's repository check would close this for itself, once built, by
 comparing each typed row's full statement (spec FR-40 item 5a). Whether the lens should refuse to
-project such a row as typed is open, and not yet recorded on PR 2155.
+project such a row as typed is open; [PR 2155, comment
+6049435349](https://github.com/MEFORORG/MessageFoundry/pull/2155#issuecomment-6049435349) records it.
 
 That sentence of E.11 is not rewritten; the dated pointer appended to it sends the reader here. The
 change is being built separately and has not landed.
