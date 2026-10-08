@@ -211,6 +211,10 @@ def test_every_analysis_marker_matches_a_step(workflow: dict) -> None:
     """A marker that matches nothing drops its step out of the guard above, and the `>= 6` floor
     there cannot see one going missing. That is how the coverage step left it unnoticed."""
     runs = [step.get("run") or "" for _, step in _steps(workflow)]
+    assert len(runs) >= 6, f"expected the workflow's run steps to be found, got {len(runs)}"
+    assert len(_ANALYSIS_MARKERS) >= 6, (
+        "the marker list is empty, so this check would pass vacuously"
+    )
     dead = [marker for marker in _ANALYSIS_MARKERS if not any(marker in run for run in runs)]
     assert not dead, f"analysis marker(s) match no step in the workflow: {dead}"
 
