@@ -146,8 +146,8 @@ class ProtocolFloorUnavailable(RuntimeError):
     """The server class lacks a hook the protocol header floor needs, so the floor cannot be built.
 
     ``serve`` refuses to start on this. The message names the hook and the installed versions, and
-    :attr:`hook` holds the hook alone. From the startup self-test it holds what the test found in
-    place of a hook: each response and the header it lacked."""
+    :attr:`hook` holds the hook alone. A refusal from the startup self-test names no single hook, so
+    there it holds ``"startup self-test"`` and the message says what the test found."""
 
     hook: str = ""
 

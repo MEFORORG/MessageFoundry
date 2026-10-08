@@ -51,7 +51,9 @@ def _refusal(http: type[Any], ws: type[Any] | None) -> str:
         selftest_protocol_floor(http, ws)
     message = str(refused.value)
     assert "failed its startup self-test" in message, message
-    assert refused.value.hook and refused.value.hook in message
+    assert refused.value.hook == "startup self-test"
+    # Raised outside any handler, so nothing the drive raised rides on the refusal's chain.
+    assert refused.value.__context__ is None and refused.value.__cause__ is None
     return message
 
 
@@ -145,7 +147,40 @@ def test_a_wrong_header_value_is_refused(monkeypatch: pytest.MonkeyPatch) -> Non
     assert f"lacked {name}" in _refusal(http, ws)
 
 
+def test_a_header_written_twice_is_refused() -> None:
+    """Flooring a floored class stamps the 400 twice. Two writers for one header is drift the
+    check names, not a pass."""
+    http, ws = _floored(H11Protocol)
+    twice = floored_http_protocol_class(base=http)
+    message = _refusal(twice, ws)
+    for name, _ in PROTOCOL_SECURITY_HEADERS:
+        assert f"the malformed-request 400 carried {name} more than once" in message, message
+
+
 # --- a drive that does not reach its response fails closed ---------------------------------------
+
+
+@pytest.mark.parametrize("http_base", _HTTP_BASES)
+def test_an_upgrade_the_http_protocol_keeps_is_refused(
+    http_base: type[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The WebSocket drives must be answered by the WebSocket class. Here the HTTP protocol never
+    hands the upgrade over and answers with its own floored 500, which would pass on headers."""
+    http, ws = _floored(http_base)
+    monkeypatch.setattr(http, "_should_upgrade", lambda self: False)
+    message = _refusal(http, ws)
+    for response in ("WebSocket handshake rejection", "WebSocket pre-handshake 500"):
+        assert f"the {response} drive never reached the WebSocket protocol" in message, message
+    assert "lacked" not in message, message
+
+
+def test_the_environment_uvicorn_reads_does_not_reach_the_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """uvicorn's Config reads these two when left to. A bad value is not a header floor failure."""
+    monkeypatch.setenv("WEB_CONCURRENCY", "not-a-number")
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "not-an-address")
+    selftest_protocol_floor(*_floored())
 
 
 def test_an_unexpected_status_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:

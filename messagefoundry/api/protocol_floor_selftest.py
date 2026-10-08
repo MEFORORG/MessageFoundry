@@ -31,9 +31,24 @@ exception from the drive itself all raise
 ``supervise`` already refuse to start on. The message names each response and each header it lacked.
 It never quotes the bytes written, and it names an exception by type only.
 
-**What it does not prove.** It drives the four families above and no others. A response family a new
-server version adds is outside it, as it is outside the floor. The header set comes from
+**What it does not prove.** At least these are outside it:
+
+* A response family other than the four above. One a new server version adds is outside it, as it is
+  outside the floor.
+* The settings ``serve`` runs with. The drives use a plain ``uvicorn.Config``: no TLS, no server-wide
+  default headers, one worker, and nothing read from the environment. A header merge that depended
+  on those would not show here.
+* Any class other than the two it is handed. ``serve`` runs it a second time on the
+  client-certificate shim when it stacks that on the floored class, because the shim is then the
+  class served.
+
+The header set comes from
 :data:`~messagefoundry.api.protocol_headers.PROTOCOL_SECURITY_HEADERS`, the floor's one definition.
+
+**It leans on CPython internals.** The private loop subclasses ``asyncio.BaseEventLoop`` and supplies
+the ``_selector`` and ``_process_events`` that class expects. A Python release that moves either
+makes every drive raise, and the engine then refuses to start, naming this module as a possible
+cause. The test suite drives the real self-test, so such a release turns CI red first.
 """
 
 from __future__ import annotations
@@ -72,6 +87,10 @@ _UPGRADE = (
 )
 #: The sample nonce from RFC 6455 section 1.3. It is public and protects nothing.
 _UPGRADE_KEY = b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+
+
+#: What ``ProtocolFloorUnavailable.hook`` holds for a refusal from here. No one hook failed.
+_HOOK = "startup self-test"
 
 
 class _Drive(NamedTuple):
@@ -139,7 +158,8 @@ class _CapturingTransport(asyncio.Transport):
         super().__init__()
         self.written = bytearray()
         self._closing = False
-        self._protocol: Any = None
+        #: The protocol now holding this transport. uvicorn's upgrade hand-over replaces it.
+        self.protocol: Any = None
 
     def write(self, data: bytes | bytearray | memoryview) -> None:
         self.written += data
@@ -148,8 +168,8 @@ class _CapturingTransport(asyncio.Transport):
         if self._closing:
             return
         self._closing = True
-        if self._protocol is not None:
-            asyncio.get_running_loop().call_soon(self._protocol.connection_lost, None)
+        if self.protocol is not None:
+            asyncio.get_running_loop().call_soon(self.protocol.connection_lost, None)
 
     def abort(self) -> None:
         self.close()
@@ -158,7 +178,7 @@ class _CapturingTransport(asyncio.Transport):
         return self._closing
 
     def set_protocol(self, protocol: asyncio.BaseProtocol) -> None:
-        self._protocol = protocol
+        self.protocol = protocol
 
     def pause_reading(self) -> None:
         pass
@@ -201,15 +221,19 @@ def _missing(drive: _Drive, written: bytes) -> list[str]:
     status = int(status_line[1])
     if status not in drive.statuses:
         return [f"the {drive.response} drive was answered with status {status}"]
-    sent = set()
+    sent = []
     for line in lines[1:]:
-        name, _, value = line.partition(b":")
-        sent.add((name.strip().lower(), value.strip()))
-    return [
-        f"the {drive.response} lacked {name}"
-        for name, value in PROTOCOL_SECURITY_HEADERS
-        if (name.lower().encode("latin-1"), value.encode("latin-1")) not in sent
-    ]
+        got, _, text = line.partition(b":")
+        sent.append((got.strip().lower(), text.strip()))
+    problems = []
+    for name, value in PROTOCOL_SECURITY_HEADERS:
+        wanted = name.lower().encode("latin-1")
+        if (wanted, value.encode("latin-1")) not in sent:
+            problems.append(f"the {drive.response} lacked {name}")
+        elif sum(got == wanted for got, _ in sent) > 1:
+            # The floor adds each header once. A second copy means two paths now write it.
+            problems.append(f"the {drive.response} carried {name} more than once")
+    return problems
 
 
 async def _turns(count: int) -> None:
@@ -223,12 +247,16 @@ async def _drive_all(http_class: type[Any], ws_class: type[Any] | None) -> list[
     import uvicorn
     from uvicorn.server import ServerState
 
+    # workers and proxy_headers are spelled out so Config reads neither WEB_CONCURRENCY nor
+    # FORWARDED_ALLOW_IPS: a bad value there is not a header floor failure and must not read as one.
     config = uvicorn.Config(
         _failing_app,
         http=http_class,
         ws=ws_class if ws_class is not None else "none",
         lifespan="off",
         log_config=None,
+        workers=1,
+        proxy_headers=False,
     )
     state = ServerState()
     problems: list[str] = []
@@ -249,7 +277,11 @@ async def _drive_all(http_class: type[Any], ws_class: type[Any] | None) -> list[
             if b"\r\n\r\n" in transport.written:
                 break
             await asyncio.sleep(0)
-        problems += _missing(drive, bytes(transport.written))
+        if drive.websocket and not isinstance(transport.protocol, ws_class or ()):
+            # A floored answer from the HTTP protocol would otherwise pass for the WebSocket one.
+            problems.append(f"the {drive.response} drive never reached the WebSocket protocol")
+        else:
+            problems += _missing(drive, bytes(transport.written))
 
     # Hang up as a client would, then cancel whatever is still waiting, so the loop is discarded
     # with nothing pending on it.
@@ -271,6 +303,7 @@ def selftest_protocol_floor(http_class: type[Any], ws_class: type[Any] | None) -
 
     Raises :class:`~messagefoundry.api.protocol_headers.ProtocolFloorUnavailable`; see the module
     docstring for what counts."""
+    problems: list[str] = []
     try:
         loop = _NoIOLoop()
         drives = _drive_all(http_class, ws_class)
@@ -281,13 +314,13 @@ def selftest_protocol_floor(http_class: type[Any], ws_class: type[Any] | None) -
             drives.close()  # a no-op once it ran; it never starts when a loop is already running
             loop.close()
     except Exception as exc:
-        # Type only: the message could carry bytes the server was handed.
-        # The cause may be this harness and not the server, so the message points here as well.
-        problem = (
+        # Only the type is kept, and the refusal is raised after this handler ends, so the caught
+        # exception is not on its chain. The cause may be this harness and not the server, so the
+        # message points here as well.
+        problems = [
             f"the drive raised {type(exc).__name__} before a response could be read, in the "
             "server or in messagefoundry/api/protocol_floor_selftest.py itself"
-        )
-        raise floor_unavailable(f"failed its startup self-test: {problem}", problem) from None
+        ]
     if problems:
         found = "; ".join(problems)
-        raise floor_unavailable(f"failed its startup self-test: {found}", found)
+        raise floor_unavailable(f"failed its {_HOOK}: {found}", _HOOK)

@@ -230,11 +230,11 @@ def test_serve_allows_non_loopback_bind_with_tls(
     assert isinstance(factory(None, None), ssl.SSLContext)
 
 
-def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
+def _serve_mtls_with_cert_map(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # ADR 0083 activation: in-process mTLS (client CA) + a cert-identity map → the scope-populating shim
-    # is passed to uvicorn as the `http` protocol so a verified peer cert reaches the resolver.
+) -> tuple[int, dict[str, Any]]:
+    """Run ``serve`` with in-process mTLS and a cert-identity map. Returns the exit code and what
+    reached ``uvicorn.run``."""
     from messagefoundry.store.crypto import generate_key
 
     cert, key = _self_signed(tmp_path)
@@ -256,12 +256,45 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
         '{ "CN:svc" = "0123456789abcdef0123456789abcdef" } }\n',
         encoding="utf-8",
     )
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]), captured
+
+
+def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADR 0083 activation: in-process mTLS (client CA) + a cert-identity map → the scope-populating shim
+    # is passed to uvicorn as the `http` protocol so a verified peer cert reaches the resolver.
+    rc, captured = _serve_mtls_with_cert_map(tmp_path, monkeypatch)
+    assert rc == 0
     http_cls = captured.get("http")
     assert http_cls is not None
     assert "connection_made" in vars(http_cls)  # the shim's per-connection cert-stashing override
     # BACKLOG #1120: the shim is stacked ON the header-floored protocol, never instead of it.
     assert "send_400_response" in vars(http_cls.__mro__[1])
+
+
+def test_serve_refuses_when_the_shim_it_serves_answers_bare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1120: with the shim stacked on, the shim is the class uvicorn serves, so the startup
+    self-test drives it too. A shim that shadowed the floor's 400 writer is refused. The test above
+    is the control: the same fixture with the real shim starts."""
+    from messagefoundry.api import tls_client_cert
+
+    real = tls_client_cert.client_cert_http_protocol_class
+
+    def _shadowing_shim(base: Any) -> Any:
+        shim: Any = real(base=base)
+        shim.send_400_response = base.__mro__[1].send_400_response  # the server's own writer
+        return shim
+
+    monkeypatch.setattr(tls_client_cert, "client_cert_http_protocol_class", _shadowing_shim)
+    rc, captured = _serve_mtls_with_cert_map(tmp_path, monkeypatch)
+    assert rc == 2
+    assert captured == {}, "uvicorn.run was reached"
+    err = capsys.readouterr().err
+    assert "failed its startup self-test: the malformed-request 400 lacked" in err, err
+    assert "refusing to start." in err, err
 
 
 def test_serve_mtls_without_cert_map_gets_no_shim(

@@ -4402,10 +4402,20 @@ def _serve(args: argparse.Namespace) -> int:
         # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
         # and every non-mTLS bind keep the header-floored protocol without the shim.
         if settings.api.tls_client_ca_file and settings.api.tls_client_cert_identities:
+            from messagefoundry.api.protocol_floor_selftest import selftest_protocol_floor
+            from messagefoundry.api.protocol_headers import ProtocolFloorUnavailable
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
             # Stacked ON the floored protocol, never instead of it (BACKLOG #1120).
             run_kwargs["http"] = client_cert_http_protocol_class(base=run_kwargs["http"])
+            # The shim is now the class served, so it is measured too. The first self-test ran on
+            # the class beneath it, before any side effect; this one can only run here, once the
+            # settings say the shim is wanted.
+            try:
+                selftest_protocol_floor(run_kwargs["http"], run_kwargs["ws"])
+            except ProtocolFloorUnavailable as exc:
+                print(f"error: {exc}; refusing to start.", file=sys.stderr)
+                return 2
 
     # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
     # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
