@@ -456,7 +456,14 @@ jobs:
     # ubuntu run of this step can. Why `--dist loadfile` and
     # `--max-worker-restart=0` and not xdist's defaults is in ci.yml's engine step; the reasons
     # are the same here and are not restated.
-    timeout-minutes: 30
+    #
+    # XDIST ALONE DID NOT BUY THE MARGIN, SO THE CAP MOVED FROM 30 TO 45. First run under `-n 4`
+    # (PR 2170, job 113084365613, 2026-10-08): `33861 passed` in 25m50s, job 26m39s, so 3m21s
+    # under the old cap. The suite was 22043 tests nine days earlier, and a serial run at that
+    # job's rate would be about 42 minutes, so xdist bought about 1.6x on this 4 vCPU runner. 45
+    # is 1.7x the measured job. At this growth rate that margin lasts days to weeks, not months;
+    # the next lever is sharding the step across jobs and combining the coverage data.
+    timeout-minutes: 45
     permissions:
       contents: read
     outputs:
