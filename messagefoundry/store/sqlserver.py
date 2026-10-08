@@ -69,7 +69,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
-from messagefoundry.redaction import safe_text
+from messagefoundry.redaction import codec_safe_str, safe_text
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
@@ -2782,7 +2782,7 @@ class SqlServerStore:
         except Exception as exc:  # noqa: BLE001 - §4: ANY gate failure degrades, never an outage
             # A transient probe failure (e.g. a hiccup on the metadata read) must not fail the
             # open — the ADR's rule is total: any gate miss runs the shipped batch, loudly.
-            reason = f"startup-gate probe failed: {exc}"
+            reason = f"startup-gate probe failed: {codec_safe_str(exc)}"
         if reason is None:
             self._claim_proc_effective = True
             self._claim_proc_degraded_reason = None

@@ -510,7 +510,21 @@ def load_code_sets(codesets_dir: str | Path) -> dict[str, CodeSet]:
 
 
 def _load_csv(path: Path) -> dict[str, Any]:
-    """CSV with a header row: first column = key; one other column → scalar, several → ``{header: cell}``."""
+    """CSV with a header row: first column = key; one other column → scalar, several → ``{header: cell}``.
+
+    A file that is not UTF-8 is a :class:`CodeSetError` naming the file, as a malformed TOML one is.
+    It used to escape as a raw ``UnicodeDecodeError``, past every caller's ``CodeSetError`` arm, with
+    the byte it failed on in its text (vault BACKLOG #3295). The reader decodes as it iterates, so
+    the whole read is inside the arm."""
+    try:
+        return _read_csv(path)
+    except UnicodeDecodeError as exc:
+        invalid = f"code set {path.name!r}: invalid CSV — {codec_safe_str(exc)}"
+    # Raised after the handler: the decode error's .object is a block of the file.
+    raise CodeSetError(invalid)
+
+
+def _read_csv(path: Path) -> dict[str, Any]:
     data: dict[str, Any] = {}
     with path.open(newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)

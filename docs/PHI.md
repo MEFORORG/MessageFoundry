@@ -1486,6 +1486,45 @@ filters the backstop for anything that reaches a handler un-redacted. `configure
 silence python-hl7's PHI-prone loggers as well; python-hl7 is retired, and the built-in parser that
 replaced it logs no field value.
 
+**A codec error in a log line `[BUILT]` (vault BACKLOG #3185, #3295).** A `UnicodeError` holds the
+text or bytes a codec could not handle, and that can be message content. Its `str()` names one
+character or byte, and its `repr()` prints the whole input. `prepare_log_record` in
+[redaction.py](../messagefoundry/redaction.py) is the first step of the engine's filter chain and
+of the tray's. It prints such an error from its class, codec and position:
+
+- in a traceback, for every exception in the chain and every member of an exception group;
+- as the log message, or as a `%s` or `%r` argument;
+- inside a list, tuple, set, dict or deque, their subclasses, a dict's views and a `UserDict`;
+- inside a dataclass, a `SimpleNamespace`, a `ChainMap` or a `UserDict`'s views. These four are
+  read from the instance's own attributes, and one that holds an error prints as its class and a
+  fixed note.
+
+An exception that holds one prints as its class and a fixed note too, never its other arguments.
+That covers `RuntimeError(exc)`, `ValueError("bad", exc)` and an `OSError` whose `filename` is the
+error. It applies in a traceback, as a log argument, in `safe_exc()`, and in the error text a
+sandboxed Handler reports across the process boundary.
+
+**What stays the caller's job, at least:**
+
+- **Text built before the filter sees it.** `f"bad frame: {exc}"` and `str(exc)` are plain text by
+  the time a record exists, and no pattern can tell the character from prose. Render a caught error
+  through `safe_exc()` or `codec_safe_str()`. The same holds for a mapping whose own `__getitem__`
+  returns text made from a stored error: `"%(key)s"` asks that lookup, and the filter walks only
+  what it returns.
+- **Objects the filter does not read.** At least a `MappingProxyType`, a `slice`, and an object of
+  your own class that is not a dataclass. An error held in one still prints raw.
+- **An argument that renders differently the second time.** The three later filters render the
+  message again, so an object whose `__repr__` changes or raises on a later call can still raise
+  from the log call, or print what the first step did not see.
+- **A file path in an `OSError`.** The path prints whole. A caller that knows the name is
+  partner-chosen passes it to `safe_exc(exc, file_name=...)`.
+
+The source scan in `tests/test_unicode_error_log_paths.py` reads every `except` arm that names a
+Unicode error type. It also reads an arm that catches `ValueError`, `Exception` or everything,
+when its own `try` body calls `.decode()`, `.encode()`, `.read_text()` or `.write_text()`. It does
+not see a codec call made inside a function the `try` body calls, so most broad arms are outside
+it.
+
 **A second residual, from the same honesty rule (BACKLOG #1572):** the delimiter sniff reads MSH-1 and
 MSH-2, so a **headerless** custom-delimiter fragment declares nothing and passes through — `mrn
 MRN123$$$H$MR here` still survives. So does a message whose MSH-2 is shorter than its conformant width.

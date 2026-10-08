@@ -72,12 +72,19 @@ import pkgutil
 import re
 import traceback
 from abc import ABCMeta
-from collections import OrderedDict, UserDict, defaultdict, deque
-from collections.abc import Callable
+from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
+from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
-from types import BuiltinFunctionType, FunctionType, TracebackType
+from types import (
+    BuiltinFunctionType,
+    FunctionType,
+    GetSetDescriptorType,
+    MemberDescriptorType,
+    SimpleNamespace,
+    TracebackType,
+)
 from typing import Any
 
 __all__ = [
@@ -2056,10 +2063,17 @@ def safe_exc(
     That covers only the error itself: one rendered INTO another exception's message, as
     ``f"bad frame: {exc}"``, still arrives here as text. So a handler that catches one renders it
     through this function, and ``tests/test_unicode_error_log_paths.py`` scans for one that does not.
-    A traceback and a ``%s`` log argument take :func:`prepare_log_record`."""
+    A traceback and a ``%s`` log argument take :func:`prepare_log_record`.
+
+    A different exception that HOLDS one, as ``RuntimeError(exc)`` or ``ValueError("bad", exc)``,
+    prints the Unicode error's own ``str()`` or ``repr()`` as its message. It renders as its class
+    and a fixed note, never its other arguments (vault BACKLOG #3295;
+    :func:`prints_a_codec_error`)."""
     if isinstance(exc, UnicodeError):
         return safe_text(_unicode_error_text(exc), limit=limit)
     name = type(exc).__name__
+    if prints_a_codec_error(exc):  # RuntimeError(exc): its str() is the Unicode error's own
+        return f"{name}: {_HOLDER_TEXT}"
     raw = str(exc)
     if file_name and (base := _basename(file_name)):
         raw = raw.replace(base, safe_name(file_name))
@@ -2193,8 +2207,10 @@ def safe_traceback(ei: ExcInfo) -> str:
     release. A later one that drops it gets :func:`safe_exc`'s single line and no frames, rather than
     the raw text, and ``tests/test_unicode_error_log_paths.py`` fails if the write stops landing.
 
-    A different exception built FROM a Unicode error, as ``RuntimeError(exc)``, has the same
-    ``str()`` and is not rewritten here. That is the third path, closed where the wrap is written."""
+    A different exception that HOLDS a Unicode error, as ``RuntimeError(exc)``, has the same
+    ``str()``. Its line prints its class and a fixed note (vault BACKLOG #3295). One whose message
+    was built as text, ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the
+    third path, closed where the wrap is written."""
     value, tb = ei[1], ei[2]
     # `type(None)` and None are what the stdlib's own print_exception passes for an empty exc_info.
     te = traceback.TracebackException(type(value), value, tb, compact=True)  # type: ignore[arg-type]
@@ -2205,12 +2221,13 @@ def safe_traceback(ei: ExcInfo) -> str:
         node, exc = pending.pop()
         if node is None or exc is None:  # exc is None at the root of an empty exc_info
             continue
-        if isinstance(exc, UnicodeError):
+        line = _codec_line(exc)
+        if line is not None:
             # The instance's own attribute, so a class-level default cannot pass; and getattr, so a
             # __slots__ class with no __dict__ fails closed rather than raising.
             if "_str" not in getattr(node, "__dict__", {}):  # renamed: fail closed, no traceback
                 return safe_exc(value) if value is not None else ""
-            node._str = _unicode_error_detail(exc)  # the stdlib's private name: see docstring
+            node._str = line  # the stdlib's private name: see docstring
         pending.append((node.__cause__, exc.__cause__))
         pending.append((node.__context__, exc.__context__))
         if node.exceptions:  # set only for an exception group the stdlib will expand
@@ -2218,13 +2235,32 @@ def safe_traceback(ei: ExcInfo) -> str:
     return "".join(te.format()).removesuffix("\n")
 
 
+def _codec_line(exc: BaseException) -> str | None:
+    """What a traceback prints after the class name, when ``exc`` is a ``UnicodeError`` or holds
+    one, or None when its own ``str()`` is safe to print."""
+    if isinstance(exc, UnicodeError):
+        return _unicode_error_detail(exc)
+    return _HOLDER_TEXT if prints_a_codec_error(exc) else None
+
+
 def codec_safe_str(exc: BaseException) -> str:
-    """``str(exc)``, except that a ``UnicodeError`` renders as :func:`safe_exc` renders it.
+    """``str(exc)``, except that a ``UnicodeError`` renders as :func:`safe_exc` renders it, and an
+    exception that holds one (:func:`prints_a_codec_error`) renders as a fixed note.
 
     For an arm that catches a Unicode error beside an ``OSError`` or a ``TOMLDecodeError``, whose
     text an operator reads to fix a path or a file. :func:`safe_exc` would redact and cut that path,
     and only the Unicode error carries message content (vault BACKLOG #3185)."""
-    return safe_exc(exc) if isinstance(exc, UnicodeError) else str(exc)
+    if isinstance(exc, UnicodeError):
+        return safe_exc(exc)
+    return _HOLDER_TEXT if prints_a_codec_error(exc) else str(exc)
+
+
+def codec_safe_line(exc: BaseException) -> str:
+    """``Type: message`` with the message as :func:`codec_safe_str` gives it, and the class named
+    once. For a report that prints any error with its class, as the sandbox worker's does."""
+    if isinstance(exc, UnicodeError):
+        return safe_exc(exc)
+    return f"{type(exc).__name__}: {codec_safe_str(exc)}"
 
 
 #: The containers a log argument is walked through. A ``UnicodeError`` inside one renders through
@@ -2243,14 +2279,21 @@ def codec_safe_str(exc: BaseException) -> str:
 #: ``isinstance``, which a proxy can fake. For a builtin that is the builtin's own method
 #: (``dict.items(arg)``), which runs none of the caller's code. Any other ``Mapping`` runs its own
 #: code to be read: ``ConfigParser.items()`` interpolates and can raise, and the engine's
-#: ``CodeSet`` would be walked whole on every record. Those, a ``ChainMap``, a ``MappingProxyType``,
-#: a ``SimpleNamespace``, a dataclass and every other object are left as they are. The caller's code
-#: still runs in at least these places: a ``UserDict``'s ``.data``, the ``repr()`` of an element
-#: beside an error, and a container subclass's own ``__repr__`` over a bare copy (:func:`_own_render`).
-#: :func:`prepare_log_record` catches what they raise.
+#: ``CodeSet`` would be walked whole on every record. Those, a ``MappingProxyType`` and every other
+#: object are left as they are. The caller's code still runs in at least these places: a
+#: ``UserDict``'s ``.data``, the ``repr()`` of an element beside an error, and a container subclass's
+#: own ``__repr__`` over a bare copy (:func:`_own_render`). :func:`prepare_log_record` catches what
+#: they raise.
+#:
+#: FOUR KINDS ARE READ BY ATTRIBUTE (vault BACKLOG #3295): a dataclass, a ``SimpleNamespace``, a
+#: ``ChainMap`` and a ``UserDict``'s views. Each prints what its attributes hold. They are read from
+#: the instance's own storage (:func:`_attribute_values`), which runs none of the object's code, and
+#: one that can reach an error prints as its class and a fixed note, never through its own ``repr``.
 _ARG_SEQUENCES: tuple[type[Any], ...] = (tuple, list, set, frozenset, deque)
 _ARG_VIEWS: tuple[type[Any], ...] = (type({}.keys()), type({}.values()), type({}.items()))
 _ARG_MAPPINGS: tuple[type[Any], ...] = (dict, UserDict)
+#: What the record's single mapping argument may be and still be rebuilt: ``"%(key)s"`` asks it.
+_ROOT_MAPPINGS: tuple[type[Any], ...] = (*_ARG_MAPPINGS, ChainMap)
 _ARG_WALKED: tuple[type[Any], ...] = (
     BaseException,
     *_ARG_MAPPINGS,
@@ -2264,12 +2307,66 @@ _ARG_DEPTH = 5
 #: The argument types nearly every record carries, answered without a subclass check.
 _ARG_SCALARS = frozenset({str, int, float, bool, bytes, type(None)})
 _TOO_DEEP = "[holds a codec error, nested too deep to render]"
+#: What stands in for the message of an exception that holds a ``UnicodeError``.
+_HOLDER_TEXT = "[holding a codec error, not rendered]"
 _CYCLE = "[a cycle back to a container that holds a codec error]"
 #: The builtin descriptors, so a subclass that overrides one cannot run its own code here.
 _EXC_ARGS: Any = BaseException.__dict__["args"]
 _GROUP_MEMBERS: Any = BaseExceptionGroup.__dict__["exceptions"]
 _DEQUE_MAXLEN: Any = deque.__dict__["maxlen"]
 _DEFAULT_FACTORY: Any = defaultdict.__dict__["default_factory"]
+_OS_FILENAMES: tuple[Any, ...] = (OSError.__dict__["filename"], OSError.__dict__["filename2"])
+_TYPE_MRO: Any = type.__dict__["__mro__"]
+_TYPE_DICT: Any = type.__dict__["__dict__"]
+_NOT_FOUND: Any = object()
+
+
+def _class_attribute(kind: type[Any], name: str) -> Any:
+    """``name`` as the classes of ``kind`` define it, read from their own dicts along the real MRO.
+    No ``getattr``, so no descriptor, metaclass or ``__getattr__`` of the caller's runs."""
+    for base in _TYPE_MRO.__get__(kind):
+        found = _TYPE_DICT.__get__(base).get(name, _NOT_FOUND)
+        if found is not _NOT_FOUND:
+            return found
+    return _NOT_FOUND
+
+
+def _slot_names(kind: type[Any]) -> tuple[str, ...] | None:
+    """The slots a render of a ``kind`` instance may print, or None when ``kind`` is not read by
+    attribute. A dataclass's are its field names, since ``slots=True`` keeps each field in one; a
+    ``UserDict`` view's is the mapping it prints. The instance ``__dict__`` is read as well."""
+    # One pass, with identity tests along the real MRO: this runs for every log argument that
+    # is neither a scalar nor a builtin container.
+    for base in _TYPE_MRO.__get__(kind):
+        fields = _TYPE_DICT.__get__(base).get("__dataclass_fields__")
+        if type(fields) is dict:
+            return tuple(name for name in fields if type(name) is str)
+        if base is MappingView:
+            return ("_mapping",)
+        if base is SimpleNamespace or base is ChainMap:
+            return ()
+    return None
+
+
+def _attribute_values(arg: Any, kind: type[Any], slots: tuple[str, ...]) -> list[Any]:
+    """What the attributes of ``arg`` hold: every value in its instance ``__dict__``, and each
+    named slot. Both are read through the builtin descriptors, so none of the object's code runs.
+
+    It reads every instance attribute, not the fields a generated ``repr`` lists, so a dataclass
+    field declared ``repr=False`` counts. That errs toward the fixed note and prints nothing."""
+    values: list[Any] = []
+    own_dict = _class_attribute(kind, "__dict__")
+    # A Python class keeps it behind a getset descriptor, and SimpleNamespace behind a member.
+    if type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType:
+        values.extend(dict.values(own_dict.__get__(arg)))
+    for name in slots:
+        slot = _class_attribute(kind, name)
+        if type(slot) is MemberDescriptorType:
+            try:
+                values.append(slot.__get__(arg))
+            except AttributeError:  # a slot never assigned
+                continue
+    return values
 
 
 class _SafeText(str):
@@ -2368,6 +2465,9 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
     if issubclass(kind, BaseExceptionGroup):
         # Both: a subclass may print its .args, and the caller's list in .args can differ from them.
         return [*_GROUP_MEMBERS.__get__(arg), *_EXC_ARGS.__get__(arg)]
+    if issubclass(kind, OSError):
+        # str() prints .filename and .filename2 by repr, and neither is in .args.
+        return [*_EXC_ARGS.__get__(arg), *(name.__get__(arg) for name in _OS_FILENAMES)]
     if issubclass(kind, BaseException):
         return list(_EXC_ARGS.__get__(arg))  # str() and repr() print .args
     if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
@@ -2385,6 +2485,37 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
         if issubclass(kind, base):
             return list(base.__iter__(arg))
     return []
+
+
+def _attribute_children(arg: Any, kind: type[Any], slots: tuple[str, ...]) -> list[Any]:
+    try:
+        return _attribute_values(arg, kind, slots)
+    except Exception:  # noqa: BLE001 -- unreadable storage: left as it is, as with no filter
+        return []
+
+
+def prints_a_codec_error(exc: BaseException) -> bool:
+    """True when ``exc`` is not a ``UnicodeError`` but its own ``str()`` may print one: one sits in
+    its ``.args``, at any depth, or is an ``OSError``'s ``.filename`` (vault BACKLOG #3295).
+
+    ``str(RuntimeError(exc))`` is ``str(exc)``, which names the character or byte, and
+    ``str(ValueError("bad", exc))`` prints ``repr(exc)``, the whole input. A caller prints the
+    class and :data:`_HOLDER_TEXT` instead, never the other arguments, since the class may keep
+    them out of its own message.
+
+    An exception group whose ``str()`` is the builtin one prints only its message and a count, so
+    it is False however its members read; a traceback prints each member on its own line. It never
+    raises, and it answers True when the arguments cannot be read."""
+    kind = type(exc)
+    if issubclass(kind, UnicodeError):
+        return False
+    try:
+        own_str: Any = kind.__str__
+        if issubclass(kind, BaseExceptionGroup) and own_str is BaseExceptionGroup.__str__:
+            return False
+        return id(exc) in _Scan(exc).holds
+    except Exception:  # noqa: BLE001 -- fail closed: it might
+        return True
 
 
 class _Scan:
@@ -2414,6 +2545,10 @@ class _Scan:
                 seeds.append(key)
                 continue
             if not issubclass(kind, _ARG_WALKED):
+                slots = _slot_names(kind)
+                if slots is not None:
+                    nodes[key] = (arg, _attribute_children(arg, kind, slots), "")
+                    pending.extend(c for c in nodes[key][1] or () if type(c) not in _ARG_SCALARS)
                 continue
             try:
                 children = _children(arg, kind)
@@ -2625,7 +2760,8 @@ class _Rebuild:
         return None
 
     def _render(self, arg: Any, kind: type[Any], children: list[Any], depth: int) -> _Rendered:
-        if issubclass(kind, BaseException):
+        # An exception, or an object read by attribute: never printed through its own code.
+        if issubclass(kind, BaseException) or not issubclass(kind, _ARG_WALKED):
             return _holder_note(kind)
         if issubclass(kind, UserDict):
             own: Any = kind.__repr__
@@ -2642,6 +2778,8 @@ class _Rebuild:
 
     def pairs(self, root: Any) -> list[tuple[Any, Any]]:
         """The root mapping's keys and values, rebuilt, for :class:`_RenderedMapping`'s storage."""
+        if issubclass(type(root), ChainMap):
+            return []  # its maps are not flattened: "%(key)s" asks the ChainMap itself
         flat = self.scan.nodes[id(root)][1] or []
         if issubclass(type(root), UserDict):
             data = self.scan.nodes.get(id(flat[0])) if flat else None
@@ -2659,7 +2797,7 @@ def _safe_arg(arg: Any, depth: int) -> Any:
         return arg
     if issubclass(kind, UnicodeError):
         return _SafeText(safe_exc(arg))
-    if not issubclass(kind, _ARG_WALKED):
+    if not issubclass(kind, _ARG_WALKED) and _slot_names(kind) is None:
         return arg
     scan = _Scan(arg)
     if not scan.holds:
@@ -2669,7 +2807,7 @@ def _safe_arg(arg: Any, depth: int) -> Any:
 
 def _safe_mapping_args(args: Any) -> Any:
     """The stdlib's single-mapping form, whose values are the arguments, at level 1."""
-    if not issubclass(type(args), _ARG_MAPPINGS):
+    if not issubclass(type(args), _ROOT_MAPPINGS):
         return _safe_arg(args, 0)  # a ConfigParser is untouched; a bare UnicodeError is replaced
     scan = _Scan(args)
     if not scan.holds:
@@ -2714,7 +2852,13 @@ def prepare_log_record(record: logging.LogRecord) -> None:
     renders ``str(exc)``, which names the character or byte the codec failed on, and ``%r`` or a
     container renders ``repr(exc)``, which prints ``.object``, the whole input. An argument that
     holds no error is left as the same object. A container on the path to one prints as it would,
-    the error aside; an exception on that path prints its class and a fixed note.
+    the error aside; an exception on that path prints its class and a fixed note, and so does a
+    dataclass, a ``SimpleNamespace``, a ``ChainMap`` or a ``UserDict``'s view (vault BACKLOG #3295).
+
+    WHAT IT CANNOT DO IS THE CALLER'S, and ``docs/PHI.md`` section 7 lists it. At least: text built
+    from the error before the record exists (``f"{exc}"``, or a mapping whose own ``__getitem__``
+    returns such text), an object it does not read (a ``MappingProxyType``, a class that is not a
+    dataclass), and an argument that renders differently when a later filter renders it again.
 
     IT NEVER RAISES. ``Handler.handle`` does not catch a filter's exception, so one raised here would
     reach the caller's log call. An argument that cannot be walked, or a traceback that cannot be
