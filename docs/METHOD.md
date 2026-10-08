@@ -66,6 +66,9 @@ Manager, Process Improvement and ASVS Tracker. **An eighth went on 2026-09-05**,
 `reviewed` label and `review-gate.yml`; it is deliberately unnamed, here and everywhere else in this
 repository, by owner instruction 2026-09-16. **The CONSOLE went on 2026-09-10, and the Manager above
 replaces it.** If a document names one, that document is stale.
+*Count note, 2026-10-07:* this page counts the unnamed 2026-09-05 seat as the eighth, which makes
+the Console the ninth here. The `CLAUDE.md` block kept under *Retired CLAUDE.md notices* calls the
+Console the eighth because that file never counted the unnamed seat. Both name the same retirements.
 
 **A Manager is not a renamed Console, and substituting one for the other is the measured failure
 this retirement was written to stop.** A Console's workers were separate sessions across several
