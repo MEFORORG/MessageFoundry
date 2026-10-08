@@ -1,7 +1,7 @@
 # Input surfaces: what each one expects
 
-**This page maps every place the product takes input to the rule that says what that input must look
-like.** It covers the surfaces outside the operator API. The operator API has its own page,
+**This page maps the product's input surfaces to the rules that say what each input must look
+like.** It covers surfaces outside the operator API. The operator API has its own page,
 [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md).
 
 For each surface the page says four things:
@@ -13,28 +13,35 @@ For each surface the page says four things:
 
 **This page is a map, not a second copy of the rules.** Where another document already defines a
 structure, this page names it and links to it. Follow the link for settings, defaults and numbers.
-Where no structure is defined anywhere, this page says so. ASVS 2.1.1 asks for this kind of
-documentation; this page does not score anything against it.
+Where no structure is defined anywhere, this page says so.
 
-Every list here is "at least". A new connector or command can add a surface before this page is
-edited. The code named in each section is the source of record.
+Every list here is "at least", and so is the page. A new connector or command can add a surface
+before this page is edited. The code named in each section is the source of record. Where this page
+and the code disagree, the code is right.
+
+**Some surfaces are not mapped here.** They include at least:
+
+- the Python modules and code sets in a configuration directory, beyond what the
+  `connections.toml` section says;
+- the results of the read-only lookups a Handler may make, `db_lookup` and `fhir_lookup`;
+- the command lines of the separate toolkit, the test harness and the tray manager.
 
 | Surface | Where its structure is defined |
 |---|---|
-| [Inbound listeners and sources](#every-inbound-body-passes-the-same-ingress-checks) | This page for the shared checks; [CONNECTIONS.md](CONNECTIONS.md) for each connector |
+| [Inbound listeners and sources](#most-inbound-bodies-pass-the-same-ingress-checks) | This page for the shared checks; [CONNECTIONS.md](CONNECTIONS.md) for each connector |
 | [HL7 v2 messages and field content](#hl7-v2-the-engine-checks-the-envelope-and-your-code-checks-the-fields) | [HL7-VALIDATION.md](HL7-VALIDATION.md) |
 | [Non-HL7 payloads](#non-hl7-payloads-are-checked-for-type-then-parsed-on-demand) | This page, with one owner document per type |
 | [`connections.toml`](#connectionstoml-is-held-to-the-connector-factories) | [CONNECTIONS.md](CONNECTIONS.md) |
 | [Service settings](#service-settings-are-defined-in-configurationmd) | [CONFIGURATION.md](CONFIGURATION.md) |
 | [The command line](#the-command-line-is-defined-by-its-parser-and-no-prose-page-lists-it) | The parser itself |
 | [The VS Code extension](#the-vs-code-extension-is-a-client-and-the-engine-rule-is-the-control) | The engine rules it calls into |
-| [Web console rows marked `-`](#some-web-console-parameters-have-no-rule) | A generated table; no structure is defined |
+| [Web console rows marked `-`](#some-web-console-parameters-have-no-rule) | A generated table; no document defines a structure |
 
 ---
 
-## Every inbound body passes the same ingress checks
+## Most inbound bodies pass the same ingress checks
 
-An inbound connection receives a body in one of two ways. A listener takes it from a socket. A
+Most inbound connections receive a body in one of two ways. A listener takes it from a socket. A
 polling source reads it from a directory, a remote directory or a database table. Either way, the
 connector hands the raw bytes to one of two shared handlers in
 [`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py):
@@ -66,7 +73,16 @@ A text body is any `content_type` that is not binary. Today the binary types are
 | 8 | The message passes strict structural validation | `validate` in `parsing/validate.py` | `hl7v2`, and only when the inbound turns it on |
 
 A body that passes is committed to the ingress stage. Only then does the sender get a positive
-answer. [ADR 0205](adr/0205-an-outbound-frame-holds-exactly-one-message.md) gives the reason for
+answer.
+
+**A streaming inbound differs in two ways.** When an `hl7v2` inbound sets a streaming threshold and
+a body is at or over it, check 8 covers the header only. The handler then detaches large embedded
+documents before the commit. That step can refuse the body too, with an `ERROR` row and a negative
+answer.
+[ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)
+defines it.
+
+The reasons for two of the checks are recorded. [ADR 0205](adr/0205-an-outbound-frame-holds-exactly-one-message.md) covers
 check 3, and
 [ADR 0206](adr/0206-an-hl7-write-or-re-encode-never-lets-data-become-structure.md) for check 4.
 
@@ -79,22 +95,35 @@ is then carried as base64 by `carry_binary_ingress`.
 
 ### What happens to a body that fails a check
 
-**A refused body is always recorded.** The handler writes a message row with status `ERROR` and a
-reason. The reason names the check and never quotes the body. Nothing is accepted and then dropped.
+**A body that a check refuses is recorded.** The handler writes a message row with status `ERROR`
+and a reason. Nothing is accepted and then dropped.
+
+**Do not treat a stored reason as free of message content.** Most reasons are fixed text that names
+the check. The strict-validation reason is scrubbed, but a bare value from the message can survive
+the scrub.
+
+**One case leaves no message row.** If the handler itself faults, for example when the store is
+down, no check refused the body and no row is written. On MLLP,
+`MLLPSource._answer_handler_failure` records a `handler_error` connection event. A sender that
+expects replies gets a negative acknowledgment, and the connection closes.
 
 What the sender is told depends on the connector and the content type:
 
 | Sender path | Answer for a refused body |
 |---|---|
-| An `hl7v2` inbound with an acknowledgment mode other than `none` | A negative HL7 acknowledgment. Checks 1 to 4 and 7 answer the reject code. Check 8 answers the error code. `build_ack` in [`mllpcodec.py`](../messagefoundry/mllpcodec.py) builds it, and the inbound's `AckMode` picks the code family. |
+| An `hl7v2` inbound with an acknowledgment mode other than `none`, on a connector that writes the handler's reply back. MLLP does, and so does raw TCP. | A negative HL7 acknowledgment. `_handle_inbound` picks the reject or the error code for each check. `build_ack` in [`mllpcodec.py`](../messagefoundry/mllpcodec.py) builds it, and the inbound's `AckMode` picks the code family. |
 | A non-HL7 inbound on MLLP, raw TCP or X12 | No reply. These connectors send nothing for a non-HL7 body, accepted or refused. |
-| The HTTP listener | `422` with a fixed JSON body and no `message_id`. |
+| The HTTP listener, for any content type | `422` with a fixed JSON body and no `message_id`. It never sends an HL7 acknowledgment. |
 | The DICOM C-STORE receiver | A DIMSE failure status. [DICOM.md](DICOM.md) section 3 states which status answers which refusal. |
-| A polling source (file, remote file, database) | Nothing. There is no sender on the line. The `ERROR` row is the record. |
+| A polling source (file, remote file, database), for any content type | Nothing. There is no sender on the line. The `ERROR` row is the record. |
 
-**A failure after the commit is not reported to the sender.** Routing, transform and delivery run
-after the positive answer. A failure there becomes the message's `ERROR` or dead-letter disposition.
-[ADR 0001](adr/0001-staged-pipeline-architecture.md) explains why.
+**A failure after the commit is not reported to the sender, with one exception.** Routing,
+transform and delivery run after the positive answer. A failure there becomes the message's `ERROR`
+or dead-letter disposition. [ADR 0001](adr/0001-staged-pipeline-architecture.md) explains why.
+
+The exception is an HTTP inbound that sets `reply_from`. It holds the HTTP turn until the named
+outbound's reply is captured, so the caller can see a delivery failure or a timeout. The HTTP
+listener section of CONNECTIONS.md states each answer.
 
 ### Each connector adds its own rules in front of the shared checks
 
@@ -118,7 +147,14 @@ registered today are at least these. Read the `register_source(...)` calls in
 | Database poll | Rows returned by the operator's `poll_statement`. The body is one column's value when `body_column` is set, and otherwise the whole row as a JSON object. | `DatabaseSource` in `transports/database.py` | A poll error is logged and the poller keeps running. |
 | DICOM C-STORE receiver | A DIMSE association, then one stored object per C-STORE | `DicomScpSource` in `transports/dicom.py` | A DIMSE failure status. See [DICOM.md](DICOM.md) section 3. |
 | Timer | No external input. The body is the `body` setting the operator wrote. | `TimerSource` in `transports/timer.py` | A bad schedule or a missing `body` is refused when the connection is built. |
-| Loopback and pass-through | No external input. Bodies arrive only from the engine's own handoffs. | `LoopbackSource` in `transports/loopback.py`; `PassThroughSource` in `transports/passthrough.py` | Not applicable. |
+| Loopback | No socket and no poll. The body is a reply the engine captured from a downstream partner. | `LoopbackSource` in `transports/loopback.py`; `RegistryRunner._process_response_item` | See the note below the table. |
+| Pass-through | No socket and no poll. The body is what a Handler sent to it. | `PassThroughSource` in `transports/passthrough.py` | Not applicable. |
+
+**A Loopback body does not pass the shared handlers.** A captured reply comes from outside the
+engine, so treat it as untrusted. `_process_response_item` holds it to the size ceiling
+(`reingress_size_error`) and, for `hl7v2`, to `Peek.parse`. It does not run the other checks in the
+table above. A reply that fails is recorded with status `ERROR`.
+[ADR 0013](adr/0013-query-response-orchestration.md) describes the path.
 
 The two file sources run the type check themselves, before the shared handler. They call the same
 function the listeners use, `_content_matches_declared` in
@@ -180,7 +216,8 @@ are skipped for the text types.
 
 **The structure is checked when your code asks.** Each type has a codec. A Router or Handler calls
 it against the `RawMessage`. If the codec refuses the body and your code lets the error raise, the
-message takes the `ERROR` or dead-letter disposition. That happens after the sender was answered.
+message takes the `ERROR` or dead-letter disposition. By then the sender has its receipt, except on
+the `reply_from` path described above.
 
 | `content_type` | First bytes the type check expects | Codec, called on demand | Owner document |
 |---|---|---|---|
@@ -217,8 +254,11 @@ A machine-readable form of the same schema comes from `messagefoundry connection
 built by `build_schema` in
 [`config/connection_schema.py`](../messagefoundry/config/connection_schema.py).
 
-**A file that breaks a rule does not load.** The loader raises a `WiringError` that names the
-connection. The message never repeats the offending value, because a setting can be a credential.
+**A file that breaks a rule does not load.** The loader raises a `WiringError`.
+
+**Do not assume a refusal is free of the values in the file.** The type check on `[settings]`
+never repeats a value, because a setting can be a credential. Other refusals can. At least a bad
+`ack_mode` or `transport` value is echoed in the message.
 
 A connection's name is held to one more rule, shared with the operator API.
 [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md) states it.
@@ -230,9 +270,9 @@ The per-environment value files that `env()` references read are a related input
 
 ## Service settings are defined in CONFIGURATION.md
 
-[CONFIGURATION.md](CONFIGURATION.md) is the structure of the service settings. It catalogs every
-section and key of `messagefoundry.toml`, the `MEFOR_*` environment variables, and the order in which
-a flag, a variable, the file and a default win.
+[CONFIGURATION.md](CONFIGURATION.md) is the structure of the service settings. It catalogs the
+sections and keys of `messagefoundry.toml`, the `MEFOR_*` environment variables, and the order in
+which a flag, a variable, the file and a default win.
 
 The rules live in [`config/settings.py`](../messagefoundry/config/settings.py): the `ServiceSettings`
 model defines the fields, `load_settings` builds it, and `_reject_unknown_file_keys` refuses a key or
@@ -248,9 +288,14 @@ notes of CONFIGURATION.md state the exact scope; read them there.
 
 **No single document defines the structure of every command.** The parser is the definition.
 `_build_parser` in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py) declares each
-subcommand, its flags, their types and their allowed choices. `messagefoundry --help` and
-`messagefoundry <command> --help` print it. `CLI_TIERS` in
-[`cli_surface.py`](../messagefoundry/cli_surface.py) lists every subcommand by name.
+subcommand of the `messagefoundry` command, with its flags, their types and their allowed choices.
+`messagefoundry --help` and `messagefoundry <command> --help` print it.
+
+This section covers the `messagefoundry` command only. `CLI_TIERS` in
+[`cli_surface.py`](../messagefoundry/cli_surface.py) names subcommands across two commands: this
+one and the separate `messagefoundry-toolkit` command, whose parser is in
+`messagefoundry_toolkit/__main__.py`. The test harness and the tray manager have entry points of
+their own. This page does not map those three.
 
 Individual commands are described where they are used, for example in
 [USER-GUIDE.md](USER-GUIDE.md), [SERVICE.md](SERVICE.md) and [CONFIGURATION.md](CONFIGURATION.md).
@@ -259,14 +304,16 @@ What happens to input the command line will not take:
 
 | Input | Result |
 |---|---|
-| An unknown subcommand, an unknown flag, or a value outside a flag's type or choices | The parser prints a usage error to stderr and exits `2`. |
+| An unknown subcommand, an unknown flag, or a value outside a flag's type or choices | The parser prints a usage error to stderr and exits `2`. A subcommand's flags still match by unambiguous prefix, so a shortened flag can be read as a real one. The opening notes of [CONFIGURATION.md](CONFIGURATION.md) state that rule. |
 | An authoring command the engine does not carry | One line naming the toolkit command, and exit `2`. |
 | Malformed JSON given to `--data` or on stdin, on the commands that read operator JSON | An error that names which input was at fault, and a non-zero exit. `_load_operator_json` in [`cli_common.py`](../messagefoundry/cli_common.py) owns the rule. |
 | Anything a command did not expect, raised as an uncaught error | One redacted line on the log stream and exit `1`. Under `--json`, an `{"error": ...}` object on stdout as well. `run_cli` in `cli_common.py` owns this floor. |
 
 Several commands take a path to a configuration directory. The engine loads Python from that
-directory, so the path is a trust decision, not only a format question. The files inside it are held
-to the rules in the sections above.
+directory, so the path is a trust decision, not only a format question. Of the files inside it, this
+page maps `connections.toml` only. The Router and Handler modules are Python;
+[CONNECTIONS.md](CONNECTIONS.md) describes how to author them. [CODESETS.md](CODESETS.md) defines
+the code-set files.
 
 Some commands read message files, at least `dryrun` and `check`. Those bodies go through the same
 decode and guard functions as live ingress. The module docstring of
@@ -278,12 +325,13 @@ differs.
 ## The VS Code extension is a client, and the engine rule is the control
 
 The extension in [`ide/`](../ide/) does not hold rules of its own that the engine depends on. It
-sends input to the engine in two ways:
+sends input to the engine in at least these ways:
 
 - it runs `messagefoundry` subcommands ([`ide/src/cli.ts`](../ide/src/cli.ts)), so the command-line
   and `connections.toml` rules above apply;
 - it calls the operator API ([`ide/src/engineClient.ts`](../ide/src/engineClient.ts)), so
-  [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md) applies.
+  [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md) applies;
+- it writes and edits files in the configuration directory, at least Python modules (`ide/src/newRoute.ts`). The engine loads those files later, like any other file there.
 
 [`ide/README.md`](../ide/README.md) describes the extension. No document defines an input structure
 for it apart from the engine rules it reaches.
@@ -309,15 +357,19 @@ difference. The file pickers are covered by the file handling and quarantine pol
 The web console at `/ui` applies the operator API's rules on some routes.
 [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md) says which, and what a refusal looks like.
 
-**For the remaining parameters, no expected structure is defined in code or in a document.** They
-carry a length bound or nothing. A generated table lists every console parameter and the rule it
-carries:
+**For the remaining parameters, no document defines an expected structure.** A generated table
+lists the console's path and query parameters that are text, and the named rule each one carries:
 [`packaging/messagefoundry-webconsole/tests/golden/ui_input_rules.txt`](../packaging/messagefoundry-webconsole/tests/golden/ui_input_rules.txt).
-A parameter with no rule is marked `-` there. Read that table for the current set, not this page.
+A parameter with none of the console's named rules is marked `-` there. Read that table for the
+current set, not this page.
 
-**A `-` means none of the console's named rules applies.** The parameter can still carry a bound of
-its own in its route declaration. For example, `m` on the account page has a length bound, and
-`target` on the search page has a fixed pattern. Those bounds are in the route modules under
+**The table has two limits.** It does not list a form field sent in a request body, or a parameter
+that is not text. `_input_rule_rows` in
+`packaging/messagefoundry-webconsole/tests/test_golden_surface.py` builds it and states both.
+
+**A `-` does not mean the code holds no bound.** A parameter can carry a bound of its own in its
+route declaration. For example, `m` on the account page has a length bound, and `target` on the
+search page has a fixed pattern. Those bounds are in the route modules under
 [`messagefoundry_webconsole/routes/`](../messagefoundry_webconsole/routes/). No document lists them.
 
 The rows marked `-` include at least these kinds:
@@ -334,5 +386,6 @@ The operator API defines a shape for the ids and the connection names. The conso
 that shape on these rows. The two time bounds are a special case: API-INPUT-VALIDATION.md describes
 how the console parses them and then applies the API's time-bound rule.
 
-This page does not say what each of those parameters should accept. That has not been decided.
+This page does not say what each of those parameters should accept. No document records a
+decision on that.
 API-INPUT-VALIDATION.md records the two that carry no rule on purpose, and why.
