@@ -878,25 +878,30 @@ A configured forwarder that does not start never stops the engine. The engine te
 (BACKLOG #2612).
 
 - **The `log_forward_failed` alert.** It is keyed on `forwarder:<kind>`, and `kind` is one of
-  three fixed words. `not_installed`: the
-  forwarder did not start, so this process sends nothing off the host. It fires once per process.
-  `dropping`: records were lost since the last look. `spool_unreadable`: the on-disk spool could not
-  be read, so its records are held and not sent. The last two fire at most once every five minutes
-  while the count keeps rising. The engine checks every 30 seconds.
+  four fixed words. The engine checks every 30 seconds.
+  - `not_installed`: the forwarder is not attached, so this process sends nothing off the host.
+    It fires once. The reason is `permanent` or `transient` for a failed start, or `stopped`.
+  - `dropping`: a loss count rose. The reason names which, and the count is every record lost
+    since the process started.
+  - `spool_unreadable`: the on-disk spool could not be read, so its records are held and not sent.
+  - `not_sending`: every send has failed for five minutes. With a spool nothing is lost yet.
+
+  The last three share one limit: at most one alert every five minutes while the fault stands.
+  Nothing closes the alert when the forwarder recovers; resolve it by hand.
 - **`log_forwarder` on `GET /status`.** It is `null` when no forwarder is configured. Otherwise
-  `state` is `healthy`, `degraded` or `not_installed`, beside the counts: `lost`, `queued`,
-  `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped` and `spool_read_errors`. The web
-  console's status page shows the same reading, and its health indicator turns to warn.
+  `state` is `healthy`, `degraded` or `not_installed`, beside `send_failing`, `spool_read_faulted`
+  and the counts: `lost`, `queued`, `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped`,
+  `spool_skipped` and `spool_read_errors`. The web console's status page shows the same reading,
+  and its health indicator turns to warn.
 
 `degraded` means the last send failed, the spool cannot be read, or a record was lost since the
 process started. A loss keeps the state `degraded` until a restart, because the records are still
-missing at the collector. A collector that is down while a spool keeps the records is `degraded`
-with nothing lost, and raises no alert.
+missing at the collector.
 
 Both carry counts and fixed words only: never a record, the collector's address or an error text.
-Every count is since the process started. Under engine shards each process has its own forwarder.
-The alert does not say which process raised it, and `GET /status` reports the process that
-answered.
+Every count is since the process started. Each engine process has its own forwarder and watches
+its own: every engine shard, and a cluster standby too. The alert does not say which process
+raised it, and `GET /status` reports the process that answered.
 
 ### `[retention]`
 Enforced by the engine's retention/purge task ([pipeline/retention.py](../messagefoundry/pipeline/retention.py)).

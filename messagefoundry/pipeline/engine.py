@@ -69,6 +69,7 @@ from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
 from messagefoundry.pipeline.intake_bound import IntakeBoundMonitor
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
+from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.retention import RetentionRunner
@@ -414,6 +415,7 @@ class Engine:
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
         self._crl_reload_runner: CrlReloadRunner | None = None
+        self._log_forward_watch: LogForwardWatch | None = None
         self._gcm_invocation_runner: GcmInvocationRunner | None = None
         # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
         # #1169); None until start() arms it, and again after stop() disarms it.
@@ -1607,6 +1609,12 @@ class Engine:
                 watch_unlisted_held_crls=True,
             )
             self._cert_expiry_runner.start()
+        # BACKLOG #2612: page when the off-box log forwarder is absent, losing records or not
+        # sending. NOT leader-gated, for the certificate monitor's reason: the forwarder is this
+        # process's own, so a standby and every engine shard watches its own.
+        if self._log_forward_watch is None:
+            self._log_forward_watch = LogForwardWatch(alert_sink=self._alert_sink)
+            self._log_forward_watch.start()
         # BACKLOG #299: apply a replaced CRL file to the running hops that hold the old copy. Not
         # gated on [cert_monitor]: turning the expiry alert off must not also stop a revocation
         # reaching a running hop. Not leader-gated: each process holds its own TLS contexts. Its cap
@@ -2889,6 +2897,9 @@ class Engine:
         if self._crl_reload_runner is not None:
             await self._crl_reload_runner.stop()
             self._crl_reload_runner = None
+        if self._log_forward_watch is not None:
+            await self._log_forward_watch.stop()
+            self._log_forward_watch = None
         if self._secret_rotation_runner is not None:
             await self._secret_rotation_runner.stop()
         if self._update_check_runner is not None:

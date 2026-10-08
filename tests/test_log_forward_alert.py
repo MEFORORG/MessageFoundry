@@ -4,8 +4,8 @@
 (BACKLOG #2612).
 
 Three layers, each tested where it lives: the in-memory reading
-(:func:`~messagefoundry.logging_setup.forwarder_status`), the runner's check that turns a reading
-into an alert, and the status model. No test opens a socket or resolves a name.
+(:func:`~messagefoundry.logging_setup.forwarder_status`), the watch that turns a reading into an
+alert, and the status model. No test opens a socket or resolves a name.
 """
 
 from __future__ import annotations
@@ -21,14 +21,12 @@ import pytest
 
 from messagefoundry import logging_setup
 from messagefoundry.api.app import _log_forwarder_health
-from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
     _ALERT_EVENT_TYPES,
     AlertRule,
     EgressSettings,
 )
-from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.logging_setup import (
     ForwarderStatus,
     SyslogForward,
@@ -38,10 +36,10 @@ from messagefoundry.logging_setup import (
     configure_logging,
     forwarder_status,
 )
-from messagefoundry.pipeline import wiring_runner
+from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.store.store import MessageStore
 
 #: Synthetic HL7 (never real PHI). It goes through a forwarder that drops it, and must not come
@@ -66,36 +64,10 @@ def _no_network_and_no_forwarder_state(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class _RecordingSink(LoggingAlertSink):
     def __init__(self) -> None:
-        self.forward_failures: list[tuple[str, str, str, int]] = []
+        self.forward_failures: list[tuple[str, str, int]] = []
 
-    def log_forward_failed(self, name: str, *, kind: str, reason: str, count: int = 0) -> None:
-        self.forward_failures.append((name, kind, reason, count))
-
-
-@pytest.fixture
-async def store(tmp_path: Path) -> Any:
-    s = await MessageStore.open(tmp_path / "forward.db")
-    yield s
-    await s.close()
-
-
-def _runner(store: MessageStore, sink: AlertSink) -> RegistryRunner:
-    reg = Registry()
-    reg.add_inbound(
-        InboundConnection(
-            "IB_TEST_ADT",
-            ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0}),
-            router="r",
-        )
-    )
-    reg.add_router("r", lambda m: [])
-    return RegistryRunner(
-        reg,
-        store,
-        poll_interval=0.02,
-        alert_sink=sink,
-        egress=EgressSettings(deny_by_default=False),
-    )
+    def log_forward_failed(self, name: str, *, reason: str, count: int = 0) -> None:
+        self.forward_failures.append((name, reason, count))
 
 
 def _fail_the_start(monkeypatch: pytest.MonkeyPatch, exc: OSError) -> None:
@@ -227,97 +199,189 @@ def test_a_closed_forwarder_is_not_reported_as_installed() -> None:
     assert forwarder_status().installed is False
 
 
-# --- the runner's check ------------------------------------------------------------------------
+# --- the watch ---------------------------------------------------------------------------------
 
 
-async def test_a_failed_start_raises_the_alert_once(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _watch(
+    sink: AlertSink, *, readings: list[ForwarderStatus] | None = None
+) -> tuple[LogForwardWatch, _Clock]:
+    clock = _Clock()
+    if readings is None:
+        return LogForwardWatch(alert_sink=sink, clock=clock), clock
+    feed = iter(readings)
+    return LogForwardWatch(alert_sink=sink, clock=clock, read=lambda: next(feed)), clock
+
+
+def test_a_failed_start_raises_the_alert_once(monkeypatch: pytest.MonkeyPatch) -> None:
     _fail_the_start(monkeypatch, socket.gaierror(11001, "no such name"))
     configure_logging("INFO", forward=FORWARD)
     sink = _RecordingSink()
-    runner = _runner(store, sink)
+    watch, _ = _watch(sink)
     for _ in range(3):
-        runner._check_log_forwarder()
-    assert sink.forward_failures == [("forwarder:not_installed", "not_installed", "permanent", 0)]
+        watch.run_once()
+    assert sink.forward_failures == [("forwarder:not_installed", "permanent", 0)]
 
 
-async def test_a_rising_drop_count_raises_the_alert_with_no_record_text(
-    store: MessageStore,
-) -> None:
+def test_a_rising_drop_count_raises_the_alert_with_no_record_text() -> None:
     handler, _ = _attach(_Collector(), maxsize=1)
     sink = _RecordingSink()
-    runner = _runner(store, sink)
-    runner._check_log_forwarder(now=0.0)
+    watch, _ = _watch(sink)
+    watch.run_once()
     assert sink.forward_failures == []  # nothing lost yet
     for _ in range(3):
         handler.handle(_record(SYNTHETIC_RECORD))
     dropped = handler.dropped
-    runner._check_log_forwarder(now=1.0)
-    assert sink.forward_failures == [("forwarder:dropping", "dropping", "queue_full", dropped)]
+    watch.run_once()
+    assert sink.forward_failures == [("forwarder:dropping", "queue_full", dropped)]
     assert "DOE" not in repr(sink.forward_failures) and "PID" not in repr(sink.forward_failures)
 
 
-async def test_a_healthy_forwarder_raises_nothing(store: MessageStore) -> None:
+def test_a_healthy_forwarder_raises_nothing() -> None:
     collector = _Collector()
     handler, listener = _attach(collector)
     sink = _RecordingSink()
-    runner = _runner(store, sink)
+    watch, clock = _watch(sink)
     for now in (0.0, 1_000.0):
+        clock.now = now
         handler.handle(_record("fine"))
         listener.handle(handler._records.get_nowait())
-        runner._check_log_forwarder(now=now)
+        watch.run_once()
     assert sink.forward_failures == []
 
 
-async def test_no_forwarder_raises_nothing(store: MessageStore) -> None:
+def test_no_forwarder_raises_nothing() -> None:
     configure_logging("INFO")
     sink = _RecordingSink()
-    _runner(store, sink)._check_log_forwarder()
+    _watch(sink)[0].run_once()
     assert sink.forward_failures == []
 
 
-def _reading(**counts: int) -> ForwarderStatus:
-    return ForwarderStatus(configured=True, installed=True, **counts)  # type: ignore[arg-type]
+def test_a_forwarder_that_goes_away_later_raises_stopped() -> None:
+    handler, _ = _attach(_Collector())
+    sink = _RecordingSink()
+    watch, _ = _watch(sink)
+    watch.run_once()
+    handler.close()
+    watch.run_once()
+    watch.run_once()
+    assert sink.forward_failures == [("forwarder:not_installed", "stopped", 0)]
 
 
-async def test_a_rise_is_throttled_and_the_throttled_part_is_carried(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    readings = iter(
-        [
+def _reading(**fields: Any) -> ForwarderStatus:
+    return ForwarderStatus(configured=True, installed=True, **fields)
+
+
+def test_a_rise_is_throttled_and_the_count_is_the_running_total() -> None:
+    sink = _RecordingSink()
+    watch, clock = _watch(
+        sink,
+        readings=[
             _reading(queue_dropped=2),
             _reading(queue_dropped=5),  # inside the window: no alert
-            _reading(queue_dropped=5, unsent=2),  # past it: the 3 and the 2 together
+            _reading(queue_dropped=5, unsent=2),  # past it: both rises named, the total counted
             _reading(queue_dropped=5, unsent=2),  # nothing new
             _reading(queue_dropped=5, unsent=2, spool_read_errors=4),
-            _reading(),  # a rebuilt forwarder: counts restart, and that is not a loss
-            _reading(spool_dropped=1, undeliverable=1),
-        ]
+            _reading(spool_read_errors=1),  # a rebuilt forwarder: measured from zero again
+            _reading(spool_read_errors=1, spool_dropped=1, undeliverable=1, spool_skipped=1),
+        ],
     )
-    monkeypatch.setattr(wiring_runner, "forwarder_status", lambda: next(readings))
-    sink = _RecordingSink()
-    runner = _runner(store, sink)
-    window = wiring_runner._BUILDUP_REALERT_SECONDS
-    for now in (0.0, 10.0, window + 1, 2 * window + 2, 3 * window + 3, 4 * window + 4, 5 * window):
-        runner._check_log_forwarder(now=now)
+    for now in (0.0, 10.0, 301.0, 602.0, 903.0, 1204.0, 1505.0):
+        clock.now = now
+        watch.run_once()
     assert sink.forward_failures == [
-        ("forwarder:dropping", "dropping", "queue_full", 2),
-        ("forwarder:dropping", "dropping", "queue_full,collector_unreachable", 5),
-        ("forwarder:spool_unreadable", "spool_unreadable", "spool_read_failed", 4),
-        ("forwarder:dropping", "dropping", "send_error,spool_refused", 2),
+        ("forwarder:dropping", "queue_full", 2),
+        ("forwarder:dropping", "queue_full,collector_unreachable", 7),
+        ("forwarder:spool_unreadable", "spool_read_failed", 4),
+        ("forwarder:spool_unreadable", "spool_read_failed", 1),
+        ("forwarder:dropping", "send_error,spool_refused,spool_damaged", 3),
     ]
 
 
-async def test_a_sink_that_raises_does_not_escape_the_check(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class _Raising(LoggingAlertSink):
-        def log_forward_failed(self, name: str, **_kw: Any) -> None:
-            raise RuntimeError("sink bug")
+def test_two_kinds_in_one_pass_are_two_alerts() -> None:
+    sink = _RecordingSink()
+    watch, _ = _watch(sink, readings=[_reading(queue_dropped=1, spool_read_errors=1)])
+    watch.run_once()
+    assert [name for name, _, _ in sink.forward_failures] == [
+        "forwarder:dropping",
+        "forwarder:spool_unreadable",
+    ]
 
-    monkeypatch.setattr(wiring_runner, "forwarder_status", lambda: _reading(queue_dropped=1))
-    _runner(store, _Raising())._check_log_forwarder(now=0.0)  # logs, never raises
+
+def test_sends_failing_for_a_whole_window_raise_not_sending() -> None:
+    # With a spool nothing is lost while the collector is down, so no loss count would ever say so.
+    sink = _RecordingSink()
+    failing, fine = _reading(send_failing=True), _reading()
+    watch, clock = _watch(sink, readings=[failing, failing, fine, failing, failing, failing])
+    for now in (0.0, 299.0, 300.0, 301.0, 600.0, 601.0):
+        clock.now = now
+        watch.run_once()
+    # 0 to 299: not yet a window. 300: a send got through, so the clock starts over at 301.
+    assert sink.forward_failures == [("forwarder:not_sending", "collector_unreachable", 0)]
+
+
+def test_a_sink_that_raises_leaves_the_alert_to_be_raised_again() -> None:
+    class _FailsOnce(_RecordingSink):
+        raised = False
+
+        def log_forward_failed(self, name: str, *, reason: str, count: int = 0) -> None:
+            if not self.raised:
+                self.raised = True
+                raise RuntimeError("sink bug")
+            super().log_forward_failed(name, reason=reason, count=count)
+
+    for reading, expected in (
+        (ForwarderStatus(configured=True, start_failure="permanent"), "forwarder:not_installed"),
+        (_reading(queue_dropped=1), "forwarder:dropping"),
+    ):
+        sink = _FailsOnce()
+        watch, _ = _watch(sink, readings=[reading, reading, reading])
+        with pytest.raises(RuntimeError):
+            watch.run_once()
+        watch.run_once()
+        watch.run_once()
+        assert [name for name, _, _ in sink.forward_failures] == [expected]
+
+
+async def test_the_loop_checks_at_once_survives_a_bad_pass_and_stops() -> None:
+    passes = 0
+
+    def _read() -> ForwarderStatus:
+        nonlocal passes
+        passes += 1
+        raise RuntimeError("reading failed")
+
+    watch = LogForwardWatch(alert_sink=_RecordingSink(), read=_read)
+    watch.start()
+    watch.start()  # idempotent
+    await asyncio.sleep(0.05)
+    assert passes == 1  # the first pass ran without waiting an interval, and the loop lived
+    await watch.stop()
+    await watch.stop()
+
+
+async def test_the_engine_runs_the_watch_and_stops_it(tmp_path: Path) -> None:
+    # The engine owns the watch, not the message graph, so a cluster standby (which runs no graph)
+    # still watches its own forwarder.
+    store = await MessageStore.open(tmp_path / "forward.db")
+    try:
+        engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
+        await engine.start()
+        try:
+            watch = engine._log_forward_watch
+            assert watch is not None and watch._task is not None
+        finally:
+            await engine.stop()
+        assert engine._log_forward_watch is None
+    finally:
+        await store.close()
 
 
 # --- the alert type ----------------------------------------------------------------------------
@@ -342,24 +406,23 @@ class _RecordingTransport:
 async def test_the_notifier_payload_is_counts_and_fixed_words() -> None:
     transport = _RecordingTransport()
     sink = NotifierAlertSink([transport])
-    sink.log_forward_failed("forwarder", kind="dropping", reason="queue_full", count=7)
+    sink.log_forward_failed("forwarder:dropping", reason="queue_full", count=7)
+    # Another kind in the same moment: its own key, so the throttle does not swallow it.
+    sink.log_forward_failed("forwarder:spool_unreadable", reason="spool_read_failed", count=1)
     sink.start()
     await asyncio.sleep(0)
     await sink.aclose()
-    assert len(transport.events) == 1
+    assert len(transport.events) == 2
     event = transport.events[0]
     assert event["type"] == "log_forward_failed"
-    assert event["connection"] == "forwarder"
-    assert (event["kind"], event["detail"], event["count"]) == (
-        "dropping",
-        "dropping: queue_full",
-        7,
-    )
+    assert event["connection"] == "forwarder:dropping"
+    assert (event["detail"], event["count"]) == ("queue_full", 7)
+    assert transport.events[1]["connection"] == "forwarder:spool_unreadable"
 
 
 def test_the_logging_sink_writes_one_line(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alerts"):
-        LoggingAlertSink().log_forward_failed("forwarder", kind="not_installed", reason="permanent")
+        LoggingAlertSink().log_forward_failed("forwarder:not_installed", reason="permanent")
     assert [r.getMessage() for r in caplog.records] == [
-        "ALERT log_forward_failed: forwarder not_installed (permanent; count 0)"
+        "ALERT log_forward_failed: forwarder:not_installed (permanent; count 0)"
     ]

@@ -1412,6 +1412,17 @@ def _forward_targets(logger: logging.Logger) -> list[logging.Handler]:
 _forward_configured = False
 _forward_start_failure = ""
 
+#: The :class:`ForwarderStatus` counts that are LOSSES, each with the fixed word an alert names it
+#: by. The one list: :attr:`ForwarderStatus.lost` adds these up, and the watch names the ones that
+#: rose (``pipeline/log_forward_watch.py``).
+FORWARD_LOSS_COUNTERS = (
+    ("queue_dropped", "queue_full"),
+    ("unsent", "collector_unreachable"),
+    ("undeliverable", "send_error"),
+    ("spool_dropped", "spool_refused"),
+    ("spool_skipped", "spool_damaged"),
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ForwarderStatus:
@@ -1441,6 +1452,8 @@ class ForwarderStatus:
     undeliverable: int = 0
     #: Records the on-disk spool refused: full, or the write failed.
     spool_dropped: int = 0
+    #: Spooled records skipped as torn or malformed, and segments found gone before they were sent.
+    spool_skipped: int = 0
     #: Spool reads that failed for a reason other than a missing file. Held, not lost.
     spool_read_errors: int = 0
     #: Whether the last spool read failed that way.
@@ -1449,7 +1462,7 @@ class ForwarderStatus:
     @property
     def lost(self) -> int:
         """Records that will not reach the collector, as a floor."""
-        return self.queue_dropped + self.unsent + self.undeliverable + self.spool_dropped
+        return sum(getattr(self, field) for field, _ in FORWARD_LOSS_COUNTERS)
 
     @property
     def state(self) -> str:
@@ -1490,6 +1503,7 @@ def forwarder_status() -> ForwarderStatus:
         unsent=listener.unsent,
         undeliverable=listener.undeliverable,
         spool_dropped=spool.dropped if spool is not None else 0,
+        spool_skipped=spool.unreadable if spool is not None else 0,
         spool_read_errors=spool.read_errors if spool is not None else 0,
         spool_read_faulted=spool.read_faulted if spool is not None else False,
     )

@@ -23,7 +23,15 @@ from messagefoundry_webconsole.routes.status import _derive_health
 
 NOT_INSTALLED = LogForwarderInfo(state="not_installed", installed=False, start_failure="permanent")
 DROPPING = LogForwarderInfo(state="degraded", installed=True, lost=7, queue_dropped=7)
-HELD = LogForwarderInfo(state="degraded", installed=True, send_failing=True, spool_read_errors=2)
+HELD = LogForwarderInfo(
+    state="degraded",
+    installed=True,
+    send_failing=True,
+    spool_read_errors=2,
+    spool_read_faulted=True,
+)
+# A read fault that cleared: the count stays, and the sentence must not name the spool.
+CLEARED = LogForwarderInfo(state="degraded", installed=True, lost=1, unsent=1, spool_read_errors=2)
 HEALTHY = LogForwarderInfo(state="healthy", installed=True)
 
 
@@ -80,8 +88,9 @@ def _page(forwarder: LogForwarderInfo | None) -> str:
         (
             HELD,
             "off-box log forwarding is degraded: the collector is not answering; "
-            "2 spool read(s) failed",
+            "the on-disk spool cannot be read",
         ),
+        (CLEARED, "off-box log forwarding is degraded: 1 record(s) lost since start"),
     ],
 )
 def test_the_reason_sentence(forwarder: LogForwarderInfo | None, reason: str | None) -> None:

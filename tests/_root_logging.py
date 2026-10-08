@@ -39,6 +39,7 @@ def root_logging_restored() -> Iterator[None]:
     live handlers, not stale ones. A handler the body added is closed, which releases a forwarder's
     thread and socket or a log file. A stream handler's close leaves its stream open.
     """
+    from messagefoundry import logging_setup
     from messagefoundry.logging_guard import active_guard, set_active_guard
 
     root = logging.getLogger()
@@ -48,9 +49,13 @@ def root_logging_restored() -> Iterator[None]:
     level = root.level
     disabled = logging.root.manager.disable
     guard = active_guard()
+    # BACKLOG #2612: what the last configure_logging call was asked about a forwarder. Module
+    # state, so it outlives the handlers; left behind, later tests read a forwarder that is gone.
+    forward_state = (logging_setup._forward_configured, logging_setup._forward_start_failure)
     try:
         yield
     finally:
+        logging_setup._forward_configured, logging_setup._forward_start_failure = forward_state
         added = [h for h in root.handlers if h not in saved_state]
         root.handlers[:] = saved
         for handler, (filters, handler_level, formatter) in saved_state.items():

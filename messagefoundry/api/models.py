@@ -1027,13 +1027,15 @@ class LogForwarderInfo(BaseModel):
     installed: bool
     start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
     send_failing: bool = False  # the last send hit a network error
-    lost: int = 0  # the four loss counts below, added up; a floor
+    lost: int = 0  # the five loss counts below, added up; a floor
     queued: int = 0  # waiting on the hand-off queue now: a level, not a loss
     queue_dropped: int = 0  # dropped because the hand-off queue was full
     unsent: int = 0  # a network error cost them, with no spool to keep them
     undeliverable: int = 0  # dropped for a send error that was not a network error
     spool_dropped: int = 0  # the on-disk spool was full or refused the write
+    spool_skipped: int = 0  # spooled records found torn, malformed or gone
     spool_read_errors: int = 0  # spool reads that failed; those records are held, not lost
+    spool_read_faulted: bool = False  # the last spool read failed
 
 
 class LogLevelInfo(BaseModel):
