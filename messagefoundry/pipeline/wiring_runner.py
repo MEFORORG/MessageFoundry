@@ -137,7 +137,7 @@ from messagefoundry.parsing.sniff import (
     b64_head,
     text_sniff_head,
 )
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.ingress_guards import (
@@ -629,8 +629,9 @@ class _RefusalLog:
 
 
 # A queue_buildup alert re-fires at most this often per connection while the lane stays over threshold,
-# so an ongoing stall reminds the operator without spamming on every backed-off retry.
-_BUILDUP_REALERT_SECONDS = 300.0
+# so an ongoing stall reminds the operator without spamming on every backed-off retry. The value is
+# shared with the intake pause's reminder (BACKLOG #2272).
+_BUILDUP_REALERT_SECONDS = REMINDER_SECONDS
 
 # Bound on the in-runner connection-event queue (#46). A flood of refused/garbage connections can't grow
 # memory without limit — excess events are dropped + counted (a diagnostic log, not a reliability surface).
