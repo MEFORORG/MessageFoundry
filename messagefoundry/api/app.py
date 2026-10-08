@@ -9429,7 +9429,8 @@ def create_managed_app(
     startup AND on every reload — ``serve --shard X`` passes ``filter_registry_for_shard(.., X)`` so
     this process owns only shard X's inbounds; ``None`` = the whole graph (unchanged default).
     ``registry_guard`` refuses a graph by raising ``WiringError``; it runs on the first load and on
-    every reload (the opt-in static-credential gate, BACKLOG #1182). ``static_credential_settings`` is
+    every reload (``serve`` chains its guards into one; at least the opt-in static-credential gate,
+    BACKLOG #1182, is among them). ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it.
     """

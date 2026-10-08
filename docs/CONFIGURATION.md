@@ -975,7 +975,7 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `messages_days` | | | **→ moved to `[security].delete_message_bodies_after_days`** (ADR 0118) — set it there; no longer accepted in `[retention]`. |
-| `dead_letter_days` | int | `0` | past N days, null the bodies of **dead-lettered** rows at **every stage**. A dead `ingress` or `routed` row carries the whole raw body, so the purge reaches it as well as a dead outbound row (BACKLOG #1188). This is their own window, because a dead row stays replayable until purged. Unset or `0`, this global window meets the startup posture gate described above this table; `0` = keep only where that gate allows it. An outbound's own `dead_letter_days` overrides it for that outbound's dead rows only (see *Per-connection overrides* below). The gate does not read that override. A dead row at any other stage always takes this global window. *Corrected 2026-09-28 (BACKLOG #1186):* this row used to scope the purge to outbound rows, which BACKLOG #1188 made false. |
+| `dead_letter_days` | int | `0` | past N days, null the bodies of **dead-lettered** rows at **every stage**. A dead `ingress` or `routed` row carries the whole raw body, so the purge reaches it as well as a dead outbound row (BACKLOG #1188). This is their own window, because a dead row stays replayable until purged. Unset or `0`, this global window meets the startup posture gate described above this table; `0` = keep only where that gate allows it. An outbound's own `dead_letter_days` overrides it for that outbound's dead rows only (see *Per-connection overrides* below). An override of `0` meets its own gate, described there. A dead row at any other stage always takes this global window. *Corrected 2026-09-28 (BACKLOG #1186):* this row used to scope the purge to outbound rows, which BACKLOG #1188 made false. |
 | `allow_unbounded_phi` | | | **→ moved to `[security].allow_keeping_phi_indefinitely`** (ADR 0118) — set it there; no longer accepted in `[retention]`. |
 | `state_max_age_days` | int | `0` | past N days, **delete** transform-state entries (ADR 0005) last written before the cutoff — keeps the in-memory state cache + table bounded. A simple global age purge (by `set_at`); per-namespace policy is a follow-up. `0` = keep |
 | `connection_event_retention_hours` | int | `0` | past N **hours**, **delete** `connection_event` rows (the `[diagnostics]` #46 transport/lifecycle log — high-volume under a connect-per-message sender or a probe storm, so its own short window in **hours**, not days). `0` = inherit the `messages_days` body window (the ADR 0021 §7.5 default). |
@@ -997,6 +997,25 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > pruning** (`prune_documents_after` + `prune_documents_min_bytes`, [ADR 0042](adr/0042-embedded-document-pruning.md))
 > to strip bulky base64 attachments while keeping the readable message. These live on the connection (code-first
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
+>
+> **An override of `0` needs the same acknowledgement as a global `0`** (BACKLOG #2368). It keeps that
+> connection's PHI bodies forever, whatever the global window says. The overrides live in the graph, so
+> `serve` checks them when it loads the graph, at least at startup and on every config reload:
+>
+> - Without `[security].allow_keeping_phi_indefinitely = true`, under `enforce`, the engine refuses the
+>   graph and names each connection. At startup the engine does not start. On a reload the running
+>   graph stays.
+> - Without it, under `warn`, the engine logs a warning naming each connection and loads the graph.
+> - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection,
+>   each time it passes one. A dry-run reload counts.
+>
+> **That switch is not scoped to one connection.** It also turns off the 30-day default for each
+> unset window that carries one (those named in the posture paragraph above), and it acknowledges
+> every connection's `0`, including one added by a later reload. Before you set it for one feed, set
+> each of those windows to an explicit number of days.
+>
+> The acknowledgement is read once, at startup. `messagefoundry connection upsert` and `remove` refuse
+> an edit an enforcing engine would refuse. `messagefoundry check` does not run this gate.
 
 > **Backend coverage.** The retention/purge pass is **backend-agnostic** and every PHI purge runs on
 > **all three** backends (SQLite, SQL Server, Postgres). `wal_checkpoint_seconds` and `vacuum_at` are
@@ -2217,7 +2236,7 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `max_session_hours` | int | `12` | session absolute lifetime |
 | `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send. Leaving it unset applies `true`, because the internal `[egress]` field defaults to deny too (see [`[egress]`](#egress)). `serve` still reads whether you **wrote** it, because its [`[egress]`](#egress) startup gate treats unset and written `true` differently |
 | `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited). **Leaving it unset does not apply 30 through the desugar** — the internal window stays `0`, and the `[retention]` startup gate then defaults it to 30 days on a PHI instance under **either** enforcement dial. This row used to say the gate refuses under `enforce` and auto-bounds only under `warn`; it does not — only an **explicit** `0` reaches the refusal. See the note under this table |
-| `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention |
+| `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention. It covers the whole instance, and every connection's own keep-forever override too: see *Per-connection overrides* under [`[retention]`](#retention) |
 | `allow_keeping_transform_state_indefinitely` | bool | `false` | the acknowledgement for `[retention].state_max_age_days = 0` (BACKLOG #1967). Without it or a window, an enforcing instance refuses to start. With it, the start writes a WARNING-level `AUDIT:` line naming the tier. A **loosening**. See the tier table under [`[retention]`](#retention) |
 | `allow_keeping_search_presets_indefinitely` | bool | `false` | the same, for `[retention].search_preset_days = 0` |
 | `allow_keeping_app_logs_indefinitely` | bool | `false` | the same, for `[retention].app_log_days = 0` while `[logging].log_dir` is set |

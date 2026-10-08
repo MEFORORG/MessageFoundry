@@ -20,9 +20,10 @@ catch it. This module makes that a build failure, modelled on
   a new connector credential can't be added there without a rotation row here.
 * **Registry ⊆ doc.** Every registered secret's token must appear in the doc's **Rotation schedule**
   section — so a registered secret with no rotation row also fails.
-* **Recorded exemptions stay recorded.** The TOTP seed and the WebAuthn credential are not env vars or
-  connector settings, so they are not in :data:`CRITICAL_SECRETS`. Each has a schedule row that says it
-  has no calendar cadence and why (BACKLOG #1931), pinned by :data:`EXEMPT_FROM_CALENDAR_ROTATION`.
+* **Recorded exemptions stay recorded.** The TOTP seed, the WebAuthn credential and the MFA recovery
+  codes are not env vars or connector settings, so they are not in :data:`CRITICAL_SECRETS`. Each has a
+  schedule row that says it has no calendar cadence and why (BACKLOG #1931, #2225), pinned by
+  :data:`EXEMPT_FROM_CALENDAR_ROTATION`.
 
 This guards the *definition/enumeration* only. It does **not** assert the engine force-rotates or hard-
 expires anything — that stays operator- / secret-manager-driven by design (session tokens are the one
@@ -475,12 +476,14 @@ def test_every_fingerprinted_env_secret_is_a_registered_critical_secret() -> Non
 # The TOTP seed is a backend secret under ASVS 13.3.1 ("keys and seeds for time-based tokens"), and the
 # WebAuthn credential is a stored public key. Neither had a row in the rotation schedule, so the
 # schedule was silent on both with no reason given. They are now EXEMPT BY RECORD: the TOTP seed by owner
-# ruling 2026-09-27, the WebAuthn credential because the engine holds no secret for it. An exemption
-# that can vanish silently is the same gap again, so each row is pinned here: it must exist, and its
-# cadence cell must keep saying "exempt" and citing why.
+# ruling 2026-09-27, the WebAuthn credential because the engine holds no secret for it. The MFA recovery
+# codes joined them when owner ruling 2026-10-08 extended the TOTP ruling to them (BACKLOG #2225). An
+# exemption that can vanish silently is the same gap again, so each row is pinned here: it must exist,
+# and its cadence cell must keep saying "exempt" and citing why.
 
 #: Exempt class -> (a token that names the row in its FIRST cell, phrases its CADENCE cell must carry).
-EXEMPT_FROM_CALENDAR_ROTATION: dict[str, tuple[str, tuple[str, ...]]] = {
+_ExemptPins = dict[str, tuple[str, tuple[str, ...]]]
+EXEMPT_FROM_CALENDAR_ROTATION: _ExemptPins = {
     "TOTP shared secret": (
         "users.totp_secret",
         ("no calendar cadence", "exempt", "owner ruling 2026-09-27"),
@@ -489,18 +492,24 @@ EXEMPT_FROM_CALENDAR_ROTATION: dict[str, tuple[str, tuple[str, ...]]] = {
         "webauthn_credentials",
         ("no calendar cadence", "exempt", "not a backend secret"),
     ),
+    "MFA recovery codes": (
+        "users.totp_recovery_codes",
+        ("no calendar cadence", "exempt", "owner ruling 2026-10-08", "BACKLOG #2225"),
+    ),
 }
 
 
-def _exempt_row_problems(section: str) -> list[str]:
-    """Every way the exempt rows in ``section`` fall short, or ``[]`` (self-testable)."""
+def _exempt_row_problems(
+    section: str, pins: _ExemptPins = EXEMPT_FROM_CALENDAR_ROTATION
+) -> list[str]:
+    """Every way the pinned exempt rows in ``section`` fall short, or ``[]`` (self-testable)."""
     rows = [
         [cell.strip() for cell in line.strip().strip("|").split("|")]
         for line in section.splitlines()
         if line.lstrip().startswith("|")
     ]
     problems: list[str] = []
-    for label, (token, phrases) in EXEMPT_FROM_CALENDAR_ROTATION.items():
+    for label, (token, phrases) in pins.items():
         matches = [row for row in rows if row and _whole_token_present(token, row[0])]
         if len(matches) != 1:
             problems.append(
@@ -512,25 +521,37 @@ def _exempt_row_problems(section: str) -> list[str]:
         missing = [phrase for phrase in phrases if phrase.lower() not in cadence]
         if missing:
             problems.append(f"{label}: cadence cell {row[1:2]!r} lacks {missing}")
+        # The pins are substrings, so "not exempt" would carry "exempt" and pass without this.
+        if "not exempt" in cadence:
+            problems.append(f"{label}: cadence cell {row[1:2]!r} says 'not exempt'")
     return problems
 
 
 def test_second_factor_exemptions_are_recorded_in_the_rotation_schedule() -> None:
-    """BACKLOG #1931: the two exempt classes keep their rows and their stated exemption.
+    """BACKLOG #1931, #2225: each exempt class keeps its row and its stated exemption.
 
     Mutation: delete the TOTP row from the schedule. Red: "expected ONE schedule row naming
     'users.totp_secret', found 0". Mutation: change its cadence to "Annually". Red: the cell lacks
-    "no calendar cadence" and "exempt"."""
+    "no calendar cadence" and "exempt". The recovery-code row reds the same two ways, and also when its
+    cadence drops the 2026-10-08 extension, which the 2026-09-27 ruling alone does not cover."""
     problems = _exempt_row_problems(_rotation_schedule_section())
     assert not problems, (
         "docs/ASVS-L2-PHASE0-CHANGES.md rotation schedule no longer records the second-factor "
-        f"calendar-rotation exemptions (BACKLOG #1931): {problems}. Restore each row with its reason, "
-        "or, if a ruling changed, update EXEMPT_FROM_CALENDAR_ROTATION in the same change."
+        f"calendar-rotation exemptions (BACKLOG #1931, #2225): {problems}. Restore each row with its "
+        "reason, or, if a ruling changed, update EXEMPT_FROM_CALENDAR_ROTATION in the same change."
     )
 
 
 def test_exempt_row_guard_self_test() -> None:
-    """Non-vacuity: the guard clears a complete pair of rows and names each defect it exists for."""
+    """Non-vacuity: the guard clears a complete pair of rows and names each defect it exists for. It
+    pins its own pair, so a later entry in EXEMPT_FROM_CALENDAR_ROTATION does not break it."""
+    pins: _ExemptPins = {
+        "totp": ("users.totp_secret", ("no calendar cadence", "exempt", "owner ruling 2026-09-27")),
+        "webauthn": (
+            "webauthn_credentials",
+            ("no calendar cadence", "exempt", "not a backend secret"),
+        ),
+    }
     totp = (
         "| TOTP seed, `users.totp_secret` | **No calendar cadence: exempt** (owner ruling 2026-09-27)"
         " | why |"
@@ -539,15 +560,18 @@ def test_exempt_row_guard_self_test() -> None:
         "| WebAuthn, a `webauthn_credentials` row | No calendar cadence: exempt (not a backend secret)"
         " | why |"
     )
-    assert _exempt_row_problems("\n".join((totp, webauthn))) == []
-    dropped = _exempt_row_problems(webauthn)
+    assert _exempt_row_problems("\n".join((totp, webauthn)), pins) == []
+    dropped = _exempt_row_problems(webauthn, pins)
     assert len(dropped) == 1 and "found 0" in dropped[0]
     annual = totp.replace("No calendar cadence: exempt", "Annually")
-    reworded = _exempt_row_problems("\n".join((annual, webauthn)))
+    reworded = _exempt_row_problems("\n".join((annual, webauthn)), pins)
     assert len(reworded) == 1 and "exempt" in reworded[0]
+    negated = totp.replace("cadence: exempt", "cadence: not exempt")
+    refused = _exempt_row_problems("\n".join((negated, webauthn)), pins)
+    assert len(refused) == 1 and "says 'not exempt'" in refused[0]
     # The token counts only in the FIRST cell: a row that merely mentions it in its notes is not the row.
     elsewhere = "| Session tokens | Automatic | unlike `users.totp_secret` |"
-    assert "found 0" in _exempt_row_problems("\n".join((elsewhere, webauthn)))[0]
+    assert "found 0" in _exempt_row_problems("\n".join((elsewhere, webauthn)), pins)[0]
     # A look-alike token that merely STARTS with the pinned one is not the row either (whole-token match).
     lookalike = "| Staged seed, `users.totp_secret_staged` | No calendar cadence: exempt | x |"
-    assert "found 0" in _exempt_row_problems("\n".join((lookalike, webauthn)))[0]
+    assert "found 0" in _exempt_row_problems("\n".join((lookalike, webauthn)), pins)[0]
