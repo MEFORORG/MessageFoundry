@@ -4621,6 +4621,30 @@ _GLOBALS_ATTRS = frozenset(
 )
 
 
+def _handler_scope_nodes(node: ast.AST) -> list[ast.AST]:
+    """Every descendant of ``node`` in its own scope. Unlike :func:`_own_scope_nodes` it also stops at
+    a nested ``class`` body and a comprehension, since a name bound there is not the handler's."""
+    out: list[ast.AST] = []
+    for child in ast.iter_child_nodes(node):
+        out.append(child)
+        if not isinstance(child, _NESTED_SCOPES):
+            out.extend(_handler_scope_nodes(child))
+    return out
+
+
+#: Nodes that open a scope of their own (:func:`_handler_scope_nodes` does not descend into them).
+_NESTED_SCOPES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.Lambda,
+    ast.ClassDef,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
+
 def _message_scope(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
     tree: ast.Module,
@@ -4644,11 +4668,15 @@ def _message_scope(
     (``range(int(msg[...]))``), but the builtin yields only ints, so the index carries a number and
     never message text."""
     bound = _bound_names(func)
+    # Only the handler's OWN loops: a ``for i in range(...)`` in a nested def or class binds that
+    # scope's ``i`` and leaves the handler's ``i`` free, so it may resolve to a module global set from
+    # the message (Lander review of 034e441eea). ``bound`` still counts the nested binding, so a name
+    # bound in both scopes is not an index either.
+    own_loops = [n for n in _handler_scope_nodes(func) if isinstance(n, ast.For | ast.AsyncFor)]
     range_targets = [
         n.target.id
-        for n in ast.walk(func)
-        if isinstance(n, ast.For | ast.AsyncFor)
-        and isinstance(n.target, ast.Name)
+        for n in own_loops
+        if isinstance(n.target, ast.Name)
         and isinstance(n.iter, ast.Call)
         and isinstance(n.iter.func, ast.Name)
         and n.iter.func.id == "range"
@@ -4659,10 +4687,8 @@ def _message_scope(
     # ``k >= 1`` and literal ``step >= 1`` (review of head bd5843dbd4, findings 1 and 2).
     zero_based = {
         n.target.id
-        for n in ast.walk(func)
-        if isinstance(n, ast.For | ast.AsyncFor)
-        and isinstance(n.target, ast.Name)
-        and not _is_one_based_range(n.iter)
+        for n in own_loops
+        if isinstance(n.target, ast.Name) and not _is_one_based_range(n.iter)
     }
     module_names, star = _module_bound_names(tree)
     globals_ = {name for n in ast.walk(tree) if isinstance(n, ast.Global) for name in n.names}

@@ -1537,3 +1537,52 @@ def test_r14_finding_1_a_globals_route_voids_the_loop_index(rebind: str) -> None
     )
     line = len(src.splitlines())
     _refused(src, _edit("set_params", line, params={"to": {"expr": "i"}}), match=REFUSED)
+
+
+# --- Lander review of 784abde3d4..034e441eea: a loop in a NESTED scope is not the handler's index ---
+
+_NESTED_LOOP = """\
+i = ""
+
+
+def stash(msg):  # type: ignore[no-untyped-def]
+    global i
+    i = msg.field("PID-5")
+
+
+@handler("H")
+def h(msg):
+{nested}
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize(
+    "nested",
+    [
+        "    def inner():\n        for i in range(1, 3):\n            pass",
+        "    async def inner():\n        for i in range(1, 3):\n            pass",
+        "    class Inner:\n        for i in range(1, 3):\n            pass",
+    ],
+    ids=["def", "async-def", "class"],
+)
+def test_r15_a_nested_scope_s_loop_does_not_make_the_handler_s_free_name_an_index(
+    nested: str,
+) -> None:
+    src = _NESTED_LOOP.format(nested=nested)
+    line = len(src.splitlines())
+    _refused(src, _edit("set_params", line, params={"to": {"expr": "i"}}), match=REFUSED)
+
+
+def test_r15_the_handler_s_own_one_based_loop_still_admits_its_index() -> None:
+    src = _NESTED_LOOP.format(nested="    for i in range(1, 3):\n        pass")
+    # Before the loop body's ``pass``, so the inserted read sits inside the loop that binds ``i``.
+    line = len(src.splitlines()) - 1
+    edit = _edit(
+        "insert_row",
+        line,
+        position="before",
+        action="set_field",
+        params={"path": "OBX-3", "value": "x", "occurrence": {"expr": "i"}},
+    )
+    assert "occurrence=i" in rewrite_source(src, edit)
