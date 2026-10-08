@@ -12,7 +12,10 @@ finalizer touched / never raises into ``_emit``), and three-backend schema/metho
 from __future__ import annotations
 
 import asyncio
+import gc
 import sqlite3
+import threading
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -573,6 +576,195 @@ async def test_no_store_is_noop() -> None:
     sink = NotifierAlertSink([])  # store=None
     sink.connection_error("OB_X", kind="connection_lost", detail="refused")
     sink.connection_restored("OB_X")
+    assert sink._state_tasks == set()
+
+
+# --- per-key write ordering (BACKLOG #2272 defect 8) --------------------------
+
+
+class _GatedStore(_RecordingStore):
+    """A recording store that holds open instances by key and can stall one write kind on a gate.
+
+    ``open`` is the state a real store would end in; ``log`` is the order the writes landed."""
+
+    def __init__(self, *, slow: str) -> None:
+        super().__init__()
+        # "upsert" or "resolve": that kind waits on ``gate`` for one named connection.
+        self.slow = slow
+        self.slow_connection = "OB_X"
+        self.gate = asyncio.Event()
+        self.open: set[str] = set()
+        self.log: list[str] = []
+
+    async def _maybe_wait(self, kind: str, connection: str) -> None:
+        if kind == self.slow and connection == self.slow_connection:
+            await self.gate.wait()
+
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = None,
+        escalation_tier: int = 0,
+        now: float | None = None,
+    ) -> None:
+        await self._maybe_wait("upsert", connection)
+        self.open.add(f"{event_type}:{connection}")
+        self.log.append(f"upsert {connection}")
+
+    async def resolve_alert_instances_for(
+        self, *, event_type: str, connection: str, now: float | None = None
+    ) -> int:
+        await self._maybe_wait("resolve", connection)
+        self.open.discard(f"{event_type}:{connection}")
+        self.log.append(f"resolve {connection}")
+        return 1
+
+
+async def _spin(turns: int = 20) -> None:
+    for _ in range(turns):
+        await asyncio.sleep(0)
+
+
+async def test_slow_raise_then_fast_clear_ends_resolved() -> None:
+    # The raise's upsert stalls; the clear emitted after it must not land first, or the store ends
+    # with a condition open that the engine already cleared.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    sink.connection_restored("OB_X")
+    await _spin()
+    assert store.log == []  # the resolve waits behind the stalled upsert for the same key
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["upsert OB_X", "resolve OB_X"]
+    assert store.open == set()
+    assert sink._state_locks == {}  # the per-key lock entry is dropped once nothing holds it
+
+
+async def test_slow_clear_then_fast_raise_ends_open() -> None:
+    # The reverse order: a clear stalls and a fresh raise follows. The raise must win.
+    store = _GatedStore(slow="resolve")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_restored("OB_X")
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    await _spin()
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["resolve OB_X", "upsert OB_X"]
+    assert store.open == {"connection_error:OB_X"}
+
+
+async def test_writes_for_different_keys_stay_concurrent() -> None:
+    # Control: a stalled write for OB_X must not hold up a write for OB_Y.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    sink.connection_error("OB_Y", kind="connection_lost", detail="refused")
+    await _spin()
+    assert store.log == ["upsert OB_Y"]  # OB_Y landed while OB_X is still stalled
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["upsert OB_Y", "upsert OB_X"]
+
+
+def _new_state_task(sink: NotifierAlertSink, before: set[asyncio.Task[None]]) -> asyncio.Task[None]:
+    (task,) = sink._state_tasks - before
+    return task
+
+
+async def test_cancelled_holder_releases_the_next_write() -> None:
+    # A write cancelled while it holds the key must let the one queued behind it run.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    first = _new_state_task(sink, set())
+    sink.connection_restored("OB_X")
+    await _spin()
+    first.cancel()
+    await _drain(sink)
+    assert store.log == ["resolve OB_X"]
+    assert store.open == set()
+
+
+async def test_cancelled_middle_waiter_keeps_later_writes_in_order() -> None:
+    # A slow upsert holds the key with three writes queued behind it. Cancelling the middle one must
+    # leave the other two in emit order, and a write emitted after the cancel must still queue last.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")  # A: stalls
+    await _spin()  # A now holds the lock and waits on the gate
+    store.slow = "none"  # so only A stalls; later upserts run once they hold the lock
+    sink.connection_restored("OB_X")  # B: waits
+    before = set(sink._state_tasks)
+    sink.connection_error("OB_X", kind="connection_lost", detail="again")  # C: cancelled below
+    middle = _new_state_task(sink, before)
+    sink.connection_error("OB_X", kind="connection_lost", detail="last")  # D: waits
+    await _spin()
+    middle.cancel()
+    await _spin()
+    assert middle.cancelled()
+    sink.connection_restored("OB_X")  # E: emitted after the cancel
+    await _spin()
+    assert store.log == []  # everything still queued behind the stalled upsert
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["upsert OB_X", "resolve OB_X", "upsert OB_X", "resolve OB_X"]
+    assert store.open == set()
+    assert sink._state_locks == {}
+
+
+async def test_write_cancelled_before_it_starts_closes_its_coroutine() -> None:
+    # Loop shutdown cancels fresh tasks before their first step. The store coroutine they carry
+    # must be closed, not left to warn "never awaited" at garbage collection.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+        sink.connection_restored("OB_X")
+        tasks = list(sink._state_tasks)
+        for task in tasks:
+            task.cancel()
+        await _spin()
+        assert all(task.cancelled() for task in tasks)
+        del tasks  # drop the last references so the store coroutines are collected here
+        gc.collect()
+    assert not _store_coroutine_leaks(caught)
+    assert store.log == []
+
+
+def _store_coroutine_leaks(caught: list[warnings.WarningMessage]) -> list[str]:
+    # Match only this sink's coroutines: the session-scoped loop may collect an unrelated test's
+    # leak inside the same block.
+    names = ("upsert_alert_instance", "resolve_alert_instances_for", "_run_state")
+    return [
+        str(w.message)
+        for w in caught
+        if "never awaited" in str(w.message) and any(n in str(w.message) for n in names)
+    ]
+
+
+def test_emit_with_no_running_loop_leaks_no_coroutine() -> None:
+    # An emit off any event loop drops the state write. Neither the store coroutine nor the
+    # wrapper around it may be left to warn "never awaited".
+    store = _GatedStore(slow="none")
+    sink = NotifierAlertSink([], store=store)
+
+    def emit() -> None:
+        sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+        sink.connection_restored("OB_X")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        # A fresh thread has no event loop at all; the test thread may hold the session loop.
+        worker = threading.Thread(target=emit)
+        worker.start()
+        worker.join()
+        gc.collect()
+    assert not _store_coroutine_leaks(caught)
     assert sink._state_tasks == set()
 
 
