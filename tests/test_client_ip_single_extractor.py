@@ -35,8 +35,9 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 
-#: Every package that serves or handles an HTTP or WebSocket request. The harness is a CLIENT of the
-#: engine and reads no peer address today; it is scanned so that stays true.
+#: The packages this guard covers. The first two serve requests. The toolkit and the harness serve
+#: none and read no peer address today; they are scanned so that stays true. A new top-level package
+#: is NOT picked up on its own: add it here.
 _SCANNED = ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit", "harness")
 
 #: Names a route, dependency or middleware gives a Starlette connection. ``req`` and ``connection``
@@ -48,7 +49,7 @@ _CONN_NAMES = frozenset({"request", "websocket", "conn", "ws"})
 #: moves or goes away reds here too and the list cannot go stale. A new entry needs a stated reason
 #: that the site wants the raw peer rather than the client address.
 _ALLOWED: dict[tuple[str, str], int] = {
-    # The extractor itself, which reads ``conn.client`` once.
+    # The extractor itself, which reads ``conn.scope.get("client")`` once.
     ("messagefoundry/api/security.py", "client_ip"): 1,
 }
 

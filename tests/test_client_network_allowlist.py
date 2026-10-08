@@ -465,27 +465,58 @@ async def test_unparseable_client_fails_closed(engine: Engine) -> None:
     ("peer", "denied"),
     [
         pytest.param((), True, id="empty-tuple"),
-        pytest.param(("10.1.2.3",), True, id="one-item"),
-        pytest.param(("::1", 12345, 0, 0), True, id="four-item"),
+        pytest.param(("192.168.9.9",), True, id="one-item-outside"),
+        pytest.param(("10.1.2.3",), False, id="one-item-inside"),
+        pytest.param(("::1", 12345, 0, 0), False, id="four-item-loopback"),
+        pytest.param((b"10.1.2.3", 12345), True, id="bytes-host"),
+        pytest.param((167838211, 12345), True, id="int-host"),
         pytest.param(("10.1.2.3", 12345), False, id="control-a-pair-inside"),
     ],
 )
-async def test_a_malformed_client_tuple_is_refused_not_crashed(
+async def test_an_odd_client_tuple_is_judged_not_crashed(
     engine: Engine, peer: tuple[Any, ...], denied: bool
 ) -> None:
-    """RED when: a scope["client"] that is not exactly a pair escapes the gate as a 500.
+    """RED when: a scope["client"] that is not a (str, port) pair crashes the gate.
 
     The gate reads through ``api.security.client_ip`` since BACKLOG #2289. starlette's
-    ``conn.client`` builds ``Address(*scope["client"])`` and raises ``TypeError`` on these shapes.
-    Uncaught, that turns the gate's 403 into a 500 with no denial marker, no counter and no
-    ``observed_client``. client_ip answers ``None`` instead, which the gate refuses: fail closed,
-    even for an in-network first item. The well-formed pair is the control: a gate that denied
-    everything would pass the other three."""
+    ``conn.client`` builds ``Address(*scope["client"])`` and raises ``TypeError`` on any shape but a
+    pair, so a client_ip built on it crashes here, and the transport re-raises that out of
+    ``c.get``. client_ip reads the first item, as the gate's own read did before: a ``str`` is
+    judged, so loopback stays allowed, and anything else is ``None``, which the gate refuses. The
+    allowed arms are the control: a gate that denied everything would pass the denied ones."""
     transport = httpx.ASGITransport(app=_app(engine, WARD), client=peer)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         resp = await c.get("/status")
     assert resp.status_code != 500, resp.text
     assert (resp.headers.get(DENIAL_HEADER) == DENIAL_MARKER) is denied, resp.status_code
+
+
+@pytest.mark.parametrize(
+    ("peer", "expected"),
+    [
+        pytest.param(("192.0.2.7", 1), "192.0.2.7", id="pair"),
+        pytest.param(["192.0.2.7", 1], "192.0.2.7", id="list-pair"),
+        pytest.param(("::1", 1, 0, 0), "::1", id="four-item"),
+        pytest.param(("192.0.2.7",), "192.0.2.7", id="one-item"),
+        pytest.param((), None, id="empty"),
+        pytest.param(None, None, id="none"),
+        pytest.param((b"192.0.2.7", 1), None, id="bytes-host"),
+        pytest.param((3221225991, 1), None, id="int-host"),
+        pytest.param("192.0.2.7", None, id="bare-string"),
+    ],
+)
+@pytest.mark.parametrize("kind", ["http", "websocket"])
+def test_client_ip_reads_the_first_item_of_any_client_tuple(
+    peer: Any, expected: str | None, kind: str
+) -> None:
+    """RED when: ``client_ip`` stops answering the scope's first ``str`` item, or raises. It is the
+    one client-address reader (BACKLOG #2289), so the gate, the limiters, the audit rows and the
+    session anchor all take this value on both planes, with or without an allow-list."""
+    from starlette.requests import HTTPConnection
+
+    from messagefoundry.api.security import client_ip
+
+    assert client_ip(HTTPConnection({"type": kind, "client": peer})) == expected
 
 
 async def test_denial_carries_the_baseline_security_headers(engine: Engine) -> None:

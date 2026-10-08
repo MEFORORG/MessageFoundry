@@ -965,8 +965,8 @@ class _FakeURL:
 
 #: The peer address both doubles below report, and the value the ADR 0150 ``client`` assertions in this
 #: file compare against. A real :class:`starlette.datastructures.Address` rather than a hand-rolled
-#: stand-in: ``client_ip`` reads ``.host`` off whatever ``HTTPConnection.client`` yields, so borrowing
-#: starlette's own type is what stops these doubles drifting from the shape the server really passes.
+#: stand-in, so borrowing starlette's own type is what stops these doubles drifting from the shape the
+#: server really passes. The doubles hand it to ``client_ip`` as the ``scope["client"]`` pair.
 #: RFC 5737 TEST-NET-1, so nothing here can resolve to a real host.
 #:
 #: It must be a REAL address and never None. A double reporting None would let every ``client``
@@ -985,7 +985,8 @@ class _FakeWS:
         self.url = _FakeURL()
         # BACKLOG #1644: authorize_ws now stamps the peer address onto its three audit rows, so a
         # double without this attribute raises AttributeError rather than failing an assertion.
-        self.client = _PEER
+        # client_ip reads the scope's pair, as on a real connection (BACKLOG #2289).
+        self.scope = {"client": tuple(_PEER)}
 
 
 async def test_must_change_password_blocks_websocket(engine: Engine) -> None:
@@ -1077,7 +1078,7 @@ class _FakeReqURL:
 class _FakeRequest:
     """Minimal ASGI-shaped Request for driving ``api.security.require()`` directly — the HTTP sibling of
     :class:`_FakeWS`. ``require()`` reads only ``.app.state.auth``, ``.headers``, ``.url.path``,
-    ``.method`` and — since BACKLOG #1644 — ``.client`` (``allow_no_auth`` is absent → fail-closed,
+    ``.method`` and — since BACKLOG #1644 — ``.scope["client"]`` (``allow_no_auth`` is absent → fail-closed,
     matching a served app)."""
 
     def __init__(self, auth: object, token: str | None, *, method: str, path: str) -> None:
@@ -1085,7 +1086,7 @@ class _FakeRequest:
         self.method = method
         self.headers: dict[str, str] = {"Authorization": f"Bearer {token}"} if token else {}
         self.url = _FakeReqURL(path)
-        self.client = _PEER  # BACKLOG #1644 — see the note on :class:`_FakeWS`
+        self.scope = {"client": tuple(_PEER)}  # BACKLOG #1644 — see the note on :class:`_FakeWS`
 
 
 async def _assert_http_grant_deny_precision(store: object) -> None:

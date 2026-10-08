@@ -431,7 +431,7 @@ async def test_a_stale_step_up_proof_is_not_recorded_as_an_mfa_denial(engine: En
 # covers _auth.py, which is BACKLOG #2088's scope. The reads outside it, including the ones that
 # write the login and reauth anchors, went through ``client_ip`` under BACKLOG #2289, and
 # ``tests/test_client_ip_single_extractor.py`` in the engine suite fails on a new raw read, for the
-# shapes and packages its docstring lists. Today ``client_ip`` reads the
+# shapes its docstring lists and the packages its ``_SCANNED`` names. Today ``client_ip`` reads the
 # same ``scope["client"]`` an inline ``request.client.host`` reads, because uvicorn's
 # ProxyHeadersMiddleware is the single X-Forwarded-For trust point. So an inline read records the
 # right address TODAY, and a test that checks only the address cannot tell it from ``client_ip``. The
