@@ -28,9 +28,9 @@ A third rule rides the same hook because only commit-msg sees the message (CLAUD
     No line may START with a `Co-Authored-By:` trailer naming Claude, a `Claude-Session:` trailer,
     or the `Generated with Claude Code` byline. Any case.
 
-The exact shapes are stated once, in docs/Secure_AI_Development_Standards.md section 6.7.
-It reads the whole message, fires on every commit, and runs before any git read. Indented,
-backticked or blockquoted, a body may still quote any of them. It is inert on a box until
+The prose statement of the shapes is docs/Secure_AI_Development_Standards.md section 6.7.
+It reads the whole message, fires on every commit, and runs before any git read. A line that does
+not start with one of them, such as an indented or backticked quote, passes. It is inert on a box until
 ``scripts/coord/install-git-hooks.ps1`` re-copies this file into the shared ``.git/hooks``.
 
 Three scoping decisions for the claim rule, each load-bearing:
@@ -117,17 +117,18 @@ _COMMENT_LINE = re.compile(r"#(?!\d)")
 # Lander caught them by reading commit bodies by hand. Anchored at the start of a line, so a body may
 # still QUOTE any of them when it is indented, blockquoted or set in backticks.
 #
-# Three arms. A `Co-Authored-By:` line refuses when its NAME part, before any `<`, holds `Claude` as a
-# word: that catches `Claude Opus` and `Anthropic Claude`, and leaves `Claudette` and `Jean-Claude`
-# alone. The email is not read, so a human at any address passes. A `Claude-Session:` line refuses
-# whatever follows. The byline is the one the harness appends to a body, with or without its leading
-# U+1F916 (and an optional U+FE0F); the codepoints are escaped so this file stays cp1252-clean.
+# Three arms; docs/Secure_AI_Development_Standards.md section 6.7 is the prose statement of them.
+# The `Co-Authored-By:` arm reads only the text before any `<`, and skips a `Claude` glued to the word
+# before it (`Jean-Claude`, `a.claude`) or part of an address (`claude@x`), so a human's email never
+# counts. The byline's optional lead is built with chr(): no non-cp1252 literal, and no `\N{}` escape
+# for an old PATH python to choke on.
 # Whitespace is allowed before the colon because git's trailer parser accepts it there.
+_BYLINE_LEAD = f"(?:{chr(0x1F916)}{chr(0xFE0F)}?\\s*)?"
 _ATTRIBUTION_TRAILER = re.compile(
     r"^(?:"
-    r"Co-Authored-By\s*:[^<\n]*?(?<![\w-])Claude\b"
+    r"Co-Authored-By\s*:[^<\n]*?(?<![\w.@+-])Claude\b(?![\w.+-]*@)"
     r"|Claude-Session\s*:"
-    r"|(?:\U0001F916\N{VARIATION SELECTOR-16}?\s*)?Generated\s+with\s+\[?Claude\s+Code\b"
+    rf"|{_BYLINE_LEAD}Generated\s+with\s+\[?Claude\s+Code\b"
     r")",
     re.IGNORECASE,
 )
@@ -420,19 +421,17 @@ def _attribution_trailers(message: str) -> list[tuple[int, str]]:
     hits: list[tuple[int, str]] = []
     # No scissors handling is needed: every line `git commit -v` writes below the scissors starts
     # with a diff marker, so the anchored pattern cannot match one.
-    for n, line in enumerate(message.splitlines(), 1):
+    # Split on "\n" only, as git does. str.splitlines() also breaks on U+2028, form feed and others,
+    # so it would see a line start git does not, and number lines differently from the editor.
+    for n, line in enumerate(message.split("\n"), 1):
         if _ATTRIBUTION_TRAILER.match(line):
             hits.append((n, line))
     return hits
 
 
 def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
-    # ASCII-escaped: the byline can carry U+1F916, and a cp1252 stderr would raise on it mid-report.
-    rows = "\n".join(
-        f"      line {n}: "
-        + _safe_for_message(line, 120).encode("ascii", "backslashreplace").decode("ascii")
-        for n, line in hits
-    )
+    # No ASCII escape is needed for the byline's U+1F916: sys.stderr always uses backslashreplace.
+    rows = "\n".join(f"      line {n}: {_safe_for_message(line, 120)}" for n, line in hits)
     sys.stderr.write(
         f"\nMessageFoundry attribution-trailer check\n\n"
         f"  The message carries a line CLAUDE.md section 5 says to omit (standing owner\n"
@@ -441,7 +440,7 @@ def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
         f"{rows}\n\n"
         f"  Delete those lines from the message file, then commit again:\n"
         f"      git commit -F <file>\n"
-        f"  .claude/settings.json turns both off at source with `attribution`. If your session\n"
+        f"  .claude/settings.json turns all of these off at source with `attribution`. If your session\n"
         f"  added one anyway, it is reading a stale or user-scope setting.\n"
         f"  To QUOTE one in a body, indent it, put it in backticks, or start the line with '> '.\n"
         f"  This check reads the whole message and fires whatever the commit touches.\n\n"

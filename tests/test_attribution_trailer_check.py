@@ -32,7 +32,9 @@ def _run(tmp_path: Path, message: str) -> subprocess.CompletedProcess[str]:
         [sys.executable, str(_CHECK), str(msg)],
         cwd=tmp_path,
         capture_output=True,
-        text=True,
+        # The child may write UTF-8 (the byline's lead), whatever this process's locale is.
+        encoding="utf-8",
+        errors="backslashreplace",
         timeout=60,
     )
 
@@ -107,32 +109,48 @@ def test_a_quoted_trailer_in_the_body_passes(tmp_path: Path, quoted: str) -> Non
     assert _run(tmp_path, f"docs: a plain subject\n\n{bare}\n").returncode == 1
 
 
+_CO = "Co-Authored-By" + ": "
+
+
 @pytest.mark.parametrize(
-    "human",
+    ("human", "twin"),
     [
-        "Co-Authored-By" + ": Claudette Smith <c@example.invalid>",
-        "Co-Authored-By" + ": Jean-Claude Smith <jc@example.invalid>",
-        # The email is not read: a human whose address mentions the name passes.
-        "Co-Authored-By" + ": A Person <claude.fan@example.invalid>",
-        "Co-Authored-By" + ": A Person <a@anthropic.com>",
-        "Generated with" + " a script, not Claude Code",
-        "Generated with" + " Claudette Code",
+        # Each silent line is paired with the nearest line its own arm refuses.
+        (_CO + "Claudette Smith <c@example.invalid>", _CO + "Claude Smith <c@example.invalid>"),
+        (_CO + "Jean-Claude Smith <jc@example.invalid>", _CO + "Jean Claude Smith"),
+        # The email is never read, bracketed or not.
+        (
+            _CO + "A Person <claude.fan@example.invalid>",
+            _CO + "Claude <claude.fan@example.invalid>",
+        ),
+        (_CO + "A Person <a@anthropic.com>", _CO + "Claude <a@anthropic.com>"),
+        (_CO + "claude@anthropic.com", _CO + "Claude claude@anthropic.com"),
+        (_CO + "A Person claude.fan@example.invalid", _CO + "A Claude claude.fan@example.invalid"),
+        (_CO + "A Person (claude@x.invalid)", _CO + "Claude (claude@x.invalid)"),
+        ("Generated with" + " a script, not Claude Code", "Generated with" + " Claude Code"),
+        ("Generated with" + " Claudette Code", "Generated with" + " [Claude Code]"),
+        ("Regenerated with" + " Claude Code", "Generated with" + " Claude Code"),
     ],
 )
-def test_a_human_or_lookalike_is_not_refused(tmp_path: Path, human: str) -> None:
+def test_a_human_or_lookalike_is_not_refused(tmp_path: Path, human: str, twin: str) -> None:
     proc = _run(tmp_path, f"docs: subject\n\n{human}\n")
     assert proc.returncode == 0, proc.stderr
-    # Control: the name followed by a word boundary fires.
-    assert _run(tmp_path, f"docs: subject\n\n{_COAUTHOR}\n").returncode == 1
+    assert _run(tmp_path, f"docs: subject\n\n{twin}\n").returncode == 1
 
 
-def test_the_byline_is_named_in_ascii(tmp_path: Path) -> None:
-    """The refusal escapes the U+1F916 lead, so a cp1252 stderr cannot raise on it."""
+def test_a_unicode_line_separator_does_not_start_a_line(tmp_path: Path) -> None:
+    """Git splits a message on newline only, so a U+2028 mid-line is not a line start."""
+    proc = _run(tmp_path, f"docs: subject\n\nFixed it{chr(0x2028)}{_COAUTHOR}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert _run(tmp_path, f"docs: subject\n\nFixed it\n{_COAUTHOR}\n").returncode == 1
+
+
+def test_the_byline_is_refused_without_a_traceback(tmp_path: Path) -> None:
+    """The U+1F916 lead reaches stderr unescaped, and the report still completes."""
     proc = _run(tmp_path, f"docs: subject\n\nbody\n\n{_BYLINE}\n")
     assert proc.returncode == 1, proc.stderr
     assert "Traceback" not in proc.stderr
-    assert "line 5: \\U0001f916 Generated with" in proc.stderr
-    assert proc.stderr.isascii()
+    assert "line 5:" in proc.stderr
 
 
 def test_a_diff_line_from_commit_verbose_is_not_a_trailer(tmp_path: Path) -> None:
