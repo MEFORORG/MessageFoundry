@@ -25,13 +25,15 @@ discards what the peer still sends, up to a bound, so a peer that writes its who
 reading sees the refusal rather than a reset.
 
 Every answer carries :data:`BASELINE_RESPONSE_HEADERS`: ``nosniff``, a framing and ``<base>``
-policy, and the rest of the engine listener's baseline (ASVS 3.4.3, 3.4.4 and 3.4.6; BACKLOG #1120).
+policy, and the rest of the engine listener's baseline (ASVS 3.4.4 and 3.4.6, and the ``base-uri``
+part of 3.4.3; BACKLOG #1120).
 That includes the answers the stdlib handler writes before the sink's own code runs, such as its
 ``400`` for a malformed request line and its ``501`` for a method the sink does not serve. The
 handler's ``end_headers`` adds them, and the stdlib closes every header block through that one
-method. Nothing is answered in HTTP/0.9 form, which has no header block: the stdlib would use it
-for an HTTP/0.9 request and for its own ``400`` and ``505`` on a bad request version, and the sink
-answers those in HTTP/1.0 form instead.
+method. Nothing is answered in HTTP/0.9 form, which has no status line and no header block. The
+stdlib would use that form for at least an HTTP/0.9 request and its own ``400`` and ``505`` on a
+request line it cannot read a version from. The sink answers those with a status line and a header
+block, like any other; the handler's ``request_version`` says how.
 """
 
 from __future__ import annotations
@@ -208,10 +210,16 @@ def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
 
         # The stdlib writes an answer in HTTP/0.9 form whenever request_version reads "HTTP/0.9":
         # a bare body, with no status line and no header block for end_headers to add to. That is
-        # also the value it STARTS each parse with, so its own 400 for a bad request version and
-        # its 505 would go out bare. Storing "HTTP/1.0" in its place, wherever the stdlib assigns
-        # it, means every answer has a header block. Only the answer's form changes; the request
-        # is served and recorded as before.
+        # also the value it STARTS each parse with, so its own 400 for a bad request line and its
+        # 505 would go out bare. Storing "HTTP/1.0" in its place, wherever the stdlib assigns it,
+        # switches the status line and the header block on for every answer. The status line still
+        # reads protocol_version, HTTP/1.1. Only the answer's form changes; the request is served
+        # and recorded as before.
+        #
+        # The class default is what a read before the first assignment returns. The stdlib
+        # assigns before it reads today; this keeps a release that reads earlier from raising.
+        _request_version = "HTTP/1.0"
+
         @property
         def request_version(self) -> str:
             return self._request_version

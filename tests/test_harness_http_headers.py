@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every response the harness HTTP sink writes carries the baseline security headers (BACKLOG #1120;
-ASVS 3.4.3, 3.4.4 and 3.4.6).
+ASVS 3.4.4 and 3.4.6, and the base-uri part of 3.4.3).
 
 ``harness/sinks/_http.py`` is the loopback server behind the REST, SOAP, FHIR and DICOMweb sinks. It
 answers through the stdlib ``BaseHTTPRequestHandler``, which also writes answers of its own before
@@ -81,6 +81,12 @@ def _assert_floored(raw: bytes, statuses: list[int]) -> None:
 
 _POST = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
 
+#: One byte more than the longest line the stdlib reads (65536), and nothing after it.
+_STDLIB_LINE_LIMIT = 65536
+_GET_LINE = b"GET /x HTTP/1.1\r\n"
+_LONG_REQUEST_LINE = b"GET /".ljust(_STDLIB_LINE_LIMIT + 1, b"a")
+_LONG_HEADER_LINE = b"X-Long: ".ljust(_STDLIB_LINE_LIMIT + 1, b"a")
+
 #: (sink status, request, the statuses of the header blocks the sink must write).
 _CASES: list[Any] = [
     pytest.param(200, _POST, [200], id="200"),
@@ -109,18 +115,15 @@ _CASES: list[Any] = [
         id="408-stalled-body",
     ),
     # --- answers the stdlib handler writes itself, before the sink's handler runs --------------
-    pytest.param(200, b"NOT A REQUEST\r\n\r\n", [400], id="stdlib-400-malformed"),
+    #
+    # Each of these is sized so the stdlib reads ALL of it before it answers. It answers and
+    # closes without draining, and a close with input still unread can reset the connection and
+    # discard the answer before this client reads it.
+    pytest.param(200, b"NOT A REQUEST\r\n", [400], id="stdlib-400-malformed"),
     pytest.param(200, b"BREW /x HTTP/1.1\r\nHost: x\r\n\r\n", [501], id="stdlib-501-method"),
-    pytest.param(200, b"GET /x HTTP/3.0\r\nHost: x\r\n\r\n", [505], id="stdlib-505-version"),
-    pytest.param(
-        200, b"GET /" + b"a" * 70000 + b" HTTP/1.1\r\n\r\n", [414], id="stdlib-414-long-line"
-    ),
-    pytest.param(
-        200,
-        b"GET /x HTTP/1.1\r\nX-Long: " + b"a" * 70000 + b"\r\n\r\n",
-        [431],
-        id="stdlib-431-long-header",
-    ),
+    pytest.param(200, b"GET /x HTTP/3.0\r\n", [505], id="stdlib-505-version"),
+    pytest.param(200, _LONG_REQUEST_LINE, [414], id="stdlib-414-long-line"),
+    pytest.param(200, _GET_LINE + _LONG_HEADER_LINE, [431], id="stdlib-431-long-header"),
     pytest.param(
         200,
         b"POST /x HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n{}",
@@ -128,11 +131,13 @@ _CASES: list[Any] = [
         id="stdlib-100-continue",
     ),
     # An HTTP/0.9 answer has no status line and no header block, so there would be nowhere to
-    # put the headers. The stdlib writes one for each of these three; the sink answers in
-    # HTTP/1.0 form. test_the_stdlib_alone_answers_these_bare is the control for that half.
+    # put the headers. The stdlib writes one for each of these; the sink answers each with a
+    # status line and a header block. test_the_stdlib_alone_answers_these_bare is the control.
     pytest.param(200, b"GET /x\r\n\r\n", [200], id="http-0.9-two-word-request"),
     pytest.param(200, b"GET /x HTTP/0.9\r\n\r\n", [200], id="http-0.9-named-version"),
     pytest.param(200, b"BREW /x HTTP/0.9\r\n\r\n", [501], id="http-0.9-stdlib-501"),
+    pytest.param(200, b"FOO\r\n", [400], id="http-0.9-one-word-line"),
+    pytest.param(200, b"POST /x\r\n", [400], id="http-0.9-two-word-not-get"),
 ]
 
 #: The cases above that the stdlib would answer with no header block at all, by id.
@@ -196,8 +201,16 @@ def test_the_stdlib_alone_answers_these_bare(
     assert _blocks(raw) == [], raw[:80]
 
 
-def test_the_bare_control_covers_five_cases() -> None:
-    assert len(_BARE_UNDER_THE_STDLIB) == 5, [case.id for case in _BARE_UNDER_THE_STDLIB]
+def test_the_bare_control_covers_seven_cases() -> None:
+    assert len(_BARE_UNDER_THE_STDLIB) == 7, [case.id for case in _BARE_UNDER_THE_STDLIB]
+
+
+@pytest.mark.parametrize("request_bytes", _BARE_UNDER_THE_STDLIB)
+def test_an_answer_the_stdlib_would_write_bare_has_a_status_line(request_bytes: bytes) -> None:
+    """The status line names the handler's protocol_version, HTTP/1.1, whatever the request said."""
+    with RestSink() as sink:
+        raw = _exchange(sink.port, request_bytes)
+    assert raw.startswith(b"HTTP/1.1 "), raw[:40]
 
 
 def test_the_sink_baseline_is_the_engine_listeners() -> None:
