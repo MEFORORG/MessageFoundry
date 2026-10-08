@@ -1644,7 +1644,9 @@ class, its age, the limit and the two ways out. Rotate the secret, and the next 
 value and resets its clock. Or remove the class from the list, and it goes back to alert-only. The list
 ships empty, so a class you do not list only alerts, as before. Under `enforcement = warn` the list does
 nothing but log a warning. A keyless store, and a `vault_transit` store, fingerprint no secrets, so
-there the list refuses nothing and the engine logs a warning saying so.
+the engine tracks no non-DEK class there at all. On those stores the list refuses nothing, **and no
+non-DEK class raises a rotation alert either**, listed or not; the engine logs a warning saying so
+(BACKLOG #2320).
 
 Valid entries are `MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_ALERTS_EMAIL_PASSWORD`,
 `MEFOR_AUTH_OIDC_CLIENT_SECRET`, `MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY`,
