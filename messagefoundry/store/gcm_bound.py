@@ -52,8 +52,10 @@ degrades to a no-op. So nothing counts, alarms or refuses on that path. Its boun
 OPERATOR PRECONDITION, not a counted one: the operator must rotate the Transit data key before any one
 key version seals 2**32 values, and the engine does not check that they do. It is weaker than this
 module's bound, and the owner ruled on 2026-09-28 that it does not meet ASVS 11.5.2 ruling R3, which
-needs an engine-recorded attestation that is not built yet. ADR 0138's 2026-09-28 amendment states the
-precondition and why (BACKLOG #1173).
+needs an engine-recorded attestation. ADR 0138's 2026-09-28 amendment states the precondition and why
+(BACKLOG #1173). That attestation is :mod:`messagefoundry.store.transit_attestation` (BACKLOG #2337,
+ADR 0138's 2026-10-07 amendment): a CLI-written, audited store row naming the Transit key, without which
+``serve`` refuses under enforce. It records who vouched for the rotation; it still counts nothing.
 """
 
 from __future__ import annotations

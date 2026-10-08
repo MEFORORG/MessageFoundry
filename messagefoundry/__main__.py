@@ -1012,8 +1012,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     # of any build whose schema moved.
     store_cmd = sub.add_parser(
         "store",
-        help="server-DB store administration: provision-schema runs the schema DDL as a "
-        "provisioning principal, so the engine's runtime login needs no DDL rights (BACKLOG #305)",
+        help="store administration: provision-schema runs a server database's schema DDL as a "
+        "provisioning principal, so the engine's runtime login needs no DDL rights (BACKLOG #305); "
+        "attest-transit-bound and withdraw-transit-bound record the vault_transit AES-GCM bound "
+        "attestation on any backend (BACKLOG #2337)",
     )
     store_sub = store_cmd.add_subparsers(dest="store_command", required=True)
     provision_schema = store_sub.add_parser(
@@ -1035,6 +1037,50 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "Under auth = 'integrated' the command connects as the Windows account running it",
     )
     provision_schema.add_argument("--json", action="store_true", help="emit JSON")
+
+    # BACKLOG #2337 (owner rulings 2026-10-07): on vault_transit the engine counts no AES-GCM
+    # invocations, so serve needs a recorded, audited attestation naming the Transit data key. Only
+    # these two commands write it; there is no API endpoint and no permission for it.
+    attest_transit = store_sub.add_parser(
+        "attest-transit-bound",
+        help="record, with an audit row, that the vault_transit data key's rotation policy keeps "
+        "each key version under 2**32 encryptions. serve on vault_transit refuses to start under "
+        "[security].enforcement=enforce without it",
+        description="Record who attests, and when, that the Transit data key the store is "
+        "configured with (MEFOR_STORE_TRANSIT_KEY) is rotated before any one key version seals "
+        "2**32 values. The engine counts no AES-GCM invocations on vault_transit, so this record "
+        "stands in for the count. It binds to the key NAME: rotating versions inside that key "
+        "keeps it, and pointing the store at another key name voids it. It binds to the name "
+        "only, so a store pointed at another Vault or Transit mount holding a key of the same "
+        "name keeps it. It replaces any earlier "
+        "attestation. The row and its audit row commit in one transaction, with the OS user as "
+        "the actor. serve reads it at its next start.",
+    )
+    attest_transit.add_argument(
+        "--reason",
+        required=True,
+        help="why the bound holds, for example the Transit key's rotation policy (recorded in the "
+        "store and in the audit row)",
+    )
+    withdraw_transit = store_sub.add_parser(
+        "withdraw-transit-bound",
+        help="remove the vault_transit bound attestation, with an audit row; serve then refuses "
+        "under [security].enforcement=enforce until it is recorded again",
+        description="Delete the recorded vault_transit AES-GCM bound attestation. The delete and "
+        "its audit row commit in one transaction, with the OS user as the actor. With nothing "
+        "recorded it changes nothing and writes no audit row.",
+    )
+    withdraw_transit.add_argument(
+        "--reason", default=None, help="why it is withdrawn (optional; recorded in the audit row)"
+    )
+    for transit_cmd in (attest_transit, withdraw_transit):
+        transit_cmd.add_argument(
+            "--service-config",
+            default=None,
+            help="service settings TOML (default: ./messagefoundry.toml if present)",
+        )
+        transit_cmd.add_argument("--db", default=None, help="store path (overrides [store].path)")
+        transit_cmd.add_argument("--json", action="store_true", help="emit JSON")
 
     # BACKLOG #305 part E2 (ASVS 13.2.2): the read-only per-hop privilege read-out. It probes the store
     # principal with the startup preflight's own probe, each Vault token with a self-lookup and a
@@ -5752,16 +5798,20 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         return 2
 
 
-def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | int:
+def _host_gated_store_settings(
+    args: argparse.Namespace, *, false_finding: str = "'no such user'"
+) -> ServiceSettings | int:
     """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
     Shared by ``admin-unlock``, ``admin-set-notify-email`` and ``admin-reset-totp`` so the gate is
-    stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it legitimately creates the
-    store, so it cannot carry the M-31 guard below.
+    stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin``
+    does not use it: it legitimately creates the store, so it cannot carry the M-31 guard below.
+    ``store attest-transit-bound`` and ``withdraw-transit-bound`` use it too (BACKLOG #2337). Each
+    passes ``false_finding``, the result a fresh empty store would wrongly report for it.
 
     Both refusals exit 2, "could not start", as each command's ``StoreNotFoundError`` arm already
-    did for a server database with no store (vault BACKLOG #3110, item 4). They exited 1, the code
-    these commands give a refusal about the account.
+    did for a server database with no store (vault BACKLOG #3110, item 4). The admin commands exited
+    1 before that, the code they give a refusal about the account.
     """
     from pathlib import Path
 
@@ -5783,7 +5833,7 @@ def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | in
     if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
         _emit_error(
             f"no store at {settings.store.path} — refusing to create one and report a false "
-            f"'no such user' (check --db / [store].path)",
+            f"{false_finding} (check --db / [store].path)",
             as_json=args.json,
         )
         return 2
@@ -6104,8 +6154,259 @@ def _read_new_password(prompt: str) -> str:
 
 
 def _store(args: argparse.Namespace) -> int:
-    """`store` command group (BACKLOG #305) — only `provision-schema` today."""
-    return _store_provision_schema(args)
+    """`store` command group: `provision-schema` (BACKLOG #305), and the vault_transit bound
+    attestation's `attest-transit-bound` and `withdraw-transit-bound` (BACKLOG #2337)."""
+    if args.store_command == "provision-schema":
+        return _store_provision_schema(args)
+    return _store_transit_bound(args)
+
+
+class _StoreConnectFailed(Exception):  # noqa: N818 -- a carrier, caught one frame up
+    """A store error raised while OPENING the store, such as a path that is not a database or a
+    server backend that cannot be reached, so ``_store_transit_bound`` reports exit 2 rather than a
+    refused write. The same classes raised by the write are a refused write, except the defects
+    ``_store_transit_bound`` names (BACKLOG #2337)."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+class _StoreDefect(Exception):  # noqa: N818 -- carries a defect to the dispatch floor
+    """A store error the transit-bound write raised that names a defect in the code, not a refusal
+    (BACKLOG #2337). Its text is the error's class and SQLSTATE as :func:`_store_error_text` renders
+    them, so the dispatch floor reports the defect without the server's text."""
+
+
+def _store_transit_bound(args: argparse.Namespace) -> int:
+    """Record or withdraw the vault_transit AES-GCM bound attestation (BACKLOG #2337).
+
+    Owner rulings 2026-10-07: the engine records who attested and when, in an audited store row
+    that only this CLI writes, with the ``cli:<osuser>`` actor ``admin-unlock`` uses. The row binds
+    to the Transit data-key name, read from the opened store's live cipher rather than typed, so the
+    attestation names the key ``serve`` will check. Runs on ``admin-unlock``'s host gate.
+
+    Exit codes: 0 done (including a withdraw with nothing recorded); 1 refused (a blank or
+    too-long reason, a key name too long to record, a cipher that is not vault_transit, or a write
+    the store refused, which then wrote nothing); 2 could not open the store. A SQLite error raised
+    while OPENING is exit 2; the same class raised by the write, such as "database is locked" while
+    the engine holds the file, is a refused write and exit 1."""
+    import datetime
+    import getpass
+    import math
+
+    from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+        store_driver_errors,
+        store_open_errors,
+    )
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.transit_attestation import (
+        TRANSIT_BOUND_KEY_NAME_MAX,
+        TRANSIT_BOUND_REASON_MAX,
+        TransitBoundAttestation,
+        TransitBoundAttestationStore,
+        utf16_units,
+    )
+
+    attesting = args.store_command == "attest-transit-bound"
+    reason = (args.reason or "").strip()
+    if attesting and not reason:
+        return _emit_error("--reason must not be blank", as_json=args.json)
+    # UTF-16 code units, as SQL Server's NVARCHAR(1000) counts them, so a reason that passes here
+    # fits every backend's column.
+    if utf16_units(reason) > TRANSIT_BOUND_REASON_MAX:
+        return _emit_error(
+            f"--reason is longer than {TRANSIT_BOUND_REASON_MAX} UTF-16 code units",
+            as_json=args.json,
+        )
+    false_finding = (
+        "'OK: recorded' into a store serve never reads" if attesting else "'nothing recorded'"
+    )
+    settings = _host_gated_store_settings(args, false_finding=false_finding)
+    if isinstance(settings, int):
+        return settings
+    # Only a vault_transit store has a bound to attest. A withdraw runs on any cipher, so a store
+    # moved off vault_transit can still drop the row it left behind.
+    if attesting and settings.store.cipher_provider != "vault_transit":
+        return _emit_error(
+            f"[store].cipher_provider is {settings.store.cipher_provider!r}: the engine counts the "
+            "AES-GCM bound itself there, so there is nothing to attest. This command applies to "
+            "'vault_transit' only",
+            as_json=args.json,
+        )
+    actor = f"cli:{getpass.getuser()}"
+    # What a failure left in place, for the refusal lines below.
+    unchanged = (
+        "nothing was recorded"
+        if attesting
+        else "nothing was withdrawn, and any attestation on record still stands"
+    )
+
+    # What an OPEN that cannot reach or use its database raises, on any backend, at least: the
+    # engine's own refusals (RuntimeError, such as SchemaNotProvisionedError), the drivers' errors
+    # (SQLite's among them, for a path that is not a database, #1670), pyodbc's Error root and
+    # InterfaceError (a missing driver, a failed login), OSError (vault BACKLOG #3054, item 10), and
+    # UnicodeError, a driver decoding a row's text.
+    store_errors: tuple[type[Exception], ...] = (RuntimeError, UnicodeError, *store_open_errors())
+    # The same classes raised by the WRITE are a refused write (BACKLOG #1983): the row and its
+    # audit row share one transaction, so a refusal leaves neither. Two carve-outs reach the
+    # dispatch floor as defects instead, at least: pyodbc's bare Error root, which
+    # store_driver_errors() leaves out, unless its SQLSTATE names a transient condition such as a
+    # deadlock victim (40001), so a bind-count mismatch (07002) is a defect; and SQLite's
+    # ProgrammingError and InterfaceError, its own bind-count and misuse errors.
+    refused_writes: tuple[type[Exception], ...] = (
+        RuntimeError,
+        UnicodeError,
+        OSError,
+        *store_driver_errors(),
+    )
+    # A key that cannot be resolved at open, or a cipher refusal (Transit unreachable) at either end.
+    key_errors: tuple[type[Exception], ...] = (
+        *_key_unresolved(),
+        StoreKeylessError,
+        CipherError,
+    )
+    # Raised by the open, and each reported by its own clause below rather than as a failed open.
+    open_refusals: tuple[type[Exception], ...] = (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        *key_errors,
+    )
+
+    async def run() -> tuple[str, TransitBoundAttestation | None, str]:
+        """``(outcome, the row recorded or withdrawn, the store path)``."""
+        try:
+            store = await open_store(
+                settings.store,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        except open_refusals:
+            raise  # each has its own message and exit code below
+        except store_errors as exc:
+            # A path that is not a database (#1670), or a server backend that cannot be reached or
+            # refuses the login, fails here: "cannot open the store" (exit 2), not a refused write.
+            raise _StoreConnectFailed(exc) from exc
+        try:
+            if not isinstance(store, TransitBoundAttestationStore):
+                return ("unsupported", None, store.path)
+            _refuse_an_unauditable_write(store)
+            if not attesting:
+                withdrawn = await store.withdraw_transit_bound_attestation(
+                    actor=actor, reason=reason or None
+                )
+                return ("withdrawn" if withdrawn else "none", withdrawn, store.path)
+            key_name = store.cipher_info().transit_key_name
+            if key_name is None:  # cipher_provider said vault_transit; the open built another
+                return ("no-transit-key", None, store.path)
+            if utf16_units(key_name) > TRANSIT_BOUND_KEY_NAME_MAX:
+                return ("key-name-too-long", None, store.path)
+            recorded = await store.record_transit_bound_attestation(
+                key_name=key_name, reason=reason, actor=actor
+            )
+            return ("attested", recorded, store.path)
+        finally:
+            # A close that fails after the write committed must not report that write as refused.
+            await _close_store_quietly(store)
+
+    try:
+        outcome, row, path = run_guarded(run())
+    except (KeylessAuditChainRefused, StoreNotFoundError, _UnauditableWrite) as exc:
+        _emit_error(str(exc), as_json=args.json)
+        return 2
+    except key_errors as exc:
+        _emit_error(f"{unchanged}: {exc}", as_json=args.json)
+        return 2
+    except _StoreConnectFailed as exc:
+        return _emit_store_open_error(
+            exc.cause,
+            _store_label(settings.store),
+            as_json=args.json,
+            text=_transit_store_error_text(exc.cause),
+        )
+    except store_errors as exc:
+        if isinstance(exc, (sqlite3.ProgrammingError, sqlite3.InterfaceError)) or (
+            not isinstance(exc, refused_writes) and not _is_transient_driver_error(exc)
+        ):
+            # A defect, not a refusal: the dispatch floor reports it, by class and SQLSTATE only.
+            raise _StoreDefect(_store_error_text(exc)) from exc
+        text = _transit_store_error_text(exc)
+        if _write_outcome_unknown(exc):
+            # The link failed, possibly after the server applied the COMMIT, so nothing here can
+            # say whether the write took effect. Re-running either command is safe.
+            return _emit_error(
+                f"the connection to the store failed during the write, so whether it took effect "
+                f"is unknown ({text}). Re-run the command",
+                as_json=args.json,
+            )
+        # Only a lock is fixed by stopping a SQLite engine, so only a lock gets that hint.
+        hint = (
+            ". If the engine is running on this SQLite store, stop it and re-run"
+            if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+            else ""
+        )
+        return _emit_error(
+            f"the store refused the write, so {unchanged} ({text}){hint}", as_json=args.json
+        )
+    if outcome == "unsupported":
+        return _emit_error("this store backend cannot hold the attestation", as_json=args.json)
+    if outcome == "no-transit-key":
+        return _emit_error(
+            "the store opened without a Transit data key, so there is no key to attest",
+            as_json=args.json,
+        )
+    if outcome == "key-name-too-long":
+        return _emit_error(
+            f"the Transit data key name is longer than {TRANSIT_BOUND_KEY_NAME_MAX} UTF-16 code "
+            "units, which the attestation's key_name column cannot hold, so nothing was recorded",
+            as_json=args.json,
+        )
+    if args.json:
+        _print_json(
+            {
+                "ok": True,
+                "action": outcome,
+                "store": path,
+                "attestation": None
+                if row is None
+                else {
+                    "key_name": row.key_name,
+                    "reason": row.reason,
+                    "actor": row.actor,
+                    # null for a corrupt, non-finite time: NaN is not JSON.
+                    "attested_at": row.attested_at if math.isfinite(row.attested_at) else None,
+                },
+            },
+            compact=True,
+        )
+        return 0
+    if row is None:
+        _safe_print(
+            f"OK: no vault_transit bound attestation is recorded in {path}; nothing changed"
+        )
+        return 0
+    try:
+        when = datetime.datetime.fromtimestamp(row.attested_at, tz=datetime.UTC).isoformat()
+    except (ValueError, OverflowError, OSError):
+        # A withdrawn row whose time is corrupt has already been deleted and audited; report that,
+        # rather than a traceback and a failure exit for a write that succeeded.
+        when = "an unreadable time"
+    if outcome == "attested":
+        _safe_print(
+            f"OK: recorded the AES-GCM bound attestation for Transit data key {row.key_name!r} "
+            f"as {row.actor} at {when} in {path}. serve reads it at its next start"
+        )
+    else:
+        _safe_print(
+            f"OK: withdrew the attestation for Transit data key {row.key_name!r} (recorded by "
+            f"{row.actor!r} at {when}) from {path}. Under [security].enforcement=enforce, serve now "
+            "refuses to start on vault_transit until one is recorded again"
+        )
+    return 0
 
 
 def _store_provision_schema(args: argparse.Namespace) -> int:
@@ -7909,8 +8210,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # EXIT 1 WITH A FAIL LINE (vault BACKLOG #3054, item 8). It reached the dispatch floor and
         # exited 1 with no line, so a job would see a broken chain's code with nothing to read. NOT a
         # softer code of its own: under Transit each row goes to the provider for its MAC, so a
-        # planted row the provider refuses stops the walk, and a code that reads as "not checked"
-        # would let that row hide every break the rest of the walk would have found. The line names
+        # planted row the provider refuses for its content, such as one too large for one request,
+        # stops the walk, and a code that reads as "not checked" would let that row hide every
+        # break the rest of the walk would have found. (A planted key VERSION does not stop the
+        # walk; it is a reported break, BACKLOG #2337.) The line names
         # the error's class and its cause's class only, never its text. The walk reports a break only
         # once it finishes, so a break it had already met is lost too, and the line says so.
         print(
@@ -9556,8 +9859,9 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
 
 
 async def _close_store_quietly(store: Store) -> None:
-    """Close ``store`` after ``audit-verify`` or ``audit-anchor`` has its result. A close that fails
-    prints a warning naming its class, and never replaces that result (vault BACKLOG #3054)."""
+    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``store attest-transit-bound`` or
+    ``store withdraw-transit-bound`` has its result. A close that fails prints a warning naming its
+    class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()
     except Exception as exc:
@@ -9587,7 +9891,109 @@ class _AuditWalkStopped(RuntimeError):
     to print."""
 
 
-def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
+def _store_error_text(exc: Exception) -> str:
+    """A store error as one line that quotes no row's content: the rendering
+    :func:`_emit_store_open_error` documents. The two transit-bound commands use it too, for a
+    driver error at the open or at the write (BACKLOG #2337); an engine refusal goes to
+    :func:`_engine_refusal_text` instead."""
+    import re
+
+    from messagefoundry.redaction import safe_exc
+    from messagefoundry.store.base import driver_sqlstate
+
+    state = driver_sqlstate(exc)
+    if isinstance(exc, sqlite3.DatabaseError):
+        return re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
+    if state is not None:
+        # The native number, read by the anchored pattern the database connector uses; never text.
+        native = re.findall(r"\((\d{1,6})\)\s*\(SQL[A-Za-z]+\)", str(exc))
+        return f"{type(exc).__name__} [SQLSTATE {state}]" + (
+            f" native error {native[-1]}" if native else ""
+        )
+    return safe_exc(exc)
+
+
+def _is_engine_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` is a refusal the engine wrote itself (BACKLOG #2337): a ``RuntimeError``
+    subclass the engine defines, such as ``SchemaNotProvisionedError``, or a plain ``RuntimeError``
+    raised from engine code, as the store's refusal sites raise it. A plain one raised by a library,
+    or a subclass from elsewhere such as ``NotImplementedError``, is not one. A refusal's text names
+    its fix, so it is printed whole."""
+    if not isinstance(exc, RuntimeError):
+        return False
+    if type(exc) is not RuntimeError:
+        return type(exc).__module__.split(".")[0] == "messagefoundry"
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    module = tb.tb_frame.f_globals.get("__name__", "")
+    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
+
+
+def _engine_refusal_text(exc: BaseException) -> str:
+    """An engine refusal's whole text, with any error it quotes from its cause chain rendered by
+    :func:`_store_error_text` in place of that error's own text (BACKLOG #2337).
+
+    A refusal such as the SQL Server open's READ_COMMITTED_SNAPSHOT check embeds the driver error
+    it was raised from, and a server's text can quote a stored value. The chain is followed through
+    ``__cause__``, or ``__context__`` where no cause was set. Each link that is not itself an engine
+    refusal has its ``repr``, its ``str`` and each of its string arguments replaced wherever the
+    refusal quotes them. Every occurrence is replaced: a short cause text that also appears in the
+    refusal's own prose costs that prose, which is the cheaper failure. A quotation in any other
+    shape is not caught; the refusal sites themselves are unchanged."""
+    text = str(exc)
+    renderings: list[str] = []
+    link = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    seen: set[int] = set()
+    while isinstance(link, Exception) and id(link) not in seen:
+        seen.add(id(link))
+        if not _is_engine_refusal(link):
+            # Longest first, so a repr is replaced before the str inside it; a placeholder keeps a
+            # rendering from being matched again by a later, shorter quotation.
+            quotations = {repr(link), str(link), *(a for a in link.args if isinstance(a, str))}
+            for quoted in sorted((q for q in quotations if len(q) > 5), key=len, reverse=True):
+                if quoted in text:
+                    text = text.replace(quoted, f"\x00{len(renderings)}\x00")
+                    renderings.append(_store_error_text(link))
+        link = link.__cause__ or (None if link.__suppress_context__ else link.__context__)
+    for n, rendered in enumerate(renderings):
+        text = text.replace(f"\x00{n}\x00", rendered)
+    return text
+
+
+def _transit_store_error_text(exc: Exception) -> str:
+    """How the transit-bound commands render a store error at the open or the write (BACKLOG
+    #2337): an engine refusal whole, through :func:`_engine_refusal_text`, so its remedy survives;
+    anything else as :func:`_store_error_text` renders it."""
+    return _engine_refusal_text(exc) if _is_engine_refusal(exc) else _store_error_text(exc)
+
+
+def _is_transient_driver_error(exc: BaseException) -> bool:
+    """Whether a server driver's error carries a SQLSTATE the database connector counts as
+    transient, such as a deadlock victim (40001) (BACKLOG #2337)."""
+    from messagefoundry.store.base import driver_sqlstate
+    from messagefoundry.transports.database import _is_transient
+
+    state = driver_sqlstate(exc)
+    return state is not None and _is_transient(state)
+
+
+def _write_outcome_unknown(exc: BaseException) -> bool:
+    """Whether a failed write may still have committed: a lost connection (OSError, or SQLSTATE
+    class 08), or 40003, "statement completion unknown" (BACKLOG #2337)."""
+    from messagefoundry.store.base import driver_sqlstate
+
+    if isinstance(exc, OSError):
+        return True
+    state = driver_sqlstate(exc)
+    return state is not None and (state.startswith("08") or state == "40003")
+
+
+def _emit_store_open_error(
+    exc: Exception, path: str, *, as_json: bool, text: str | None = None
+) -> int:
     """One line and exit 2 for a store that could not be opened (BACKLOG #1670).
 
     EXIT 2 AND NOT 1, DELIBERATELY. These subcommands already spend 1 on a negative *finding* --
@@ -9613,24 +10019,11 @@ def _emit_store_open_error(exc: Exception, path: str, *, as_json: bool) -> int:
     is (...)", and ``safe_exc``'s pattern redaction keeps that (measured in BACKLOG #1661). An
     error with no SQLSTATE goes through ``safe_exc``: at least asyncpg's refused connection, an
     OSError, and its client errors, whose text ``safe_exc`` redacts by pattern only.
+
+    ``text``, when given, replaces that rendering, for a caller that has already rendered the error
+    its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337).
     """
-    import re
-
-    from messagefoundry.redaction import safe_exc
-    from messagefoundry.store.base import driver_sqlstate
-
-    state = driver_sqlstate(exc)
-    if isinstance(exc, sqlite3.DatabaseError):
-        shown = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
-    elif state is not None:
-        # The native number, read by the anchored pattern the database connector uses; never text.
-        native = re.findall(r"\((\d{1,6})\)\s*\(SQL[A-Za-z]+\)", str(exc))
-        shown = f"{type(exc).__name__} [SQLSTATE {state}]" + (
-            f" native error {native[-1]}" if native else ""
-        )
-    else:
-        shown = safe_exc(exc)
-    message = f"cannot open the store at {path}: {shown}"
+    message = f"cannot open the store at {path}: {_store_error_text(exc) if text is None else text}"
     if as_json:
         print(json.dumps({"error": message}))
     else:

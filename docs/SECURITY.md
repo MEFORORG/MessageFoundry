@@ -5146,6 +5146,71 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   entry rather than enforced by the engine. 11.7.2's encrypt-after-use guarantee is active only on a
   keyed instance (a key must be configured), which is already the case for any PHI-bearing deployment.
 
+### On vault_transit, a recorded attestation stands in for the AES-GCM count (BACKLOG #2337)
+
+Under `[store].cipher_provider = "vault_transit"` the engine counts no AES-GCM encryptions. The
+bound is the operator's rotation of the Transit data key, which must happen before any one key
+version seals 2^32 values ([ADR 0138](adr/0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md),
+amendments of 2026-09-28 and 2026-10-07). So the engine requires a record of who vouched for that
+rotation, and when.
+
+1. An operator runs `messagefoundry store attest-transit-bound --reason "<the rotation policy>"`
+   on the host. It writes one row in the store: the Transit data-key name, the reason, the actor
+   `cli:<OS user>` and the time. Its `store.transit_bound_attested` audit row commits in the same
+   transaction, on all three backends.
+2. At every start, `serve` compares that row with the key named by `MEFOR_STORE_TRANSIT_KEY`. With
+   no row, or a row for another key name, it **refuses to start** under
+   `[security].enforcement = enforce` and logs a warning under `warn`.
+3. `messagefoundry store withdraw-transit-bound` deletes the row, with a
+   `store.transit_bound_withdrawn` audit row in the same transaction. The next start under enforce
+   refuses until a new attestation is recorded.
+
+The record binds to the key **name**, and to nothing else. Rotating versions inside one key
+keeps it, because that rotation is what the operator attested. Pointing the store at another key
+name voids it. Pointing it at **another Vault, or another Transit mount, that holds a key with the
+same name keeps it**, under the owner ruling of 2026-10-07. Whoever moves the store there must
+withdraw and re-attest by hand if that key's rotation policy differs. Only the CLI writes the row:
+there is no API endpoint and no permission for it, and no settings key stands in for it.
+`GET /security/posture` reports it in `transit_bound_attestation`, with `gap` saying why it does not
+count. `messagefoundry check` does not, because it reads configuration and never opens the store.
+
+**The row is bound to its audit row, so DML on the table alone forges nothing.** The row stores the
+sequence number and chain hash of the audit row its write appended. Every read checks that audit
+row: it must exist, be the newest attest or withdraw row, name the same key, reason, actor and time,
+carry the recorded hash, and verify under the audit key of its range. On `vault_transit` that key is
+inside Transit, so a writer with database rights and no Transit access cannot seal a new one. A row
+that fails any check counts as no attestation, and the start log and the posture say which check
+failed. The check recomputes the MAC under the Transit key version the audit row names, so
+rotating the key, which is what the operator attests to, keeps the attestation. The audit chain
+walk pins the version the same way, so a rotation does not read as a chain break either.
+
+**A planted key version is a break at its row.** A writer can plant a version Transit does not
+hold. Transit refuses it with HTTP 400 while it still answers under the latest version. The walk
+then reports a break at that row and keeps going. `audit-verify` names the row and exits 1. With
+`[integrity].audit_verify_on_start` on, the startup check also raises its `audit-chain` alert.
+Other failures still stop the walk as a check that could not run. Those include at least an
+outage, a dropped connection, and a row too large for one request.
+
+**Retiring an old version of the audit key breaks the chain.** Transit also refuses a version below the key's
+`min_encryption_version`, or one trimmed away. Every audit row sealed under that version then reads
+as a break, `audit-verify` exits 1, and the attestation counts as none. The audit key is the data
+key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` names another. So raising the data key's minimum version
+breaks the chain too. Rotating is safe; retiring is not. The break text names both causes, a planted
+version and a retired one.
+
+**What this check does not catch: a replay after a deleted withdraw row.** A writer can delete the
+withdraw row and re-insert the old attestation row. This check does not see that. If other audit
+rows follow the deleted one, the chain breaks, and `messagefoundry audit-verify` reports it. So does
+the start-up walk, when `[integrity].audit_verify_on_start` is on. If the withdraw row was the
+newest row, the rest of the chain still verifies. Only an external anchor taken after the withdraw
+catches that cut: `audit-verify --expected-anchor`, or `[integrity].audit_anchor_file`, which the
+engine reads only when `audit_verify_on_start` is on.
+
+**What it does not do.** The engine still counts nothing on this path, so passing 2^32 on one key
+version would still be silent. The record says that someone named took responsibility for the
+rotation schedule. It does not check that the schedule exists or keeps up with the real encrypt
+rate.
+
 ### Remote debugging of the engine process (PEP 768)
 
 Python 3.14 lets another process run a script inside a running interpreter, if the operating
