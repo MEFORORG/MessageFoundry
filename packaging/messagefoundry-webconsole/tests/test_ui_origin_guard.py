@@ -7,7 +7,8 @@ Two layers:
 
 * **HTTP behaviour** — both branches of the check are exercised on login and logout (the modern
   ``Sec-Fetch-Site`` branch AND the older ``Origin``-only fallback), plus the two shapes that must
-  still succeed (a same-origin browser form POST, and a header-less non-browser client). The login
+  still succeed (a same-origin browser form POST by either header), and the one that must not: a
+  POST carrying neither header, which fails closed (BACKLOG #1116, #1124). The login
   assertions additionally pin that a rejected attempt sets NO cookie; the logout assertions pin that
   the session SURVIVES a rejected attempt.
 * **Static enumeration** — an AST walk of every ``@app.post`` handler in
@@ -23,7 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
-from _ui_clients import create_local_user_chosen
+from _ui_clients import HEADERLESS_UI_REQUEST, create_local_user_chosen
 from starlette.datastructures import Headers
 
 import messagefoundry_webconsole
@@ -37,6 +38,9 @@ PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the A
 
 #: RFC 5737 TEST-NET-2 has no hostname form; use a reserved example domain for the hostile origin.
 EVIL_ORIGIN = "http://evil.example"
+
+#: Sends one request with no fetch metadata at all; the suite's browser stand-in leaves it alone.
+HEADERLESS = {HEADERLESS_UI_REQUEST: True}
 
 
 async def _service(engine: Engine) -> AuthService:
@@ -125,9 +129,9 @@ async def test_login_rejection_precedes_the_rate_limiter(engine: Engine) -> None
         assert "set-cookie" in {k.lower() for k in ok.headers}
 
 
-async def test_login_same_origin_and_headerless_still_succeed(engine: Engine) -> None:
-    """The two shapes that must keep working: a same-origin browser form POST, and a header-less
-    non-browser client (which cannot be CSRF-ridden, so the fallthrough is safe by construction)."""
+async def test_login_same_origin_succeeds_by_either_header(engine: Engine) -> None:
+    """The shapes that must keep working: a browser form POST naming itself same-origin, and an
+    older browser's POST that carries a matching ``Origin`` and no ``Sec-Fetch-Site``."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -139,9 +143,33 @@ async def test_login_same_origin_and_headerless_still_succeed(engine: Engine) ->
         assert browser.status_code == 303
         assert (await c.get("/ui")).status_code == 200
     async with _client(engine, service) as c2:
-        headerless = await c2.post("/ui/login", data=_creds())
-        assert headerless.status_code == 303
+        older = await c2.post("/ui/login", data=_creds(), headers={"Origin": "http://t"})
+        assert older.status_code == 303
         assert (await c2.get("/ui")).status_code == 200
+
+
+async def test_login_with_neither_header_fails_closed_without_setting_a_cookie(
+    engine: Engine,
+) -> None:
+    """BACKLOG #1116, #1124. A sign-in POST carrying NEITHER ``Sec-Fetch-Site`` NOR ``Origin`` used
+    to pass, and on this route no session cookie exists for ``SameSite=Strict`` to withhold, so
+    nothing at all bounded it. It is refused now, and mints nothing. An empty ``Origin`` is absence.
+
+    The control is the same client and credentials with ``Origin`` added, which signs in: the 403 is
+    the missing header, not a bad password or a spent budget."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        for headers in ({}, {"Origin": ""}):
+            r = await c.post("/ui/login", data=_creds(), headers=headers, extensions=HEADERLESS)
+            assert r.status_code == 403, headers
+            assert "neither Sec-Fetch-Site nor Origin" in r.text
+            assert "set-cookie" not in {k.lower() for k in r.headers}
+        assert (await c.get("/ui", follow_redirects=False)).status_code != 200
+        ok = await c.post(
+            "/ui/login", data=_creds(), headers={"Origin": "http://t"}, extensions=HEADERLESS
+        )
+        assert ok.status_code == 303
 
 
 # --- POST /ui/logout: forced logout (the route has NO Depends gate, by design) --------------------
@@ -170,8 +198,9 @@ async def test_logout_rejects_foreign_origin_and_the_session_survives(engine: En
         assert (await c.get("/ui")).status_code == 200  # session SURVIVED
 
 
-async def test_logout_same_origin_and_headerless_still_revoke(engine: Engine) -> None:
-    """A genuine same-origin Sign-out still revokes, and so does the header-less non-browser leg."""
+async def test_logout_same_origin_revokes_and_neither_header_does_not(engine: Engine) -> None:
+    """A genuine same-origin Sign-out still revokes. A POST carrying neither provenance header is
+    refused and the session SURVIVES it (BACKLOG #1116, #1124), where it used to revoke."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -183,8 +212,24 @@ async def test_logout_same_origin_and_headerless_still_revoke(engine: Engine) ->
         assert (await c.get("/ui")).status_code in (302, 303, 401)
     async with _client(engine, service) as c2:
         assert (await c2.post("/ui/login", data=_creds())).status_code == 303
-        assert (await c2.post("/ui/logout")).status_code == 303
+        assert (await c2.post("/ui/logout", extensions=HEADERLESS)).status_code == 403
+        assert (await c2.get("/ui")).status_code == 200  # session SURVIVED
+        assert (await c2.post("/ui/logout", headers={"Origin": "http://t"})).status_code == 303
         assert (await c2.get("/ui")).status_code in (302, 303, 401)
+
+
+async def test_an_authenticated_write_with_neither_header_fails_closed(engine: Engine) -> None:
+    """The same refusal on a write behind ``require_ui``, which asserts provenance before it spends
+    the actor's budget. The control is the same POST with ``Origin``, which is not a 403."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        assert (await c.post("/ui/login", data=_creds())).status_code == 303
+        refused = await c.post("/ui/config/reload", extensions=HEADERLESS)
+        assert refused.status_code == 403
+        assert "neither Sec-Fetch-Site nor Origin" in refused.text
+        named = await c.post("/ui/config/reload", headers={"Origin": "http://t"})
+        assert named.status_code != 403, named.text
 
 
 # --- POST /ui/csp-report: the third unguarded POST, narrow guard ----------------------------------
@@ -215,7 +260,9 @@ async def test_csp_report_accepts_conforming_delivery_shapes(engine: Engine) -> 
         assert same_origin.status_code == 204
         agent = await c.post("/ui/csp-report", json=body, headers={"Origin": "null"})
         assert agent.status_code == 204
-        headerless = await c.post("/ui/csp-report", json=body)
+        # Still accepted with neither header: this sink uses the NARROWER assert_not_cross_site, and a
+        # reporting agent sends no fetch metadata. The fail-closed rule is assert_same_origin's alone.
+        headerless = await c.post("/ui/csp-report", json=body, extensions=HEADERLESS)
         assert headerless.status_code == 204
 
 

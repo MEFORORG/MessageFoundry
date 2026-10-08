@@ -140,8 +140,8 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   ``mf_session`` rather than a cookie the browser would silently reject and thereby break login —
   session termination is SERVER-side (revoke + ``Clear-Site-Data``, never cookie deletion alone), and
   every state-changing /ui POST carries the server-side ``Sec-Fetch-Site``/``Origin`` check, so a
-  browser that ignores the attributes still cannot be driven cross-site with the cookie, provided it
-  sends one of those two headers (a client that sends neither passes that check; see the fourth set).
+  browser that ignores the attributes still cannot be driven cross-site with the cookie: a request
+  that carries neither header is refused by that check (see the fourth set).
 * **``Cross-Origin-Opener-Policy``** — DEGRADES SILENTLY, by necessity. No browser API exposes COOP
   enforcement to the page. ``window.crossOriginIsolated`` is NOT a COOP detect — it additionally
   requires COEP, which is deliberately not set (above), so reading it would render a false "degraded"
@@ -158,8 +158,8 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   cookie's SameSite attribute, so the absence is undetectable client-side, but every state-changing
   ``/ui`` POST — including the unauthenticated ``/ui/login`` and the gate-less ``/ui/logout`` — carries
   an explicit server-side ``Sec-Fetch-Site``/``Origin`` check (:func:`._auth.assert_same_origin`,
-  ASVS 3.5.1). A browser that ignores SameSite therefore still cannot mount CSRF against /ui, provided
-  it sends ``Sec-Fetch-Site`` or ``Origin``; one that sends neither passes the check.
+  ASVS 3.5.1). A browser that ignores SameSite therefore still cannot mount CSRF against /ui. The
+  check FAILS CLOSED on a request that carries neither header (BACKLOG #1116, #1124).
 * **``Clear-Site-Data``** (ASVS 14.3.1; emitted by :mod:`._auth` on every login redirect and by
   :mod:`.routes.core` on logout and the post-termination login render) — DEGRADES SILENTLY; Safari
   has no support. Compensating: it is only the Back/bfcache belt. The session is revoked SERVER-side,

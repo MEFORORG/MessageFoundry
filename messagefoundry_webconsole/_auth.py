@@ -683,16 +683,24 @@ def assert_same_origin(request: Request) -> None:
     state-changing POSTs (ASVS 3.5.1): ``POST /ui/login``, where SameSite=Strict supplies nothing
     because no session cookie exists yet, and ``POST /ui/logout``, which has no ``Depends`` gate at all
     (by design — a must-change-confined session must be able to revoke itself, ASVS 7.4.4) and so has
-    no other request-provenance control. The header-less fallthrough is safe by construction: a browser
-    attaches ``Sec-Fetch-Site`` or ``Origin`` to every cross-site POST, so only a non-browser client —
-    which cannot be CSRF-ridden — passes header-less.
+    no other request-provenance control.
+
+    A request carrying NEITHER header **fails closed** with 403 (BACKLOG #1116, #1124). It used to
+    pass, on the reasoning that a browser attaches one of the two to every cross-site POST. That is an
+    assumption about the browser, and nothing told the operator when it did not hold. No shipped
+    first-party client posts to ``/ui`` without a browser, so the refusal costs a conforming client
+    nothing; a script that drives ``/ui`` must send ``Origin``.
     """
     sec_fetch_site = request.headers.get("sec-fetch-site")
     if sec_fetch_site is not None:
         assert_not_cross_site(request)
         return
     origin = request.headers.get("origin")
-    if origin and not _origin_matches(request.app.state, origin, request.headers.get("host")):
+    if not origin:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "request carries neither Sec-Fetch-Site nor Origin"
+        )
+    if not _origin_matches(request.app.state, origin, request.headers.get("host")):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-origin request rejected")
 
 

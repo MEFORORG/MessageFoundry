@@ -69,6 +69,12 @@ this line.**
 
 ### Security
 
+- **A state-changing `/ui` request that carries neither `Sec-Fetch-Site` nor `Origin` is refused.**
+  It answers `403` and changes nothing. It used to pass, which left the sign-in POST with no
+  cross-site control in a browser that sends neither header. A browser sends one of the two on its
+  own form POST, so the console's pages are unaffected. A script that drives `/ui` must now send
+  `Origin`. The CSP report sink `/ui/csp-report` still accepts a report with neither. No seam
+  change. (BACKLOG #1116, #1124)
 - **Resend, edit-resend, upload resend, queue purge and config reload each take a proof bound to
   that action.** A fresh session window no longer reaches them. Each needs a re-authentication made
   for it, which it spends. The re-auth page mints that proof when it continues to the action's
