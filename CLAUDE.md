@@ -375,44 +375,15 @@ an old id can resolve to plausible wrong text rather than to nothing. One comman
 
     git -C <korus clone> show origin/main:roles/LANDER.md | Select-String '^### '
 
-**THE SPECIAL SEAT IS THE OWNER'S, AND IT HAS NO STANDING DUTIES (owner decision 2026-09-16).** It
-exists for work that falls outside the other five, so its instruction is the whole of its scope and
-it has none until the owner gives it one. It does not take a BACKLOG item, a brief, or a red. It is
-an ADDITION -- nothing retired to make room for it -- and it is not a spawn-authorised seat, so the
-ruling below binds it.
-
-**Standing by is its normal state, not a fault in it.** An idle Special session is the owner holding
-one in reserve, and work it finds itself spends that. It announces and declares before its first
-SHARED write rather than on arrival, which is the one point where it parts company with every other
-seat here: the arrival prompt that tells each session to declare is the line this seat alone does
-not act on. The cost of that silence is real and lands on nobody while the seat touches nothing --
-`fleet.ps1` omits it and no peer can forecast a collision with it -- which is why the deferral ends
-at the first shared write and not later. Its card is
-[`docs/roles/special.card.md`](docs/roles/special.card.md); the full playbook is korus
-`roles/SPECIAL.md`, read at `origin/main` like every other playbook.
+**The Special seat is the owner's, and it has no standing duties (owner decision 2026-09-16).** Its
+instruction is its whole scope, and it announces and declares before its first shared write rather
+than on arrival. Its card is [`docs/roles/special.card.md`](docs/roles/special.card.md); the
+playbook is korus `roles/SPECIAL.md`, read at `origin/main`.
 
 **A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
-ruling 2026-09-16).** The owner still starts each Manager in the ordinary case, and a Manager's
-workers are still subagents in its own process rather than spawned sessions. A Manager still needs
-no account roster and still cannot reach another Manager: spawning makes a NEW session, it does not
-address an existing one, so the shape still dissolves the cross-account problem rather than solving
-it.
-
-**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing sends a
-red PR to a seat -- `failure-signal.yml` sets a `ci-red` label that only an advisory daily report
-reads back, and `stalled-prs.yml` reports green-but-unmergeable PRs rather than red ones -- so the
-work stops until somebody happens to look. **CORRECTED 2026-09-26:** this read "a `ci-red` label no
-workflow reads back"; `ci-red-report.yml` (PR 1240) reads it daily into its own run summary. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
-landing means nobody checked it, and a fix written to turn CI green is checked by the very signal it
-was written against.
-
-**SPAWNING SHOULD BE RARE, AND REACHING FOR IT IS WORTH NOTICING.** A Manager's subagents already
-cover almost everything it does, and the load-bearing property is that **a subagent cannot outlive a
-mistake** -- it needs no grant and it dies with its Manager. **A spawned session can outlive one**,
-which is the whole of the added risk. So a spawn is better read as a SIGNAL THAT SOMETHING UPSTREAM
-HAS FAILED -- a seat died with work outstanding, or nobody was alive to take a red -- than as a
-routine tool. Raised by a Manager seat on 2026-09-16, about its own grant, which is the direction
-that argument is most credible from.
+ruling 2026-09-16).** Spawning should be rare: a subagent cannot outlive a mistake, and a spawned
+session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in
+wave 2*.
 
 The brief is disposable. The BACKLOG item is the record.
 
