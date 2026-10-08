@@ -6,9 +6,14 @@
 import { DiffUris } from '@theia/core/lib/browser/diff-uris';
 import URI from '@theia/core/lib/common/uri';
 
-/** A Router or Handler module. Case-insensitive, because a Windows file system is. */
+/**
+ * A Router or Handler module. Case-insensitive, because a Windows file system is. Windows also drops
+ * trailing dots and spaces from a name (`x.py.` and `x.py ` both land as `x.py`) and reads `x.py:s` as
+ * a stream of `x.py`, so those spellings count as a `.py` too (S-2b review).
+ */
 export function isPythonUri(uri: URI): boolean {
-    return uri.path.ext.toLowerCase() === '.py';
+    const base = uri.path.base.replace(/:.*$/, '').replace(/[. ]+$/, '');
+    return base.toLowerCase().endsWith('.py');
 }
 
 /** The Steps view opens only a `.py` on disk. An `untitled:` buffer named `x.py` is not a config file. */
@@ -45,4 +50,17 @@ export const BLOCKED_COMMANDS: ReadonlyMap<string, string> = new Map([
     ['file.compare', 'Compare with Each Other opens a text diff editor'],
     ['compare:first', 'Select for Compare is the first half of a text diff'],
     ['compare:second', 'Compare with Selected opens a text diff editor'],
+    // Spike S-2b: three commands only the Electron build registers. Each leaves the app for a route
+    // the guard cannot see. Underneath, the main-process guard (electron-app/analyst-main-guard.js)
+    // refuses the first two outright and closes Developer Tools as soon as a forged message opens it.
+    ['openWithSystemApp', 'Open With System Editor hands the file to the operating system, which opens a .py in Notepad or an IDE'],
+    ['revealFileInOS', 'Reveal in File Explorer opens Explorer on the file, whose own context menu offers Edit and Open with'],
+    ['theia.toggleDevTools', 'Developer Tools is a console in the page, with every service the guard wraps one call away'],
 ]);
+
+/**
+ * Open With entries the analyst build drops for a guarded URI: Theia's text editor ('default', and
+ * EditorWidgetFactory.ID, spelled out here to keep this file free of service imports), and the OS
+ * editor (Electron). A Theia upgrade that renames either id must update this set.
+ */
+export const TEXT_OPEN_WITH_HANDLERS: ReadonlySet<string> = new Set(['default', 'code-editor-opener', 'system-editor']);

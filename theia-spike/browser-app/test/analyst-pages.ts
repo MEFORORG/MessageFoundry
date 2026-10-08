@@ -41,6 +41,8 @@ export interface AnalystHook {
     createFile(u: string, text: string): Promise<string>;
     move(from: string, to: string): Promise<string>;
     exists(u: string): Promise<boolean>;
+    upload(dir: string, name: string, text: string): Promise<string>;
+    openViaOpenerWith(u: string, options: Record<string, unknown>): Promise<string>;
     progress(text: string): Promise<string>;
     activateSteps(u?: string): Promise<string>;
 }
@@ -136,8 +138,14 @@ export class AnalystPage {
         }
     }
 
-    /** The visible labels of an open Lumino menu. */
+    /**
+     * The visible labels of an open Lumino menu. It waits for the first label: a menu attaches before it
+     * renders its items, and on the Electron build an immediate read returned an empty list (S-2b), which
+     * every "no such entry" check would then pass for the wrong reason.
+     */
     async visibleMenuLabels(): Promise<string[]> {
-        return this.page.locator('.lm-Menu .lm-Menu-item:not(.lm-mod-hidden) .lm-Menu-itemLabel').allInnerTexts();
+        const labels = this.page.locator('.lm-Menu .lm-Menu-item:not(.lm-mod-hidden) .lm-Menu-itemLabel');
+        await labels.filter({ hasText: /\S/ }).first().waitFor({ state: 'visible', timeout: 10_000 }).catch(() => undefined);
+        return (await labels.allInnerTexts()).filter(l => l.trim());
     }
 }

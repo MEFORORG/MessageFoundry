@@ -11,7 +11,7 @@
     "target": "electron",
     "frontend": {
       "config": {
-        "applicationName": "MessageFoundry Steps (spike S-3)",
+        "applicationName": "MessageFoundry Steps (spike S-2b)",
         "preferences": {
           "security.workspace.trust.enabled": false
         }
@@ -24,6 +24,7 @@
     "@theia/editor": "1.76.0",
     "@theia/electron": "1.76.0",
     "@theia/filesystem": "1.76.0",
+    "@theia/messages": "1.76.0",
     "@theia/monaco": "1.76.0",
     "@theia/navigator": "1.76.0",
     "@theia/preferences": "1.76.0",
@@ -32,6 +33,7 @@
   "devDependencies": {
     "@playwright/test": "1.63.0",
     "@theia/cli": "1.76.0",
+    "@theia/playwright": "1.76.0",
     "electron": "42.8.1",
     "electron-builder": "26.15.3"
   },
@@ -39,6 +41,7 @@
     "build": "theia build --mode production",
     "start": "electron .",
     "package": "electron-builder --win nsis --publish never",
-    "test:smoke": "playwright test"
+    "test:smoke": "playwright test installed-smoke",
+    "test:walk": "playwright test analyst-routes-electron"
   }
 }

@@ -29,6 +29,9 @@
 'use strict';
 
 const { app, dialog } = require('electron');
+
+// Spike S-2b: the analyst build's main-process guard, installed before anything else runs.
+require('./analyst-main-guard').install();
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');

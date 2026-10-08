@@ -19,6 +19,7 @@ asar: false
 files:
   - package.json
   - launcher.js
+  - analyst-main-guard.js
   - runtime-pin.json
   - lib/**
   - "!**/node_modules/**"

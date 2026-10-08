@@ -8,7 +8,12 @@
 #   pwsh -NoProfile -File theia-spike\scripts\smoke-installed.ps1
 #Requires -Version 7
 [CmdletBinding()]
-param([string]$Installer)
+param(
+    [string]$Installer,
+    # The Playwright specs to run against the installed app. S-2b's walk runs here with
+    # -Specs installed-smoke, analyst-routes-electron; the S-3 verdict stays the smoke test alone.
+    [string[]]$Specs = @('installed-smoke')
+)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -58,7 +63,9 @@ try {
     try {
         $env:MF_S3_EXE = $exe
         $env:MF_S3_WORKSPACE = $workspace
-        npx playwright test
+        # `pwsh -File` hands "a,b" over as one string; split it so both calling forms work.
+        $specList = @($Specs | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+        npx playwright test @specList
         $testExit = $LASTEXITCODE
     } finally {
         Remove-Item Env:MF_S3_EXE, Env:MF_S3_WORKSPACE -ErrorAction SilentlyContinue

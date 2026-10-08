@@ -4,7 +4,12 @@
 // message shown while a Steps view is up goes into that view rather than a pop-up (FR-17).
 //
 // A rename or copy that turns another file into a `.py` is refused too, since that writes raw text
-// into a `.py` without the Steps view.
+// into a `.py` without the Steps view. So is an upload that lands a `.py` (spike S-2b): File > Upload
+// Files, or a drop from the operating system onto the navigator.
+//
+// The Electron build adds routes this module cannot close on its own (the OS editor, Explorer,
+// Developer Tools, native dialogs and menus). Their commands are blocked here, and
+// electron-app/analyst-main-guard.js refuses them again in the main process.
 //
 // It is a separate frontend module so a developer build can leave it out and keep the text editor.
 // It closes the text route at three layers, because no single one sees every caller:
@@ -60,14 +65,16 @@ import { MonacoEditorProvider } from '@theia/monaco/lib/browser/monaco-editor-pr
 import { WorkspaceService } from '@theia/workspace/lib/browser/workspace-service';
 import { FileService } from '@theia/filesystem/lib/browser/file-service';
 import { CopyFileOptions, FileStatWithMetadata, MoveFileOptions } from '@theia/filesystem/lib/common/files';
-import { BLOCKED_COMMANDS, isPythonUri, isStepsUri, textEditorRefusal } from './analyst-routes';
+import { FileUploadService } from '@theia/filesystem/lib/common/upload/file-upload';
+import { FileUploadServiceImpl } from '@theia/filesystem/lib/browser/upload/file-upload-service-impl';
+import { BLOCKED_COMMANDS, TEXT_OPEN_WITH_HANDLERS, isPythonUri, isStepsUri, textEditorRefusal } from './analyst-routes';
 import { StepsOpenHandler } from './steps-frontend-module';
 import { StepsWidget } from './steps-widget';
 
 /** One refused attempt, recorded for the S-2 walk. `layer` names the guard that caught it. */
 export interface AnalystRefusal {
     at: number;
-    layer: 'editor-manager' | 'open-with' | 'text-editor-provider' | 'command-registry' | 'file-operation';
+    layer: 'editor-manager' | 'open-with' | 'text-editor-provider' | 'command-registry' | 'file-operation' | 'upload';
     reason: string;
     target: string;
 }
@@ -125,7 +132,7 @@ export class AnalystEditorManager extends EditorManager {
 export class AnalystOpenWithService extends OpenWithService {
     override getHandlers(uri: URI): OpenWithHandler[] {
         const handlers = super.getHandlers(uri);
-        return textEditorRefusal(uri) ? handlers.filter(h => h.id !== 'default' && h.id !== EditorWidgetFactory.ID) : handlers;
+        return textEditorRefusal(uri) ? handlers.filter(h => !TEXT_OPEN_WITH_HANDLERS.has(h.id)) : handlers;
     }
 
     override async openWith(uri: URI): Promise<object | undefined> {
@@ -240,6 +247,35 @@ export class AnalystFileService extends FileService {
     }
 }
 
+/**
+ * Spike S-2b: an upload never lands a `.py`. Upload is the route behind File > Upload Files, a drop
+ * from the operating system onto the navigator, and a dropped folder, and it writes bytes through the
+ * backend's HTTP endpoint, so the FileService rebind above never sees it. Every source kind (a form,
+ * a DataTransfer, a folder entry) ends in indexFile, so that is where the refusal sits. A refused file
+ * is skipped, not thrown, so the rest of a mixed drop still uploads.
+ *
+ * LIMIT: this is a renderer-side check. The backend's upload endpoint writes to whatever URI is
+ * posted, so code running in the page can still post a `.py`. A shipped build guards the backend write.
+ */
+@injectable()
+export class AnalystFileUploadService extends FileUploadServiceImpl {
+    protected override async indexFile(targetUri: URI, file: File, context: FileUploadService.Context): Promise<void> {
+        const target = targetUri.resolve(file.name);
+        if (isPythonUri(target)) {
+            refuse('upload', 'upload to .py', target.path.base);
+            const text = 'A Router or Handler cannot be uploaded here. Ask a developer.';
+            const panel = StepsWidget.panelTarget();
+            if (panel) {
+                panel.showPanelMessage('info', text);
+            } else {
+                this.messageService.info(text);
+            }
+            return;
+        }
+        return super.indexFile(targetUri, file, context);
+    }
+}
+
 interface MenuItemRecord { path: string[]; commandId: string; label: string }
 
 /**
@@ -262,6 +298,7 @@ export class AnalystRoutesContribution implements FrontendApplicationContributio
     @inject(PreferenceService) protected readonly preferences!: PreferenceService;
     @inject(MessageClient) protected readonly messageClient!: MessageClient;
     @inject(FileService) protected readonly files!: FileService;
+    @inject(FileUploadService) protected readonly uploads!: FileUploadService;
 
     protected readonly createdEditors: string[] = [];
 
@@ -376,6 +413,14 @@ export class AnalystRoutesContribution implements FrontendApplicationContributio
             createFile: (u: string, text: string) => self.settle(this.files.create(new URI(u), text), 5000),
             move: (from: string, to: string) => self.settle(this.files.move(new URI(from), new URI(to)), 5000),
             exists: (u: string) => this.files.exists(new URI(u)),
+            // The Upload Files route: a form with one file, the shape the command's file input posts.
+            upload: (dir: string, name: string, text: string) => {
+                const form = new FormData();
+                form.append(FileUploadServiceImpl.UPLOAD, new File([text], name));
+                return self.settle(this.uploads.upload(new URI(dir), { source: form }), 10000);
+            },
+            openViaOpenerWith: (u: string, options: OpenerOptions) => self.settle(
+                this.openers.getOpener(new URI(u), options).then(h => h.open(new URI(u), options)), 5000),
             progress: (text: string) => self.settle(this.messages.showProgress({ text }).then(p => p.cancel()), 2000),
             // Workspace scope, so the setting lands in the test's temporary workspace copy, never the user's.
             setWorkspacePreference: (key: string, value: unknown) => self.settle(
@@ -401,6 +446,7 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
         return registry;
     });
     rebind(FileService).to(AnalystFileService).inSingletonScope();
+    rebind(FileUploadService).to(AnalystFileUploadService).inSingletonScope();
     StepsWidget.analystBuild = true;
     rebind(TextEditorProvider).toProvider(ctx => async (uri: URI) => {
         const reason = textEditorRefusal(uri);
