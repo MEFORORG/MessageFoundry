@@ -133,6 +133,15 @@ _SIBLING = _ROOT / "tests" / "test_lint_scope_parity.py"
 #: below can account for every declared hook.
 _COVERED_ELSEWHERE = frozenset({"ruff-format", "ruff-check", "bandit"})
 
+#: Hooks that run locally ONLY, each recorded with why it has no CI mirror. This is the "record
+#: deliberately why it has none" branch the exhaustiveness arm offers, not a quiet exemption: a
+#: replayed commit, a `--no-verify` commit or an unhooked clone lands what these hooks refuse.
+#:
+#: `new-glyph` (CLAUDE.md section 11) shipped local-only by brief. A CI step in a required job is a
+#: merge-gate change, which needs the owner. Until one is ruled on, nothing outside a hooked commit
+#: refuses a new glyph. When a mirror lands, move this id into _MIRRORS.
+_LOCAL_ONLY = frozenset({"new-glyph"})
+
 
 def _hook_ids() -> set[str]:
     cfg = yaml.safe_load(_PRECOMMIT.read_text(encoding="utf-8"))
@@ -223,13 +232,15 @@ def test_this_file_and_its_sibling_together_cover_every_hook() -> None:
     added, this reds and names it instead of letting it land unmirrored and unnoticed.
     """
     declared = _hook_ids()
-    accounted = set(_MIRRORS) | set(_COVERED_ELSEWHERE)
+    accounted = set(_MIRRORS) | set(_COVERED_ELSEWHERE) | set(_LOCAL_ONLY)
     missing = declared - accounted
     assert not missing, (
         f"hook(s) {sorted(missing)} are declared in .pre-commit-config.yaml and covered neither here "
         f"nor by tests/test_lint_scope_parity.py. Add the CI mirror and list it in _MIRRORS, or record "
-        f"deliberately why it has none."
+        f"deliberately why it has none in _LOCAL_ONLY."
     )
+    both = set(_LOCAL_ONLY) & (set(_MIRRORS) | set(_COVERED_ELSEWHERE))
+    assert not both, f"{sorted(both)} are recorded as local-only AND as mirrored; one of them lies"
     stale = accounted - declared
     assert not stale, f"{sorted(stale)} are named by these tests but no longer exist as hooks"
 

@@ -32,9 +32,10 @@ on a dated benchmark record that is exempt from the sweep and so stays non-zero.
 **It matches a literal needle rather than reusing either existing glyph class.** ``_BANNED`` in
 ``scripts/asvs/apply.py`` is the right instrument for a security record and the wrong one here: it
 also bans arrows, and the five operator docs alone carried 168 of those legitimately.
-``_GLYPH_RANGES`` in ``scripts/telemetry/rule_telemetry.py`` already excludes arrows for that
-reason, but it grades session events rather than files and still fires on the 3 U+23F3 in
-``CONNECTIONS.md``. Either would answer a question adjacent to the one asked (SDS-3.8).
+``GLYPH`` in ``scripts/quality/glyph_ranges.py``, which telemetry and the new-glyph hook share,
+already excludes arrows for that reason. It judges new lines and session events rather than one
+file's census, and it fires on far more than the warning sign: in ``CONNECTIONS.md`` alone it
+matches the check marks, the cross marks and the 3 U+23F3. Either would answer a question adjacent to the one asked (SDS-3.8).
 """
 
 from __future__ import annotations
