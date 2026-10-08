@@ -145,7 +145,7 @@ looked at.
 | `tomlkit` | parses operator-authored TOML from the config directory, which is inside the trust boundary |
 | `annotated-doc`, `annotated-types`, `typing-extensions`, `typing-inspection` | typing shims, no runtime input handling |
 | `tzdata` | timezone tables |
-| `opentelemetry-api` | the OpenTelemetry API that `fastapi` requires. With no SDK provider configured, every call into it is a no-op. It also holds the propagators that parse trace headers from a request, but `fastapi` calls them only once a tracer provider is configured, and the engine configures none. A change that configures one needs this row read again |
+| `opentelemetry-api` | the OpenTelemetry API that `fastapi` requires. With no SDK provider configured, every call into it is a no-op. It also holds the propagators that parse trace headers from a request. `fastapi` calls them only once a tracer provider is configured. The engine configures none, but `fastapi` 0.142 configures one itself when an `OTEL_EXPORTER_OTLP_*` endpoint is set in the environment and the SDK is installed, as the `otel` extra installs it. This row holds for the default install only. A change that configures a provider, or an install that sets that variable, needs this row read again |
 
 That is 12, and 23 plus 12 is 35. The arithmetic is stated so a reader can check the set is closed
 rather than trusting that it is.
