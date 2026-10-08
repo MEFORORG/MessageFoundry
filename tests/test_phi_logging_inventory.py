@@ -771,9 +771,11 @@ def test_every_inventory_row_has_the_headers_cell_count() -> None:
     section = _inventory_section()
     width = len(_header_cells(section))
     rows = _inventory_rows(section)
-    assert width >= 8 and len(rows) >= 17, f"read {width} header cells and {len(rows)} rows"
-    wrong = {_cells(row)[0].strip()[:30]: len(_cells(row)) for row in rows}
-    wrong = {name: count for name, count in wrong.items() if count != width}
+    assert width >= 8, f"read {width} header cells"
+    assert len(rows) >= 17, f"read {len(rows)} inventory rows"
+    wrong = {
+        _cells(row)[0].strip()[:30]: len(_cells(row)) for row in rows if len(_cells(row)) != width
+    }
     assert not wrong, f"inventory rows whose cell count is not the header's {width}: {wrong}"
 
 
