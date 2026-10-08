@@ -644,14 +644,6 @@ records those accesses (no double-audit). The web console's gates write no grant
 `authorize_ui_ws`, which every same-origin browser `/ws/stats` handshake passes through. BACKLOG #1197
 tracks that gap.
 
-An admin route refused because it targets the caller's own account writes `auth.self_target_refused`
-on both planes (vault BACKLOG #3260). That covers reset-password, reset-mfa, the federated-identity
-bind and unbind, disable and delete. The row names the actor, the route as `op`, and the caller's
-stored id. The guard compares that stored id, not the path's spelling, because the console passes
-the path through as plain text and a case-insensitive store finds the row from another case (vault
-BACKLOG #3259). The `404` that `DELETE /me/sessions/{session_id}` answers for another account's
-session still writes no row of its own.
-
 So on the console, an operator action's own audit row is its only record. **At least these operator
 mutations commit that row in the same transaction as the change they record (vault BACKLOG #2624):**
 message replay, dead-letter replay (inline and released), an inline purge, resend, edit-and-resubmit
@@ -663,6 +655,14 @@ audit chain on a first deployment. A config reload is not in this set: its graph
 is written, as [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
 describes.
 
+An admin route refused because it targets the caller's own account writes `auth.self_target_refused`
+on both planes (vault BACKLOG #3260). That covers reset-password, reset-mfa, the federated-identity
+bind and unbind, disable and delete. The row names the actor, the route as `op`, the caller's stored
+id and the caller's address. The guard refuses when the path's spelling OR the stored id matches the
+caller. The stored id is the half that matters on the console, which passes the path through as
+plain text, so a case-insensitive store finds the caller's row from another case (vault BACKLOG
+#3259). The `404` that `DELETE /me/sessions/{session_id}` answers for another account's session
+still writes no row of its own.
 That is the shipped default as of BACKLOG #1277 (2026-09-02). Until then the grant audit was **scoped**
 to the sensitive / state-changing / config / user-mgmt permission set (`_GRANT_AUDIT_PERMISSIONS` in
 `api/security.py`) on non-GET requests only, on the ground that console polling and the `/ws/stats` feed
