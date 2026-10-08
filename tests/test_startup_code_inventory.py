@@ -912,6 +912,7 @@ import json
 from messagefoundry.config.settings import (
     AlertsSettings, ApiSettings, AuthSettings, SecretRotationSettings, SecuritySettings,
     ApprovalsSettings,
+    CertMonitorSettings,
     StoreSettings, security_loosenings,
 )
 from messagefoundry.remotedebug import install_remote_debug_guard, remote_debug_posture
@@ -924,6 +925,7 @@ names = [name for name, _ in security_loosenings(
     cleartext_hops=(), expiry_relaxed_hops=(), hostname_unchecked_hops=(), query_credential_hops=(),
     unverified_db_hops=(), attested_hops=(), revocation_attested_hops=(), api=ApiSettings(),
     approvals=ApprovalsSettings(),
+    cert_monitor=CertMonitorSettings(),
     store_privilege=None, audit_chain_unkeyed=None, remote_debug=remote_debug_posture(),
     startup=startup,
 )]

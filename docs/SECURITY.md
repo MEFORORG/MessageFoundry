@@ -3900,7 +3900,8 @@ Users are notified of security-relevant changes to their account through **two**
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
-  alert and once per credential per engine process like it. `temporary_credential_expiring` goes to
+  alert and once per credential like it. The holder's reminder audit row is the once-only mark, so
+  a restart inside the warn window sends none of the three again (BACKLOG #2303). `temporary_credential_expiring` goes to
   the holder and states the deadline. `temporary_credential_expiring_issuer` goes to the administrator
   who issued the password and names the account and the deadline. The engine finds that
   administrator from the audit row the create or reset wrote. It skips the administrator's reminder,
@@ -4683,6 +4684,7 @@ still writes every lock row (ADR 0197 AC-10), and an Administrator reads them al
 |---|---|
 | `auth.account_locked` | a lock landed, which in a combined campaign under a live sign-in lock only a right candidate causes |
 | `auth.lock_notice` | the lock mail's throttle row, whose detail names the counter |
+| `auth.lock_notice_undelivered` | a lock mail the relay's queue dropped or the send lost, written only when a lock landed (BACKLOG #2383) |
 | `auth.login_locked` | a sign-in refused by a live lock, where a wrong candidate is refused as a plain wrong password |
 | `auth.admin_unlocked` (the whole row) | its detail records both lock expiries and both cycle counts |
 | `auth.mfa_failed` and `auth.webauthn_failed` with detail `{"reason": "locked"}`, and `auth.login_failed` with detail `{"provider": "ad", "reason": "locked"}` | the lock refusals of the factor and directory legs, which say a lock is live only in their detail |
@@ -4750,9 +4752,10 @@ and header are that route's.
 - **An undeliverable lock notice writes no per-event log line.** With no mail relay, no address on
   the account, a full queue or a failed send, the engine used to log a WARNING naming the
   `account_locked` notice and the username, once per lock. It logs nothing for a lock notice now.
-  Two of those cases are still recorded for administrators, on the `auth.lock_notice` row: no relay
-  (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`). The other two are a
-  residual, below. A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
+  An administrator can still read each case in the audit trail, with the gaps listed below. No
+  relay (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`) are on the
+  `auth.lock_notice` row. A full queue and a failed send are on an `auth.lock_notice_undelivered`
+  row (BACKLOG #2383). A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
   startup by the serve gate, except under `[security].enforcement = "warn"` with
   `[alerts].security_notifications_required = false`. Every other notice kind keeps its per-event
   line (BACKLOG #1139); none of them fires on a refused sign-in. The list is
@@ -4801,10 +4804,23 @@ process for each relay, by the security notifier when it is built rather than at
 a failed TLS key-exchange pin is logged once per process. **The cost of the tee line:** a sink that
 stays broken, or recovers and breaks again, is reported only by that first line.
 
-**Residual: a lost lock notice leaves no record** (BACKLOG #1139 deliverability, not the oracle).
-The `auth.lock_notice` row is written when the notice is handed to the relay, as `mailed: true`. So
-when the relay's queue is full, or the send fails, a lock notice is lost with no audit row and, now,
-no log line. The account holder is not told, and nothing says so.
+**A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
+when the notice is handed to the relay, as `mailed: true`. When the relay's queue is full, or the
+send fails, the engine writes one more row, with the notice's recipient as the actor. A lock
+notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
+`auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
+notice kind and the `reason`, `queue_full` or `send_failed`. An issuer's reminder also names the
+holder. The row never carries the address, the rest of the notice's detail, or the error. The
+source of record is `SecurityEventNotifier._record_undelivered` in
+`messagefoundry/pipeline/security_notify.py`. **Still open, at least:**
+
+- At shutdown the notifier drains its queue after the store has closed, so a send that fails then
+  is not recorded.
+- An offline command such as `provision-admin` wires no audit writer, so it records nothing.
+- Under a long overload only 64 queue-full records are written at a time, and drops past that are
+  not recorded.
+- A lock notice lost this way still leaves its `auth.lock_notice` row reading `mailed: true`, so
+  the throttle holds back the next one.
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
 engine waits about two seconds for pending notices. A notice still pending then is cut off, and may be

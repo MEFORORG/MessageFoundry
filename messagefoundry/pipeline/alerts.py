@@ -28,6 +28,7 @@ from messagefoundry.redaction import log_timestamp
 __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
+    "REMINDER_SECONDS",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -44,15 +45,23 @@ log = logging.getLogger(__name__)
 INTAKE_DEPTH_REASON = "staged_depth"
 INTAKE_DISK_REASON = "disk_floor"
 
+#: How often an emitter raises a condition that persists again: ``queue_buildup``, ``message_stall``
+#: and ``saturation`` in ``wiring_runner``, and ``intake_paused`` in ``intake_bound``. One value, so
+#: the emitters' cadences cannot drift apart (BACKLOG #2272). It does not set the notifier's own
+#: cooldown, ``[alerts].realert_seconds``, which an operator can raise; a cooldown longer than this
+#: throttles some reminders, by that operator's choice.
+REMINDER_SECONDS = 300.0
+
 
 def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
     """The one-line, PHI-free description of an intake pause both sinks show. It must stay true on a
     reminder raised inside the hysteresis band, where the measurement is back on the right side of
     the bound but the pause still holds, so it says what STARTED the pause. A depth read stops at
-    limit + 1, so the depth line quotes no value; the disk reading is exact, so its line does."""
+    limit + 1, so the depth line quotes no value; the disk reading is exact, so its line does. That
+    reading is the last one taken: a reminder raised while the probe fails carries it (#2272)."""
     if reason == INTAKE_DISK_REASON:
         return (
-            f"intake paused: free space fell below the {limit} MiB floor; {value} MiB free now "
+            f"intake paused: free space fell below the {limit} MiB floor; {value} MiB free at the last reading "
             f"({store_kind} store)"
         )
     return f"intake paused: the staged backlog went over {limit} messages ({store_kind} store)"

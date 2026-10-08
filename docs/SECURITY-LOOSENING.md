@@ -84,6 +84,8 @@ section reference.
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
+| | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
+| | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
@@ -103,12 +105,13 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
-`[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies` and
+`[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
+`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies` and
 `[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed here anyway, and all but `update_url_form` are reported, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
-`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[api]` sections; the per-connection
+`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot). At least one per-connection row is not passed in
 yet: `update_url_form`, whose entry names the two records it does have.
@@ -565,6 +568,48 @@ This section is kept rather than deleted, because the claim it used to make is t
   visible.
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart. Nothing
   about the key or the store changes either way; only whether the engine agrees to start.
+
+### `[cert_monitor].warn_days` or `[secret_rotation].warn_days` at `0`, or below its default — a credential reminder is off or late
+Named as `cert_monitor.warn_days` and `secret_rotation.warn_days` (ASVS 6.4.5, BACKLOG #2227). A
+value below the shipped default (`30` and `14` days) is named too, as the sign-in limits are when looser
+than theirs: a reminder one day ahead leaves no time to renew.
+- **What you lose:** the renewal reminder, or the time it gives. At `0`, the cert monitor raises no
+  `cert_expiry` alert for any certificate or CRL file it watches, and a service caller's client
+  certificate is never flagged as near expiry. At `0`, the periodic rotation reminder is off:
+  nothing reminds anyone ahead of a due date, or later while a secret runs overdue. Before this
+  entry, each showed only as a debug line from its runner.
+- **What you keep:** at least the start-time expiry checks, whatever `warn_days` is, and only where
+  they can run. Under `enforcement = enforce`, on a store that tracks its key, a store key past
+  `store_key_max_age_days + enforce_grace_days`, or of an age that cannot be determined, raises a
+  `secret_rotation` alert and refuses to start under `enforce_store_key_expiry`. An expired class
+  listed in `enforce_secret_expiry_classes` does the same. On a keyless or `vault_transit` store
+  these checks find nothing, so with `warn_days = 0` no `secret_rotation` alert of any kind fires
+  there. The `[alerts]` recipient gate counts each reminder separately, so turning one off does not
+  hide the others. A longer `check_interval_seconds` also delays a reminder, and it is not named.
+- **When acceptable:** an instance where something outside the engine tracks the same certificates or
+  secrets and reminds a person in time.
+- **Compensating controls:** that outside tracker, and a calendar entry per credential.
+- **Reversible:** yes. Set the default or more, or delete the line, and restart.
+
+### `[[alerts.rules]]` that send a credential reminder to no transport — the reminder is recorded but nobody is told
+Named as `alerts.rules`, with each rule's position, its `id`, and the reminder events it can match
+(ASVS 6.4.5, BACKLOG #2008).
+- **What you lose:** the notice. A rule whose `event_type` is `any`, `initial_credential_expiring`,
+  `cert_expiry` or `secret_rotation`, and which sets `mute = true` or `transports = []`, or has an
+  `escalate` tier with `transports = []`, sends a matching reminder to no transport. The `[alerts]`
+  recipient gate has already passed by then, so nothing else says so. The engine still records the
+  alert instance; it notifies nobody.
+- **What the check cannot see:** it reads each rule alone. A rule whose `connection` glob or `schedule`
+  never matches a reminder, or one an earlier rule always matches first, is still named. It errs toward
+  naming a rule that silences nothing.
+- **When acceptable:** a reminder already reaches people some other way, and the rule exists to stop a
+  duplicate.
+- **Compensating controls:** route the reminder events to a transport somebody reads, ahead of the
+  silencing rule, since the first matching rule wins. The entry stays listed even so, because the check
+  reads each rule alone.
+- **Reversible:** yes. Remove the rule or narrow its `event_type`, and restart. Giving it a transport
+  is not enough on its own: `mute = true` sends nothing whatever `transports` holds, and an
+  `escalate` tier with `transports = []` overrides the base rule once it is reached.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating
 > **Conditional**, like `allowed_client_networks`. With no directory to reconcile against, `0` is not a
@@ -1479,6 +1524,7 @@ chapter was not part of the verification above.
 | `[auth].phi_read_rate_limit_*`, `[auth].admin_write_*`, `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`, `[auth].oidc_callback_floor_exempt_amr` (PHI-read and admin-write pacing, second-step time floors and the federated floor's exemption) | V2 Validation and Business Logic (anti-automation, 2.4.1 / 2.4.2) | **SC-5** Denial-of-Service Protection | §164.312(a)(1) Access Control |
 | `[auth].max_sessions_per_user` (concurrent-session cap) | V7 Session Management (7.1.2) | **AC-10** Concurrent Session Control | §164.312(a)(1) Access Control |
 | `[auth].oidc_flow_cache_max` (pending federated sign-in bound) | V2 Validation and Business Logic (anti-automation) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
+| `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, `[[alerts.rules]]` (credential reminders off, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
 | `[api].trusted_proxies` (trust-every-peer forwarded header) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |

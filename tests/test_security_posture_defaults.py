@@ -32,6 +32,7 @@ from messagefoundry.config.settings import (
     ApiSettings,
     ApprovalsSettings,
     AuthSettings,
+    CertMonitorSettings,
     EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -73,6 +74,7 @@ def _pairs(
     revocation_hops: tuple[str, ...] = (),
     api: ApiSettings | None = None,
     approvals: ApprovalsSettings | None = None,
+    cert_monitor: CertMonitorSettings | None = None,
 ) -> list[tuple[str, str]]:
     """The loosening ``(switch, risk)`` pairs for a settings combination (defaults where not
     overridden)."""
@@ -91,6 +93,7 @@ def _pairs(
         revocation_attested_hops=revocation_hops,
         api=api or ApiSettings(),
         approvals=approvals or ApprovalsSettings(),
+        cert_monitor=cert_monitor or CertMonitorSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
@@ -144,6 +147,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -177,6 +181,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -207,6 +212,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -258,6 +264,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -400,6 +407,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -890,6 +898,141 @@ async def test_posture_route_reports_the_approval_dwell_the_app_was_built_with(
     assert "min_dwell_seconds" not in default and "expiry_hours" not in default
 
 
+# --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4) --------------------
+
+
+def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
+    """BACKLOG #2227: each warn_days = 0 turned its reminder off with only a runner debug line."""
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(warn_days=0),
+            rotation=SecretRotationSettings(warn_days=0),
+        )
+    )
+    assert "cert_expiry reminder" in named["cert_monitor.warn_days"]
+    assert "periodic secret-rotation reminder off" in named["secret_rotation.warn_days"]
+    # Not "however overdue": under enforce the start-time checks still alert, and the text says so.
+    assert "start-time expiry checks are the only source" in named["secret_rotation.warn_days"]
+    # The control: the shipped leads, and longer ones, name nothing.
+    for cert, rotation in ((30, 14), (90, 60)):
+        on = _names(
+            cert_monitor=CertMonitorSettings(warn_days=cert),
+            rotation=SecretRotationSettings(warn_days=rotation),
+        )
+        assert "cert_monitor.warn_days" not in on and "secret_rotation.warn_days" not in on
+
+
+def test_a_reminder_lead_below_its_default_is_a_named_loosening() -> None:
+    """As #1131 names a limit looser than its default: a one-day lead leaves no time to renew."""
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(warn_days=29),
+            rotation=SecretRotationSettings(warn_days=1),
+        )
+    )
+    assert "warn_days = 29, shorter than the default of 30" in named["cert_monitor.warn_days"]
+    assert "warn_days = 1, shorter than the default of 14" in named["secret_rotation.warn_days"]
+
+
+def _rules(*rules: dict[str, object]) -> AlertsSettings:
+    return AlertsSettings.model_validate({"rules": list(rules)})
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        pytest.param({"event_type": "any", "mute": True}, id="catch-all-mute"),
+        pytest.param({"event_type": "cert_expiry", "transports": []}, id="no-transport"),
+        pytest.param(
+            {"event_type": "secret_rotation", "escalate": [{"after_count": 2, "transports": []}]},
+            id="escalate-tier-to-nowhere",
+        ),
+        pytest.param(
+            {"event_type": "initial_credential_expiring", "connection": "a*", "mute": True},
+            id="glob-scoped-mute",
+        ),
+    ],
+)
+def test_a_rule_that_can_silence_a_reminder_is_a_named_loosening(rule: dict[str, object]) -> None:
+    """BACKLOG #2008 step 4: what ASVS 6.4.5's trigger 1 names. The rule decision sends a matching
+    reminder to no transport, after the recipient gate has passed, and nothing said so."""
+    named = dict(_pairs(alerts=_rules(rule)))
+    assert "rules[0]" in named["alerts.rules"]
+    assert "to no transport" in named["alerts.rules"]
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        pytest.param({"event_type": "connection_stopped", "mute": True}, id="other-event"),
+        pytest.param(
+            {"event_type": "any", "min_depth": 5, "mute": True}, id="depth-rule-never-matches"
+        ),
+        pytest.param({"event_type": "any", "transports": ["email"]}, id="routes-somewhere"),
+        pytest.param(
+            {"event_type": "cert_expiry", "escalate": [{"after_count": 2, "severity": "critical"}]},
+            id="tier-keeps-transports",
+        ),
+    ],
+)
+def test_a_rule_that_cannot_silence_a_reminder_is_not_named(rule: dict[str, object]) -> None:
+    assert "alerts.rules" not in _names(alerts=_rules(rule))
+
+
+def test_the_silencing_entry_names_each_rule_and_quotes_its_id() -> None:
+    """Every silencing rule is named, by position and by its id. The id is operator text, so it is
+    quoted with repr and a control character in it never reaches the log raw."""
+    named = dict(
+        _pairs(
+            alerts=_rules(
+                {"event_type": "connection_stopped", "mute": True},
+                {"event_type": "cert_expiry", "mute": True, "id": "quiet\ncerts"},
+                {"event_type": "any", "transports": []},
+            )
+        )
+    )
+    risk = named["alerts.rules"]
+    assert risk.startswith("2 [[alerts.rules]] entries")
+    assert "rules[1] (id 'quiet\\ncerts') matches cert_expiry, " in risk
+    assert "rules[2] matches initial_credential_expiring/cert_expiry/secret_rotation" in risk
+    assert "\n" not in risk
+    # The serve warning joins whole entries with "; ", so the entry must not use it inside itself.
+    assert "; " not in risk
+
+
+def test_the_reminder_event_types_are_rule_targetable_and_emitted() -> None:
+    """The silencing check names rules by these types, so each must be one a rule can match and
+    one the notifier actually emits. A renamed type would make the check under-report silently."""
+    from messagefoundry.config.settings import (
+        _ALERT_EVENT_TYPES,
+        CREDENTIAL_REMINDER_EVENT_TYPES,
+    )
+    from messagefoundry.pipeline import alert_sinks
+
+    source = Path(alert_sinks.__file__).read_text(encoding="utf-8")
+    for event_type in CREDENTIAL_REMINDER_EVENT_TYPES:
+        assert event_type in _ALERT_EVENT_TYPES, event_type
+        assert f'"type": "{event_type}"' in source, event_type
+
+
+async def test_posture_route_reports_the_cert_monitor_the_app_was_given(engine: Engine) -> None:
+    """The route reads [cert_monitor] off app.state, where the managed lifespan stashes it. The
+    default app is the control."""
+
+    async def switches(cert_monitor: CertMonitorSettings | None) -> list[str]:
+        app = create_app(engine, allow_no_auth=True)
+        if cert_monitor is not None:
+            app.state.cert_monitor_settings = cert_monitor
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            resp = await client.get("/security/posture")
+        assert resp.status_code == 200
+        return [entry["switch"] for entry in resp.json()["loosenings"]]
+
+    assert "cert_monitor.warn_days" in await switches(CertMonitorSettings(warn_days=0))
+    assert "cert_monitor.warn_days" not in await switches(None)
+
+
 def test_a_zero_flow_cache_cap_refuses_every_flow() -> None:
     """Ground the direction in FlowCache: 0 is stricter, which is why it is not named."""
     from messagefoundry.auth.oidc.flow import FlowCache, FlowCacheFullError, PendingFlow
@@ -1026,6 +1169,7 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             revocation_attested_hops=(),
             api=_proxied(*entries),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1058,6 +1202,7 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             revocation_attested_hops=(),
             api=_proxied("::/0", "::/0"),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1122,6 +1267,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=_terminated(ack=True),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1814,6 +1960,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1859,6 +2006,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1895,6 +2043,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             revocation_attested_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1928,6 +2077,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
