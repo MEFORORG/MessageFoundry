@@ -349,6 +349,28 @@ def test_a_lone_surrogate_is_spooled_as_its_escape_not_raised(spool_dir: Path) -
         spool.close()
 
 
+def test_non_ascii_text_costs_its_utf8_bytes_against_the_cap_and_round_trips(
+    spool_dir: Path,
+) -> None:
+    """BACKLOG #2279: the default JSON escaping wrote six bytes for each non-ASCII character, so a
+    spool of such text filled, and dropped, well before the cap said it should."""
+    # 2-, 3- and 4-byte characters, built by code point so this file stays ASCII.
+    line = f"Zo{chr(0xEB)} {chr(0x4E2D)} {chr(0x1F5C4)}"
+    plain = SpoolEntry(level="INFO", line="x")
+    entry = SpoolEntry(level="INFO", line=line)
+    assert len(entry.encode()) - len(plain.encode()) == len(line.encode("utf-8")) - 1
+    assert line in entry.encode().decode("utf-8")  # written as itself, not as escapes
+
+    spool = LogSpool(spool_dir, max_bytes=len(entry.encode()))  # room for exactly one, in UTF-8
+    spool.open()
+    try:
+        assert spool.append(entry)
+        assert spool.bytes_used == sum(p.stat().st_size for p in _segments(spool_dir))
+        assert _drain(spool) == [line]
+    finally:
+        spool.close()
+
+
 def test_a_segment_number_is_never_reused(spool_dir: Path) -> None:
     """A segment whose unlink failed stays on disk; reusing its number would collide on O_EXCL."""
     spool = LogSpool(spool_dir, max_bytes=100_000)

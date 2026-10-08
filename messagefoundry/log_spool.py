@@ -83,9 +83,15 @@ class SpoolEntry:
 
     def encode(self) -> bytes:
         payload = {"v": SPOOL_FORMAT_VERSION, "level": self.level, "line": self.line}
-        # ensure_ascii (the default): a lone surrogate in a record is written as its escape instead
-        # of raising UnicodeEncodeError on the listener thread, which would end that thread.
-        return (json.dumps(payload) + "\n").encode("ascii")
+        # Real UTF-8, so a non-ASCII character costs its own bytes against the cap and not a
+        # six-byte escape each (BACKLOG #2279). JSON still escapes every control character, so one
+        # entry stays on one physical line, and no UTF-8 sequence contains the newline byte.
+        try:
+            return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        except UnicodeEncodeError:
+            # A lone surrogate has no UTF-8 form. Write that one entry escaped, as before, instead
+            # of raising on the listener thread, which would end that thread. decode() reads both.
+            return (json.dumps(payload) + "\n").encode("ascii")
 
     @staticmethod
     def decode(raw: bytes) -> SpoolEntry | None:
