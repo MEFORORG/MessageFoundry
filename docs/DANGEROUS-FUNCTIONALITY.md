@@ -283,9 +283,11 @@ Two argument-list starts are not pinned that way:
   `shutil.which`, whose Windows search can include the working directory, so a planted `code.cmd`
   may win there too. What holds the argument: `open_repo` refuses a `repo_path` holding a character
   `cmd.exe` would re-read, at least `& | < > ^ % ! ( )`, a double quote, or a control character. It
-  refuses before the start and escapes nothing (BACKLOG #2327). `repo_path` must also name an
-  existing folder. Nothing pins which `code` command runs; what holds that is that the tray runs as
-  the signed-in user, who owns `tray.toml`.
+  refuses before the start and escapes nothing (BACKLOG #2327). The menu offers the start only
+  when `repo_path` names an existing folder on a local drive letter; `open_repo` does not check
+  that again. Nothing pins which `code` command runs, and `cmd.exe` re-reads that command's own
+  path too, which is not screened. What holds both is that the tray runs as the signed-in user, who
+  owns `tray.toml` and their own `PATH`.
 
 **What each child is handed.** A process started with no environment of its own gets a copy of the
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the

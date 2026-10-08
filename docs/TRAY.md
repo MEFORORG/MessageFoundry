@@ -138,10 +138,15 @@ So the tray refuses a `repo_path` holding any of `& | < > ^ % ! ( )`, a double q
 character. It shows "Repo not opened" and starts nothing. Rename the folder, or open it from VS
 Code itself.
 
-The menu item is also greyed out, marked "(unavailable)", unless `repo_path` starts with a local
-drive letter and that drive is not a mapped network drive. The tray judges this from the text of
-the path and the local drive list, and only then checks that the folder exists. So a `repo_path`
-on a share is never contacted. A local link that points at a share is the same gap as for the log.
+This refusal is wider than `cmd.exe` strictly needs. A folder under `C:\Program Files (x86)`, or
+one with `&` in its name, is refused even where the launch would have been harmless.
+
+The menu item is greyed out and marked "(unavailable)" in at least these cases: the `code` command
+was not found, the folder does not exist, `repo_path` does not start with a local drive letter, or
+that drive is a mapped network drive. The tray judges the last two from the text of the path and
+the local drive list, and only then checks that the folder exists. So the menu does not contact a
+`repo_path` that names a share. A local link that points at a share is not caught: the menu's
+check follows it, and VS Code then opens the share.
 
 ## Why the icon is named "MessageFoundry Tray"
 

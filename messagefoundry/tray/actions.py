@@ -98,8 +98,9 @@ def _is_local_drive_path(path: str) -> bool:
 def _on_a_local_drive(path: str, is_remote_drive: Callable[[str], bool]) -> bool:
     """True when ``path`` is on a local drive letter that is not a mapped network drive.
 
-    It judges the string and the local drive table only, so it sends nothing to any host. Every
-    file-system probe of a configured path runs behind it (BACKLOG #2086, #2332).
+    It judges the string and the local drive table only, so it sends nothing to any host. At
+    least :func:`open_log` and the two menu predicates run their probes behind it (BACKLOG #2086,
+    #2332). Other configured paths, such as ``engine_cacert``, do not pass through it.
     """
     return _is_local_drive_path(path) and not is_remote_drive(path)
 
@@ -111,7 +112,9 @@ def repo_open_available(
     is_dir: Callable[[str], bool] = _is_dir,
     is_remote_drive: Callable[[str], bool] = _is_remote_drive,
 ) -> bool:
-    """True iff Open-Repo can work: a real directory on a local drive and a resolved ``code`` CLI.
+    """True iff Open-Repo is offered: a real directory on a local drive and a resolved ``code`` CLI.
+
+    Offered is not the same as opened: :func:`open_repo` can still refuse the path, and says why.
 
     The menu calls this on every build, so the path is screened by :func:`_on_a_local_drive`
     before ``is_dir`` touches it. A UNC or mapped-drive ``repo_path`` is never probed.
@@ -206,6 +209,10 @@ def open_repo(
     is a batch file, ``code.cmd``, and Windows runs a batch file under ``cmd.exe``, which re-reads
     the argument text. Python's argv quoting does not escape ``&``, ``|`` or ``%``. So a path with
     any such character is refused before the launch, and nothing is escaped (BACKLOG #2327).
+
+    The refusal is wider than ``cmd.exe`` needs: it also refuses characters that are harmless in
+    some positions, such as parentheses or a quoted ``&``. Only ``repo_path`` is screened;
+    ``code_cmd`` is re-read by ``cmd.exe`` too and is trusted as resolved.
     """
     if _cmd_would_reread(repo_path):
         raise RepoPathRefused

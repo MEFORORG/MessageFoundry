@@ -212,7 +212,7 @@ def test_open_repo_runs_code_with_list_argv() -> None:
         "C:\\a\x00b",
         "C:\\a\x1ab",
         "C:\\a\x7fb",
-        "C:\\with space\\a&b",  # quoting the argument does not make it safe to hand over
+        "C:\\with space\\a&b",  # refused even though the space gets the argument quoted
     ],
 )
 def test_open_repo_refuses_a_path_cmd_would_reread(repo_path: str) -> None:
