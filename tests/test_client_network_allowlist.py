@@ -24,10 +24,12 @@ from typing import Any
 import httpx
 import pytest
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import HTTPConnection
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from messagefoundry.api import create_app
 from messagefoundry.api.client_networks import DENIAL_HEADER, DENIAL_MARKER, ClientNetworkMiddleware
+from messagefoundry.api.security import client_ip
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
@@ -476,14 +478,11 @@ async def test_unparseable_client_fails_closed(engine: Engine) -> None:
 async def test_an_odd_client_tuple_is_judged_not_crashed(
     engine: Engine, peer: tuple[Any, ...], denied: bool
 ) -> None:
-    """RED when: a scope["client"] that is not a (str, port) pair crashes the gate.
-
-    The gate reads through ``api.security.client_ip`` since BACKLOG #2289. starlette's
-    ``conn.client`` builds ``Address(*scope["client"])`` and raises ``TypeError`` on any shape but a
-    pair, so a client_ip built on it crashes here, and the transport re-raises that out of
-    ``c.get``. client_ip reads the first item, as the gate's own read did before: a ``str`` is
-    judged, so loopback stays allowed, and anything else is ``None``, which the gate refuses. The
-    allowed arms are the control: a gate that denied everything would pass the denied ones."""
+    """RED when: a scope["client"] that is not a (str, port) pair crashes the gate, or is judged by
+    anything but its first ``str`` item. The gate reads through ``api.security.client_ip`` since
+    BACKLOG #2289; its docstring says why it does not use starlette's ``conn.client``. A crash comes
+    out of ``c.get`` as the raised exception, since the transport re-raises it. The allowed arms are
+    the control: a gate that denied everything would pass the denied ones."""
     transport = httpx.ASGITransport(app=_app(engine, WARD), client=peer)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         resp = await c.get("/status")
@@ -512,10 +511,6 @@ def test_client_ip_reads_the_first_item_of_any_client_tuple(
     """RED when: ``client_ip`` stops answering the scope's first ``str`` item, or raises. It is the
     one client-address reader (BACKLOG #2289), so the gate, the limiters, the audit rows and the
     session anchor all take this value on both planes, with or without an allow-list."""
-    from starlette.requests import HTTPConnection
-
-    from messagefoundry.api.security import client_ip
-
     assert client_ip(HTTPConnection({"type": kind, "client": peer})) == expected
 
 

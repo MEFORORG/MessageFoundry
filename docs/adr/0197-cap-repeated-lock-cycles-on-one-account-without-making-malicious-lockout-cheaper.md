@@ -364,7 +364,7 @@ the owner unreachable to deny. It raises the cost of holding one owner out from 
 hour against one account, which nobody else notices, to a denial of every sign-in on the engine.
 That costs about 3,600 requests an hour from 6 or more addresses (10 each) where client addresses
 are real. **Behind an undeclared proxy or a NAT the owner shares, it costs only about 600 an hour:**
-`_client` (now `api.security.client_ip`, BACKLOG #2289) reads `request.client.host`, `[api].trusted_proxies` defaults to empty, so every caller
+`_client` (now `api.security.client_ip`, BACKLOG #2289) reads the ASGI peer address, `[api].trusted_proxies` defaults to empty, so every caller
 shares one address, and filling that one per-address bucket of 10 a minute refuses everyone. The
 limiter does not count refused attempts, so retrying for each freed slot costs the attacker
 nothing more. Residual 4 names this.

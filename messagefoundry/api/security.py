@@ -387,9 +387,9 @@ def client_ip(conn: HTTPConnection) -> str | None:
     :func:`authorize_ws` audits the same three authorization outcomes :func:`require` does, over a
     :class:`WebSocket` rather than a :class:`Request`, so a WS-only extractor is exactly the second
     notion this docstring forbids. Widening costs nothing structural: ``scope`` is ONE attribute of
-    starlette's ``HTTPConnection``, which both classes inherit unchanged and which carries the
-    ``client`` pair on both planes, so this is the same read on
-    both planes rather than two reads that agree today. The parameter is ``conn`` rather than
+    starlette's ``HTTPConnection``, which both classes inherit unchanged and which carries
+    ``scope["client"]`` on both planes, so this is the same read on both planes rather than two
+    reads that agree today. The parameter is ``conn`` rather than
     ``request`` for the same reason, matching ``_auth.session_cookie_name``. It is typed as that base
     class so the raw-ASGI network gate, which holds a scope and no Request, can pass
     ``HTTPConnection(scope)`` rather than read the scope a second way (BACKLOG #2289).
@@ -406,10 +406,13 @@ def client_ip(conn: HTTPConnection) -> str | None:
     so a header read here would let any caller spoof its way past that gate. uvicorn is the one
     ``X-Forwarded-For`` trust point (ADR 0151, D-1).
 
-    It reads ``scope["client"][0]`` itself, as the gate always has, rather than starlette's
-    ``conn.client``: that builds ``Address(*scope["client"])`` and raises ``TypeError`` on any shape
-    but a pair, which would turn the gate's 403 into a 500. A first item that is not a ``str`` answers
-    ``None``, the "no address" the gate refuses, so it fails closed with its 403."""
+    It reads ``scope["client"][0]`` itself, the item the gate judged before BACKLOG #2289, rather
+    than starlette's ``conn.client``: that builds ``Address(*scope["client"])`` and raises
+    ``TypeError`` on any shape but a pair, which would turn the gate's 403 into a 500. So a tuple or
+    list of any length is judged by its first item, and loopback in a four-item IPv6 tuple stays
+    allowed. A first item that is not a ``str``, or a client that is not a tuple or list, answers
+    ``None``, the "no address" the gate refuses with its 403. Before BACKLOG #2289 such a host
+    reached the gate as-is."""
     peer = conn.scope.get("client")
     host = peer[0] if isinstance(peer, (tuple, list)) and peer else None
     return host if isinstance(host, str) else None
