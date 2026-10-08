@@ -889,6 +889,9 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         #: Whether the last send hit a network error. :func:`forwarder_status` reads it. A deferred
         #: connect (BACKLOG #1966) starts out failing; the first good send clears it.
         self.send_failing = getattr(target, "startup_error", None) is not None
+        #: Sends that hit a network error, spooled or not. It tells a collector that is still
+        #: failing from one whose last failure is simply the last thing that happened.
+        self.send_failures = 0
 
     def handle(self, record: logging.LogRecord) -> None:
         deadline = self._drain_deadline
@@ -975,6 +978,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
                 )
             return True
         self.send_failing = bool(getattr(target, "send_failed", False))
+        if self.send_failing:
+            self.send_failures += 1
         return not self.send_failing
 
     def _spool_record(self, record: logging.LogRecord) -> bool:
@@ -1442,6 +1447,8 @@ class ForwarderStatus:
     start_failure: str = ""
     #: Whether the last send hit a network error. With a spool the records are kept meanwhile.
     send_failing: bool = False
+    #: Sends that hit a network error, whether or not a spool kept the record.
+    send_failures: int = 0
     #: Records waiting on the hand-off queue right now. A level, not a loss.
     queued: int = 0
     #: Records dropped because the hand-off queue was full.
@@ -1493,11 +1500,17 @@ def forwarder_status() -> ForwarderStatus:
     else:
         return ForwarderStatus(configured=configured, start_failure=start_failure)
     listener = handler._listener
+    thread = listener._thread
+    if thread is not None and not thread.is_alive():
+        # The listener thread ended without being stopped. The handler still queues, and
+        # nothing takes a record off the queue, so this forwarder sends nothing.
+        return ForwarderStatus(configured=True, start_failure=start_failure)
     spool = listener.spool
     return ForwarderStatus(
         configured=True,
         installed=True,
         send_failing=listener.send_failing,
+        send_failures=listener.send_failures,
         queued=handler._records.qsize(),
         queue_dropped=handler.dropped,
         unsent=listener.unsent,
