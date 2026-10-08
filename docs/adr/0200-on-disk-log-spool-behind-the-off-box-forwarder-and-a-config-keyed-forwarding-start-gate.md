@@ -139,3 +139,14 @@ question for the owner.
 **Still not caught, at least:** an alias that resolves to this host, and the fully qualified name
 on a host whose OS name is short. Both need a lookup. They stay with the collector-separation
 probe that #1199 names.
+
+**It can refuse a collector that is separate.** The address test asks the routing table, and the
+routing table calls an address local when it is bound on this host, even if another system
+answers on it. A virtual address bound on every node is the known case: a Kubernetes Service
+address under kube-proxy's IPVS mode, read from the node's own network namespace, or a
+direct-server-return address held on `lo`. This is reasoned, not measured. Naming the collector
+by DNS name passes, and the refusal text says so.
+
+**The Consequences line on start-time cost moved too.** It called the gate "a settings read". For
+an IP-literal collector it is now also one local socket call, measured at well under a
+millisecond on a Windows host. For a name it is one `gethostname` call.

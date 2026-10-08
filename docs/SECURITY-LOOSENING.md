@@ -618,16 +618,18 @@ This section is kept rather than deleted, because the claim it used to make is t
 ### `[auth].ad_connect_timeout` or `ad_receive_timeout` above `10` s **with `ad_enabled`** — a stalled directory call holds a thread longer
 > **Conditional** on `[auth].ad_enabled`, since nothing reads the timeouts with no directory (vault
 > BACKLOG #2567, ASVS 13.1.3). Each is named on its own once it is above `10` s. A shorter timeout
-> fails a stalled call sooner, which is stricter, and is not named. The load refuses `0`, a negative,
-> `inf`, `NaN` and anything above `3600`, so neither has an off value.
+> fails a stalled call sooner, which is stricter, and is not named. Neither has an off value: the
+> row in the table above gives what the load refuses.
 - **What you lose:** each directory call runs in a worker thread until the domain controller answers
-  or the timeout ends. That covers at least a sign-in, a step-up and a session recheck. With a longer
-  timeout, a controller that has stopped answering holds each thread longer. Fewer stalled calls are
-  then needed to tie up the thread pool that sign-in shares.
+  or a timeout ends. That covers at least a sign-in, a step-up and a session recheck. One call can
+  wait on several connects and reads, each bounded on its own. With a longer timeout, a controller
+  that has stopped answering holds each thread longer, so stalled calls tie up the thread pool that
+  sign-in shares for longer.
 - **When acceptable:** a directory reached over a slow link, where `10` s is measured to be too short
   for a healthy round trip.
-- **Compensating controls:** raise it only as far as the measured round trip needs. Keep the sign-in
-  rate limit on, since it bounds how many calls can start.
+- **Compensating controls:** none bounds how many calls stall at once. The sign-in rate limit paces
+  how many start per window, not how many are held, and a session recheck does not pass it. So
+  raise the timeout only as far as the measured round trip needs.
 - **Reversible:** yes, immediately — restore `10` (or delete the line) and restart.
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
@@ -672,8 +674,9 @@ This section is kept rather than deleted, because the claim it used to make is t
 > value at or stricter than the default is not reported. That includes a **negative** count, which
 > refuses *more* attempts, not fewer. A window that is not a number, or is infinite, does not load
 > (vault BACKLOG #2466): a `NaN` or `+inf` window never ages an attempt out, so once the count filled
-> the limiter would refuse every sign-in until a restart. The same holds for
-> `phi_read_rate_limit_window_seconds`.
+> the limiter would refuse every sign-in until a restart. A window above `86400` s (one day) does
+> not load either, since a huge finite one does the same in practice. Both rules hold for
+> `phi_read_rate_limit_window_seconds` and `admin_write_rate_limit_window_seconds` too.
 - **What you lose:** a password spray across many usernames never trips one account's lockout, and these
   limits are what slow it. With the per-address limit off, one client may try as fast as the all-clients
   limit allows. With the all-clients limit off, a spray spread across many addresses grows with the number

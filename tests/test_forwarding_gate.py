@@ -91,7 +91,11 @@ def test_the_gate_opens_no_connection_and_resolves_no_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Keyed on configuration, so a down collector cannot block a start through it. Any socket or
-    name lookup during the check fails the test."""
+    name lookup during the check fails the test.
+
+    This holds for a collector given BY NAME, which is what this test uses. An IP-literal collector
+    does open one unsent UDP socket for the own-address check; the test after the next section
+    holds that path to no resolver call and no connection."""
     settings = _verified(tmp_path)
 
     def _no_network(*args: Any, **kwargs: Any) -> Any:
@@ -270,6 +274,82 @@ def test_a_name_collector_never_opens_the_probe_socket(
     monkeypatch.setattr(socket, "gethostname", lambda: "eng1")
     assert forwarding_gate_refusal(_verified(tmp_path, host="siem.corp.test")) is None
     assert forwarding_gate_refusal(_verified(tmp_path, host="eng1")) is not None
+
+
+def test_an_address_collector_resolves_no_name_and_opens_no_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The IP-literal path with the REAL probe: it may make its one UDP socket, and nothing else.
+    192.0.2.10 is a documentation address no host holds, so the gate passes whether this machine
+    has a route to it or not. A resolver call or a stream connection fails the test."""
+
+    def _no_lookup(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the forwarding gate resolved a name or opened a connection")
+
+    made: list[int] = []
+    real_socket = socket.socket
+
+    def _udp_only(family: int, kind: int, *args: Any, **kwargs: Any) -> socket.socket:
+        made.append(kind)
+        return real_socket(family, kind, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "socket", _udp_only)
+    monkeypatch.setattr(socket, "create_connection", _no_lookup)
+    monkeypatch.setattr(socket, "getaddrinfo", _no_lookup)
+    monkeypatch.setattr(socket, "gethostbyname", _no_lookup)
+    monkeypatch.setattr(socket, "getfqdn", _no_lookup)
+    assert forwarding_gate_refusal(_verified(tmp_path, host="192.0.2.10")) is None
+    assert made == [socket.SOCK_DGRAM]
+
+
+def test_the_real_probe_reads_a_loopback_address_as_local() -> None:
+    """What the OS does, not what a fake says: the source address for 127.0.0.1 is 127.0.0.1 on
+    any host with a loopback interface, so this reads no runner-specific state."""
+    loopback = ipaddress.ip_address("127.0.0.1")
+    assert settings_module._local_source_address(loopback) == loopback
+
+
+@pytest.mark.parametrize("host", ["a\x00b", "fe80::1%\x00", "\udcff", "1234", "999.1.1.1", "[zz::"])
+def test_odd_host_text_never_crashes_the_gate(tmp_path: Path, host: str) -> None:
+    """``[logging].forward_host`` has no validator, so the gate meets whatever was configured. A
+    NUL or an undecodable byte raised out of the address helpers (review round 1, measured). The
+    gate must answer, and for text that is neither this host's name nor an address it passes."""
+    assert forwarding_gate_refusal(_verified(tmp_path, host=host)) is None
+
+
+def test_an_all_digit_os_name_is_compared_as_a_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``1234`` also parses as the IPv4 shorthand for 0.0.4.210. The name is compared first, so a
+    host really named ``1234`` is still recognised."""
+    _as_this_host(monkeypatch, names=("1234",), addresses=(_OWN_V4,))
+    assert forwarding_gate_refusal(_verified(tmp_path, host="1234")) is not None
+
+
+def test_an_ipv6_zone_keeps_its_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zone is an interface name, which is case-sensitive on Linux, so the probe must be asked
+    about ``%enP4p65s0`` and not a lowercased copy."""
+    asked: list[str] = []
+
+    def source(addr: Any) -> Any:
+        asked.append(str(addr))
+        return addr
+
+    monkeypatch.setattr(settings_module, "_own_host_names", lambda: frozenset())
+    monkeypatch.setattr(settings_module, "_local_source_address", source)
+    assert forwarding_gate_refusal(_verified(tmp_path, host="FE80::1%enP4p65s0")) is not None
+    assert asked == ["fe80::1%enP4p65s0"]
+
+
+def test_the_own_address_refusal_says_how_to_name_a_virtual_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The routing table calls a virtual address local when it is bound here, even if another
+    system answers on it. The refusal names the way out, and that way out does pass."""
+    _as_this_host(monkeypatch, names=("eng1",), addresses=(_OWN_V4,))
+    reason = forwarding_gate_refusal(_verified(tmp_path, host=_OWN_V4))
+    assert reason is not None and "name the collector by DNS name" in reason
+    assert forwarding_gate_refusal(_verified(tmp_path, host="siem.corp.test")) is None
 
 
 # --- the gate wired into serve ------------------------------------------------------------------

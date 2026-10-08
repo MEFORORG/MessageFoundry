@@ -2775,6 +2775,13 @@ EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 #: real directory round trip and far below the point where a socket timeout overflows.
 _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
+#: Upper bound for the three ``[auth]`` rate-limit windows (vault BACKLOG #2466). A window holds each
+#: counted attempt for its whole length, so one far longer than the process lives acts as a NaN one
+#: does: the count fills once and then refuses every later attempt. One day is a JUDGMENT with no
+#: measured anchor. It is 1440 times the sign-in default, and at the cap a filled count still
+#: refuses for up to a day, so a long window is a choice to make with care at any length.
+_RATE_WINDOW_MAX_SECONDS = 86400.0
+
 #: The widest ``[auth].oidc_issuer`` the engine loads, in UTF-16 units (BACKLOG #2331): the width of
 #: the narrowest issuer column a federated binding is stored in, SQL Server ``NVARCHAR(256)``.
 _OIDC_ISSUER_MAX = 256
@@ -3237,9 +3244,12 @@ class AuthSettings(_Section):
     login_rate_limit_global: int = 60  # max attempts across all clients per window
     # No nan/inf (vault BACKLOG #2466): the limiter prunes a hit once it is older than the window,
     # and no hit is ever older than a NaN or +inf one. The counts then fill once and never drain, so
-    # after login_rate_limit_global attempts every sign-in would be refused until a restart. -inf is
+    # after login_rate_limit_global attempts every sign-in would be refused until a restart. A huge
+    # finite window does the same in practice, so it is capped (_RATE_WINDOW_MAX_SECONDS). -inf is
     # refused with them; 0 and a finite negative still load, as the named off value above.
-    login_rate_limit_window_seconds: float = Field(default=60.0, allow_inf_nan=False)
+    login_rate_limit_window_seconds: float = Field(
+        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
 
     # Anti-automation on the authenticated PHI-read endpoints (WP-8, ASVS 2.4.1): a per-actor sliding
     # window over /messages, /messages/{id}, /dead-letters — bounds scripted PHI harvesting on top of
@@ -3249,8 +3259,10 @@ class AuthSettings(_Section):
     phi_read_rate_limit_per_actor: int = 120  # max PHI reads per user per window
     phi_read_rate_limit_global: int = 0  # max PHI reads across all users per window (0 = off)
     # No nan/inf, for the reason login_rate_limit_window_seconds gives: the count would fill once
-    # and then refuse every PHI read until a restart.
-    phi_read_rate_limit_window_seconds: float = Field(default=60.0, allow_inf_nan=False)
+    # and then refuse every PHI read until a restart. Capped for the same reason.
+    phi_read_rate_limit_window_seconds: float = Field(
+        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
 
     # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
     # sliding window folded into the step-up gate (require_step_up) for every NON-GET sensitive op —
@@ -3288,7 +3300,9 @@ class AuthSettings(_Section):
     )
     # gt=0 and no nan/inf: a zero window turns the floor off silently, and a nan one never prunes, so
     # every write after the twelfth would be refused for the life of the process.
-    admin_write_rate_limit_window_seconds: float = Field(default=15.0, gt=0, allow_inf_nan=False)
+    admin_write_rate_limit_window_seconds: float = Field(
+        default=15.0, gt=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
     # THE MINIMUM GAP BETWEEN TWO WRITES BY ONE ACTOR, AND IT IS PROVISIONAL TOO (BACKLOG #2301, ASVS
     # 2.4.2; owner ruling R7 of 2026-09-23). The count above admits its twelve writes back to back;
     # this refuses a write that lands sooner than this after the same actor's last admitted one. It
@@ -4141,7 +4155,7 @@ def _host_ip_literal(h: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | 
     except ValueError:
         try:
             return ipaddress.IPv4Address(_socket.inet_aton(h))
-        except OSError:
+        except (OSError, ValueError):  # ValueError: a NUL, or text the OS cannot encode
             return None
 
 
@@ -4177,7 +4191,7 @@ def _local_source_address(
             probe.connect((str(addr), 9))  # discard port; nothing is sent
             # A link-local answer carries its zone ("fe80::1%eth0"), which ip_address reads.
             return ipaddress.ip_address(probe.getsockname()[0])
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):  # TypeError: a NUL in an IPv6 zone
         return None
 
 
@@ -4195,11 +4209,22 @@ def _is_own_name_or_address(host: str) -> bool:
     **What it does not catch, at least:** a name that is not the OS host name but resolves to this
     host (an alias, or the fully qualified form on a host whose OS name is short), and an address
     held by this host that the routing table does not treat as local. Both need a lookup, and
-    ADR 0200 leaves the collector-separation probe to #1199's remainder."""
+    ADR 0200 leaves the collector-separation probe to #1199's remainder.
+
+    **Where it refuses a collector that IS separate:** an address the routing table treats as local
+    although another system answers on it. A virtual address bound on every node is the known
+    case: a Kubernetes Service address under kube-proxy's IPVS mode, read from the node's own
+    network namespace, or a direct-server-return address held on ``lo``. Reasoned, not measured.
+    Naming the collector by DNS name passes, since a name is compared with the OS name only; the
+    refusal text says so."""
     h = _bare_host(host)
-    addr = _host_ip_literal(h)
+    # The name first, so an all-digit OS name such as "1234" is not read as an address instead.
+    if h in _own_host_names():
+        return True
+    # Not lowercased: an IPv6 zone is an interface name, and those are case-sensitive on Linux.
+    addr = _host_ip_literal(host.strip().rstrip("."))
     if addr is None:
-        return h in _own_host_names()
+        return False
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
     source = _local_source_address(addr)
@@ -4244,7 +4269,8 @@ def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
     if _is_own_name_or_address(log.forward_host):
         return (
             f"[logging].forward_host {log.forward_host!r} is this host's own name or one of its "
-            "own addresses, which is this host and not a logically separate collector"
+            "own addresses, which is this host and not a logically separate collector (if it is "
+            "a virtual address that another system answers on, name the collector by DNS name)"
         )
     return None
 
@@ -7591,12 +7617,12 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 out.append(
                     (
                         field,
-                        # 15 significant digits, so a value just past the default never prints as it.
-                        f"{what} is {value:.15g} s, above the default of {default:g} s, so each "
-                        "directory call (a sign-in, a step-up or a session recheck) to a domain "
-                        "controller that has stopped answering holds a worker thread for up to "
-                        "that long before it fails -- fewer stalled calls are then needed to tie "
-                        "up the thread pool that sign-in shares",
+                        # repr round-trips, so a value one step past the default never prints as it.
+                        f"{what} is {value!r} s, above the default of {default:g} s, so a "
+                        "directory call (at least a sign-in, a step-up and a session recheck) to "
+                        "a domain controller that has stopped answering holds a worker thread "
+                        "longer before it fails -- stalled calls then tie up the thread pool that "
+                        "sign-in shares for longer",
                     )
                 )
     return out

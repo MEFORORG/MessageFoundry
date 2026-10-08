@@ -20,7 +20,10 @@ switch be added at an insecure value with nothing reporting it.
 from __future__ import annotations
 
 import ipaddress
+import math
+from collections.abc import Collection
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -242,11 +245,15 @@ def test_an_ad_timeout_above_its_default_is_a_named_loosening(field: str) -> Non
     """Each timeout is named alone, with its value and the default, at the load's ceiling and just
     past the default alike."""
     risks = dict(_pairs(auth=_ad(**{field: 3600.0})))
-    assert "3600 s, above the default of 10 s" in risks[field]
+    assert "3600.0 s, above the default of 10 s" in risks[field]
     assert "worker thread" in risks[field]
     assert [n for n in risks if n in _AD_TIMEOUTS] == [field]
-    # A value just past the default is named, and never printed as the default itself.
+    # A value just past the default is named, and never printed as the default itself. The second
+    # is the next float above 10.0, which 15 significant digits would print as "10".
     assert "is 10.0001 s" in dict(_pairs(auth=_ad(**{field: 10.0001})))[field]
+    next_up = math.nextafter(10.0, math.inf)
+    assert f"is {next_up!r} s" in dict(_pairs(auth=_ad(**{field: next_up})))[field]
+    assert repr(next_up) != "10.0"
 
 
 @pytest.mark.parametrize("field", _AD_TIMEOUTS)
@@ -611,11 +618,21 @@ def test_a_non_finite_window_from_the_environment_is_refused(field: str, text: s
 
 
 @pytest.mark.parametrize("field", _BARE_WINDOWS)
-@pytest.mark.parametrize("value", [0.0, -1.0, 1e-6, 3600.0])
+@pytest.mark.parametrize("value", [0.0, -1.0, 1e-6, 3600.0, 86400.0])
 def test_a_finite_window_still_loads(field: str, value: float) -> None:
-    """The control for the two refusals above: only non-finite values are refused. A window of 0 or
+    """The control for the refusals around it: a finite value up to the cap loads. A window of 0 or
     less stays the named off value it was."""
     assert getattr(AuthSettings(**{field: value}), field) == value  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", [*_BARE_WINDOWS, "admin_write_rate_limit_window_seconds"])
+@pytest.mark.parametrize("value", [math.nextafter(86400.0, math.inf), 1e12, 1e300])
+def test_a_window_past_one_day_is_refused_at_load(field: str, value: float) -> None:
+    """A huge finite window holds every counted attempt for longer than the process lives, which
+    is the NaN failure by another spelling. Review round 1 measured 1e12 loading unnamed."""
+    with pytest.raises(ValueError, match="less than or equal to 86400"):
+        AuthSettings(**{field: value})  # type: ignore[arg-type]
+    assert AuthSettings(**{field: 86400.0})  # type: ignore[arg-type]
 
 
 def test_an_unpruned_window_refuses_every_attempt_once_full(
@@ -2417,16 +2434,40 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         (StoreSettings, exempt_store, "store"),
         (AuthSettings, exempt_auth, "auth"),
     ):
-        for field, info in model.model_fields.items():
-            if field in exempt or not isinstance(info.default, bool):
-                continue
-            flipped = model(**{field: not info.default})  # type: ignore[arg-type]
-            kwargs = {"store": flipped} if section == "store" else {"auth": flipped}
-            assert field in _names(**kwargs), (  # type: ignore[arg-type]
-                f"[{section}].{field} at its insecure value ({not info.default}) is NOT named by "
-                "security_loosenings(). Add it to the registry, or add it to this test's exemption "
-                "set with the reason — silence is not an option."
-            )
+        unreported = _unreported_bools(model, exempt, section)
+        assert unreported == [], (
+            f"[{section}] bool(s) {unreported} at the non-default value are NOT named by "
+            "security_loosenings(). Add each to the registry, or add it to this test's exemption "
+            "set with the reason — silence is not an option."
+        )
+
+
+def _unreported_bools(model: type[Any], exempt: Collection[str], section: str) -> list[str]:
+    """The bools of ``model`` that, flipped alone from their default, are neither named by
+    ``security_loosenings()`` nor in ``exempt``. ``section`` is the :func:`_pairs` keyword the
+    model is passed as. Takes the model so a control can add a field to a subclass."""
+    return [
+        field
+        for field, info in model.model_fields.items()
+        if field not in exempt
+        and isinstance(info.default, bool)
+        and field not in _names(**{section: model(**{field: not info.default})})
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "section"), [(StoreSettings, "store"), (AuthSettings, "auth"), (ApiSettings, "api")]
+)
+def test_each_bool_floor_fires_on_an_unlisted_bool(model: type[Any], section: str) -> None:
+    """The control that makes an empty result mean something, for all three floors: a made-up bool
+    that the registry does not name and nobody exempted is the one field the floor returns. Every
+    real bool is exempted here, so the answer does not depend on which of them are reported."""
+
+    class _WithANewSwitch(model):  # type: ignore[misc]
+        made_up_allow_anonymous_stats: bool = False
+
+    real = {f for f, info in model.model_fields.items() if isinstance(info.default, bool)}
+    assert _unreported_bools(_WithANewSwitch, real, section) == ["made_up_allow_anonymous_stats"]
 
 
 #: ``[api]`` bools the floor below does not require, each with its reason (vault BACKLOG #2385).
@@ -2443,37 +2484,26 @@ _API_BOOLS_EXEMPT = {
 }
 
 
-def _unreported_api_bools(model: type[ApiSettings]) -> list[str]:
-    """The ``[api]`` bools of ``model`` that, flipped alone from their default, are neither named by
-    ``security_loosenings()`` nor exempt. Takes the model so the control below can add a field."""
-    return [
-        field
-        for field, info in model.model_fields.items()
-        if field not in _API_BOOLS_EXEMPT
-        and isinstance(info.default, bool)
-        and field not in _names(api=model(**{field: not info.default}))
-    ]
-
-
 def test_every_api_bool_is_reported_or_exempt() -> None:
     """The completeness floor over ``[api]`` (vault BACKLOG #2385).
 
     The two floors above reach ``[security]``, ``[store]`` and ``[auth]``. The registry takes ``api``
     too, and nothing looked at its bools, so a new one could ship at an insecure value unnamed."""
-    assert _unreported_api_bools(ApiSettings) == [], (
+    assert _unreported_bools(ApiSettings, _API_BOOLS_EXEMPT, "api") == [], (
         "an [api] bool at its non-default value is NOT named by security_loosenings(). Add it to "
         "the registry, or to _API_BOOLS_EXEMPT with the reason -- silence is not an option."
     )
 
 
-def test_the_api_floor_fires_on_an_unlisted_bool() -> None:
-    """The control that makes the empty list above mean something: a made-up ``[api]`` bool that the
-    registry does not name, and nobody exempted, is the one field the floor returns."""
+def test_the_api_floor_fires_with_its_real_exemptions() -> None:
+    """The same control as above, run against the real ``[api]`` exemption list, so an exemption
+    that swallowed every field would red here."""
 
     class _ApiWithANewSwitch(ApiSettings):
         made_up_allow_anonymous_stats: bool = False
 
-    assert _unreported_api_bools(_ApiWithANewSwitch) == ["made_up_allow_anonymous_stats"]
+    unreported = _unreported_bools(_ApiWithANewSwitch, _API_BOOLS_EXEMPT, "api")
+    assert unreported == ["made_up_allow_anonymous_stats"]
 
 
 def test_no_api_exemption_outlives_its_field() -> None:
@@ -2490,6 +2520,24 @@ def test_exposed_api_docs_are_a_named_loosening() -> None:
     risk = dict(_pairs(api=ApiSettings(expose_docs=True)))["expose_docs"]
     assert "/openapi.json" in risk
     assert "NO sign-in" in risk
+
+
+async def test_posture_route_reports_docs_an_embedder_turned_on(engine: Engine) -> None:
+    """The docs routes are built from ``create_app``'s own argument. An app built with it on and no
+    settings stashed serves them, so the posture route reads the app and not the [api] default."""
+
+    async def switches(**kwargs: bool) -> list[str]:
+        app = create_app(engine, allow_no_auth=True, **kwargs)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            served = (await client.get("/openapi.json")).status_code == 200
+            body = (await client.get("/security/posture")).json()
+        names = [entry["switch"] for entry in body["loosenings"]]
+        assert served is ("expose_docs" in names)  # the read-out matches what is served
+        return names
+
+    assert "expose_docs" in await switches(expose_docs=True)
+    assert "expose_docs" not in await switches()
 
 
 def test_the_backup_cleartext_flag_is_documented_as_not_yet_reported() -> None:
