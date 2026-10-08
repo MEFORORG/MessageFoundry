@@ -2935,11 +2935,6 @@ class Engine:
         if self._intake_monitor is not None:
             await self._intake_monitor.stop()
             self._intake_monitor = None
-            # An unpinned cluster node clears its intake alerts at stop (BACKLOG #2272). The clear is
-            # a background write, so give it a bounded chance to land before the store closes below.
-            drain = getattr(self._alert_sink, "drain_state", None)
-            if drain is not None:
-                await drain(_ALERT_STATE_DRAIN_SECONDS)
         # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
         # unused remainder of this process's reserved block and unhooks the refill signal, so anything
         # that encrypts after it runs is charged against no reservation with no checkpointer left to
@@ -2963,4 +2958,10 @@ class Engine:
             self._warm_pool_task.cancel()
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
+        # Clears raised on the way out are background writes: an unpinned cluster node's intake
+        # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
+        # to land before the store closes. Last, so it covers every stop step above.
+        drain = getattr(self._alert_sink, "drain_state", None)
+        if drain is not None:
+            await drain(_ALERT_STATE_DRAIN_SECONDS)
         await self.store.close()
