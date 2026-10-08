@@ -387,9 +387,66 @@ async def test_a_keyless_engine_with_an_opt_in_starts(
         security_enforcement=SecurityEnforcement.ENFORCE,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
-        await engine.start()
     try:
-        assert "does not fingerprint secrets" in caplog.text
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await engine.start()
+        _assert_the_line_says_nothing_alerts(engine, caplog.text)
     finally:
         await engine.stop()
+
+
+def _assert_the_line_says_nothing_alerts(engine: Engine, text: str) -> None:
+    """BACKLOG #2320: the line said those classes "only alert". On a store that fingerprints
+    nothing the reconcile stamps no non-DEK class, so the reminder runner tracks none and nothing
+    alerts. The runner's own secret list is the instrument; the log text is what is pinned."""
+    assert "does not fingerprint secrets" in text
+    assert "neither refuse nor alert" in text
+    assert "only alert" not in text
+    runner = engine._secret_rotation_runner
+    assert runner is not None
+    assert _AD not in {c.class_id for c in runner.run_once()}, "premise: the class is untracked"
+
+
+async def test_a_vault_transit_engine_with_an_opt_in_says_nothing_alerts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #2320, the second store kind the line names. A vault_transit store keys its audit
+    chain inside Transit and holds no fingerprint key, so it takes the same branch as keyless."""
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.base import open_store
+    from tests.test_crypto_transit import _use_fake
+
+    _use_fake(monkeypatch)
+    monkeypatch.setenv(_AD, "test-only-bind-password")
+    store = await open_store(
+        StoreSettings(path=str(tmp_path / "transit.db"), cipher_provider="vault_transit"),
+        create=True,
+        keyless_chain_refusal=None,
+    )
+    assert isinstance(store, MessageStore)
+    assert store.cipher().encrypts, "premise: an encrypting store, not a keyless one"
+    assert store.secret_rotation_fingerprint_key() is None, "premise: nothing is fingerprinted"
+    engine = Engine(
+        store,
+        secret_rotation_settings=SecretRotationSettings(enforce_secret_expiry_classes=[_AD]),
+        security_enforcement=SecurityEnforcement.ENFORCE,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await engine.start()
+        _assert_the_line_says_nothing_alerts(engine, caplog.text)
+    finally:
+        await engine.stop()
+
+
+def test_the_warn_mode_line_names_when_a_class_can_alert(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #2320, the sibling line: off enforce it said an expired class "only alerts", which
+    is false on a store that fingerprints nothing or with the reminder off."""
+    with caplog.at_level("WARNING", logger="messagefoundry.pipeline.secret_rotation"):
+        _enforce([_AD], {_AD: _stamp(_AD, _OLD)}, enforcement=SecurityEnforcement.WARN)
+    assert "does not refuse" in caplog.text
+    assert "not keyless or vault_transit" in caplog.text
+    assert "warn_days is above 0" in caplog.text

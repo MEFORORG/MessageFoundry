@@ -1369,7 +1369,7 @@ path, no git commit and no message content.
 | `email_subject_template` | str | _unset_ | optional **operator-editable** alert-email subject (#138, [ADR 0127](adr/0127-operator-editable-alert-email-templates-with-a-non-phi-variable-allowlist.md)). Unset (the default, with its two siblings) = the fixed subject + key/value body, byte-identical to before. When set it is a `{name}` template over a **closed non-PHI variable allow-list**, validated at config load and **fail-closed** — an unknown or message-derived reference raises rather than rendering |
 | `email_body_template` | str | _unset_ | the same, for the **plain-text** body. The plain-text part is **always** sent, even when an HTML alternative is configured |
 | `email_html_template` | str | _unset_ | the same, adding an **HTML alternative** part whose substituted *values* are HTML-escaped. Never HTML-only — it supplements `email_body_template`, it does not replace it |
-| `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start (exit 2)**. **The refuse/warn split is `[security].enforcement`, not the production tier:** the gate reads `enforcing` ([`__main__.py`](../messagefoundry/__main__.py)), which is `enforce` by default on **all three** built-in env names, and all three derive PHI ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — so `serve --env dev` and `--env staging` on shipped defaults with no `[alerts]` SMTP are refused exactly like `prod`, not warned. (Measured: `dev`/`staging`/`prod` all resolve `data_class=phi, enforcing=True, channel_ready=False`.) It downgrades to a warning only under `enforcement = warn`. **This gate is why `[alerts]` is not optional on a stock instance** — configure the SMTP transport, or set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). **The same gate also requires a reminder recipient (BACKLOG #2008, ASVS 6.4.5).** Host and sender are enough for the per-user notices, which are addressed to each account. The credential reminders (`initial_credential_expiring`, `cert_expiry`) go to the `[alerts]` notifier instead, and that is built only from `webhook_url`, or from `email_smtp_host` + `email_from` + at least one `email_to`. So when either reminder can fire (`[auth].initial_password_expiry_hours` or `[cert_monitor].warn_days` above `0`) and neither recipient is set, `serve` refuses under `enforce` and warns under `warn`. Setting this flag `false` waives that check too, with an audit line saying the reminders reach only the log. |
+| `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start (exit 2)**. **The refuse/warn split is `[security].enforcement`, not the production tier:** the gate reads `enforcing` ([`__main__.py`](../messagefoundry/__main__.py)), which is `enforce` by default on **all three** built-in env names, and all three derive PHI ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — so `serve --env dev` and `--env staging` on shipped defaults with no `[alerts]` SMTP are refused exactly like `prod`, not warned. (Measured: `dev`/`staging`/`prod` all resolve `data_class=phi, enforcing=True, channel_ready=False`.) It downgrades to a warning only under `enforcement = warn`. **This gate is why `[alerts]` is not optional on a stock instance** — configure the SMTP transport, or set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). **The same gate also requires a reminder recipient (BACKLOG #2008, ASVS 6.4.5).** Host and sender are enough for the per-user notices, which are addressed to each account. The credential reminders (`initial_credential_expiring`, `cert_expiry`, `secret_rotation`) go to the `[alerts]` notifier instead, and that is built only from `webhook_url`, or from `email_smtp_host` + `email_from` + at least one `email_to`. So when any reminder can fire (`[auth].initial_password_expiry_hours`, `[cert_monitor].warn_days` or `[secret_rotation].warn_days` above `0`; the last since BACKLOG #2227) and neither recipient is set, `serve` refuses under `enforce` and warns under `warn`. Setting this flag `false` waives that check too, with an audit line saying the reminders reach only the log. |
 | `realert_seconds` | num | 300 | suppress re-notifying the same (event, connection) more often than this (anti-spam for a flapping lane). A matching rule's `cooldown_seconds` overrides it. |
 | `rules` | list | `[]` | ordered `[[alerts.rules]]` table array — per-event severity, transport routing, thresholds, suppression, cooldown (see below). Empty = today's behaviour (every event → every transport at `warning`). |
 
@@ -1422,6 +1422,17 @@ transports = ["email"]
 connection = "OB_LOADTEST"
 transports = []   # suppress every event for this connection
 ```
+
+> **A rule that can send a credential reminder to no transport is named at every start** (BACKLOG
+> #2008, ASVS 6.4.5). That is a rule whose `event_type` is `any`, `initial_credential_expiring`,
+> `cert_expiry` or `secret_rotation`, with `mute = true`, `transports = []`, or an `escalate` tier
+> with `transports = []`. The serve-time loosening warning and `GET /security/posture` list it as
+> `alerts.rules`. The check reads each rule alone, so the last example above is named too: its
+> `connection` glob decides whether a reminder ever matches it, and the check does not try to tell.
+> An earlier rule that routes the reminders does not clear the entry either. The only way off the
+> list is a rule that cannot match a reminder event: one rule per non-reminder `event_type` you want
+> suppressed, in place of the one `any` rule. That is more rules, and the warning is the cost of the
+> shorter form.
 
 > A rule routing to a transport that isn't configured (e.g. `transports = ["email"]` with a webhook
 > but no SMTP settings) is rejected at startup, so a typo can't silently black-hole an alert.
@@ -1540,7 +1551,7 @@ window and alerts on every scan.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `warn_days` | int | 30 | alert when a served cert expires within this many days; **`0` disables** the monitor |
+| `warn_days` | int | 30 | alert when a served cert expires within this many days; **`0` disables** the monitor. `0`, or any value below `30`, is named as the security loosening `cert_monitor.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
 | `check_interval_seconds` | num | 43200 | rescan cadence (default 12h); the per-cert re-alert throttle is `[alerts].realert_seconds` |
 | `crl_max_reloads` | int | 10000 | how many replaced copies of one CRL file a running hop takes before it refuses the next and asks for a restart (BACKLOG #299). Must be above 0. The CRL reload reads it even when `warn_days` is `0`. The default outlasts a year of hourly CRLs (8,760). **What each held copy costs**, measured on CPython 3.14 / OpenSSL 3.5.7: about four times the CRL file's size plus about 1.5 KB of memory. Each handshake takes about 2 microseconds longer per copy held for its issuer. So 10,000 copies of a 1 KB CRL hold about 40 MB and add about 20 ms to each handshake. Lower it for a large CRL that is reissued often. |
 
@@ -1642,9 +1653,12 @@ refuses to start the engine, with an `enforced = true` alert. So does a listed c
 a keyed store with no recorded age, which means the rotation-meta reconcile failed. The error names each
 class, its age, the limit and the two ways out. Rotate the secret, and the next start detects the new
 value and resets its clock. Or remove the class from the list, and it goes back to alert-only. The list
-ships empty, so a class you do not list only alerts, as before. Under `enforcement = warn` the list does
+ships empty, so a class you do not list only alerts, as before. "Alert-only" holds while `warn_days` is
+above `0`; with `warn_days = 0` the periodic reminder is off and an unlisted class does not alert at all. Under `enforcement = warn` the list does
 nothing but log a warning. A keyless store, and a `vault_transit` store, fingerprint no secrets, so
-there the list refuses nothing and the engine logs a warning saying so.
+the engine tracks no non-DEK class there at all. On those stores the list refuses nothing, **and no
+non-DEK class raises a rotation alert either**, listed or not; the engine logs a warning saying so
+(BACKLOG #2320).
 
 Valid entries are `MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_ALERTS_EMAIL_PASSWORD`,
 `MEFOR_AUTH_OIDC_CLIENT_SECRET`, `MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY`,
@@ -1662,7 +1676,7 @@ tracked; set `warn_days = 0` to disable the reminder.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `warn_days` | int | 14 | alert when a tracked secret is due within this many days; **`0` disables** the reminder |
+| `warn_days` | int | 14 | alert when a tracked secret is due within this many days; **`0` disables** the reminder. `0`, or any value below `14`, is named as the security loosening `secret_rotation.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
 | `check_interval_seconds` | num | 86400 | rescan cadence (default 24h); the per-secret re-alert throttle is `[alerts].realert_seconds` |
 | `store_key_last_rotated` | str | — | ISO `YYYY-MM-DD` the store DEK was last rotated; **unset ⇒ the DEK is still tracked live-by-default** off a persisted first-seen stamp (this date is an override) |
 | `store_key_max_age_days` | int | 365 | rotate the store DEK within this many days of its effective last-rotated (the operator date if set, else the persisted stamp) |

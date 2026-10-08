@@ -2512,6 +2512,7 @@ def _serve(args: argparse.Namespace) -> int:
         revocation_attested_hops=(),
         api=settings.api,
         approvals=settings.approvals,
+        cert_monitor=settings.cert_monitor,
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
@@ -3742,18 +3743,22 @@ def _serve(args: argparse.Namespace) -> int:
             )
 
     # --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need a RECIPIENT, not just a relay ---
-    # The unclaimed-temporary-password reminder and the cert-expiry reminder go to the [alerts]
-    # notifier, and notifier_from_settings builds one only from a webhook_url, or from SMTP host +
-    # sender + at least one email_to. The per-user channel above needs no email_to (each notice is
-    # addressed to its account), so a config that passes it can still send every reminder to the log
+    # The unclaimed-temporary-password reminder, the cert-expiry reminder and the secret-rotation
+    # reminder go to the [alerts] notifier, and notifier_from_settings builds one only from a
+    # webhook_url, or from SMTP host + sender + at least one email_to. The per-user channel above
+    # needs no email_to (each notice is addressed to its account), so a config that passes it can still send every reminder to the log
     # alone. Same refuse/warn split and the same audited waiver as the channel gate, so an instance
     # that waived out-of-band notices in writing is not refused twice. The recipient test IS
     # configured_alert_transport_names, the no-build mirror of notifier_from_settings, so the two
     # cannot drift.
     from messagefoundry.pipeline.alert_sinks import configured_alert_transport_names
 
+    # BACKLOG #2227: the secret-rotation reminder counts too. Without it, a config that turned the
+    # other two off passed this gate silently while that reminder, still on, reached only the log.
     reminder_can_fire = (
-        settings.auth.initial_password_expiry_hours > 0 or settings.cert_monitor.warn_days > 0
+        settings.auth.initial_password_expiry_hours > 0
+        or settings.cert_monitor.warn_days > 0
+        or settings.secret_rotation.warn_days > 0
     )
     if reminder_can_fire and not configured_alert_transport_names(settings.alerts):
         if settings.alerts.security_notifications_required:
@@ -3762,7 +3767,8 @@ def _serve(args: argparse.Namespace) -> int:
                     "error: no [alerts] recipient is configured on a "
                     f"{'production ' if production else ''}PHI instance ({env_name!r}); "
                     "refusing to start — the credential reminders (an unclaimed temporary "
-                    "password nearing its deadline, a certificate nearing expiry) would reach "
+                    "password nearing its deadline, a certificate nearing expiry, a secret due "
+                    "for rotation) would reach "
                     "only the log (ASVS 6.4.5). Set [alerts].webhook_url, or email_to alongside "
                     "email_smtp_host + email_from; or, to accept reminders in the log only, set "
                     "[alerts].security_notifications_required=false (audited).",
@@ -3772,7 +3778,8 @@ def _serve(args: argparse.Namespace) -> int:
             print(
                 "warning: no [alerts] recipient is configured in a PHI-carrying environment "
                 f"({env_name!r}) — the credential reminders (an unclaimed temporary password, an "
-                "expiring certificate) reach only the log. Set [alerts].webhook_url, or email_to "
+                "expiring certificate, a secret due for rotation) reach only the log. Set "
+                "[alerts].webhook_url, or email_to "
                 "alongside email_smtp_host + email_from (ASVS 6.4.5).",
                 file=sys.stderr,
             )
@@ -9292,6 +9299,7 @@ def _security(args: argparse.Namespace) -> int:
         ApiSettings,
         ApprovalsSettings,
         AuthSettings,
+        CertMonitorSettings,
         SecretRotationSettings,
         SecuritySettings,
         StoreSettings,
@@ -9302,7 +9310,7 @@ def _security(args: argparse.Namespace) -> int:
     path = args.service_config
 
     # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api]/[approvals] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # [secret_rotation]/[api]/[approvals]/[cert_monitor] deviations (ADR 0148: one posture). Resolve those from the whole file so the
     # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
@@ -9317,6 +9325,8 @@ def _security(args: argparse.Namespace) -> int:
     _api = ApiSettings()
     # BACKLOG #2489: [approvals] carries the dual-control dwell and expiry. Same read, same marker.
     _approvals = ApprovalsSettings()
+    # BACKLOG #2227: [cert_monitor].warn_days = 0 turns the certificate reminder off. Same read and marker.
+    _cert_monitor = CertMonitorSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -9327,6 +9337,7 @@ def _security(args: argparse.Namespace) -> int:
             _rotation = _full.secret_rotation
             _api = _full.api
             _approvals = _full.approvals
+            _cert_monitor = _full.cert_monitor
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -9361,6 +9372,7 @@ def _security(args: argparse.Namespace) -> int:
                 revocation_attested_hops=(),
                 api=_api,
                 approvals=_approvals,
+                cert_monitor=_cert_monitor,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
@@ -9387,7 +9399,8 @@ def _security(args: argparse.Namespace) -> int:
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]); the "
+            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
+            "[cert_monitor]); the "
             "per-connection "
             "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
             "generic-ODBC database TLS, "

@@ -1139,10 +1139,16 @@ class Engine:
         if self.store.secret_rotation_fingerprint_key() is None:
             # Keyless, or `vault_transit`, where the DEK never enters the heap: no secret is
             # fingerprinted, so no class can carry an age and the opt-in cannot fire. Say so rather
-            # than let an operator believe the listed classes refuse.
+            # than let an operator believe the listed classes refuse. BACKLOG #2320: this line used
+            # to say those classes "only alert", but reconcile_rotation_meta stamps a non-DEK class
+            # only under a fingerprint key, so here no class has a stamp and the reminder runner
+            # never sees one. They do not alert either, and the line must say so.
             log.warning(
                 "[secret_rotation].enforce_secret_expiry_classes is set but this store does not "
-                "fingerprint secrets (keyless or vault_transit), so those classes only alert"
+                "fingerprint secrets (keyless, or vault_transit, which keeps the store key out of "
+                "this process). The engine tracks no rotation age for the non-DEK secret classes "
+                "here, so those classes neither refuse nor alert: no secret_rotation alert fires "
+                "for them on this store"
             )
             return frozenset()
         return frozenset(held_env_secret_values()) | frozenset(self._connector_secret_env_values())
