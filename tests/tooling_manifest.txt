@@ -26,6 +26,7 @@ tests/test_adr0071_crossing_count.py
 tests/test_adr_index_coverage.py
 tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
+tests/test_attribution_trailer_check.py
 tests/test_announce_wiring.py
 tests/test_asvs_anchor_provenance.py
 tests/test_asvs_anchor_report.py
@@ -142,6 +143,7 @@ tests/test_mypy_tests_scope.py
 tests/test_negative_controls.py
 tests/test_net_helper_signing_scope.py
 tests/test_new_dependency_check.py
+tests/test_new_glyph_check.py
 tests/test_nightly_notice.py
 tests/test_operator_docs_no_warning_sign.py
 tests/test_precompact_reprime_hook.py

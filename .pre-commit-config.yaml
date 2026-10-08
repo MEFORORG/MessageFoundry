@@ -231,6 +231,20 @@ repos:
         pass_filenames: true
         files: \.(py|ps1|sh|ts|js|go|md|toml|ya?ml|json|cfg|ini|txt)$
 
+      # NEW GLYPHS (CLAUDE.md section 11): refuse a commit whose ADDED lines carry a glyph or emoji.
+      # It reads the staged diff itself, so pass_filenames is FALSE and always_run is TRUE: the
+      # glyphs already in tracked files are BACKLOG #1265's migration, and judging whole files would
+      # hand that migration to whoever next edits one. The exempt paths mirror
+      # tests/test_operator_docs_no_warning_sign.py, and tests/test_new_glyph_check.py holds the two
+      # together. `pre-commit run --all-files` stages nothing, so there it passes having judged
+      # nothing; run `new_glyph_check.py --commit <rev>` to judge a commit that already exists.
+      - id: new-glyph
+        name: new glyph or emoji (net additions, staged diff)
+        entry: python scripts/quality/new_glyph_check.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
       # BACKLOG #1226. always_run with pass_filenames FALSE: the screen walks its own DEFAULT_SCOPE,
       # and handing it a changed-file list would silently narrow what it looked at while still
       # printing a confident total -- the shape this screen exists to catch, in its own wiring.
