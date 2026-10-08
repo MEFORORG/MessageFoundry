@@ -4442,6 +4442,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
         # events the stop also emits.
         "log_write_failed",
+        # BACKLOG #2612: the off-box log forwarder did not start, or is losing records. Keyed on the
+        # fixed label `forwarder`, which is not a connection, so it takes no control_action.
+        "log_forward_failed",
         # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
         # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
         "approval_stale_requester",

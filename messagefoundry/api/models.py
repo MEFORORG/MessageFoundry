@@ -1011,6 +1011,31 @@ class LogSinkInfo(BaseModel):
     rolled_aside: str | None = None  # where the broken file was renamed to
 
 
+class LogForwarderInfo(BaseModel):
+    """Health of the **off-box log forwarder** in THIS process (BACKLOG #2612).
+
+    The pull-side counterpart of the ``log_forward_failed`` alert, read from process memory, so it
+    still answers when the collector does not. ``state`` is ``healthy``, ``degraded`` (the last
+    send failed, the spool cannot be read, or a record was lost since this process started; the
+    last does not clear until a restart) or ``not_installed`` (a forwarder was configured and did
+    not start, so nothing leaves the host). Every count is since this process started. Under
+    engine shards each process has its own forwarder, and this is the one that answered.
+
+    **Counts and fixed words only**: never a record, a collector address or an error text."""
+
+    state: str  # "healthy" | "degraded" | "not_installed"
+    installed: bool
+    start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
+    send_failing: bool = False  # the last send hit a network error
+    lost: int = 0  # the four loss counts below, added up; a floor
+    queued: int = 0  # waiting on the hand-off queue now: a level, not a loss
+    queue_dropped: int = 0  # dropped because the hand-off queue was full
+    unsent: int = 0  # a network error cost them, with no spool to keep them
+    undeliverable: int = 0  # dropped for a send error that was not a network error
+    spool_dropped: int = 0  # the on-disk spool was full or refused the write
+    spool_read_errors: int = 0  # spool reads that failed; those records are held, not lost
+
+
 class LogLevelInfo(BaseModel):
     """Runtime log-verbosity state (BACKLOG #171, ADR 0130). ``level`` is the current effective root
     level; ``configured`` is the startup ``[logging].level`` baseline a restart returns to; ``levels`` is
@@ -1140,6 +1165,9 @@ class SystemStatus(BaseModel):
     # which the byte/free-space metering above deliberately does not answer. Empty when logging was not
     # configured through configure_logging (an embedding/test), so the existing payload is unchanged.
     log_sinks: list[LogSinkInfo] = []
+    # BACKLOG #2612: the off-box log forwarder's health. ``None`` when no forwarder is configured,
+    # so "not configured" and "configured but absent" cannot be confused.
+    log_forwarder: LogForwarderInfo | None = None
     # No-network version-update signal (#30, ADR 0026). Additive + ``None`` when [update_check] is
     # disabled or the runner hasn't produced a result yet, so the existing payload is unchanged when off.
     update: UpdateInfo | None = None

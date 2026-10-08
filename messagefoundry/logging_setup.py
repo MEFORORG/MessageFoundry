@@ -884,6 +884,10 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         self._reclaim_at = 0.0
         self._reclaim_delay = _SPOOL_RETRY_MIN
         self._reclaimed_at_stop = False
+        #: Records a network error cost with no spool to keep them (BACKLOG #2612). They are gone.
+        self.unsent = 0
+        #: Whether the last send hit a network error. :func:`forwarder_status` reads it.
+        self.send_failing = False
 
     def handle(self, record: logging.LogRecord) -> None:
         deadline = self._drain_deadline
@@ -893,7 +897,10 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             if past_deadline:
                 self.undrained += 1
                 return
-            super().handle(record)
+            if not self._send(record):
+                # No spool, so nothing keeps it. Counted, because the collector being down is
+                # otherwise silent here until the queue fills (BACKLOG #2612).
+                self.unsent += 1
             return
         if past_deadline:
             # Shutdown: no more network, but the record is kept for the next start.
@@ -966,7 +973,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
                     self.undeliverable,
                 )
             return True
-        return not getattr(target, "send_failed", False)
+        self.send_failing = bool(getattr(target, "send_failed", False))
+        return not self.send_failing
 
     def _spool_record(self, record: logging.LogRecord) -> bool:
         assert self.spool is not None
@@ -1323,6 +1331,8 @@ def _build_queued_forwarder(
     target.setFormatter(logging.Formatter("%(message)s"))
     records: queue.Queue[Any] = queue.Queue(maxsize=_FORWARD_QUEUE_MAXSIZE)
     listener = _ForwardQueueListener(records, target, spool=spool)
+    # A deferred connect (BACKLOG #1966) starts out failing; the first good send clears it.
+    listener.send_failing = getattr(target, "startup_error", None) is not None
     handler = _ForwardQueueHandler(records, listener)
     handler.setFormatter(_make_formatter(fmt))
     _install_phi_filters(handler)  # near side — see _ForwardQueueHandler for why that is the point
@@ -1394,6 +1404,96 @@ def _forward_targets(logger: logging.Logger) -> list[logging.Handler]:
         if isinstance(handler, _ForwardQueueHandler):
             targets.extend(handler.targets)
     return targets
+
+
+# --- forwarder health, for the alert and GET /status (BACKLOG #2612) ------------------------------
+
+#: What the last :func:`configure_logging` call was asked for, and how a failed start ended.
+#: Module state because the forwarder is process-wide, like the root logger it hangs on.
+_forward_configured = False
+_forward_start_failure = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ForwarderStatus:
+    """A point-in-time reading of the off-box log forwarder. Counts and fixed words only: never a
+    record, a host name or an exception text. Every count is since this process started.
+
+    One reading per process. Under engine shards each ``serve --shard`` process has its own
+    forwarder, so each reports its own."""
+
+    #: Whether ``[logging].forward_host`` asked for a forwarder at all.
+    configured: bool = False
+    #: Whether a forwarder is attached and accepting records.
+    installed: bool = False
+    #: Why a configured forwarder is not installed: ``"permanent"`` (a certificate that fails
+    #: verification or a name that does not resolve), ``"transient"`` (the collector did not answer
+    #: and there is no spool to wait behind), or ``""``.
+    start_failure: str = ""
+    #: Whether the last send hit a network error. With a spool the records are kept meanwhile.
+    send_failing: bool = False
+    #: Records waiting on the hand-off queue right now. A level, not a loss.
+    queued: int = 0
+    #: Records dropped because the hand-off queue was full.
+    queue_dropped: int = 0
+    #: Records a network error cost, with no spool to keep them.
+    unsent: int = 0
+    #: Records dropped for a send error that was not a network error.
+    undeliverable: int = 0
+    #: Records the on-disk spool refused: full, or the write failed.
+    spool_dropped: int = 0
+    #: Spool reads that failed for a reason other than a missing file. Held, not lost.
+    spool_read_errors: int = 0
+    #: Whether the last spool read failed that way.
+    spool_read_faulted: bool = False
+
+    @property
+    def lost(self) -> int:
+        """Records that will not reach the collector, as a floor."""
+        return self.queue_dropped + self.unsent + self.undeliverable + self.spool_dropped
+
+    @property
+    def state(self) -> str:
+        """``"off"``, ``"not_installed"``, ``"degraded"`` or ``"healthy"``.
+
+        ``degraded`` means the last send failed, the spool cannot be read, or a record was lost
+        since this process started. The last one does not clear until a restart: the records are
+        still missing at the collector."""
+        if not self.configured:
+            return "off"
+        if not self.installed:
+            return "not_installed"
+        if self.send_failing or self.spool_read_faulted or self.lost:
+            return "degraded"
+        return "healthy"
+
+
+def forwarder_status() -> ForwarderStatus:
+    """Read the forwarder's health from memory. It touches no socket and no disk, so it is safe on
+    the event loop and still answers when the collector does not.
+
+    The counters belong to other threads and are read without their locks. Each is one integer
+    that only goes up, so a reading is at worst one record behind."""
+    configured, start_failure = _forward_configured, _forward_start_failure
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, _ForwardQueueHandler) and handler._accepting:
+            break
+    else:
+        return ForwarderStatus(configured=configured, start_failure=start_failure)
+    listener = handler._listener
+    spool = listener.spool
+    return ForwarderStatus(
+        configured=True,
+        installed=True,
+        send_failing=listener.send_failing,
+        queued=handler._records.qsize(),
+        queue_dropped=handler.dropped,
+        unsent=listener.unsent,
+        undeliverable=listener.undeliverable,
+        spool_dropped=spool.dropped if spool is not None else 0,
+        spool_read_errors=spool.read_errors if spool is not None else 0,
+        spool_read_faulted=spool.read_faulted if spool is not None else False,
+    )
 
 
 def _resolve_level(level: str) -> int:
@@ -1504,6 +1604,8 @@ def configure_logging(
     set_active_guard(guard)
 
     forwarder_installed = False
+    global _forward_configured, _forward_start_failure
+    _forward_configured, _forward_start_failure = forward is not None, ""
     if forward is not None:
         spool = _open_forward_spool(forward)
         try:
@@ -1521,7 +1623,10 @@ def configure_logging(
                     )
             if not isinstance(exc, OSError):
                 raise
-            if is_permanent_connect_error(exc):
+            permanent = is_permanent_connect_error(exc)
+            # A fixed word, read by forwarder_status(): this is what the alert and /status carry.
+            _forward_start_failure = "permanent" if permanent else "transient"
+            if permanent:
                 # Never deferred, even with a spool: waiting cannot fix a bad certificate or name.
                 _log.error(
                     "off-box log forwarding to %s:%d (%s) failed permanently: %s; fix the collector "

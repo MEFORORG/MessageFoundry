@@ -872,6 +872,31 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 > longer a synthetic arm to fall into. To keep a plaintext off-box hop, either move to `forward_protocol = "tls"` or set
 > `forward_hop_attested` with a reason — an acknowledged escape, not a silent default.
 
+#### When the forwarder is absent or losing records
+
+A configured forwarder that does not start never stops the engine. The engine tells you two ways
+(BACKLOG #2612).
+
+- **The `log_forward_failed` alert.** Its `kind` is one of three fixed words. `not_installed`: the
+  forwarder did not start, so this process sends nothing off the host. It fires once per process.
+  `dropping`: records were lost since the last look. `spool_unreadable`: the on-disk spool could not
+  be read, so its records are held and not sent. The last two fire at most once every five minutes
+  while the count keeps rising. The engine checks every 30 seconds.
+- **`log_forwarder` on `GET /status`.** It is `null` when no forwarder is configured. Otherwise
+  `state` is `healthy`, `degraded` or `not_installed`, beside the counts: `lost`, `queued`,
+  `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped` and `spool_read_errors`. The web
+  console's status page shows the same reading, and its health indicator turns to warn.
+
+`degraded` means the last send failed, the spool cannot be read, or a record was lost since the
+process started. A loss keeps the state `degraded` until a restart, because the records are still
+missing at the collector. A collector that is down while a spool keeps the records is `degraded`
+with nothing lost, and raises no alert.
+
+Both carry counts and fixed words only: never a record, the collector's address or an error text.
+Every count is since the process started. Under engine shards each process has its own forwarder.
+The alert does not say which process raised it, and `GET /status` reports the process that
+answered.
+
 ### `[retention]`
 Enforced by the engine's retention/purge task ([pipeline/retention.py](../messagefoundry/pipeline/retention.py)).
 A purge **NULLs the PHI *body*** past its window while **keeping the message row** (counts,
@@ -1381,7 +1406,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
