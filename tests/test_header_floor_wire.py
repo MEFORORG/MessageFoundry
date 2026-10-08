@@ -752,3 +752,44 @@ def test_supervise_refuses_the_fleet_before_spawning_or_renewing(
     assert created == set(), f"supervise refused only after a side effect: {created}"
     err = capsys.readouterr().err
     assert "send_400_response method" in err and "refusing to start the fleet" in err, err
+
+
+# --- the startup self-test: a floor that builds but does not add its headers still refuses ------
+#
+# The structural refusals above knock out a hook's SHAPE. These leave every shape in place and stop
+# one hook working, which only the behavioural self-test (api/protocol_floor_selftest.py) can see.
+# test_serve_hands_uvicorn_the_floored_protocols is their control: the same fixture, nothing knocked
+# out, starts.
+
+
+def _cycle_500_hook_does_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(protocol_headers, "_floor_the_cycle_500", lambda cycle: None)
+
+
+def test_serve_refuses_to_start_when_a_built_floor_leaves_a_response_bare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _cycle_500_hook_does_nothing(monkeypatch)
+    rc, captured, created = _serve_captured(tmp_path, monkeypatch)
+    assert rc == 2
+    assert captured == {}, "uvicorn.run was reached"
+    assert created == set(), f"serve refused only after a side effect: {created}"
+    err = capsys.readouterr().err
+    assert "failed its startup self-test: the app-error 500 lacked" in err, err
+    assert "refusing to start." in err, err
+
+
+def test_supervise_refuses_the_fleet_when_a_built_floor_leaves_a_response_bare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _no_spawn(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("supervise spawned shards")
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", _no_spawn)
+    _cycle_500_hook_does_nothing(monkeypatch)
+    rc, _, created = _serve_captured(tmp_path, monkeypatch, command="supervise")
+    assert rc == 2
+    assert created == set(), f"supervise refused only after a side effect: {created}"
+    err = capsys.readouterr().err
+    assert "failed its startup self-test: the app-error 500 lacked" in err, err
+    assert "refusing to start the fleet" in err, err

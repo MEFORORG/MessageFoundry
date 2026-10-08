@@ -556,7 +556,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Why it is left out | Modules |
 |---|---|
 | It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
-| It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
+| It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py`, `api/protocol_floor_selftest.py` |
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py` |
