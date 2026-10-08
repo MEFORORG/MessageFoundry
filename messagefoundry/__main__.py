@@ -1941,6 +1941,14 @@ def _serve(args: argparse.Namespace) -> int:
         print(f"error: {detail}", file=sys.stderr)
         return 2
 
+    # BACKLOG #1120: the class uvicorn is handed when a cert-identity map is set. Measured here, as
+    # soon as the settings can say it is wanted, so this refusal too comes before the TLS mint.
+    shim_floored, shim_http = _client_cert_shim_or_refusal(
+        settings, floored_http, floored_ws, "start"
+    )
+    if not shim_floored:
+        return 2
+
     # The bundle root from BOTH sources (ADR 0050 §1 "the same merged value"): --project-root is already
     # written into cli["environments"]["base_dir"] above, so the MERGED settings.environments.base_dir
     # carries the CLI flag OR a file/env-set base_dir. Derive the effective root from it so a file-only
@@ -4301,16 +4309,17 @@ def _serve(args: argparse.Namespace) -> int:
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
         # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
         # and every non-mTLS bind keep the header-floored protocol without the shim.
-        if settings.api.tls_client_ca_file and settings.api.tls_client_cert_identities:
-            from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
-
-            # Stacked ON the floored protocol, never instead of it (BACKLOG #1120).
-            run_kwargs["http"] = client_cert_http_protocol_class(base=run_kwargs["http"])
+        # The shim was built ON the floored protocol, never instead of it, and passed the floor's
+        # self-test at the top of serve (BACKLOG #1120; _client_cert_shim_or_refusal). It is None
+        # when those two settings do not both ask for it.
+        if shim_http is not None:
+            run_kwargs["http"] = shim_http
 
     # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
     # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
     # serving lifespan, inside the loop uvicorn owns. Every other loop the CLI starts gets it from
-    # `last_resort.run_guarded` (BACKLOG #1789).
+    # `last_resort.run_guarded` (BACKLOG #1789), bar one: the protocol floor's self-test runs a
+    # private loop with its own handler, which logs no exception text.
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -4324,7 +4333,13 @@ def _protocol_floor_or_refusal(refusing_to: str) -> tuple[Any, Any] | None:
 
     BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py. Fail
     closed, no opt-out: a uvicorn that moved a hook the floor overrides would otherwise serve its own
-    400s and 500s without nosniff."""
+    400s and 500s without nosniff.
+
+    Two checks, and both refuse. The class build reads the shape of the hooks. The self-test then
+    drives the built classes' own 400, 500 and handshake answers in memory and reads the headers off
+    what they wrote, so a hook that kept its shape and stopped working is refused too, on whichever
+    uvicorn and websockets are installed (api/protocol_floor_selftest.py)."""
+    from messagefoundry.api.protocol_floor_selftest import selftest_protocol_floor
     from messagefoundry.api.protocol_headers import (
         ProtocolFloorUnavailable,
         floored_http_protocol_class,
@@ -4332,10 +4347,40 @@ def _protocol_floor_or_refusal(refusing_to: str) -> tuple[Any, Any] | None:
     )
 
     try:
-        return floored_http_protocol_class(), floored_ws_protocol_class()
+        floored_http, floored_ws = floored_http_protocol_class(), floored_ws_protocol_class()
+        selftest_protocol_floor(floored_http, floored_ws)
+        return floored_http, floored_ws
     except ProtocolFloorUnavailable as exc:
         print(f"error: {exc}; refusing to {refusing_to}.", file=sys.stderr)
         return None
+
+
+def _client_cert_shim_or_refusal(
+    settings: ServiceSettings, floored_http: Any, floored_ws: Any, refusing_to: str
+) -> tuple[bool, Any]:
+    """Build the client-certificate shim serve stacks on the floored HTTP class, and self-test it.
+
+    Returns ``(True, None)`` when the settings ask for no shim, ``(True, shim)`` when the shim
+    passed, and ``(False, None)`` after printing why it did not.
+
+    BACKLOG #1120: with a client CA and a cert-identity map both set (ADR 0083), the shim is the
+    class uvicorn serves, so the floor's self-test must drive it and not only the class beneath it.
+    Keyed on those two settings alone, so it can run before the TLS mint and in ``supervise``.
+    ``serve`` stacks the shim only when it also terminates TLS itself, so this may measure a shim
+    that is then not served. That errs toward refusing."""
+    if not (settings.api.tls_client_ca_file and settings.api.tls_client_cert_identities):
+        return True, None
+    from messagefoundry.api.protocol_floor_selftest import selftest_protocol_floor
+    from messagefoundry.api.protocol_headers import ProtocolFloorUnavailable
+    from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
+
+    shim = client_cert_http_protocol_class(base=floored_http)
+    try:
+        selftest_protocol_floor(shim, floored_ws)
+    except ProtocolFloorUnavailable as exc:
+        print(f"error: {exc}; refusing to {refusing_to}.", file=sys.stderr)
+        return False, None
+    return True, shim
 
 
 def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> Path:
@@ -4453,7 +4498,11 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.
-    if _protocol_floor_or_refusal("start the fleet") is None:
+    floor = _protocol_floor_or_refusal("start the fleet")
+    if floor is None:
+        return 2
+    # The same again for the client-certificate shim, when the settings ask each shard for one.
+    if not _client_cert_shim_or_refusal(settings, *floor, "start the fleet")[0]:
         return 2
 
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same

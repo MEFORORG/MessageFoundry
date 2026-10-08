@@ -1989,6 +1989,13 @@ _REMINDER_ISSUER_ACTION: Final = "auth.temporary_credential_expiring_issuer"
 #: current credential's is the newest, so a page this size is ample.
 _REMINDER_MARK_PAGE: Final = 50
 
+#: Vault BACKLOG #3260: the row an admin route writes when it refuses the caller's own account.
+#: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
+SELF_TARGET_REFUSED_ACTION: Final = "auth.self_target_refused"
+SelfTargetOp = Literal[
+    "password_reset", "mfa_reset", "federated_bind", "federated_unbind", "disable", "delete"
+]
+
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
         ACCOUNT_LOCKED: ACCOUNT_LOCKED_ACTION,
@@ -11795,6 +11802,27 @@ class AuthService:
             "auth.mfa_denied",
             actor=identity.username,
             detail=_json({"path": path}),
+            client=client,
+        )
+
+    async def audit_self_target_refused(
+        self, identity: Identity, *, op: SelfTargetOp, client: str | None
+    ) -> None:
+        """Audit an administrator route refused because it targets the caller's own account (vault
+        BACKLOG #3260, ASVS 16.3.2). ``op`` names the route.
+
+        The refusal is an authorization decision of its own. Before this row, the JSON plane kept
+        only the step-up gate's ``auth.permission_granted`` for the attempt, and the console plane
+        kept nothing. The API handlers write it, so a console call through the seam writes it too.
+
+        ``user_id`` is the caller's stored id, never the path's spelling, which on the console is
+        an unbounded caller string (``api.auth_routes._refuse_if_self`` says why the two differ).
+        ``client`` is required, not defaulted: both planes reach this from a request, and
+        :meth:`audit_permission_denied` says what a row that omits a known address costs."""
+        await self._audit(
+            SELF_TARGET_REFUSED_ACTION,
+            actor=identity.username,
+            detail=_json({"op": op, "user_id": identity.user_id}),
             client=client,
         )
 

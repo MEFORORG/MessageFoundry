@@ -189,12 +189,38 @@ export function securityEditorScript(token: string, fields: unknown): string {
     $('save').addEventListener('click', () => vscode.postMessage({ command: 'save', updates: collectUpdates() }));
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
+    // The JS type each FIELDS type arrives as. Types only: a negative or oversized int is a value
+    // range, which is a different requirement (webviewMessaging.ts, SHAPE_HELPERS).
+    const TYPE_OK = {
+      bool: mfBool,
+      int: mfInt,
+      string: mfStr,
+      tristate: (x) => x === null || mfBool(x),
+    };
+    // Every switch this form has, read the way render() and collectUpdates() read it. One the engine
+    // reported with the wrong type fails. null is a value only for a tristate: elsewhere it would
+    // render as "No" or as an empty number, and Save would write that as false or 0.
+    // A switch the engine did not report (undefined) passes, as it did before this check: the installed
+    // engine can be older than this form. setValue() still shows such a Yes/No as "No". That is not a
+    // type error, so it is not refused here. Keys with no FIELDS entry are never read, so never checked.
+    function fieldTypesOk(o) {
+      for (const f of FIELDS) {
+        const v = o[f.key];
+        if (v === undefined) { continue; }
+        // Own-property lookup, so a FIELDS type with no entry here fails closed and does not throw.
+        const ok = Object.prototype.hasOwnProperty.call(TYPE_OK, f.type) ? TYPE_OK[f.type] : null;
+        if (!ok || ok(v) !== true) { return false; }
+      }
+      return true;
+    }
+
     // One entry per message the host posts (at least securityEditor.ts). The state is ShowResult,
     // the JSON "security show" prints. That comes from the INSTALLED engine, which can be older or
     // newer than this extension, so the two fields the form renders from are required and the two
     // it does not read are typed only when present.
     const SHAPES = {
       state: (d) => mfObj(d.state) && mfObj(d.state.values) && mfObj(d.state.defaults) &&
+        fieldTypesOk(d.state.values) && fieldTypesOk(d.state.defaults) &&
         mfOpt(d.state.set, (s) => mfArrOf(s, mfStr)) &&
         mfOpt(d.state.loosenings, (ls) => mfArrOf(ls, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk))),
       error: (d) => mfStr(d.message),

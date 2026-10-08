@@ -468,6 +468,20 @@ const security: Receiver = {
       ["set is a string", variant(STATE_OK, (c) => (c.state.set = "require_mfa"))],
       ["a loosening has no risk", variant(STATE_OK, (c) => delete c.state.loosenings[0].risk)],
       ["loosenings is an object", variant(STATE_OK, (c) => (c.state.loosenings = c.state.loosenings[0]))],
+      // One per FIELDS type, on values and on defaults (BACKLOG #2447). Types only, never ranges.
+      ["a bool value is a string", variant(STATE_OK, (c) => (c.state.values.require_mfa = "false"))],
+      ["a bool value is null", variant(STATE_OK, (c) => (c.state.values.local_access_only = null))],
+      ["an int value is a string", variant(STATE_OK, (c) => (c.state.values.max_session_hours = "12"))],
+      ["an int value is fractional", variant(STATE_OK, (c) => (c.state.values.max_session_hours = 1.5))],
+      // null is not "absent": an empty number control reads back as 0, which here means keep forever.
+      ["an int value is null", variant(STATE_OK, (c) => (c.state.values.delete_message_bodies_after_days = null))],
+      ["a string value is null", variant(STATE_OK, (c) => (c.state.values.listen_address = null))],
+      ["a string value is a number", variant(STATE_OK, (c) => (c.state.values.listen_address = 127))],
+      ["a tristate value is a string", variant(STATE_OK, (c) => (c.state.values.production_instance = "true"))],
+      ["a bool default is a number", variant(STATE_OK, (c) => (c.state.defaults.require_mfa = 1))],
+      ["an int default is a string", variant(STATE_OK, (c) => (c.state.defaults.delete_message_bodies_after_days = "30"))],
+      ["a string default is an array", variant(STATE_OK, (c) => (c.state.defaults.listen_address = ["127.0.0.1"]))],
+      ["a tristate default is a number", variant(STATE_OK, (c) => (c.state.defaults.production_instance = 0))],
     ],
     error: badMessages(ERROR_OK),
   },
@@ -612,6 +626,26 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.strictEqual(save.disabled, true, "a discarded state turned Save on");
     p.deliver(STATE_OK);
     assert.strictEqual(save.disabled, false, "a well-formed state did not turn Save on");
+  });
+
+  test("Security Settings: a switch the engine does not report, and a key this form has no switch for, still render", () => {
+    // BACKLOG #2447. The per-key type check must not turn version skew into a blank panel: the
+    // INSTALLED engine can be older than this extension (a switch is absent) or newer (a key has no
+    // FIELDS entry). Both rendered before the check and both must render after it. This is also the
+    // control for the wrongly typed cases above, which change a key's TYPE rather than remove it.
+    for (const [why, change] of [
+      ["an absent int switch", (c: Payload) => { delete c.state.values.max_session_hours; delete c.state.defaults.max_session_hours; }],
+      ["an absent Yes/No switch", (c: Payload) => { delete c.state.values.serve_web_console; delete c.state.defaults.serve_web_console; }],
+      ["a switch with a value and no default", (c: Payload) => { delete c.state.defaults.listen_address; }],
+      ["an unknown key of another type", (c: Payload) => { c.state.values.a_future_switch = { nested: [1] }; c.state.defaults.a_future_switch = 7; }],
+      ["a tristate that is set", (c: Payload) => { c.state.values.production_instance = true; }],
+    ] as [string, (c: Payload) => void][]) {
+      const p = security.load();
+      p.deliver(variant(STATE_OK, change));
+      assert.deepStrictEqual(p.errors.map(String), [], `${why}: the page threw`);
+      assert.deepStrictEqual(p.warnings, [], `${why}: discarded`);
+      assert.strictEqual(p.window.document.getElementById("save").disabled, false, `${why}: did not render`);
+    }
   });
 
   test("Security Settings: every retention acknowledgement the engine reports has its own switch", () => {

@@ -176,6 +176,17 @@ function assertEachDiscarded(good: Payload, cases: [string, (p: Payload) => void
 
 const XSS = '<img src=x onerror="window.__pwned=1">';
 
+/**
+ * Leave a HOLE at index 0: the length is unchanged and the index is absent, which is not the same
+ * as holding undefined. Structured clone carries a hole across postMessage, and `every()` and `map()`
+ * both skip one, so a shape check written with `every()` passes the array (BACKLOG #2447).
+ */
+function hole(a: unknown[]): void {
+  assert.ok(a.length > 0, "the fixture array is empty, so there is no element to remove");
+  delete a[0];
+  assert.ok(!(0 in a), "no hole was made");
+}
+
 // ---- Fixtures, built by the host's own pure functions -------------------------------------------
 
 const MSG_A = "MSH|^~\\&|APP|FAC|RCV|RF|20200101010101||ADT^A01|C1|P|2.5\rPID|1||A123";
@@ -310,6 +321,8 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       ["a string truncated flag", (p) => (p.dump.truncated = "false")],
       ["a numeric ascii gutter", (p) => (p.dump.lines[0].ascii = 5)],
       ["lines not an array", (p) => (p.dump.lines = { 0: p.dump.lines[0] })],
+      ["a hole in lines", (p) => hole(p.dump.lines)],
+      ["a hole in a row's hex pairs", (p) => hole(p.dump.lines[0].hex)],
       ["a numeric source", (p) => (p.source = 5)],
       ["no dump", (p) => delete p.dump],
     ]);
@@ -370,6 +383,9 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       ["a string hasTiming", (p) => (p.detail.hasTiming = "yes")],
       ["no profile", (p) => delete p.detail.invocations[0].profile],
       ["invocations not an array", (p) => (p.detail.invocations = {})],
+      ["a hole in invocations", (p) => hole(p.detail.invocations)],
+      ["a hole in coverage lines", (p) => hole(p.detail.invocations[0].coverage.lines)],
+      ["a hole in profile lines", (p) => hole(p.detail.invocations[0].profile.lines)],
       ["a numeric source", (p) => (p.detail.source = 1)],
       ["no detail", (p) => delete p.detail],
     ]);
@@ -387,6 +403,7 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       ["a string total", (p) => (p.total = "1")],
       ["no total", (p) => delete p.total],
       ["results not an array", (p) => (p.results = { 0: p.results[0] })],
+      ["a hole in results", (p) => hole(p.results)],
       ["a string pass flag", (p) => (p.results[0].pass = "false")],
       ["a numeric case name", (p) => (p.results[0].name = 1)],
       ["a numeric disposition", (p) => (p.results[0].disposition = 1)],
@@ -409,6 +426,7 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       ["a negative case count", (p) => (p.items[0].cases = -1)],
       ["a numeric name", (p) => (p.items[0].name = 3)],
       ["items not an array", (p) => (p.items = "regress")],
+      ["a hole in items", (p) => hole(p.items)],
     ]);
   });
 
@@ -423,6 +441,9 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       ["a string changed flag", (p) => (p.diff.before[0].fields[0].c = "true")],
       ["a string seg flag", (p) => (p.diff.after[0].seg = "yes")],
       ["after not an array", (p) => (p.diff.after = {})],
+      ["a hole in before", (p) => hole(p.diff.before)],
+      ["a hole in after", (p) => hole(p.diff.after)],
+      ["a hole in a cell's fields", (p) => hole(p.diff.before[0].fields)],
       ["no diff", (p) => delete p.diff],
       ["a numeric destination", (p) => (p.to = 1)],
     ]);
@@ -599,6 +620,8 @@ suite("Test Bench webview — a collection run reveals values one case at a time
       ["a numeric before value", (p) => (p.deliveries[0].differences[0].before = 5)],
       ["a numeric error", (p) => (p.error = 5)],
       ["deliveries not an array", (p) => (p.deliveries = null)],
+      ["a hole in deliveries", (p) => hole(p.deliveries)],
+      ["a hole in a delivery's differences", (p) => hole(p.deliveries[0].differences)],
       ["a string case index", (p) => (p.index = "0")],
       ["a string run id", (p) => (p.run = String(RUN_ID))],
       ["no run id", (p) => delete p.run],
