@@ -7,7 +7,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BASELINE_BYPASS_RECORD, writeStamped } from "./checksLog";
+import { logChecks, showChecks } from "./checksChannel";
+import { BASELINE_BYPASS_RECORD } from "./checksLog";
 import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 import { openChannel, postToWebview } from "./webviewMessaging";
@@ -65,20 +66,6 @@ exec "$PY" -m messagefoundry check --config __CONFIG_DIR__ --messages __MESSAGES
 `;
 
 const DISMISS_KEY = "messagefoundry.scPromptDismissed";
-
-// A plain channel on purpose: the editor stamps nothing on it, so `log` below is the ONLY writer and
-// it stamps every line in UTC (vault BACKLOG #2349, #2353). Never call `appendLine` on it directly;
-// source-control-log.test.ts fails on a write that goes around `log`.
-let channel: vscode.OutputChannel | undefined;
-function out(): vscode.OutputChannel {
-  channel ??= vscode.window.createOutputChannel("MessageFoundry Checks");
-  return channel;
-}
-
-/** Write to the Checks channel. Each line of `text` gets its own UTC time stamp. */
-function log(text: string): void {
-  writeStamped(out(), text);
-}
 
 // Setup writes a commit hook that runs the folder's own `.venv` interpreter on every later commit,
 // and runs git inside the folder. That is the workspace-supplied-interpreter hazard cli.ts refuses in
@@ -195,9 +182,9 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   await maybeAddRemote(bin, ws);
   await maybeFirstCommit(bin, ws);
 
-  log("Set Up Version Control & Checks:");
+  logChecks("Set Up Version Control & Checks:");
   for (const n of notes) {
-    log(`  • ${n}`);
+    logChecks(`  • ${n}`);
   }
   void vscode.window.showInformationMessage("MessageFoundry: version control & checks are set up.");
 }
@@ -530,7 +517,7 @@ function renderRepoStorageHtml(webview: vscode.Webview, current: string): string
 function logResult(label: string, res: { stdout: string; stderr: string }): void {
   for (const part of [label, res.stdout.trim(), res.stderr.trim()]) {
     if (part) {
-      log(part);
+      logChecks(part);
     }
   }
 }
@@ -552,7 +539,7 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   }
   await git(bin, ["add", "-A"], ws);
 
-  log("--- pre-flight: messagefoundry check ---");
+  logChecks("--- pre-flight: messagefoundry check ---");
   const chk = await run(["check", "--config", configDir(), "--messages", messageSetsDir()], ws);
   logResult("", chk);
 
@@ -564,7 +551,7 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
         "MessageFoundry: baseline committed — all required checks passed. ✓",
       );
     } else {
-      out().show();
+      showChecks();
       void vscode.window.showWarningMessage(
         "MessageFoundry: the commit hook reported an issue — see the 'MessageFoundry Checks' output.",
       );
@@ -574,7 +561,7 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
 
   // A required check failed. Offer the baseline anyway (fix-forward) — the seed commit is the only one
   // exempted; every commit after it runs the hook.
-  out().show();
+  showChecks();
   const choice = await vscode.window.showWarningMessage(
     "A required check hasn't passed yet. You can still commit this as your baseline snapshot — the checks run on every commit after it, so you can fix the flagged items next. Details are in the 'MessageFoundry Checks' output.",
     "Commit baseline anyway",
@@ -583,7 +570,7 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   );
   if (choice === "Commit baseline anyway") {
     // Logged before git runs: the stamped line is the timed record of the bypass itself.
-    log(BASELINE_BYPASS_RECORD);
+    logChecks(BASELINE_BYPASS_RECORD);
     const res = await git(
       bin,
       ["commit", "-m", "Initial commit (MessageFoundry checks enabled)", "--no-verify"],
@@ -598,6 +585,6 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
       void vscode.window.showErrorMessage(`MessageFoundry: commit failed — ${res.stderr.trim()}`);
     }
   } else if (choice === "Show details") {
-    out().show();
+    showChecks();
   }
 }

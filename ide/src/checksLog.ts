@@ -2,33 +2,26 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Time stamps for the "MessageFoundry Checks" output channel (vault BACKLOG #2349, #2353).
 //
-// That channel is a PLAIN output channel, so the editor stamps nothing on it. Every line written to
-// it goes through `writeStamped`, which puts an ISO 8601 UTC instant at the front of each line. A
+// That channel is a PLAIN output channel, so the editor stamps nothing on it. checksChannel.ts owns
+// it and writes every line through `writeStamped`, which puts an ISO 8601 UTC instant at the front. A
 // multi-line block, such as the output of `messagefoundry check`, is split first so that no line is
 // left without one.
 //
 // No `vscode` import: the unit tests drive this with a fixed clock and no Extension Host.
 
-/** The one method of `vscode.OutputChannel` this module needs. */
-export interface LineSink {
-  appendLine(line: string): void;
-}
-
-export type Clock = () => Date;
-
-/** Each line of `text`, prefixed with `now` as ISO 8601 UTC (`2026-01-02T03:04:05.678Z`).
+/** Write `text` to `sink`, each line prefixed with the clock's instant as ISO 8601 UTC
+ *  (`2026-01-02T03:04:05.678Z`).
  *
  *  One instant covers the whole block: it is when the block was written, and the lines of one
  *  subprocess result have no separate times of their own to report. */
-export function stampLines(text: string, now: Date): string[] {
-  const stamp = now.toISOString();
-  return text.split(/\r\n|\r|\n/).map((line) => (line === "" ? stamp : `${stamp} ${line}`));
-}
-
-/** Write `text` to the Checks channel, one stamped line per line of text. */
-export function writeStamped(sink: LineSink, text: string, clock: Clock = () => new Date()): void {
-  for (const line of stampLines(text, clock())) {
-    sink.appendLine(line);
+export function writeStamped(
+  sink: { appendLine(line: string): void },
+  text: string,
+  clock: () => Date = () => new Date(),
+): void {
+  const stamp = clock().toISOString();
+  for (const line of text.split(/\r\n|\r|\n/)) {
+    sink.appendLine(line === "" ? stamp : `${stamp} ${line}`);
   }
 }
 
