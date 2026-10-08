@@ -1494,6 +1494,10 @@ An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-r
 `aioodbc`, via the `[sqlserver]` extra (`pip install 'messagefoundry[sqlserver]'`), **lazily imported**
 (SQLite-only installs unaffected). It has **two dialects** (#66):
 
+**Host precondition for the `sqlserver` dialect and `db_lookup`:** the engine cannot set TLS cipher
+suites on an ODBC hop, so the operator sets the host cipher policy. The step is stated once, in
+[`DEPLOY-SERVER-DB.md` section 5.4](DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition).
+
 - **`dialect="sqlserver"`** (default) — the **SQL Server preset** over the Microsoft ODBC Driver 18.
   **Status: production / supported** — the live aioodbc round-trip is exercised by the CI SQL Server
   service-container job.
