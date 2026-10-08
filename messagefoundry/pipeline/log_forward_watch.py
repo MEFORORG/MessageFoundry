@@ -15,15 +15,19 @@ an engine maintenance task, like the certificate monitor, and not part of the me
 (``forwarder:<kind>``):
 
 * ``not_installed``: a forwarder was configured and is not attached, or its listener thread has
-  ended. Once, until it is attached again. The reason is the start failure's fixed word, or
-  ``stopped`` when it went away later.
+  ended. At once when it is first seen absent, then again every :data:`REALERT_SECONDS` while it
+  stays absent: the notifier's cooldown, suspend and escalation all assume a standing fault is
+  emitted again. The reason is the start failure's fixed word, or ``stopped`` when it went away
+  later.
 * ``dropping``: a loss counter rose. The count is every record lost since the process started.
 * ``spool_unreadable``: the on-disk spool could not be read. Held, not lost, so no count.
 * ``not_sending``: sends have failed without a break for a whole re-alert window, and are still
   failing. With a spool nothing is lost yet, which is exactly why nothing else would say so.
 
-After any of the last three fires, none fires for :data:`REALERT_SECONDS`. The default sink's
-alert is a log line, and a log line is one more record for a forwarder that is already losing them.
+All four share one throttle: after any kind fires, none fires for :data:`REALERT_SECONDS`. The
+one exception is the first pass that finds the forwarder absent, which fires whatever the
+throttle says. The default sink's alert is a log line, and a log line is one more record for a
+forwarder that is already losing them.
 
 The alert carries counts and fixed words only: never a record, a host name or an error text.
 """
@@ -82,7 +86,9 @@ class LogForwardWatch:
         self._read = read
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        self._absent_alerted = False
+        #: Whether the forwarder was absent on the last pass. The pass that first finds it absent
+        #: fires at once; later ones wait for the shared throttle.
+        self._absent = False
         #: The reading the last alert was raised on. A rise is measured from it.
         self._alerted = ForwarderStatus()
         self._next_alert = 0.0
@@ -121,14 +127,18 @@ class LogForwardWatch:
         status = self._read()
         if not status.configured:
             return
+        now = self._clock()
         if not status.installed:
             self._failing_since = None  # a forwarder attached later starts its own clock
-            if not self._absent_alerted:
-                self._fire("not_installed", status.start_failure or "stopped")
-                self._absent_alerted = True
+            if self._absent and now < self._next_alert:
+                return
+            # Armed BEFORE the sink is called, as below. A sink that raises on the first absent
+            # pass leaves ``_absent`` unset, so the very next pass tries again.
+            self._next_alert = now + REALERT_SECONDS + _THROTTLE_MARGIN_SECONDS
+            self._fire("not_installed", status.start_failure or "stopped")
+            self._absent = True
             return
-        self._absent_alerted = False
-        now = self._clock()
+        self._absent = False
         if not status.send_failing:
             self._failing_since = None
         elif self._failing_since is None:

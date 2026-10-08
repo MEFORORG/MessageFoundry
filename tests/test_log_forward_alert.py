@@ -220,14 +220,36 @@ def _watch(
     return LogForwardWatch(alert_sink=sink, clock=clock, read=lambda: next(feed)), clock
 
 
-def test_a_failed_start_raises_the_alert_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_failed_start_raises_the_alert_and_raises_it_again_each_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _fail_the_start(monkeypatch, socket.gaierror(11001, "no such name"))
     configure_logging("INFO", forward=FORWARD)
     sink = _RecordingSink()
-    watch, _ = _watch(sink)
-    for _ in range(3):
+    watch, clock = _watch(sink)
+    # At once, then nothing inside the window, then once per window while it stays absent. The
+    # notifier's cooldown, suspend and escalation need the standing fault emitted again.
+    for now, fired in ((0.0, 1), (30.0, 1), (300.0, 1), (330.0, 2), (600.0, 2), (660.0, 3)):
+        clock.now = now
         watch.run_once()
-    assert sink.forward_failures == [("forwarder:not_installed", "permanent", 0)]
+        assert len(sink.forward_failures) == fired, now
+    assert set(sink.forward_failures) == {("forwarder:not_installed", "permanent", 0)}
+
+
+def test_a_forwarder_that_goes_away_inside_a_window_still_raises_at_once() -> None:
+    sink = _RecordingSink()
+    absent = ForwarderStatus(configured=True)
+    watch, clock = _watch(sink, readings=[_reading(queue_dropped=1), absent, absent, absent])
+    for now in (0.0, 30.0, 60.0, 400.0):
+        clock.now = now
+        watch.run_once()
+    # The first absent pass is not held back by the window "dropping" opened at 0. The next one
+    # is, and the one after the window fires again.
+    assert sink.forward_failures == [
+        ("forwarder:dropping", "queue_full", 1),
+        ("forwarder:not_installed", "stopped", 0),
+        ("forwarder:not_installed", "stopped", 0),
+    ]
 
 
 def test_a_rising_drop_count_raises_the_alert_with_no_record_text() -> None:
@@ -402,7 +424,8 @@ def test_a_sink_that_raises_leaves_the_alert_to_be_raised_again() -> None:
                 raise RuntimeError("sink bug")
             super().log_forward_failed(name, reason=reason, count=count)
 
-    # not_installed: the very next pass. A rise: after one window, and only once.
+    # not_installed: the very next pass, then not again inside the window. A rise: after one
+    # window, and only once.
     for reading, times, expected in (
         (
             ForwarderStatus(configured=True, start_failure="permanent"),

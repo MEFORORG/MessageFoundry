@@ -880,14 +880,16 @@ A configured forwarder that does not start never stops the engine. The engine te
 - **The `log_forward_failed` alert.** It is keyed on `forwarder:<kind>`. The engine checks every 30
   seconds, and `kind` is a fixed word, at least one of these.
   - `not_installed`: the forwarder is not attached, so this process sends nothing off the host.
-    It fires once. The reason is `permanent` or `transient` for a failed start, or `stopped`.
+    It fires when the engine first finds it absent, then again every five minutes while it stays
+    absent. The reason is `permanent` or `transient` for a failed start, or `stopped`.
   - `dropping`: a loss count rose. The reason names which, and the count is every record lost
     since the process started.
   - `spool_unreadable`: the on-disk spool could not be read, so its records are held and not sent.
     It carries no count.
   - `not_sending`: sends have kept failing for five minutes. With a spool nothing is lost yet.
 
-  After any of the last three fires, none of them fires again for five minutes.
+  The four kinds share one five-minute window: after any of them fires, none fires again until
+  it ends. The one exception is the first check that finds the forwarder absent.
   Nothing closes the alert when the forwarder recovers; resolve it by hand.
 - **`log_forwarder` on `GET /status`.** It is `null` when no forwarder is configured. Otherwise
   `state` is `healthy`, `degraded` or `not_installed`, beside `send_failing`, `spool_read_faulted`
