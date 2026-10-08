@@ -526,11 +526,14 @@ def test_a_read_that_fails_for_another_reason_keeps_every_segment(
             patch.setattr(log_spool, "open", _deny_open, raising=False)
             assert spool.peek() is None
             assert spool.peek() is None
-        assert spool.read_errors == 2
+        assert spool.read_errors == 2 and spool.read_faulted
         assert spool.unreadable == 0
         assert _segments(spool_dir) == before
         # The fault cleared: everything is still there, in order.
         assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+        assert (
+            spool.read_errors == 2 and not spool.read_faulted
+        )  # the count stays; the state clears
     finally:
         spool.close()
 
@@ -616,12 +619,12 @@ def test_the_full_spool_report_names_a_read_fault_only_when_there_was_one(
     listener, _ = _idle_listener(spool)
     try:
         assert spool.append(_entry(0))
-        spool.read_errors = 3 if faulted else 0
+        spool.read_faulted = faulted
         record = logging.makeLogRecord({"msg": "next", "levelname": "WARNING", "levelno": 30})
         with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
             assert listener._spool_record(record) is False
         (report,) = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
-        assert ("3 read(s) of the spool have failed" in report) is faulted
+        assert ("cannot be read just now" in report) is faulted
     finally:
         spool.close()
 
@@ -651,9 +654,10 @@ def test_a_segment_whose_delete_failed_still_counts_against_the_cap(
             assert spool.bytes_used == on_disk == size * 2
             assert spool.append(_entry(2)) is False  # the cap still holds
             assert spool.dropped == 1
-        # Deletes work again: an append that would have dropped reclaims the space first.
-        assert spool.append(_entry(2))
+        # Deletes work again: one reclaim frees the space, and the next append fits.
+        spool.reclaim()
         assert spool.undeleted_segments == 0
+        assert spool.append(_entry(2))
         assert spool.bytes_used == sum(p.stat().st_size for p in _segments(spool_dir)) == size
         assert _drain(spool) == ["record 0002"]  # the sent entries are not sent again
     finally:
@@ -808,8 +812,144 @@ def test_records_spooled_at_shutdown_are_reported_once_with_their_count(
     with caplog.at_level(logging.INFO, logger="messagefoundry.logging_setup"):
         fwd.close()
         fwd.close()  # idempotent: no second report
-    reports = [r.getMessage() for r in caplog.records if "kept" in r.getMessage()]
+    reports = [r.getMessage() for r in caplog.records if "drain deadline" in r.getMessage()]
     assert len(reports) == 1
-    assert "kept 3 queued record(s)" in reports[0] and str(spool_dir) in reports[0]
+    assert "moved 3 record(s)" in reports[0] and str(spool_dir) in reports[0]
     assert "late" not in caplog.text  # a count and a directory, never a record
     assert len(_segments(spool_dir)) == 1  # and they are on disk for the next start
+
+
+def test_the_shutdown_report_is_not_counted_as_a_dropped_record(spool_dir: Path) -> None:
+    """logging.shutdown() closes the handler while it is still on the root logger, so the report
+    comes straight back to it. Counting that as a drop logged a false "queue is full" warning on
+    a shutdown that lost nothing."""
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    fwd = _build_queued_forwarder(_FlakyCollector(), fmt="text", spool=spool)
+    root = logging.getLogger()
+    root.addHandler(fwd)
+    saved = root.level
+    root.setLevel(logging.INFO)
+    try:
+        listener = fwd._listener
+        assert listener.stop_within(1.0)
+        listener._drain_deadline = time.monotonic() - 1.0
+        listener.handle(logging.makeLogRecord({"msg": "late", "levelname": "INFO", "levelno": 20}))
+        assert listener.spooled_at_stop == 1  # so close() has something to report
+        fwd.close()
+        assert fwd.dropped == 0
+        # The control: a record that is NOT the handler's own report is still counted.
+        root.info("after close")
+        assert fwd.dropped == 1
+    finally:
+        root.removeHandler(fwd)
+        root.setLevel(saved)
+
+
+def test_close_makes_a_last_try_at_a_segment_whose_delete_failed(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sent segment left on disk is replayed whole by the next start, which cannot tell it from
+    a waiting one. close() is the last chance to remove it."""
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    spool.append(_entry(0))
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", _deny_unlink)
+        assert _drain(spool) == ["record 0000"]
+    assert len(_segments(spool_dir)) == 1 and spool.undeleted_segments == 1
+    spool.close()
+    assert _segments(spool_dir) == []
+
+    again = LogSpool(spool_dir, max_bytes=100_000)
+    again.open()
+    try:
+        assert _drain(again) == []  # nothing is sent twice
+    finally:
+        again.close()
+
+
+def test_the_listener_retries_a_failed_delete_at_most_once_per_interval(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    tries: list[int] = []
+    monkeypatch.setattr(spool, "reclaim", lambda: tries.append(1))
+    try:
+        listener._reclaim_spool()
+        assert tries == []  # nothing is left over, so nothing is tried
+        spool.append(_entry(0))
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", _deny_unlink)
+            assert _drain(spool) == ["record 0000"]
+        for _ in range(50):
+            listener._reclaim_spool()
+        assert tries == [1]  # fifty passes, one try
+        listener._reclaim_at = 0.0  # the interval has passed
+        listener._reclaim_spool()
+        assert tries == [1, 1]
+    finally:
+        spool.close()
+
+
+def test_the_full_spool_report_names_sent_segments_that_would_not_delete(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    size = len(_entry(0).encode())
+    spool = LogSpool(spool_dir, max_bytes=size)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    try:
+        assert spool.append(_entry(0))
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", _deny_unlink)
+            assert _drain(spool) == ["record 0000"]
+            record = logging.makeLogRecord({"msg": "next", "levelname": "WARNING", "levelno": 30})
+            with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+                assert listener._spool_record(record) is False
+        (report,) = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+        assert "1 segment(s) already sent could not be deleted" in report
+    finally:
+        spool.close()
+
+
+def test_a_failed_start_also_removes_the_parent_directories_it_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default spool directory is two levels below the store directory, and both are new."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _bad_certificate)
+    forward = _forward_to(store_dir / "log-spool" / "engine")
+    assert configure_logging("INFO", forward=forward) is False
+    assert list(store_dir.iterdir()) == []
+
+
+def test_a_failed_start_names_the_segments_an_earlier_run_left(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    earlier = LogSpool(spool_dir, max_bytes=100_000)
+    earlier.open()
+    earlier.append(_entry(0))
+    earlier.close()
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _bad_certificate)
+    assert configure_logging("INFO", forward=_forward_to(spool_dir)) is False
+    out = capsys.readouterr().out
+    assert "did not start" in out and "still holds 1 spool segment(s)" in out
+    assert len(_segments(spool_dir)) == 1
+
+
+def test_a_spool_directory_that_cannot_be_listed_is_reported_not_read_as_empty(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    spool_dir.mkdir()
+
+    def _deny_iterdir(self: Path) -> Any:
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(Path, "iterdir", _deny_iterdir)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        assert _open_forward_spool(_forward_to(spool_dir, spool_max_bytes=0)) is None
+    assert "could not be checked" in caplog.text
