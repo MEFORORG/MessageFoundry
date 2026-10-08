@@ -78,7 +78,9 @@ _ANALYSIS_MARKERS = (
 )
 
 # An analysis command must be incapable of failing its step.
-_NON_FAILING_IDIOMS = ("--exit-zero", "--fail-under=0", "|| true")
+# `|| RC=$?` is the coverage shard's: it keeps pytest's exit code to judge the data, and still
+# cannot fail the step.
+_NON_FAILING_IDIOMS = ("--exit-zero", "--fail-under=0", "|| true", "|| RC=$?")
 
 _SHA_PINNED = re.compile(r"^[^@]+@[0-9a-f]{40}$")
 
@@ -211,15 +213,115 @@ def test_every_analysis_marker_matches_a_step(workflow: dict) -> None:
     """A marker that matches nothing drops its step out of the guard above, and the `>= 6` floor
     there cannot see one going missing. That is how the coverage step left it unnoticed."""
     runs = [step.get("run") or "" for _, step in _steps(workflow)]
+    assert len(_ANALYSIS_MARKERS) >= 7
+    assert runs, "the workflow has no run steps to match the markers against"
     dead = [marker for marker in _ANALYSIS_MARKERS if not any(marker in run for run in runs)]
     assert not dead, f"analysis marker(s) match no step in the workflow: {dead}"
 
 
 def test_coverage_step_is_guarded(workflow: dict) -> None:
-    names = [step.get("name", "") for job, step in _analysis_steps(workflow) if job == "coverage"]
+    """The pytest step moved into the `coverage-shard` matrix, so that is where the guard must find it."""
+    names = [
+        step.get("name", "") for job, step in _analysis_steps(workflow) if job == "coverage-shard"
+    ]
     assert any(name.startswith("Tests under coverage") for name in names), (
-        f"the coverage job's pytest step is outside the advisory guard; guarded steps: {names}"
+        f"the coverage shard's pytest step is outside the advisory guard; guarded steps: {names}"
     )
+
+
+# --------------------------------------------------------------------------------------------
+# The coverage shards and their combine.
+# --------------------------------------------------------------------------------------------
+
+
+def _shard_step(workflow: dict) -> dict:
+    steps = [
+        s
+        for s in workflow["jobs"]["coverage-shard"]["steps"]
+        if s.get("name", "").startswith("Tests under coverage")
+    ]
+    assert len(steps) == 1, f"expected one pytest step in coverage-shard, found {len(steps)}"
+    return steps[0]
+
+
+def test_the_combine_job_keeps_its_context_name_and_trigger(workflow: dict) -> None:
+    """Renaming a context can wedge every open pull request that expects it, so the job that owns
+    `diff-coverage (advisory)` keeps that name and stays PR-only. The shards take a NEW name."""
+    combine = workflow["jobs"]["coverage"]
+    shard = workflow["jobs"]["coverage-shard"]
+    assert combine["name"] == "diff-coverage (advisory)"
+    assert "github.event_name == 'pull_request'" in combine["if"]
+    assert "github.event_name == 'pull_request'" in shard["if"]
+    assert shard["name"] != combine["name"]
+    assert not shard["name"].startswith("diff-coverage (advisory)")
+
+
+def test_the_combine_job_runs_after_a_failed_shard_but_not_after_a_cancel(workflow: dict) -> None:
+    """A failed shard must still reach the receipt step, which records it as a dead gate. Under the
+    default `success()` the combine job would be SKIPPED instead, and `liveness` excuses a skip."""
+    combine = workflow["jobs"]["coverage"]
+    assert combine["needs"] == "coverage-shard" or combine["needs"] == ["coverage-shard"]
+    assert "!cancelled()" in combine["if"]
+    assert "always()" not in combine["if"]
+    assert workflow["jobs"]["coverage-shard"]["strategy"]["fail-fast"] is False
+
+
+def test_the_shard_count_agrees_between_the_matrix_and_the_receipt(workflow: dict) -> None:
+    """The receipt calls the gate dead when fewer than SHARDS data files arrive. A matrix that grew
+    without SHARDS following would make every run read as dead; one that shrank would hide a gap."""
+    matrix = workflow["jobs"]["coverage-shard"]["strategy"]["matrix"]["shard"]
+    assert matrix == list(range(1, len(matrix) + 1)), f"shards must be numbered 1..N: {matrix}"
+    assert len(matrix) >= 2
+    assert workflow["jobs"]["coverage"]["env"]["SHARDS"] == str(len(matrix))
+    assert _shard_step(workflow)["env"]["SHARDS"] == "${{ strategy.job-total }}"
+
+
+def test_each_shard_runs_its_own_files_under_loadfile(workflow: dict) -> None:
+    body = _shard_step(workflow)["run"]
+    assert "scripts/quality/shard_tests.py" in body
+    assert '"${FILES[@]}"' in body
+    assert "--dist loadfile" in body
+    assert "--cov-report= " in body, "a shard writes raw data only; the combine job reports"
+    assert '[ "$RC" -le 1 ]' in body, "a run that did not finish must not upload partial data"
+
+
+def test_the_shard_artifacts_are_what_the_combine_job_downloads(workflow: dict) -> None:
+    uploads = [
+        s
+        for s in workflow["jobs"]["coverage-shard"]["steps"]
+        if "upload-artifact" in (s.get("uses") or "")
+    ]
+    downloads = [
+        s
+        for s in workflow["jobs"]["coverage"]["steps"]
+        if "download-artifact" in (s.get("uses") or "")
+    ]
+    assert len(uploads) == 1 and len(downloads) == 1
+    name = uploads[0]["with"]["name"]
+    pattern = downloads[0]["with"]["pattern"]
+    assert name == "coverage-shard-${{ matrix.shard }}"
+    assert pattern == "coverage-shard-*"
+    combine = next(
+        s
+        for s in workflow["jobs"]["coverage"]["steps"]
+        if "coverage combine" in (s.get("run") or "")
+    )
+    assert "SHARDS_ARRIVED" in combine["run"]
+    receipt = next(s for s in workflow["jobs"]["coverage"]["steps"] if s.get("id") == "receipt")
+    assert 'SHARDS_ARRIVED:-0}" -ne "$SHARDS"' in receipt["run"]
+
+
+def test_the_shards_install_the_same_extras_as_the_engine_leg(workflow: dict) -> None:
+    """Job 113084365613 failed 11 tests here and nowhere else because this install lacked `vault`.
+    The shards measure the suite ci.yml's ubuntu engine leg runs, so they install what it installs."""
+    extras = re.compile(r'-e "\.\[([a-z0-9,_-]+)\]" -e packaging/messagefoundry-webconsole')
+    ci = (_REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    engine = {m.group(1) for m in extras.finditer(ci) if "vault" in m.group(1)}
+    assert len(engine) == 1, f"expected ci.yml's engine leg install line to be unique: {engine}"
+    shard_steps = workflow["jobs"]["coverage-shard"]["steps"]
+    runs = "\n".join(step.get("run") or "" for step in shard_steps)
+    ours = [m.group(1) for m in extras.finditer(runs)]
+    assert ours == [engine.pop()], f"coverage-shard installs {ours}, not the engine leg's extras"
 
 
 # --------------------------------------------------------------------------------------------
@@ -265,6 +367,7 @@ def test_diff_cover_is_pinned_exactly(workflow: dict) -> None:
     lock-install assertion in `test_mutmut_*` is workflow-wide.
     """
     _assert_job_installs_the_toolchain_lock(workflow, "coverage")
+    _assert_job_installs_the_toolchain_lock(workflow, "coverage-shard")
     pin = _group_pin("diff-cover")
     assert re.fullmatch(r"diff-cover==\d+\.\d+\.\d+", pin), (
         f"diff-cover must be pinned exactly in [dependency-groups], got {pin!r}"
@@ -565,7 +668,9 @@ def test_mutmut_artifact_includes_hidden_files(workflow: dict) -> None:
     """.mutmut-cache is a dotfile and upload-artifact skips hidden files by default -- without this
     the step logs 'No files were found', uploads nothing, and still reports success."""
     upload = next(
-        step for _, step in _steps(workflow) if "upload-artifact" in (step.get("uses") or "")
+        step
+        for step in workflow["jobs"]["mutation"]["steps"]
+        if "upload-artifact" in (step.get("uses") or "")
     )
     with_ = upload.get("with", {})
     assert with_.get("include-hidden-files") is True, (

@@ -524,7 +524,9 @@ LOCK_INSTALLED_TOOLCHAINS = (
     # them carry byte-identical copies of the first two. Back to 3 when step 3 deletes the originals.
     ("security.yml", "ci/locks/ci-scanners.lock", 5),
     ("zizmor.yml", "ci/locks/ci-scanners.lock", 1),
-    ("quality-advisory.yml", "ci/locks/ci-quality.lock", 2),
+    # THREE: the coverage shards (pytest-cov), the coverage combine job (coverage, diff-cover), and
+    # mutation.
+    ("quality-advisory.yml", "ci/locks/ci-quality.lock", 3),
     # SEVEN in release.yml: SIX since ADR 0201 (the toolkit build step in the `release` job installs
     # its own `build`), and one more since the Windows-resolved engine SBOM. That SBOM also makes TWO in
     # security.yml: each file's `sbom-windows` job installs the lock for `cyclonedx_py`, beside the
