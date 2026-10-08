@@ -5,7 +5,7 @@
 // without `vscode`. codeSetEditor.ts builds the page and embeds this; the unit suite evaluates the
 // SAME source in a jsdom page (webview-receivers.test.ts), so what the tests exercise is what
 // ships.
-import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, embedJson, guardScript } from "./webviewMessaging";
+import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
 
 /** The whole inline `<script>` body for one render, guard included. `token` is this render's
  *  channel token, minted by the caller with the nonce (webviewMessaging.ts). */
@@ -16,7 +16,7 @@ export function codeSetEditorScript(
   existing: readonly string[],
 ): string {
   return `
-    const vscode = acquireVsCodeApi();${guardScript(token)}${SHAPE_HELPERS}
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}${guardScript(token)}${SHAPE_HELPERS}
     const INITIAL = ${embedJson(initial)};         // Detail | null
     const READONLY = ${embedJson(readonly)};       // true => TOML, view-only
     const EXISTING = ${embedJson(existing)};       // existing code-set names (client-side dup warning)

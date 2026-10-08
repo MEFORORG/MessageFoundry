@@ -12,7 +12,7 @@
 // obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
-import { openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { FIELDS, securityEditorScript } from "./securityEditorWebview";
 
 interface ShowResult {
@@ -141,6 +141,7 @@ function formHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <h2>Security settings</h2>
   <p class="sub">The <code>[security]</code> posture in the service-settings TOML (ADR 0118). Every switch
      defaults to the <b>secure</b> position; loosening one is warned in place. Saved changes apply on the next

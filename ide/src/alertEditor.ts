@@ -11,7 +11,7 @@
 // at startup, so it takes effect on the next engine restart (not via Promote/reload) — the UI says so.
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
-import { openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { alertEditorScript } from "./alertEditorWebview";
 
 const EVENT_TYPES = [
@@ -180,6 +180,7 @@ function formHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <h2>Alert Rules</h2>
   <p class="sub">Operator rules over the alert notifier (ADR 0014), stored in <code>[[alerts.rules]]</code> of the
      service-settings TOML. <b>First match wins.</b> Rules are pure data (no code). A change takes effect on the

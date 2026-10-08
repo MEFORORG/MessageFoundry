@@ -4,7 +4,7 @@
 // extension commands. Every action is live; the `soon` flag renders a "soon" badge for any action
 // still queued in the backlog. Monitoring + engine run/stop deliberately live in the Console, not here.
 import * as vscode from "vscode";
-import { openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { homeScript } from "./homeWebview";
 
 interface Action {
@@ -148,6 +148,7 @@ export class HomeView implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <div class="search">
     <input id="search" type="search" spellcheck="false"
            placeholder="Find connection, handler, router, transform…" value="${esc(initialFilter)}" />

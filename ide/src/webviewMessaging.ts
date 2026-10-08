@@ -260,3 +260,65 @@ export const SHAPE_HELPERS = `
       console.warn('MessageFoundry ' + panel + ': discarded a malformed "' + String(k) + '" message');
       return false;
     }`;
+
+// --- startup banners: a panel that warns for itself (BACKLOG #1116, #1124; ASVS 3.1.1, 3.7.5) ------
+//
+// Two failures used to look exactly like a healthy panel. A panel whose script never ran showed an
+// inert shell with nothing saying why, and a VS Code browser engine that ignored the `<meta>` CSP
+// would have run every panel unchanged. Each now has a plain-text banner in the HTML shell. Neither
+// banner depends on the panel's script, its stylesheet or a message from the host:
+//
+//   * SCRIPT NOT STARTED is VISIBLE by default. `SCRIPT_STARTED_MARK` hides it, and that source is
+//     the statement right after `acquireVsCodeApi()` in the panel's nonced script. So the banner
+//     stays up when the script is blocked, fails to parse, or dies acquiring the API. It does NOT
+//     stay up for a script that starts and throws later; only the Steps view's host-side handshake
+//     timer covers any part of that.
+//   * CSP NOT ENFORCED is HIDDEN by default, with the `hidden` attribute so no stylesheet is needed.
+//     The canary is one deliberately UN-NONCED inline script. Every panel's policy is
+//     `default-src 'none'` with a `script-src` that names a nonce and never `'unsafe-inline'`, so an
+//     engine that enforces the policy must refuse the canary, and the banner stays hidden. An engine
+//     that ignores the policy runs it, and the canary reveals the banner.
+//
+// WHY AN INLINE CANARY HERE, when the web console's is an external file (`/ui/static/csp-probe.js`).
+// The console chose external so its violation report carries a URL the report route can recognise.
+// A webview has no report route, and most panels grant no `localResourceRoots`, so an external file
+// could not load whether or not the policy was enforced. An enforcing engine logs one CSP violation
+// for the canary in the webview's developer console on every render. That line is the control
+// working, not a defect.
+//
+// WHAT THE CANARY DOES NOT SHOW. It proves the engine blocks an un-nonced inline script. It says
+// nothing about any other directive, and it cannot fire on a document that has no policy at all and
+// no canary, which is why the two static notices (the "outside the config dir" line and the Steps
+// view's fallback notice) are named as exceptions in the test rather than left to be forgotten.
+
+/** The banner a panel shows until its own script hides it. */
+export const SCRIPT_BANNER_ID = "mf-script-not-started";
+/** The banner only the un-nonced CSP canary can reveal. */
+export const CSP_BANNER_ID = "mf-csp-not-enforced";
+
+const BANNER_STYLE =
+  "margin:0 0 8px;padding:6px 10px;border:1px solid var(--vscode-inputValidation-warningBorder,#b89500);" +
+  "background:var(--vscode-inputValidation-warningBackground,transparent)";
+
+/**
+ * The two banners and the CSP canary, as markup for the top of a panel's `<body>`.
+ *
+ * Every builder that assigns `webview.html` a document with a script embeds this exactly once, and
+ * that document's script embeds `SCRIPT_STARTED_MARK`. `startup-banners.test.ts` derives the list of
+ * builders from the code and fails on one that carries neither.
+ *
+ * The `<script>` tag below must stay WITHOUT a nonce. A nonced canary would run under an enforcing
+ * engine and raise the warning on every healthy panel.
+ */
+export const STARTUP_BANNERS = `<div id="${SCRIPT_BANNER_ID}" role="alert" style="${BANNER_STYLE}">MessageFoundry: this panel's script has not started, so its buttons and fields do nothing. Close the panel and open it again. If this message stays, VS Code is not running the panel's script.</div>
+  <div id="${CSP_BANNER_ID}" role="alert" hidden style="${BANNER_STYLE}">MessageFoundry: VS Code is not enforcing this panel's Content Security Policy, so the panel's defense against injected script is not active. Update VS Code, and treat what this panel shows with care until the message is gone.</div>
+  <script>document.getElementById(${JSON.stringify(CSP_BANNER_ID)}).hidden = false;</script>`;
+
+/**
+ * Inline script source that hides the script-not-started banner.
+ *
+ * Place it right after `acquireVsCodeApi()`, so a script that dies acquiring the API leaves the
+ * banner up. A block, so its `const` cannot collide with a panel's own names.
+ */
+export const SCRIPT_STARTED_MARK = `
+    { const mfBanner = document.getElementById(${JSON.stringify(SCRIPT_BANNER_ID)}); if (mfBanner) { mfBanner.hidden = true; } }`;
