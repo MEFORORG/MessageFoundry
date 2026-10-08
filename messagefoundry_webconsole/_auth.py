@@ -695,39 +695,36 @@ def assert_same_origin(request: Request) -> None:
     nothing; a script that drives ``/ui`` must send ``Origin``. A write whose ``Sec-Fetch-Site`` is
     present but is not exactly ``same-origin`` or ``none`` fails closed the same way.
 
-    **A GET keeps the rule it had before that item, and must.** The one GET that reaches this check
-    is ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in navigation. Owner rulings
-    R4 and R4b of 2026-09-28 hold that a sign-in GET is never blocked for missing fetch metadata. So
-    on a GET an absent, empty or unknown ``Sec-Fetch-Site`` raises nothing by itself; ``cross-site``,
-    ``same-site`` and a non-matching ``Origin`` are still refused there, as they were.
+    **A GET keeps the rule it had before that item, and must.** At least one GET reaches this
+    check: ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in navigation. Owner
+    rulings R4 and R4b of 2026-09-28 hold that a sign-in GET is never blocked for missing fetch
+    metadata. So on a GET an absent, empty or unknown ``Sec-Fetch-Site`` raises nothing by itself.
+    ``cross-site`` and ``same-site`` are still refused there. A non-matching ``Origin`` is refused
+    there only when NO ``Sec-Fetch-Site`` line was sent at all, as before: on a GET any such line,
+    even an empty one, settles the check and ``Origin`` is not read.
     """
+    # "GET" and nothing wider, to match require_ui's own definition of a write.
+    write = request.method != "GET"
     site = request.headers.get("sec-fetch-site")
-    if request.method == "GET":
-        # The pre-#1116 rule, unchanged. "GET" and nothing wider, to match require_ui's own
-        # definition of a write (``request.method != "GET"``).
-        if site is not None:
-            assert_not_cross_site(request)
-            return
-        origin = request.headers.get("origin")
-        if origin and not _origin_matches(request.app.state, origin, request.headers.get("host")):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-origin request rejected")
-        return
-    # An EMPTY Sec-Fetch-Site names no provenance, so it is absence, as an empty Origin is below.
-    if site:
+    # On a write an EMPTY Sec-Fetch-Site names no provenance, so it is absence, as an empty Origin
+    # is below. On a GET any present line settles it, which is the pre-#1116 rule unchanged.
+    if site if write else site is not None:
         assert_not_cross_site(request)
         # An ALLOW set on a write, not only the two refused values above. The Fetch Metadata
         # values are four exact lowercase tokens; anything else (an unknown token, another case,
         # padding) is not a browser naming this request same-origin, so it fails closed.
-        if site not in _SAME_ORIGIN_FETCH:
+        if write and site not in _SAME_ORIGIN_FETCH:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "unrecognised Sec-Fetch-Site value rejected"
             )
         return
     origin = request.headers.get("origin")
     if not origin:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "request carries neither Sec-Fetch-Site nor Origin"
-        )
+        if write:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "request carries neither Sec-Fetch-Site nor Origin"
+            )
+        return
     if not _origin_matches(request.app.state, origin, request.headers.get("host")):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-origin request rejected")
 

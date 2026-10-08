@@ -140,7 +140,14 @@ async def test_oidc_start_get_still_refuses_what_it_refused(
     async with _client(engine, service, interstitial=False) as c:
         r = await c.get(
             "/ui/oidc/start",
-            headers={"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document", **headers},
+            # A complete user-started navigation, so the fetch-metadata middleware lets a
+            # same-site one through and the refusal measured is assert_same_origin's own.
+            headers={
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-User": "?1",
+                **headers,
+            },
             follow_redirects=False,
         )
     assert r.status_code == 403, r.text

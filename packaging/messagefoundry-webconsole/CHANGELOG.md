@@ -73,7 +73,8 @@ this line.**
   It answers `403` and changes nothing. It used to pass, which left the sign-in POST with no
   cross-site control in a browser that sends neither header. A current browser sends
   `Sec-Fetch-Site` on every request, so the console's pages are unaffected there. A browser without
-  `Sec-Fetch-Site` should be treated as unable to sign in; `docs/BROWSER-SUPPORT.md` says why. A
+  `Sec-Fetch-Site` should be treated as unable to sign in with a password or to change anything,
+  sign-out included; `docs/BROWSER-SUPPORT.md` says why. A
   script that drives `/ui` must now send `Origin`. The CSP report sink `/ui/csp-report` still
   accepts a report with neither. A write whose `Sec-Fetch-Site` is present but is not exactly
   `same-origin` or `none` is refused too. Both refusals are for writes. Three sign-in GETs are deliberately not

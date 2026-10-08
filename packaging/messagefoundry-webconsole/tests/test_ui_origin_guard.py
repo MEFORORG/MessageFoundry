@@ -201,6 +201,8 @@ def test_a_padded_sec_fetch_site_is_refused_by_the_check_itself() -> None:
     # control: the GET arm is live, so the passes above are the rule and not a dead branch
     with pytest.raises(HTTPException):
         webconsole_auth.assert_same_origin(request("GET", "cross-site"))
+    with pytest.raises(HTTPException):
+        webconsole_auth.assert_same_origin(request("GET", "same-site"))
 
 
 async def test_login_with_neither_header_fails_closed_without_setting_a_cookie(
