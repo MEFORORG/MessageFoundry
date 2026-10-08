@@ -502,8 +502,9 @@ gates a merge**, and no seat has to clear one.
   with no queue.** The Lander's roster row and its 2026-10-07 note say how (owner ruling
   2026-10-07). Enqueuing and merging have BOTH been the Lander's since the Console retired on 2026-09-10,
   so a Manager hands the PR over and leaves the queue to it. **Dequeue before pushing**, because
-  whether a queued entry drops a later push is unmeasured. The full text is in
-  [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
+  whether a queued entry drops a later push is unmeasured; [`docs/METHOD.md`](docs/METHOD.md),
+  *Auto-merge: the hazard kept*, says why. The full text is in the same file, *CLAUDE.md text moved
+  in wave 3*.
 
 - Work on a feature branch. Which seat opens the PR, and when, is the batching bullet below. Commit
   at logical stops, **one coherent layer per commit**, with clear messages. Direct pushes to `main` stay blocked by the harness.
