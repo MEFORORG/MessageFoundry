@@ -28,7 +28,7 @@ from .. import pages
 from .._auth import (
     require_ui,
 )
-from ..pages._common import _failed_inbound_reason
+from ..pages._common import _failed_inbound_reason, _log_forwarder_reason
 
 _log = logging.getLogger(__name__)
 
@@ -115,6 +115,7 @@ def _derive_health(
       and untouched by #1563; ``SystemStatus.log_sinks`` already carries a purpose-built
       ``unwritable`` state for it that nothing in this function reads yet.
     - server DB connection pool saturated (``idle == 0``) → **warn**.
+    - the off-box log forwarder absent or degraded → **warn** (BACKLOG #2612).
     - running on the DR failover box (``dr.active``) → **warn**; a clustered engine with no leader → **down**.
     - a pooled pipeline stage whose claimer died and has not recovered → **down**, naming
       the stage (BACKLOG #1609).
@@ -187,6 +188,10 @@ def _derive_health(
                 issues.append((1, f"low disk ({label}): {free / 1024**3:.1f} GiB free"))
         if sysinfo.pool is not None and sysinfo.pool.idle == 0:
             issues.append((1, "DB connection pool saturated"))
+        # BACKLOG #2612. warn, not down: the message path does not depend on the forwarder.
+        forwarder_reason = _log_forwarder_reason(sysinfo.log_forwarder)
+        if forwarder_reason is not None:
+            issues.append((1, forwarder_reason))
     if dr is not None and dr.enabled and dr.active:
         issues.append((1, "running on the DR failover box"))
     if (

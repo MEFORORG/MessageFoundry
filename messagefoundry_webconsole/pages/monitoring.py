@@ -33,7 +33,13 @@ from messagefoundry.api.models import (
 )
 
 from .._html import Markup, el, page, register_nav, rows_table
-from ._common import _failed_inbound_reason, _pager, _reveal_cell, _window_note
+from ._common import (
+    _failed_inbound_reason,
+    _log_forwarder_reason,
+    _pager,
+    _reveal_cell,
+    _window_note,
+)
 
 __all__ = [
     "alerts",
@@ -495,6 +501,21 @@ def status(
         if e.channels_failed
         else []
     )
+    # BACKLOG #2612: no row when no forwarder is configured. This process's forwarder only: under
+    # engine shards each process has its own.
+    forwarder_reason = _log_forwarder_reason(sys.log_forwarder)
+    forwarder_rows: list[list[object]] = (
+        []
+        if sys.log_forwarder is None
+        else [
+            [
+                "Off-box log forwarding",
+                "healthy"
+                if forwarder_reason is None
+                else el("span", forwarder_reason, class_="status status-failed"),
+            ]
+        ]
+    )
     engine_tbl = rows_table(
         ["Field", "Value"],
         [
@@ -503,6 +524,7 @@ def status(
             ["PID", e.pid],
             ["Inbound", inbound],
             *failed_rows,
+            *forwarder_rows,
             # #93 engine-wide KPI headline: combined inbound+outbound endpoint count + engine-wide
             # msg/s (reusing the recent_done rate window) — the single-glance roll-up no per-connection
             # row gives. Metadata only (counts + a rate), no PHI.
