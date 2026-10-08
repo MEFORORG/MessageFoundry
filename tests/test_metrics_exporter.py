@@ -349,11 +349,14 @@ async def test_metrics_gated_by_monitoring_read(engine: Engine) -> None:
         assert (await c.get("/metrics", headers=nr)).status_code == 403
 
 
-# --- 5. OTel seam (skips cleanly when opentelemetry isn't installed) ---------
+# --- 5. OTel seam (skips cleanly when the [otel] extra isn't installed) ------
 
 
 async def test_otel_seam_records_without_phi(engine: Engine) -> None:
-    pytest.importorskip("opentelemetry")
+    # Guard on what build_otel_meter_provider imports, not on `opentelemetry`: fastapi brings in
+    # opentelemetry-api on its own, so that namespace imports even without the [otel] extra.
+    pytest.importorskip("opentelemetry.sdk.metrics")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.grpc.metric_exporter")
     from messagefoundry.api.metrics import OtelMetricsExporter, build_otel_meter_provider
 
     # The provider builds with the SDK present (no OTLP endpoint required to construct it).

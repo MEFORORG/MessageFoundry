@@ -15,7 +15,7 @@ uses dated public data.
 
 The set assessed is the **core runtime closure**: every distribution a default engine install
 carries, transitive dependencies included, with no optional extras and no development toolchain.
-That is **34 distributions**, recorded in
+That is **35 distributions**, recorded in
 [`security/runtime-closure-core.txt`](../security/runtime-closure-core.txt).
 
 **Which denominator you pick changes the answer by about half, so it is stated rather than implied:**
@@ -24,12 +24,12 @@ That is **34 distributions**, recorded in
 |---|---|---|
 | Names in `pyproject.toml`, core only | 19 | Misses everything transitive, which is a large share of what runs. |
 | Names in `pyproject.toml`, core plus every extra | 45 | Still direct-only, and mixes in extras nobody enabled. |
-| **Core runtime closure** | **34** | **Used for the tiers below.** What a default install actually executes. |
-| **`sqlserver` runtime closure** | **36** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
-| **`harness` runtime closure** | **38** | **Used for the `harness` section only.** The core closure plus what that extra adds. |
+| **Core runtime closure** | **35** | **Used for the tiers below.** What a default install actually executes. |
+| **`sqlserver` runtime closure** | **37** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
+| **`harness` runtime closure** | **39** | **Used for the `harness` section only.** The core closure plus what that extra adds. |
 | `requirements.lock` | A superset | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
 
-Two extras are assessed as well. The `sqlserver` runtime closure is **36 distributions**, recorded in
+Two extras are assessed as well. The `sqlserver` runtime closure is **37 distributions**, recorded in
 [`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt). It has its
 own section below, which classifies only the names the extra adds to the core closure.
 
@@ -37,7 +37,7 @@ It is assessed because the SQL Server store is the deployment the project's secu
 names. This page chose its own scope; covering the extra here does not decide what that assessment
 grades.
 
-The `harness` runtime closure is **38 distributions**, recorded in
+The `harness` runtime closure is **39 distributions**, recorded in
 [`security/runtime-closure-harness.txt`](../security/runtime-closure-harness.txt). Installing the
 harness wheel brings in these names, because the wheel's only dependency is
 `messagefoundry[harness]`. The versions are the lock's; an install resolved from an index can take
@@ -68,7 +68,7 @@ Native compiled code is treated as an aggravating factor within a tier, not a ti
 memory-safety fault in a compiled parser is not the same class of event as a logic bug in a pure
 Python one, and the tables below say which components carry it.
 
-**Twenty-three of thirty-four are designated, and the proportion is the finding.** This is an
+**Twenty-three of thirty-five are designated, and the proportion is the finding.** This is an
 integration engine: its job is parsing clinical traffic from partners it does not control and
 terminating network protocols. Most of its runtime closure is therefore in one of those two paths by
 construction. A short list here would be a less honest document, not a safer engine.
@@ -145,8 +145,9 @@ looked at.
 | `tomlkit` | parses operator-authored TOML from the config directory, which is inside the trust boundary |
 | `annotated-doc`, `annotated-types`, `typing-extensions`, `typing-inspection` | typing shims, no runtime input handling |
 | `tzdata` | timezone tables |
+| `opentelemetry-api` | the OpenTelemetry API that `fastapi` requires. With no SDK provider configured, every call into it is a no-op. It also holds the propagators that parse trace headers from a request. `fastapi` calls them only once a tracer provider is configured. The engine configures none, but `fastapi` 0.142 configures one itself when an `OTEL_EXPORTER_OTLP_*` endpoint is set in the environment and the SDK is installed, as the `otel` extra installs it. This row holds for the default install only. A change that configures a provider, or an install that sets that variable, needs this row read again |
 
-That is 11, and 23 plus 11 is 34. The arithmetic is stated so a reader can check the set is closed
+That is 12, and 23 plus 12 is 35. The arithmetic is stated so a reader can check the set is closed
 rather than trusting that it is.
 
 Not designated is a statement about the tiers only. A wheel in this table can still carry a bundled
@@ -173,7 +174,7 @@ tables.
 
 None. Both names the extra adds are designated.
 
-So 2 plus 0 is 2, and 34 plus 2 is 36.
+So 2 plus 0 is 2, and 35 plus 2 is 37.
 
 ### The ODBC driver is designated too, and the guard cannot see it
 
@@ -228,7 +229,7 @@ On the reading of 2026-10-03, the harness imports four Qt modules: `QtCore`, `Qt
 | `pyside6` | a metadistribution: the `PySide6` package initialiser, two small version and configuration modules, and typing stubs. It parses no input, and it exists to pull in the other three. It ships no compiled file. The survey further down listed the pinned Linux x86_64 and Windows amd64 wheels and found none in either |
 | `pyside6-addons` | compiled, but it holds only Qt modules the harness never imports, among them the web engine, multimedia, PDF, serial port and HTTP server modules. None of them runs, so none sees input. A harness change that imports one needs this row read again |
 
-So 2 plus 2 is 4, and 34 plus 4 is 38.
+So 2 plus 2 is 4, and 35 plus 4 is 39.
 
 ### Why the listener meets tiers 1 and 3
 
@@ -295,7 +296,7 @@ vulnerabilities". This section reads every component on those examples.
 
 <!-- BEGIN component-readings: rendered by scripts/security/component_readings.py from security/risky-component-readings.json. Do not edit by hand. -->
 
-> **Snapshot date: 2026-10-04. Re-read by: 2027-01-02.** Every reading below comes from public data
+> **Snapshot date: 2026-10-08. Re-read by: 2027-01-06.** Every reading below comes from public data
 > on the snapshot date: PyPI, the Python Package Index, and OSV, the Open Source Vulnerabilities
 > database. It covers the versions the closure files pinned that day. Support status and advisory
 > history go stale. After the re-read date, treat this section as out of date until
@@ -306,7 +307,7 @@ The readings, their sources and their windows are recorded in
 
 ### What is read, and the test for each example
 
-All 40 distributions this page assesses are read: the 34 in the core closure and the 6 that the
+All 41 distributions this page assesses are read: the 35 in the core closure and the 6 that the
 assessed extras add to it. The `sqlserver` extra adds 2: `aioodbc` and `pyodbc`. The `harness` extra
 adds 4: `pyside6`, `pyside6-addons`, `pyside6-essentials` and `shiboken6`. That is not only the
 designated part. A library can be risky on these examples even where the tiers did not designate it.
@@ -335,8 +336,8 @@ says which wheels carry another project in any of those forms, and what this pag
 These tests are mechanical. A small library that is finished can trip the first one without being
 neglected. The reading says where to look; it does not say the library is broken.
 
-**Risky on at least one example: 10 of 40. On maintenance: 2. On support: 0. On vulnerability
-history: 8. Not risky on any: 30. 10 plus 30 is 40.**
+**Risky on at least one example: 9 of 41. On maintenance: 2. On support: 0. On vulnerability
+history: 7. Not risky on any: 32. 9 plus 32 is 41.**
 
 ### Poorly maintained
 
@@ -355,14 +356,13 @@ None on the snapshot date.
 |---|---|---|---|
 | `anyio` | 2 | 2026-09-18 | no |
 | `certifi` | 1 | 2023-07-25 | yes, tier 2 |
-| `click` | 1 | 2026-04-30 | no |
 | `cryptography` | 8 | 2026-08-03 | yes, tier 2 |
 | `h11` | 1 | 2025-04-24 | yes, tier 3 |
 | `httpx` | 1 | 2022-04-28 | yes, tier 3 |
 | `pyasn1` | 5 | 2026-07-14 | yes, tier 2 |
 | `starlette` | 5 | 2026-06-15 | yes, tier 3 |
 
-On the snapshot date OSV listed no advisory against any pinned version, in any of the 40. The table
+On the snapshot date OSV listed no advisory against any pinned version, in any of the 41. The table
 above counts past advisories only.
 
 Every advisory in the window carries a rating from one of the two sources.
@@ -370,15 +370,12 @@ Every advisory in the window carries a rating from one of the two sources.
 1 record was left out because every GitHub advisory about the package it names is withdrawn:
 `PYSEC-2024-38` against `fastapi`, twin of `GHSA-qf9m-vfgh-m389`.
 
-1 record names a GitHub advisory that OSV does not have, so its status is unknown. It still counts:
-`PYSEC-2026-2132` against `click`, naming `GHSA-47fr-3ffg-hgmw`.
-
 ### Not risky on any of the three
 
 | Components | Designated above |
 |---|---|
 | `argon2-cffi`, `argon2-cffi-bindings`, `cffi`, `fastapi`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyside6-essentials`, `pyspnego`, `shiboken6`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
-| `aiosqlite`, `annotated-doc`, `annotated-types`, `psutil`, `pyside6`, `pyside6-addons`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop` | no |
+| `aiosqlite`, `annotated-doc`, `annotated-types`, `click`, `opentelemetry-api`, `psutil`, `pyside6`, `pyside6-addons`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop` | no |
 
 Not risky here means that none of the three tests fired. It is not a clean result beyond them: the
 vulnerability-history test reads advisories by PyPI name only, as stated with the tests above.
@@ -401,17 +398,17 @@ the two agree is where to look first.
 | `pyasn1` | tier 2 | vulnerability history |
 | `starlette` | tier 3 | vulnerability history |
 
-2 components are risky here and not designated above: `anyio` (vulnerability history), `click`
-(vulnerability history). The tiers did not designate them under the exposure criterion. The reading
-names them so that choice stays visible, and a reviewer can revisit it.
+1 component is risky here and not designated above: `anyio` (vulnerability history). The tiers did
+not designate it under the exposure criterion. The reading names it so that choice stays visible,
+and a reviewer can revisit it.
 
 ### What each wheel carries inside it
 
 The vulnerability-history test reads advisories by PyPI name. This survey asks what that test
-cannot: whether each of the 40 pinned wheels carries a bundled copy of another separately
+cannot: whether each of the 41 pinned wheels carries a bundled copy of another separately
 distributed project, and in what form. The compiled-code answers were made by hand between
-2026-10-04 and 2026-10-05, and the source and data answers on 2026-10-05, against the pins the
-snapshot reads. The evidence, the files read and their hashes are recorded in
+2026-10-04 and 2026-10-07, and the source and data answers between 2026-10-05 and 2026-10-07,
+against the pins the snapshot reads. The evidence, the files read and their hashes are recorded in
 [`security/bundled-code-survey.json`](../security/bundled-code-survey.json). A run of the script
 does not repeat it.
 
@@ -428,14 +425,14 @@ page's choice, and a reader can draw it elsewhere: data still decides things, as
 certificates decides what is trusted. A wheel whose answer is not established, for any form, is
 treated as carrying code.
 
-**Another project's compiled code: found in 9 of 40. Not found in 31. Not established: 0. 9 plus 31
-plus 0 is 40.**
+**Another project's compiled code: found in 9 of 41. Not found in 32. Not established: 0. 9 plus 32
+plus 0 is 41.**
 
-**Another project's source code: found in 0 of 40. Not found in 38. Not established: 2. 0 plus 38
-plus 2 is 40.**
+**Another project's source code: found in 0 of 41. Not found in 39. Not established: 2. 0 plus 39
+plus 2 is 41.**
 
-**Another project's data: found in 5 of 40. Not found in 33. Not established: 2. 5 plus 33 plus 2 is
-40.**
+**Another project's data: found in 5 of 41. Not found in 34. Not established: 2. 5 plus 34 plus 2 is
+41.**
 
 Each count is what the search described below found, and not a statement of what a wheel holds. The
 search reads names, sizes and marked text. It can miss a copy that has no marker, so a wheel counted
@@ -448,7 +445,7 @@ The table has one row for each wheel and form where the answer is not a plain no
 | `argon2-cffi-bindings` | 26.1.0 | compiled code | Argon2 reference implementation (phc-winner-argon2), version not established | wheel file list and source tree | designated, tier 2 |
 | `certifi` | 2026.7.22 | data | Mozilla's list of trusted root certificates, version not established | wheel file list and files opened | designated, tier 2 |
 | `cffi` | 2.1.1 | compiled code | libffi, version not established | wheel file list and source tree | designated, tier 2 |
-| `cryptography` | 50.0.1 | compiled code | OpenSSL 4.0.2; Rust crates, the 40 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 2 |
+| `cryptography` | 50.0.2 | compiled code | OpenSSL 4.0.3; Rust crates, the 40 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 2 |
 | `hl7apy` | 1.3.5 | data | HL7 v2 definitions of messages, segments, fields and data types, the twelve versions from 2.1 to 2.8.2 | wheel file list and files opened | designated, tier 1 |
 | `httptools` | 0.8.0 | compiled code | llhttp 9.4.1; http-parser 2.9.4 | wheel file list and source tree | designated, tier 3 |
 | `idna` | 3.20 | data | IDNA and UTS 46 mapping tables, Unicode 18.0.0 | wheel file list and files opened | designated, tier 3 |
@@ -462,23 +459,23 @@ The table has one row for each wheel and form where the answer is not a plain no
 | `pyside6-essentials` | 6.11.2 | data | not established | wheel not fetched | designated, the `harness` extra |
 | `shiboken6` | 6.11.2 | compiled code | Microsoft Visual C++ runtime libraries (Windows wheel) 14.44.35211.0, with two files at 14.24.28127.4 | wheel file list | designated, the `harness` extra |
 | `tzdata` | 2026.4 | data | IANA Time Zone Database 2026d | wheel file list and files opened | none owed: data only |
-| `uvloop` | 0.22.1 | compiled code | libuv 1.48.0 | wheel file list and source tree | highlighted below |
+| `uvloop` | 0.23.0 | compiled code | libuv 1.52.1 | wheel file list and source tree | highlighted below |
 
-26 wheels were found to carry no compiled code, on the evidence of the wheel tag and file list:
+27 wheels were found to carry no compiled code, on the evidence of the wheel tag and file list:
 `aioodbc`, `aiosqlite`, `annotated-doc`, `annotated-types`, `anyio`, `argon2-cffi`, `certifi`,
-`click`, `fastapi`, `h11`, `hl7apy`, `httpcore`, `httpx`, `idna`, `ldap3`, `pyasn1`, `pycparser`,
-`pydantic`, `pyspnego`, `starlette`, `tomlkit`, `truststore`, `typing-extensions`,
-`typing-inspection`, `tzdata`, `uvicorn`.
+`click`, `fastapi`, `h11`, `hl7apy`, `httpcore`, `httpx`, `idna`, `ldap3`, `opentelemetry-api`,
+`pyasn1`, `pycparser`, `pydantic`, `pyspnego`, `starlette`, `tomlkit`, `truststore`,
+`typing-extensions`, `typing-inspection`, `tzdata`, `uvicorn`.
 
 4 wheels were found to carry no compiled code, on the evidence of the wheel file list and source
 tree: `psutil`, `pyodbc`, `sspilib`, `websockets`.
 
 1 wheel was found to carry no compiled code, on the evidence of the wheel file list: `pyside6`.
 
-26 wheels have no row in the table: the search found no package, library tree or data set of another
+27 wheels have no row in the table: the search found no package, library tree or data set of another
 project in them, in any form.
 
-The word search ran over the 38 wheels that were fetched. It hit 90 files. Counted in files: 7 hold
+The word search ran over the 39 wheels that were fetched. It hit 90 files. Counted in files: 7 hold
 a single module adapted from another project, 24 hold lines copied into a wheel's own module, and 59
 hold prose that marks no copy, such as a project's own licence header. The record lists each hit
 under its wheel.
@@ -554,7 +551,7 @@ carried project's own advisories.
 | Component | Carries | Why |
 |---|---|---|
 | `pyside6-addons` | Qt, version not established | It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it. |
-| `uvloop` | libuv 1.48.0 | libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it. |
+| `uvloop` | libuv 1.52.1 | libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it. |
 
 No advisory for a carried project was read for these. A reader who needs that has to check the
 carried project's own security notices against the version the pinned wheel carries. Where the table

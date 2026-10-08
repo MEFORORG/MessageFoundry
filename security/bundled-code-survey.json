@@ -24,7 +24,8 @@
     "Data means another project's or body's published tables, held in the wheel as files or as generated modules: a time zone database, a list of root certificates, Unicode tables, a standard's definitions, a server's schema.",
     "This search reads names, sizes and marked text. What it cannot see is listed under `search`, as `cannot_see`.",
     "A search that finds nothing proves nothing unless it can fire. The `control` entry names a wheel known to vendor source, which is not one of the surveyed wheels. The same search was run over it, and `fired_on` names a path for each rule that fired.",
-    "The `pyside6-addons` and `pyside6-essentials` wheels were not fetched for this either. Their source and data answers are recorded as not established."
+    "The `pyside6-addons` and `pyside6-essentials` wheels were not fetched for this either. Their source and data answers are recorded as not established.",
+    "On 2026-10-07 the `fastapi` 0.142.2 lock bump moved four pins and added one name, so five wheels were surveyed again that day by the same rules and the same word list: `cryptography`, `fastapi`, `opentelemetry-api`, `pyspnego` and `uvloop`. `opentelemetry-api` entered the closure as a new runtime dependency of `fastapi`. Each file named under `files_read` for them was fetched, its sha256 checked against the lock, its contents listed and its text word-searched. Nothing was installed or run. The other wheels' answers were not re-made, and their pins did not move."
   ],
   "sources": {
     "pypi_release": "https://pypi.org/pypi/<name>/<version>/json",
@@ -84,8 +85,8 @@
       ".rst"
     ],
     "word_rule": "Each file outside `.dist-info` whose name ends in one of `suffixes` was decoded as UTF-8 and put in lower case. Each line was searched for each of `words` as a substring.",
-    "wheels_searched": 38,
-    "wheel_files_searched": 48,
+    "wheels_searched": 39,
+    "wheel_files_searched": 49,
     "cannot_see": [
       "A copy that carries none of `words`, sits under no directory in `directories`, and has no licence file named for another project.",
       "A module adapted from another project that says so in other words, or does not say so. So `adapted_modules` lists what was found and is not a full list.",
@@ -609,12 +610,12 @@
     },
     {
       "name": "cryptography",
-      "pinned": "50.0.1",
+      "pinned": "50.0.2",
       "carries": "yes",
       "projects": [
         {
           "name": "OpenSSL",
-          "version": "4.0.2"
+          "version": "4.0.3"
         },
         {
           "name": "Rust crates, the 40 entries of the source distribution's `Cargo.lock`",
@@ -622,19 +623,19 @@
         }
       ],
       "evidence_kind": "wheel file list and source tree",
-      "evidence": "The wheel holds one extension module, `_rust`, and no bundled library. That module holds the string `OpenSSL 4.0.2 25 Aug 2026` on both platforms, so OpenSSL is linked in. The source distribution's `Cargo.lock` names the Rust crates built into it.",
+      "evidence": "The wheel holds one extension module, `_rust`, and no bundled library. That module holds the string `OpenSSL 4.0.3 29 Sep 2026` on both platforms, so OpenSSL is linked in. The source distribution's `Cargo.lock` names the Rust crates built into it.",
       "files_read": [
         {
-          "file": "cryptography-50.0.1-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
-          "sha256": "ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef"
+          "file": "cryptography-50.0.2-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "sha256": "630ebfea3bf689d075f82316324ff7433dc447fe6bc1bfc76524b74b4a9567d2"
         },
         {
-          "file": "cryptography-50.0.1-cp311-abi3-win_amd64.whl",
-          "sha256": "aed8db4f6d71c51efb89530e12d9464e7bf2923d46c3205dc794a2a93f8c0648"
+          "file": "cryptography-50.0.2-cp311-abi3-win_amd64.whl",
+          "sha256": "7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c"
         },
         {
-          "file": "cryptography-50.0.1.tar.gz",
-          "sha256": "5dd9bda1c12b4162f6ff568eeb5e0ff956c28d14406e875cfe8a63a2d414ff20"
+          "file": "cryptography-50.0.2.tar.gz",
+          "sha256": "7b46165bb56eb4704e2eaaf86f3c940d19154535d9b0ca7d6d590b04060e00d5"
         }
       ],
       "source": {
@@ -649,8 +650,8 @@
       },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05",
+      "surveyed": "2026-10-07",
+      "forms_surveyed": "2026-10-07",
       "word_hits": [
         {
           "files": [
@@ -670,21 +671,21 @@
     },
     {
       "name": "fastapi",
-      "pinned": "0.141.1",
+      "pinned": "0.142.2",
       "carries": "no",
       "projects": [],
       "evidence_kind": "wheel tag and file list",
-      "evidence": "PyPI lists one wheel for the pinned version, `fastapi-0.141.1-py3-none-any.whl`, tagged `none-any`. Its 61 files were listed, and none is a compiled file.",
+      "evidence": "PyPI lists one wheel for the pinned version, `fastapi-0.142.2-py3-none-any.whl`, tagged `none-any`. Its 65 files were listed, and none is a compiled file.",
       "files_read": [
         {
-          "file": "fastapi-0.141.1-py3-none-any.whl",
-          "sha256": "bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3"
+          "file": "fastapi-0.142.2-py3-none-any.whl",
+          "sha256": "bd5f4d81f1e93a88bcd77caf4dfe3c2dbffc3805407a0007e9a114c18b3a670b"
         }
       ],
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 61 files were listed again. The top-level name is `fastapi`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The seven `.md` files under `fastapi/.agents` are the project's own notes. The word search hit 3 files: 0 recorded as an adapted module, 3 as copied lines and 0 as prose. `word_hits` lists each."
+        "evidence": "The wheel's 65 files were listed again. The top-level name is `fastapi`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The seven `.md` files under `fastapi/.agents` are the project's own notes. The word search hit 3 files: 0 recorded as an adapted module, 3 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -693,8 +694,8 @@
       },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05",
+      "surveyed": "2026-10-07",
+      "forms_surveyed": "2026-10-07",
       "word_hits": [
         {
           "files": [
@@ -729,10 +730,10 @@
             "fastapi/routing.py"
           ],
           "lines": [
-            192,
-            197,
-            215,
-            222
+            199,
+            204,
+            222,
+            229
           ],
           "words": [
             "vendored"
@@ -1125,6 +1126,36 @@
           "words": "# Copyright (c) 2009 Raymond Hettinger"
         }
       ]
+    },
+    {
+      "name": "opentelemetry-api",
+      "pinned": "1.45.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `opentelemetry_api-1.45.0-py3-none-any.whl`, tagged `none-any`. Its 47 files were listed, and none is a compiled file.",
+      "files_read": [
+        {
+          "file": "opentelemetry_api-1.45.0-py3-none-any.whl",
+          "sha256": "80e068aba7cd56c8b58512d6a36f8d25cb1dfaa0c0a4cc1c938ccf9f362d9cb3"
+        }
+      ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 47 files were listed again. The top-level name is `opentelemetry`, the namespace package the project's own distributions share. No directory has a vendoring name, and the one licence file is the project's own. The word search hit no file."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB. The largest Python module, `opentelemetry/metrics/_internal/__init__.py` at 30,867 bytes, was opened and is the project's own metrics API, not a table."
+      },
+      "route": null,
+      "route_reason": null,
+      "surveyed": "2026-10-07",
+      "forms_surveyed": "2026-10-07",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "psutil",
@@ -1551,15 +1582,15 @@
     },
     {
       "name": "pyspnego",
-      "pinned": "0.12.2",
+      "pinned": "0.12.3",
       "carries": "no",
       "projects": [],
       "evidence_kind": "wheel tag and file list",
-      "evidence": "PyPI lists one wheel for the pinned version, `pyspnego-0.12.2-py3-none-any.whl`, tagged `none-any`. Its 38 files were listed, and none is a compiled file.",
+      "evidence": "PyPI lists one wheel for the pinned version, `pyspnego-0.12.3-py3-none-any.whl`, tagged `none-any`. Its 38 files were listed, and none is a compiled file.",
       "files_read": [
         {
-          "file": "pyspnego-0.12.2-py3-none-any.whl",
-          "sha256": "04e7c9260ced15197b3f42b891ffa30fa98c37bb09372c5c2bf927bcdfe30b53"
+          "file": "pyspnego-0.12.3-py3-none-any.whl",
+          "sha256": "39b87aa00491e554cef05441bf2f7e52e85b09b5229ff62a89c35b59548794be"
         }
       ],
       "source": {
@@ -1574,8 +1605,8 @@
       },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05",
+      "surveyed": "2026-10-07",
+      "forms_surveyed": "2026-10-07",
       "word_hits": [],
       "adapted_modules": []
     },
@@ -1923,24 +1954,24 @@
     },
     {
       "name": "uvloop",
-      "pinned": "0.22.1",
+      "pinned": "0.23.0",
       "carries": "yes",
       "projects": [
         {
           "name": "libuv",
-          "version": "1.48.0"
+          "version": "1.52.1"
         }
       ],
       "evidence_kind": "wheel file list and source tree",
-      "evidence": "The wheel holds one extension module, `loop`, of about 15 MB, and no bundled library. It names only libc, libpthread and librt as needed libraries and holds libuv's `uv_version_string` symbol. The source distribution carries libuv under `vendor/libuv`, its `include/uv/version.h` gives 1.48.0, and `setup.py` builds that copy unless told to use the system's. PyPI has no Windows wheel for it.",
+      "evidence": "The wheel holds one extension module, `loop`, of about 15 MB, and no bundled library. It names only libc, libpthread and librt as needed libraries and holds libuv's `uv_version_string` symbol. The source distribution carries libuv under `vendor/libuv`, its `include/uv/version.h` gives 1.52.1, and `setup.py` builds that copy unless told to use the system's. PyPI has no Windows wheel for it.",
       "files_read": [
         {
-          "file": "uvloop-0.22.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
-          "sha256": "c1955d5a1dd43198244d47664a5858082a3239766a839b2102a269aaff7a4e25"
+          "file": "uvloop-0.23.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+          "sha256": "31e0cf90bc8fd88784f6802cdba968a51fb1aec1cc3feec74d862b2d371d1330"
         },
         {
-          "file": "uvloop-0.22.1.tar.gz",
-          "sha256": "6c84bae345b9147082b17371e3dd5d42775bddce91f885499017f4607fdaf39f"
+          "file": "uvloop-0.23.0.tar.gz",
+          "sha256": "28d160f51ab4da3b187063652e643dea6831072add4adc1e6d62afbe73b6be27"
         }
       ],
       "source": {
@@ -1955,8 +1986,8 @@
       },
       "route": "highlight",
       "route_reason": "libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it.",
-      "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05",
+      "surveyed": "2026-10-07",
+      "forms_surveyed": "2026-10-07",
       "word_hits": [
         {
           "files": [
@@ -1977,7 +2008,7 @@
             "uvloop/loop.pyx"
           ],
           "lines": [
-            1445
+            1442
           ],
           "words": [
             "copied from"
@@ -1990,7 +2021,7 @@
             "uvloop/handles/stream.pyx"
           ],
           "lines": [
-            377
+            384
           ],
           "words": [
             "copied from"
