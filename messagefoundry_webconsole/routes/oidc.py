@@ -33,7 +33,8 @@ Two deliberate departures a reviewer will want to check rather than "fix":
   POST leg directly when the interstitial is skipped is NOT refused for that: a browser sends no
   ``Origin`` on a GET navigation, and owner rulings R4 and R4b of 2026-09-28 hold that a sign-in
   GET is never blocked for missing fetch metadata. ``assert_same_origin`` keeps its earlier rule
-  on a GET, so that navigation still refuses ``cross-site``, ``same-site`` and a foreign ``Origin``.
+  on a GET, so that navigation still refuses ``cross-site`` and ``same-site``. What it does with
+  ``Origin`` on a GET is stated once, in :func:`.._auth.assert_same_origin`.
 * **The callback returns 200 + a meta refresh, never a 303.** See :func:`pages.oidc_landing`.
 
 Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter.**

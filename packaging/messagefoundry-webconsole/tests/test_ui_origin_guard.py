@@ -205,6 +205,34 @@ def test_a_padded_sec_fetch_site_is_refused_by_the_check_itself() -> None:
         webconsole_auth.assert_same_origin(request("GET", "same-site"))
 
 
+def test_a_get_with_any_sec_fetch_site_line_deliberately_does_not_read_origin() -> None:
+    """DELIBERATE, and narrowing it is an owner call. On a GET, a present ``Sec-Fetch-Site`` line
+    settles the request, an empty or unknown one included, and ``Origin`` is never read. So a GET
+    with such a line and a FOREIGN ``Origin`` is not refused. That is the ``origin/main`` rule,
+    which owner rulings R4 and R4b of 2026-09-28 keep for the sign-in GETs.
+
+    Put to the function directly: over HTTP the fetch-metadata middleware and the route's own
+    checks sit around it, and this pins what ``assert_same_origin`` itself does.
+
+    Controls: the same foreign ``Origin`` with NO ``Sec-Fetch-Site`` line is refused on a GET, and
+    the same headers on a POST are refused, so the passes are this rule and not a dead check."""
+    state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
+
+    def request(method: str, headers: dict[str, str]) -> Any:
+        return SimpleNamespace(
+            method=method,
+            headers=Headers({"host": "t", "origin": EVIL_ORIGIN, **headers}),
+            app=SimpleNamespace(state=state),
+        )
+
+    for value in ("", "x"):
+        webconsole_auth.assert_same_origin(request("GET", {"sec-fetch-site": value}))
+        with pytest.raises(HTTPException):
+            webconsole_auth.assert_same_origin(request("POST", {"sec-fetch-site": value}))
+    with pytest.raises(HTTPException):
+        webconsole_auth.assert_same_origin(request("GET", {}))
+
+
 async def test_login_with_neither_header_fails_closed_without_setting_a_cookie(
     engine: Engine,
 ) -> None:
