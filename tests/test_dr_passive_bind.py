@@ -79,7 +79,8 @@ async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_criti
         assert not await _accepts(crit_port) and not await _accepts(norm_port)
         assert set(rr.filtered_inbound()) == {_CRIT, _NORM}
         assert rr.inbound_failed(_CRIT) is None  # parked, not failed
-        assert rr.filtered_outbound() == {}  # a passive box parks no outbound
+        # A passive box parks every outbound too (vault BACKLOG #3262).
+        assert set(rr.filtered_outbound()) == {"OB_CRIT_ADT", "OB_NORM_ADT"}
 
         # The engine callback POST /dr/activate runs once its seed and VIP gates pass.
         await engine._dr_activate_profile()
@@ -97,7 +98,7 @@ async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_criti
         await engine.reload_detail(cfg)
         assert not await _accepts(crit_port) and not await _accepts(norm_port)
         assert set(rr.filtered_inbound()) == {_CRIT, _NORM}
-        assert rr.filtered_outbound() == {}
+        assert set(rr.filtered_outbound()) == {"OB_CRIT_ADT", "OB_NORM_ADT"}
 
 
 async def test_a_box_activated_at_startup_binds_only_the_critical_feed(tmp_path: Path) -> None:
