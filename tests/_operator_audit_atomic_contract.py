@@ -212,23 +212,6 @@ async def assert_operator_audit_atomic(store: Any) -> None:
         changed=resend_changed,
     )
 
-    # --- resend_to with an edited body: a new child carries the operator (vault BACKLOG #2615)
-    direct_alt = f"OB_D{tag}"
-    direct = await store.resend_to(
-        message_id=done_mid,
-        to=direct_alt,
-        idempotency_key=f"contract-direct-{tag}",
-        body_override=_RAW.replace("DOE^JANE", "DOE^JUNE"),
-        actor="contract-op",
-    )
-    assert direct.status == "resent" and direct.new_message_id is not None
-    direct_child = await store.get_message(direct.new_message_id)
-    assert direct_child is not None
-    assert (direct_child["origin"], direct_child["origin_actor"]) == (
-        MessageOrigin.OPERATOR_EDIT.value,
-        "contract-op",
-    )
-
     # --- reingress: an edited body re-enters the origin channel as a new message
     origin_ch = f"IB_R{tag}"
     origin = await _seed(store, origin_ch, dest, settle=None)
@@ -266,6 +249,40 @@ async def assert_operator_audit_atomic(store: Any) -> None:
         ),
         unchanged=reingress_unchanged,
         changed=reingress_changed,
+    )
+
+    # --- resend_to with an edited body: a new child on the origin's channel carries the operator
+    # (vault BACKLOG #2615). Its own outbound and channel, so a claim sees only what it seeded.
+    direct_ch, direct_alt = f"IB_E{tag}", f"OB_E{tag}"
+    direct_origin = await _seed(store, direct_ch, f"OB_F{tag}", settle="done")
+
+    async def direct_unchanged() -> None:
+        assert await count(direct_ch) == 1
+
+    async def direct_changed(outcome: Any) -> None:
+        assert outcome.status == "resent" and await count(direct_ch) == 2
+        assert outcome.new_message_id is not None
+        child = await store.get_message(outcome.new_message_id)
+        assert child is not None
+        assert (child["origin"], child["origin_actor"]) == (
+            MessageOrigin.OPERATOR_EDIT.value,
+            "contract-op",
+        )
+
+    await _check(
+        store,
+        label="resend_to_edited",
+        channel=direct_ch,
+        run=lambda audit: store.resend_to(
+            message_id=direct_origin,
+            to=direct_alt,
+            idempotency_key=f"contract-direct-{tag}",
+            body_override=_RAW.replace("DOE^JANE", "DOE^JUNE"),
+            audit=audit,
+            actor="contract-op",
+        ),
+        unchanged=direct_unchanged,
+        changed=direct_changed,
     )
 
     # --- enqueue_ingress with an audit: the upload inject

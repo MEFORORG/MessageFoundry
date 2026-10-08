@@ -659,7 +659,7 @@ def _body_mac(key: bytes, body: str) -> HMAC:
     return mac
 
 
-def audit_body_digests(cipher: Cipher, **bodies: str) -> dict[str, str | None] | None:
+def audit_body_digests(cipher: Cipher, /, **bodies: str) -> dict[str, str | None] | None:
     """Keyed digests of message bodies for an audit row (vault BACKLOG #2615).
 
     Returns ``{"alg", "key_id", <name>: <hex or None>, ...}``, one entry per keyword. An empty body,
@@ -668,8 +668,9 @@ def audit_body_digests(cipher: Cipher, **bodies: str) -> dict[str, str | None] |
     :func:`verify_audit_body_digest` can still find that key after a rotation.
 
     The key is HKDF-SHA256 over the in-heap audit-chain key under ``mefor/audit-body-digest/v1``. So
-    the digest reveals nothing about a body to a reader of the audit log who lacks the store key, and
-    anyone who holds a candidate body and the key can confirm it. Returns ``None`` when there is no
+    a reader of the audit log who lacks the store key cannot recover or test a body from its digest,
+    and anyone who holds a candidate body and the key can confirm it. The digest is deterministic
+    under one key, so such a reader can still see that two digests match. Returns ``None`` when there is no
     in-heap key: a keyless store, or a Vault Transit cipher whose audit key never enters the engine.
     The caller records that as no digest, never as a plain hash.
 

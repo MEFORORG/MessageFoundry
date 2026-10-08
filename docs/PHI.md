@@ -139,7 +139,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `queue.handler_name` / `destination_name` / `channel_id` | all three | No — names, not bodies | No (metadata, deliberately not ciphered) | **PL-4** | The handler the transform worker runs; the destination the delivery worker drains | `n/a — not PHI` |
 | `messages.control_id`, `messages.message_type` | all three | Low (MSH-10/MSH-9) | **No** — plaintext by design | **PL-4** | Needed plaintext for dedup/routing/indexes (`ix_messages_control`). Covered only by the whole-DB / volume layer | `keep-forever by design` — dedup/routing keys that live and die with the message row |
 | `messages.origin`, `messages.origin_actor` (vault BACKLOG #2615) | all three | **No** — a fixed label and a username, never message content | **No** — plaintext by design | **PL-4** | How the row came to exist: `partner`, `operator_edit`, `operator_upload` or `reingress`, and for the two operator origins the acting user. Written at insert and never updated. Plain on purpose, because it must outlive the body and the ciphered `metadata`, which retention blanks. `NULL` on a row written before the column existed means not recorded. See [§6](#6-audit--accountability) | `keep-forever by design` — provenance that lives and dies with the message row |
-| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access*, not the PHI itself. Its writers only ever store filter shapes, counts and ids, plus one exception: an edit-resend row holds **keyed** HMAC-SHA256 digests of the original and the edited body, which reveal nothing without the store key ([§6](#6-audit--accountability), vault BACKLOG #2615) | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
+| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access*, not the PHI itself. Its writers only ever store filter shapes, counts and ids, plus at least these exceptions: an edit-resend row holds **keyed** HMAC-SHA256 digests of the original and the edited body, and an upload-inject row one of the injected body. Without the store key a digest cannot be recovered or tested against a guess ([§6](#6-audit--accountability), vault BACKLOG #2615) | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
 | `audit_log.client` (ADR 0150) | all three | **No** — a network address; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The caller's client address — the "from where" of an audited action; `NULL` for engine-internal/`system` writes. **Personal data, but not PHI**, and exactly what HIPAA §164.312(b) audit controls exist to capture. Plaintext by decision: it must stay greppable/indexable for incident response, it already appears in the clear in `sessions.client`, and it is folded **inside** the tamper-evident hash chain — so it carries **integrity** protection even without confidentiality. Widens a store-file compromise from *who did what* to *who did what from where*; volume encryption + owner-only ACLs on whichever host owns the files — the engine's own `_secure_file` covers the **SQLite** store only ([§10](#10-secure-deployment--operations-checklist)) — are the control | `keep-forever by design` — same `audit_log` row lifetime as `detail`; the value is folded **inside** the hash chain |
 | `delivered_keys` (H2 idempotency ledger) | all three | **No** — hashes + ids only | No (deliberately not ciphered — nothing to protect) | **PL-4** | One row per completed outbound delivery: a SHA-256 `delivery_key` over non-PHI ids + a replay-stable seq, plus `outbox_id`/`message_id`/`destination_name`/`delivery_seq`. **Never a body or any PHI** — `control_id` is only *folded into the hash input*, never stored in the clear here. Lets the FIFO claim skip-and-complete a re-claimed already-delivered head without re-sending | `keep-forever by design` — the idempotency ledger a re-claimed already-delivered row checks instead of re-sending |
 | `state.namespace` / `state.key` | all three | **Possibly** — a Handler that keys correlation state on a raw MRN stores that identifier here in the clear | **No** — plaintext by construction: the pair is the composite primary key **and** the AAD input for `state.value`, so it cannot be ciphered without losing the lookup | **PL-4** | Authors must key state on a **surrogate, never a raw identifier**. Covered only by the whole-DB / volume layer. Rides `[retention].state_max_age_days` with its value | ``rides `[retention].state_max_age_days` `` |
@@ -1316,7 +1316,7 @@ sent, not only that something was. Two pieces of evidence outlive the bodies:
 
 | Evidence | Where | What it holds |
 |---|---|---|
-| Body digests | the `message_edit_resend` audit row, `detail.body_digest` | `alg` (`hmac-sha256`), `key_id`, and an `original` and an `edited` digest. `original` is the origin message's stored body; it is `null` when retention had already blanked it |
+| Body digests | the `message_edit_resend` audit row, `detail.body_digest` | `alg` (`hmac-sha256`), `key_id`, and an `original` and an `edited` digest. `original` is the origin message's body as the store holds it, so after any document detach or prune; it is `null` when retention had already blanked it. `edited` is the edited body as the engine admitted and stored it, after the inbound's own normalization such as line endings |
 | Origin | `messages.origin` and `messages.origin_actor` on the new message, repeated as `detail.origin` | `operator_edit` and the acting user. Anything an inbound connection takes in reads `partner`, a timer's configured body included. Upload injects read `operator_upload`, and the engine's own loopback and pass-through hops read `reingress` |
 
 Both modes write the same row: a re-route names the new message in `new_message_id`, and so does a
@@ -1326,8 +1326,8 @@ upload inject's `upload.resend` row carries the same kind of digest, of the inje
 
 **What the `edited` digest covers depends on the mode.** A direct send delivers the edited body
 itself, so the digest is of what the partner received. A re-route puts the edited body back on the
-origin channel, where a handler transforms it, so the digest is of what the operator submitted, not
-of the handler's output.
+origin channel, where a handler transforms it, so the digest is of the body that re-entered, not of
+the handler's output.
 
 **The digest is keyed, never a plain hash.** A short PHI body, such as one result value or one
 name, can be guessed, and a plain hash kept for good in the audit log would let anyone holding the
@@ -1339,7 +1339,9 @@ keyed ranges depend on the same key, so keep a retired key for as long as its ro
 
 **To prove a body afterwards,** hold the candidate body and the store key, and call
 `verify_audit_body_digest` in `store/crypto.py` with the row's `key_id` and digest. A match shows
-that body is the one the row describes. A reader without the key learns nothing from the digest.
+that body is the one the row describes. A reader without the key can neither recover a body nor
+test a guess. The digest is deterministic under one key, so that reader can still see that two
+digests are equal, for example that an edit changed nothing.
 
 **A store with no in-heap audit key records no digest.** That is a keyless store, and a
 `vault_transit` store, whose audit key never enters the engine. The row then holds

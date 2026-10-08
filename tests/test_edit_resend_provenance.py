@@ -51,7 +51,8 @@ TRANSFORMED = "MSH|^~\\&|MEFOR|RF|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rZXF|sent\
 
 
 def _plain_digests(body: str) -> set[str]:
-    """Every unkeyed digest a careless writer might have stored, to prove none of them is."""
+    """The bare SHA-256 and SHA-1 of a body: the plain hashes this change must not store. Not every
+    unkeyed derivation; the re-route child id is one, and it predates this change."""
     data = body.encode()
     return {hashlib.sha256(data).hexdigest(), hashlib.sha1(data).hexdigest()}
 
@@ -284,7 +285,7 @@ async def test_the_audit_row_proves_what_was_sent(tmp_path: Path, payload: dict[
             MessageOrigin.OPERATOR_EDIT.value,
             rec["actor"],
         )
-        # No body, and no plain hash of one, ever reaches the row.
+        # No body, and no bare hash of one, reaches the row.
         text = str(rec["detail"])
         assert "PID|" not in text and "DOE^JOHN" not in text
         for plain in _plain_digests(EDITED) | _plain_digests(ADT):
