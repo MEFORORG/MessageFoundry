@@ -616,6 +616,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "match the 'lens parse --contract' that produced them, so a v1 client's coordinates resolve "
         "against the v1 partition and a v2 client's against the v2 one",
     )
+    lens_rewrite.add_argument(
+        "--typed-only",
+        action="store_true",
+        help="refuse at least the edits known to carry raw Python source - a 'paste_block', an "
+        "if/elif 'test', and a move or delete of code not shown as typed steps (default off; an "
+        "analyst-facing editor must set it)",
+    )
     # `lens rewrite` has no --json flag, yet every error it reports is JSON on stdout. Setting the
     # attribute lets `main` treat it as a --json command: its logging goes to stderr (BACKLOG #1489),
     # and an uncaught exception still yields `{"error": ...}` (#1863). `_lens_rewrite` never reads it.
@@ -2516,6 +2523,7 @@ def _serve(args: argparse.Namespace) -> int:
         revocation_attested_hops=(),
         api=settings.api,
         approvals=settings.approvals,
+        cert_monitor=settings.cert_monitor,
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
@@ -3760,18 +3768,22 @@ def _serve(args: argparse.Namespace) -> int:
             )
 
     # --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need a RECIPIENT, not just a relay ---
-    # The unclaimed-temporary-password reminder and the cert-expiry reminder go to the [alerts]
-    # notifier, and notifier_from_settings builds one only from a webhook_url, or from SMTP host +
-    # sender + at least one email_to. The per-user channel above needs no email_to (each notice is
-    # addressed to its account), so a config that passes it can still send every reminder to the log
+    # The unclaimed-temporary-password reminder, the cert-expiry reminder and the secret-rotation
+    # reminder go to the [alerts] notifier, and notifier_from_settings builds one only from a
+    # webhook_url, or from SMTP host + sender + at least one email_to. The per-user channel above
+    # needs no email_to (each notice is addressed to its account), so a config that passes it can still send every reminder to the log
     # alone. Same refuse/warn split and the same audited waiver as the channel gate, so an instance
     # that waived out-of-band notices in writing is not refused twice. The recipient test IS
     # configured_alert_transport_names, the no-build mirror of notifier_from_settings, so the two
     # cannot drift.
     from messagefoundry.pipeline.alert_sinks import configured_alert_transport_names
 
+    # BACKLOG #2227: the secret-rotation reminder counts too. Without it, a config that turned the
+    # other two off passed this gate silently while that reminder, still on, reached only the log.
     reminder_can_fire = (
-        settings.auth.initial_password_expiry_hours > 0 or settings.cert_monitor.warn_days > 0
+        settings.auth.initial_password_expiry_hours > 0
+        or settings.cert_monitor.warn_days > 0
+        or settings.secret_rotation.warn_days > 0
     )
     if reminder_can_fire and not configured_alert_transport_names(settings.alerts):
         if settings.alerts.security_notifications_required:
@@ -3780,7 +3792,8 @@ def _serve(args: argparse.Namespace) -> int:
                     "error: no [alerts] recipient is configured on a "
                     f"{'production ' if production else ''}PHI instance ({env_name!r}); "
                     "refusing to start — the credential reminders (an unclaimed temporary "
-                    "password nearing its deadline, a certificate nearing expiry) would reach "
+                    "password nearing its deadline, a certificate nearing expiry, a secret due "
+                    "for rotation) would reach "
                     "only the log (ASVS 6.4.5). Set [alerts].webhook_url, or email_to alongside "
                     "email_smtp_host + email_from; or, to accept reminders in the log only, set "
                     "[alerts].security_notifications_required=false (audited).",
@@ -3790,7 +3803,8 @@ def _serve(args: argparse.Namespace) -> int:
             print(
                 "warning: no [alerts] recipient is configured in a PHI-carrying environment "
                 f"({env_name!r}) — the credential reminders (an unclaimed temporary password, an "
-                "expiring certificate) reach only the log. Set [alerts].webhook_url, or email_to "
+                "expiring certificate, a secret due for rotation) reach only the log. Set "
+                "[alerts].webhook_url, or email_to "
                 "alongside email_smtp_host + email_from (ASVS 6.4.5).",
                 file=sys.stderr,
             )
@@ -5020,6 +5034,7 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
         rewrite_module,
         rewrite_source,
     )
+    from messagefoundry.redaction import safe_exc
 
     # Read stdin as raw UTF-8 (never the Windows locale codepage) so source bytes round-trip exactly —
     # byte-stability (gate 2) would break if a non-ASCII char (the samples carry — and → in comments)
@@ -5044,7 +5059,7 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
         stdin_source = _read_stdin() if args.module == "-" else None
     except UnicodeDecodeError as exc:
         return _emit_error(
-            f"<stdin>: cannot read (not UTF-8 at byte {exc.start}: {exc.reason})",
+            f"<stdin>: cannot read (not UTF-8: {safe_exc(exc)})",
             as_json=True,
             code=REFUSAL_GENERIC,
         )
@@ -5059,9 +5074,17 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
 
     try:
         if stdin_source is not None:
-            rewritten = rewrite_source(stdin_source, edit, module="<stdin>", contract=args.contract)
+            rewritten = rewrite_source(
+                stdin_source,
+                edit,
+                module="<stdin>",
+                contract=args.contract,
+                typed_only=args.typed_only,
+            )
         else:
-            rewritten = rewrite_module(args.module, edit, contract=args.contract)
+            rewritten = rewrite_module(
+                args.module, edit, contract=args.contract, typed_only=args.typed_only
+            )
     except LensRewriteError as exc:
         # The code is the refusal family the IDE branches on (BACKLOG #237); the message stays prose.
         return _emit_error(str(exc), as_json=True, code=exc.code)
@@ -5715,6 +5738,7 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
     # itself, because the engine's `[integrity].audit_anchor_file` startup check consumes the SAME
     # artifact (BACKLOG #328). A copy here would be the one place a later hardening -- of the refusals,
     # the encoding handling, or the byte bound -- could reach the CLI and miss the engine.
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.store import parse_audit_anchor, read_audit_anchor_file
 
     raw: str | None
@@ -5728,7 +5752,8 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
             # would have read a file-encoding problem as a detected tamper. PowerShell 5.1's `>`
             # writes UTF-16LE, so this is the likely file, not an exotic one.
             print(
-                f"error: cannot read --expected-anchor-file {args.expected_anchor_file!r}: {exc}. "
+                f"error: cannot read --expected-anchor-file {args.expected_anchor_file!r}: "
+                f"{codec_safe_str(exc)}. "
                 "It must be a UTF-8 text file holding the COUNT:HEAD line; PowerShell 5.1's '>' "
                 "writes UTF-16 — pipe to 'Set-Content -Encoding utf8' there.",
                 file=sys.stderr,
@@ -9365,6 +9390,7 @@ def _security(args: argparse.Namespace) -> int:
         ApiSettings,
         ApprovalsSettings,
         AuthSettings,
+        CertMonitorSettings,
         SecretRotationSettings,
         SecuritySettings,
         StoreSettings,
@@ -9375,7 +9401,7 @@ def _security(args: argparse.Namespace) -> int:
     path = args.service_config
 
     # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api]/[approvals] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # [secret_rotation]/[api]/[approvals]/[cert_monitor] deviations (ADR 0148: one posture). Resolve those from the whole file so the
     # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
@@ -9390,6 +9416,8 @@ def _security(args: argparse.Namespace) -> int:
     _api = ApiSettings()
     # BACKLOG #2489: [approvals] carries the dual-control dwell and expiry. Same read, same marker.
     _approvals = ApprovalsSettings()
+    # BACKLOG #2227: [cert_monitor].warn_days = 0 turns the certificate reminder off. Same read and marker.
+    _cert_monitor = CertMonitorSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -9400,6 +9428,7 @@ def _security(args: argparse.Namespace) -> int:
             _rotation = _full.secret_rotation
             _api = _full.api
             _approvals = _full.approvals
+            _cert_monitor = _full.cert_monitor
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -9434,6 +9463,7 @@ def _security(args: argparse.Namespace) -> int:
                 revocation_attested_hops=(),
                 api=_api,
                 approvals=_approvals,
+                cert_monitor=_cert_monitor,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
@@ -9460,7 +9490,8 @@ def _security(args: argparse.Namespace) -> int:
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]); the "
+            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
+            "[cert_monitor]); the "
             "per-connection "
             "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
             "generic-ODBC database TLS, "

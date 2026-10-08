@@ -110,6 +110,7 @@ tests/test_install_gate_records_the_install.py
 tests/test_install_gate_upstream_provenance.py
 tests/test_npm_audit_retry.py
 tests/test_quality_expiry_audit.py
+tests/test_quality_shard_tests.py
 tests/test_coord_seat_roster_verdict.py
 tests/test_coord_seat_prompt.py
 tests/test_coord_seat_session_key.py
@@ -159,6 +160,7 @@ tests/test_required_contexts.py
 tests/test_required_contexts_drift.py
 tests/test_required_workflow_state.py
 tests/test_rescue_ref_provenance.py
+tests/test_review_standards.py
 tests/test_role_cards.py
 tests/test_scan_forbidden_loaded_set.py
 tests/test_sbom_finalize.py

@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import StreamingResponse
 
 # The /ui admin pages moved to the messagefoundry_webconsole package (Option B, ADR 0065); this module
@@ -71,9 +72,12 @@ from messagefoundry.api.auth_models import (
 )
 from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
+    AuthenticatedBeforeBodyRoute,
+    RepeatedCredentialError,
     alert_administrator_granted,
     alert_directory_administrator_granted,
     answers_before_body,
+    authorization_header,
     bearer_token,
     bearer_token_dependency,
     client_ip,
@@ -81,6 +85,7 @@ from messagefoundry.api.security import (
     pending_credential_deadline,
     pending_credential_deadline_for,
     public_route,
+    record_repeated_credential,
     require,
     require_reauth_only_action,
     require_step_up,
@@ -233,26 +238,6 @@ def _client(request: Request) -> str | None:
     # rotation from a directly-reachable attacker (SEC-024) — the real brute-force bounds are the
     # global ceiling + per-account argon2 lockout (applied to both the password and MFA factors).
     return request.client.host if request.client else None
-
-
-async def _no_store_reply(response: Response) -> None:
-    """Forbid caching a reply whose BODY carries a live credential (ASVS 7.2.4 delivery, 14.2.2).
-
-    A session token, a staged TOTP seed, one-time recovery codes and an admin-issued temporary
-    password all have to reach the client somehow, and the body is the only channel a bearer client
-    has. So none of those replies may sit in a proxy or browser cache, where a later reader could
-    lift a working credential out of one.
-
-    Every credential-bearing route declares this as a ROUTE-LEVEL dependency
-    (``dependencies=[Depends(_no_store_reply)]``), one mechanism for all of them. That form also
-    leaves the handler's own signature alone, which matters because the web console calls
-    ``enroll_mfa`` and ``reset_user_password`` as plain functions; their HTML replies are under
-    ``/ui``, which the security-header middleware already serves ``no-store``. A refusal raises
-    before the reply is built, and FastAPI drops the header with it, which is fine: a refusal carries
-    no credential. ``tests/test_credential_reply_no_store.py`` finds every route whose response model
-    carries one of the credential field names it lists, and drives each one on the wire (BACKLOG
-    #1185)."""
-    response.headers["Cache-Control"] = "no-store"
 
 
 def _current_user(identity: Identity) -> CurrentUser:
@@ -429,6 +414,20 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     :class:`AdminHandlers` type lives in the engine leaf ``api._ui_seam`` (never the console package),
     so this function — called UNCONDITIONALLY from ``create_app`` — imports with the console absent.
     """
+    # The credential replies below are served no-store by the route class, not by any route
+    # (BACKLOG #2372), so on a router without it they would go out cacheable.
+    if not issubclass(app.router.route_class, AuthenticatedBeforeBodyRoute):
+        raise RuntimeError("add_auth_routes needs the AuthenticatedBeforeBodyRoute route class")
+
+    async def _repeated_credential(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2454: every HTTP read of a repeated Authorization header or session cookie, on
+        # the engine or the mounted console, raises this one error, so it is logged and audited in
+        # one place. Then the ordinary 400 answer, the one a plain HTTPException gets.
+        assert isinstance(exc, RepeatedCredentialError)
+        await record_repeated_credential(request, exc.credential)
+        return await http_exception_handler(request, exc)
+
+    app.add_exception_handler(RepeatedCredentialError, _repeated_credential)
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)
@@ -452,7 +451,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/auth/login",
         response_model=LoginResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     @public_route("sign-in itself; a session does not exist yet")
     async def login(
@@ -501,7 +499,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/auth/negotiate",
         response_model=LoginResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     @public_route("Kerberos sign-in itself; a session does not exist yet")
     async def negotiate(
@@ -509,7 +506,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> LoginResponse:
         if not service.allow_login_attempt(_client(request)):
             raise _rate_limited(request, "negotiate")
-        header = request.headers.get("Authorization", "")
+        header = authorization_header(request)  # 400 on a repeated header (BACKLOG #2454)
         if not header.startswith("Negotiate "):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing SPNEGO token")
         try:
@@ -642,7 +639,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/me/reauth",
         response_model=ElevatedResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def reauth(
         body: ReauthRequest,
@@ -710,7 +706,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/auth/mfa-verify",
         response_model=ElevatedResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def mfa_verify(
         body: MfaVerifyRequest,
@@ -760,7 +755,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/me/mfa/enroll",
         response_model=MfaEnrollResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def enroll_mfa(
         service: AuthService = Depends(_service),
@@ -781,7 +775,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/me/mfa/confirm",
         response_model=MfaConfirmResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def confirm_mfa(
         body: MfaConfirmRequest,
@@ -809,7 +802,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
-        # _no_store_reply dependency keeps the reply out of every cache.
+        # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).
         return MfaConfirmResponse(
             recovery_codes=list(elevation.recovery_codes), token=elevation.token
         )
@@ -1082,8 +1075,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         "/users",
         response_model=UserCreatedResponse,
         status_code=status.HTTP_201_CREATED,
-        # ADR 0197 Amendment A (AC-A2): the reply carries the generated credential (ASVS 14.2.2).
-        dependencies=[Depends(_no_store_reply)],
+        # ADR 0197 Amendment A (AC-A2): the reply carries the generated credential (ASVS 14.2.2),
+        # so its CredentialReply model makes the route class serve it no-store (BACKLOG #2372).
     )
     async def create_user(
         body: UserCreateRequest,
@@ -1298,7 +1291,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/users/{user_id}/reset-password",
         response_model=PasswordResetResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def reset_user_password(
         user_id: ResourceId,
@@ -1354,8 +1346,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/users/{user_id}/reset-mfa",
         response_model=MfaResetResponse,
-        # ADR 0197 Amendment A (AC-A4): a local account's reply carries the generated credential.
-        dependencies=[Depends(_no_store_reply)],
+        # ADR 0197 Amendment A (AC-A4): a local account's reply carries the generated credential,
+        # so its CredentialReply model makes the route class serve it no-store (BACKLOG #2372).
     )
     async def reset_user_mfa(
         user_id: ResourceId,

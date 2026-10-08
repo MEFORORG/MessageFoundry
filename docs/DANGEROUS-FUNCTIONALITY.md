@@ -267,7 +267,8 @@ What each form means:
 - **shell string** -- one string that a shell parses and runs.
 
 **What holds the argument-list starts.** Python hands the program and its arguments to the OS
-without a shell, and `tray/actions.py` sets `shell=False` explicitly. Where the program is a Windows
+without a shell, and `tray/actions.py` sets `shell=False` explicitly. That setting alone does not
+keep `cmd.exe` out of a start; the second item below says why. Where the program is a Windows
 system tool, the code pins its absolute path under the system directory, so a same-named program
 planted in the working directory cannot run instead. The security lint marks the reviewed sites with
 a `nosec` note naming the rule it answers.
@@ -276,12 +277,19 @@ Two argument-list starts are not pinned that way:
 
 - `checks.py` is a developer tool. It runs `ruff` and `mypy` by bare name, so Windows may find a
   copy in the working directory before the one on `PATH`.
-- `tray/actions.py` opens a folder in VS Code through its `code` command. On Windows that command
-  is a batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`. So a shell does read
-  that start's arguments, one of which is `repo_path` from `tray.toml`. The command is found with
-  `shutil.which`, whose Windows search can include the working directory, so a planted `code.cmd`
-  may win there too. What holds it: `repo_path` must name an existing folder, and the tray runs as
-  the signed-in user, who owns `tray.toml`.
+- `tray/actions.py` opens a folder in VS Code. It finds the `code` command, which on Windows is a
+  batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`, which re-reads the whole
+  command line. So the tray does not start that file where it can avoid it. `resolve_vscode` looks
+  for the editor program beside the command's `bin` folder and starts that, with `repo_path` from
+  `tray.toml` as one argument. No shell reads that start (BACKLOG #2327). Where no such program is
+  found, the batch file is the fallback, and `cmd.exe` cannot be avoided. `open_repo` then refuses
+  the start unless `repo_path` and the batch file's own path are made of plain characters only.
+  It escapes nothing. [`TRAY.md`](TRAY.md) lists the characters it allows. The menu offers the start only
+  when `repo_path` names an existing folder on a local drive letter; `open_repo` does not check
+  that again. Nothing pins which `code` command is found: `shutil.which` can search the working
+  directory on Windows, so a planted `code.cmd` may win, and it would run as the fallback. What
+  holds that is that the tray runs as the signed-in user, who owns `tray.toml` and their own
+  `PATH`.
 
 **What each child is handed.** A process started with no environment of its own gets a copy of the
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
@@ -297,7 +305,8 @@ the script only from a checkout. Windows hands that process the user's environme
 process's import path (vault BACKLOG #2852). The relaunch it starts does read the user's
 `PYTHONPATH`, as above. A tray started by hand gets none of the options. Section 3, under
 *Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The other
-starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
+starts in the table hand over the whole environment. One of them leaves two names out: when the
+tray starts VS Code, it drops the two variables VS Code's own launcher manages. `tests/test_child_process_environment.py`
 lists each of those with its reason, and fails a new start whose environment does not come from
 that module.
 
@@ -356,8 +365,9 @@ pure-Python equivalent:
   the call that creates it and an existing file or link is refused. It asks `advapi32` to build
   that list and to resolve an account name to its SID. POSIX needs no `ctypes` for this; it
   creates the file with `O_CREAT | O_EXCL` and mode `0o600`
-- Log path check: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether View Log's
-  drive letter is a mapped network drive, so it can refuse one before opening the file
+- Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
+  of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
+  and again before View Log opens the file, so it can refuse one before touching it
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
   only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and the disaster-recovery takeover hook use it. On Windows it puts
@@ -545,7 +555,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
+| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
@@ -620,6 +630,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads a value you typed into the extension's connection form | `connectionForm.ts` |
 | It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
+| It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
 
 **Extension files that parse text the patterns cannot see.**
 

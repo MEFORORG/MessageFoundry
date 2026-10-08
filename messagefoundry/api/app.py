@@ -397,6 +397,10 @@ from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
+from messagefoundry.pipeline.security_signals import (
+    SecuritySignalThresholds,
+    install_security_signals,
+)
 from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
@@ -782,16 +786,53 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
     return identity.can_access_channel(channel_id)
 
 
-async def _alert_control_action(engine: Engine, action: str, target: str) -> None:
+#: Which namespace each alert control action restarts (BACKLOG #2528).
+_CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
+
+
+async def _alert_control_action(
+    engine: Engine, action: str, target: str, *, default_target: bool
+) -> None:
     """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
 
     Re-reads ``engine.registry_runner`` on each call, so it stays right across a reload that swaps
     the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067); that
     is the rule working as designed, not a failure, so it is logged once here at INFO and nothing
-    else happens. Any other error reaches the notifier, which logs it and never raises."""
+    else happens. Any other error reaches the notifier, which logs it and never raises.
+
+    ``default_target`` means the rule set no ``control_target``, so ``target`` is the event's own
+    bare name, and the event does not say whether that name is an inbound or an outbound. The two
+    are separate namespaces (BACKLOG #2528). So the restart runs only when the name is declared on
+    the action's side and not on the other: then the event can only have come from that side. A
+    name declared on both sides, or only on the other, is skipped with a WARNING that says to set
+    ``control_target``. A config-load refusal cannot do this, because a rule does not know the
+    graph and a reload can change it."""
     rr = engine.registry_runner
     if rr is None:
         return
+    if default_target:
+        wanted = _CONTROL_ACTION_SIDE.get(action)
+        if wanted is None:
+            _log.warning("alert control_action %s for %r skipped: unknown action", action, target)
+            return
+        sides = {
+            side
+            for side, declared in (
+                ("inbound", target in rr.registry.inbound),
+                # A reload-dropped outbound still draining is an outbound too (#2528 review).
+                ("outbound", rr.knows_outbound(target)),
+            )
+            if declared
+        }
+        if sides != {wanted}:
+            _log.warning(
+                "alert control_action %s for %r skipped: the rule sets no control_target and the "
+                "name is not declared as an %s connection only; set control_target",
+                action,
+                target,
+                wanted,
+            )
+            return
     if action == "restart_inbound":
         if rr.inbound_filtered(target) is not None:
             # An operator start of a parked inbound overrides the profile; a rule is the engine,
@@ -1228,6 +1269,11 @@ def _posture_loosenings(
             api=api_settings,
             # BACKLOG #2489: the dual-control dwell and expiry, read off the gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),
+            # BACKLOG #2227: a short or zero warn_days is named. The managed lifespan stashes the
+            # live section. An app built without it (an embedding, or a test) is read at the
+            # shipped default, the stash-or-default rule [secret_rotation] follows above. KNOWN
+            # GAP: such an engine may run no cert monitor at all, and this then reads it as on.
+            cert_monitor=getattr(state, "cert_monitor_settings", None) or CertMonitorSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -9134,7 +9180,12 @@ async def _remind_expiring_initial_credentials(
     ``warned`` maps a user id to the deadline already reminded about. A new credential on the same
     account has a new deadline, so it is reminded about again. An entry is dropped once its account
     leaves every window (claimed, lapsed, disabled or deleted), so the map stays as small as the set
-    of live reminders."""
+    of live reminders.
+
+    The map is only a cache. The once-only mark is the holder's reminder audit row (BACKLOG #2303),
+    so an account missing from the map is checked against the store before anything is sent. A
+    restart inside the window therefore sends nothing again. A failed read sends the reminders, so
+    a store fault costs a duplicate rather than a credential that lapses with nobody told."""
     now = time.time() if now is None else now
     live: set[str] = set()
     for user in await auth.store.list_users():
@@ -9146,24 +9197,42 @@ async def _remind_expiring_initial_credentials(
         live.add(user.id)
         if warned.get(user.id) == deadline:
             continue
+        try:
+            reminded = await auth.initial_credential_reminded(user, deadline=deadline)
+        except Exception as exc:  # noqa: BLE001 - a failed read must not cost the reminder
+            # Read as not reminded: a duplicate reminder is the cheap failure, a missing one before
+            # the credential lapses the costly. The class only, since a driver message can quote
+            # bound values.
+            _log.warning(
+                "initial credential reminder: could not read whether %s was reminded (%s), so it "
+                "is reminded now",
+                scrub_log_argument(user.username),
+                type(exc).__name__,
+            )
+            reminded = False
+        if reminded:
+            warned[user.id] = deadline
+            continue
         expires = deadline_utc(deadline)
         if expires is None:
             continue
-        sink.initial_credential_expiring(
-            f"user:{user.username}",
-            expires_at=expires,
-            hours_remaining=max(0, int((deadline - now) // 3600)),
-        )
         warned[user.id] = deadline
-        # BACKLOG #2007: the holder and the issuing administrator, under the same once-per-credential
-        # mark as the operator reminder above. A failure here is logged per account, so it neither
-        # repeats the operator reminder nor stops the pass for the accounts after this one.
+        # BACKLOG #2007: the holder and the issuing administrator. This writes the once-only mark
+        # (BACKLOG #2303) before any notice, so it runs before the operator reminder below: a crash
+        # between the two then loses that reminder rather than repeating all three. A failure here
+        # is logged per account, so it neither stops the operator reminder nor the pass for the
+        # accounts after this one.
         try:
             await auth.remind_expiring_initial_credential(user, deadline=deadline)
         except Exception:
             _log.exception(
                 "initial credential reminder: the security notices for %s failed", user.username
             )
+        sink.initial_credential_expiring(
+            f"user:{user.username}",
+            expires_at=expires,
+            hours_remaining=max(0, int((deadline - now) // 3600)),
+        )
     for user_id in warned.keys() - live:
         del warned[user_id]
 
@@ -9721,6 +9790,19 @@ def create_managed_app(
         # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
         credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
+        # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
+        # adds no commit to the request path. Here, just above the span whose finally removes it,
+        # so no startup failure can leave it registered. Before the start's config_loaded row.
+        signal_settings = alerts_settings or AlertsSettings()
+        remove_security_signals = (
+            install_security_signals(
+                notifier or LoggingAlertSink(),
+                SecuritySignalThresholds.from_settings(signal_settings),
+                asyncio.get_running_loop(),
+            )
+            if signal_settings.security_signals
+            else None
+        )
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
@@ -9748,6 +9830,7 @@ def create_managed_app(
                         alerts_settings,
                         secret_provider=secret_provider,
                         trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                        audit=store,
                     )
                 auth = AuthService(
                     store,
@@ -9788,8 +9871,10 @@ def create_managed_app(
             # runner. The sink dispatches this off-worker + never-raise, so exceptions here are logged, not fatal.
             if notifier is not None:
 
-                async def _alert_control(action: str, target: str) -> None:
-                    await _alert_control_action(engine, action, target)
+                async def _alert_control(action: str, target: str, *, default_target: bool) -> None:
+                    await _alert_control_action(
+                        engine, action, target, default_target=default_target
+                    )
 
                 notifier.set_control_callback(_alert_control)
             app.state.engine = engine
@@ -10036,6 +10121,8 @@ def create_managed_app(
                         "window's audit row is lost; continuing the teardown"
                     )
             finally:
+                if remove_security_signals is not None:
+                    remove_security_signals()
                 await engine.stop()
                 # B11: shut down the harness-only instrumented executor (None in production / other tests).
                 # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.

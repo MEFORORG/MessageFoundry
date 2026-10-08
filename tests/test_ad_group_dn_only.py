@@ -11,8 +11,9 @@ key that is not a full DN. Every directory value below is synthetic.
 
 from __future__ import annotations
 
+import gc
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -259,32 +260,86 @@ def test_distinct_groups_keep_distinct_canonical_forms(one: str, other: str) -> 
         assert key.isascii() and key.isprintable() and key == key.lower(), key
 
 
-#: Inputs of about 50,000 characters shaped to make a backtracking parser slow. The first three
-#: target the attribute type, which a nested-quantifier regex checked before this item's ReDoS fix.
-#: Each case is ``id: (text, valid)``; the id keeps a 50,000-character string out of the test name.
-_PATHOLOGICAL_DNS = {
-    "oid-failing-at-its-end": ("1" + ".1" * 25_000 + "x=v,DC=example", False),
-    "oid-valid": ("1" + ".1" * 25_000 + "=v,DC=example", True),
-    "descr-failing-at-its-end": ("a" * 50_000 + "!=v,DC=example", False),
-    "padding-only": ("CN=" + " " * 50_000 + ",DC=example", False),
-    "escaped-spaces": ("CN=" + "\\ " * 25_000 + "a,DC=example", True),
-    "half-hex-escapes": ("CN=" + "\\2" * 25_000 + ",DC=example", True),
-    "many-rdns": ("CN=a" + ",DC=x" * 10_000, True),
-    "huge-multi-valued-rdn": ("CN=a" + "+OU=b" * 10_000 + ",DC=x", True),
+#: Inputs shaped to make a backtracking parser slow, each built at a chosen size of about ``k``
+#: characters. The first three target the attribute type, which a nested-quantifier regex checked
+#: before this item's ReDoS fix. Each case is ``id: (make, valid)``; the id keeps a long string out
+#: of the test name.
+_PATHOLOGICAL_DNS: dict[str, tuple[Callable[[int], str], bool]] = {
+    "oid-failing-at-its-end": (lambda k: "1" + ".1" * (k // 2) + "x=v,DC=example", False),
+    "oid-valid": (lambda k: "1" + ".1" * (k // 2) + "=v,DC=example", True),
+    "descr-failing-at-its-end": (lambda k: "a" * k + "!=v,DC=example", False),
+    "padding-only": (lambda k: "CN=" + " " * k + ",DC=example", False),
+    "escaped-spaces": (lambda k: "CN=" + "\\ " * (k // 2) + "a,DC=example", True),
+    "half-hex-escapes": (lambda k: "CN=" + "\\2" * (k // 2) + ",DC=example", True),
+    "many-rdns": (lambda k: "CN=a" + ",DC=x" * (k // 5), True),
+    "huge-multi-valued-rdn": (lambda k: "CN=a" + "+OU=b" * (k // 5) + ",DC=x", True),
 }
+
+#: The time ratio between an input four times as long and the base one. A linear pass gives about
+#: 4 and a quadratic one about 16, so 8 splits them with room for runner noise either way.
+_MAX_LINEAR_RATIO = 8.0
+
+
+def _fastest(judge: Callable[[str], object], text: str, runs: int) -> float:
+    """The fastest of ``runs`` timings of ``judge(text)``, with the collector off."""
+    best = float("inf")
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(runs):
+            started = time.perf_counter()
+            judge(text)
+            best = min(best, time.perf_counter() - started)
+    finally:
+        if was_enabled:
+            gc.enable()
+    return best
+
+
+def _scaling_ratio(judge: Callable[[str], object], make: Callable[[int], str], k: int) -> float:
+    """How much longer ``judge`` takes on an input of size ``4 * k`` than on one of size ``k``.
+
+    A ratio rather than an absolute bound, because CI runners took 1.2 to 1.6 s on one
+    50,000-character linear pass that takes milliseconds locally (BACKLOG #2610). A slow runner
+    slows both sizes alike, so the ratio still tells linear from quadratic. Each size keeps its
+    fastest run, and a ratio over the line is measured again, so one preemption cannot fake a
+    curve. Keeping the lowest of three is fair to the control: a quadratic parser stays over the
+    line on every attempt, because noise never makes it scale linearly."""
+    small, large = make(k), make(4 * k)
+    ratio = float("inf")
+    for _ in range(3):
+        ratio = min(ratio, _fastest(judge, large, 3) / _fastest(judge, small, 7))
+        if ratio < _MAX_LINEAR_RATIO:
+            break
+    return ratio
 
 
 @pytest.mark.parametrize(
-    ("text", "valid"), list(_PATHOLOGICAL_DNS.values()), ids=list(_PATHOLOGICAL_DNS)
+    ("make", "valid"), list(_PATHOLOGICAL_DNS.values()), ids=list(_PATHOLOGICAL_DNS)
 )
-def test_a_pathological_dn_is_judged_in_linear_time(text: str, valid: bool) -> None:
+def test_a_pathological_dn_is_judged_in_linear_time(
+    make: Callable[[int], str], valid: bool
+) -> None:
     """Group DNs come from operator config and from the directory, so the parser must not
-    backtrack on either. The bound is loose for a slow runner; a linear pass takes milliseconds."""
-    started = time.perf_counter()
-    result = canonical_group_dn(text)
-    elapsed = time.perf_counter() - started
-    assert (result is not None) is valid
-    assert elapsed < 1.0, f"{elapsed:.3f}s for {len(text)} characters"
+    backtrack on either. Time grows with input length by about the same factor, not its square."""
+    assert (canonical_group_dn(make(16_000)) is not None) is valid
+    ratio = _scaling_ratio(canonical_group_dn, make, 4_000)
+    assert ratio < _MAX_LINEAR_RATIO, f"4x the input took {ratio:.1f}x the time"
+
+
+def test_the_linear_time_check_fails_a_quadratic_parser() -> None:
+    """Control: the ratio check must catch a quadratic parser, or its pass above proves nothing.
+
+    This one re-parses a prefix every 100 characters, the shape of a parser that rescans from the
+    start at each separator. Its work grows with the square of the length."""
+
+    def quadratic(text: str) -> None:
+        for end in range(100, len(text) + 1, 100):
+            canonical_group_dn(text[:end])
+
+    make = _PATHOLOGICAL_DNS["many-rdns"][0]
+    ratio = _scaling_ratio(quadratic, make, 1_000)
+    assert ratio > _MAX_LINEAR_RATIO, f"a quadratic parser scaled by only {ratio:.1f}x"
 
 
 def test_resolve_groups_counts_a_dropped_dn_at_debug(caplog: pytest.LogCaptureFixture) -> None:

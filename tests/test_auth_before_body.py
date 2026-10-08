@@ -29,8 +29,10 @@ import base64
 import collections
 import contextlib
 import inspect
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -43,12 +45,12 @@ from pydantic import BaseModel
 from messagefoundry.api import create_app
 from messagefoundry.api import security as api_security
 from messagefoundry.api.app import _get_engine
-from messagefoundry.api.auth_routes import _no_store_reply
 from messagefoundry.api.auth_routes import _service as _service_guard
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
     before_body_of,
     mark_route_gate,
+    no_store_reply,
     refuse_undeclared_route,
     require,
     require_phi_read,
@@ -286,7 +288,7 @@ async def test_every_dependency_ahead_of_a_gate_is_accounted_for(engine: Engine)
     dependencies read and found unable to refuse. A new kind fails here until someone reads it."""
     # refuse_undeclared_route runs ahead of every route's own dependencies, but it refuses only a
     # route with no gate, and every route this loop reads has one (vault BACKLOG #2604).
-    cannot_refuse = {_no_store_reply, refuse_undeclared_route}
+    cannot_refuse = {no_store_reply, refuse_undeclared_route}
     app = create_app(engine, auth=await _service(engine), serve_ui=True, oidc_enabled=True)
     marked: set[object] = set()
     skipped: set[object] = set()
@@ -698,7 +700,7 @@ async def test_a_signed_in_caller_pays_a_second_session_read_only_where_a_body_i
 
 
 async def test_a_signed_in_caller_gets_what_it_got_before_on_every_body_route(
-    engine: Engine,
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every gated JSON operation that declares a body, all four probes, signed in as an
     Administrator: the live app and the control app give the same response, byte for byte. The
@@ -719,6 +721,13 @@ async def test_a_signed_in_caller_gets_what_it_got_before_on_every_body_route(
         if (row.method, row.path) in declared
     ]
     assert len(operations) >= 30, len(operations)
+    # BACKLOG #2144: a paced write's 429 carries the time left in the window as Retry-After, so the
+    # two apps must be asked at one instant or that header can differ by a second. The limiter's
+    # clock follows the real one, stepped once per pair.
+    instant = [time.monotonic()]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: instant[0])
+    )
 
     statuses: collections.Counter[tuple[str, int]] = collections.Counter()
     async with _client(live) as new, _client(control) as old:
@@ -726,6 +735,7 @@ async def test_a_signed_in_caller_gets_what_it_got_before_on_every_body_route(
             url = route_gates.concrete_path(path)
             for probe, (body, headers) in _PROBES.items():
                 sent = {**headers, **bearer}
+                instant[0] = time.monotonic()
                 before = await old.request(method, url, content=body, headers=sent)
                 after = await new.request(method, url, content=body, headers=sent)
                 assert _fingerprint(after) == _fingerprint(before), (method, path, probe)

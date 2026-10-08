@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import socket
 import ssl
@@ -19,11 +20,14 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import log_spool
 from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_setup import (
     SyslogForward,
     _build_queued_forwarder,
     _ForwardQueueHandler,
+    _ForwardQueueListener,
+    _open_forward_spool,
     _TimeoutSysLogHandler,
     _TlsSysLogHandler,
     configure_logging,
@@ -347,6 +351,28 @@ def test_a_lone_surrogate_is_spooled_as_its_escape_not_raised(spool_dir: Path) -
         spool.close()
 
 
+def test_non_ascii_text_costs_its_utf8_bytes_against_the_cap_and_round_trips(
+    spool_dir: Path,
+) -> None:
+    """BACKLOG #2279: the default JSON escaping wrote six bytes for each non-ASCII character, so a
+    spool of such text filled, and dropped, well before the cap said it should."""
+    # 2-, 3- and 4-byte characters, built by code point so this file stays ASCII.
+    line = f"Zo{chr(0xEB)} {chr(0x4E2D)} {chr(0x1F5C4)}"
+    plain = SpoolEntry(level="INFO", line="x")
+    entry = SpoolEntry(level="INFO", line=line)
+    assert len(entry.encode()) - len(plain.encode()) == len(line.encode("utf-8")) - 1
+    assert line in entry.encode().decode("utf-8")  # written as itself, not as escapes
+
+    spool = LogSpool(spool_dir, max_bytes=len(entry.encode()))  # room for exactly one, in UTF-8
+    spool.open()
+    try:
+        assert spool.append(entry)
+        assert spool.bytes_used == sum(p.stat().st_size for p in _segments(spool_dir))
+        assert _drain(spool) == [line]
+    finally:
+        spool.close()
+
+
 def test_a_segment_number_is_never_reused(spool_dir: Path) -> None:
     """A segment whose unlink failed stays on disk; reusing its number would collide on O_EXCL."""
     spool = LogSpool(spool_dir, max_bytes=100_000)
@@ -460,12 +486,14 @@ def _not_yet_valid() -> ssl.SSLCertVerificationError:
     ("error", "permanent"),
     [
         (socket.gaierror(11001, "host not found"), True),
+        # The platform's own EAI_NONAME: -2 on Linux, where a bare 11001 exercises nothing.
+        (socket.gaierror(socket.EAI_NONAME, "name or service not known"), True),
         (socket.gaierror(getattr(socket, "EAI_AGAIN", -3), "temporary failure"), False),
         (ssl.SSLCertVerificationError("certificate verify failed"), True),
         (_not_yet_valid(), False),
         (ConnectionRefusedError("refused"), False),
     ],
-    ids=["no-such-name", "dns-try-again", "bad-cert", "clock-not-synced", "refused"],
+    ids=["no-such-name", "eai-noname", "dns-try-again", "bad-cert", "clock-not-synced", "refused"],
 )
 def test_only_a_missing_name_or_a_bad_certificate_is_permanent(
     error: OSError, permanent: bool
@@ -473,3 +501,566 @@ def test_only_a_missing_name_or_a_bad_certificate_is_permanent(
     """A temporary DNS failure or a not-yet-valid certificate (a clock not synced at boot) must be
     deferred to the spool, not turn the forwarder off for the life of the process."""
     assert is_permanent_connect_error(error) is permanent
+
+
+# --- BACKLOG #2278: a read fault is kept, counted and reported as a read fault ----------------------
+
+
+def _deny_open(*args: Any, **kwargs: Any) -> Any:
+    raise PermissionError(13, "sharing violation")
+
+
+def test_a_read_that_fails_for_another_reason_keeps_every_segment(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """peek()'s split: only a segment that is GONE is retired. A revert to "retire on any error"
+    would delete undelivered records, and this is the test that would see it."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        before = _segments(spool_dir)
+        assert len(before) > 1
+        with monkeypatch.context() as patch:
+            patch.setattr(log_spool, "open", _deny_open, raising=False)
+            assert spool.peek() is None
+            assert spool.peek() is None
+        assert spool.read_errors == 2 and spool.read_faulted
+        assert spool.unreadable == 0
+        assert _segments(spool_dir) == before
+        # The fault cleared: everything is still there, in order.
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+        assert (
+            spool.read_errors == 2 and not spool.read_faulted
+        )  # the count stays; the state clears
+    finally:
+        spool.close()
+
+
+def test_a_segment_that_is_gone_is_retired_and_the_rest_still_replays(spool_dir: Path) -> None:
+    """The other arm of the split, and the control for the test above: a missing file IS retired,
+    counted as unreadable and not as a read error."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        first = _segments(spool_dir)[0]
+        lost = [json.loads(line)["line"] for line in first.read_bytes().splitlines()]
+        first.unlink()
+        assert spool.peek() is None  # the pass that finds it gone
+        assert spool.unreadable == 1
+        assert spool.read_errors == 0
+        expected = [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
+        assert lost and _drain(spool) == expected
+    finally:
+        spool.close()
+
+
+def _idle_listener(spool: LogSpool) -> tuple[_ForwardQueueListener, _FlakyCollector]:
+    """A listener that is never started, so the test drives it on its own thread."""
+    collector = _FlakyCollector()
+    return _ForwardQueueListener(queue.Queue(), collector, spool=spool), collector
+
+
+def test_a_spool_read_fault_is_reported_as_one_rate_limited_and_without_record_text(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    try:
+        assert spool.append(SpoolEntry(level="ERROR", line="secret-marker-2278"))
+        monkeypatch.setattr(log_spool, "open", _deny_open, raising=False)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            for _ in range(5):
+                listener._replay()
+        reports = [r.getMessage() for r in caplog.records if "could not read" in r.getMessage()]
+        assert len(reports) == 1  # five faults, one line
+        assert str(spool_dir) in reports[0] and "1 read(s) failed" in reports[0]
+        assert "is full" not in reports[0]
+        assert "secret-marker-2278" not in caplog.text
+        assert spool.read_errors == 5
+
+        # Past the interval the next report carries what the first one did not.
+        listener._last_spool_read_report = time.monotonic() - 3600
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            listener._replay()
+        (later,) = [r.getMessage() for r in caplog.records if "could not read" in r.getMessage()]
+        assert "5 read(s) failed (6 since this process started)" in later
+    finally:
+        spool.close()
+
+
+def test_a_drained_spool_reports_no_read_fault(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control: peek() also returns None for a drained spool, and that is not a fault."""
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            listener._replay()
+        assert "could not read" not in caplog.text
+    finally:
+        spool.close()
+
+
+@pytest.mark.parametrize("faulted", [True, False], ids=["after-a-read-fault", "plain-full"])
+def test_the_full_spool_report_names_a_read_fault_only_when_there_was_one(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture, faulted: bool
+) -> None:
+    size = len(_entry(0).encode())
+    spool = LogSpool(spool_dir, max_bytes=size)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    try:
+        assert spool.append(_entry(0))
+        spool.read_faulted = faulted
+        record = logging.makeLogRecord({"msg": "next", "levelname": "WARNING", "levelno": 30})
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            assert listener._spool_record(record) is False
+        (report,) = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+        assert ("cannot be read just now" in report) is faulted
+    finally:
+        spool.close()
+
+
+# --- BACKLOG #2279: follow-ups from the two review rounds of engine PR 1725 -------------------------
+
+
+def _deny_unlink(self: Path, missing_ok: bool = False) -> None:
+    raise PermissionError(13, "file in use")
+
+
+def test_a_segment_whose_delete_failed_still_counts_against_the_cap(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sent segment that would not delete is still on disk. Forgetting its size let the directory
+    grow past the cap by one segment per failed delete."""
+    size = len(_entry(0).encode())
+    spool = LogSpool(spool_dir, max_bytes=size * 2, segment_bytes=size)
+    spool.open()
+    try:
+        assert spool.append(_entry(0)) and spool.append(_entry(1))
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", _deny_unlink)
+            assert _drain(spool) == ["record 0000", "record 0001"]
+            assert spool.undeleted_segments == 2
+            on_disk = sum(p.stat().st_size for p in _segments(spool_dir))
+            assert spool.bytes_used == on_disk == size * 2
+            assert spool.append(_entry(2)) is False  # the cap still holds
+            assert spool.dropped == 1
+        # Deletes work again: one reclaim frees the space, and the next append fits.
+        spool.reclaim()
+        assert spool.undeleted_segments == 0
+        assert spool.append(_entry(2))
+        assert spool.bytes_used == sum(p.stat().st_size for p in _segments(spool_dir)) == size
+        assert _drain(spool) == ["record 0002"]  # the sent entries are not sent again
+    finally:
+        spool.close()
+
+
+class _FullDiskWriter:
+    """A segment writer on a full disk: the file was created, and every write is refused."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def write(self, data: bytes) -> int:
+        raise OSError(28, "No space left on device")
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        os.close(self._fd)
+
+
+def test_a_full_disk_leaves_no_empty_segments_and_burns_no_sequence_numbers(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "fdopen", lambda fd, mode: _FullDiskWriter(fd))
+            assert [spool.append(_entry(n)) for n in range(3)] == [False, False, False]
+        assert spool.dropped == 3
+        assert _segments(spool_dir) == []  # was: three empty files
+        assert spool.bytes_used == 0
+        # The disk has room again: the first real segment takes the first number.
+        assert spool.append(_entry(3))
+        assert [p.name for p in _segments(spool_dir)] == ["spool-000000000001.jsonl"]
+        assert _drain(spool) == ["record 0003"]
+    finally:
+        spool.close()
+
+
+def test_a_failed_write_that_left_bytes_keeps_the_segment_and_counts_them(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: only an EMPTY segment is removed. A torn write stays on
+    disk, is counted against the cap, and is skipped as unreadable on replay."""
+
+    class _TornWriter(_FullDiskWriter):
+        def write(self, data: bytes) -> int:
+            os.write(self._fd, data[:5])
+            raise OSError(28, "No space left on device")
+
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "fdopen", lambda fd, mode: _TornWriter(fd))
+            assert spool.append(_entry(0)) is False
+        assert len(_segments(spool_dir)) == 1
+        assert spool.bytes_used == 5
+        assert spool.append(_entry(1))
+        assert len(_segments(spool_dir)) == 2  # never appended after the torn line
+        assert _drain(spool) == ["record 0001"]
+        assert spool.unreadable == 1
+    finally:
+        spool.close()
+
+
+def _bad_certificate(self: Any) -> None:
+    raise ssl.SSLCertVerificationError("certificate verify failed")
+
+
+def _forward_to(spool_dir: Path, *, spool_max_bytes: int = 1_000_000) -> SyslogForward:
+    return SyslogForward(
+        host="siem.example.org",
+        port=6514,
+        protocol="tcp",
+        spool_dir=str(spool_dir),
+        spool_max_bytes=spool_max_bytes,
+    )
+
+
+def test_a_handler_that_fails_to_build_leaves_no_spool_directory_or_lock_behind(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spool is opened before the handler is built. When the build fails for good, the
+    directory and ``spool.lock`` that open created must not outlive it."""
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _bad_certificate)
+    assert configure_logging("INFO", forward=_forward_to(spool_dir)) is False
+    assert not spool_dir.exists()
+
+
+def test_that_cleanup_never_removes_a_directory_or_segments_that_were_there_before(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: undelivered segments from an earlier run, and the directory that holds them,
+    are kept. An empty directory that already existed is kept too, without the new lock file."""
+    earlier = LogSpool(spool_dir, max_bytes=100_000)
+    earlier.open()
+    earlier.append(_entry(0))
+    earlier.close()
+    (spool_dir / "spool.lock").unlink()  # so the open below is the one that creates it
+    kept = [(p.name, p.read_bytes()) for p in _segments(spool_dir)]
+    assert kept
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _bad_certificate)
+    assert configure_logging("INFO", forward=_forward_to(spool_dir)) is False
+    assert [(p.name, p.read_bytes()) for p in _segments(spool_dir)] == kept
+
+    empty = spool_dir.parent / "already-there"
+    empty.mkdir()
+    assert configure_logging("INFO", forward=_forward_to(empty)) is False
+    assert empty.is_dir() and list(empty.iterdir()) == []
+
+
+@pytest.mark.parametrize("leftover", [2, 0], ids=["segments-left", "nothing-left"])
+def test_a_spool_turned_off_warns_once_about_segments_it_leaves_and_deletes_none(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture, leftover: int
+) -> None:
+    earlier = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=1)
+    earlier.open()
+    for n in range(leftover):
+        earlier.append(_entry(n))
+    earlier.close()
+    before = [(p.name, p.read_bytes()) for p in _segments(spool_dir)]
+    assert len(before) == leftover
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        assert _open_forward_spool(_forward_to(spool_dir, spool_max_bytes=0)) is None
+    warnings = [r.getMessage() for r in caplog.records if "turned off" in r.getMessage()]
+    assert len(warnings) == (1 if leftover else 0)
+    if leftover:
+        assert str(spool_dir) in warnings[0] and "2 spool segment(s)" in warnings[0]
+    assert [(p.name, p.read_bytes()) for p in _segments(spool_dir)] == before
+
+
+def test_records_spooled_at_shutdown_are_reported_once_with_their_count(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    fwd = _build_queued_forwarder(_FlakyCollector(), fmt="text", spool=spool)
+    listener = fwd._listener
+    assert listener.stop_within(1.0)  # the thread has ended; drive the listener by hand
+    listener._drain_deadline = time.monotonic() - 1.0  # the drain window has closed
+    for n in range(3):
+        listener.handle(
+            logging.makeLogRecord({"msg": f"late {n}", "levelname": "WARNING", "levelno": 30})
+        )
+    assert listener.spooled_at_stop == 3
+    with caplog.at_level(logging.INFO, logger="messagefoundry.logging_setup"):
+        fwd.close()
+        fwd.close()  # idempotent: no second report
+    reports = [r.getMessage() for r in caplog.records if "drain deadline" in r.getMessage()]
+    assert len(reports) == 1
+    assert "moved 3 record(s)" in reports[0] and str(spool_dir) in reports[0]
+    assert "late" not in caplog.text  # a count and a directory, never a record
+    assert len(_segments(spool_dir)) == 1  # and they are on disk for the next start
+
+
+def test_the_shutdown_report_is_not_counted_as_a_dropped_record(spool_dir: Path) -> None:
+    """logging.shutdown() closes the handler while it is still on the root logger, so the report
+    comes straight back to it. Counting that as a drop logged a false "queue is full" warning on
+    a shutdown that lost nothing."""
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    fwd = _build_queued_forwarder(_FlakyCollector(), fmt="text", spool=spool)
+    root = logging.getLogger()
+    root.addHandler(fwd)
+    saved = root.level
+    root.setLevel(logging.INFO)
+    try:
+        listener = fwd._listener
+        assert listener.stop_within(1.0)
+        listener._drain_deadline = time.monotonic() - 1.0
+        listener.handle(logging.makeLogRecord({"msg": "late", "levelname": "INFO", "levelno": 20}))
+        assert listener.spooled_at_stop == 1  # so close() has something to report
+        fwd.close()
+        assert fwd.dropped == 0
+        # The control: a record that is NOT the handler's own report is still counted.
+        root.info("after close")
+        assert fwd.dropped == 1
+    finally:
+        root.removeHandler(fwd)
+        root.setLevel(saved)
+
+
+def test_close_makes_a_last_try_at_a_segment_whose_delete_failed(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sent segment left on disk is replayed whole by the next start, which cannot tell it from
+    a waiting one. close() is the last chance to remove it."""
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    spool.append(_entry(0))
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", _deny_unlink)
+        assert _drain(spool) == ["record 0000"]
+    assert len(_segments(spool_dir)) == 1 and spool.undeleted_segments == 1
+    spool.close()
+    assert _segments(spool_dir) == []
+
+    again = LogSpool(spool_dir, max_bytes=100_000)
+    again.open()
+    try:
+        assert _drain(again) == []  # nothing is sent twice
+    finally:
+        again.close()
+
+
+def test_the_listener_retries_a_failed_delete_at_most_once_per_interval(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    tries: list[int] = []
+    monkeypatch.setattr(spool, "reclaim", lambda: tries.append(1))
+    try:
+        listener._reclaim_spool()
+        assert tries == []  # nothing is left over, so nothing is tried
+        spool.append(_entry(0))
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", _deny_unlink)
+            assert _drain(spool) == ["record 0000"]
+        for _ in range(50):
+            listener._reclaim_spool()
+        assert tries == [1]  # fifty passes, one try
+        first_wait = listener._reclaim_at
+        listener._reclaim_at = 0.0  # the wait has passed
+        listener._reclaim_spool()
+        assert tries == [1, 1]
+        assert listener._reclaim_delay > 1.0 and listener._reclaim_at > first_wait  # it backs off
+    finally:
+        spool.close()
+
+
+def test_the_full_spool_report_names_sent_segments_that_would_not_delete(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    size = len(_entry(0).encode())
+    spool = LogSpool(spool_dir, max_bytes=size)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    try:
+        assert spool.append(_entry(0))
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", _deny_unlink)
+            assert _drain(spool) == ["record 0000"]
+            record = logging.makeLogRecord({"msg": "next", "levelname": "WARNING", "levelno": 30})
+            with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+                assert listener._spool_record(record) is False
+        (report,) = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+        assert "1 segment(s) already sent could not be deleted" in report
+    finally:
+        spool.close()
+
+
+def test_a_failed_start_also_removes_the_parent_directories_it_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default spool directory is two levels below the store directory, and both are new."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _bad_certificate)
+    forward = _forward_to(store_dir / "log-spool" / "engine")
+    assert configure_logging("INFO", forward=forward) is False
+    assert list(store_dir.iterdir()) == []
+
+
+def test_a_failed_start_names_the_segments_an_earlier_run_left(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    earlier = LogSpool(spool_dir, max_bytes=100_000)
+    earlier.open()
+    earlier.append(_entry(0))
+    earlier.close()
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _bad_certificate)
+    assert configure_logging("INFO", forward=_forward_to(spool_dir)) is False
+    out = capsys.readouterr().out
+    assert "did not start" in out and "still holds 1 spool segment(s)" in out
+    assert len(_segments(spool_dir)) == 1
+
+
+def test_a_spool_directory_that_cannot_be_listed_is_reported_not_read_as_empty(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    spool_dir.mkdir()
+
+    def _deny_iterdir(self: Path) -> Any:
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(Path, "iterdir", _deny_iterdir)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        assert _open_forward_spool(_forward_to(spool_dir, spool_max_bytes=0)) is None
+    assert "could not be checked" in caplog.text
+
+
+def test_the_running_listener_frees_a_sent_segment_once_deletes_work_again(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through handle(), not by calling the retry directly: handle() and the idle poll are the only
+    things that free such a segment while the engine runs."""
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    listener, collector = _idle_listener(spool)
+    collector.down = False
+    try:
+        spool.append(_entry(0))
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", _deny_unlink)
+            listener._replay()  # sends it; the delete fails
+            assert spool.undeleted_segments == 1
+            listener.handle(logging.makeLogRecord({"msg": "a", "levelname": "INFO", "levelno": 20}))
+            assert spool.undeleted_segments == 1  # still held
+        listener._reclaim_at = 0.0  # the wait has passed, and deletes work again
+        listener.handle(logging.makeLogRecord({"msg": "b", "levelname": "INFO", "levelno": 20}))
+        assert spool.undeleted_segments == 0 and _segments(spool_dir) == []
+        assert listener._reclaim_delay == 1.0  # and the backoff starts over
+    finally:
+        spool.close()
+
+
+def test_shutdown_tries_the_delete_before_dropping_a_record_for_space(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    size = len(_entry(0).encode())
+    spool = LogSpool(spool_dir, max_bytes=size)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    try:
+        assert spool.append(_entry(0))
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", _deny_unlink)
+            assert _drain(spool) == ["record 0000"]
+            listener._reclaim_spool()  # fails, and sets a wait
+        assert listener._reclaim_at > time.monotonic()
+        listener._drain_deadline = time.monotonic() - 1.0
+        listener.handle(
+            logging.makeLogRecord({"msg": "record 0001", "levelname": "INFO", "levelno": 20})
+        )
+        assert (listener.spooled_at_stop, listener.undrained) == (1, 0)
+    finally:
+        spool.close()
+
+
+def test_a_sent_segment_still_undeletable_at_close_is_reported(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    fwd = _build_queued_forwarder(_FlakyCollector(), fmt="text", spool=spool)
+    assert fwd._listener.stop_within(1.0)
+    spool.append(_entry(0))
+    monkeypatch.setattr(Path, "unlink", _deny_unlink)
+    assert _drain(spool) == ["record 0000"]
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        fwd.close()
+    monkeypatch.undo()
+    assert "left 1 spool segment(s)" in caplog.text and "sends them again" in caplog.text
+
+
+def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """And the control: a directory another process holds is NOT named, because that process sends
+    what it holds."""
+    earlier = LogSpool(spool_dir, max_bytes=100_000)
+    earlier.open()
+    earlier.append(_entry(0))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        assert _open_forward_spool(_forward_to(spool_dir)) is None  # held by `earlier`
+    assert "in use by another process" in caplog.text and "still holds" not in caplog.text
+    earlier.close()
+
+    def _deny_lock(path: Any, flags: int, mode: int = 0o777) -> int:
+        raise PermissionError(13, "read-only directory")
+
+    caplog.clear()
+    monkeypatch.setattr(os, "open", _deny_lock)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        assert _open_forward_spool(_forward_to(spool_dir)) is None
+    monkeypatch.undo()
+    assert (
+        "could not be opened, but" in caplog.text
+        and "still holds 1 spool segment(s)" in caplog.text
+    )
+
+
+def test_open_removes_only_the_directories_it_made_when_it_fails_partway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "log-spool" / "engine"
+    real_mkdir = os.mkdir
+
+    def _mkdir(path: Any, mode: int = 0o777) -> None:
+        if Path(path) == target:
+            raise PermissionError(13, "cannot create the leaf")
+        real_mkdir(path, mode)
+
+    monkeypatch.setattr(os, "mkdir", _mkdir)
+    with pytest.raises(SpoolUnavailable):
+        LogSpool(target, max_bytes=1_000).open()
+    monkeypatch.undo()
+    assert list(tmp_path.iterdir()) == []  # the parent it made on the way is gone too

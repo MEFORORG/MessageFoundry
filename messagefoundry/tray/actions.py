@@ -2,8 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tray actions: open the console, the repo in VS Code, and the service log (ADR 0113 §5/§7).
 
-Side-effecting shells (open a browser tab, spawn ``code``, open a file) kept thin; the resolution
-logic — the exact ``/ui`` URL, whether the ``code`` CLI and repo resolve, whether a log exists — is
+Side-effecting shells (open a browser tab, start VS Code, open a file) kept thin; the resolution
+logic — the exact ``/ui`` URL, whether a VS Code launcher and repo resolve, whether a log exists — is
 pure/injectable so it is unit-testable without launching anything. The tray never opens the bare
 engine URL (FastAPI 404s there — there is no ``/`` route); it always appends ``/ui``.
 """
@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from messagefoundry.tray.config import is_engine_url
@@ -30,6 +30,22 @@ _VSCODE_FALLBACKS = (
     r"%ProgramFiles(x86)%\Microsoft VS Code\bin\code.cmd",
 )
 _CREATE_NO_WINDOW = 0x08000000  # keep `code`'s launcher from flashing a console window
+
+#: The editor executable a standard install keeps one folder above its ``bin`` folder. The
+#: ``code.cmd`` in ``bin`` starts it by that relative path itself.
+_VSCODE_EXE = "Code.exe"
+#: Suffixes Windows runs under ``cmd.exe``.
+_BATCH_SUFFIXES = frozenset({".cmd", ".bat"})
+#: Besides letters and digits, the only characters allowed on a batch file's command line.
+#: ``cmd.exe`` re-reads that line, and a list of what it treats as syntax cannot be trusted to be
+#: whole: ``& | < > ^ ( )`` are operators, ``%`` and ``!`` expand even inside double quotes, and
+#: ``, ; =`` and many Unicode spaces cut an unquoted program name short. So the rule names what is
+#: plain instead. docs/TRAY.md shows operators this set, and a test holds the two together.
+_CMD_PLAIN_CHARS = frozenset(" \\/:._-~+@#")
+#: Variables ``code.cmd`` sets or clears before it starts the editor. Inherited by a direct start,
+#: the first makes the editor run the folder as a Node script and the second puts it in its
+#: development mode.
+_EDITOR_ENV_NOT_INHERITED = frozenset({"ELECTRON_RUN_AS_NODE", "VSCODE_DEV"})
 
 
 def console_url(engine_url: str) -> str:
@@ -45,21 +61,110 @@ def _is_dir(path: str) -> bool:
     return Path(path).is_dir()
 
 
+def _is_batch_file(path: str) -> bool:
+    """True when Windows would run ``path`` under ``cmd.exe`` (a ``.cmd`` or ``.bat`` file).
+
+    Windows drops trailing dots and spaces from a file name, so ``code.cmd.`` is judged without
+    them.
+    """
+    return ntpath.splitext(path.rstrip(". "))[1].casefold() in _BATCH_SUFFIXES
+
+
+def _cmd_would_reread(text: str) -> bool:
+    """True unless ``text`` is only letters, digits and :data:`_CMD_PLAIN_CHARS`.
+
+    An allowlist, so a control character, a quote and a Unicode space all fail without being named.
+    """
+    return not all(ch.isalnum() or ch in _CMD_PLAIN_CHARS for ch in text)
+
+
+def _launcher_for(cli: str, is_file: Callable[[str], bool]) -> str | None:
+    """The program Open Repo starts for the ``code`` CLI found at ``cli``, or ``None``.
+
+    A batch ``code.cmd`` is replaced by the editor executable beside its ``bin`` folder when that
+    file exists, so ``cmd.exe`` takes no part in the launch (BACKLOG #2327). With no such
+    executable (a shim, or a layout this does not know) the batch file is all there is, and it is
+    used only if ``cmd.exe`` would not re-read its own path. Anything else is returned as found.
+    """
+    if not _is_batch_file(cli):
+        return cli
+    bin_dir = ntpath.dirname(cli)
+    if ntpath.basename(bin_dir).casefold() == "bin":
+        exe = ntpath.join(ntpath.dirname(bin_dir), _VSCODE_EXE)
+        if is_file(exe):
+            return exe
+    return None if _cmd_would_reread(cli) else cli
+
+
 def resolve_vscode(
     *,
     which: Callable[[str], str | None] = shutil.which,
     is_file: Callable[[str], bool] = _is_file,
     expandvars: Callable[[str], str] = os.path.expandvars,
 ) -> str | None:
-    """Locate the ``code`` CLI: PATH first, then the common install locations. ``None`` if absent."""
-    found = which("code")
-    if found:
-        return found
-    for template in _VSCODE_FALLBACKS:
-        candidate = expandvars(template)
-        if "%" not in candidate and is_file(candidate):
-            return candidate
+    """Locate the program that opens a folder in VS Code. ``None`` if there is none to use.
+
+    The ``code`` CLI is looked up on PATH first, then in the common install locations. Each one
+    found goes through :func:`_launcher_for`, so the result is the editor executable where a
+    standard install has one, and a batch file only as the fallback :func:`open_repo` screens.
+    """
+
+    def found_clis() -> Iterator[str]:  # lazy: a usable PATH hit probes no install location
+        on_path = which("code")
+        if on_path:
+            yield on_path
+        for template in _VSCODE_FALLBACKS:
+            candidate = expandvars(template)
+            if "%" not in candidate and is_file(candidate):
+                yield candidate
+
+    for cli in found_clis():
+        launcher = _launcher_for(cli, is_file)
+        if launcher is not None:
+            return launcher
     return None
+
+
+#: A local drive path: a drive letter, a colon, then a separator. Nothing else is a local path.
+_LOCAL_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
+
+_DRIVE_REMOTE = 4  # GetDriveTypeW's DRIVE_REMOTE: a mapped network drive
+
+
+def _is_remote_drive(path: str) -> bool:
+    """True when ``path``'s drive letter is a mapped network drive (``GetDriveTypeW``).
+
+    It reads the local drive table and sends nothing to the server. Off Windows the tray does not
+    run, so the answer there is False.
+    """
+    if sys.platform != "win32":
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+    kernel32.GetDriveTypeW.restype = ctypes.c_uint
+    return bool(kernel32.GetDriveTypeW(path[:2] + "\\") == _DRIVE_REMOTE)
+
+
+def _is_local_drive_path(path: str) -> bool:
+    """True when ``path`` has the shape of a path on a local drive letter.
+
+    The shape is an allowlist, so every remote form fails it without a list of its own: a UNC path
+    (``\\\\host\\share``, ``//host/share``), a WebDAV path (``\\\\host@SSL\\DavWWWRoot``), and the
+    device and extended forms (``\\\\?\\UNC\\...``, ``\\\\?\\C:\\...``, ``\\\\.\\...``). So do a
+    relative path, a drive-relative one (``C:x.log``), a rooted one with no drive (``\\logs``), and
+    the ``shell:``, ``file:`` and ``https:`` forms the OS opener would launch.
+    """
+    return _LOCAL_DRIVE_PATH.match(path) is not None
+
+
+def _on_a_local_drive(path: str, is_remote_drive: Callable[[str], bool]) -> bool:
+    """True when ``path`` is on a local drive letter that is not a mapped network drive.
+
+    It judges the string and the local drive table only, so it sends nothing to any host. At
+    least :func:`open_log` and the two menu predicates run their probes behind it (BACKLOG #2086,
+    #2332). Other configured paths, such as ``engine_cacert``, do not pass through it.
+    """
+    return _is_local_drive_path(path) and not is_remote_drive(path)
 
 
 def repo_open_available(
@@ -67,14 +172,35 @@ def repo_open_available(
     vscode: str | None,
     *,
     is_dir: Callable[[str], bool] = _is_dir,
+    is_remote_drive: Callable[[str], bool] = _is_remote_drive,
 ) -> bool:
-    """True iff Open-Repo can work: a real directory and a resolved ``code`` CLI."""
-    return bool(repo_path) and vscode is not None and is_dir(repo_path or "")
+    """True iff Open-Repo is offered: a real directory on a local drive and a resolved launcher.
+
+    Offered is not the same as opened: :func:`open_repo` can still refuse the path, and says why.
+
+    The menu calls this on every build, so the path is screened by :func:`_on_a_local_drive`
+    before ``is_dir`` touches it. A UNC or mapped-drive ``repo_path`` is never probed.
+    """
+    if not repo_path or vscode is None:
+        return False
+    return _on_a_local_drive(repo_path, is_remote_drive) and is_dir(repo_path)
 
 
-def log_available(log_path: str | None, *, is_file: Callable[[str], bool] = _is_file) -> bool:
-    """True iff a service log file is known and present."""
-    return bool(log_path) and is_file(log_path or "")
+def log_available(
+    log_path: str | None,
+    *,
+    is_file: Callable[[str], bool] = _is_file,
+    is_remote_drive: Callable[[str], bool] = _is_remote_drive,
+) -> bool:
+    """True iff a service log file is known, on a local drive, and present.
+
+    The menu calls this on every build, so the path gets the same no-touch screen
+    :func:`open_log` applies before ``is_file`` touches it (BACKLOG #2332). A UNC, device,
+    relative or mapped-drive ``log_path`` is never probed, and View Log would refuse it anyway.
+    """
+    if not log_path:
+        return False
+    return _on_a_local_drive(log_path, is_remote_drive) and is_file(log_path)
 
 
 class ConsoleUrlRefused(ValueError):
@@ -105,17 +231,53 @@ def open_console(engine_url: str, *, opener: Callable[[str], object] | None = No
 
 def _run_detached(args: list[str]) -> None:
     creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    subprocess.Popen(args, shell=False, creationflags=creationflags)  # nosec B603 - fixed argv (resolved code CLI + repo path), shell=False, no shell interpolation
+    # The child inherits the tray's environment, which is the signed-in user's. A copy is passed
+    # only when one of the editor's own variables has to come out, because a copy of os.environ
+    # carries every name in upper case on Windows.
+    env: dict[str, str] | None = None
+    if any(name.upper() in _EDITOR_ENV_NOT_INHERITED for name in os.environ):
+        env = {k: v for k, v in os.environ.items() if k.upper() not in _EDITOR_ENV_NOT_INHERITED}
+    # shell=False does not keep cmd.exe out of a batch-file launch; see open_repo().
+    subprocess.Popen(args, shell=False, creationflags=creationflags, env=env)  # nosec B603 - argv is the launcher resolve_vscode() chose plus repo_path as one list item; open_repo() screens the batch-file case (BACKLOG #2327)
+
+
+class RepoPathRefused(ValueError):
+    """Open Repo refused a batch-file launch that ``cmd.exe`` would re-read.
+
+    The message is fixed text. ``repo_path`` comes from ``tray.toml`` or the service's registry
+    hint, so no part of it is echoed, which matches :class:`ConsoleUrlRefused`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "the code launcher is a batch file, and its path or repo_path has a character "
+            "the Windows command shell may re-read"
+        )
 
 
 def open_repo(
     repo_path: str,
-    code_cmd: str,
+    launcher: str,
     *,
     runner: Callable[[list[str]], object] = _run_detached,
 ) -> None:
-    """Open ``repo_path`` as a folder in VS Code via the resolved ``code`` CLI (list argv, no shell)."""
-    runner([code_cmd, repo_path])
+    """Open ``repo_path`` as a folder in VS Code, or raise :class:`RepoPathRefused`.
+
+    ``launcher`` is what :func:`resolve_vscode` returned. Normally that is the editor executable,
+    which takes the folder as one argv item with no shell, so any folder name opens.
+
+    The fallback is a batch file, used when no editor executable was found beside it. Windows runs
+    a batch file under ``cmd.exe``, which re-reads the whole command line, and Python's argv
+    quoting does not escape ``&``, ``|`` or ``%``. ``cmd.exe`` cannot be avoided there, so the
+    launch is refused when either string fails :func:`_cmd_would_reread`. Nothing is escaped. That
+    test is an allowlist and is wider than ``cmd.exe`` needs: it also refuses characters that are
+    harmless in some positions, such as parentheses or a comma.
+    """
+    # resolve_vscode() never returns a batch file whose own path fails the test. The launcher is
+    # tested again here because this is the last stop before the start, whoever the caller is.
+    if _is_batch_file(launcher) and (_cmd_would_reread(repo_path) or _cmd_would_reread(launcher)):
+        raise RepoPathRefused
+    runner([launcher, repo_path])
 
 
 def _open_path(target: str) -> None:
@@ -157,38 +319,6 @@ def _viewable_name(path: str) -> bool:
     return ntpath.splitext(name)[1].casefold() in _VIEWABLE_LOG_SUFFIXES
 
 
-#: A local drive path: a drive letter, a colon, then a separator. Nothing else is a local path.
-_LOCAL_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
-
-_DRIVE_REMOTE = 4  # GetDriveTypeW's DRIVE_REMOTE: a mapped network drive
-
-
-def _is_remote_drive(path: str) -> bool:
-    """True when ``path``'s drive letter is a mapped network drive (``GetDriveTypeW``).
-
-    It reads the local drive table and sends nothing to the server. Off Windows the tray does not
-    run, so the answer there is False.
-    """
-    if sys.platform != "win32":
-        return False
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
-    kernel32.GetDriveTypeW.restype = ctypes.c_uint
-    return bool(kernel32.GetDriveTypeW(path[:2] + "\\") == _DRIVE_REMOTE)
-
-
-def _is_local_drive_path(path: str) -> bool:
-    """True when ``path`` has the shape of a path on a local drive letter.
-
-    The shape is an allowlist, so every remote form fails it without a list of its own: a UNC path
-    (``\\\\host\\share``, ``//host/share``), a WebDAV path (``\\\\host@SSL\\DavWWWRoot``), and the
-    device and extended forms (``\\\\?\\UNC\\...``, ``\\\\?\\C:\\...``, ``\\\\.\\...``). So do a
-    relative path, a drive-relative one (``C:x.log``), a rooted one with no drive (``\\logs``), and
-    the ``shell:``, ``file:`` and ``https:`` forms the OS opener would launch.
-    """
-    return _LOCAL_DRIVE_PATH.match(path) is not None
-
-
 def open_log(
     log_path: str,
     *,
@@ -215,11 +345,7 @@ def open_log(
     Residual: resolving a local symlink that points at a UNC path reaches that host before the
     resolved target is refused. Planting one needs write access to the log's own directory.
     """
-    if (
-        not _is_local_drive_path(log_path)
-        or not _viewable_name(log_path)
-        or is_remote_drive(log_path)
-    ):
+    if not _viewable_name(log_path) or not _on_a_local_drive(log_path, is_remote_drive):
         raise LogPathRefused
     # The refusal is raised outside the handler, so the OSError (which quotes the path) is not
     # chained onto it (tests/test_from_none_is_not_redaction.py).
@@ -230,9 +356,8 @@ def open_log(
         target = None
     if (
         target is None
-        or not _is_local_drive_path(target)
         or not _viewable_name(target)
-        or is_remote_drive(target)
+        or not _on_a_local_drive(target, is_remote_drive)
         or not is_file(target)
     ):
         raise LogPathRefused

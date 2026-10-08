@@ -479,8 +479,13 @@ async def test_an_unresolvable_issuer_is_skipped_and_the_reason_logged(
             reason = "names no actor"
         elif case == "read_fails":
             alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            real_list_audit = store.list_audit
 
-            async def _refuse(**_kw: Any) -> Any:
+            async def _refuse(**kw: Any) -> Any:
+                # Only the issuer read fails. The once-only mark read (BACKLOG #2303) still works,
+                # or the pass would skip the account before the issuer is ever looked for.
+                if kw.get("action") == "auth.temporary_credential_expiring":
+                    return await real_list_audit(**kw)
                 raise RuntimeError("synthetic store failure")
 
             monkeypatch.setattr(store, "list_audit", _refuse)
@@ -615,5 +620,83 @@ async def test_a_credential_claimed_after_the_pass_read_it_is_not_reminded() -> 
             live, deadline=await _deadline(store, service, alice)
         )
         assert [r[0] for r in notifier.reminders("alice")][:1] == [TEMPORARY_CREDENTIAL_EXPIRING]
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #2303: the once-only mark outlives the process -------------------------------------
+
+
+async def test_a_restart_inside_the_window_sends_nothing_again() -> None:
+    """A second service over the same store, with an empty ``warned`` map, stands in for a restart.
+    The holder's reminder audit row is the mark, so neither the alert nor a notice goes out again."""
+    store, service, notifier = await _notified_service()
+    try:
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email="alice@example.org", actor="root")
+        deadline = await _deadline(store, service, alice)
+        sink = _RecordingSink()
+        await _remind_expiring_initial_credentials(
+            service, sink, lead=24 * _HOUR, warned={}, now=deadline - 2 * _HOUR
+        )
+        # root holds an unclaimed credential too, so it is reminded on this pass as well.
+        assert sorted(e["name"] for e in sink.events) == ["user:alice", "user:root"]
+        assert len(notifier.reminders("alice")) == 2
+
+        restarted_notifier = _RecordingNotifier()
+        restarted = AuthService(
+            store,
+            AuthSettings(initial_password_expiry_hours=72),
+            security_notifier=restarted_notifier,
+        )
+        restarted_sink = _RecordingSink()
+        await _remind_expiring_initial_credentials(
+            restarted, restarted_sink, lead=24 * _HOUR, warned={}, now=deadline - _HOUR
+        )
+        assert restarted_sink.events == []
+        assert restarted_notifier.events == []
+
+        # POSITIVE CONTROL: a new credential has a new deadline, so the restarted process reminds.
+        await restarted.admin_reset_password(alice, actor="root")
+        second = await _deadline(store, restarted, alice)
+        await _remind_expiring_initial_credentials(
+            restarted, restarted_sink, lead=24 * _HOUR, warned={}, now=second - _HOUR
+        )
+        assert restarted_sink.events == [
+            {"name": "user:alice", "expires_at": deadline_utc(second), "hours_remaining": 1}
+        ]
+        assert [r[0] for r in restarted_notifier.reminders("alice")] == [
+            TEMPORARY_CREDENTIAL_EXPIRING,
+            TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
+        ]
+    finally:
+        await store.close()
+
+
+async def test_a_failed_mark_read_still_reminds_and_does_not_stop_the_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A duplicate is the cheap failure, a credential that lapses with nobody told the costly."""
+    store, service = await _service()
+    try:
+        alice, _ = await _issue(service, "alice")
+        await _issue(service, "bob")
+        deadline = await _deadline(store, service, alice)
+        real = service.initial_credential_reminded
+
+        async def _flaky(user: Any, *, deadline: float) -> bool:
+            if user.username == "alice":
+                raise RuntimeError("synthetic store failure")
+            return await real(user, deadline=deadline)
+
+        monkeypatch.setattr(service, "initial_credential_reminded", _flaky)
+        sink = _RecordingSink()
+        warned: dict[str, float] = {}
+        for _ in range(2):
+            await _remind_expiring_initial_credentials(
+                service, sink, lead=24 * _HOUR, warned=warned, now=deadline - _HOUR
+            )
+        # Each once: the in-process map still holds alice after the first pass.
+        assert sorted(e["name"] for e in sink.events) == ["user:alice", "user:bob"]
     finally:
         await store.close()

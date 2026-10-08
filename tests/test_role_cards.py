@@ -465,9 +465,10 @@ class NoCardContradictsAnAnchoredRuling(unittest.TestCase):
         ),
         # The SECOND shape, added 2026-09-18. This screen was built from the push case alone and
         # therefore found only that shape -- builder.card.md carried "Declare its own seat. Your
-        # Manager does that." for the whole time this class existed. CLAUDE.md:418 records the
-        # opposite and says why the old rule was worth naming: it was SELF-CONFIRMING, because a
-        # Builder told it cannot declare does not try, renders undeclared, and confirms the rule.
+        # Manager does that." for the whole time this class existed. CLAUDE.md section 5, item 5
+        # of "A Builder gets one turn", records the opposite and says why the old rule was worth
+        # naming: it was SELF-CONFIRMING, because a Builder told it cannot declare does not try,
+        # renders undeclared, and confirms the rule.
         # The shipped shape: "**Declare its own seat.** Your Manager does that." Note it crosses a
         # sentence boundary, so the window CANNOT exclude "." the way the push patterns do -- the
         # first draft of this pattern used `[^.\n]` and stayed quiet on the very line it was
@@ -479,12 +480,14 @@ class NoCardContradictsAnAnchoredRuling(unittest.TestCase):
                 r"(?:manager|console|owner)\s+does",
                 re.I,
             ),
-            "a seat declares its own seat (CLAUDE.md:418, measured 2026-09-02); the Manager "
-            "supplies the seat and goal at dispatch but does not declare for it",
+            "a seat declares its own seat (CLAUDE.md section 5, 'A Builder gets one turn' item 5, "
+            "measured 2026-09-02); the Manager supplies the seat and goal at dispatch but does "
+            "not declare for it",
         ),
         (
             re.compile(r"(?:cannot|can't|must not|never)\s+declare\b[^\n]{0,30}\bseat\b", re.I),
-            "a seat CAN declare itself through the Bash tool (CLAUDE.md:418, measured 2026-09-02)",
+            "a seat CAN declare itself through the Bash tool (CLAUDE.md section 5, "
+            "'A Builder gets one turn' item 5, measured 2026-09-02)",
         ),
     )
 

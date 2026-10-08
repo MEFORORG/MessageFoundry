@@ -57,12 +57,14 @@ _WEBCONSOLE = _ROOT / "messagefoundry_webconsole"
 
 _H_CONFIG_AUTH = "### `[auth]` — authentication & RBAC"
 
-#: The two limiter accessors that defend the AUTHENTICATION surface (6.1.1). The other two
+#: The three limiter accessors that defend the AUTHENTICATION surface (6.1.1). The other two
 #: (``allow_phi_read``, ``allow_admin_write``) are post-authentication business-logic limits and
 #: belong to the 2.1.3 table instead. The split is asserted rather than assumed:
-#: ``test_every_sliding_window_limiter_is_filed_under_the_right_requirement`` fails if a fifth
+#: ``test_every_sliding_window_limiter_is_filed_under_the_right_requirement`` fails if a sixth
 #: limiter appears, forcing an explicit decision about which table it joins.
-_AUTH_SURFACE_ACCESSORS = frozenset({"allow_login_attempt", "allow_reauth_attempt"})
+_AUTH_SURFACE_ACCESSORS = frozenset(
+    {"allow_login_attempt", "allow_reauth_attempt", "allow_repeated_credential_audit"}
+)
 _BUSINESS_LIMIT_ACCESSORS = frozenset({"allow_phi_read", "allow_admin_write"})
 
 #: Anti-automation controls that are not objects and so cannot be derived: they are enforcement
@@ -1485,12 +1487,43 @@ _WARNING_LOG_CALLS = frozenset(
     {"warning", "error", "exception", "critical", "log", "_rate_limited"}
 )
 _UI_REFUSAL_HEADING = "**The console's refusal differs from the JSON floor's.**"
+_WRITE_WAIT_HEADING = "**The write floor's `Retry-After` is the actor's real wait"
+_API_SECURITY = _ROOT / "messagefoundry" / "api" / "security.py"
+#: The accessor both admin-write 429 sites must take their Retry-After from (BACKLOG #2144).
+_ADMIN_WRITE_WAIT = "admin_write_retry_after"
+#: At least these wordings stated the literals the header carried before BACKLOG #2144.
+_RETIRED_WRITE_LITERALS = (
+    "`Retry-After: 10`, not `1`",
+    "`Retry-After: 1` on the JSON API",
+    "on the JSON API and `10` on `/ui`",
+    "where the JSON floor sends `1`",
+    "(`allow_admin_write`), 429 + `Retry-After: 1`",
+    "JSON API: 429 + `Retry-After: 1`",
+)
 #: At least these wordings say the console's refusal writes no WARNING line.
 _UNLOGGED_PHRASES = ("no warning line", "no log line", "not logged")
 
 
+def _retry_after_values(tree: ast.AST) -> list[str]:
+    """Each ``Retry-After`` an ``HTTPException`` under ``tree`` sends, as it is written.
+
+    A string literal reads as its value (``"10"`` gives ``10``). Anything else reads as its source
+    text, so a computed wait is compared as an expression and never mistaken for a literal.
+    """
+    return [
+        value.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str)
+        else ast.unparse(value)
+        for call in call_sites(tree, "HTTPException")
+        for kw in call.keywords
+        if kw.arg == "headers" and isinstance(kw.value, ast.Dict)
+        for key, value in zip(kw.value.keys, kw.value.values, strict=True)
+        if isinstance(key, ast.Constant) and key.value == "Retry-After"
+    ]
+
+
 def _ui_refusal(src: str, limiter: str) -> tuple[str, bool] | None:
-    """``(Retry-After value, logs at WARNING?)`` for ``require_ui``'s refusal on ``limiter``.
+    """``(Retry-After as written, logs at WARNING?)`` for ``require_ui``'s refusal on ``limiter``.
 
     The branch is the one ``if`` whose test calls ``limiter``. None when there is no such branch;
     more than one reds, so a second charge site is never read silently in place of the first.
@@ -1505,16 +1538,8 @@ def _ui_refusal(src: str, limiter: str) -> tuple[str, bool] | None:
         return None
     assert len(branches) == 1, f"expected one {limiter} branch in require_ui, got {len(branches)}"
     body = ast.Module(body=branches[0].body, type_ignores=[])
-    retry_after = [
-        value.value
-        for call in call_sites(body, "HTTPException")
-        for kw in call.keywords
-        if kw.arg == "headers" and isinstance(kw.value, ast.Dict)
-        for key, value in zip(kw.value.keys, kw.value.values, strict=True)
-        if isinstance(key, ast.Constant) and key.value == "Retry-After"
-        if isinstance(value, ast.Constant) and isinstance(value.value, str)
-    ]
-    assert len(retry_after) == 1, f"expected one literal Retry-After in the branch: {retry_after}"
+    retry_after = _retry_after_values(body)
+    assert len(retry_after) == 1, f"expected one Retry-After in the branch: {retry_after}"
     return retry_after[0], bool(calls_to(body, _WARNING_LOG_CALLS))
 
 
@@ -1546,9 +1571,13 @@ def test_ui_refusal_reader_can_fail() -> None:
     indent = " " * (len(head) - len(head.rstrip(" ")) + 4)
     logged = head + charge + f"{indent}log.warning('throttled')\n" + tail
     assert _ui_refusal(logged, "allow_admin_write") == (baseline[0], True)
-    header = f'"Retry-After": "{baseline[0]}"'
+    # The first Retry-After after the charge is this branch's, whether a literal or an expression.
+    header = re.search(r'"Retry-After": [^\n]*\},\n', tail)
+    if header is None:
+        pytest.fail("the admin-write branch's Retry-After is no longer on one line; re-aim")
     sentinel = "98" if baseline[0] == "99" else "99"  # never equal to the live value
-    moved = head + charge + tail.replace(header, f'"Retry-After": "{sentinel}"', 1)
+    planted = f'"Retry-After": "{sentinel}"}},\n'
+    moved = head + charge + tail[: header.start()] + planted + tail[header.end() :]
     assert _ui_refusal(moved, "allow_admin_write") == (sentinel, baseline[1])
     debug = head + charge + f"{indent}log.debug('throttled')\n" + tail
     assert _ui_refusal(debug, "allow_admin_write") == baseline, "a DEBUG line is not a WARNING"
@@ -1557,10 +1586,16 @@ def test_ui_refusal_reader_can_fail() -> None:
 def test_ui_refusal_is_described_as_the_code_behaves() -> None:
     """SECURITY.md's paragraph on the console's refusal follows ``require_ui``, both ways.
 
-    Pinned: that paragraph (the header, and logging for the admin-write floor and the ``phi=True``
-    PHI-read arm it also names), the Admin writes row of the 2.1.3 limits table, the /ui plane's
-    item 2, the contextual-attributes row, and ``docs/CONFIGURATION.md``'s window row. At least the
-    logging restatements outside the paragraph are NOT pinned here.
+    Pinned: that paragraph (logging for the admin-write floor and the ``phi=True`` PHI-read arm it
+    also names), the paragraph on the write floor's ``Retry-After``, the Admin writes row of the
+    2.1.3 limits table, the /ui plane's item 2, the contextual-attributes row, and
+    ``docs/CONFIGURATION.md``'s window row. At least the logging restatements outside the paragraph
+    are NOT pinned here.
+
+    BACKLOG #2144: the write floor's ``Retry-After`` is the limiter's own wait on both surfaces. So
+    the code half pins that ``require_ui`` and the JSON gate send the SAME expression, and the doc
+    half pins that neither pinned document carries at least the retired wordings listed in
+    ``_RETIRED_WRITE_LITERALS``. Another document, or another wording, is not read.
     """
     src = _CONSOLE_AUTH.read_text(encoding="utf-8-sig")
     write = _ui_refusal(src, "allow_admin_write")
@@ -1580,9 +1615,24 @@ def test_ui_refusal_is_described_as_the_code_behaves() -> None:
     assert len(found) == 1, f"SECURITY.md must carry one paragraph headed {_UI_REFUSAL_HEADING}"
     paragraph = found[0]
     retry_after, write_logs = write
-    assert f"`Retry-After: {retry_after}`" in paragraph, (
-        f"require_ui's admin-write 429 sends Retry-After: {retry_after}; the paragraph must say so"
+    assert _ADMIN_WRITE_WAIT in retry_after, (
+        f"require_ui's admin-write 429 sends Retry-After: {retry_after}, not the limiter's wait "
+        f"({_ADMIN_WRITE_WAIT}); restate every passage this test pins before changing it"
     )
+    json_gate = named_func(
+        _parse_src(_API_SECURITY.read_text(encoding="utf-8-sig")), "_enforce_admin_write_pacing"
+    )
+    assert _retry_after_values(json_gate) == [retry_after], (
+        "the JSON gate and require_ui must send the same Retry-After for the same refusal"
+    )
+    waits = [
+        " ".join(block.split())
+        for block in re.split(r"\n\s*\n", text)
+        if block.lstrip().startswith(_WRITE_WAIT_HEADING)
+    ]
+    assert len(waits) == 1, f"SECURITY.md must carry one paragraph headed {_WRITE_WAIT_HEADING}"
+    for claim in ("rounded up", "never below 1", "send the same value"):
+        assert claim in waits[0], f"the write-floor Retry-After paragraph must still say {claim!r}"
     says_unlogged = any(p in paragraph.casefold() for p in _UNLOGGED_PHRASES)
     logs = write_logs or (phi is not None and phi[1])
     assert says_unlogged is not logs, (
@@ -1594,19 +1644,25 @@ def test_ui_refusal_is_described_as_the_code_behaves() -> None:
         line for line in _section(_H_LIMITS).splitlines() if line.startswith("| Admin writes |")
     ]
     assert len(rows) == 1, "the 2.1.3 limits table lost its Admin writes row"
-    assert f"`/ui`: 429 + `Retry-After: {retry_after}`" in rows[0], (
-        "the 2.1.3 Admin writes row must carry the console's Retry-After"
+    assert "`/ui`: the same 429 + `Retry-After`" in rows[0], (
+        "the 2.1.3 Admin writes row must say the console sends the JSON floor's Retry-After"
     )
     folded = " ".join(text.split())
     for restatement in (
-        f"its 429 carries `Retry-After: {retry_after}` where the JSON floor",
-        f"on the JSON API and `{retry_after}` on `/ui`",
+        "its 429 carries the same `Retry-After` the JSON floor sends",
+        "the same on the JSON API and on `/ui`",
     ):
         assert restatement in folded, f"SECURITY.md must still say {restatement!r}"
     config = " ".join(_CONFIG_DOC.read_text(encoding="utf-8").split())
-    assert f"`Retry-After: {retry_after}` on the `/ui` console" in config, (
+    assert "the same on the JSON API and the `/ui` console" in config, (
         "docs/CONFIGURATION.md's admin_write_rate_limit_window_seconds row must carry it too"
     )
+    for retired in _RETIRED_WRITE_LITERALS:
+        for name, doc in (("docs/SECURITY.md", folded), ("docs/CONFIGURATION.md", config)):
+            assert retired not in doc, (
+                f"{name} states a literal admin-write Retry-After again ({retired!r}); the header "
+                "is the limiter's wait (BACKLOG #2144)"
+            )
 
 
 def test_ui_pacing_gap_wording_flips_with_the_code() -> None:
@@ -1773,9 +1829,10 @@ def _derived_protection_seams() -> dict[str, str]:
 
 
 def test_every_sliding_window_limiter_is_filed_under_the_right_requirement() -> None:
-    """A fifth limiter must join one table or the other — it cannot land undocumented.
+    """A sixth limiter must join one table or the other — it cannot land undocumented.
 
-    ``allow_login_attempt``/``allow_reauth_attempt`` defend the AUTHENTICATION surface (6.1.1);
+    ``allow_login_attempt``/``allow_reauth_attempt``/``allow_repeated_credential_audit`` defend the
+    AUTHENTICATION surface (6.1.1);
     ``allow_phi_read``/``allow_admin_write`` are post-authentication business-logic limits (2.1.3).
     The split is asserted, so a new accessor forces an explicit decision rather than silently
     inheriting one table's coverage claim.

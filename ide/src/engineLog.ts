@@ -21,6 +21,9 @@ let channel: vscode.LogOutputChannel | undefined;
 /** The singleton channel. Created lazily so merely importing this module costs nothing. */
 export function engineLog(): vscode.LogOutputChannel {
   if (!channel) {
+    // A LogOutputChannel: the EDITOR stamps each line, in a format the extension cannot set. Do not
+    // add a stamp of our own here, or every line carries two. The plain Checks channel is the one
+    // this extension stamps itself (checksLog.ts).
     channel = vscode.window.createOutputChannel("MessageFoundry Engine", { log: true });
   }
   return channel;

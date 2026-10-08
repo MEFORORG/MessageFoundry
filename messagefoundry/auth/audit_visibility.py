@@ -20,6 +20,8 @@ This module is the one place that names the hidden rows. Every API read of the t
 * ``auth.account_locked`` -- a lock landed. In a combined campaign under a live sign-in lock, only
   a right candidate can make one.
 * ``auth.lock_notice`` -- the throttle row of a lock mail, and its detail names the counter.
+* ``auth.lock_notice_undelivered`` -- a lock mail the relay's queue dropped or the send lost
+  (BACKLOG #2383). It is written only when a lock landed.
 * ``auth.login_locked`` -- a sign-in refused by a live lock. A live second-step lock refuses a
   later sign-in that a wrong candidate would have been refused for as a plain wrong password.
 * ``auth.admin_unlocked`` -- the whole row, not only its lock fields. Its detail records both lock
@@ -77,6 +79,7 @@ __all__ = [
     "LOCKED_REFUSAL_DETAIL",
     "LOCK_EVENT_ACTIONS",
     "LOCK_NOTICE_ACTION",
+    "LOCK_NOTICE_UNDELIVERED_ACTION",
     "LOGIN_LOCKED_ACTION",
     "audit_exclusion_for",
     "is_audit_copy_line",
@@ -86,12 +89,21 @@ __all__ = [
 
 ACCOUNT_LOCKED_ACTION: Final = "auth.account_locked"
 LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
+#: A lock notice that never left this engine (BACKLOG #2383). Its own name, not
+#: ``auth.security_notice_undelivered``, so the whole row can be hidden like the lock rows.
+LOCK_NOTICE_UNDELIVERED_ACTION: Final = "auth.lock_notice_undelivered"
 LOGIN_LOCKED_ACTION: Final = "auth.login_locked"
 ADMIN_UNLOCKED_ACTION: Final = "auth.admin_unlocked"
 
 #: The whole-row hides.
 LOCK_EVENT_ACTIONS: Final[frozenset[str]] = frozenset(
-    {ACCOUNT_LOCKED_ACTION, LOCK_NOTICE_ACTION, LOGIN_LOCKED_ACTION, ADMIN_UNLOCKED_ACTION}
+    {
+        ACCOUNT_LOCKED_ACTION,
+        LOCK_NOTICE_ACTION,
+        LOCK_NOTICE_UNDELIVERED_ACTION,
+        LOGIN_LOCKED_ACTION,
+        ADMIN_UNLOCKED_ACTION,
+    }
 )
 
 #: The exact detail of a lock refusal on the TOTP/recovery and passkey legs. The writers use this

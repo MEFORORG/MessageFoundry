@@ -4472,6 +4472,15 @@ _ALERT_EVENT_TYPES = frozenset(
         # recorded one. Keyed `config:<12 hex>`, which no connection can be named, so it is not in
         # _ALERT_CONTROL_EVENT_TYPES below.
         "config_changed",
+        # vault BACKLOG #2613: the security-signal rule layer over the audit stream. Each detector
+        # has its own type; pipeline/security_signals.py SECURITY_SIGNAL_TYPES mirrors this block, and
+        # a test pins that each is here. None is connection-scoped.
+        "signin_failure_burst",
+        "access_denied_burst",
+        "body_view_burst",
+        "bulk_export",
+        "log_level_debug",
+        "posture_loosened",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,
@@ -4492,12 +4501,16 @@ _ALERT_CONTROL_ACTIONS = frozenset({"restart_inbound", "restart_outbound"})
 #: Some stand-ins fit the connection-name grammar, so a restart aimed at one could hit an unrelated
 #: real connection. The notifier checks the same set at dispatch (``NotifierAlertSink._emit``).
 #:
-#: KNOWN GAPS this set does not close, at least these two. First, two emitters raise
-#: ``connection_stopped`` with a stand-in: ``reference:<name>`` (pipeline/reference_sync.py) and
-#: ``transform-state`` (pipeline/state_convergence.py); the second fits the connection-name grammar.
-#: Second, an allowed event can carry an inbound name or an outbound name, and the two are separate
-#: namespaces. With no control_target, restart_outbound on an inbound's event, or restart_inbound on
-#: an outbound's, aims at whatever connection on the other side shares the bare name.
+#: This set checks the event TYPE only, and an allowed type can still carry a stand-in:
+#: ``reference:<name>`` (pipeline/reference_sync.py) and ``cluster:transform-state``
+#: (pipeline/state_convergence.py) both raise ``connection_stopped``. So the notifier also skips the
+#: action for an event whose ``connection`` key is not a connection name, even at an explicit
+#: control_target (BACKLOG #2527). A stand-in raised under one of these types must keep a colon.
+#:
+#: An allowed event can carry an inbound name or an outbound name, and the two are separate
+#: namespaces. With no control_target, the api/app.py control callback restarts the bare name only
+#: when it is declared on the action's side and not the other (BACKLOG #2528), and logs a skip
+#: otherwise. That needs the graph, which a rule does not have, so it is not a load-time check.
 _ALERT_CONTROL_EVENT_TYPES = frozenset(
     {
         "connection_stopped",
@@ -4648,8 +4661,8 @@ class AlertRule(BaseModel):
     # BACKLOG #1898: allowed only with an event_type in _ALERT_CONTROL_EVENT_TYPES; "any" and every
     # other type are refused at load (_check_control_scope below).
     control_action: str | None = None
-    # The connection the control action targets. None = the event's own `connection` key (see the
-    # KNOWN GAP on _ALERT_CONTROL_EVENT_TYPES); set it to act on a DIFFERENT connection than the one
+    # The connection the control action targets. None = the event's own `connection` key, restarted
+    # only on the action's side (see _ALERT_CONTROL_EVENT_TYPES); set it to act on a DIFFERENT connection than the one
     # that fired (e.g. restart an inbound when its paired outbound stalls). BACKLOG #1898: when set it
     # must be a connection name and needs a control_action.
     control_target: str | None = None
@@ -4795,6 +4808,24 @@ class AlertsSettings(_Section):
     # Re-alert throttle: the same (event, connection) won't re-notify more often than this, so a
     # flapping lane can't spam the channel.
     realert_seconds: float = 300.0
+
+    # --- security signals (vault BACKLOG #2613) ------------------------------------------------
+    # A rule layer over the audit stream (pipeline/security_signals.py) raises an alert when a count
+    # below is reached inside security_window_seconds. On by default. A count of 0 switches that one
+    # detector off; security_signals=false switches the whole layer off, the DEBUG and posture
+    # detectors included. The defaults are set high on purpose: a page nobody acts on teaches an
+    # operator to ignore the channel. docs/CONFIGURATION.md [alerts] lists each one.
+    security_signals: bool = True
+    security_window_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    # Refused sign-ins from ONE client address. Keyed on the address, never the typed username.
+    security_signin_failures: int = Field(default=20, ge=0)
+    # auth.permission_denied + auth.channel_denied + auth.mfa_denied for ONE account.
+    security_denials: int = Field(default=20, ge=0)
+    # Stored-body reads by ONE account: message_body_view, outbound.read, response.read and
+    # attachment_download rows.
+    security_body_views: int = Field(default=100, ge=0)
+    # Messages selected by ONE account's messages_export calls, summed over the window.
+    security_export_messages: int = Field(default=5000, ge=0)
 
     # Secure-by-default (#188, ASVS 6.3.5/6.3.7): out-of-band security-event notifications are required
     # by default. `serve` refuses to start under [security].enforcement=enforce (warns under
@@ -7567,6 +7598,118 @@ def oidc_second_factor_claim_exception(auth: AuthSettings) -> str:
     return ""
 
 
+#: The alert event types that carry a credential reminder (ASVS 6.4.5): an unclaimed temporary
+#: password near its deadline, a certificate near expiry, a secret due for rotation. Each is a member
+#: of ``_ALERT_EVENT_TYPES``, so a rule can name it.
+CREDENTIAL_REMINDER_EVENT_TYPES: tuple[str, ...] = (
+    "initial_credential_expiring",
+    "cert_expiry",
+    "secret_rotation",
+)
+
+
+def reminder_silencing_rules(alerts: AlertsSettings) -> list[tuple[str, tuple[str, ...]]]:
+    """Each ``[[alerts.rules]]`` entry that can send a credential reminder to no transport, as
+    ``(label, reminder event types it can match)`` (BACKLOG #2008 step 4, ASVS 6.4.5).
+
+    A rule silences a matching event when it sets ``mute = true`` or ``transports = []``, or when an
+    escalate tier sets ``transports = []`` and the occurrence count reaches it
+    (``NotifierAlertSink._apply_escalation``). A rule that sets ``min_depth`` or
+    ``min_oldest_seconds`` never matches a reminder event (``AlertRuleSet._matches``), so it is
+    skipped.
+
+    **It reads each rule alone, and so it can over-report.** A rule whose connection glob or schedule
+    excludes every reminder, or one that an earlier rule always shadows (first match wins), is still
+    listed. That errs toward naming a rule that silences nothing over missing one that silences a
+    reminder. The label is the rule's position, plus its ``id`` quoted with ``repr`` so a control
+    character in it cannot reach the log raw."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for i, rule in enumerate(alerts.rules):
+        if rule.min_depth is not None or rule.min_oldest_seconds is not None:
+            continue
+        types = tuple(t for t in CREDENTIAL_REMINDER_EVENT_TYPES if rule.event_type in ("any", t))
+        if not types:
+            continue
+        if rule.mute or rule.transports == [] or any(t.transports == [] for t in rule.escalate):
+            label = f"rules[{i}]" if rule.id is None else f"rules[{i}] (id {rule.id!r})"
+            out.append((label, types))
+    return out
+
+
+def _reminder_lead(
+    switch: str, value: int, default: int, off: str, late: str
+) -> list[tuple[str, str]]:
+    """One reminder's ``warn_days`` entry: ``off`` at 0, ``late`` (formatted with the value and the
+    default) below the shipped default, nothing at or above it."""
+    if value == 0:
+        return [(switch, off)]
+    if value < default:
+        return [(switch, late.format(value=value, default=default))]
+    return []
+
+
+def _reminder_loosenings(
+    cert_monitor: CertMonitorSettings,
+    secret_rotation: SecretRotationSettings,
+    alerts: AlertsSettings,
+) -> list[tuple[str, str]]:
+    """The credential-reminder weakenings :func:`security_loosenings` names (ASVS 6.4.5).
+
+    BACKLOG #2227: each ``warn_days = 0`` turned its reminder off with only a debug line from the
+    runner. A lead shorter than the shipped default is named too, as BACKLOG #1131 names a limit
+    looser than its default: a reminder one day ahead leaves no time to renew. Each section's
+    ``check_interval_seconds`` also delays a reminder and is NOT named here.
+
+    BACKLOG #2008 step 4: an ``[[alerts.rules]]`` entry that can send a reminder to no transport
+    (:func:`reminder_silencing_rules`)."""
+    out = _reminder_lead(
+        "cert_monitor.warn_days",
+        cert_monitor.warn_days,
+        CertMonitorSettings.model_fields["warn_days"].default,
+        "[cert_monitor].warn_days = 0 turns the certificate-expiry monitor off -- no "
+        "cert_expiry reminder is raised for any certificate or CRL file the monitor watches, so "
+        "one can reach its expiry with no warning ahead of it, and a service caller's client "
+        "certificate is never flagged as near expiry",
+        "[cert_monitor].warn_days = {value}, shorter than the default of {default} -- a "
+        "certificate or CRL file the monitor watches, and a service caller's client certificate, "
+        "is first flagged only {value} day(s) before it expires, which may leave too little time "
+        "to renew it",
+    )
+    # Not "no secret_rotation alert at all". On a store that tracks the key, under enforce, at least
+    # the start-time expiry checks still raise one (reconcile_rotation_meta,
+    # enforce_store_key_expiry, enforce_secret_expiry), whatever warn_days is. On a keyless or vault_transit store
+    # they find nothing to check. What warn_days = 0 removes is the periodic runner.
+    out += _reminder_lead(
+        "secret_rotation.warn_days",
+        secret_rotation.warn_days,
+        SecretRotationSettings.model_fields["warn_days"].default,
+        "[secret_rotation].warn_days = 0 turns the periodic secret-rotation reminder off -- "
+        "nothing reminds anyone ahead of a due date, or later while a secret runs overdue. The "
+        "start-time expiry checks are the only source of a secret_rotation alert left: they run "
+        "only under enforcement = enforce, and find something only on a store that tracks its "
+        "key",
+        "[secret_rotation].warn_days = {value}, shorter than the default of {default} -- a "
+        "secret is first flagged only {value} day(s) before it is due, which may leave too "
+        "little time to rotate it",
+    )
+    silencing = reminder_silencing_rules(alerts)
+    if silencing:
+        # ", " between rules and "/" between types: the serve warning joins whole entries with
+        # "; ", so an entry must not use that separator inside itself.
+        named = ", ".join(f"{label} matches {'/'.join(types)}" for label, types in silencing)
+        out.append(
+            (
+                "alerts.rules",
+                f"{len(silencing)} [[alerts.rules]] entr{'y' if len(silencing) == 1 else 'ies'} "
+                f"can send a credential reminder to no transport ({named}) -- mute = true, "
+                "transports = [], or an escalate tier with transports = [] records the reminder "
+                "but notifies nobody, so a temporary password, certificate or secret can reach "
+                "its deadline with no one told",
+            )
+        )
+    return out
+
+
 def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
@@ -7583,6 +7726,7 @@ def security_loosenings(
     revocation_attested_hops: Sequence[str],
     api: ApiSettings,
     approvals: ApprovalsSettings,
+    cert_monitor: CertMonitorSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
@@ -7604,7 +7748,9 @@ def security_loosenings(
     (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
+    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
+    leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
+    ``[[alerts.rules]]`` entry that can silence a reminder (#2227, #2008), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS
     12.3.2), an endpoint ``url`` with a credential in its query string (ASVS 14.2.1), a generic-ODBC
     ``DATABASE`` hop
@@ -7648,6 +7794,18 @@ def security_loosenings(
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
+    ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227).
+
+    **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
+    settings silence one or more of them with no refusal, and each is named here, so the serve-time
+    warning says so: ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` at ``0`` or
+    below their defaults, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
+    transport (:func:`_reminder_loosenings`). Not every way is named.
+    ``[auth].initial_password_expiry_hours = 0`` also stops a reminder and is unreported. The
+    paragraph above gives the reason as a new required parameter, and that premise no longer
+    holds: ``auth`` is already a parameter here, so naming it is one more arm, owed and not built.
+    ``[alerts].security_notifications_required = false`` with no recipient sends every reminder to
+    the log alone; serve audits that waiver, and this registry does not list it.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -7938,6 +8096,10 @@ def security_loosenings(
                 "key's 2**32-encrypt usage ceiling still refuses unconditionally)",
             )
         )
+    # --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4). Owner answer to
+    # #2006 (a): a silent weakening keeps the cell at partial. _reminder_loosenings says what each
+    # entry covers.
+    out.extend(_reminder_loosenings(cert_monitor, secret_rotation, alerts))
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to
     # reconcile against, so 0 is not a weaker choice, it is the only meaningful one.
     if auth.ad_enabled and not auth.ad_session_recheck_seconds:

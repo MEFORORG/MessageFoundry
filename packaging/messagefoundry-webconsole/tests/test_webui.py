@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 import httpx
 import pytest
 from _ui_clients import create_local_user_chosen, issue_continuation
+from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -1482,7 +1483,9 @@ class _FakeWS:
         app: object,
         peer: tuple[str, int] = ("127.0.0.1", 123),
     ) -> None:
-        self.headers = {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
+        self.headers = Headers(  # has getlist (BACKLOG #2454)
+            {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
+        )
         self.app = app
         # ``.client`` is what ``client_ip`` reads for the denial rows (ADR 0150, BACKLOG #1644). A
         # real address by default, never None, so a client assertion cannot pass as None == None.
@@ -7205,7 +7208,7 @@ def _sys_status(*, update: object = None) -> object:
     )
 
 
-def _status_html(sys_status: object) -> str:
+def _status_html(sys_status: object, security: dict[str, object] | None = None) -> str:
     from messagefoundry.api.models import (
         ClusterNodeList,
         ClusterStatus,
@@ -7222,6 +7225,7 @@ def _status_html(sys_status: object) -> str:
         key_id=None,
         require_encryption=False,
         allow_unencrypted_phi=True,
+        security=security or {},
     )
     cluster = ClusterStatus(
         node_id="n1", clustered=False, is_leader=True, role="single-node", config_version=0
@@ -7230,6 +7234,25 @@ def _status_html(sys_status: object) -> str:
     svc = ServiceStatusInfo(enabled=False, state="disabled", service_name="")
     nodes = ClusterNodeList(nodes=[], leader_node_id=None, lease_owner=None, lease_expires_at=None)
     return str(status(sys_status, posture, cluster, nodes, dr, svc))
+
+
+def test_status_page_gives_each_retention_acknowledgement_its_own_row() -> None:
+    """Vault BACKLOG #2280: the posture table showed ``allow_keeping_phi_indefinitely`` only.
+
+    The switches are read off the engine's classification, so a tier given one there reds here
+    until the page shows it. A distinct marker per switch proves each row reads ITS key."""
+    from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
+
+    switches = [w.acknowledged_by for w in PHI_RETENTION_WINDOWS if w.acknowledged_by]
+    assert len(switches) >= 4  # a floor, so an emptied classification cannot pass this vacuously
+    labels = {s: "Allow " + s.removeprefix("allow_").replace("_", " ") for s in switches}
+    sys_status = _sys_status(update=None)
+    marked = _status_html(sys_status, {s: f"marker-{s}" for s in switches})
+    unset = _status_html(sys_status)
+    for switch, label in labels.items():
+        assert f"{label}</td><td>marker-{switch}<" in marked, switch
+        # The control: with no value the row is still there, and shows the dash.
+        assert f"{label}</td><td>—<" in unset, switch
 
 
 def test_status_update_banner() -> None:
@@ -8724,6 +8747,12 @@ async def test_a_cookie_replayed_from_a_second_address_is_sent_to_reauth(engine:
             "/ui/reauth", data={"next": f"/ui/messages/{mid}", "password": PW}, headers=same
         )
         assert (done.status_code, done.headers["location"]) == (303, f"/ui/messages/{mid}")
+        # Keep only the rotated cookie. The jar files the hand-set copy and the server's under
+        # different domains, so both would ride the next request, and two copies are refused
+        # (BACKLOG #2454). A browser holds one: the engine's cookie is host-only.
+        rotated = done.cookies["mf_session"]
+        b.cookies.clear()
+        b.cookies.set("mf_session", rotated)
         # The re-auth re-anchored the session at this address.
         assert (await b.get(f"/ui/messages/{mid}")).status_code == 200
     seen = [

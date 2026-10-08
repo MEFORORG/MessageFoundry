@@ -234,6 +234,24 @@ def test_show_reports_a_shortened_approval_dwell(
     assert "min_dwell_seconds" not in [e["switch"] for e in data["loosenings"]]
 
 
+def test_show_reports_the_credential_reminders_turned_off(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #2227: [cert_monitor] is resolved from the whole file, like [secret_rotation], so
+    each warn_days = 0 is listed. The shipped values are the control."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text(
+        "[cert_monitor]\nwarn_days = 0\n[secret_rotation]\nwarn_days = 0\n", encoding="utf-8"
+    )
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False
+    switches = [e["switch"] for e in data["loosenings"]]
+    assert "cert_monitor.warn_days" in switches and "secret_rotation.warn_days" in switches
+    toml.write_text("[cert_monitor]\nwarn_days = 30\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert "cert_monitor.warn_days" not in [e["switch"] for e in data["loosenings"]]
+
+
 def test_show_declares_a_partial_report_when_the_file_will_not_load(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

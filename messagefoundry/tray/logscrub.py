@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 
 from messagefoundry.controlchars import scrub_control_chars
-from messagefoundry.redaction import redact_untrusted
+from messagefoundry.redaction import prepare_log_record, redact_untrusted
 from messagefoundry.secretscrub import scrub_credentials
 
 __all__ = ["TrayLogScrubFilter"]
@@ -42,10 +42,6 @@ __all__ = ["TrayLogScrubFilter"]
 #: The engine's traceback continuation prefix (``logging_setup._CONTINUATION_PREFIX``). Every line
 #: of a traceback is indented with it, so no line can pass for a new record's prefix.
 _CONTINUATION_PREFIX = "    | "
-
-# Renders a record's exception to text. ``formatException`` ignores the format string, so one
-# shared instance is safe.
-_EXC_RENDERER = logging.Formatter()
 
 
 def _scrub_text(text: str) -> str:
@@ -81,9 +77,8 @@ class TrayLogScrubFilter(logging.Filter):
     def _scrub(record: logging.LogRecord) -> None:
         # Render the traceback first and clear exc_info unconditionally, so no formatter can
         # re-render the raw exception past the scrub (the engine's RedactionFilter does the same).
-        if not record.exc_text and record.exc_info:
-            record.exc_text = _EXC_RENDERER.formatException(record.exc_info)
-        record.exc_info = None
+        # A UnicodeError prints from its attributes, never its str() (vault BACKLOG #3185).
+        prepare_log_record(record)
         # Always replace msg and args, so the formatter writes the text that was scrubbed rather
         # than rendering the arguments a second time.
         record.msg = scrub_control_chars(_scrub_text(record.getMessage()))
