@@ -837,6 +837,9 @@ def test_check_passes_reference_set_against_sqlserver_backend(tmp_path: Path) ->
     assert report.ok is True
 
 
+# The retention leg is required too (vault BACKLOG #2280), and arm (b) asserts the whole gate is
+# green, so it takes windows on the two warn-only tiers that ship with none.
+@pytest.mark.usefixtures("bounded_warn_only_retention")
 def test_reference_backend_check_skips_and_passes_appropriately(tmp_path: Path) -> None:
     # The three fail-safe arms (the _check_build convention), so the new REQUIRED check can never block
     # an existing green config.

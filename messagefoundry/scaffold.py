@@ -113,6 +113,16 @@ port = 8765
 # EVERY instance carries patient data (ADR 0186) - there is no data-class switch to set here, and the
 # retired one is REFUSED at load. To relax a specific PHI gate, name that gate's own switch.
 # block_unlisted_outbound = false     # the audited opt-out: an empty [egress] list allows any destination
+# Transform state has no retention window by default, and `serve` and `messagefoundry check` refuse
+# a tier with neither a window nor its acknowledgement. This is the acknowledgement: a window here
+# deletes state by the time it was last WRITTEN, so it can remove an entry a Handler still reads.
+# It is an audited loosening; `serve` writes an AUDIT line for it at each start.
+allow_keeping_transform_state_indefinitely = true
+
+[retention]
+# Saved searches nobody has used or edited for this many days are deleted. They ship with no window,
+# and an enforcing instance refuses to start on that. Set the number your site requires.
+search_preset_days = 30
 
 [ai]
 # The active-environment NAME — REQUIRED (also passable as `serve --env <name>`). Free-form: name

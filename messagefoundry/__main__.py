@@ -3491,138 +3491,29 @@ def _serve(args: argparse.Namespace) -> int:
         )
 
     # --- #186(a) secure-by-default data retention (ASVS 14.2.4) --------------------------------------
-    # RetentionSettings defaults every window to 0 (keep-forever) and RetentionRunner then purges
-    # NOTHING, so a PHI instance accumulates PHI bodies indefinitely. Both PHI-body windows must be
-    # bounded: messages_days (inbound bodies) AND dead_letter_days (a dead-lettered row at ANY stage
-    # stays replayable, i.e. full PHI, until its own window purges it — #1188 widened that purge past
-    # the outbound stage, so this window now also bounds a dead ingress/routed row, which carries the
-    # whole raw body). As at the open-egress / MFA-at-exposure gates, the refuse/warn split is
-    # [security].enforcement, NOT the production tier, and no instance is exempt as synthetic or
-    # dev. Every instance AUTO-BOUNDS each of the three auto-bounded windows (messages_days,
-    # dead_letter_days and reference_snapshot_days) to 30 days when it is UNSET (WP243/#243,
-    # secure-by-default), production included. One of those three explicitly set to 0 REFUSES to
-    # start under enforce and WARNS under enforcement = warn; the warn-only windows only ever warn.
-    # The explicit, audited opt-out is [security].allow_keeping_phi_indefinitely=true, which
-    # suppresses the auto-bound and, under enforce, downgrades the refusal to a loud audited
-    # warning. Placed after the exposure gates so an exposed instance's cleartext/MFA refusals
-    # surface first.
-    # WP243 (#243, ASVS 14.2.7): the auto-bound mirrors the egress deny default above. It
-    # applies on every instance and on both dials (owner ruling 2026-07-30, at the AUTO-BOUND block
-    # below). Only an UNSET window is defaulted (model_fields_set), so an explicit value —
-    # including an explicit 0 — is respected; the audited keep-forever opt-out is
-    # [security].allow_keeping_phi_indefinitely=true.
-    # settings.retention is the same object later passed to create_managed_app, so the in-place
-    # default threads through to the RetentionRunner (no forbidden-file edit).
-    # messages_days moved to [security].delete_message_bodies_after_days (ADR 0118);
-    # dead_letter_days stays [retention] plumbing — label each window at its real home.
-    # ASVS 14.2.7: the tier list is GENERATED from the classification in
-    # config/retention_classification.py, which a drift test holds equal — in both directions — to
-    # docs/PHI.md §2's Retention column. It used to be a two-element literal here, and the cell
-    # broke once because a new PHI tier landed and nobody widened it. A wider literal with no
-    # binding to the classification is the same defect with more characters.
-    from messagefoundry.config.retention_classification import (
-        MIN_PHI_RETENTION_WINDOWS,
-        PHI_RETENTION_WINDOWS,
-        auto_bounded_windows,
-    )
-    from messagefoundry.config.retention_classification import (
-        unbounded_windows as _unbounded_windows,
-    )
+    # Every PHI retention tier must be bounded or acknowledged. Each unset auto-bounded window takes
+    # its default bound here; an explicit 0 on one refuses under enforce and warns under
+    # enforcement = warn; a warn-only tier needs a window or its own acknowledgement (BACKLOG
+    # #1967). The decision, its order and its wording are in evaluate_retention_gate, which
+    # `messagefoundry check` calls too (vault BACKLOG #2280), so the two commands share one text.
+    # Placed after the exposure gates so an exposed instance's cleartext/MFA refusals surface
+    # first.
+    # The gate sets the defaulted windows on `settings` in place. settings.retention is the same
+    # object later passed to create_managed_app, so the default threads through to the
+    # RetentionRunner.
+    from messagefoundry.config.retention_classification import evaluate_retention_gate
 
-    # A FLOOR, not an emptiness check. `if not PHI_RETENTION_WINDOWS` passes for a one-element
-    # tuple, so a bad merge dropping most entries would leave this gate checking one window while
-    # reporting success — the precise shape of failure this whole change set exists to remove.
-    if len(PHI_RETENTION_WINDOWS) < MIN_PHI_RETENTION_WINDOWS:
-        print(
-            f"error: the PHI retention classification has shrunk to "
-            f"{len(PHI_RETENTION_WINDOWS)} windows (floor {MIN_PHI_RETENTION_WINDOWS}); refusing "
-            "to start rather than gate on a partial classification. This is a build defect, not a "
-            "configuration one — see messagefoundry/config/retention_classification.py.",
-            file=sys.stderr,
-        )
+    retention_gate = evaluate_retention_gate(
+        settings, enforcing=enforcing, production=production, env_name=env_name
+    )
+    for gate_line in retention_gate.lines:
+        if gate_line.audit:
+            logging.getLogger(__name__).warning("%s", gate_line.text)
+        else:
+            print(gate_line.text, file=sys.stderr)
+    if retention_gate.refusal is not None:
+        print(f"error: {retention_gate.refusal}", file=sys.stderr)
         return 2
-
-    # AUTO-BOUND. Owner ruling 2026-07-30: the three PHI-BODY windows default to 30 days when
-    # UNSET, on BOTH dials — previously this ran only when `not enforcing`, so on the shipped
-    # `enforce` posture an unset window took the refusal below instead of a default.
-    #
-    # THE SAFETY TRADE IS DELIBERATE AND WORTH STATING: a production PHI instance with an unset
-    # window used to REFUSE TO START, which forced an operator to choose a number. It now starts
-    # with 30. What survives is the fail-closed path for an EXPLICIT 0 — choosing keep-forever is
-    # still refused unless the audited opt-out is set. So "unbounded by accident" is still
-    # prevented; "unbounded by inattention" becomes "30 days by inattention".
-    #
-    # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
-    # omission: `purge_state` keys on a timestamp that only moves on a WRITE, so silently bounding
-    # it deletes live operational data a Handler is still reading. (`purge_search_presets` keys on
-    # last use since #306; the 2026-07-30 ruling still covers it.) Since BACKLOG #1967 they are not
-    # merely warned either: each needs a window or its own acknowledgement, below.
-    if not settings.retention.allow_unbounded_phi:
-        defaulted = [
-            w
-            for w in auto_bounded_windows()
-            if w.field not in getattr(settings, w.reads_from.strip("[]")).model_fields_set
-        ]
-        for window in defaulted:
-            setattr(
-                getattr(settings, window.reads_from.strip("[]")),
-                window.field,
-                window.auto_bound_days,
-            )
-        if defaulted:
-            print(
-                f"info: {', '.join(w.setting for w in defaulted)} defaulted ON (30 days) for a PHI "
-                f"instance ({env_name!r}) — these PHI tiers are now bounded at rest "
-                "(secure-by-default, ASVS 14.2.7). Set an explicit window to override, or "
-                "[security].allow_keeping_phi_indefinitely=true to retain indefinitely.",
-                file=sys.stderr,
-            )
-
-    # REFUSE / WARN. `unbounded_windows` skips the tiers where 0 does not mean unbounded
-    # (`connection_event_retention_hours` INHERITS the body window; `uploads_retention_days` has a
-    # ge=1 floor so 0 is unrepresentable) and those whose `requires_setting` is unmet — with no
-    # [logging].log_dir there is nothing for the app-log sweep to sweep.
-    still_unbounded = _unbounded_windows(settings)
-    refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
-    warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
-
-    if refusable:
-        windows_desc = ", ".join(w.setting for w in refusable)
-        if not settings.retention.allow_unbounded_phi:
-            if enforcing:
-                print(
-                    f"error: a data-retention window is explicitly disabled for {windows_desc} on "
-                    f"a {'production ' if production else ''}PHI instance ({env_name!r}); refusing "
-                    "to start — PHI message bodies would be retained indefinitely (unbounded PHI "
-                    "at rest, ASVS 14.2.4/14.2.7). Set the window(s) to a positive number of days "
-                    "(e.g. 30); or, to deliberately retain forever, set "
-                    "[security].allow_keeping_phi_indefinitely=true (audited).",
-                    file=sys.stderr,
-                )
-                return 2
-            print(
-                f"warning: no data-retention window is configured for {windows_desc} in a "
-                f"PHI-carrying environment ({env_name!r}) — PHI message bodies accumulate without "
-                "bound. Set the window(s) to bound PHI at rest (ASVS 14.2.4).",
-                file=sys.stderr,
-            )
-        elif enforcing:
-            # Explicit, audited override: unbounded PHI retention under strict enforcement.
-            logging.getLogger(__name__).warning(
-                "AUDIT: starting a %sPHI instance (environment %r) with unbounded data "
-                "retention ([security].allow_keeping_phi_indefinitely=true; %s = 0) — PHI message "
-                "bodies are retained INDEFINITELY (retention opt-out override).",
-                "production " if production else "",
-                env_name,
-                windows_desc,
-            )
-            print(
-                f"warning: [security].allow_keeping_phi_indefinitely=true — a "
-                f"{'production ' if production else ''}PHI instance "
-                f"({env_name!r}) retains PHI message bodies indefinitely ({windows_desc} unset). "
-                "Configure a window to bound PHI at rest.",
-                file=sys.stderr,
-            )
 
     # Vault BACKLOG #2368: a connection may override either body window, and its own 0 keeps that
     # connection's bodies forever. Those overrides are in the graph, which this function does not
@@ -3637,63 +3528,6 @@ def _serve(args: argparse.Namespace) -> int:
         env_name=env_name,
         log=_credlog,
     )
-
-    # BACKLOG #1967, owner ruling R4 (b) of 2026-09-24 (ASVS 14.2.7): each warn-only tier needs a
-    # window OR its own acknowledgement. Under `enforce` a tier with neither REFUSES, naming the tier
-    # and its switch; under `warn` it warns, the refuse/warn split every posture gate here shares.
-    # An acknowledged tier starts and writes a WARNING-level AUDIT line naming it, in the shape of the
-    # keyless-PHI second ack. `allow_unbounded_phi` does not reach these: it covers the auto-bounded
-    # body tiers above, and one switch for every tier is what the ruling's "per-window" rules out.
-    # Placed AFTER the body-window gate so an explicit body 0, the PL-1 core, is reported first.
-    acknowledged = [w for w in warn_only if w.is_acknowledged(settings.security)]
-    unacknowledged = [w for w in warn_only if w not in acknowledged]
-    if unacknowledged:
-        # Naming the tier AND its protection level is the point: an operator who sees "PL-1" knows a
-        # full body is involved. Every warn-only tier that can read as unbounded has a switch, pinned
-        # by a test; one without would still refuse, offering only the window.
-        # A tier with a window caveat leads with its acknowledgement, because the window is the
-        # remedy the caveat advises against (#1188); every other tier leads with the window.
-        tiers = "; ".join(
-            (
-                f"{w.setting} ({w.level}): set {w.acknowledgement_setting}=true "
-                f"rather than a window -- {w.window_caveat}"
-            )
-            if w.window_caveat and w.acknowledgement_setting
-            else (
-                f"{w.setting} ({w.level}): set a window"
-                + (
-                    f", or set {w.acknowledgement_setting}=true"
-                    if w.acknowledgement_setting
-                    else ""
-                )
-            )
-            for w in unacknowledged
-        )
-        if enforcing:
-            print(
-                f"error: these classified PHI tiers have no retention window on a PHI instance "
-                f"({env_name!r}) and would accumulate without bound; refusing to start, because each "
-                f"needs a window or its own audited acknowledgement (ASVS 14.2.7): {tiers}.",
-                file=sys.stderr,
-            )
-            return 2
-        print(
-            "warning: these classified PHI tiers have no retention window on a PHI instance "
-            f"({env_name!r}) and will accumulate without bound. They are deliberately NOT defaulted "
-            f"(owner ruling 2026-07-30); under enforcement=enforce this refuses to start: {tiers}.",
-            file=sys.stderr,
-        )
-    for window in acknowledged:
-        logging.getLogger(__name__).warning(
-            "AUDIT: starting a %sPHI instance (environment %r) with %s (%s) unbounded, permitted "
-            "because %s=true -- that tier accumulates without bound (retention acknowledgement, "
-            "ASVS 14.2.7).",
-            "production " if production else "",
-            env_name,
-            window.setting,
-            window.level,
-            window.acknowledgement_setting,
-        )
 
     # --- #290 slice 1: low-disk storage floor (ASVS 15.2.2) --------------------------------------
     # Default-ON for SQLite at 1024 MiB free (owner ruling 2026-09-27). Refuses under BOTH

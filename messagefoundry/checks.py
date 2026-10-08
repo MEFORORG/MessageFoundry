@@ -58,6 +58,10 @@ token or JWKS leg that checks no certificate revocation under an enforcing postu
 ``serve`` applies (ADR 0173 AC-4). It reads the decision ``verify``'s ``fed.idp_revocation`` row
 reads.
 
+``retention`` is required too (vault BACKLOG #2280): it FAILS settings the retention start gate
+refuses, an explicit 0 on an auto-bounded PHI window or a warn-only tier with neither a window nor
+its acknowledgement. It calls the function ``serve`` calls, so the refusal reads the same.
+
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
 config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable — at
@@ -298,6 +302,16 @@ def run_checks(
         # revocation under an enforcing posture. Required, so the gate refuses what serve refuses.
         _with_source(
             _check_oidc_revocation(
+                config_dir,
+                service_config=service_config,
+                suppress_search=suppress_service_toml_search,
+            ),
+            env_only,
+        ),
+        # Vault BACKLOG #2280: serve refuses an unbounded PHI retention tier nobody acknowledged.
+        # Required, so the gate refuses what serve refuses, in serve's words.
+        _with_source(
+            _check_retention(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
@@ -3426,6 +3440,100 @@ def _check_oidc_revocation(
         ok=row.status not in FAILING,
         required=True,
         detail=f"{row.status.value}: {row.detail}",
+    )
+
+
+def _check_retention(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Report the retention start gate ``serve`` applies, at commit/CI time (vault BACKLOG #2280).
+
+    Without it the gate passed settings that ``serve`` then refuses with exit 2: an explicit 0 on
+    an auto-bounded PHI window, or a warn-only tier with neither a window nor its acknowledgement.
+    The decision is
+    :func:`~messagefoundry.config.retention_classification.evaluate_retention_gate`, the function
+    ``serve`` calls, so on the same settings the two agree and the refusal reads the same.
+
+    A refusal FAILS this leg. Under ``enforcement = warn`` that function refuses nothing, so the
+    leg passes and its line carries what ``serve`` would write, the warnings included.
+
+    The function sets each unset auto-bounded window on the settings it is given. Those are this
+    leg's own load, and nothing else reads them.
+
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`. It
+    also SKIPs with no active environment or an unresolved production tier: ``serve`` stops on
+    each of those before it reaches this gate, and the ``posture`` leg reports the second. The
+    settings are the ones this leg loads, so a start that sets the environment or a window on
+    ``serve``'s own command line or in its own environment can still decide differently."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.retention_classification import evaluate_retention_gate
+    from messagefoundry.config.settings import SecurityEnforcement
+
+    name = "retention"
+    toml, env_only = _settings_source(
+        config_dir, service_config=service_config, suppress_search=suppress_search
+    )
+    if toml is None and not env_only:
+        return CheckResult(
+            name,
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
+        )
+    try:
+        settings = _load_check_settings(toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            name,
+            ok=False,
+            required=True,
+            detail=f"settings did not load: {_settings_error(exc)}",
+        )
+    env_name = settings.ai.environment
+    if env_name is None:
+        return CheckResult(
+            name, ok=True, required=True, skipped=True, detail="no active environment set"
+        )
+    try:
+        production = settings.ai.require_posture()
+    except ValueError:
+        return CheckResult(
+            name,
+            ok=True,
+            required=True,
+            skipped=True,
+            detail="the production tier is unresolved; the posture check reports it",
+        )
+    outcome = evaluate_retention_gate(
+        settings,
+        enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+        production=production,
+        env_name=env_name,
+    )
+    if outcome.refusal is not None:
+        return CheckResult(
+            name,
+            ok=False,
+            required=True,
+            detail=f"serve would refuse to start (exit 2): {outcome.refusal}",
+        )
+    if not outcome.lines:
+        return CheckResult(
+            name,
+            ok=True,
+            required=True,
+            detail="serve would start: no classified PHI retention tier reads as unbounded",
+        )
+    return CheckResult(
+        name,
+        ok=True,
+        required=True,
+        detail="serve would start and write: " + " | ".join(line.text for line in outcome.lines),
     )
 
 
