@@ -804,7 +804,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the common helper instead of building an SSLContext by hand -- which is the point of the seam,
     # and centralising it is why these files import no `ssl`. Where a file's usage is not merely that,
     # it carries its own line below.
-    "messagefoundry/api/app.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # Vault BACKLOG #2615: app.py also reaches store.crypto for audit_body_digests, the keyed digests
+    # an edit-resend audit row holds of the original and the edited body. See its operation row.
+    "messagefoundry/api/app.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
+    ),
     "messagefoundry/api/security.py": frozenset({"messagefoundry.config.tls_policy"}),
     # reach the seam to parse and bound it rather than to open a connection.
     "messagefoundry/config/models.py": frozenset({"messagefoundry.config.tls_policy"}),
@@ -954,10 +958,18 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #1167 (ASVS 11.2.4): the config-provenance drift compare, via fingerprint_matches.
     # Vault BACKLOG #2371: the SHA-256 of a dialling CA file, via make_lane_anchor_check. It
     # fingerprints the file to tell a repeated refusal from a changed one. A digest, not a key.
+    # Vault BACKLOG #2615: the hash, kdf and mac rows via store.crypto are audit_body_digests. It
+    # derives a key from the audit-chain key by HKDF-SHA256 under its own label, then takes an
+    # HMAC-SHA256 of each body for the edit-resend audit row. Keyed so the digest of a short PHI
+    # body cannot be guessed offline from the audit log. The hash row is audit_key_id, the
+    # non-secret id naming the audit key the digest key came from.
     "messagefoundry/api/app.py": frozenset(
         {
             "compare:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.auth.trust_anchors",
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:via messagefoundry.store.crypto",
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
@@ -1274,6 +1286,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # ADR 0196: HKDF-Extract and -Expand for the store data sub-key, run as their HMAC steps
             # (RFC 5869) so the cipher holds a keyed HMAC context instead of the DEK.
             "mac:cryptography.hazmat.primitives.hmac.HMAC[sha256]",
+            # Vault BACKLOG #2615: HMAC.verify, the constant-time check of an edit-resend audit
+            # row's body digest (verify_audit_body_digest). A MAC check, not a signature.
+            "sign_verify:.verify()",
         }
     ),
     "messagefoundry/store/crypto_transit.py": frozenset(

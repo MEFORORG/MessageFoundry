@@ -811,6 +811,9 @@ class ResendOutcome:
     to_destination: str
     from_destination: str
     outbox_id: str | None
+    #: The child message an edit-and-resend DIRECT call created (vault BACKLOG #2615); ``None`` for a
+    #: plain resend, which adds a delivery to the same message, and for a duplicate.
+    new_message_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -840,6 +843,25 @@ class ReingressOriginMissing(ResendError):
 #: disjoint from a resend-to-alternate's ``(message_id, <outbound>)`` so the two can never be confused
 #: when a duplicate/conflict is reported, while sharing the one ``resend_log`` UNIQUE gate.
 REINGRESS_TARGET_PREFIX = "@reingress:"
+
+
+class MessageOrigin(StrEnum):
+    """How a ``messages`` row came to exist: the plain ``messages.origin`` column (vault BACKLOG #2615).
+
+    Written once, at insert, and never updated; retention blanks the body columns and leaves it, so a
+    site can still tell an operator-made message from a partner's after the body is gone. The acting
+    user of an operator origin sits beside it in ``messages.origin_actor``. ``NULL`` on a row written
+    before the column existed means "not recorded", never "partner"."""
+
+    #: Received from a partner through an inbound connection, refused ones included.
+    PARTNER = "partner"
+    #: An operator's edited body, by edit-and-resend (either mode).
+    OPERATOR_EDIT = "operator_edit"
+    #: An operator's injection of one message from an uploaded log file.
+    OPERATOR_UPLOAD = "operator_upload"
+    #: The engine's own hop: a loopback re-ingress or a pass-through child of an earlier message.
+    REINGRESS = "reingress"
+
 
 #: How long an upload-quota reservation may stay CONTINUOUSLY outstanding before the next reserve
 #: reclaims it (seconds) — ASVS 2.3.4, BACKLOG #1112. One reservation covers a single
@@ -4560,7 +4582,9 @@ CREATE TABLE IF NOT EXISTS messages (
     error        TEXT,
     summary      TEXT,             -- ingest-derived (MRN/name/order) — PHI, cipher-encrypted at rest (EF-3)
     metadata     TEXT,             -- code/operator-attached values — PHI, cipher-encrypted at rest (EF-3)
-    documents_pruned REAL          -- #47/ADR 0042: epoch ts an embedded doc was stripped in place (NULL=never)
+    documents_pruned REAL,         -- #47/ADR 0042: epoch ts an embedded doc was stripped in place (NULL=never)
+    origin       TEXT,             -- vault BACKLOG #2615: MessageOrigin, plain, set at insert, never updated
+    origin_actor TEXT              -- vault BACKLOG #2615: the operator behind an operator origin, else NULL
 );
 CREATE INDEX IF NOT EXISTS ix_messages_channel  ON messages(channel_id, received_at);
 CREATE INDEX IF NOT EXISTS ix_messages_control  ON messages(channel_id, control_id);
@@ -5132,7 +5156,14 @@ _LAST_EVENT_COLUMN = (
 # `documents_pruned` (#47, ADR 0042): a nullable epoch timestamp set when retention strips an embedded
 # document in place (NULL = never pruned / no document was ever present). Orthogonal to `status` — it
 # alters no disposition/count; it is the message-level "evicted vs never present" signal a raw-view reads.
-_MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
+_MESSAGE_MIGRATIONS = {
+    "summary": "TEXT",
+    "metadata": "TEXT",
+    "documents_pruned": "REAL",
+    # vault BACKLOG #2615. NULL on an existing row means the origin was not recorded.
+    "origin": "TEXT",
+    "origin_actor": "TEXT",
+}
 
 # BACKLOG #1909: the account a 0.3.2 preset row belongs to. See MessageStore._migrate_preset_owner.
 _PRESET_OWNER_MATCH = (
@@ -6875,6 +6906,7 @@ class MessageStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             await self._insert_outbound_deliveries(mid, channel_id, deliveries, now)
             # #63 verbosity gate — a routine 'received' row is thinnable; suppressing it does NOT
@@ -7362,6 +7394,8 @@ class MessageStore:
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
         audit: OperatorAudit[str] | None = None,
+        origin: MessageOrigin = MessageOrigin.PARTNER,
+        origin_actor: str | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001 Step A).
@@ -7399,6 +7433,8 @@ class MessageStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=origin,
+                origin_actor=origin_actor,
             )
             # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059).
             ingress_created_at = now
@@ -7862,12 +7898,14 @@ class MessageStore:
         metadata: str | None,
         error: str | None,
         now: float,
+        origin: MessageOrigin,
+        origin_actor: str | None = None,
     ) -> None:
         await self._db.execute(
             "INSERT INTO messages"
             " (id, channel_id, received_at, source_type, control_id,"
-            "  message_type, raw, status, error, summary, metadata)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "  message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 mid,
                 channel_id,
@@ -7881,6 +7919,9 @@ class MessageStore:
                 # EF-3: MRN/name is PHI — ciphered at rest like the body
                 self._enc(summary, aad=cell_aad("messages", "summary", mid)),
                 self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
+                origin.value,
+                origin_actor,
             ),
         )
         self.body_copies += (
@@ -7923,6 +7964,7 @@ class MessageStore:
                 metadata=metadata,
                 error=error,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             # #63 verbosity gate. `event` is 'error' (a compliance-floor event → always kept) or
             # 'filtered' (routine → thinnable). The messages row above records the disposition
@@ -8804,6 +8846,7 @@ class MessageStore:
                 metadata=child_meta,
                 error=None,
                 now=now,
+                origin=MessageOrigin.REINGRESS,
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
             ingress_created = now
@@ -9058,6 +9101,7 @@ class MessageStore:
                         (peek_error or "re-ingress body failed HL7 peek") if peek_failed else None
                     ),
                     now=now,
+                    origin=MessageOrigin.REINGRESS,
                 )
                 # 6. The ingress queue row — UNLESS peek_failed (an ERROR message owes no work).
                 if not peek_failed:
@@ -9888,6 +9932,7 @@ class MessageStore:
         body_override: str | None = None,
         now: float | None = None,
         audit: OperatorAudit[ResendOutcome] | None = None,
+        actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's **stored transformed body** to an ALTERNATE outbound ``to`` (ADR 0090,
         BACKLOG #123). Ships exactly what we sent — the retained ``done``/``cancelled`` outbound
@@ -9919,7 +9964,9 @@ class MessageStore:
         message/target — review #123-4).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
-        commits with the resend (BACKLOG #2624, :data:`OperatorAudit`)."""
+        commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
+        origin ``operator_edit`` with ``actor`` as its ``origin_actor``, and the outcome names it in
+        ``new_message_id`` (vault BACKLOG #2615)."""
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
@@ -9959,6 +10006,7 @@ class MessageStore:
                 await self._append_operator_audit(written, audit, outcome)
                 await self._commit()
                 return outcome
+            child_mid: str | None = None
             if body_override is not None:
                 # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                 # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN
@@ -10026,6 +10074,8 @@ class MessageStore:
                     metadata=child_meta,
                     error=None,
                     now=now,
+                    origin=MessageOrigin.OPERATOR_EDIT,
+                    origin_actor=actor,
                 )
                 await self._event(
                     child_mid, "received", None, f"edit-resend from {message_id}", now
@@ -10109,6 +10159,7 @@ class MessageStore:
                 to_destination=to,
                 from_destination=src_dest,
                 outbox_id=outbox_id,
+                new_message_id=child_mid,
             )
             await self._append_operator_audit(written, audit, outcome)
             await self._commit()
@@ -10122,6 +10173,7 @@ class MessageStore:
         idempotency_key: str,
         now: float | None = None,
         audit: OperatorAudit[ReingressOutcome] | None = None,
+        actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-enter an EDITED body onto the
         ORIGIN message's channel as a **fresh, correlated ``RECEIVED`` child message** at the ingress
@@ -10142,7 +10194,8 @@ class MessageStore:
         on a raise (the whole txn rolls back).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
-        commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`)."""
+        commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
+        ``operator_edit`` with ``actor`` as its ``origin_actor`` (vault BACKLOG #2615)."""
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
@@ -10224,6 +10277,8 @@ class MessageStore:
                     metadata=child_meta,
                     error=None,
                     now=now,
+                    origin=MessageOrigin.OPERATOR_EDIT,
+                    origin_actor=actor,
                 )
                 # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
                 # Hoist the row id so the payload binds to its own (queue, payload, id) cell.

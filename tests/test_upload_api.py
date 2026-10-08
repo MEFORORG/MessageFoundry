@@ -566,10 +566,12 @@ async def test_engine_inject_message_creates_received(engine: Engine) -> None:
         raw=ADT,
         source_type="upload",
         audit=lambda new_mid: AuditAppend("upload.resend", actor="op", detail=new_mid),
+        actor="op",
     )
     row = await engine.store.get_message(mid)
     assert row is not None
     assert row["channel_id"] == "in1"
+    assert (row["origin"], row["origin_actor"]) == ("operator_upload", "op")  # vault BACKLOG #2615
     assert row["status"] == MessageStatus.RECEIVED.value
     assert row["source_type"] == "upload"
     [audit] = await engine.store.list_audit(action="upload.resend")

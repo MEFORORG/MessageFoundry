@@ -138,7 +138,8 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `users.totp_secret` | all three | **No** — not PHI | **Yes, when a key is set** — store cipher; AAD `("users","totp_secret",id)`; store DEK | **PL-3** | The base32 TOTP MFA seed. It is returned **once**, when enrollment stages it. §3's PL-3 block says how. **This cell said "Never returned by any API response model" until BACKLOG #1185 corrected it.** Its siblings `users.password_hash` and `users.totp_recovery_codes` are **argon2id one-way hashes** and are deliberately **not** ciphered | `keep-forever by design` — it lives and dies with the user row |
 | `queue.handler_name` / `destination_name` / `channel_id` | all three | No — names, not bodies | No (metadata, deliberately not ciphered) | **PL-4** | The handler the transform worker runs; the destination the delivery worker drains | `n/a — not PHI` |
 | `messages.control_id`, `messages.message_type` | all three | Low (MSH-10/MSH-9) | **No** — plaintext by design | **PL-4** | Needed plaintext for dedup/routing/indexes (`ix_messages_control`). Covered only by the whole-DB / volume layer | `keep-forever by design` — dedup/routing keys that live and die with the message row |
-| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access*, not the PHI itself. Its writers only ever store filter shapes, counts and ids | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
+| `messages.origin`, `messages.origin_actor` (vault BACKLOG #2615) | all three | **No** — a fixed label and a username, never message content | **No** — plaintext by design | **PL-4** | How the row came to exist: `partner`, `operator_edit`, `operator_upload` or `reingress`, and for the two operator origins the acting user. Written at insert and never updated. Plain on purpose, because it must outlive the body and the ciphered `metadata`, which retention blanks. `NULL` on a row written before the column existed means not recorded. See [§6](#6-audit--accountability) | `keep-forever by design` — provenance that lives and dies with the message row |
+| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access*, not the PHI itself. Its writers only ever store filter shapes, counts and ids, plus one exception: an edit-resend row holds **keyed** HMAC-SHA256 digests of the original and the edited body, which reveal nothing without the store key ([§6](#6-audit--accountability), vault BACKLOG #2615) | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
 | `audit_log.client` (ADR 0150) | all three | **No** — a network address; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The caller's client address — the "from where" of an audited action; `NULL` for engine-internal/`system` writes. **Personal data, but not PHI**, and exactly what HIPAA §164.312(b) audit controls exist to capture. Plaintext by decision: it must stay greppable/indexable for incident response, it already appears in the clear in `sessions.client`, and it is folded **inside** the tamper-evident hash chain — so it carries **integrity** protection even without confidentiality. Widens a store-file compromise from *who did what* to *who did what from where*; volume encryption + owner-only ACLs on whichever host owns the files — the engine's own `_secure_file` covers the **SQLite** store only ([§10](#10-secure-deployment--operations-checklist)) — are the control | `keep-forever by design` — same `audit_log` row lifetime as `detail`; the value is folded **inside** the hash chain |
 | `delivered_keys` (H2 idempotency ledger) | all three | **No** — hashes + ids only | No (deliberately not ciphered — nothing to protect) | **PL-4** | One row per completed outbound delivery: a SHA-256 `delivery_key` over non-PHI ids + a replay-stable seq, plus `outbox_id`/`message_id`/`destination_name`/`delivery_seq`. **Never a body or any PHI** — `control_id` is only *folded into the hash input*, never stored in the clear here. Lets the FIFO claim skip-and-complete a re-claimed already-delivered head without re-sending | `keep-forever by design` — the idempotency ledger a re-claimed already-delivered row checks instead of re-sending |
 | `state.namespace` / `state.key` | all three | **Possibly** — a Handler that keys correlation state on a raw MRN stores that identifier here in the clear | **No** — plaintext by construction: the pair is the composite primary key **and** the AAD input for `state.value`, so it cannot be ciphered without losing the lookup | **PL-4** | Authors must key state on a **surrogate, never a raw identifier**. Covered only by the whole-DB / volume layer. Rides `[retention].state_max_age_days` with its value | ``rides `[retention].state_max_age_days` `` |
@@ -850,7 +851,7 @@ is no plaintext to protect.
 
 **Applies to:** `audit_log.detail` · `audit_log.client` · `sessions.token_hash` / `client` · `processed_files` ·
 `pending_approvals.params` · `delivered_keys` · `resend_log` · `queue.handler_name` / `destination_name` /
-`channel_id` · `messages.control_id` / `message_type` · `webauthn_credentials.public_key` · `state.namespace` /
+`channel_id` · `messages.control_id` / `message_type` · `messages.origin` / `origin_actor` · `webauthn_credentials.public_key` · `state.namespace` /
 `state.key` · `reference.name` / `version` / `key` · `connection_event.peer_host` · `known_login_addresses` · the `attachment`
 header row (`content_type`, `total_bytes`, `refcount`, `created_at`) + the `message_attachment`
 linkage · `secret_rotation_meta` (all three backends) · `.mfbak` on the server backends · and,
@@ -877,6 +878,8 @@ address is folded *inside* it), not from a cipher. Its strength is **key-custody
   `MessageDetail.attachments` under the detail route's `messages:view_raw` + channel scope; the
   linkage row is what scopes the audited byte download to a message the caller may already read.
 - `pending_approvals.params` — only through the approvals routes, under their own permission.
+- `messages.origin` / `origin_actor` — no API response model returns them yet; they are read from the
+  store, and an edit-resend's audit row repeats the origin under `audit:read`.
 - `delivered_keys`, `resend_log`, `processed_files`, `webauthn_credentials.public_key`, `known_login_addresses`,
   `state.namespace`/`key`, `reference.name`/`version`/`key`, `connection_event.peer_host`'s siblings —
   **no API surface** (`connection_event.peer_host` itself is returned by `GET /events` under
@@ -895,7 +898,7 @@ on the store-file ACL plus the volume/whole-DB layer for the rest.
 - `state.namespace` / `state.key` — removed with their value on `[retention].state_max_age_days`.
 - `reference.*` — **no purge path**; replaced only by the next sync's build-new-then-flip.
 - `queue` metadata columns — removed with their row; `messages.control_id` / `message_type` are kept for
-  the life of the metadata row.
+  the life of the metadata row, and so are `messages.origin` / `origin_actor`.
 - `known_login_addresses` — each sign-in or step-up that records an address deletes that
   account's rows older than the sign-in signal's 90-day lookback, and `delete_user` deletes
   them all; an account that records nothing keeps its stale rows until it does or is deleted.
@@ -1306,6 +1309,36 @@ bodies). Read the trail via `GET /audit` (`audit:read`).
   lists them.
 
 **Credentials, tokens, and PHI bodies are never written to the audit log.**
+
+**An edit-resend can be proved after retention blanks both bodies (vault BACKLOG #2615).** An
+operator with `messages:edit` can send any body to a partner, so the record has to show what was
+sent, not only that something was. Two pieces of evidence outlive the bodies:
+
+| Evidence | Where | What it holds |
+|---|---|---|
+| Body digests | the `message_edit_resend` audit row, `detail.body_digest` | `alg` (`hmac-sha256`), `key_id`, and an `original` and an `edited` digest. `original` is the origin message's stored body; it is `null` when retention had already blanked it |
+| Origin | `messages.origin` and `messages.origin_actor` on the new message, repeated as `detail.origin` | `operator_edit` and the acting user. Partner receipts read `partner`, upload injects `operator_upload`, and the engine's own loopback and pass-through hops `reingress` |
+
+Both modes write the same row: a re-route names the new message in `new_message_id`, and so does a
+direct send. The console's edit-resend reaches the same handler, so it writes the same row.
+
+**The digest is keyed, never a plain hash.** A short PHI body, such as one result value or one
+name, can be guessed, and a plain hash kept for good in the audit log would let anyone holding the
+log test guesses offline. The key is HKDF-SHA256 over the in-heap audit-chain key under its own
+label, `mefor/audit-body-digest/v1`, so it never doubles as the chain MAC. `key_id` names the audit
+key it came from, so a digest taken before `rotate-key` still verifies while the retired key is
+configured.
+
+**To prove a body afterwards,** hold the candidate body and the store key, and call
+`verify_audit_body_digest` in `store/crypto.py` with the row's `key_id` and digest. A match shows
+that body is the one sent. A reader without the key learns nothing from the digest.
+
+**A store with no in-heap audit key records no digest.** That is a keyless store, and a
+`vault_transit` store, whose audit key never enters the engine. The row then holds
+`"body_digest": null` and still records the origin. It never falls back to a plain hash.
+
+The digests and the origin are not a second approver. Whether an edit-resend should need one is a
+separate question, and this change does not answer it.
 
 **Attribution:** with auth built, the `audit_log.actor` is always populated — a real username, or
 `system` for internal actions — so an audit row is never unattributed. (The schema comment was
@@ -1785,6 +1818,7 @@ window purely so a replay can be richer — is precisely the defect ASVS 14.2.7 
 | `users.totp_secret` | no window by design — it lives and dies with the user row |
 | `audit_log`, `delivered_keys`, `resend_log` | keep-forever by design (see below) |
 | `messages.control_id`, `messages.message_type` | kept for the life of the message row by design (dedup/routing keys) |
+| `messages.origin`, `messages.origin_actor` | kept for the life of the message row by design. Retention blanks the body and `metadata`, whose `edited_from` goes with it, and leaves these, so an operator-made message stays identifiable (vault BACKLOG #2615) |
 | PL-5 substrate (SQLite `-wal`/`-shm`; SQL Server `.ldf` + tempdb; Postgres `pg_wal`) | not application-managed — database/platform lifecycle |
 
 **`audit_days` is reserved / keep-forever by design.** The reason is the **audit-retention

@@ -169,6 +169,7 @@ from messagefoundry.store.store import (
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
+    MessageOrigin,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -629,8 +630,8 @@ _SQL_INSERT_QUEUE_INGRESS: Final[str] = (
 )
 _SQL_INSERT_MESSAGE: Final[str] = (
     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-    " message_type, raw, status, error, summary, metadata)"
-    " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+    " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 _SQL_APPLOCK: Final[str] = (
     "SET NOCOUNT ON;"
@@ -800,6 +801,9 @@ def _insert_message_params(
     error: str | None,
     enc_summary: str | None,
     enc_metadata: str | None,
+    *,
+    origin: MessageOrigin,
+    origin_actor: str | None = None,
 ) -> tuple[Any, ...]:
     return (
         message_id,
@@ -813,6 +817,9 @@ def _insert_message_params(
         error,
         enc_summary,
         enc_metadata,
+        # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
+        origin.value,
+        origin_actor,
     )
 
 
@@ -1614,7 +1621,7 @@ _SCHEMA: list[str] = [
         received_at FLOAT NOT NULL, source_type NVARCHAR(64) NULL, control_id NVARCHAR(256) NULL,
         message_type NVARCHAR(64) NULL, raw NVARCHAR(MAX) NOT NULL, status NVARCHAR(32) NOT NULL,
         error NVARCHAR(MAX) NULL, summary NVARCHAR(MAX) NULL, metadata NVARCHAR(MAX) NULL,
-        documents_pruned FLOAT NULL)""",
+        documents_pruned FLOAT NULL, origin NVARCHAR(32) NULL, origin_actor NVARCHAR(256) NULL)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_channel','IndexID') IS NULL
         CREATE INDEX ix_messages_channel ON messages(channel_id, received_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_control','IndexID') IS NULL
@@ -1738,6 +1745,11 @@ _SCHEMA: list[str] = [
     # existing rows = never pruned; COL_LENGTH-gated like the others so a re-open is a no-op.
     """IF COL_LENGTH('messages','documents_pruned') IS NULL
         ALTER TABLE messages ADD documents_pruned FLOAT NULL""",
+    # Vault BACKLOG #2615: the plain origin pair. NULL on an existing row = the origin was not recorded.
+    """IF COL_LENGTH('messages','origin') IS NULL
+        ALTER TABLE messages ADD origin NVARCHAR(32) NULL""",
+    """IF COL_LENGTH('messages','origin_actor') IS NULL
+        ALTER TABLE messages ADD origin_actor NVARCHAR(256) NULL""",
     # Store-once-deliver-many (L2b): body_ref on a pre-existing queue (NULL = body inline, byte-identical).
     """IF COL_LENGTH('queue','body_ref') IS NULL
         ALTER TABLE queue ADD body_ref NVARCHAR(64) NULL""",
@@ -4967,8 +4979,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-                    " message_type, raw, status, error, summary, metadata)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         mid,
                         channel_id,
@@ -4982,6 +4994,8 @@ class SqlServerStore:
                         # EF-3: MRN/name is PHI — ciphered at rest
                         self._enc(summary, aad=cell_aad("messages", "summary", mid)),
                         self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                        MessageOrigin.PARTNER.value,  # vault BACKLOG #2615: plain by design
+                        None,
                     ),
                 )
                 for dest_name, payload in deliveries:
@@ -5153,6 +5167,7 @@ class SqlServerStore:
                     None,
                     None,
                     self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                    origin=MessageOrigin.REINGRESS,
                 ),
             )
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own queue cell
@@ -5227,6 +5242,7 @@ class SqlServerStore:
                     None,
                     None,
                     self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                    origin=MessageOrigin.REINGRESS,
                 ),
             )
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own queue cell
@@ -5312,6 +5328,8 @@ class SqlServerStore:
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
         audit: OperatorAudit[str] | None = None,
+        origin: MessageOrigin = MessageOrigin.PARTNER,
+        origin_actor: str | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the ingress stage (status RECEIVED + one
         ``stage='ingress'`` queue row holding the raw) in ONE transaction — the staged pipeline's
@@ -5337,8 +5355,8 @@ class SqlServerStore:
                 async with self._cursor(conn) as cur:
                     await cur.execute(
                         "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-                        " message_type, raw, status, error, summary, metadata)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             mid,
                             channel_id,
@@ -5352,6 +5370,8 @@ class SqlServerStore:
                             # EF-3: MRN/name is PHI — ciphered at rest
                             self._enc(summary, aad=cell_aad("messages", "summary", mid)),
                             self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                            origin.value,  # vault BACKLOG #2615: plain by design
+                            origin_actor,
                         ),
                     )
                     # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
@@ -6910,8 +6930,8 @@ class SqlServerStore:
                     )
                     await cur.execute(
                         "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-                        " message_type, raw, status, error, summary, metadata)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             new_mid,
                             loopback_channel_id,
@@ -6933,6 +6953,8 @@ class SqlServerStore:
                             # EF-3: MRN/name is PHI — ciphered at rest
                             self._enc(summary, aad=cell_aad("messages", "summary", new_mid)),
                             self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                            MessageOrigin.REINGRESS.value,  # vault BACKLOG #2615: plain by design
+                            None,
                         ),
                     )
                     if not peek_failed:
@@ -8009,8 +8031,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-                    " message_type, raw, status, error, summary, metadata)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    " message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         mid,
                         channel_id,
@@ -8025,6 +8047,8 @@ class SqlServerStore:
                         # EF-3: MRN/name is PHI — ciphered at rest
                         self._enc(summary, aad=cell_aad("messages", "summary", mid)),
                         self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                        MessageOrigin.PARTNER.value,  # vault BACKLOG #2615: plain by design
+                        None,
                     ),
                 )
                 # `_event` re-scrubs + ciphers the plaintext `error` internally (parity with SQLite).
@@ -9972,6 +9996,7 @@ class SqlServerStore:
         body_override: str | None = None,
         now: float | None = None,
         audit: OperatorAudit[ResendOutcome] | None = None,
+        actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
         Mirrors :meth:`MessageStore.resend_to`. When ``body_override`` is set this is the edit-and-resend
@@ -10039,6 +10064,7 @@ class SqlServerStore:
                         await self._append_operator_audit(cur, written, audit, outcome)
                         await self._commit(conn)
                         return outcome
+                    child_mid: str | None = None
                     if body_override is not None:
                         # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                         # operator's EDITED body to `to` as a NEW, correlated CHILD delivery; the ORIGIN row
@@ -10103,6 +10129,8 @@ class SqlServerStore:
                                 self._enc(
                                     child_meta, aad=cell_aad("messages", "metadata", child_mid)
                                 ),
+                                MessageOrigin.OPERATOR_EDIT.value,  # vault BACKLOG #2615
+                                actor,
                             ),
                         )
                         self.body_copies += 1  # A1: the child messages.raw copy
@@ -10211,6 +10239,7 @@ class SqlServerStore:
                         to_destination=to,
                         from_destination=str(src_dest),
                         outbox_id=outbox_id,
+                        new_message_id=child_mid,
                     )
                     await self._append_operator_audit(cur, written, audit, outcome)
                     await self._commit(conn)
@@ -10229,6 +10258,7 @@ class SqlServerStore:
         idempotency_key: str,
         now: float | None = None,
         audit: OperatorAudit[ReingressOutcome] | None = None,
+        actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
         fresh, correlated ``RECEIVED`` child message at the origin channel's ingress stage; the origin
@@ -10322,6 +10352,8 @@ class SqlServerStore:
                                 self._enc(
                                     child_meta, aad=cell_aad("messages", "metadata", new_mid)
                                 ),
+                                MessageOrigin.OPERATOR_EDIT.value,  # vault BACKLOG #2615
+                                actor,
                             ),
                         )
                         # Hoist the row id so the payload binds to its own queue cell.
