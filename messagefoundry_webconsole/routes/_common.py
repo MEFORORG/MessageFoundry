@@ -3,8 +3,9 @@
 """Small route helpers shared by the admin/account modules (moved from ``api.auth_routes``).
 
 ``_form_pairs`` is the stdlib urlencoded-form parser (no python-multipart dep) shared by every
-body-carrying /ui admin/account POST; ``_client`` / ``_rate_limited`` are the account-lifecycle
-throttle helpers re-implemented package-side (so the package never imports ``auth_routes``);
+body-carrying /ui admin/account POST; ``_rate_limited`` is the account-lifecycle throttle helper
+re-implemented package-side (so the package never imports ``auth_routes``), and it reads the
+address through ``api.security.client_ip`` like every other console read (BACKLOG #2289);
 ``check_filters`` applies ``messagefoundry.api.validation``'s rules to the filter values an operator
 types into a /ui form, which a direct handler call would otherwise never validate (BACKLOG #1740).
 """
@@ -19,6 +20,7 @@ from urllib.parse import parse_qsl
 from fastapi import HTTPException, Request, status
 from pydantic import TypeAdapter, ValidationError
 
+from messagefoundry.api.security import client_ip
 from messagefoundry.api.validation import (
     ConnectionName,
     ControlIdFilter,
@@ -223,16 +225,9 @@ async def _form_pairs(request: Request) -> list[tuple[str, str]]:
     return parse_qsl((await request.body()).decode("utf-8", "replace"), keep_blank_values=True)
 
 
-def _client(request: Request) -> str | None:
-    # Already proxy-aware: uvicorn runs with forwarded_allow_ips = settings.api.trusted_proxies
-    # (defaults to [] = trust nothing), so behind a declared trusted proxy this resolves to the
-    # real client. Matches how ``api.auth_routes._client`` records it on the session.
-    return request.client.host if request.client else None
-
-
 def _rate_limited(request: Request, label: str) -> HTTPException:
     """Log a throttled (HTTP 429) attempt so password-spraying is no longer silent (ASVS 16.3.3),
     then return the exception to raise. We log (the rotating general log) rather than write an
     audit_log row per rejection so a sustained flood can't amplify into unbounded DB growth."""
-    _log.warning("rate-limited %s attempt from client=%s", label, _client(request))
+    _log.warning("rate-limited %s attempt from client=%s", label, client_ip(request))
     return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many attempts; please retry later")

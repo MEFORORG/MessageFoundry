@@ -15,7 +15,7 @@ from messagefoundry.api.auth_models import (
     NotifyEmailRequest,
     PasswordChangeRequest,
 )
-from messagefoundry.api.security import pending_credential_deadline_for
+from messagefoundry.api.security import client_ip, pending_credential_deadline_for
 from messagefoundry.auth import AuthProvider, Identity
 from messagefoundry.auth import webauthn as webauthn_mod
 from messagefoundry.auth.service import (
@@ -50,7 +50,7 @@ from .._auth import (
     webauthn_rp,
 )
 from .._service import _service
-from ._common import _client, _form_pairs, _rate_limited
+from ._common import _form_pairs, _rate_limited
 
 # --- L4b: self-service account (change password + TOTP MFA lifecycle) -------
 # Self-scoped actions: any authenticated session acts on ITS OWN credential, so the registry
@@ -372,7 +372,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 pages.notify_address_page(error="that address is too long"), status_code=400
             )
         try:
-            await service.fill_own_notify_email(identity, body.email, client=_client(request))
+            await service.fill_own_notify_email(identity, body.email, client=client_ip(request))
         except NotifyEmailAlreadySet as exc:
             # Say so rather than redirect: a second tab that submitted a different address must not
             # read a quiet redirect as its address having been saved.
@@ -426,7 +426,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # so this route drives the SERVICE directly with the cookie session token — the same
         # cookie-vs-header split ui_login/ui_reauth already handle. Semantics match the JSON
         # handler: rate-limited like login; wrong code changes nothing.
-        client = _client(request)
+        client = client_ip(request)
         if not allow_reauth_attempt(service, identity, client):  # per-ACTOR, not the sign-in budget
             raise _rate_limited(request, "mfa-confirm")
         token = session_token(request)
@@ -637,7 +637,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 response_json,
                 label=label,
                 token=token,
-                client=_client(request),
+                client=client_ip(request),
                 rp_id=rp[0],
                 origin=rp[1],
             )
@@ -668,7 +668,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         assert_same_origin(request)
         try:
             removed = await service.delete_webauthn_credential(
-                identity, credential_id_hash, client=_client(request)
+                identity, credential_id_hash, client=client_ip(request)
             )
         except ValueError as exc:  # last-required-factor refusal
             return await _account_response(

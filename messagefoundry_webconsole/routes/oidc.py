@@ -47,6 +47,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.security import (
     alert_directory_administrator_granted,
+    client_ip,
     get_auth,
     public_route,
 )
@@ -306,7 +307,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # oidc_enabled, not oidc_available: AC-8 requires recovery without an engine restart, so
             # the start leg ALWAYS attempts and a degraded IdP is discovered per-request.
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not auth.allow_login_attempt(client):
             # A _log.warning, never an audit — parity with sso.py, so exhaustion writes zero DB rows.
             _log.warning("federated sign-in rate limit exceeded for %s", client or "<unknown>")
@@ -377,7 +378,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # returns to the console with nothing run and no grant minted for the named action.
         continues = continues_after_reauth(action, token, next_)
         return_to = next_ if continues else reauth_landing(identity)
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
             return reauth_idp_response(
                 deps,
@@ -440,7 +441,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         auth = get_auth(request)
         if auth is None or not auth.oidc_enabled:
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not auth.allow_login_attempt(client):
             # The limiter runs on BOTH legs (ADR 0142): the callback is equally unauthenticated.
             _log.warning("federated callback rate limit exceeded for %s", client or "<unknown>")

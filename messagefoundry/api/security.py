@@ -373,9 +373,12 @@ async def bearer_token_dependency(request: Request) -> str | None:
 
 
 def client_ip(conn: Request | WebSocket) -> str | None:
-    """The caller's client address, matching how login records it on the session (``_client`` in
-    ``auth_routes``). Used by the WP-L3-13 new-client-IP risk signal so the comparison is
-    apples-to-apples, and — since ADR 0150 — as the ``client`` recorded on audit rows. It is public
+    """The caller's client address: the one login records on the session as its anchor, on both
+    the JSON auth routes and the console. Used by the WP-L3-13 new-client-IP risk signal so the
+    comparison is apples-to-apples, and — since ADR 0150 — as the ``client`` recorded on audit rows.
+    The per-IP rate limiters key on it too. Since BACKLOG #2289 it is the only reader of
+    ``.client.host`` in ``api/`` and the console, and ``tests/test_client_ip_single_extractor.py``
+    holds that line; the two kept exceptions are listed there with their reasons. It is public
     (not ``_``-prefixed) precisely so audit callers REUSE this one extraction rather than growing a
     second, divergent notion of "the client address": two extractors would eventually disagree about
     proxy handling and the audit trail would contradict the risk signal.
@@ -392,7 +395,8 @@ def client_ip(conn: Request | WebSocket) -> str | None:
     uvicorn runs with ``forwarded_allow_ips = settings.api.trusted_proxies`` (``__main__.py``;
     defaults to ``[]`` = trust nothing), and an off-loopback proxied bind is gated to require it. The
     residual is the inherent limit that an in-process per-IP limiter cannot stop pure source-IP
-    rotation by a directly-reachable attacker (SEC-024)."""
+    rotation by a directly-reachable attacker (SEC-024). The real brute-force bounds are the global
+    ceiling and the per-account lockout, applied to both the password and the MFA factor."""
     return conn.client.host if conn.client else None
 
 

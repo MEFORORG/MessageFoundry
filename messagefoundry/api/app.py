@@ -2948,7 +2948,7 @@ def create_app(
         # Rejections are logged (ASVS 16.3.3) — these are control-bypass attempts (a pre-auth memory
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         length = request.headers.get("content-length")
         transfer_encoding = request.headers.get("transfer-encoding", "").lower()
         # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
@@ -3012,6 +3012,12 @@ def create_app(
         # gate (api/client_networks.py), which is what lets a locked-out operator curl it and discover
         # which address the engine is matching — the difference between a diagnosable 403 and a
         # console that looks dead.
+        #
+        # The echo reads ``scope["client"]`` itself, not through client_ip, on purpose: it must report
+        # exactly what ClientNetworkMiddleware matched, and that middleware is raw ASGI with no Request
+        # to hand client_ip. Were client_ip ever to resolve the address differently, this echo must
+        # still name the gate's address (BACKLOG #2289; allow-listed in
+        # tests/test_client_ip_single_extractor.py).
         networks = getattr(request.app.state, "client_networks", ())
         observed = (request.client.host if request.client else None) if networks else None
         return Health(
