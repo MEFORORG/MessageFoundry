@@ -8200,8 +8200,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # EXIT 1 WITH A FAIL LINE (vault BACKLOG #3054, item 8). It reached the dispatch floor and
         # exited 1 with no line, so a job would see a broken chain's code with nothing to read. NOT a
         # softer code of its own: under Transit each row goes to the provider for its MAC, so a
-        # planted row the provider refuses stops the walk, and a code that reads as "not checked"
-        # would let that row hide every break the rest of the walk would have found. The line names
+        # planted row the provider refuses for its content, such as one too large for one request,
+        # stops the walk, and a code that reads as "not checked" would let that row hide every
+        # break the rest of the walk would have found. (A planted key VERSION does not stop the
+        # walk; it is a reported break, BACKLOG #2337.) The line names
         # the error's class and its cause's class only, never its text. The walk reports a break only
         # once it finishes, so a break it had already met is lost too, and the line says so.
         print(

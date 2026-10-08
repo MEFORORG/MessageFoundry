@@ -38,6 +38,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.base import open_store
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.store import MessageStore
@@ -243,7 +244,8 @@ async def test_a_forged_audit_row_does_not_verify(store: MessageStore, tmp_path:
 
 class _RotatingTransit(_FakeTransit):
     """Fake Transit with key versions: ``generate_hmac`` uses the latest unless ``key_version`` pins
-    one, as the real engine does, and each version MACs under its own secret."""
+    one, as the real engine does, and each version MACs under its own secret. A version above the
+    latest is refused with HTTP 400, as real Transit refuses it."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -260,6 +262,12 @@ class _RotatingTransit(_FakeTransit):
         **_: Any,
     ) -> dict[str, Any]:
         self.pinned.append(key_version)
+        if key_version is not None and key_version > self.latest:
+            # The [vault] extra's class, which the cipher classifies on. Only a test that pins an
+            # unheld version reaches this, and _needs_hvac() skips those without the extra.
+            from hvac.exceptions import InvalidRequest  # type: ignore[import-untyped]
+
+            raise InvalidRequest("cannot generate HMAC: invalid key version")
         version = self.latest if key_version is None else key_version
         secret = self._hmac_secret[name] + version.to_bytes(4, "big")
         digest = hmac.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
@@ -292,29 +300,29 @@ async def test_rotating_the_transit_key_keeps_the_attestation(
     await _start(again, SecurityEnforcement.ENFORCE)  # no raise; stopping closes the store
 
 
+#: A Transit key version the fake does not hold, as a DML writer would plant it.
+_UNHELD_VERSION = 9999999
+_PLANTED = f"vault:v{_UNHELD_VERSION}:AAAA"
+
+
+def _needs_hvac() -> None:
+    """Skip without the [vault] extra: the cipher tells a refused version by hvac's own class."""
+    pytest.importorskip("hvac.exceptions")
+
+
 async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A DML writer sets both hashes to a key version Transit does not hold. Transit refuses the
     pinned recompute; that must read as unattested, so a warn start still starts."""
-    transit = _RotatingTransit()
-    _use_fake(monkeypatch, transit)
+    _needs_hvac()
+    _use_fake(monkeypatch, _RotatingTransit())
     db = tmp_path / "forged-version.db"
     store = await _transit_store(db)
     recorded = await _attest(store)
     await store.close()
-    forged = "vault:v9999999:AAAA"
-    _dml(db, "UPDATE transit_bound_attestation SET audit_hash = ? WHERE id = 1", (forged,))
-    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", (forged, recorded.audit_seq))
-
-    real = transit.generate_hmac
-
-    def refuse_unknown(**kw: Any) -> dict[str, Any]:
-        if kw.get("key_version") == 9999999:
-            raise RuntimeError("key version does not exist")
-        return real(**kw)
-
-    monkeypatch.setattr(transit, "generate_hmac", refuse_unknown)
+    _dml(db, "UPDATE transit_bound_attestation SET audit_hash = ? WHERE id = 1", (_PLANTED,))
+    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", (_PLANTED, recorded.audit_seq))
     again = await _transit_store(db)
     try:
         got = await again.get_transit_bound_attestation()
@@ -323,6 +331,218 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
         raise
     assert got is not None and got.audit_gap is not None and "Transit refused" in got.audit_gap
     await _start(again, SecurityEnforcement.WARN)  # no raise
+
+
+# --- a planted key version on the audit chain is a break, not a walk that could not run ----------
+
+
+class _StartupSink(LoggingAlertSink):
+    """Records every ``integrity_drift`` the startup audit walk fires."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+
+    def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+        self.events.append((name, reason))
+
+
+async def _chain_with_a_planted_version(db: Path) -> int:
+    """A Transit store whose audit chain has one middle row naming a key version Transit does not
+    hold, as a DML writer would plant it. Returns that row's sequence number."""
+    _needs_hvac()
+    store = await _transit_store(db)
+    try:
+        await store.record_audit("test.planted", actor="cli:tester")
+        await store.record_audit("test.after", actor="cli:tester")
+    finally:
+        await store.close()
+    con = sqlite3.connect(db)
+    try:
+        (seq,) = con.execute("SELECT seq FROM audit_log WHERE action = 'test.planted'").fetchone()
+    finally:
+        con.close()
+    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", (_PLANTED, seq))
+    return int(seq)
+
+
+async def _walk_on_start(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> tuple[_StartupSink, list[str]]:
+    """Run only the engine's startup audit check, returning the alerts and the engine's log lines."""
+    sink = _StartupSink()
+    engine = Engine(
+        store,
+        alert_sink=sink,
+        audit_verify_on_start=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.engine"):
+        await engine._verify_audit_chain_on_start()
+    lines = [r.getMessage() for r in caplog.records if r.name == "messagefoundry.pipeline.engine"]
+    # Proves the capture saw the walk at all, so an absent "could not run" line means something.
+    assert any("startup audit-chain verification" in line for line in lines), lines
+    return sink, lines
+
+
+async def test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A DML writer names a Transit key version Transit does not hold. Transit refuses the pinned
+    recompute, and that is the row's own evidence: the startup walk must raise the tamper alert at
+    that row, never stop with "could not run" and no alert (the sixth defect on PR 2167)."""
+    _use_fake(monkeypatch, _RotatingTransit())
+    db = tmp_path / "planted.db"
+    seq = await _chain_with_a_planted_version(db)
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+    assert f"key version {_UNHELD_VERSION}" in str(msg), msg
+    assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
+    assert f"seq={seq}," in sink.events[0][1], sink.events
+    assert not any("could not run" in line for line in lines), lines
+
+
+async def test_a_planted_unheld_key_version_on_the_genesis_row_opens_and_reads_as_a_break(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The open MACs the genesis row too. A planted version there must not stop the open; the
+    walk reports the break at row 1."""
+    _use_fake(monkeypatch, _RotatingTransit())
+    db = tmp_path / "planted-genesis.db"
+    await _chain_with_a_planted_version(db)
+    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = 1", (_PLANTED,))
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert not ok and "seq=1," in str(msg), msg
+
+
+async def test_a_transit_outage_on_the_startup_walk_still_could_not_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Transit unreachable is not evidence about any row: the walk could not run, and no tamper
+    alert fires."""
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "outage.db"
+    await _chain_with_a_planted_version(db)
+    store = await _transit_store(db)
+
+    def unreachable(**_kw: Any) -> dict[str, Any]:
+        raise httpx.ConnectError("Vault is unreachable")
+
+    monkeypatch.setattr(transit, "generate_hmac", unreachable)
+    try:
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert sink.events == []
+    assert any("could not run" in line for line in lines), lines
+
+
+async def test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dropped connection on a pinned call, while the latest version still answers, must not
+    read as a refused key version. Only Transit's 400 for the version is that; anything else is a
+    check that could not run, so a clean row is never reported as tampered."""
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "transient.db"
+    store = await _transit_store(db)
+    await store.record_audit("test.clean", actor="cli:tester")
+    real = transit.generate_hmac
+
+    def drop_pinned(**kw: Any) -> dict[str, Any]:
+        if kw.get("key_version") is not None:
+            raise httpx.ConnectError("connection reset")
+        return real(**kw)
+
+    monkeypatch.setattr(transit, "generate_hmac", drop_pinned)
+    try:
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert sink.events == []
+    assert any("could not run" in line for line in lines), lines
+
+
+def _pinned_refusal(answer: Any) -> CipherError:
+    """What the cipher raises when a pinned call gets Transit's 400 and the probe gets ``answer``
+    (a reply, or an exception to raise)."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store.crypto_transit import TransitCipher
+    from tests.test_crypto_transit import _FakeClient
+
+    class _Transit(_FakeTransit):
+        def generate_hmac(self, **kw: Any) -> dict[str, Any]:
+            if kw.get("key_version") is not None:
+                raise InvalidRequest("bad request")
+            if isinstance(answer, Exception):
+                raise answer
+            return {"data": {"hmac": answer}}
+
+    cipher = TransitCipher(_FakeClient(_Transit()), _KEY_NAME)
+    with pytest.raises(CipherError) as caught:
+        cipher.audit_hmac(b"row", key_version=3)
+    return caught.value
+
+
+def test_a_pinned_400_with_a_working_probe_is_a_refused_version() -> None:
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    assert isinstance(_pinned_refusal("vault:v2:AAAA"), AuditKeyVersionRefusedError)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(RuntimeError("key not found"), id="probe-fails"),
+        pytest.param("vault:v3:AAAA", id="probe-names-the-same-version"),
+    ],
+)
+def test_a_pinned_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: Any) -> None:
+    """A missing key also answers 400, and so may a refusal that has nothing to do with the version.
+    Neither may read as a planted version, or a clean chain would read as tampered."""
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    assert not isinstance(_pinned_refusal(answer), AuditKeyVersionRefusedError)
+
+
+def test_a_refused_key_version_survives_a_pickle_with_its_text() -> None:
+    import pickle
+
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    exc = AuditKeyVersionRefusedError(7)
+    again = pickle.loads(pickle.dumps(exc))
+    assert isinstance(again, AuditKeyVersionRefusedError) and isinstance(again, CipherError)
+    assert again.version == 7 and str(again) == str(exc)
+
+
+def test_cli_audit_verify_exits_1_on_a_planted_unheld_key_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+
+    _use_fake(monkeypatch, _RotatingTransit())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit")
+    db = tmp_path / "planted-cli.db"
+    seq = asyncio.run(_chain_with_a_planted_version(db))
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 1, captured
+    assert f"seq={seq}," in captured.out + captured.err, captured
 
 
 async def test_a_non_numeric_attested_at_is_a_gap_not_a_crash(

@@ -103,6 +103,7 @@ from messagefoundry.store.content_search import SearchSpec, newest_first, row_ma
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
+    AuditKeyVersionRefusedError,
     AuditMacFn,
     Cipher,
     CipherError,
@@ -2475,7 +2476,8 @@ def _audit_row_mac(
     value of a type no engine build writes -- which the walk reports as a break rather than raising.
 
     A MAC provider is pinned to the Transit key version ``row``'s stored hash names
-    (:func:`_version_pinned_mac`), so a row sealed before a key rotation still verifies after it."""
+    (:func:`_version_pinned_mac`), so a row sealed before a key rotation still verifies after it.
+    It may raise :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError`."""
     if mac is not None:
         mac = _version_pinned_mac(mac, row["row_hash"])
     try:
@@ -2787,16 +2789,19 @@ def verify_audit_rows(
         # Not held: the stored hash is compared with itself. The only check left is that it is a
         # non-empty text value; an empty or non-text one is never a MAC (#2725). Any other text
         # passes, whether or not it is a real MAC: that needs the key.
-        expected = (
-            _audit_row_mac(r, prev, key, mac)
-            if held
-            else (stored if isinstance(stored, str) and stored else None)
-        )
+        refused: str | None = None
+        if held:
+            try:
+                expected = _audit_row_mac(r, prev, key, mac)
+            except AuditKeyVersionRefusedError as exc:  # a break at this row; the walk goes on
+                expected, refused = None, str(exc)
+        else:
+            expected = stored if isinstance(stored, str) and stored else None
         # Bind the compare first so it is ALWAYS evaluated: folding it behind a known-break test
         # would short-circuit the comparator once a break is known.
         mac_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))
         if seq_ok and not (mac_ok and expected is not None):
-            breaks.append((pos, rid, None))
+            breaks.append((pos, rid, refused))
         if ranged:
             range_digest.update(_audit_digest_line(r))
         # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
@@ -3062,12 +3067,18 @@ async def settle_audit_ranges(
     problem: str | None = None
     first_secret = _audit_secret_for(genesis_key, keys, host._audit_mac_fn)
     if first_secret is not None:
-        expected = _audit_row_mac(genesis, "", first_secret[0], first_secret[1])
+        refused = ""
+        try:
+            expected = _audit_row_mac(genesis, "", first_secret[0], first_secret[1])
+        except AuditKeyVersionRefusedError as exc:  # the genesis row fails, as the walk reports it
+            expected, refused = None, f" ({exc})"
         mac_ok = hmac.compare_digest(
             audit_mac_bytes(genesis["row_hash"]), audit_mac_bytes(expected)
         )
         if not mac_ok or expected is None or _strict_int(genesis["seq"]) != 1:
-            problem = "the audit chain's genesis row does not verify under the key it names"
+            problem = (
+                f"the audit chain's genesis row does not verify under the key it names{refused}"
+            )
     genesis_ok = problem is None
     current, current_from = genesis_key, 1
     seen: list[str] = [genesis_key]
@@ -12328,7 +12339,8 @@ class MessageStore:
         the intentional disclosure. (Under ``vault_transit`` each row MAC is a Transit round trip, so a
         broken chain now pays the same N round trips a healthy one already pays — accepted: the
         healthy-verify cost is the bound, and a tamper alarm must not be cheaper to provoke than a
-        clean pass.)"""
+        clean pass. A row whose key version Transit refuses costs one more, the probe that tells the
+        refusal from an outage, BACKLOG #2337.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(

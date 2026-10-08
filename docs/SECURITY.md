@@ -5113,6 +5113,20 @@ failed. The check recomputes the MAC under the Transit key version the audit row
 rotating the key, which is what the operator attests to, keeps the attestation. The audit chain
 walk pins the version the same way, so a rotation does not read as a chain break either.
 
+**A planted key version is a break at its row.** A writer can plant a version Transit does not
+hold. Transit refuses it with HTTP 400 while it still answers under the latest version. The walk
+then reports a break at that row and keeps going. `audit-verify` names the row and exits 1. With
+`[integrity].audit_verify_on_start` on, the startup check also raises its `audit-chain` alert.
+Other failures still stop the walk as a check that could not run. Those include at least an
+outage, a dropped connection, and a row too large for one request.
+
+**Retiring an old version of the audit key breaks the chain.** Transit also refuses a version below the key's
+`min_encryption_version`, or one trimmed away. Every audit row sealed under that version then reads
+as a break, `audit-verify` exits 1, and the attestation counts as none. The audit key is the data
+key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` names another. So raising the data key's minimum version
+breaks the chain too. Rotating is safe; retiring is not. The break text names both causes, a planted
+version and a retired one.
+
 **What this check does not catch: a replay after a deleted withdraw row.** A writer can delete the
 withdraw row and re-insert the old attestation row. This check does not see that. If other audit
 rows follow the deleted one, the chain breaks, and `messagefoundry audit-verify` reports it. So does

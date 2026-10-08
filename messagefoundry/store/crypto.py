@@ -502,6 +502,26 @@ class CipherError(Exception):
     JSON. The message says which, so an operator is not sent looking for a missing key."""
 
 
+class AuditKeyVersionRefusedError(CipherError):
+    """Transit refused an audit MAC pinned to one key version, and still answers under the latest.
+
+    The pinned version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
+    So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
+    a walk that could not run. Transit also refuses a version its policy retires, so the break says
+    both."""
+
+    def __init__(self, version: int) -> None:
+        # The version alone in ``args``, so a copy or pickle rebuilds the same exception.
+        super().__init__(version)
+        self.version = version
+
+    def __str__(self) -> str:
+        return (
+            f"Transit refused audit key version {self.version}: the key does not hold it, or its "
+            "policy retires it"
+        )
+
+
 class StoreKeylessError(RuntimeError):
     """A store eager-read seam met an **encrypted** value (an ``mfenc:`` marker) but **no store key is
     configured** — a keyless (mis)configured open of a store that carries key-encrypted rows at rest.
