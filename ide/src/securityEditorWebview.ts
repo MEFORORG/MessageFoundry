@@ -168,7 +168,18 @@ export function securityEditorScript(token: string, fields: unknown): string {
       defaults = state.defaults || {};
       for (const f of FIELDS) { setValue(f, state.values ? state.values[f.key] : undefined); }
       errorEl.style.display = 'none';
+      $('form').style.display = '';
       $('save').disabled = false;
+    }
+
+    // A state this form cannot read. The form is hidden and Save goes off, so nothing can be written
+    // from placeholders or from the values of an earlier state. textContent (through show): the
+    // problem names a switch, and no part of a message is ever parsed as markup here.
+    function refuse(problem) {
+      $('save').disabled = true;
+      $('form').style.display = 'none';
+      show('These settings cannot be shown. The engine sent a state this form cannot read: ' + problem +
+        '. Save is off until a readable state arrives.');
     }
 
     function collectUpdates() {
@@ -184,51 +195,78 @@ export function securityEditorScript(token: string, fields: unknown): string {
       return updates;
     }
 
-    function show(msg) { errorEl.textContent = msg; errorEl.style.display = ''; }
+    // 'block', not '': the page's stylesheet hides .error, and clearing the inline value would hand
+    // the element back to that rule, so the text would be set and never seen.
+    function show(msg) { errorEl.textContent = msg; errorEl.style.display = 'block'; }
 
     $('save').addEventListener('click', () => vscode.postMessage({ command: 'save', updates: collectUpdates() }));
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
-    // The JS type each FIELDS type arrives as. Types only: a negative or oversized int is a value
-    // range, which is a different requirement (webviewMessaging.ts, SHAPE_HELPERS).
+    // The JS type each FIELDS type arrives as, and how the refusal names it. Types only: a negative
+    // int is a value range, which is a different requirement (webviewMessaging.ts, SHAPE_HELPERS).
+    // mfInt is Number.isSafeInteger, so a fraction and a number past 2^53 are refused as not an int.
+    // null is a value only for a tristate: elsewhere it would render as "No" or as an empty number.
     const TYPE_OK = {
-      bool: mfBool,
-      int: mfInt,
-      string: mfStr,
-      tristate: (x) => x === null || mfBool(x),
+      bool: { ok: mfBool, want: 'true or false' },
+      int: { ok: mfInt, want: 'a whole number' },
+      string: { ok: mfStr, want: 'text' },
+      tristate: { ok: (x) => x === null || mfBool(x), want: 'true, false or null' },
     };
-    // Every switch this form has, read the way render() and collectUpdates() read it. One the engine
-    // reported with the wrong type fails. null is a value only for a tristate: elsewhere it would
-    // render as "No" or as an empty number, and Save would write that as false or 0.
-    // A switch the engine did not report (undefined) passes, as it did before this check: the installed
-    // engine can be older than this form. setValue() still shows such a Yes/No as "No". That is not a
-    // type error, so it is not refused here. Keys with no FIELDS entry are never read, so never checked.
-    function fieldTypesOk(o) {
+    // The kind of a value, for the refusal. Never the value itself.
+    function kindOf(v) { return v === null ? 'null' : Array.isArray(v) ? 'list' : typeof v; }
+
+    // What is wrong with the first switch in o (state.values or state.defaults) that is missing or
+    // has the wrong type, or null when every FIELDS switch is there with its type.
+    // EVERY switch is required in BOTH objects. "security show" prints the whole settings model
+    // twice (the file's values, then the defaults), so a missing switch is a malformed state. It is
+    // refused for the reason a null is: setValue() would show an absent Yes/No as "No" and an absent
+    // number as empty, and Save would write that as false or 0. A tristate that is unset arrives as
+    // null, which is present. Keys with no FIELDS entry are never read, so never checked.
+    function switchProblem(o, where) {
       for (const f of FIELDS) {
+        const name = where + '.' + f.key;
         const v = o[f.key];
-        if (v === undefined) { continue; }
+        if (v === undefined) { return name + ' is missing'; }
         // Own-property lookup, so a FIELDS type with no entry here fails closed and does not throw.
-        const ok = Object.prototype.hasOwnProperty.call(TYPE_OK, f.type) ? TYPE_OK[f.type] : null;
-        if (!ok || ok(v) !== true) { return false; }
+        const t = Object.prototype.hasOwnProperty.call(TYPE_OK, f.type) ? TYPE_OK[f.type] : null;
+        if (!t) { return name + ' has a type this form does not know'; }
+        if (t.ok(v) !== true) { return name + ' must be ' + t.want + ', got ' + kindOf(v); }
       }
-      return true;
+      return null;
     }
 
-    // One entry per message the host posts (at least securityEditor.ts). The state is ShowResult,
-    // the JSON "security show" prints. That comes from the INSTALLED engine, which can be older or
-    // newer than this extension, so the two fields the form renders from are required and the two
-    // it does not read are typed only when present.
+    // What is wrong with a 'state' message, or null. The state is ShowResult, the JSON "security
+    // show" prints. The two objects the form renders from are required, with every switch; the two
+    // fields it does not read are typed only when present.
+    function stateProblem(d) {
+      const s = d.state;
+      if (!mfObj(s)) { return 'state is missing or is not an object'; }
+      for (const where of ['values', 'defaults']) {
+        if (!mfObj(s[where])) { return where + ' is missing or is not an object'; }
+        const problem = switchProblem(s[where], where);
+        if (problem !== null) { return problem; }
+      }
+      if (!mfOpt(s.set, (x) => mfArrOf(x, mfStr))) { return 'set must be a list of text'; }
+      if (!mfOpt(s.loosenings, (ls) => mfArrOf(ls, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk)))) {
+        return 'loosenings must be a list of switch and risk entries';
+      }
+      return null;
+    }
+
+    // One entry per message the host posts (at least securityEditor.ts).
     const SHAPES = {
-      state: (d) => mfObj(d.state) && mfObj(d.state.values) && mfObj(d.state.defaults) &&
-        fieldTypesOk(d.state.values) && fieldTypesOk(d.state.defaults) &&
-        mfOpt(d.state.set, (s) => mfArrOf(s, mfStr)) &&
-        mfOpt(d.state.loosenings, (ls) => mfArrOf(ls, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk))),
+      state: (d) => stateProblem(d) === null,
       error: (d) => mfStr(d.message),
     };
     ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
       const d = mfTrusted(e);
-      if (!d || !mfShapeOk(d, 'command', SHAPES, 'Security Settings')) { return; }
+      if (!d) { return; }
+      if (!mfShapeOk(d, 'command', SHAPES, 'Security Settings')) {
+        // A discarded state is shown as well as warned: an empty form with no reason reads as broken.
+        if (d.command === 'state') { refuse(stateProblem(d)); }
+        return;
+      }
       if (d.command === 'state') { render(d.state); }
       else if (d.command === 'error') { show(d.message); }
     });
