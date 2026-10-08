@@ -21,7 +21,7 @@ import pytest
 from messagefoundry.auth import Role
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from tests.test_api_auth import _add, _auth, _client, _login, _reauth, _service
+from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _client, _login, _reauth, _service
 
 
 @pytest.fixture
@@ -94,6 +94,7 @@ async def test_each_self_target_refusal_writes_its_own_audit_row(
     rows = await engine.store.list_audit(action="auth.self_target_refused", limit=10)
     assert len(rows) == 1, "one refusal, one audit row"
     assert rows[0]["actor"] == "root"
+    assert rows[0]["client"] == _DEFAULT_PEER[0], "the refusal row dropped the caller's address"
     # The route and the caller's stored id: no credential, no body, no message content.
     assert json.loads(str(rows[0]["detail"])) == {"op": op, "user_id": me.id}
 

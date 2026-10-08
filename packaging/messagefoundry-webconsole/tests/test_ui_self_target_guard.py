@@ -114,8 +114,11 @@ async def test_each_self_target_refusal_is_by_stored_id_and_audited(
     rows = await engine.store.list_audit(action="auth.self_target_refused", limit=10)
     assert len(rows) == 1, "one refusal, one audit row"
     assert rows[0]["actor"] == "root"
+    assert rows[0]["client"] == "127.0.0.1", "the refusal row dropped the caller's address"
     # The caller's stored id and the route, nothing more: no path spelling, no message content.
     assert json.loads(str(rows[0]["detail"])) == {"op": op, "user_id": me}
+    # A backstop only. On the upper spelling the status and the row are what tell the fix apart: a
+    # guard that let it through reached writes keyed by that spelling, which SQLite matches to no row.
     after = await engine.store.get_user(me)
     assert after is not None and before is not None
     assert (after.disabled, after.oidc_subject) == (before.disabled, before.oidc_subject)
