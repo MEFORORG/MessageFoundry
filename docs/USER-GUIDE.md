@@ -212,6 +212,19 @@ The complete procedure — least-privilege accounts, locking down the config/log
 
 `messagefoundry dryrun` and `messagefoundry generate` print **full message bodies** to stdout/stderr (`dryrun` only with `--show-phi`; redacted otherwise). Run them against **synthetic HL7 only** — never real PHI — and never redirect their output into a committed file, ticket, or CI log. See [PHI.md](PHI.md).
 
+### Command options that depend on each other
+
+Some `messagefoundry` commands refuse a set of options that do not fit together. The rule is about the combination, not about one option's value. The table lists at least the rules a search of the command-line code found. It is not a complete list, so run a command with `--help` for its own options.
+
+| Command | Options | Rule | When the rule is broken |
+|---|---|---|---|
+| `impact` | `--rename-to` and `--delete` | Never both. Either one alone is fine, and so is neither. | An error message and a non-zero exit |
+| `impact` | `--apply` | Valid only with `--rename-to`. | An error message and a non-zero exit |
+| `audit-verify` | `--expected-anchor` and `--expected-anchor-file` | Never both, because they carry the same anchor. Neither is required. | The argument parser refuses the command |
+| `serve` | `--shard` and the `[cluster].enabled` setting | Engine sharding cannot run with active-passive clustering. | An error message and exit code 2 |
+
+All four rules are in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py). The table leaves out a rule that one action needs one option, such as `service install` needing `--env`. The rules for the engine's API and the web console are in [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md#rules-over-two-or-more-items), which also says how the search ran.
+
 ---
 
 ## Quickstart: send your first message
@@ -427,6 +440,23 @@ Routers and Handlers work against the mutable HL7 `Message` in [messagefoundry/p
 - **Re-encode** — `msg.encode()` (or just pass `msg` to a `Send`, which encodes for you).
 
 A non-HL7 inbound (`content_type` other than `hl7v2`) delivers a `RawMessage` instead — read `.raw` / `.text` / `.json()` / `.xml()` (the XML accessor is XXE-safe via defusedxml: DOCTYPE, external-entity, and billion-laughs payloads raise) and `Send` a built string. For cross-field business-rule checks beyond what schema validation catches, compose the primitives in `parsing/consistency.py`, as [samples/consistency/validated_adt.py](../samples/consistency/validated_adt.py) does (raise `ConsistencyError` → dead-letter, or `return None` → filter). The three validation tiers are laid out in [HL7-VALIDATION.md](HL7-VALIDATION.md).
+
+**Those primitives read an HL7 `Message` only.** Each one calls `msg.field(path)` with an HL7 path. A `RawMessage` has no `field` method, so they do not work on a JSON, XML, FHIR, DICOM or X12 payload.
+
+For such a payload, write the cross-field comparison in your Handler, as plain Python over the value you parsed. Then decide the same way: `return None` to filter the message, or raise to dead-letter it.
+
+You can still raise `ConsistencyError`. It takes any list of `Violation`, and a `Violation` is a rule name plus the paths involved. `Violation("dates_in_order", ("admit", "discharge"))` is one you could build yourself. Put names and paths in it, never a value from the message.
+
+The engine ships validators for some of these formats. All are opt-in: nothing runs one unless your Handler calls it. They include at least these:
+
+| Format | Call | What it checks |
+|---|---|---|
+| X12 | `check_integrity`, in `messagefoundry.parsing.x12` | Whether the envelope agrees with itself: the control-number pairs (ISA13 with IEA02, GS06 with GE02, ST02 with SE02) and the group, set and segment counts |
+| X12 | `validate`, in `messagefoundry.parsing.x12.validate` | The interchange against an implementation guide. It needs the `[x12]` extra |
+| XML | `validate_against`, in `messagefoundry.parsing.xml.schema` | The document against an XML Schema you supply. It needs the `[xml]` extra |
+| FHIR | `FhirResource.parse`, in `messagefoundry.parsing.fhir.resource` | The resource's structure and cardinality. It needs the `[fhir]` extra |
+
+Only the first row is a cross-field check this guide can vouch for. The other three check a payload against a guide, a schema or a model. Which cross-field rules that covers depends on the guide, schema or model, so read it before you rely on it. `check_integrity` quotes the control numbers it compared in its problem text, so treat that text as message content when you log.
 
 ### 4. Translation tables (code sets)
 
