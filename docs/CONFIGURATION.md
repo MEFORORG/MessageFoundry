@@ -921,10 +921,13 @@ forwarder with no fault seen reads `unconfirmed` and never `healthy`, and the co
 that delivery is not confirmed. The health indicator does not warn for it. Use `tcp` or `tls`
 where a silent loss must page.
 
-Both carry counts and fixed words only: never a record, the collector's address or an error text.
+Neither carries a record, the collector's address or an error text. `log_forwarder` on
+`GET /status` holds counts, true-or-false flags and fixed words only. The alert holds a count,
+fixed reason words and its key. The key ends in the process label where one applies, and the
+alert item above says what that label is and what it holds on an unpinned cluster node.
 Every count is since the process started. Each engine process has its own forwarder and watches
-its own: every engine shard, and a cluster standby too. The alert does not say which process
-raised it, and `GET /status` reports the process that answered.
+its own: every engine shard, and a cluster standby too. `GET /status` reports the process that
+answered.
 
 ### `[retention]`
 Enforced by the engine's retention/purge task ([pipeline/retention.py](../messagefoundry/pipeline/retention.py)).
