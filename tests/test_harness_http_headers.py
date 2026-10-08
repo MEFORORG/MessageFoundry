@@ -20,6 +20,7 @@ reporting presence.
 
 from __future__ import annotations
 
+import http.client
 import socket
 from typing import Any
 
@@ -36,17 +37,34 @@ _Block = tuple[int, list[tuple[str, str]]]
 _EXPECTED = [(name.lower(), value) for name, value in _BASELINE_RESPONSE_HEADERS]
 
 
-def _exchange(port: int, request: bytes) -> bytes:
-    """Send raw bytes and read until the sink closes the connection."""
+def _exchange(port: int, request: bytes, *, half_close: bool) -> bytes:
+    """Send raw bytes and read until the sink closes the connection. ``half_close`` tells the sink
+    no more is coming, so a refusal that discards the rest of the request ends at once and not on
+    the read timeout."""
     with socket.create_connection(("127.0.0.1", port), 5.0) as conn:
         conn.sendall(request)
+        if half_close:
+            conn.shutdown(socket.SHUT_WR)
         chunks = []
         try:
             while chunk := conn.recv(65536):
                 chunks.append(chunk)
         except ConnectionError:
-            pass  # the sink closed with unread input still queued; what arrived is the answer
+            # The sink closed with unread input still queued. What arrived is the answer; with
+            # nothing arrived, the reset is the finding, and it is raised as itself.
+            if not chunks:
+                raise
     return b"".join(chunks)
+
+
+def _answer(monkeypatch: pytest.MonkeyPatch, request: bytes, status: int = 200) -> bytes:
+    """What a fresh sink writes back for ``request``. Only the stalled-body case shortens the read
+    timeout and keeps its side open: every other case leaves the sink its normal five seconds."""
+    stalled = request is _STALLED_BODY
+    if stalled:
+        monkeypatch.setattr(http_sink, "READ_TIMEOUT_SECONDS", 0.3)
+    with RestSink(status=status, reply_body=b'{"ok":1}') as sink:
+        return _exchange(sink.port, request, half_close=not stalled)
 
 
 def _blocks(raw: bytes) -> list[_Block]:
@@ -81,8 +99,13 @@ def _assert_floored(raw: bytes, statuses: list[int]) -> None:
 
 _POST = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
 
-#: One byte more than the longest line the stdlib reads (65536), and nothing after it.
-_STDLIB_LINE_LIMIT = 65536
+#: Declares a hundred bytes and sends ten, then waits: the sink's 408.
+_STALLED_BODY = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nonly ten b"
+
+#: The longest line the stdlib reads. http.client holds it as the private _MAXLINE for a header
+#: line, and http/server.py spells the same 65536 as a literal for the request line. A release
+#: that raises either leaves the 414 or 431 case waiting for bytes that never come.
+_STDLIB_LINE_LIMIT: int = getattr(http.client, "_MAXLINE", 65536)
 _GET_LINE = b"GET /x HTTP/1.1\r\n"
 _LONG_REQUEST_LINE = b"GET /".ljust(_STDLIB_LINE_LIMIT + 1, b"a")
 _LONG_HEADER_LINE = b"X-Long: ".ljust(_STDLIB_LINE_LIMIT + 1, b"a")
@@ -108,17 +131,14 @@ _CASES: list[Any] = [
         [400],
         id="400-transfer-encoding",
     ),
-    pytest.param(
-        200,
-        b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nonly ten b",
-        [408],
-        id="408-stalled-body",
-    ),
+    pytest.param(200, _STALLED_BODY, [408], id="408-stalled-body"),
     # --- answers the stdlib handler writes itself, before the sink's handler runs --------------
     #
-    # Each of these is sized so the stdlib reads ALL of it before it answers. It answers and
-    # closes without draining, and a close with input still unread can reset the connection and
-    # discard the answer before this client reads it.
+    # The stdlib answers these and closes without draining, and a close with input still unread
+    # can reset the connection and discard the answer before this client reads it. So each one,
+    # and each HTTP/0.9 case below, ends where the stdlib stops reading on Python 3.14: after the
+    # request line when it answers from that line alone, after the blank line when it reads
+    # headers first.
     pytest.param(200, b"NOT A REQUEST\r\n", [400], id="stdlib-400-malformed"),
     pytest.param(200, b"BREW /x HTTP/1.1\r\nHost: x\r\n\r\n", [501], id="stdlib-501-method"),
     pytest.param(200, b"GET /x HTTP/3.0\r\n", [505], id="stdlib-505-version"),
@@ -133,7 +153,7 @@ _CASES: list[Any] = [
     # An HTTP/0.9 answer has no status line and no header block, so there would be nowhere to
     # put the headers. The stdlib writes one for each of these; the sink answers each with a
     # status line and a header block. test_the_stdlib_alone_answers_these_bare is the control.
-    pytest.param(200, b"GET /x\r\n\r\n", [200], id="http-0.9-two-word-request"),
+    pytest.param(200, b"GET /x\r\n", [200], id="http-0.9-two-word-request"),
     pytest.param(200, b"GET /x HTTP/0.9\r\n\r\n", [200], id="http-0.9-named-version"),
     pytest.param(200, b"BREW /x HTTP/0.9\r\n\r\n", [501], id="http-0.9-stdlib-501"),
     pytest.param(200, b"FOO\r\n", [400], id="http-0.9-one-word-line"),
@@ -146,11 +166,6 @@ _BARE_UNDER_THE_STDLIB = [
     for case in _CASES
     if case.id in ("stdlib-400-malformed", "stdlib-505-version") or case.id.startswith("http-0.9-")
 ]
-
-
-@pytest.fixture(autouse=True)
-def _short_read_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(http_sink, "READ_TIMEOUT_SECONDS", 0.3)
 
 
 def _without(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
@@ -167,11 +182,9 @@ def _without(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
 
 @pytest.mark.parametrize(("status", "request_bytes", "statuses"), _CASES)
 def test_every_answer_carries_the_baseline_headers(
-    status: int, request_bytes: bytes, statuses: list[int]
+    status: int, request_bytes: bytes, statuses: list[int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with RestSink(status=status, reply_body=b'{"ok":1}') as sink:
-        raw = _exchange(sink.port, request_bytes)
-    _assert_floored(raw, statuses)
+    _assert_floored(_answer(monkeypatch, request_bytes, status), statuses)
 
 
 @pytest.mark.parametrize(("status", "request_bytes", "statuses"), _CASES)
@@ -181,8 +194,7 @@ def test_the_probe_sees_absence_when_the_choke_point_is_removed(
     """The control. One override puts the headers on every case above, so removing it must leave
     every case bare, and the assertion the suite relies on must fire."""
     _without(monkeypatch, "end_headers")
-    with RestSink(status=status, reply_body=b'{"ok":1}') as sink:
-        raw = _exchange(sink.port, request_bytes)
+    raw = _answer(monkeypatch, request_bytes, status)
     with pytest.raises(AssertionError, match="lacks x-content-type-options"):
         _assert_floored(raw, statuses)
 
@@ -195,8 +207,7 @@ def test_the_stdlib_alone_answers_these_bare(
     stdlib answers each of these with no status line, so no header block exists to carry
     anything. With it, each is a floored answer (the cases above)."""
     _without(monkeypatch, "request_version")
-    with RestSink(reply_body=b'{"ok":1}') as sink:
-        raw = _exchange(sink.port, request_bytes)
+    raw = _answer(monkeypatch, request_bytes)
     assert raw, "the sink wrote nothing, so this says nothing about its form"
     assert _blocks(raw) == [], raw[:80]
 
@@ -206,11 +217,11 @@ def test_the_bare_control_covers_seven_cases() -> None:
 
 
 @pytest.mark.parametrize("request_bytes", _BARE_UNDER_THE_STDLIB)
-def test_an_answer_the_stdlib_would_write_bare_has_a_status_line(request_bytes: bytes) -> None:
+def test_an_answer_the_stdlib_would_write_bare_has_a_status_line(
+    request_bytes: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The status line names the handler's protocol_version, HTTP/1.1, whatever the request said."""
-    with RestSink() as sink:
-        raw = _exchange(sink.port, request_bytes)
-    assert raw.startswith(b"HTTP/1.1 "), raw[:40]
+    assert _answer(monkeypatch, request_bytes).startswith(b"HTTP/1.1 ")
 
 
 def test_the_sink_baseline_is_the_engine_listeners() -> None:
@@ -226,7 +237,7 @@ def test_the_sink_baseline_is_the_engine_listeners() -> None:
 def test_the_body_and_the_record_are_unchanged() -> None:
     """Adding headers changes no status, body or record."""
     with RestSink(reply_body=b'{"ok":1}') as sink:
-        raw = _exchange(sink.port, _POST)
+        raw = _exchange(sink.port, _POST, half_close=True)
         (record,) = sink.wait_for(lambda rs: len(rs) == 1, 5.0)
     head, _, body = raw.partition(b"\r\n\r\n")
     assert head.startswith(b"HTTP/1.1 200 ") and body == b'{"ok":1}'

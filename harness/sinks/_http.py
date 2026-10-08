@@ -31,8 +31,8 @@ That includes the answers the stdlib handler writes before the sink's own code r
 ``400`` for a malformed request line and its ``501`` for a method the sink does not serve. The
 handler's ``end_headers`` adds them, and the stdlib closes every header block through that one
 method. Nothing is answered in HTTP/0.9 form, which has no status line and no header block. The
-stdlib would use that form for at least an HTTP/0.9 request and its own ``400`` and ``505`` on a
-request line it cannot read a version from. The sink answers those with a status line and a header
+stdlib would use that form for at least an HTTP/0.9 request, its own ``400`` for a request line
+it cannot parse, and its ``505`` for a version it refuses. The sink answers those with a status line and a header
 block, like any other; the handler's ``request_version`` says how.
 """
 

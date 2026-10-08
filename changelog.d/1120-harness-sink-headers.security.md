@@ -6,8 +6,8 @@
   `frame-ancestors 'none'; base-uri 'none'`. That covers the answers Python's own HTTP server
   writes before the sink's code runs, such as its `400` for a malformed request and its `501` for
   an unknown method. Python's server would write some answers with no status line and no headers
-  at all, in HTTP/0.9 form: at least an HTTP/0.9 request, and its own `400` and `505` for a request
-  line it cannot read a version from. The sink now answers those with a status line and headers.
+  at all, in HTTP/0.9 form: at least an HTTP/0.9 request, its own `400` for a request line it
+  cannot parse, and its `505` for a version it refuses. The sink now answers those with a status line and headers.
   The interim `100 Continue` carries the four headers too. No answer carries HSTS. The sink still
   sends Python's `Server` line, which the engine listener does not. The status, body and what the
   sink records are unchanged. (`BACKLOG #1120`)
