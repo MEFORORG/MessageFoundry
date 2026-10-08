@@ -105,6 +105,8 @@ export function securityEditorScript(token: string, fields: unknown): string {
     const $ = (id) => document.getElementById(id);
     const errorEl = $('error');
     let defaults = {};
+    // The refusal now showing, or '' while the form is up. See refuse().
+    let refusal = '';
 
     // Build the grouped form once; values are filled in on 'state'.
     function buildForm() {
@@ -167,6 +169,7 @@ export function securityEditorScript(token: string, fields: unknown): string {
     function render(state) {
       defaults = state.defaults || {};
       for (const f of FIELDS) { setValue(f, state.values ? state.values[f.key] : undefined); }
+      refusal = '';
       errorEl.style.display = 'none';
       $('form').style.display = '';
       $('save').disabled = false;
@@ -178,8 +181,9 @@ export function securityEditorScript(token: string, fields: unknown): string {
     function refuse(problem) {
       $('save').disabled = true;
       $('form').style.display = 'none';
-      show('These settings cannot be shown. The engine sent a state this form cannot read: ' + problem +
-        '. Save is off until a readable state arrives.');
+      refusal = 'These settings cannot be shown. The engine sent a state this form cannot read: ' + problem +
+        '. Save is off until a readable state arrives.';
+      show(refusal);
     }
 
     function collectUpdates() {
@@ -212,8 +216,14 @@ export function securityEditorScript(token: string, fields: unknown): string {
       string: { ok: mfStr, want: 'text' },
       tristate: { ok: (x) => x === null || mfBool(x), want: 'true, false or null' },
     };
-    // The kind of a value, for the refusal. Never the value itself.
-    function kindOf(v) { return v === null ? 'null' : Array.isArray(v) ? 'list' : typeof v; }
+    // The kind of a value, for the refusal. Never the value itself. A number that is not an int says
+    // which way, or "must be a whole number, got number" would name no difference.
+    function kindOf(v) {
+      if (v === null) { return 'null'; }
+      if (Array.isArray(v)) { return 'list'; }
+      if (typeof v !== 'number') { return typeof v; }
+      return Number.isInteger(v) ? (mfInt(v) ? 'number' : 'a number too large') : 'a fraction';
+    }
 
     // What is wrong with the first switch in o (state.values or state.defaults) that is missing or
     // has the wrong type, or null when every FIELDS switch is there with its type.
@@ -264,11 +274,13 @@ export function securityEditorScript(token: string, fields: unknown): string {
       if (!d) { return; }
       if (!mfShapeOk(d, 'command', SHAPES, 'Security Settings')) {
         // A discarded state is shown as well as warned: an empty form with no reason reads as broken.
-        if (d.command === 'state') { refuse(stateProblem(d)); }
+        // The fallback text covers a discard stateProblem() does not explain, so "null" is never shown.
+        if (d.command === 'state') { refuse(stateProblem(d) || 'it is malformed'); }
         return;
       }
       if (d.command === 'state') { render(d.state); }
-      else if (d.command === 'error') { show(d.message); }
+      // After a refusal the form is still hidden, so the reason stays up beside the new error.
+      else if (d.command === 'error') { show(refusal ? refusal + ' The engine also reported: ' + d.message : d.message); }
     });
 
     // Save stays off until a state has rendered. Until then the form holds placeholders, not the file's

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
 
 import { alertEditorScript } from "../../alertEditorWebview";
 import { codeSetEditorScript } from "../../codeSetEditorWebview";
@@ -19,8 +21,10 @@ import { wiringMapScript } from "../../wiringMapWebview";
 // mfTrusted() decides WHO sent a message. This suite pins the next step at each receiver: a message
 // that is correctly stamped and carries a known discriminator, but whose payload is missing a
 // required field or has one of the wrong JS type, is DISCARDED. Nothing on the page changes and
-// nothing throws. One receiver SHOWS the discard: Security Settings, for a `state` (see its
-// `shownDiscard`), because an empty settings form with no reason given reads as a broken panel. Value ranges are a different requirement and are not tested here.
+// nothing throws. Value ranges are a different requirement and are not tested here.
+//
+// One receiver SHOWS the discard: Security Settings, for a `state` (see its `shownDiscard`). An
+// empty settings form with no reason given reads as a broken panel.
 //
 // Each panel's REAL script is evaluated in a jsdom page, so what runs here is what ships. Each
 // well-formed fixture is built by the host's own pure function where there is one (buildForm,
@@ -479,10 +483,14 @@ function refusalShown(p: Page): string {
   return computed.display === "none" ? "" : String(el.textContent);
 }
 
-/** The rule securityEditor.ts formHtml() ships for the error element, and the element as it ships. */
-const SECURITY_ERROR_CSS = "<style>.error { display: none; }</style>";
+/** The rule securityEditor.ts formHtml() ships for the error element, and the element as it ships.
+ *  That file imports `vscode`, so it cannot be loaded here; a test below reads its text instead and
+ *  fails if this rule or that element is no longer in it. */
+const SECURITY_ERROR_RULE = ".error { display: none;";
+const SECURITY_ERROR_ELEMENT = '<div id="error" class="error">';
+const SECURITY_ERROR_CSS = `<style>${SECURITY_ERROR_RULE} }</style>`;
 function securityBody(seed: string): string {
-  return `${SECURITY_ERROR_CSS}<div id="form"></div><div id="error" class="error">${seed}</div>
+  return `${SECURITY_ERROR_CSS}<div id="form"></div>${SECURITY_ERROR_ELEMENT}${seed}</div>
        <button id="save"></button><button id="close"></button>`;
 }
 const REFUSAL = "These settings cannot be shown.";
@@ -694,14 +702,21 @@ suite("webview receivers discard a malformed payload and render a well-formed on
 
   test("Security Settings: a discarded state names the switch and what was wrong with it", () => {
     // BACKLOG #1123. The operator sees why the panel is empty, not only the webview console.
+    // Every case that can carry text sends this marker as the bad value. None may echo it.
+    const SENT = "SENT_IN_THE_MESSAGE";
     const cases: [string, (c: Payload) => void, string][] = [
       ...ONE_PER_TYPE.flatMap(([, key]): [string, (c: Payload) => void, string][] => [
         [`values.${key} absent`, (c) => delete c.state.values[key], `values.${key} is missing`],
         [`defaults.${key} absent`, (c) => delete c.state.defaults[key], `defaults.${key} is missing`],
       ]),
-      ["a bool that is a string", (c) => (c.state.values.require_mfa = "false"), "values.require_mfa must be true or false, got string"],
+      ["a bool that is a string", (c) => (c.state.values.require_mfa = SENT), "values.require_mfa must be true or false, got string"],
+      ["an int that is a string", (c) => (c.state.values.max_session_hours = SENT), "values.max_session_hours must be a whole number, got string"],
+      ["an int that is a fraction", (c) => (c.state.defaults.max_session_hours = 12.5), "defaults.max_session_hours must be a whole number, got a fraction"],
+      ["an int past 2^53", (c) => (c.state.defaults.max_session_hours = 2 ** 60), "defaults.max_session_hours must be a whole number, got a number too large"],
       ["an int that is null", (c) => (c.state.defaults.max_session_hours = null), "defaults.max_session_hours must be a whole number, got null"],
-      ["a string that is a list", (c) => (c.state.values.listen_address = ["::"]), "values.listen_address must be text, got list"],
+      ["a string that is a list", (c) => (c.state.values.listen_address = [SENT]), "values.listen_address must be text, got list"],
+      ["a string that is an object", (c) => (c.state.defaults.listen_address = { [SENT]: SENT }), "defaults.listen_address must be text, got object"],
+      ["a tristate that is a string", (c) => (c.state.values.production_instance = SENT), "values.production_instance must be true, false or null, got string"],
       ["a tristate that is a number", (c) => (c.state.values.production_instance = 0), "values.production_instance must be true, false or null, got number"],
       ["no values object", (c) => delete c.state.values, "values is missing or is not an object"],
       ["no state", (c) => delete c.state, "state is missing or is not an object"],
@@ -714,9 +729,30 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       assert.ok(shown.startsWith(REFUSAL), `${why}: no refusal, got "${shown}"`);
       assert.ok(shown.includes(problem), `${why}: the refusal does not say "${problem}": "${shown}"`);
       assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "state"')), `${why}: console.warn was dropped`);
-      // The message's own values are never echoed: the refusal names a type, not what was sent.
-      assert.ok(!shown.includes("::"), `${why}: the refusal echoed a value from the message`);
+      // The message's own values are never echoed: the refusal names a kind, not what was sent.
+      assert.ok(!shown.includes(SENT), `${why}: the refusal echoed a value from the message`);
     }
+  });
+
+  test("Security Settings: the test page hides its error element by the rule the panel ships", () => {
+    // refusalShown() reads a computed style under a COPY of the panel's rule. This ties the copy to
+    // the source: if formHtml() changes how it hides the element, this fails and the copy is redone.
+    const host = fs.readFileSync(path.resolve(__dirname, "../../../src/securityEditor.ts"), "utf8");
+    assert.ok(host.includes(SECURITY_ERROR_RULE), "securityEditor.ts no longer hides .error this way");
+    assert.ok(host.includes(SECURITY_ERROR_ELEMENT), "securityEditor.ts no longer ships this error element");
+  });
+
+  test("Security Settings: an error that follows a refusal keeps the reason on the page", () => {
+    const p = security.load();
+    p.deliver(variant(STATE_OK, (c) => delete c.state.values.require_mfa));
+    p.deliver(ERROR_OK);
+    const shown = refusalShown(p);
+    assert.ok(shown.startsWith(REFUSAL) && shown.includes("values.require_mfa is missing"), shown);
+    assert.ok(shown.includes(CLI_ERROR), "the new error was dropped");
+    // The control: once a state renders, an error shows alone.
+    p.deliver(STATE_OK);
+    p.deliver(ERROR_OK);
+    assert.strictEqual(refusalShown(p), CLI_ERROR);
   });
 
   test("Security Settings: a switch name with markup in it reaches the refusal as text", () => {
