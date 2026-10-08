@@ -352,8 +352,14 @@ def test_the_hook_and_telemetry_agree_in_and_around_the_glyph_ranges() -> None:
     def telemetry_flags(ch: str) -> bool:
         return bool(telemetry.check_no_glyphs([telemetry._ev_text(f"see {ch} here")]).violations)
 
-    swept = set(range(0x2000, 0x3000)) | set(range(0xFE00, 0xFE20)) | set(range(0x1EF00, 0x1FC00))
+    blocks = ((0x2000, 0x3000), (0xFE00, 0xFE20), (0x1EF00, 0x1FC00))
+    # A shared range outside every block would get only its margin swept, not its neighbourhood.
+    assert all(any(a <= lo and hi < b for a, b in blocks) for lo, hi in shared), "range unswept"
+    swept = {cp for a, b in blocks for cp in range(a, b)}
     swept |= {cp for lo, hi in shared for cp in range(max(lo - 16, 0), hi + 17)}
+    # The blocks are literals, so this floor cannot fail today. It is the count the absence lint
+    # asks for before `assert not disagree`. The containment check above is the one with teeth.
+    assert len(swept) >= sum(b - a for a, b in blocks), f"only {len(swept)} codepoints swept"
     disagree = [
         f"U+{cp:04X}" for cp in sorted(swept) if hook.is_banned(chr(cp)) != telemetry_flags(chr(cp))
     ]
