@@ -2,8 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 # PreToolUse guard: block blanket git staging so parallel Claude Code sessions sharing a working
 # tree can't sweep each other's files into one commit. Reads the tool-call JSON on stdin; if the
-# command does a broad stage (git add -A/--all/-u/. or git commit -a/-am/--all) it returns a
-# PreToolUse "deny" decision asking for explicit paths. Anything else passes silently (exit 0).
+# command does a broad stage (git add -A/--all/-u/. or git commit -a/-am/--all, or git commit
+# with a whole-tree pathspec) it returns a PreToolUse "deny" decision asking for explicit paths.
+# Anything else passes silently (exit 0). What it is measured to let through is listed once, in
+# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md.
 # Fail-OPEN on any error: a guardrail must never wedge all git work.
 #
 # WIRING IS NOT ASSERTED HERE ON PURPOSE. Whether this script is referenced by a PreToolUse matcher
@@ -113,12 +115,25 @@ function Resolve-GitSubcommand([string[]]$Tokens) {
     return $null
 }
 
+# Blank every unquoted line continuation in BOTH views at once, keeping length. The caller scans
+# the result as a SECOND view beside the unjoined one, never instead of it -- see the views below.
+function Join-ContinuedLines([string]$Scan, [string]$Raw, [string]$Pattern) {
+    $s = $Scan.ToCharArray()
+    $r = $Raw.ToCharArray()
+    foreach ($m in [regex]::Matches($Scan, $Pattern)) {
+        for ($k = $m.Index; $k -lt ($m.Index + $m.Length); $k++) { $s[$k] = ' '; $r[$k] = ' ' }
+    }
+    return @((-join $s), (-join $r))
+}
+
 $cmd = $null
+$tool = $null
 try {
     $raw = [Console]::In.ReadToEnd()
     if (-not [string]::IsNullOrWhiteSpace($raw)) {
         $j = $raw | ConvertFrom-Json
         $cmd = [string]$j.tool_input.command
+        $tool = [string]$j.tool_name
     }
 } catch {
     exit 0
@@ -139,18 +154,61 @@ $reason = $null
 # ordinary argument and blanking it would hide a real pathspec. `git add ':(top)'` needs the raw
 # view; `git commit -m "wip; git add -a"` needs the blanked one. The resolved SUBCOMMAND is what
 # selects between them, below.
+#
+# EVERY EXTRA VIEW AND EVERY EXTRA SEGMENT BELOW IS ADDED BESIDE THE ORIGINAL, NEVER IN PLACE OF
+# IT (BACKLOG #1339). That is the polarity rule again: a second reading may only ADD a deny.
+# Replacing the original reading would buy a fail-open each time, and the tests pin both cases:
+#   * joining a continued line would hide a real stage on the line after a comment that ends in
+#     a backslash, because a shell comment does not continue;
+#   * splitting on a bracket would cut 'git add ${x} -A' in two and strand the flag in a segment
+#     that does not start with git.
+#
+# LINE CONTINUATIONS. A backslash before a newline continues a bash line; a backtick does it in
+# PowerShell. 'git add \<newline>-A' is one command to the shell and was two segments here. The
+# two shells disagree about the character, so the tool name picks it: a path ending in a backslash
+# is ordinary PowerShell and must not glue the next command on. An unknown tool gets both, which
+# can only add a deny. The lookbehind skips an ESCAPED escape character, which continues nothing.
+$views = New-Object 'System.Collections.Generic.List[string[]]'
+$views.Add(@($scan, $cmd))
+$continuations = @()
+if ($tool -ne 'PowerShell') { $continuations += '(?<=(?<!\\)(?:\\\\)*)\\\r?\n' }
+if ($tool -ne 'Bash') { $continuations += '(?<=(?<!`)(?:``)*)`\r?\n' }
+$joined = Join-ContinuedLines $scan $cmd ($continuations -join '|')
+if ($joined[0] -cne $scan) { $views.Add($joined) }
+
+# GROUPING AND SUBSTITUTION. '(git add -A)', '{ git add -A; }', '$(git add -A)' and a backtick
+# substitution all run the stage, and none puts git at the front of a segment. So a segment also
+# STARTS after every opening bracket and every backtick. It still ENDS only at an ordinary
+# separator: ending it at a bracket would cut 'git add ./{a,b}.py' down to 'git add ./' and deny
+# a scoped stage. The closing bracket is left on the last token and $tokenEnd below accepts it.
+$separator = '(\|\||&&|[;|&\n])'
+$opener = '[({`]'
+
+# Each bound is (view index, start, length).
 $bounds = New-Object 'System.Collections.Generic.List[int[]]'
-$cursor = 0
-foreach ($m in [regex]::Matches($scan, '(\|\||&&|[;|&\n])')) {
-    $bounds.Add(@($cursor, ($m.Index - $cursor)))
-    $cursor = $m.Index + $m.Length
+for ($v = 0; $v -lt $views.Count; $v++) {
+    $text = $views[$v][0]
+    $starts = New-Object 'System.Collections.Generic.List[int]'
+    $ends = New-Object 'System.Collections.Generic.List[int]'
+    $starts.Add(0)
+    foreach ($m in [regex]::Matches($text, $separator)) {
+        $ends.Add($m.Index)
+        $starts.Add($m.Index + $m.Length)
+    }
+    $ends.Add($text.Length)
+    foreach ($m in [regex]::Matches($text, $opener)) { $starts.Add($m.Index + 1) }
+    foreach ($from in $starts) {
+        # $ends is ascending and its last entry is the text length, so a hit always exists.
+        $i = $ends.BinarySearch($from)
+        if ($i -lt 0) { $i = -bnot $i }
+        $bounds.Add(@($v, $from, ($ends[$i] - $from)))
+    }
 }
-$bounds.Add(@($cursor, ($scan.Length - $cursor)))
 
 foreach ($b in $bounds) {
-    if ($b[1] -le 0) { continue }
-    $s = $scan.Substring($b[0], $b[1]).Trim()
-    $rawSeg = $cmd.Substring($b[0], $b[1]).Trim()
+    if ($b[2] -le 0) { continue }
+    $s = $views[$b[0]][0].Substring($b[1], $b[2]).Trim()
+    $rawSeg = $views[$b[0]][1].Substring($b[1], $b[2]).Trim()
     # The PROGRAM NAME is matched case-INSENSITIVELY, and only it. Windows resolves git, Git and
     # GIT to the same git.exe, so 'Git add -A' staged the tree while 'git add -A' was denied. The
     # subcommand and flag tests below stay -cmatch on purpose: git rejects 'git ADD', and '-A' and
@@ -192,6 +250,10 @@ foreach ($b in $bounds) {
     $staging = ($sub -ceq 'add' -or $sub -ceq 'stage') -or
                ($null -eq $sub -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)') -or
                ($null -ne $sub -and $sub -cne 'commit' -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)')
+    # The same shape for commit: the resolved subcommand, or the bare word when the subcommand did
+    # not resolve to it. A whole TOKEN, so 'git checkout fix-commit -- .' is not a commit.
+    $committing = ($sub -ceq 'commit') -or
+                  (-not $staging -and $s -cmatch '(^|\s)commit(\s|$)')
 
     # LIMB 2 -- the blanket-stage FLAG family, GENERATED from the option words rather than typed,
     # per the method BACKLOG #1097 settled for worktree_gate.ps1's interpreter flag. A longer list
@@ -223,33 +285,48 @@ foreach ($b in $bounds) {
     # would need one boundary to satisfy both tests and would be wrong for one of them. The two
     # also earn different deny messages: telling an operator who typed `:/` that the problem was a
     # flag is the wrong sentence.
-    # AT LEAST these four -- this is not an enumeration of git's pathspec grammar.
+    # AT LEAST these -- this is not an enumeration of git's pathspec grammar. The dot form is a
+    # FAMILY: any path built only from single dots and separators names the current directory, so
+    # './.', '././', './/' and the backslash spellings stage exactly what '.' stages (measured,
+    # BACKLOG #1339). A double dot is NOT in the family: '..' is the whole tree from one level
+    # down and a scoped directory from two, and this guard cannot see the working directory.
     # QUOTES ARE TOLERATED AROUND THE WHOLE TOKEN because `:(top)` cannot be typed unquoted in
     # either shell -- the parentheses are syntax. The token must still be EXACTLY the pathspec:
     # `git add './src/x.py'` stays allowed, because the trailing boundary is outside the quote.
-    $treeRoot = '["'']?(?:\.|\./|:/|:\(top\))["'']?'
+    $treeRoot = '["'']?(?:\.(?:[/\\]+\.?)*|:/|:\(top\))["'']?'
+    # A redirect may be glued to the last argument ('git add .>/dev/null'), and a segment that
+    # started inside a bracket keeps its closer ('(git add -A)'), so those end a token the same
+    # way whitespace does.
+    $tokenEnd = '(\s|$|[<>)}`])'
 
-    # WHAT THESE THREE LIMBS DELIBERATELY DO NOT REACH, stated beside the rule per CLAUDE.md
-    # section 11 rather than left for a reader to discover:
-    #   --renormalize             implies -u; `git add --renormalize .` stages tracked changes
-    #   --pathspec-from-file=-    the pathspec is on stdin, so no pathspec appears in the command
-    #   :^x / :!x / :(glob) / *   the rest of magic pathspec; an exclude-only spec is a blanket
-    #                             stage spelled as an exclusion
-    #   any dispatching wrapper   `cmd /c "git add -A"`, `env git add -A`, a path-qualified git.
-    #                             That is BACKLOG #1305's axis and needs a wrapper allowlist, the
-    #                             construct BACKLOG #1229 measured as fail-open.
-    if ($staging -and $argView -cmatch "(^|\s)$blanketFlag(\s|$)") {
+    # WHAT THESE LIMBS DO NOT REACH is listed once, with what git does for each form, in
+    # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. It is not restated here, because the copy that
+    # stood here said '--renormalize' was not reached. Measured: the bare flag stages nothing,
+    # and '--renormalize .' was already denied by the pathspec limb.
+    #
+    # QUOTES ARE TOLERATED AROUND A FLAG TOO. 'git add "-A"' reaches git as -A. This is the add
+    # branch only, where the raw view is read; a quoted commit flag is blanked with its message.
+    if ($staging -and $argView -cmatch "(^|\s)[`"']?$blanketFlag[`"']?$tokenEnd") {
         $reason = "git add/stage -A/--all/-u/--update (or a cluster containing A or u) stages everything, including files another session may be editing."
         break
     }
-    if ($staging -and $argView -cmatch "(^|\s)$treeRoot(\s|$)") {
+    if ($staging -and $argView -cmatch "(^|\s)$treeRoot$tokenEnd") {
         $reason = "git add/stage with a whole-tree pathspec (. ./ :/ :(top)) stages everything, including files another session may be editing."
         break
     }
     # git commit with -a / -am / --all (auto-stages every tracked change). A single-dash flag
     # cluster containing 'a' catches -a, -am, -na, etc.; '--amend' (double dash) is left alone.
-    if ($s -cmatch '\bcommit\b' -and ($s -cmatch '(^|\s)--all(\s|$)' -or $s -cmatch '(^|\s)-[A-Za-z]*a[A-Za-z]*(\s|$)')) {
+    if ($s -cmatch '\bcommit\b' -and ($s -cmatch "(^|\s)--all$tokenEnd" -or $s -cmatch "(^|\s)-[A-Za-z]*a[A-Za-z]*$tokenEnd")) {
         $reason = "git commit -a/-am/--all auto-stages every tracked change before committing."
+        break
+    }
+    # git commit with a whole-tree PATHSPEC. 'git commit -m wip .' commits every tracked change
+    # under the current directory, staged or not, and so do '-o .', '-i .' and '-- :/' (measured,
+    # BACKLOG #1339). Read from the BLANKED view, so a dot inside a quoted message is not a
+    # pathspec. The price: a QUOTED pathspec is blanked with it and still passes, and an unquoted
+    # one-character message ('git commit -m . file') is refused.
+    if ($committing -and $s -cmatch "(^|\s)$treeRoot$tokenEnd") {
+        $reason = "git commit with a whole-tree pathspec (. ./ :/ :(top)) commits every tracked change under it, including files another session may be editing."
         break
     }
 }

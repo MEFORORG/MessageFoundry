@@ -3,7 +3,8 @@
 r"""Tests for the blanket-git-stage PreToolUse guard (scripts/hooks/block-blanket-git-stage.ps1).
 
 The guard stops one session sweeping another session's files into its commit: it denies
-`git add -A/--all/-u/.` and `git commit -a/-am/--all`, and passes everything else silently.
+`git add -A/--all/-u/.`, `git commit -a/-am/--all` and `git commit` with a whole-tree pathspec,
+and passes everything else silently.
 
 THE CASE THESE TESTS EXIST FOR. The guard used to match the program name with `-cnotmatch`, so it
 compared a SPELLING while Windows resolves an EXECUTABLE. `git`, `Git` and `GIT` all run the same
@@ -44,10 +45,10 @@ THE ADD VOCABULARY IS A GENERATED FAMILY, NOT A LIST (BACKLOG #1340). Seven form
 ground-truth pass measured at least 33 that really stage the whole tree, so patching literals would
 have fixed almost nothing. The flag rule is generated from the option words per the method BACKLOG
 #1097 settled, because a longer list has the same shape as the defect and decays the same way.
-WHAT IS STILL NOT REACHED is stated in the guard beside the rules rather than left to be
-discovered: magic pathspec beyond `.`, `./`, `:/` and `:(top)`; `--renormalize`;
-`--pathspec-from-file`; and any wrapper-dispatched or path-qualified git, which is BACKLOG #1305's
-axis and needs the allowlist construct BACKLOG #1229 measured as fail-open.
+WHAT IS STILL NOT REACHED was measured under BACKLOG #1339 and is listed once, with what git did
+for each form, in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. That pass also closed the forms that
+needed neither a quote-state parser nor a program-position test; they are driven below, each
+beside a scoped control.
 
 A MEASUREMENT THAT DID NOT ANSWER THIS QUESTION, recorded so it is not repeated. A scan of every
 tracked file found 1 segment that already trips the guard and 0 that the case fix newly trips. The
@@ -523,6 +524,287 @@ def test_an_unrecognised_subcommand_falls_through_to_deny_not_allow() -> None:
     predicate in BACKLOG #1229.
     """
     assert_denied(run_guard(bash("git zzz-not-a-subcommand add -A")))
+
+
+# ------------------------------------------- the measured fail-opens, step one (#1339)
+
+# EVERY BLANKET ROW IN THIS SECTION WAS MEASURED FIRST: run under the shell its tool names, in a
+# throwaway repository holding three modified tracked files at three depths and two untracked
+# files, and seen to stage or commit all three tracked files. Every one was ALLOWED by the guard at
+# the commit before this change. The full table, with what git did, is
+# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md.
+#
+# EACH ROW IS A PAIR, AND THE SECOND HALF IS THE CONTROL. A deny test passes just as well against a
+# guard that refuses every commit, so each blanket form is driven beside the nearest SCOPED form of
+# the same shape, which must allow. If the rule were widened until it swallowed ordinary work, the
+# control half fails; if the rule were removed, the blanket half fails.
+_BS = "\\"
+_BT = "`"
+
+BLANKET_AND_SCOPED_CONTROL = [
+    # git commit with a whole-tree pathspec: commits every tracked change, staged or not
+    pytest.param("Bash", "git commit -m wip .", "git commit -m wip ./a.py", id="commit-dot"),
+    pytest.param("Bash", "git commit -m wip -- :/", "git commit -m wip -- :/a.py", id="commit-top"),
+    pytest.param("Bash", "git commit -o . -m wip", "git commit -o a.py -m wip", id="commit-only"),
+    pytest.param(
+        "Bash", "git commit -i -m wip .", "git commit -i -m wip a.py", id="commit-include"
+    ),
+    pytest.param("Bash", "git commit -m wip ./", "git commit -m wip ./sub", id="commit-dot-slash"),
+    pytest.param(
+        "Bash", "git commit . -m wip", "git commit .gitignore -m wip", id="commit-dot-first"
+    ),
+    pytest.param(
+        "Bash", "git commit --amend --no-edit .", "git commit --amend --no-edit", id="commit-amend"
+    ),
+    pytest.param(
+        "PowerShell",
+        "git -c user.name=x commit -m wip .",
+        "git -c user.name=x commit -m wip a.py",
+        id="commit-after-a-global-option",
+    ),
+    # the dot FAMILY: every path built only from single dots and separators is the current directory
+    pytest.param("Bash", "git add ./.", "git add ./.gitignore", id="add-dot-slash-dot"),
+    pytest.param("Bash", "git add ././", "git add ./sub/", id="add-dot-slash-dot-slash"),
+    pytest.param("Bash", "git add .//", "git add sub//", id="add-dot-double-slash"),
+    pytest.param("PowerShell", f"git add .{_BS}", f"git add .{_BS}a.py", id="add-dot-backslash"),
+    pytest.param(
+        "PowerShell", f"git add .{_BS}.", f"git add sub{_BS}.", id="add-dot-backslash-dot"
+    ),
+    pytest.param("Bash", "git stage ./.", "git stage ./a.py", id="stage-dot-slash-dot"),
+    pytest.param("Bash", "git add -- ./.", "git add -- ./a.py", id="add-after-double-dash"),
+    # a quoted flag reaches git as the flag
+    pytest.param("Bash", 'git add "-A"', 'git add "-A.txt"', id="add-dquoted-flag"),
+    pytest.param("PowerShell", "git add '--all'", "git add '--all.txt'", id="add-squoted-flag"),
+    # a redirect glued to the last argument
+    pytest.param(
+        "Bash", "git add .>/dev/null", "git add .gitignore>/dev/null", id="add-dot-redirect"
+    ),
+    pytest.param("Bash", "git add -A>/dev/null", "git add a.py>/dev/null", id="add-flag-redirect"),
+    pytest.param(
+        "Bash",
+        "git commit -m wip -a>/dev/null",
+        "git commit -m wip a.py>/dev/null",
+        id="commit-redirect",
+    ),
+    # grouping and substitution: the stage runs, and git is not at the front of a separator segment
+    pytest.param("Bash", "(git add -A)", "(git add a.py)", id="bash-subshell"),
+    pytest.param("Bash", "( git add -A )", "( git add a.py )", id="bash-subshell-spaced"),
+    pytest.param("Bash", "{ git add -A; }", "{ git add a.py; }", id="bash-brace-group"),
+    pytest.param("Bash", "echo $(git add -A)", "echo $(git add a.py)", id="bash-substitution"),
+    pytest.param(
+        "Bash", f"echo {_BT}git add -A{_BT}", f"echo {_BT}git add a.py{_BT}", id="bash-backticks"
+    ),
+    pytest.param(
+        "Bash", "(git commit -m wip -a)", "(git commit -m wip a.py)", id="bash-subshell-commit"
+    ),
+    pytest.param("Bash", "f() { git add -A; }; f", "f() { git add a.py; }; f", id="bash-function"),
+    pytest.param("PowerShell", "(git add -A)", "(git add a.py)", id="pwsh-parens"),
+    pytest.param("PowerShell", "$(git add -A)", "$(git add a.py)", id="pwsh-subexpression"),
+    pytest.param("PowerShell", "& { git add -A }", "& { git add a.py }", id="pwsh-scriptblock"),
+    pytest.param(
+        "PowerShell", "if ($true) { git add -A }", "if ($true) { git add a.py }", id="pwsh-if"
+    ),
+    pytest.param(
+        "PowerShell",
+        "if ($true) {git add .}",
+        "if ($true) {git add .gitignore}",
+        id="pwsh-if-tight",
+    ),
+    pytest.param(
+        "PowerShell",
+        "1..1 | ForEach-Object { git add -A }",
+        "1..1 | ForEach-Object { git add a.py }",
+        id="pwsh-foreach-object",
+    ),
+    # a line continuation: one command to the shell, two lines to the old splitter
+    pytest.param("Bash", f"git add {_BS}\n-A", f"git add {_BS}\n  a.py", id="bash-continued-flag"),
+    pytest.param(
+        "Bash", f"git {_BS}\nadd -A", f"git {_BS}\nadd a.py", id="bash-continued-subcommand"
+    ),
+    pytest.param(
+        "Bash", f"git add {_BS}\n.", f"git add {_BS}\n.gitignore", id="bash-continued-dot"
+    ),
+    pytest.param(
+        "Bash",
+        f"git commit {_BS}\n-am wip",
+        f"git commit {_BS}\n-m wip a.py",
+        id="bash-continued-commit",
+    ),
+    pytest.param(
+        "Bash",
+        f"git commit -m wip {_BS}\n.",
+        f"git commit -m wip {_BS}\n  a.py",
+        id="bash-continued-commit-dot",
+    ),
+    pytest.param(
+        "PowerShell", f"git add {_BT}\n-A", f"git add {_BT}\n  a.py", id="pwsh-continued-flag"
+    ),
+    pytest.param(
+        "PowerShell", f"git {_BT}\nadd -A", f"git {_BT}\nadd a.py", id="pwsh-continued-subcommand"
+    ),
+    pytest.param(
+        "PowerShell",
+        f"git commit {_BT}\n-am wip",
+        f"git commit {_BT}\n-m wip a.py",
+        id="pwsh-continued-commit",
+    ),
+]
+
+
+@pytest.mark.parametrize(("tool", "blanket", "scoped"), BLANKET_AND_SCOPED_CONTROL)
+def test_a_measured_blanket_form_denies_and_its_scoped_control_allows(
+    tool: str, blanket: str, scoped: str
+) -> None:
+    assert_denied(run_guard(bash(blanket, tool=tool)))
+    assert_allowed(run_guard(bash(scoped, tool=tool)))
+
+
+def test_the_commit_pathspec_deny_names_the_pathspec_and_not_the_flag() -> None:
+    reason = assert_denied(run_guard(bash("git commit -m wip .")))
+    assert "git commit with a whole-tree pathspec" in reason
+    assert "git add <path>" in reason
+
+
+# WHAT A BUILDER TYPES ALL DAY, PINNED AS ALLOW. A false deny on this guard is a defect: it is the
+# friction that gets a control disarmed. Each row sits next to a rule above that could have caught
+# it, and the comment names which.
+MUST_STAY_ALLOWED = [
+    # the commit pathspec rule reads the BLANKED view, so a dot inside a quoted message is not one
+    ("Bash", 'git commit -m "msg" path/to/file.py'),
+    ("PowerShell", 'git commit -m "msg" path/to/file.py'),
+    ("Bash", 'git commit -m "add . to the list"'),
+    ("PowerShell", "git commit -m 'add . to the list'"),
+    ("Bash", "git commit -m 'one. two.' a.py"),
+    ("Bash", 'git commit -m "wip" -- a.py sub/b.py'),
+    ("Bash", "git commit -F .msg-file a.py"),
+    ("Bash", "git commit --fixup :/pattern"),
+    ("Bash", "git commit -m wip sub/."),
+    ("Bash", "git commit --amend --no-edit"),
+    # a path that merely STARTS with a dot, or climbs out, is scoped
+    ("Bash", "git add path/to/file"),
+    ("Bash", "git add ./a.py ../x.py"),
+    ("Bash", "git add ../sibling/file.py"),
+    ("Bash", "git add .github/workflows/ci.yml"),
+    ("PowerShell", f"git add .{_BS}a.py"),
+    # `commit` as a whole TOKEN only: a ref that contains the word is not the subcommand
+    ("Bash", "git checkout fix-commit -- a.py"),
+    # read-only subcommands still suppress, whatever their pathspec
+    ("Bash", "git log --all --grep commit"),
+    ("Bash", "git diff -- ."),
+    ("Bash", "git status ."),
+    ("Bash", "git grep -n add -- ."),
+    # quoted prose that names the denied commands
+    ("Bash", 'gh pr create --title t --body "do not run git add -A or git commit -m wip ."'),
+    ("PowerShell", "gh pr create --body 'git add -A; git commit -m wip .'"),
+    ("Bash", "git commit -m 'fix (git add -A) note' a.py"),
+    # brackets that do NOT put a blanket stage at the front of a segment
+    ("Bash", "git add src/{a,b}.py"),
+    ("Bash", "git add ./{a,b}.py"),  # a segment ended at the brace would read `git add ./`
+    ("Bash", "(git add ./{a,b}.py)"),
+    ("Bash", "git commit -m msg -- src/{a,b}.py"),
+    ("Bash", "git show HEAD@{1}:a.py"),
+    ("Bash", "git stash apply stash@{0}"),
+    ("Bash", "(cd sub && git add b.py)"),
+    ("Bash", "x=$(git rev-parse HEAD) && git add a.py"),
+    ("Bash", "git commit -m $(cat msgfile) a.py"),
+    ("PowerShell", "$h = (git rev-parse HEAD); git add a.py"),
+    ("PowerShell", "git add (Get-ChildItem a.py).Name"),
+    ("PowerShell", "$m = @{ a = 1 }; git add a.py"),
+    ("PowerShell", "Write-Output (git status --short)"),
+    # continuations that join ordinary work
+    ("Bash", f"git add a.py {_BS}\n  sub/b.py"),
+    ("Bash", f"git commit -m wip {_BS}\n  a.py"),
+    ("Bash", f'gh pr create --title t {_BS}\n  --body "git add -A is denied"'),
+    ("PowerShell", f"git commit -m 'line one' {_BT}\n  a.py"),
+    # A BACKSLASH IS NOT A POWERSHELL CONTINUATION. `git add src\` and `git diff --stat .` are two
+    # commands there, so the tool name must keep them apart; joined, they read as `git add ... .`.
+    ("PowerShell", f"git add src{_BS}\ngit diff --stat ."),
+    # an ESCAPED backslash before the newline continues nothing in bash either
+    ("Bash", f"git add src{_BS}{_BS}\ngit diff --stat ."),
+    # MEASURED: the bare flag stages nothing (git prints the empty-pathspec hint), so allowing it
+    # costs nothing. `git add --renormalize .` is denied by the pathspec limb and always was.
+    ("Bash", "git add --renormalize"),
+    ("Bash", "git add --renormalize a.py"),
+]
+
+
+@pytest.mark.parametrize(("tool", "command"), MUST_STAY_ALLOWED)
+def test_ordinary_work_next_to_the_new_rules_is_allowed(tool: str, command: str) -> None:
+    assert_allowed(run_guard(bash(command, tool=tool)))
+
+
+# THE NEW READINGS ARE ADDED BESIDE THE OLD ONE, AND THESE ROWS ARE WHY. Each denied before this
+# change and each would have flipped to ALLOW had the new reading REPLACED the old:
+#   * a shell comment does not continue, so the stage on the line after `# see C:\temp\` is real
+#     (measured under bash: it stages the whole tree). Joining the two lines hides it in a comment.
+#   * splitting at the brace of `${x}` strands `-A` in a segment that does not start with git.
+ADDED_NOT_REPLACED = [
+    ("Bash", f"# see C:{_BS}temp{_BS}\ngit add -A"),
+    ("Bash", "git add ${nothing} -A"),
+    ("Bash", "git add $(cat list) -u"),
+    ("PowerShell", "git add (Get-ChildItem) -A"),
+]
+
+
+@pytest.mark.parametrize(("tool", "command"), ADDED_NOT_REPLACED)
+def test_a_second_reading_only_ever_adds_a_deny(tool: str, command: str) -> None:
+    assert_denied(run_guard(bash(command, tool=tool)))
+
+
+@pytest.mark.parametrize("continuation", [_BS, _BT])
+def test_an_unknown_tool_gets_both_continuation_characters(continuation: str) -> None:
+    """The tool name picks ONE character for a tool the guard knows. For any other name it must
+    apply both, never neither: an unrecognised name may only add a deny. The scoped half is the
+    control."""
+    assert_denied(run_guard(bash(f"git add {continuation}\n-A", tool="SomeFutureTool")))
+    assert_allowed(run_guard(bash(f"git add {continuation}\n  a.py", tool="SomeFutureTool")))
+
+
+# THE MEASURED REMAINDER: NEITHER ACCEPTED BY THE OWNER NOR CLOSED HERE. Each row stages or commits
+# the whole tree in a real shell and is ALLOWED. They are pinned the same way as the quote class
+# above, and for the same reason: the assertion demands the DENY, `strict` turns a repair into a
+# visible XPASS, and nobody can write today's ALLOW down as a requirement. Closing any of them
+# needs a quote-state parser, a program-position test, or knowledge of the working directory, and
+# the first two are declined (BACKLOG #1341, #1229). The list for the owner, with what git did for
+# each, is docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. AT LEAST these.
+_REMAINDER = pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #1339: measured to stage the whole tree and allowed; awaiting the owner's "
+    "answer on docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md",
+)
+
+MEASURED_REMAINDER = [
+    # a word before git: needs a program-position test
+    ("Bash", "if true; then git add -A; fi"),
+    ("Bash", "for i in 1; do git add -A; done"),
+    ("Bash", "true && ! git add -A"),
+    ("Bash", "time git add -A"),
+    ("Bash", "FOO=1 git add -A"),
+    ("Bash", ">/dev/null git add -A"),
+    # a parent-directory pathspec: whole tree or scoped, depending on a directory the guard cannot see
+    ("Bash", "cd sub && git add .."),
+    ("Bash", "git -C sub add .."),
+    ("Bash", "cd sub && git commit -m wip .."),
+    ("Bash", "git add sub/.."),
+    # quoting the guard cannot read without quote state
+    ("Bash", "git commit -m wip '.'"),
+    ("PowerShell", "git commit '-a' -m wip"),
+    ("Bash", 'git "add" -A'),
+    ("Bash", '"git" add -A'),
+    ("Bash", 'echo "$(git add -A)"'),
+    # the shell or git supplies the pathspec
+    ("Bash", 'git add "$PWD"'),
+    ("PowerShell", "git add (Get-Location)"),
+    ("Bash", "git -c alias.aa=add aa ."),
+    ("Bash", "git ls-files -m | git update-index --stdin"),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool", "command"), [pytest.param(*r, marks=_REMAINDER) for r in MEASURED_REMAINDER]
+)
+def test_the_measured_remainder_is_still_allowed_and_should_not_be(tool: str, command: str) -> None:
+    assert_denied(run_guard(bash(command, tool=tool)))
 
 
 # --------------------------------------------------------------------------------- still fail-open
