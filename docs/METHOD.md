@@ -884,3 +884,97 @@ that argument is most credible from.
    not say it was true when written.*** **Finding an item already answered is a GOOD outcome** --
    record it with evidence and stop, rather than building it again. BACKLOG #1448, same family
    as #1391.
+
+### The glyph rule's reasoning, history and census, from section 11
+
+From the first bullet of section 11. `CLAUDE.md` keeps the rule, a short form of its reasoning, the
+backticked-token exception, the `backlog-hygiene.yml` warning, the ban on new glyph vocabulary, the
+U+26A0 ruling and the positive-control rule.
+
+  **Why this is a correctness rule and not a style preference.** A glyph's meaning is *positional*, and
+  that is invisible to anyone who learns it from examples rather than from its definition. Measured
+  2026-08-04: the backlog's `✅` means "this item is closed" **only** in the leading blockquote — quoted
+  in an item's prose it is narrative. Two parsers of the same file disagreed on exactly that, one
+  reading "the glyph appears in this item" and the other "this item declares closed status", and they
+  **agreed on the current corpus by luck** because no item happens to have the discriminating shape.
+  Words carry their scope in the sentence around them; a bare glyph does not, so it invites
+  presence-equals-meaning reading and hides the ambiguity from review.
+
+  Secondary but real: emoji need variation-selector handling (`️`) in every regex that touches
+  them, and they raise `UnicodeEncodeError` on a stock Windows cp1252 console — which cost four
+  separate failures in one session.
+
+  **THE ONE HOLDOUT IS RETIRED, AND IT LEFT BY MIGRATION RATHER THAN BY EDIT (BACKLOG #1250).** It was
+  a machine-parsed contract: `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` encoded
+  item status as a banner alphabet, `scripts/docs/backlog_status_check.py` defined it, and
+  `.github/workflows/backlog-hygiene.yml` quoted it. The PARSING went to the maintainer-internal
+  repository on 2026-09-13 with the ledger itself.
+
+  **TWO OF THOSE FOUR FILES ARE STILL TRACKED HERE, AND DELETING ONE OF THEM WEDGES EVERY PULL
+  REQUEST.** This paragraph previously read "all four went", which invites a tidier to remove a merge
+  gate. Measured 2026-09-16 with `git ls-files`: `BACKLOG-CLOSED.md` and `backlog_status_check.py` are
+  gone, `docs/BACKLOG.md` is still tracked as a stub, and `.github/workflows/backlog-hygiene.yml` is
+  still tracked **because its `name:` is a REQUIRED status-check context in branch protection**. The
+  job itself is a deliberate no-op that prints why it has nothing to check. Deleting it, renaming it,
+  or dropping either trigger makes the context never report -- and a required context that never
+  reports does not fail, it WEDGES, in the queue and out of it. Retiring it is a branch-protection
+  change, not an in-repo edit. That file's own header is the source of record; read it first.
+
+  **SO NO GLYPH IN THIS REPOSITORY CARRIES MACHINE-PARSED MEANING ANY MORE, AND THE RULE ABOVE IS NOW
+  UNCONDITIONAL HERE.** Nothing reads a status banner; nothing may start.
+
+  **THAT IS NOT THE SAME AS THE GLYPHS BEING GONE, and the difference is the next person's trap.**
+  Measured 2026-09-13, git-tracked files, after the move: the five former status glyphs still appear
+  **557 times across 61 files** — 133 in `docs/FEATURE-MAP.md`, 124 in `docs/CONNECTIONS.md`, 63 in
+  one benchmark status page, and a long tail. Every one of them is now plain decoration, which the
+  rule forbids outright. They were tolerated only because a parser depended on them, and that parser
+  is gone. **Removing them is a migration with its own item, not a doc edit** — the same standing this
+  paragraph used to give the holdout — so do not start sweeping them out of files you are editing for
+  another reason. **No NEW glyph vocabulary may be introduced anywhere.**
+
+  **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
+  is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
+  anywhere; it is decoration, which the rule above forbids outright. Retiring it is **BACKLOG #1265**,
+  a filed migration, sliced by owner go (the 2026-09-30 ruling quoted below is the latest) — *not* a
+  licence to edit lines outside a ruled slice, and not a cp1252 hazard (the cp1252 gate covers
+  `scripts/**/*.py`, which contains none of them).
+
+  **The measured population is recorded here so nobody re-derives the false zero that stalled this
+  question once already. Re-censused over git-tracked files 2026-09-13, after the ledger left: 256
+  occurrences across 67 files** — 172 under `docs/`, 37 in `docs/adr/`, 26 in `harness/`, 8 in
+  `tests/`, 4 in `ide/`, 3 in engine source, 3 at the repository root, 2 in the web console, 1 under
+  `.github/`, and **zero in `scripts/`**. 23 tracked files did not decode and were not counted.
+  **Re-censused 2026-09-30 by codepoint: 223 across 48 files at `a4c42c86e9`, and 161 across 26
+  after the live-docs slice below.** After the `CONFIGURATION.md` slice it read 154 across 24, at
+  `cf9224acca`. The control `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` read 93 each time,
+  and the same 23 undecodable files were skipped. 142 of the 154 sit under `docs/benchmarks/`.
+
+  **The previous figure was 476, and 218 of those left with the ledger rather than being fixed.** That
+  is the whole of the drop: `BACKLOG.md` carried 125 and `BACKLOG-CLOSED.md` 93. A migration is not
+  remediation, and reading the smaller number as progress on #1265 would be wrong.
+
+  Earlier slices were real, and `tests/test_operator_docs_no_warning_sign.py` pins each at zero or
+  at a named ceiling: the five shipped operator docs — `SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`,
+  `DEPLOYMENT.md`, `CONNECTIONS.md`; every top-level `docs/adr/*.md` (PR 1604, 31 sites, with
+  `README.md` finished later); and the live docs plus code comments and docstrings, 62 sites. That
+  last slice rests on the owner ruling of 2026-09-30, given to the batch 183 Manager in session:
+  *"the sweep extends beyond docs/adr/ to live docs and code comments. Dated benchmark and status
+  records are exempt and must be named as exempt. The CLA and license banners are reviewed
+  separately, not in this sweep."* What still carries the glyph is named in that test with its
+  reason: `docs/benchmarks/` and `CHANGELOG.md` as dated records, `CLA.md` and
+  `COMMERCIAL-LICENSE.md` for the owner's separate review, seven glyphs inside user-visible string
+  literals, and test data in `tests/test_ledger_check.py`. `docs/CONFIGURATION.md` and
+  `messagefoundry/config/settings.py` were held until BACKLOG #1504 landed, then swept, 7 sites.
+
+  **Two rows of the filed table were instrument errors, both SDS-3.8, and they are kept because the
+  errors recur.** It read the web console as zero by counting `packaging/`; the console's source is
+  `messagefoundry_webconsole/`. And it had no `harness/` row at all, so 26 occurrences sat outside
+  every bucket while the buckets still printed a confident total.
+
+  **CENSUS THIS POPULATION WITH A POSITIVE CONTROL, AND THE OLD CONTROL IS GONE.** The first attempt
+  ever made returned a false zero off a broken shell escape, and a pattern that finds nothing anywhere
+  is indistinguishable from a clean repo. The control used to be the ledger's own counts; those files
+  are no longer here. Use `docs/FEATURE-MAP.md` and `docs/CONNECTIONS.md`, which carry 133 and 124
+  status glyphs: an instrument that cannot find those proves nothing by returning zero anywhere else.
+  **Do not print a glyph to a Windows console while measuring** — a stock cp1252 terminal raises
+  `UnicodeEncodeError` and kills the run mid-report, which happened during this very census.
