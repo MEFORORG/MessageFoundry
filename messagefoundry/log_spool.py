@@ -192,8 +192,9 @@ class LogSpool:
         self._read_seq: int | None = None
         self._peeked: SpoolEntry | None = None
         self._peeked_end = 0
-        #: The highest segment number ever seen or issued. Never reused: a segment whose unlink
-        #: failed stays on disk, and reusing its number would collide with it on O_EXCL for good.
+        #: The highest segment number on disk or issued. Never reused while its file may exist: a
+        #: segment whose unlink failed stays on disk, and reusing its number would collide with it
+        #: on O_EXCL for good. Only an empty write segment that WAS deleted hands its number back.
         self._last_seq = 0
         #: Sent segments whose file would not delete (BACKLOG #2279). Out of the replay order, but
         #: still on disk, so their bytes stay in :attr:`_sizes` and count against the cap.
@@ -313,9 +314,10 @@ class LogSpool:
         """Append ``entry`` at the tail. ``False`` (and counted in :attr:`dropped`) when it would
         cross :attr:`max_bytes` or the disk refuses the write."""
         data = entry.encode()
-        if self._undeleted and self.bytes_used + len(data) > self.max_bytes:
-            self._reclaim()  # only when it would otherwise drop: one unlink try per leftover
-        if self.bytes_used + len(data) > self.max_bytes:
+        # Before dropping, try again to delete what an earlier delete left behind.
+        if self.bytes_used + len(data) > self.max_bytes and (
+            not self._reclaim() or self.bytes_used + len(data) > self.max_bytes
+        ):
             self.dropped += 1
             return False
         try:
@@ -371,11 +373,13 @@ class LogSpool:
         except OSError:
             return
         if on_disk:
-            self._sizes[seq] = max(self._sizes[seq], on_disk)
+            self._sizes[seq] = on_disk
             return
         self._retire(seq)
-        if seq == self._last_seq and seq not in self._undeleted:
-            self._last_seq = seq - 1  # the file is gone, so the number cannot collide
+        if seq not in self._undeleted:
+            # The write segment is always the newest number, and its file is gone, so handing the
+            # number back cannot collide with anything on disk.
+            self._last_seq = seq - 1
 
     def _close_writer(self) -> None:
         if self._writer is not None:
@@ -471,6 +475,8 @@ class LogSpool:
             self._reader = None
             self._read_seq = None
         self._segments.remove(seq)
+        if self._undeleted:
+            self._reclaim()  # so a spool that drains ends with no files once deletes work again
         if self._unlink(seq):
             self._sizes.pop(seq, None)
         else:
@@ -481,19 +487,19 @@ class LogSpool:
     def _unlink(self, seq: int) -> bool:
         """Delete segment ``seq``'s file. Whether it is gone afterwards."""
         try:
-            self._path(seq).unlink()
-        except FileNotFoundError:
-            return True
+            self._path(seq).unlink(missing_ok=True)
         except OSError:
             return False
         return True
 
-    def _reclaim(self) -> None:
-        """Try again to delete the segments whose delete failed, and stop counting those now gone."""
-        for seq in list(self._undeleted):
-            if self._unlink(seq):
-                self._undeleted.remove(seq)
-                self._sizes.pop(seq, None)
+    def _reclaim(self) -> bool:
+        """Try again to delete the segments whose delete failed, and stop counting those now gone.
+        Whether any was freed."""
+        freed = [seq for seq in self._undeleted if self._unlink(seq)]
+        for seq in freed:
+            self._undeleted.remove(seq)
+            self._sizes.pop(seq, None)
+        return bool(freed)
 
 
 #: ``O_BINARY`` on Windows (no newline translation), zero elsewhere.
