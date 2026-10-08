@@ -381,9 +381,10 @@ than on arrival. Its card is [`docs/roles/special.card.md`](docs/roles/special.c
 playbook is korus `roles/SPECIAL.md`, read at `origin/main`.
 
 **A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
-ruling 2026-09-16).** Spawning should be rare: a subagent cannot outlive a mistake, and a spawned
-session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in
-wave 2*.
+ruling 2026-09-16).** The case it exists for is a PR that needs a fix with no Manager alive. A
+Manager seat added, the same day, that spawning should be rare: a subagent cannot outlive a mistake,
+and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
+text moved in wave 2*.
 
 The brief is disposable. The BACKLOG item is the record.
 
@@ -421,9 +422,10 @@ gates a merge**, and no seat has to clear one.
    and goal at dispatch. The measurements are in [`docs/METHOD.md`](docs/METHOD.md).
 
 6. **A brief can be wrong by the time you read it, and nothing will tell you.** Verify it against
-   the tree, including the diff of every PR it names. **Where the brief and the tree disagree, the
-   tree wins**, and an item already answered is a good outcome: record it and stop. BACKLOG #1448;
-   the evidence is in [`docs/METHOD.md`](docs/METHOD.md).
+   the tree, however recently it was written: read the diff of every PR it names, and re-locate every
+   line number by symbol. **Where the brief and the tree disagree, the tree wins.** One confirmed
+   drift is a reason to re-check the rest. An item already answered is a good outcome: record it and
+   stop. BACKLOG #1448; the evidence is in [`docs/METHOD.md`](docs/METHOD.md).
 
 ### The Manager plans, dispatches, and holds the owner's attention
 
@@ -434,15 +436,18 @@ gates a merge**, and no seat has to clear one.
   them, read at `origin/main`: every brief ends with push, then report; a brief names who else is
   running, what paths they touch, and whether they share the worktree; hand down readings, not
   conclusions; announce the files a wave changes, never the items' subjects.
-- Four more live in this repository. Dispatch a fresh Builder after about two failed attempts. Mail
-  the receiver when you take back a dispatched brief, because you cannot update a chip (BACKLOG
-  #1448). Put the prompt first when you spawn. Grant `--allowedTools` by bare name, never scoped to
-  a command. The text is in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 2*,
-  and [`docs/WORKTREES.md`](docs/WORKTREES.md).
+- At least these live in this repository. Dispatch a fresh Builder after about two failed attempts;
+  a stuck Builder pushes what is green and reports that the brief needs re-cutting. Whichever seat
+  dispatched, mail the receiver when you take back a brief, because you cannot update a started
+  chip (BACKLOG #1448). Put the prompt first when you spawn. Grant `--allowedTools` by bare name,
+  never scoped to a command. Rules a Builder needs go in the account's `settings.json`, outside
+  git. The text is in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 2*, and
+  [`docs/WORKTREES.md`](docs/WORKTREES.md).
 - Give each session its own git worktree and start the session in it (`spawn.ps1`). Never brief a
   subagent to relocate into one; give it `isolation: worktree` and have it run `ensure-venv.ps1`
-  before its first `pytest`. [`docs/WORKTREES.md`](docs/WORKTREES.md), "Start the session in the
-  worktree", says why. The AI project memory is shared across sessions, so coordinate memory writes.
+  before its first `pytest`, `mypy` or `ruff` run. [`docs/WORKTREES.md`](docs/WORKTREES.md), "Start
+  the session in the worktree", says why. The AI project memory is shared across sessions, so
+  coordinate memory writes.
 - Read a role playbook from the **`MEFORORG/korus`** repository, and read it at `origin/main`
   rather than out of a working tree. Owner ruling 2026-09-04.
 
@@ -738,12 +743,13 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   are decoration. Removing them is a migration with its own item, so do not sweep them out of files
   you are editing for another reason.
 
-  **Do not delete or rename `.github/workflows/backlog-hygiene.yml`.** Its `name:` is a REQUIRED
-  status-check context, and a required context that never reports wedges every pull request.
-  Retiring it is a branch-protection change; read that file's header first.
+  **Do not delete or rename `.github/workflows/backlog-hygiene.yml`, or drop either trigger.** Its
+  `name:` is a REQUIRED status-check context, and a required context that never reports wedges every
+  pull request. Retiring it is a branch-protection change; read that file's header first.
 
   **The warning sign (U+26A0) is not sanctioned (owner ruling 2026-08-14).** Retiring it is BACKLOG
-  #1265, sliced by owner go, and `tests/test_operator_docs_no_warning_sign.py` pins each slice.
+  #1265, sliced by owner go, and *not* a licence to edit lines outside a ruled slice.
+  `tests/test_operator_docs_no_warning_sign.py` pins each slice.
 
   **Census glyphs with a positive control.** `docs/FEATURE-MAP.md` and `docs/CONNECTIONS.md` carry
   many, so an instrument that finds none there proves nothing. Do not print a glyph to a cp1252
@@ -788,8 +794,9 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   (e.g. "cross-shard reads span K stores" is true only of *database* shards; *engine* shards share one
   store), and conflating them causes real errors.
 - **ASVS vocabulary lives in [`scripts/asvs/CLAUDE.md`](scripts/asvs/CLAUDE.md).** Never say "vault
-  cell", "gate cell" or "vault gate cell"; say "the cell has a stale anchor". The vocabulary is
-  public and cell content stays vaulted. The current score:
+  cell", "gate cell" or "vault gate cell"; say "the cell has a stale anchor", and keep that apart
+  from *verifier drift*. The vocabulary is public; cell ids, coverage and gaps stay vaulted, and so
+  does any map pairing cell ids with paths. The current score:
 
   ```
   python scripts/asvs/scorecard.py --scorecard <vault>/docs/security/asvs-scorecard.toml --status
@@ -810,14 +817,18 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 - Don't build **visual / template-driven authoring** -- **declined-by-design (v0.2+)**, BACKLOG #26.
   The narrow Steps-view carve-out over real Handlers and Routers stands (2026-07-10, widened
   2026-08-05 by [ADR 0076](docs/adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment D;
-  BACKLOG #222, #232). Reasoning: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), *Declined by design*.
+  BACKLOG #222, #232) because the `.py` stays the only artifact and the only execution path.
+  Declarative logic execution, declarative field-mapping and drag-drop canvas logic authoring remain
+  declined. Reasoning: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), *Declined by design*.
 - Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity --
   **declined-by-design (v0.2+)**, BACKLOG #27. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
   *Declined by design*.
-- Don't build **per-key message ordering** (sequence-keyed lanes) -- **declined-by-design (owner
-  ruling 2026-09-20)**, BACKLOG #3; [ADR 0052](docs/adr/0052-enterprise-scale-target.md) does not
-  imply it, and the decline does not rest on the purity argument. See
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), *Declined by design*.
+- Don't build **per-key message ordering** (sequence-keyed lanes; older text says `partition_key` or
+  "order-group sharding") -- **declined-by-design (owner ruling 2026-09-20)**, BACKLOG #3. One
+  strictly-ordered feed stays core-bound by design, and relaxing order is ruled out too;
+  [ADR 0052](docs/adr/0052-enterprise-scale-target.md) does not imply it, and the decline does not
+  rest on the purity argument. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), *Declined by
+  design*.
 - Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** -- **declined-by-design
   (2026-08-07)**. The ASCQM catalogue was adopted instead (#1073, findings #1089-#1093). See
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), *Declined by design*.

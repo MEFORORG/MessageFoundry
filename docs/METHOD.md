@@ -66,9 +66,8 @@ Manager, Process Improvement and ASVS Tracker. **An eighth went on 2026-09-05**,
 `reviewed` label and `review-gate.yml`; it is deliberately unnamed, here and everywhere else in this
 repository, by owner instruction 2026-09-16. **The CONSOLE went on 2026-09-10, and the Manager above
 replaces it.** If a document names one, that document is stale.
-*Count note, 2026-10-07:* this page counts the unnamed 2026-09-05 seat as the eighth, which makes
-the Console the ninth here. The `CLAUDE.md` block kept under *Retired CLAUDE.md notices* calls the
-Console the eighth because that file never counted the unnamed seat. Both name the same retirements.
+*Count note, 2026-10-07:* the blocks under *Retired CLAUDE.md notices* call the Console the eighth,
+because that file never counted the unnamed seat; the note at the head of that section says the same.
 
 **A Manager is not a renamed Console, and substituting one for the other is the measured failure
 this retirement was written to stop.** A Console's workers were separate sessions across several
@@ -475,6 +474,9 @@ exit 0 in 38.8 seconds; every root measured that day without them was refused. E
 prove a spawn worked, because a prompt swallowed by a list-taking flag exits 0 too (see the dispatch
 bullet below), so check what the child did. **What binds a Manager's workers instead is the
 tool-grant spelling, and the careful spelling is the broken one** -- same bullet.
+*Since 2026-10-07 both bullets this paragraph points at are in [`WORKTREES.md`](WORKTREES.md):
+"Put the prompt first, or a list-valued flag eats it and the lane dies quietly" and "Grant tools by
+bare name in the `--allowedTools` flag".*
 
 ### The korus playbooks: the pointer moved and the thing it pointed at did not
 
@@ -846,6 +848,9 @@ that argument is most credible from.
    target. **So neither guard intercepts an ordinary shell write, such as a redirect into a
    file.** The worktree gate's own deny text says a shell route around a denied write still breaks
    its rule. CI arrives later, when the process is gone.
+
+<!-- list break: keeps the CLAUDE.md item number -->
+
 5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
    Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
    which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
@@ -864,6 +869,8 @@ that argument is most credible from.
    starting session to declare. **Do not ignore it.** The Manager should still supply seat and goal
    at dispatch, because no hook will invent a goal, by design: a machine that invents one writes a
    record that looks declared and says nothing.
+
+<!-- list break: keeps the CLAUDE.md item number -->
 
 6. **A brief can be wrong by the time you read it, and nothing will tell you.** Verify it against
    the tree before you act on it: read the diff of **every PR it names**, at hunk granularity, and
