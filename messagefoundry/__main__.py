@@ -2032,8 +2032,8 @@ def _serve(args: argparse.Namespace) -> int:
     # the environment label, and since BACKLOG #1279 it is not gated on a data class either: every
     # instance carries patient data, so a custom-named dev/test box holding near-real PHI is covered
     # exactly as prod is, with no declaration able to exempt it.
-    # An explicit [security].allow_unencrypted_phi=true is the loud, audited override that lets an
-    # instance start keyless (warn); under enforce it also needs
+    # An explicit [security].allow_unencrypted_phi=true, or [security].encrypt_stored_data=false, is
+    # the loud, audited override that lets an instance start keyless (warn); under enforce it also needs
     # [security].allow_unencrypted_phi_under_strict_enforcement=true. It is the per-gate switch that
     # replaced the old blanket opt-out, and [store].require_encryption forces the refusal even when
     # that opt-out is set. A DPAPI-protected key
@@ -2043,6 +2043,7 @@ def _serve(args: argparse.Namespace) -> int:
         # The refuse-or-proceed DECISION is shared with provision-admin (BACKLOG #1905); the wording
         # below stays serve's own, because the remedy differs by command.
         keyless_gate = _keyless_store_gate(settings)
+        opt_out_switches = _keyless_opt_out_switches(settings)
         if keyless_gate == KEYLESS_REFUSED_BY_UNREAD_KEY:
             print(f"error: {_unread_key_text(settings)} Refusing to start.", file=sys.stderr)
             return 2
@@ -2074,11 +2075,11 @@ def _serve(args: argparse.Namespace) -> int:
             # KEYLESS_REFUSED_BY_NO_STRICT_ACK, and deliberately the catch-all: a refusal value this block does not
             # name must still refuse, never fall through to the keyless start below.
             # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
-            # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi — the highest-
+            # requires a SECOND acknowledgment beyond the opt-out switch — the highest-
             # risk posture (real PHI + strict enforcement) is never one flag away from plaintext at
             # rest. Under warn enforcement PHI keeps the single-flag audited override below.
             print(
-                "error: [security].allow_unencrypted_phi=true on a PHI instance under strict "
+                f"error: {opt_out_switches} on a PHI instance under strict "
                 f"enforcement (environment {env_name!r}), but "
                 "[security].allow_unencrypted_phi_under_strict_enforcement is not set; refusing to "
                 "start — PHI bodies and the summary/metadata (MRN + patient name) and "
@@ -2095,19 +2096,21 @@ def _serve(args: argparse.Namespace) -> int:
         # never silent. (Logging isn't configured yet here, so this goes through the root logger,
         # which emits >=WARNING to stderr by default — a durable startup audit line.) Under strict
         # enforcement the second ack ([security].allow_unencrypted_phi_under_strict_enforcement=true)
-        # was verified above, so the AUDIT line names both flags; the warn posture names just the one.
+        # was verified above, so the AUDIT line names it too; the warn posture names the opt-out alone.
+        # The opt-out is named as the operator wrote it (vault BACKLOG #2340).
         logging.getLogger(__name__).warning(
             "AUDIT: starting keyless on a %sPHI instance (environment %r) because "
-            "[security].allow_unencrypted_phi=true%s — PHI is stored UNENCRYPTED at rest "
+            "%s%s — PHI is stored UNENCRYPTED at rest "
             "(at-rest encryption opt-out override).",
             "production " if production else "",
             env_name,
+            opt_out_switches,
             " + [security].allow_unencrypted_phi_under_strict_enforcement=true"
             if enforcing
             else "",
         )
         print(
-            f"warning: [security].allow_unencrypted_phi=true — starting a "
+            f"warning: {opt_out_switches} — starting a "
             f"{'production ' if production else ''}PHI environment "
             f"({env_name!r}) keyless; PHI bodies and the summary/metadata (MRN + patient name) and "
             "error/last_error/detail columns are stored UNENCRYPTED at rest (only volume "
@@ -6370,6 +6373,23 @@ def _unread_key_text(settings: ServiceSettings) -> str:
         unread_key_refusal(settings.store)
         or "[store].key_provider does not read the key that is set."
     )
+
+
+def _keyless_opt_out_switches(settings: ServiceSettings) -> str:
+    """The at-rest opt-out as the operator wrote it, for the keyless messages (vault BACKLOG #2340).
+
+    Two ``[security]`` switches set the one ``[store].allow_unencrypted_phi`` the gate reads:
+    ``encrypt_stored_data = false`` and ``allow_unencrypted_phi = true``. The messages used to name
+    the second whichever was set, so an operator who wrote only the first was told about a key that
+    is not in their file. Both are named when both are set. With neither set, the store flag was set
+    some other way, and the text falls back to the switch that would set it."""
+    security = settings.security
+    switches = []
+    if not security.encrypt_stored_data:
+        switches.append("[security].encrypt_stored_data=false")
+    if security.allow_unencrypted_phi or not switches:
+        switches.append("[security].allow_unencrypted_phi=true")
+    return " and ".join(switches)
 
 
 def _keyless_store_gate(settings: ServiceSettings) -> str | None:
