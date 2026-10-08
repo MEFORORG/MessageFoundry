@@ -6874,20 +6874,20 @@ def _removed_key_message(
 
     The removal step depends on where the key came from (vault BACKLOG #3216). The loader reads a
     file and the environment, so it names both. A section built directly reads neither: code
-    passed the key, or ``security show`` read it from the file's table. Naming an environment
+    passed the key (the loader's own ``cli`` overrides count as code), or ``security show``
+    read it from the file's table. Naming an environment
     variable there would send the reader to a place the key cannot be."""
     if built_directly:
         fix = (
-            "This section was built directly, not by the config loader, so no environment "
-            f"variable set it. Remove `{key}` from the arguments or the file table it was built "
-            "from"
+            f"The key was passed straight to the section, so no environment variable set it. "
+            f"Remove `{key}` from the arguments or the file table the section was built from"
         )
         if hint := _REMOVED_KEY_BUILT_DIRECTLY_HINT.get((section, key)):
             fix = f"{fix}. {hint}"
     else:
         fix = (
-            f"Remove it from the config file, or unset {_ENV_PREFIX}{section.upper()}_{key.upper()} "
-            "if the environment sets it"
+            f"Remove `{key}` from the config file, or unset "
+            f"{_ENV_PREFIX}{section.upper()}_{key.upper()} if the environment sets it"
         )
     return (
         f"[{section}].{key} was REMOVED and is no longer accepted: {reason}. {fix} "

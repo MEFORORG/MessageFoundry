@@ -239,7 +239,7 @@ def test_each_refusal_names_only_the_places_the_key_could_be(section: str, key: 
     with pytest.raises(ValueError) as built:
         _section_models()[section].model_validate({key: False})
     assert variable not in str(built.value)
-    assert "built directly" in str(built.value)
+    assert "no environment variable set it" in str(built.value)
     assert f"Remove `{key}`" in str(built.value)
     # The loader's own refusal, from the environment: it names the variable that set the key.
     with pytest.raises(ValueError, match=variable):
@@ -458,3 +458,35 @@ def test_no_service_answers_one_503_text_on_every_surface(tmp_path: Path) -> Non
     assert console.status_code == 503
     assert AUTH_NOT_CONFIGURED in console.text
     assert "not enabled" not in console.text
+    # The sign-in routes need a service in the open mode too, so the opt-in does not change theirs.
+    opened = create_managed_app(
+        db_path=tmp_path / "text-open.db",
+        poll_interval=0.05,
+        allow_no_auth=True,
+        egress_settings=_EGRESS,
+    )
+    with TestClient(opened) as tc:
+        assert tc.get("/stats").status_code == 200, "control: the open mode is on"
+        sign_in = tc.post(
+            "/auth/login", json={"username": "root", "password": PW, "provider": "local"}
+        )
+    assert (sign_in.status_code, sign_in.json()["detail"]) == (503, AUTH_NOT_CONFIGURED)
+
+
+def test_every_written_copy_of_the_503_text_is_the_same_text() -> None:
+    """The console writes the text out rather than import it, so the copies are held equal here.
+
+    Every string constant in the engine and the console that starts "authentication is not" must be
+    the engine's text. The count is the control: the walk found the constant and the console's
+    copies, so a clean result is not an empty walk."""
+    copies = [
+        (path.relative_to(_ROOT).as_posix(), node.lineno, node.value)
+        for package in _SCANNED
+        for path in sorted((_ROOT / package).rglob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.startswith("authentication is not")
+    ]
+    assert len(copies) >= 3, copies
+    assert {text for _, _, text in copies} == {AUTH_NOT_CONFIGURED}, copies

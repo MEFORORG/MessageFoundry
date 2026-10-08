@@ -21,6 +21,6 @@ async def _service(request: Request) -> AuthService:
     if auth is None:
         # The engine's ``api.security.AUTH_NOT_CONFIGURED`` text, written out: importing the name
         # would widen the engine seam for one string. ``tests/test_open_mode_is_no_service.py``
-        # holds the two equal.
+        # holds every copy in the engine and the console equal.
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not configured")
     return auth

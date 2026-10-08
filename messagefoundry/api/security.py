@@ -341,9 +341,10 @@ def initial_credential_window_hours(auth: AuthService) -> float | None:
     return None if deadline is None else deadline / 3600.0
 
 
-#: The 503 detail every route gives when no auth service is attached and the app did not opt in to
-#: the open mode. One text (vault BACKLOG #3216): the sign-in routes used to say "not enabled",
-#: which named a switch that no longer exists.
+#: The 503 detail a route gives when it needs an auth service and none is attached. The gates give
+#: it only when the app did not opt in to the open mode. The sign-in routes give it in the open
+#: mode too: they have no service to sign in with. One text (vault BACKLOG #3216): those routes
+#: used to say "not enabled", which named a switch that no longer exists.
 AUTH_NOT_CONFIGURED = "authentication is not configured"
 
 
@@ -352,7 +353,8 @@ def open_mode(app_state: object) -> bool:
 
     The one spelling of the check (vault BACKLOG #3216). The request gates and the posture all ask
     here, so they cannot drift apart. Both halves are read every time: a service beside the flag
-    still requires sign-in, and no service without the flag fails closed (503)."""
+    still requires sign-in, and no service without the flag fails closed (503). A gate that has
+    already found no service reads it once more here; that is the price of one spelling."""
     return getattr(app_state, "auth", None) is None and bool(
         getattr(app_state, "allow_no_auth", False)
     )
