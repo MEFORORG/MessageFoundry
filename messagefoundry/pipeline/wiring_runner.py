@@ -110,6 +110,7 @@ from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
 from messagefoundry.logging_guard import LogSinkEvent
 from messagefoundry.logging_guard import active_guard as active_log_guard
+from messagefoundry.logging_setup import ForwarderStatus, forwarder_status
 from messagefoundry.netaddr import (
     ALLOWLIST_MIN_PREFIX_V4,
     ALLOWLIST_MIN_PREFIX_V6,
@@ -670,6 +671,16 @@ _SHARD_WATCHDOG_INTERVAL_SECONDS = 30.0
 # buildup and stall check runs only from a lane's own processing path, and a stranded in-flight row
 # is exactly a lane that has stopped processing, so this one has to run on its own clock.
 _INFLIGHT_WATCH_INTERVAL_SECONDS = 30.0
+
+# BACKLOG #2612: the fixed label a log_forward_failed alert is keyed on, and the fixed word for each
+# loss counter of logging_setup.ForwarderStatus that rose. Words, so the alert never carries text.
+_LOG_FORWARDER_LABEL = "forwarder"
+_LOG_FORWARD_LOSS_WORDS = (
+    ("queue_dropped", "queue_full"),
+    ("unsent", "collector_unreachable"),
+    ("undeliverable", "send_error"),
+    ("spool_dropped", "spool_refused"),
+)
 
 
 def _log_inflight_strand(stage: str, name: str, count: int, age: float) -> None:
@@ -1563,6 +1574,11 @@ class RegistryRunner:
         self._shard_watchdog: asyncio.Task[None] | None = None
         # BACKLOG #1611 part B: the in-flight watch (see _inflight_watch). Every mode, every backend.
         self._inflight_watch: asyncio.Task[None] | None = None
+        # BACKLOG #2612: the off-box log forwarder check, run from the in-flight watch's tick. The
+        # last reading that was alerted on, so a rise is measured from it, and the re-alert throttle.
+        self._log_forward_start_alerted = False
+        self._log_forward_alerted: ForwarderStatus | None = None
+        self._next_log_forward_alert = 0.0
         # #122 (ADR 0162): fail-closed application-log write guard. The escalation arrives on whatever
         # thread was logging, so the response is bounced onto this runner's loop as a task; the latch
         # makes the stop fire once per break rather than once per dropped record.
@@ -4549,6 +4565,9 @@ class RegistryRunner:
             if self._inflight_watch is not None:
                 self._inflight_watch.cancel()
             self._inflight_watch = asyncio.create_task(self._inflight_watch_loop())
+            # BACKLOG #2612: once now, so a forwarder that did not start pages at start and not one
+            # tick later. The watch above repeats it.
+            self._check_log_forwarder()
             if self.registry.shard_id is not None:
                 # ADR 0073 sharded-mode extras: page on a non-owned lane backing up (a hung owner is
                 # invisible to the supervisor and never pages itself), and warn on the per_lane_wake
@@ -9549,6 +9568,65 @@ class RegistryRunner:
                 await self._check_inflight_strands()
             except Exception:
                 log.exception("in-flight watch check failed; the next tick retries")
+            self._check_log_forwarder()
+
+    def _check_log_forwarder(self, now: float | None = None) -> None:
+        """Page when the off-box log forwarder is absent or losing records (BACKLOG #2612).
+
+        The forwarder counts its own drops on its own threads and may not import the alert sink,
+        so this reads :func:`~messagefoundry.logging_setup.forwarder_status` from the in-flight
+        watch's tick. That read is memory only: no socket, no disk, no store.
+
+        ``not_installed`` fires once per process: the forwarder is built once, at start, and stays
+        absent. The other two kinds fire on a RISE since the last alert, at most once per
+        ``_BUILDUP_REALERT_SECONDS``, and a throttled rise is carried into the next alert's count.
+        The throttle matters more here than elsewhere: the default sink's alert is a log line, and
+        a log line is one more record for a forwarder that is already losing them.
+
+        A collector that is down while a spool keeps the records raises nothing here. Nothing is
+        lost yet; ``GET /status`` shows the forwarder ``degraded`` meanwhile.
+
+        Not gated on leadership: every process has its own forwarder, whoever runs the graph.
+        Never raises: it runs inside start and inside the watch."""
+        try:
+            status = forwarder_status()
+            if not status.installed:
+                if status.start_failure and not self._log_forward_start_alerted:
+                    self._log_forward_start_alerted = True
+                    self._alert_sink.log_forward_failed(
+                        _LOG_FORWARDER_LABEL, kind="not_installed", reason=status.start_failure
+                    )
+                return
+            last = self._log_forward_alerted
+            if last is None or status.lost < last.lost:
+                last = (
+                    ForwarderStatus()
+                )  # first look, or a rebuilt forwarder whose counts restarted
+            lost = status.lost - last.lost
+            unread = max(0, status.spool_read_errors - last.spool_read_errors)
+            now = time.monotonic() if now is None else now
+            if not (lost or unread) or now < self._next_log_forward_alert:
+                return
+            self._next_log_forward_alert = now + _BUILDUP_REALERT_SECONDS
+            self._log_forward_alerted = status
+            if lost:
+                rose = [
+                    word
+                    for field, word in _LOG_FORWARD_LOSS_WORDS
+                    if getattr(status, field) > getattr(last, field)
+                ]
+                self._alert_sink.log_forward_failed(
+                    _LOG_FORWARDER_LABEL, kind="dropping", reason=",".join(rose), count=lost
+                )
+            if unread:
+                self._alert_sink.log_forward_failed(
+                    _LOG_FORWARDER_LABEL,
+                    kind="spool_unreadable",
+                    reason="spool_read_failed",
+                    count=unread,
+                )
+        except Exception:
+            log.exception("log forwarder check failed; the next tick retries")
 
     async def _check_inflight_strands(self, now: float | None = None) -> None:
         """Page on a row held in flight past the lane's age threshold (BACKLOG #1611 part B, P3-03).

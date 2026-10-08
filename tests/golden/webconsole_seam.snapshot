@@ -273,6 +273,7 @@ messagefoundry.api.models.GraphNode: kind, name, status
 messagefoundry.api.models.GraphResponse: dynamic, edges, nodes
 messagefoundry.api.models.IntegrityResult: detail, ok
 messagefoundry.api.models.InterpreterView: code_path_variables, ignore_environment, isolated, no_user_site, remote_debug_enabled, remote_debug_guard_installed, safe_path, startup_code, startup_dirs, unchecked_startup_dirs, writable_startup_dirs
+messagefoundry.api.models.LogForwarderInfo: installed, lost, queue_dropped, queued, send_failing, spool_dropped, spool_read_errors, start_failure, state, undeliverable, unsent
 messagefoundry.api.models.LogInfo: disk_free_bytes, path, size_bytes
 messagefoundry.api.models.LogSinkInfo: last_event, last_event_at, rolled_aside, rollovers, sink, state
 messagefoundry.api.models.MessageBody: message_id, raw
@@ -300,7 +301,7 @@ messagefoundry.api.models.StaticCredentialHopView: accepted, compliant_kind, cre
 messagefoundry.api.models.StatsResetRequest: all, targets
 messagefoundry.api.models.StatsResetTarget: channel_id, destination, role
 messagefoundry.api.models.StorePrivilegeView: detail, excess, status
-messagefoundry.api.models.SystemStatus: claim_proc, db, engine, kpis, log_sinks, logs, pool, update
+messagefoundry.api.models.SystemStatus: claim_proc, db, engine, kpis, log_forwarder, log_sinks, logs, pool, update
 messagefoundry.api.models.UpdateInfo: current_version, pinned_version, update_available
 messagefoundry.api.models.UploadResendRequest: index, to
 messagefoundry.api.models.UploadedFileInfo: content_type, file_id, filename, message_count, sha256, size, uploaded_at, uploader
