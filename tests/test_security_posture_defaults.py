@@ -315,7 +315,6 @@ _SIGN_IN_OFF_VALUES = [
     ("login_rate_limit_global", 0),
     ("login_rate_limit_window_seconds", 0.0),
     ("login_rate_limit_window_seconds", -1.0),
-    ("login_rate_limit_window_seconds", float("-inf")),
     ("lockout_minutes", 0),
     ("lockout_minutes", -5),
     ("lockout_threshold", LOCKOUT_THRESHOLD_CEILING + 1),
@@ -365,7 +364,8 @@ _LOOSER_THAN_DEFAULT = [
 #: (field, value at or stricter than its shipped default). None is named. The defaults are listed
 #: too, so a direction flipped to ">=" or "<=" reds here.
 _STRICTER_OR_DEFAULT = [
-    # A negative count refuses more, and a NaN or +inf window never prunes, so each refuses MORE.
+    # A negative count refuses more. A NaN or infinite window is refused at load (vault BACKLOG
+    # #2466), so it is in _NON_FINITE_WINDOWS below and not here.
     ("login_rate_limit_per_ip", 10),
     ("login_rate_limit_per_ip", 9),
     ("login_rate_limit_per_ip", 1),
@@ -375,8 +375,6 @@ _STRICTER_OR_DEFAULT = [
     ("login_rate_limit_global", -1),
     ("login_rate_limit_window_seconds", 60.0),
     ("login_rate_limit_window_seconds", 61.0),
-    ("login_rate_limit_window_seconds", float("inf")),
-    ("login_rate_limit_window_seconds", float("nan")),
     ("lockout_minutes", 15),
     ("lockout_minutes", 16),
     # 0 or less locks on the FIRST failure.
@@ -394,8 +392,6 @@ _STRICTER_OR_DEFAULT = [
     ("phi_read_rate_limit_global", 1),
     ("phi_read_rate_limit_window_seconds", 60.0),
     ("phi_read_rate_limit_window_seconds", 61.0),
-    ("phi_read_rate_limit_window_seconds", float("inf")),
-    ("phi_read_rate_limit_window_seconds", float("nan")),
     ("admin_write_rate_limit_per_actor", 12),
     ("admin_write_rate_limit_per_actor", 11),
     ("admin_write_rate_limit_per_actor", -1),
@@ -573,7 +569,7 @@ async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine)
     assert admitted(off, addresses=1) == 200
     assert admitted(off, addresses=1, ceremony=True) == 200
 
-    for window in (0.0, -1.0, float("-inf")):
+    for window in (0.0, -1.0):
         no_window = AuthSettings(login_rate_limit_window_seconds=window)
         assert admitted(no_window, addresses=1) == 200
         assert admitted(no_window, addresses=1, ceremony=True) == 200
@@ -587,14 +583,61 @@ async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine)
 
     # The values the registry does NOT name, because each refuses more: none may admit more than
     # the default does.
-    for window in (float("nan"), float("inf")):
-        unpruned = AuthSettings(login_rate_limit_window_seconds=window)
-        assert admitted(unpruned, addresses=1) <= 10
-        assert admitted(unpruned, addresses=50) <= 60
-        assert admitted(unpruned, addresses=1, ceremony=True) <= 10
     assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1) <= 10
     assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1, ceremony=True) <= 10
     assert admitted(AuthSettings(login_rate_limit_global=-1), addresses=50) <= 60
+
+
+#: The two [auth] windows that were bare floats (vault BACKLOG #2466), and the values no float
+#: window may load. The admin-write window already refused them.
+_BARE_WINDOWS = ["login_rate_limit_window_seconds", "phi_read_rate_limit_window_seconds"]
+_NON_FINITE_WINDOWS = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("field", [*_BARE_WINDOWS, "admin_write_rate_limit_window_seconds"])
+@pytest.mark.parametrize("value", _NON_FINITE_WINDOWS)
+def test_a_non_finite_window_is_refused_at_load(field: str, value: float) -> None:
+    """A NaN or +inf window never prunes, so its counts fill once and then refuse for good."""
+    with pytest.raises(ValueError, match="finite number"):
+        AuthSettings(**{field: value})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", _BARE_WINDOWS)
+@pytest.mark.parametrize("text", ["nan", "inf", "-inf", "NaN", "Infinity"])
+def test_a_non_finite_window_from_the_environment_is_refused(field: str, text: str) -> None:
+    """The same refusal on the env path, where the value arrives as text."""
+    with pytest.raises(ValueError, match="finite number"):
+        load_settings(environ={f"MEFOR_AUTH_{field.upper()}": text}, default_file=False)
+
+
+@pytest.mark.parametrize("field", _BARE_WINDOWS)
+@pytest.mark.parametrize("value", [0.0, -1.0, 1e-6, 3600.0])
+def test_a_finite_window_still_loads(field: str, value: float) -> None:
+    """The control for the two refusals above: only non-finite values are refused. A window of 0 or
+    less stays the named off value it was."""
+    assert getattr(AuthSettings(**{field: value}), field) == value  # type: ignore[arg-type]
+
+
+def test_an_unpruned_window_refuses_every_attempt_once_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Why the load refuses NaN and +inf, shown on the limiter those settings build: the count fills
+    and never drains, however much time passes. A finite window drains."""
+    from messagefoundry.auth import ratelimit
+
+    clock = [0.0]
+    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: clock[0])
+
+    def after_a_long_wait(window: float) -> bool:
+        clock[0] = 0.0
+        limiter = ratelimit.SlidingWindowRateLimiter(per_key=2, glob=0, window_seconds=window)
+        assert [limiter.allow("a") for _ in range(3)] == [True, True, False]
+        clock[0] = 1e9
+        return limiter.allow("a")
+
+    assert after_a_long_wait(float("nan")) is False
+    assert after_a_long_wait(float("inf")) is False
+    assert after_a_long_wait(60.0) is True
 
 
 @pytest.mark.parametrize("escalate", [True, False])

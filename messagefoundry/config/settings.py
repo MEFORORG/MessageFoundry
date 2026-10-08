@@ -3235,7 +3235,11 @@ class AuthSettings(_Section):
     login_rate_limit_enabled: bool = True
     login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
     login_rate_limit_global: int = 60  # max attempts across all clients per window
-    login_rate_limit_window_seconds: float = 60.0
+    # No nan/inf (vault BACKLOG #2466): the limiter prunes a hit once it is older than the window,
+    # and no hit is ever older than a NaN or +inf one. The counts then fill once and never drain, so
+    # after login_rate_limit_global attempts every sign-in would be refused until a restart. -inf is
+    # refused with them; 0 and a finite negative still load, as the named off value above.
+    login_rate_limit_window_seconds: float = Field(default=60.0, allow_inf_nan=False)
 
     # Anti-automation on the authenticated PHI-read endpoints (WP-8, ASVS 2.4.1): a per-actor sliding
     # window over /messages, /messages/{id}, /dead-letters — bounds scripted PHI harvesting on top of
@@ -3244,7 +3248,9 @@ class AuthSettings(_Section):
     phi_read_rate_limit_enabled: bool = True
     phi_read_rate_limit_per_actor: int = 120  # max PHI reads per user per window
     phi_read_rate_limit_global: int = 0  # max PHI reads across all users per window (0 = off)
-    phi_read_rate_limit_window_seconds: float = 60.0
+    # No nan/inf, for the reason login_rate_limit_window_seconds gives: the count would fill once
+    # and then refuse every PHI read until a restart.
+    phi_read_rate_limit_window_seconds: float = Field(default=60.0, allow_inf_nan=False)
 
     # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
     # sliding window folded into the step-up gate (require_step_up) for every NON-GET sensitive op —
@@ -7096,10 +7102,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
-      older than the window, so a SHORTER window admits more, and one of 0 or less (``-inf`` included)
-      prunes each hit before it is counted. A negative count refuses more, and a NaN or ``+inf``
-      window never prunes, so none of those is named. A ``min_interval_seconds`` of 0 turns the gap
-      off, and a shorter gap admits a faster burst.
+      older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
+      before it is counted. A negative count refuses more, so it is not named. A NaN or infinite
+      window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
+      ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
+      admits a faster burst.
     * ``next_lockout_state`` ends a lock at now + ``lockout_minutes`` (shorter is looser; 0 or less
       ends it at once) and arms it at ``lockout_threshold`` failures (higher is looser; 0 or less locks
       on the first failure). An escalating lock doubles up to ``lockout_max_minutes`` (ADR 0197), so a

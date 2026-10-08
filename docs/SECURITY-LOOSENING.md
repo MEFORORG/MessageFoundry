@@ -664,8 +664,11 @@ This section is kept rather than deleted, because the claim it used to make is t
 > it paces is `0`, since it then paces nothing; each zeroed count is named instead. **The cutoff is the shipped default, not a
 > judged threshold.** Any value looser than the default is named, so a huge count or a tiny window is
 > reported like an off value, with text that says *looser than the default of* rather than *off*. A
-> value at or stricter than the default is not reported. That includes a **negative** count, and a
-> window that is not a number or is `+inf`, each of which refuses *more* attempts, not fewer.
+> value at or stricter than the default is not reported. That includes a **negative** count, which
+> refuses *more* attempts, not fewer. A window that is not a number, or is infinite, does not load
+> (vault BACKLOG #2466): a `NaN` or `+inf` window never ages an attempt out, so once the count filled
+> the limiter would refuse every sign-in until a restart. The same holds for
+> `phi_read_rate_limit_window_seconds`.
 - **What you lose:** a password spray across many usernames never trips one account's lockout, and these
   limits are what slow it. With the per-address limit off, one client may try as fast as the all-clients
   limit allows. With the all-clients limit off, a spray spread across many addresses grows with the number
