@@ -198,6 +198,7 @@ from messagefoundry.api.models import (
     StatsResponse,
     StorePrivilegeView,
     SystemStatus,
+    TransitBoundAttestationView,
     UpdateInfo,
     UploadDeleteResult,
     UploadedFileInfo,
@@ -435,6 +436,10 @@ from messagefoundry.store.store import (
     OperatorAudit,
     ReingressOutcome,
     ResendOutcome,
+)
+from messagefoundry.store.transit_attestation import (
+    read_transit_bound_attestation,
+    transit_bound_gap,
 )
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
@@ -3176,6 +3181,32 @@ def create_app(
         )
         return AiChatResponse(reply=reply, model=ai.model, data_scope=enforced_scope)
 
+    async def _transit_bound_view(
+        store: object, key_name: str | None
+    ) -> TransitBoundAttestationView | None:
+        """The vault_transit bound attestation as the start gate reads it (BACKLOG #2337), through
+        the same reader and the same verdict. ``None`` off vault_transit.
+
+        A Transit failure during the audit-row MAC check comes back from the store as a gap, so it
+        reads as not attested rather than failing the whole posture. A row its audit row does not
+        back reports no ``attested_*`` fields: they are whatever a writer with DML put there, and
+        showing a named actor beside ``attested: false`` would still read as that person's
+        attestation."""
+        if key_name is None:
+            return None
+        recorded = await read_transit_bound_attestation(store)
+        gap = transit_bound_gap(key_name, recorded)
+        backed = recorded if recorded is not None and recorded.audit_gap is None else None
+        return TransitBoundAttestationView(
+            key_name=key_name,
+            attested=gap is None,
+            gap=gap,
+            attested_key_name=backed.key_name if backed else None,
+            attested_by=backed.actor if backed else None,
+            attested_at=backed.attested_at if backed else None,
+            reason=backed.reason if backed else None,
+        )
+
     @app.get("/security/posture", response_model=SecurityPosture)
     async def security_posture(
         request: Request,
@@ -3350,6 +3381,9 @@ def create_app(
             client_denied_last=getattr(request.app.state, "client_denied_last", None),
             client_address_monoculture=bool(
                 getattr(request.app.state, "client_address_monoculture", False)
+            ),
+            transit_bound_attestation=await _transit_bound_view(
+                engine.store, info.transit_key_name
             ),
         )
 
@@ -9368,7 +9402,8 @@ def create_managed_app(
     startup AND on every reload — ``serve --shard X`` passes ``filter_registry_for_shard(.., X)`` so
     this process owns only shard X's inbounds; ``None`` = the whole graph (unchanged default).
     ``registry_guard`` refuses a graph by raising ``WiringError``; it runs on the first load and on
-    every reload (the opt-in static-credential gate, BACKLOG #1182). ``static_credential_settings`` is
+    every reload (``serve`` chains its guards into one; at least the opt-in static-credential gate,
+    BACKLOG #1182, is among them). ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it.
     """

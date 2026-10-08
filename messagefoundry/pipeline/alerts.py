@@ -209,10 +209,12 @@ class AlertSink(Protocol):
         and ``value`` is capped at one past ``limit`` because the read only asks "over or not") or
         ``disk_floor`` (free space on the SQLite store's volume fell below
         ``[retention].min_free_disk_mb``; ``value`` and ``limit`` are MiB). ``store_kind`` is the
-        store backend (``sqlite``, ``sqlserver`` or ``postgres``). ``name`` is ``intake:<reason>``,
-        so each bound is its own instance and a drained backlog cannot resolve a low-disk pause. It
-        names no node: both bounds measure the one shared store, and a cluster node id changes on
-        every restart, so a node-keyed instance could never be resolved by the next start. It is not
+        store backend (``sqlite``, ``sqlserver`` or ``postgres``). ``name`` is
+        ``intake:<reason>@<process>`` (``node:<id>`` or ``shard:<id>``), or ``intake:<reason>`` on
+        a lone engine, so each bound on each process is its own instance: a drained backlog cannot
+        resolve a low-disk pause, and one node's clear cannot resolve another node's pause (BACKLOG
+        #2272). An unpinned cluster node's id changes on every restart, so that node clears its own
+        instances when it stops. It is not
         a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898).
         Its colon also keeps ``name`` outside the connection-name grammar, which guards only the
         default target, never a rule's ``control_target``. Carries counts and sizes only: no

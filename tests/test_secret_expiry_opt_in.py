@@ -414,7 +414,7 @@ async def test_a_vault_transit_engine_with_an_opt_in_says_nothing_alerts(
     chain inside Transit and holds no fingerprint key, so it takes the same branch as keyless."""
     from messagefoundry.config.settings import StoreSettings
     from messagefoundry.store.base import open_store
-    from tests.test_crypto_transit import _use_fake
+    from tests.test_crypto_transit import _KEY_NAME, _use_fake
 
     _use_fake(monkeypatch)
     monkeypatch.setenv(_AD, "test-only-bind-password")
@@ -426,6 +426,11 @@ async def test_a_vault_transit_engine_with_an_opt_in_says_nothing_alerts(
     assert isinstance(store, MessageStore)
     assert store.cipher().encrypts, "premise: an encrypting store, not a keyless one"
     assert store.secret_rotation_fingerprint_key() is None, "premise: nothing is fingerprinted"
+    # BACKLOG #2337: enforce refuses a vault_transit start with no bound attestation, a gate this
+    # test is not about, so attest the fake's key and keep the premise on the secret-expiry line.
+    await store.record_transit_bound_attestation(
+        key_name=_KEY_NAME, reason="Transit auto-rotates this key", actor="cli:tester"
+    )
     engine = Engine(
         store,
         secret_rotation_settings=SecretRotationSettings(enforce_secret_expiry_classes=[_AD]),
