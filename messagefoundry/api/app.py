@@ -9770,6 +9770,7 @@ def create_managed_app(
                         alerts_settings,
                         secret_provider=secret_provider,
                         trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                        audit=store,
                     )
                 auth = AuthService(
                     store,
