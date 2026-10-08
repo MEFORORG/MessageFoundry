@@ -53,6 +53,7 @@ from messagefoundry.transports.base import IntakeGate
 __all__ = [
     "DEPTH_REASON",
     "DISK_REASON",
+    "PAUSE_EFFECT",
     "IntakeBoundMonitor",
     "depth_resume_at",
     "disk_resume_at",
@@ -77,6 +78,17 @@ PROBE_TIMEOUT_SECONDS = 10.0
 #: spacing ``queue_buildup`` uses too, from one shared constant. Without it a one-second measurement
 #: loop would write an alert-state row every second.
 REALERT_SECONDS = REMINDER_SECONDS
+
+#: What a pause does to each inbound family, shared by both pause WARNINGs (BACKLOG #2324). A dimse
+#: inbound refuses only a NEW association (``transports/dicom.py``,
+#: ``_refuse_association_while_paused``); one already open runs until its peer releases it, which is
+#: the contract ``docs/CONFIGURATION.md`` states. Not a ``%`` template: it is passed as an argument.
+PAUSE_EFFECT = (
+    "The tcp, x12, http and mllp inbounds stop reading; the dimse inbounds refuse new associations, "
+    "and an association already open keeps running until it ends; the timer, file, remotefile and "
+    "database inbounds skip their tick (docs/CONFIGURATION.md). Nothing already received is dropped "
+    "or NAKed."
+)
 
 #: The reminder clock, a module name so a test can move it without moving the event loop's.
 _monotonic = time.monotonic
@@ -253,10 +265,9 @@ class IntakeBoundMonitor:
             self._gate.hold(DEPTH_REASON)
             log.warning(
                 "intake PAUSED: more than [inbound].max_staged_depth=%d staged messages (ingress + "
-                "routed). The tcp, x12, http, mllp, dimse and timer inbounds stop reading and the "
-                "file, remotefile and database pollers skip their poll (docs/CONFIGURATION.md); "
-                "nothing already received is dropped or NAKed. Intake resumes at %d.",
+                "routed). %s Intake resumes at %d.",
                 self._max_depth,
+                PAUSE_EFFECT,
                 depth_resume_at(self._max_depth),
             )
         elif held and settled:
@@ -299,14 +310,12 @@ class IntakeBoundMonitor:
             self._gate.hold(DISK_REASON)
             log.warning(
                 "intake PAUSED: %s MiB free on the volume holding the SQLite store (%s), below the "
-                "[retention].min_free_disk_mb floor of %d MiB. The tcp, x12, http, mllp, dimse and "
-                "timer inbounds stop reading and the file, remotefile and database pollers skip "
-                "their poll (docs/CONFIGURATION.md); nothing already received is dropped or NAKed. "
-                "Intake resumes at %d MiB free. Free disk space or move the store to a larger "
-                "volume.",
+                "[retention].min_free_disk_mb floor of %d MiB. %s Intake resumes at %d MiB free. "
+                "Free disk space or move the store to a larger volume.",
                 reading.free_mib,
                 reading.probed,
                 reading.floor_mib,
+                PAUSE_EFFECT,
                 resume_bytes >> 20,
             )
         elif held and settled:

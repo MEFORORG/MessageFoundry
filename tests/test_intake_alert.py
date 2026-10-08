@@ -743,3 +743,27 @@ def test_the_rung_is_silent_when_the_dial_is_not_enforcing(
     assert _serve() == 0
     captured = capsys.readouterr()
     assert _rung_lines(captured.out + captured.err) == []
+
+
+# --- BACKLOG #2324: the pause WARNINGs say what a dimse inbound actually does --------------------
+
+
+async def test_both_pause_warnings_say_an_open_dicom_association_keeps_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dimse inbound refuses only a NEW association while paused; one already open runs until it
+    ends (``transports/dicom.py``, ``docs/CONFIGURATION.md``). Neither WARNING may say it stops."""
+    monkeypatch.setattr(shutil, "disk_usage", _Disk(free_mib=1))
+    store = _FakeStore(depth=50, path=str(tmp_path / "s.db"))
+    monitor = IntakeBoundMonitor(
+        cast(Store, store), IntakeGate(), max_staged_depth=10, min_free_disk_mb=1024
+    )
+    with caplog.at_level(logging.WARNING, logger=intake_bound.__name__):
+        await monitor.check_once()
+    paused = [r.getMessage() for r in caplog.records if "intake PAUSED" in r.getMessage()]
+    assert len(paused) == 2, "one WARNING per bound: depth and disk"
+    for message in paused:
+        assert intake_bound.PAUSE_EFFECT in message
+        assert "dimse inbounds refuse new associations" in message
+        assert "an association already open keeps running until it ends" in message
+        assert "dimse and timer inbounds stop reading" not in message
