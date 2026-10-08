@@ -359,6 +359,11 @@ class NotDeployedError(RuntimeError):
         self.name = name
 
 
+#: How a passive standby's ``filtered`` reason starts. :meth:`RegistryRunner._refuse_dr_parked`
+#: reads it back to say which call lifts the park.
+_DR_PASSIVE_REASON = "DR standby is passive"
+
+
 class DrParkedError(RuntimeError):
     """A run-state CONTROL (start, stop or restart) targeted an outbound the DR run-profile parks
     (#61, ADR 0048; vault BACKLOG #3067).
@@ -2542,17 +2547,17 @@ class RegistryRunner:
             return oc.priority or self._priority_default
         return self._priority_default
 
-    def _below_dr_threshold(self, declared: Priority | None, *, inbound: bool = False) -> bool:
+    def _below_dr_threshold(self, declared: Priority | None) -> bool:
         """Whether the active DR run-profile parks a connection of this declared tier. The pure half of
         :meth:`_dr_filters_out`, which also records the ``filtered`` marker; :meth:`build_check`
         needs the answer without the marker (vault BACKLOG #2622 item 1).
 
-        For an ``inbound`` on a passive standby it answers against the threshold an activation
-        will apply, so the gates judge the listeners that activation binds (vault BACKLOG #3140).
-        A passive standby binds none of them; :meth:`_dr_filters_out` says so."""
-        threshold = self._dr_threshold
-        if inbound and self._dr_standby is not None:
-            threshold = self._dr_standby
+        On a passive standby it answers against the threshold an activation will apply, so the
+        gates judge the listeners that activation binds (vault BACKLOG #3140) and the outbounds
+        it builds (vault BACKLOG #3262). A passive standby runs none of them;
+        :meth:`_dr_filters_out` says so. The two thresholds are the same setting, so when a
+        release's drain has both set, either one gives the same answer."""
+        threshold = self._dr_threshold if self._dr_threshold is not None else self._dr_standby
         if threshold is None:
             return False
         return (declared or self._priority_default).rank < threshold.rank
@@ -2583,7 +2588,7 @@ class RegistryRunner:
                 return False
             if not ic.auto_start and ic.name not in listening:
                 return False
-            return not self._below_dr_threshold(ic.priority, inbound=True)
+            return not self._below_dr_threshold(ic.priority)
 
         return binds
 
@@ -2653,13 +2658,17 @@ class RegistryRunner:
         row already in flight still resolves, because the pause is cooperative. A lane that is
         not deployed keeps that answer and gets no marker, as in the reload. A lane a reload
         dropped that was still draining is parked as well. No later reload reads that lane, so
-        its rows wait for the next engine start, which settles rows for a dropped outbound."""
+        its rows wait for the next engine start, which settles rows for a dropped outbound.
+
+        It is synchronous, so every flip to passive parks, including the rollback of a failed
+        activation, which runs in an ``except`` block. A parked lane's connector is therefore
+        left open here, and the next reload closes it."""
         for name in {*self.registry.outbound, *self._destinations}:
             oc = self.registry.outbound.get(name)
             if oc is not None and not oc.deployed:
                 continue
-            self._dr_filters_out(name, oc.priority if oc is not None else None, kind="outbound")
-            self._dr_park_outbound(name, live=self._outbound_lane_live(name))
+            if self._dr_filters_out(name, oc.priority if oc else None, kind="outbound"):
+                self._dr_park_outbound(name, live=self._outbound_lane_live(name))
 
     def _rewrite_inbound_parks(self, held: frozenset[str] = frozenset()) -> None:
         """Write every inbound DR marker again under the current thresholds (vault BACKLOG #3140).
@@ -2737,19 +2746,19 @@ class RegistryRunner:
         :attr:`_dr_passive` says why). During a release's drain the box is not yet passive, so
         an outbound is judged against the threshold as usual and the lanes at or above it drain."""
         standby = self._dr_standby
-        if kind == "inbound" and standby is not None:
+        threshold = self._dr_threshold
+        if standby is not None and kind == "inbound":
             self._filtered[(kind, name)] = (
-                f"DR standby is passive: no listener binds until POST /dr/activate, which binds "
+                f"{_DR_PASSIVE_REASON}: no listener binds until POST /dr/activate, which binds "
                 f"tier {standby.value} and above (status:filtered, ADR 0048)"
             )
             return True
-        if standby is not None and self._dr_passive:
+        if standby is not None and threshold is None:  # passive, see _dr_passive
             self._filtered[(kind, name)] = (
-                f"DR standby is passive: nothing is delivered until POST /dr/activate, which "
+                f"{_DR_PASSIVE_REASON}: nothing is delivered until POST /dr/activate, which "
                 f"delivers on tier {standby.value} and above (status:filtered, ADR 0048)"
             )
             return True
-        threshold = self._dr_threshold
         if threshold is None:
             return False
         resolved = declared or self._priority_default
@@ -3140,8 +3149,11 @@ class RegistryRunner:
     def _refuse_dr_parked(self, name: str) -> None:
         """Raise :class:`DrParkedError` if the DR run-profile parks outbound ``name``. Asked by every
         door that would change a parked lane's run state; the error's docstring says why."""
-        if self._dr_parked(name):
-            raise DrParkedError(name, passive=self._dr_passive)
+        reason = self._filtered.get(("outbound", name))
+        if reason is not None:
+            # Read from the marker, not the box's state now: an activation's reload has not yet
+            # re-judged a lane that still holds the passive park (vault BACKLOG #3262).
+            raise DrParkedError(name, passive=reason.startswith(_DR_PASSIVE_REASON))
 
     def _dr_parked(self, name: str) -> bool:
         """Whether the DR run-profile parks outbound ``name`` this run (its ``filtered`` marker)."""
@@ -3337,10 +3349,11 @@ class RegistryRunner:
         """The lanes whose CA a reload to ``new`` reads: the ones it builds or keeps running, with
         settings resolved. It mirrors the gates of :meth:`_reconcile_outbounds` and of
         :meth:`reload`'s listener restart, read without their side effects. Left out: a lane not
-        deployed, an ``auto_start=False`` lane that is not running, a lane below a DR threshold (for
-        an inbound on a passive standby, the one its activation applies), an
+        deployed, an ``auto_start=False`` lane that is not running, a lane below a DR threshold (on
+        a passive standby, the one its activation applies), an
         ``Ftp`` poller outside its schedule window, and a lane :meth:`_keeps_anchor_failure` keeps
-        failed. Each of those is checked when it is built. It is stricter than the reconcile in one
+        failed. Each of those is checked when it is built. On a passive standby no outbound is
+        built, and the ones read are those its activation builds. It is stricter than the reconcile in one
         place: a lane a #122 halt keeps parked is still checked, since asking the halt gate here
         would run its probe, which has side effects."""
         lanes: list[tuple[Direction, str, Mapping[str, Any]]] = []
@@ -3360,7 +3373,7 @@ class RegistryRunner:
                 or not ic.spec.settings.get("tls_ca_file")
                 or not ic.deployed
                 or (not ic.auto_start and ic.name not in old_inbound_names)
-                or self._below_dr_threshold(ic.priority, inbound=True)
+                or self._below_dr_threshold(ic.priority)
                 or (ic.schedule is not None and not ic.schedule.is_active(self._schedule_clock()))
                 or self._keeps_anchor_failure("inbound", ic.name, old, ic, bound=old_inbound_names)
             ):

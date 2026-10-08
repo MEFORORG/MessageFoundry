@@ -296,7 +296,8 @@ in-flight rows stranded.
 > the run-profile parks a lane below the threshold: no connector is built, and its rows are held PENDING,
 > never claimed, charged an attempt or dead-lettered for being parked. Delivery from a DR box therefore
 > always follows an operator's `POST /dr/activate`. The activation's reload builds the lanes at or above
-> the threshold, and each held row is delivered once, in the order it was queued.
+> the threshold, and each held row is delivered once, in the order it was queued. A reload on a passive box
+> reads the CA file of the outbounds an activation would build, as it judges the listeners one would bind.
 >
 > **The release.** The drain runs as before, with the lanes at or above the threshold delivering. When it
 > ends, the release parks every outbound, without waiting for a reload. The park is cooperative, so a row

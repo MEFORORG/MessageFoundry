@@ -16,26 +16,24 @@ moves to the ``outbound`` stage and waits there with the others.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
-from messagefoundry.api import create_managed_app
-from messagefoundry.config.settings import DrSettings, EgressSettings
+from messagefoundry.config.settings import DrSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import DrParkedError
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, Store
 from messagefoundry.transports.file import FileDestination
-from tests.test_dr_running_config_dir import _free_ports
+from tests.test_dr_passive_bind import _DB, _served
+from tests.test_dr_running_config_dir import _free_ports, _until
 
 _IB = "IB_CRIT_ADT"
 _OB_CRIT = "OB_CRIT_ADT"
 _OB_NORM = "OB_NORM_ADT"
-_DB = "dr-passive.db"
-# Long enough for a worker that is free to deliver to do so: the engines here poll every 0.05 s.
-_SETTLE_SECONDS = 0.6
+# Six poll intervals, for a worker that is free to deliver to do so.
+_SETTLE_SECONDS = 0.3
 
 Sent = list[tuple[str, str]]
 
@@ -45,24 +43,6 @@ def claim_mode(request: pytest.FixtureRequest) -> str:
     """Both delivery consumers: the pooled dispatcher pauses a lane, a lane's own worker waits at
     its gate. A park has to hold in each."""
     return str(request.param)
-
-
-@asynccontextmanager
-async def _served(
-    tmp_path: Path, cfg: Path, dr: DrSettings, claim_mode: str = "pooled"
-) -> AsyncIterator[Engine]:
-    """The engine ``serve`` builds, through its lifespan, over the one store these tests share."""
-    app = create_managed_app(
-        db_path=tmp_path / _DB,
-        config_dir=cfg,
-        poll_interval=0.05,
-        dr_settings=dr,
-        egress_settings=EgressSettings(deny_by_default=False),
-        claim_mode=claim_mode,
-    )
-    async with app.router.lifespan_context(app):
-        engine: Engine = app.state.engine
-        yield engine
 
 
 def _adt(control_id: str) -> str:
@@ -118,12 +98,13 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> Sent:
     return record
 
 
-async def _until(condition: Callable[[], Awaitable[bool]], what: str) -> None:
-    for _ in range(200):
-        if await condition():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"timed out waiting for {what}")
+async def _until_sent(sent: Sent, count: int) -> None:
+    """Wait until the connectors have been handed ``count`` payloads."""
+
+    async def handed() -> bool:
+        return len(sent) >= count
+
+    await _until(handed)
 
 
 async def _held(engine: Engine, outbound: str) -> int:
@@ -132,7 +113,7 @@ async def _held(engine: Engine, outbound: str) -> int:
     return count
 
 
-async def _enqueue(store: MessageStore, control_id: str) -> None:
+async def _enqueue(store: Store, control_id: str) -> None:
     await store.enqueue_ingress(
         channel_id=_IB, raw=_adt(control_id), control_id=control_id, message_type="ADT^A01"
     )
@@ -154,7 +135,7 @@ async def _seeded(tmp_path: Path, sent: Sent) -> Path:
         async def routed() -> bool:
             return await _held(engine, _OB_CRIT) == 3 and await _held(engine, _OB_NORM) == 3
 
-        await _until(routed, "the seed rows to reach the outbound stage")
+        await _until(routed)
     assert sent == []  # the seeding engine delivered nothing, so the rows are still owed
     store = await MessageStore.open(tmp_path / _DB)
     try:
@@ -170,7 +151,7 @@ async def _all_at_outbound(engine: Engine, crit: int, norm: int) -> None:
     async def there() -> bool:
         return await _held(engine, _OB_CRIT) == crit and await _held(engine, _OB_NORM) == norm
 
-    await _until(there, f"{crit} critical and {norm} normal rows held at the outbound stage")
+    await _until(there)
 
 
 async def test_a_passive_standby_delivers_nothing_until_it_is_activated(
@@ -192,6 +173,9 @@ async def test_a_passive_standby_delivers_nothing_until_it_is_activated(
         # No door starts a parked lane, and the refusal names the way out.
         with pytest.raises(DrParkedError, match="POST /dr/activate"):
             await rr.start_outbound(_OB_CRIT)
+        # A reload's CA gate reads the outbounds an activation would build, and no other.
+        gated = rr._reload_anchor_lanes(rr.registry, rr.registry, [])
+        assert [name for _kind, name, _settings in gated] == [_OB_CRIT]
         # A reload while passive keeps every lane parked.
         await engine.reload_detail(cfg)
         await asyncio.sleep(_SETTLE_SECONDS)
@@ -199,11 +183,7 @@ async def test_a_passive_standby_delivers_nothing_until_it_is_activated(
         assert set(rr.filtered_outbound()) == {_OB_CRIT, _OB_NORM}
 
         await engine._dr_activate_profile()  # what POST /dr/activate runs once its gates pass
-
-        async def critical_delivered() -> bool:
-            return len(sent) >= 4
-
-        await _until(critical_delivered, "the critical rows to deliver")
+        await _until_sent(sent, 4)
         await asyncio.sleep(_SETTLE_SECONDS)
         # Each parked row once, in the order it was queued. The normal lane stays parked.
         assert sent == [(_OB_CRIT, "S1"), (_OB_CRIT, "S2"), (_OB_CRIT, "S3"), (_OB_CRIT, "S4")]
@@ -222,11 +202,7 @@ async def test_a_release_stops_delivery_again_until_the_next_activation(
         rr = engine.registry_runner
         assert rr is not None
         await engine._dr_activate_profile()
-
-        async def critical_delivered() -> bool:
-            return len(sent) >= 4
-
-        await _until(critical_delivered, "the critical rows to deliver")
+        await _until_sent(sent, 4)
         outcome = await engine._dr_release_drain()  # what POST /dr/release runs
         assert outcome["drained"] is True and outcome["held_on_parked_outbounds"] == 4
         # Parked at once, before any reload: the release returns with nothing delivering.
@@ -245,11 +221,7 @@ async def test_a_release_stops_delivery_again_until_the_next_activation(
         assert set(rr.filtered_outbound()) == {_OB_CRIT, _OB_NORM}
 
         await engine._dr_activate_profile()
-
-        async def delivered() -> bool:
-            return bool(sent)
-
-        await _until(delivered, "the row held through the release to deliver")
+        await _until_sent(sent, 1)
         await asyncio.sleep(_SETTLE_SECONDS)
         assert sent == [(_OB_CRIT, "S5")]
         assert await _held(engine, _OB_NORM) == 5
@@ -262,11 +234,7 @@ async def test_an_active_dr_box_over_the_same_store_delivers_its_critical_rows(
     probe, and the park is the passive state's and not the seed's."""
     cfg = await _seeded(tmp_path, sent)
     async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=True)) as engine:
-
-        async def critical_delivered() -> bool:
-            return len(sent) >= 4
-
-        await _until(critical_delivered, "the critical rows to deliver")
+        await _until_sent(sent, 4)
         await asyncio.sleep(_SETTLE_SECONDS)
         assert sent == [(_OB_CRIT, "S1"), (_OB_CRIT, "S2"), (_OB_CRIT, "S3"), (_OB_CRIT, "S4")]
         assert await _held(engine, _OB_NORM) == 4
@@ -278,11 +246,7 @@ async def test_a_box_that_is_not_a_dr_standby_delivers_every_restored_row(
     """With ``[dr].enabled`` off nothing is parked: both lanes drain."""
     cfg = await _seeded(tmp_path, sent)
     async with _served(tmp_path, cfg, DrSettings()) as engine:
-
-        async def all_delivered() -> bool:
-            return len(sent) >= 8
-
-        await _until(all_delivered, "every row to deliver")
+        await _until_sent(sent, 8)
         assert sorted(sent) == sorted(
             (ob, cid) for ob in (_OB_CRIT, _OB_NORM) for cid in ("S1", "S2", "S3", "S4")
         )

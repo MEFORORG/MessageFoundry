@@ -24,7 +24,7 @@ from messagefoundry.api.app import _alert_control_action
 from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from tests.test_dr_running_config_dir import _CRIT, _NORM, _free_ports
+from tests.test_dr_running_config_dir import _BOTH_OUTBOUNDS, _CRIT, _NORM, _free_ports
 from tests.test_dr_running_config_dir import _write_tiered_graph as _write_graph
 
 
@@ -43,15 +43,21 @@ async def _accepts(port: int) -> bool:
     return True
 
 
+_DB = "dr-passive.db"
+
+
 @asynccontextmanager
-async def _served(tmp_path: Path, cfg: Path, dr: DrSettings) -> AsyncIterator[Engine]:
+async def _served(
+    tmp_path: Path, cfg: Path, dr: DrSettings, claim_mode: str = "pooled"
+) -> AsyncIterator[Engine]:
     """The engine ``serve`` builds, through its lifespan, with ``cfg`` as the config dir."""
     app = create_managed_app(
-        db_path=tmp_path / "dr-passive.db",
+        db_path=tmp_path / _DB,
         config_dir=cfg,
         poll_interval=0.05,
         dr_settings=dr,
         egress_settings=EgressSettings(deny_by_default=False),
+        claim_mode=claim_mode,
     )
     async with app.router.lifespan_context(app):
         engine: Engine = app.state.engine
@@ -80,7 +86,7 @@ async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_criti
         assert set(rr.filtered_inbound()) == {_CRIT, _NORM}
         assert rr.inbound_failed(_CRIT) is None  # parked, not failed
         # A passive box parks every outbound too (vault BACKLOG #3262).
-        assert set(rr.filtered_outbound()) == {"OB_CRIT_ADT", "OB_NORM_ADT"}
+        assert set(rr.filtered_outbound()) == _BOTH_OUTBOUNDS
 
         # The engine callback POST /dr/activate runs once its seed and VIP gates pass.
         await engine._dr_activate_profile()
@@ -98,7 +104,7 @@ async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_criti
         await engine.reload_detail(cfg)
         assert not await _accepts(crit_port) and not await _accepts(norm_port)
         assert set(rr.filtered_inbound()) == {_CRIT, _NORM}
-        assert set(rr.filtered_outbound()) == {"OB_CRIT_ADT", "OB_NORM_ADT"}
+        assert set(rr.filtered_outbound()) == _BOTH_OUTBOUNDS
 
 
 async def test_a_box_activated_at_startup_binds_only_the_critical_feed(tmp_path: Path) -> None:

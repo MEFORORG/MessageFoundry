@@ -365,6 +365,16 @@ async def _assert_held_as_an_engine_park_after_release(
     assert "OB_NORM_ADT" in rr._gate_parked
 
 
+async def _until_only_row_done(engine: Engine, message_id: str) -> None:
+    """Wait until the message's one outbound row is delivered."""
+
+    async def delivered() -> bool:
+        (row,) = await engine.store.outbox_for(message_id)
+        return bool(row["status"] == "done")
+
+    await _until(delivered)
+
+
 async def _activate_with_a_held_row(engine: Engine) -> str:
     """Activate, then queue one row for the parked normal-tier outbound. Returns its message id."""
     coord = engine.dr_coordinator
@@ -501,12 +511,7 @@ async def test_an_operator_pause_survives_a_release_and_the_next_activation(
     assert row["status"] == "pending" and row["attempts"] == 0
 
     await rr.start_outbound("OB_CRIT_ADT")  # control: the operator's own start delivers it
-
-    async def delivered() -> bool:
-        (row,) = await engine.store.outbox_for(message_id)
-        return bool(row["status"] == "done")
-
-    await _until(delivered)
+    await _until_only_row_done(engine, message_id)
 
 
 async def test_a_start_disabled_dr_parked_outbound_is_refused_until_the_profile_admits_it(
@@ -615,12 +620,7 @@ async def test_a_calendar_parked_outbound_unscheduled_while_dr_parks_it_comes_up
     assert row["status"] == "pending" and row["attempts"] == 0
 
     await engine._dr_activate_profile()
-
-    async def delivered() -> bool:
-        (row,) = await engine.store.outbox_for(message_id)
-        return bool(row["status"] == "done")
-
-    await _until(delivered)
+    await _until_only_row_done(engine, message_id)
     assert rr.outbound_status("OB_CRIT_ADT") == "running"
 
 
