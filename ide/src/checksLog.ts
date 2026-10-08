@@ -32,12 +32,12 @@ export function writeStamped(
  *  channel even if the commit then fails. It says in plain words that the hooks were skipped and by
  *  whom, because a stamped line that only said "baseline commit" would not record a bypass.
  *
- *  It gives the pre-flight's exit code and does not say a check "failed": a non-zero code also
- *  covers a check that could not be started. It makes no claim about later commits either, because
+ *  It gives the code the pre-flight returned and does not say a check "failed" or "exited": the
+ *  runner also returns a non-zero code for a check that could not be started. It makes no claim about later commits either, because
  *  whether the hook is wired is decided elsewhere. */
 export function baselineBypassRecord(checkExitCode: number): string {
   return (
     "--- baseline commit: commit hooks SKIPPED by the user's choice of 'Commit baseline anyway' " +
-    `(git commit --no-verify); the pre-flight 'messagefoundry check' exited with code ${checkExitCode} ---`
+    `(git commit --no-verify); the pre-flight 'messagefoundry check' returned code ${checkExitCode} ---`
   );
 }

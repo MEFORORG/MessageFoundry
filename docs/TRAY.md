@@ -224,6 +224,9 @@ One engine filter is left out: the one that masks OIDC `code` and `state` values
 The tray holds no OIDC credential. It also holds the `httpx` and `httpcore` loggers at WARNING,
 so their per-request URL lines never reach `tray.log`.
 
+Each line starts with the time in UTC, in the engine log's form: `2026-01-02T03:04:05Z`. It is not
+the PC's local time, so allow for the offset when you look for an event you saw on screen.
+
 When a status check fails, or the icon update that follows it fails, the tray logs the error with a
 traceback and keeps running. **Those tracebacks are deliberately not written on every attempt.** A
 check that stays broken retries every few seconds, so one traceback per attempt would fill the

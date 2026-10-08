@@ -278,8 +278,10 @@ def test_tray_log_lines_carry_a_utc_stamp(tray_log: tuple[Path, logging.Handler]
     assert path.read_text(encoding="utf-8").splitlines() == [
         "2026-01-02T03:04:05Z INFO messagefoundry.tray: synthetic line"
     ]
+    # Read off the INSTANCE. tee's CLI sets the converter on the Formatter class and leaves it, so
+    # a class lookup would pass here after a tee test even if the tray set nothing.
     assert handler.formatter is not None
-    assert handler.formatter.converter is time.gmtime
+    assert vars(handler.formatter).get("converter") is time.gmtime
 
 
 def test_the_tray_stamp_format_is_the_engines() -> None:
