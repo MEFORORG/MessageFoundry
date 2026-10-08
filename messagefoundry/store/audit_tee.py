@@ -31,13 +31,50 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 
 from messagefoundry.logging_setup import ensure_logger_sink
 from messagefoundry.redaction import safe_text
 
-__all__ = ["audit_logger", "emit_audit_tee"]
+__all__ = [
+    "AuditObserver",
+    "add_audit_observer",
+    "audit_logger",
+    "emit_audit_tee",
+    "remove_audit_observer",
+]
 
 log = logging.getLogger(__name__)
+
+#: A synchronous callable told about each committed audit row: ``(action, actor, channel_id, client,
+#: detail)``. ``detail`` is the row's own, unredacted; an observer must not forward it anywhere.
+AuditObserver = Callable[[str, str | None, str | None, str | None, str | None], None]
+
+#: The observers this process has registered (vault BACKLOG #2613). A tuple, rebound whole on each
+#: change, so a call iterates a snapshot and needs no lock.
+_OBSERVERS: tuple[AuditObserver, ...] = ()
+#: Whether this process has logged an observer failure; see :func:`emit_audit_tee`.
+_OBSERVER_FAILURE_LOGGED = False
+
+
+def add_audit_observer(observer: AuditObserver) -> None:
+    """Tell ``observer`` about each audit row this process tees, after its commit (#2613).
+
+    The tap the security-signal rule layer reads, chosen so it costs the request path no store
+    round trip: the row is already committed, and the observer sees it in memory. It is per
+    PROCESS, like the tee: an engine shard's rows reach that shard's observers only."""
+    global _OBSERVERS
+    _OBSERVERS = (*_OBSERVERS, observer)
+
+
+def remove_audit_observer(observer: AuditObserver) -> None:
+    """Undo one :func:`add_audit_observer`; a no-op when ``observer`` is not registered."""
+    global _OBSERVERS
+    remaining = list(_OBSERVERS)
+    if observer in remaining:
+        remaining.remove(observer)
+    _OBSERVERS = tuple(remaining)
+
 
 # Pinned to INFO so audit evidence forwards regardless of the deployment's general log level: the
 # logging_setup root handlers are NOTSET, so a record's only level gate is this logger's own level.
@@ -199,3 +236,18 @@ def emit_audit_tee(
                 "tee failures in this process are not logged",
                 exc_info=True,
             )
+    # After the tee, so an observer fault cannot cost the off-box copy. Each is guarded on its own.
+    for observer in _OBSERVERS:
+        try:
+            observer(action, actor, channel_id, client, detail)
+        except Exception as exc:  # noqa: BLE001 - the row is durable; an observer is best-effort
+            # Once per process and never the action, for the reason the tee's handler above gives:
+            # a line per row would count the hidden lock rows for `logs:view` (#1131).
+            global _OBSERVER_FAILURE_LOGGED
+            if not _OBSERVER_FAILURE_LOGGED:
+                _OBSERVER_FAILURE_LOGGED = True
+                log.warning(
+                    "an audit observer failed (%s); further observer failures in this process are "
+                    "not logged",
+                    type(exc).__name__,
+                )

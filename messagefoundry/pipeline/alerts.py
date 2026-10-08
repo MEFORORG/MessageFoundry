@@ -22,11 +22,13 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.redaction import log_timestamp
 
 __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
+    "REMINDER_SECONDS",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -43,15 +45,23 @@ log = logging.getLogger(__name__)
 INTAKE_DEPTH_REASON = "staged_depth"
 INTAKE_DISK_REASON = "disk_floor"
 
+#: How often an emitter raises a condition that persists again: ``queue_buildup``, ``message_stall``
+#: and ``saturation`` in ``wiring_runner``, and ``intake_paused`` in ``intake_bound``. One value, so
+#: the emitters' cadences cannot drift apart (BACKLOG #2272). It does not set the notifier's own
+#: cooldown, ``[alerts].realert_seconds``, which an operator can raise; a cooldown longer than this
+#: throttles some reminders, by that operator's choice.
+REMINDER_SECONDS = 300.0
+
 
 def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
     """The one-line, PHI-free description of an intake pause both sinks show. It must stay true on a
     reminder raised inside the hysteresis band, where the measurement is back on the right side of
     the bound but the pause still holds, so it says what STARTED the pause. A depth read stops at
-    limit + 1, so the depth line quotes no value; the disk reading is exact, so its line does."""
+    limit + 1, so the depth line quotes no value; the disk reading is exact, so its line does. That
+    reading is the last one taken: a reminder raised while the probe fails carries it (#2272)."""
     if reason == INTAKE_DISK_REASON:
         return (
-            f"intake paused: free space fell below the {limit} MiB floor; {value} MiB free now "
+            f"intake paused: free space fell below the {limit} MiB floor; {value} MiB free at the last reading "
             f"({store_kind} store)"
         )
     return f"intake paused: the staged backlog went over {limit} messages ({store_kind} store)"
@@ -609,6 +619,21 @@ class AlertSink(Protocol):
         ``"primary"`` (leadership handed back). No PHI."""
         ...
 
+    # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
+
+    def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
+        """A detector of the audit-stream rule layer fired (vault BACKLOG #2613;
+        :mod:`messagefoundry.pipeline.security_signals`). ``signal`` is the alert event type, one of
+        ``SECURITY_SIGNAL_TYPES``, so each detector routes on its own. ``name`` is the subject that
+        stands in for "connection": ``signin:<client address>``, ``account:<username>``,
+        ``logging:debug`` or ``posture:start``. ``count`` is how many rows tripped it. ``detail`` is
+        a fixed sentence built from counts, a level name or switch names.
+
+        Never a message body, a message id, a typed username or an audit row's detail. None is
+        connection-scoped, so no rule's ``control_action`` fires on one, and nothing resolves
+        one."""
+        ...
+
 
 class LoggingAlertSink:
     """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
@@ -855,11 +880,15 @@ class LoggingAlertSink:
         )
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        # Scrubbed at the call site for CodeQL py/log-injection (alert 207); scrub_log_argument
+        # says why. The scrub runs over ``repr``, which has escaped the log alphabet already, so
+        # the two quoted values read as ``%r`` wrote them. Scrubbing first and then formatting with
+        # ``%r`` would double each backslash.
         log.warning(
-            "ALERT administrator_granted: %r was given the Administrator role (%s) by %r",
-            name,
-            via,
-            granted_by,
+            "ALERT administrator_granted: %s was given the Administrator role (%s) by %s",
+            scrub_log_argument(repr(name)),
+            scrub_log_argument(via),
+            scrub_log_argument(repr(granted_by)),
         )
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
@@ -1003,6 +1032,11 @@ class LoggingAlertSink:
     def dr_released(self, node: str, *, role: str) -> None:
         # The inverse (auto-resolve) event; a clean fail-back — logged at INFO, no page.
         log.info("ALERT dr_released: DR box %r released, handed back to %s", node, role)
+
+    # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
+
+    def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
+        log.warning("ALERT %s: %r %s (count %d)", signal, name, detail, count)
 
 
 #: The ``integrity_drift`` subject for a store-cipher refusal (BACKLOG #1169). Its own subject so it

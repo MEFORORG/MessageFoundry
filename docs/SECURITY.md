@@ -503,8 +503,9 @@ it INSIDE the shared implementation that each GET and its needle-bearing POST bo
 #1184), so a route pair is paced identically without either half having to remember to charge. The
 budget charged is
 (`allow_phi_read`, ASVS 2.4.1) at admission, so bulk egress cannot outrun the same bucket that bounds
-`/messages`. Over the write floor the request is refused with `429 Too Many Requests` +
-`Retry-After: 1`; over the PHI-read budget with `429` + `Retry-After: 10`. On the JSON API both are
+`/messages`. Over the write floor the request is refused with `429 Too Many Requests` + a
+`Retry-After` naming the actor's own wait (see *The write floor's `Retry-After` is the actor's real
+wait* below); over the PHI-read budget with `429` + `Retry-After: 10`. On the JSON API both are
 logged at WARNING with the actor and path; the console's refusals are not, as the next paragraph
 says. The floor (`[auth].admin_write_rate_limit_per_actor` over
 `admin_write_rate_limit_window_seconds`) defaults to **12 writes per 15 s**, and that default is
@@ -546,9 +547,23 @@ the password could be refused in a loop and still throttle the real user's write
 route is not covered:** `POST /ui/account/webauthn/verify`, on `require_ui_reauth_only`, still
 charges the floor before its own checks refuse such a session.
 
-**The console's refusal differs from the JSON floor's.** Over the write floor, `require_ui` answers
-`429` + `Retry-After: 10`, not `1`. It writes no WARNING line naming the actor, for the write floor
-or for the PHI-read budget it charges under `phi=True`; the JSON gates log both.
+**The write floor's `Retry-After` is the actor's real wait (BACKLOG #2144).** The header carries
+the time until that actor's next write would be admitted, in whole seconds, rounded up, and never
+below 1. When the count refused the write, that is the time until the actor's oldest counted write
+leaves the window, so at most `admin_write_rate_limit_window_seconds`, rounded up. When the minimum gap refused
+it, that is the rest of the gap, which rounds up to 1 at the default. The JSON API and the `/ui`
+console send the same value for the same refusal. It is the wait in the engine process that
+refused the write, and it holds only if the account makes no other write meanwhile; the limiter is
+counted in-process. The limiter has no cross-actor dimension, so the
+value depends only on that account's own admitted writes, never on another account's. A second
+session on the same account does read them, as it already could from which writes are refused.
+That includes a password-only session on a route that charges the floor before its factor check;
+the paragraph above names at least one. Before this, the JSON API sent a literal `1` and `/ui`
+a literal `10`, and a client that honoured either could have retried too early.
+
+**The console's refusal differs from the JSON floor's.** `require_ui` writes no WARNING line naming
+the actor, for the write floor or for the PHI-read budget it charges under `phi=True`; the JSON
+gates log both. The write floor's `Retry-After` does not differ: the paragraph above covers it.
 
 The floor reaches every non-GET `/ui` route gated by `require_ui`; **eight are not so gated** (six
 with federation off). Six charge their own auth-surface budget instead: `POST /ui/login` and
@@ -973,7 +988,7 @@ apply. What each **adds** over plain `require()`:
 | Gate wrapper | Routes | What it adds over `require()` |
 |---|---|---|
 | `require` | 42 | nothing — the ladder itself |
-| `require_paced` | 17 | the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
+| `require_paced` | 17 | the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + a `Retry-After` naming the actor's wait |
 | `require_phi_read` | 8 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
 | `require_step_up` | 25 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 13 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
@@ -1585,7 +1600,7 @@ else would need its own authorization rule stated here.
 2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
-   It draws the same bucket, but its 429 carries `Retry-After: 10` where the JSON floor sends `1`.
+   It draws the same bucket, and its 429 carries the same `Retry-After` the JSON floor sends.
 3. **The uploaded-logs resend-confirm GET is no longer weaker than its JSON equivalent (BACKLOG
    #1822).** `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is `require_ui_step_up`, like the
    permission-equivalent JSON browse route. The one weaker uploaded-logs GET left is
@@ -3061,7 +3076,7 @@ slack.
 | Live directory group membership vs. the session's channel scope | the AD groups returned by that same reconciliation probe, mapped through the AD-group→channel-scope map, decided by `decide_ad_channel_scope` (the function login applies) | on a **successful (PRESENT)** probe, the directory would withdraw the stored scope or drop a channel from it — a **single** pass, **no** strike accrual. A widened scope, an administrator's scope with no mapped group, and an Administrator do not fire. A group ADD can fire: a matching group replaces an administrator's scope, so it narrows one the group does not cover | **DENY** by revocation of every session for that account, `auth.ad_session_revoked` with `reason = scope_changed`. The pass never writes the scope; the next login does (ADR 0198). A principal whose roles also changed is revoked once, under the row above, so it is one count against the mass-revoke breaker | **300 s** (same loop; `0` disables it) | `[auth].ad_session_recheck_seconds` |
 | Live directory mass-revoke breaker | the size of one pass's revocation set vs the probed population | the set exceeds **both** `ad_session_revoke_max` (**5**) **and** `ad_session_revoke_max_fraction` (**0.34**) — a second **binary** predicate layered on the three rows above, never a score (see "Directory session reconciliation") | **LOG** — the pass aborts revoking **nothing**, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row + loud alert | 5 / 0.34 | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, charged at **admission** before any store work. WARNING-logged on the JSON API; the `/ui` `phi=True` arm is not (see *The console's refusal differs from the JSON floor's*) | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
-| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), or a write less than 0.15 s after the actor's last admitted one (`admin_write_min_interval_seconds`, BACKLOG #2301), both provisional human-timing defaults; no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
+| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), or a write less than 0.15 s after the actor's last admitted one (`admin_write_min_interval_seconds`, BACKLOG #2301), both provisional human-timing defaults; no global dimension (`glob=0`) | **THROTTLE** 429 + a `Retry-After` naming the actor's wait, the same on the JSON API and on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
 | Time from sign-in to the second factor | `session.created_at` vs the service's wall clock, while `session.mfa_verified_at` is unset | a TOTP or recovery code (`verify_mfa`), a passkey assertion, or an enrolment (`confirm_mfa_enrollment`, `finish_webauthn_registration`, BACKLOG #2389) that completes an MFA-pending session less than 1 s after the session was minted (`mfa_verify_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a session whose factor is already satisfied, or that owes none, is not floored | **DENY** with the leg's ordinary failure, so nothing tells the caller about timing (`401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the gate's own error on `POST /ui/mfa`, `400 passkey verification failed` on the console's passkey registration); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment; no lockout count, no code or challenge spent, though under the default `require_action_step_up` a TOTP enrolment confirm's route has already spent its password step-up | on, 1 s | `[auth].mfa_verify_min_elapsed_seconds` (`0` = off) |
 | Time from a federated start to its callback | the flow cache's monotonic clock when the flow was staged vs at the callback | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start, because an IdP holding a live single sign-on session answers with no human step | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The step-up is refused before its code is redeemed, unless `oidc_callback_floor_exempt_amr` is set (BACKLOG #2388): a callback whose verified `amr` names a listed value is then exempt, and the refusal waits for the code exchange | on, 1 s | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off), `[auth].oidc_callback_floor_exempt_amr` |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
@@ -3908,7 +3923,8 @@ Users are notified of security-relevant changes to their account through **two**
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
-  alert and once per credential per engine process like it. `temporary_credential_expiring` goes to
+  alert and once per credential like it. The holder's reminder audit row is the once-only mark, so
+  a restart inside the warn window sends none of the three again (BACKLOG #2303). `temporary_credential_expiring` goes to
   the holder and states the deadline. `temporary_credential_expiring_issuer` goes to the administrator
   who issued the password and names the account and the deadline. The engine finds that
   administrator from the audit row the create or reset wrote. It skips the administrator's reminder,
@@ -4599,7 +4615,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 5 console ceremony routes (`POST /ui/mfa`, `POST /ui/reauth`, `POST /ui/reauth/webauthn`, `POST /ui/reauth/oidc`, `POST /ui/account/mfa/verify`; the fourth is registered only with federation on), plus `POST /ui/account/password`, which inherits the JSON handler's single charge | 429; `Retry-After: 30` on `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn`, none on the three JSON routes, `POST /ui/reauth/oidc` (its 429 re-renders the step-up page), `POST /ui/account/mfa/verify` or `POST /ui/account/password`; logged |
 | Account lockout | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` | 5 / 15 min / 24 h | — | **yes** | no | no | **store-backed**, on **two counters** per account (ADR 0197). While the credential in force is engine-generated (an administrator's account creation and both resets set it), a sign-in failure is still counted and audited but arms no sign-in lock (`lockout_arms`, ADR 0197 Amendment A); the second-step lock arms as usual. The **sign-in** counter takes the local password leg, a combined sign-in (password and TOTP code in one request) with both factors wrong, and the step-up re-auth re-proof (AD re-binds included) + the password-change re-proof (local accounts only). The **second-step** counter takes the TOTP/recovery leg of any account with TOTP enrolled, directory ones included, and a combined sign-in with exactly one factor right. Each attempt is counted by one atomic `increment_login_failure` (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — on the password leg the uniform `auth.login_failed` (`bad_credentials`) row and then `auth.login_locked`, which only `users:manage` reads (the sign-in lock does **not** refuse a combined sign-in on a local account with TOTP enrolled; the second-step lock does), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs (the second-step lock only; the sign-in lock refuses neither), `auth.login_failed` with `reason=locked` on the Kerberos and OIDC sign-ins (which do not feed it), the re-proofs are not refused by either lock, and the failure that spends a session's cap revokes that session: `auth.reauth` (`session_revoked=true`) / `auth.password_change_failed` (`reason=session_revoked`) |
 | PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 8 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 11 `/ui` views via `require_ui(phi=True)`, 1 further `/ui` GET that inherits the charge by delegating into the handler body, and the `reveal` act on the monitoring JSON routes that carry one (at least `GET /events`, `GET /connections/{name}/events`, `GET /alerts/active`, `GET /connections` and `GET /connections/{name}/metadata`), charged at admission (BACKLOG #2443) | 429 + `Retry-After: 10`; logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
-| Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | on / 12 / 15 s / 0.15 s gap | 15 s | **yes** (12, and a 0.15 s minimum gap) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + `Retry-After: 1`, logged. `/ui`: 429 + `Retry-After: 10`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |
+| Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | on / 12 / 15 s / 0.15 s gap | 15 s | **yes** (12, and a 0.15 s minimum gap) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + a `Retry-After` naming the actor's wait, logged. `/ui`: the same 429 + `Retry-After`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login and every completed second factor | the user's oldest live session is revoked; sessions past the idle or absolute limit do not count and are revoked; see the *Concurrent session count* signal row for sign-ins that still owe a second factor |
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
@@ -4691,6 +4707,7 @@ still writes every lock row (ADR 0197 AC-10), and an Administrator reads them al
 |---|---|
 | `auth.account_locked` | a lock landed, which in a combined campaign under a live sign-in lock only a right candidate causes |
 | `auth.lock_notice` | the lock mail's throttle row, whose detail names the counter |
+| `auth.lock_notice_undelivered` | a lock mail the relay's queue dropped or the send lost, written only when a lock landed (BACKLOG #2383) |
 | `auth.login_locked` | a sign-in refused by a live lock, where a wrong candidate is refused as a plain wrong password |
 | `auth.admin_unlocked` (the whole row) | its detail records both lock expiries and both cycle counts |
 | `auth.mfa_failed` and `auth.webauthn_failed` with detail `{"reason": "locked"}`, and `auth.login_failed` with detail `{"provider": "ad", "reason": "locked"}` | the lock refusals of the factor and directory legs, which say a lock is live only in their detail |
@@ -4714,6 +4731,38 @@ export, and `GET /audit/export` sends `X-Audit-Withheld: true` and records `with
 `audit.export` row. Each is decided by the reader's permission alone. It shows whether or not a
 hidden row falls in the range read, so it cannot tell the reader that a lock happened.
 
+**Six audit signals also raise an operator alert (vault BACKLOG #2613).** A small rule layer
+(`messagefoundry/pipeline/security_signals.py`) watches the audit stream and raises one alert type
+per detector through the `[alerts]` notifier, or the log when no transport is set. It is on by
+default. What each one counts is stated once, in the `[alerts]` table of `docs/CONFIGURATION.md`.
+
+| Alert | Setting | Subject |
+|---|---|---|
+| `signin_failure_burst` | `security_signin_failures` | `signin:<address>` |
+| `access_denied_burst` | `security_denials` | `account:<username>` |
+| `body_view_burst` | `security_body_views` | `account:<username>` |
+| `bulk_export` | `security_export_messages` | `account:<username>` |
+| `log_level_debug` | none | `logging:debug` |
+| `posture_loosened` | none | `posture:start` |
+
+The layer is an observer on the off-box audit tee, which at least `record_audit` and every
+in-transaction audit append call after their commit. So it adds no commit and no store read to the
+request path. A row the tee misses, such as one whose commit a cancellation follows, is missed here
+too. It holds its counts in memory, so a restart starts them again, and an engine shard counts only
+its own rows. Past five subjects alerting from one detector inside one window, it raises under one
+shared `<prefix>:*` subject, so a spread of addresses cannot open an alert, and send a page, per
+address. The notifier still keeps a little state per subject that did alert, as it does for every
+alert key. An alert carries a count and a fixed sentence. It never carries a message body, a message
+id, an audit row's detail or a typed username, which can be a password typed into the wrong box. The
+sign-in detector counts `auth.login_failed`, which is written once per refused local sign-in in every
+lock state, and leaves out the withheld directory lock refusal, so its count does not reveal a lock.
+**An account lock raises no alert**, by the 2026-09-28 ruling above: the alert list is readable
+under `monitoring:diagnose`, and a lock alert there would show lock state to a reader the ruling
+withholds it from. **Switching the layer off is not yet reported as a posture loosening**:
+`[alerts].security_signals = false`, or a threshold of `0`, is absent from
+`GET /security/posture`. Nor does `posture_loosened` fire on a start whose `config_loaded` row
+records its loosenings as unknown, such as one a cluster convergence reload superseded.
+
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC
 gets a console cookie and never a bearer. `GET /ui/audit/export` streams the same handler from the
@@ -4726,9 +4775,10 @@ and header are that route's.
 - **An undeliverable lock notice writes no per-event log line.** With no mail relay, no address on
   the account, a full queue or a failed send, the engine used to log a WARNING naming the
   `account_locked` notice and the username, once per lock. It logs nothing for a lock notice now.
-  Two of those cases are still recorded for administrators, on the `auth.lock_notice` row: no relay
-  (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`). The other two are a
-  residual, below. A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
+  An administrator can still read each case in the audit trail, with the gaps listed below. No
+  relay (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`) are on the
+  `auth.lock_notice` row. A full queue and a failed send are on an `auth.lock_notice_undelivered`
+  row (BACKLOG #2383). A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
   startup by the serve gate, except under `[security].enforcement = "warn"` with
   `[alerts].security_notifications_required = false`. Every other notice kind keeps its per-event
   line (BACKLOG #1139); none of them fires on a refused sign-in. The list is
@@ -4777,10 +4827,23 @@ process for each relay, by the security notifier when it is built rather than at
 a failed TLS key-exchange pin is logged once per process. **The cost of the tee line:** a sink that
 stays broken, or recovers and breaks again, is reported only by that first line.
 
-**Residual: a lost lock notice leaves no record** (BACKLOG #1139 deliverability, not the oracle).
-The `auth.lock_notice` row is written when the notice is handed to the relay, as `mailed: true`. So
-when the relay's queue is full, or the send fails, a lock notice is lost with no audit row and, now,
-no log line. The account holder is not told, and nothing says so.
+**A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
+when the notice is handed to the relay, as `mailed: true`. When the relay's queue is full, or the
+send fails, the engine writes one more row, with the notice's recipient as the actor. A lock
+notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
+`auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
+notice kind and the `reason`, `queue_full` or `send_failed`. An issuer's reminder also names the
+holder. The row never carries the address, the rest of the notice's detail, or the error. The
+source of record is `SecurityEventNotifier._record_undelivered` in
+`messagefoundry/pipeline/security_notify.py`. **Still open, at least:**
+
+- At shutdown the notifier drains its queue after the store has closed, so a send that fails then
+  is not recorded.
+- An offline command such as `provision-admin` wires no audit writer, so it records nothing.
+- Under a long overload only 64 queue-full records are written at a time, and drops past that are
+  not recorded.
+- A lock notice lost this way still leaves its `auth.lock_notice` row reading `mailed: true`, so
+  the throttle holds back the next one.
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
 engine waits about two seconds for pending notices. A notice still pending then is cut off, and may be

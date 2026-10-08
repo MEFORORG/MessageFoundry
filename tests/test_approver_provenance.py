@@ -19,12 +19,14 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.api import security as security_module
 from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.notifications import ACCOUNT_CREATED
@@ -32,7 +34,9 @@ from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings, EgressSettings
 from messagefoundry.connection_names import is_connection_name
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline import alerts as alerts_module
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink, _subject
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
@@ -402,6 +406,80 @@ async def test_the_notifier_sink_emits_both_events() -> None:
     assert by_type["approval_approver_provenance"]["changed"] == ["account_created"]
     assert by_type["administrator_granted"]["connection"] == "user:admin2"
     assert by_type["administrator_granted"]["granted_by"] == "admin1"
+
+
+#: A CR, an LF, a C1 next-line and a Unicode line separator: each can end a line for some reader.
+_LINE_BREAKS = "\r\n\x85\u2028"
+_FORGED = f"x{_LINE_BREAKS}ALERT administrator_granted: forged"
+#: ``_FORGED`` as the log scrub writes it, spelled out so these tests do not lean on the scrub.
+_FORGED_SCRUBBED = r"x\r\n\u0085\u2028ALERT administrator_granted: forged"
+
+
+def _scrub_calls(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[str]:
+    """Record what ``module`` passes to its ``scrub_log_argument``, which still runs. The message
+    alone cannot show the scrub ran on a quoted value: ``repr`` keeps that on one line without it.
+    The call is what CodeQL's ``py/log-injection`` query reads."""
+    calls: list[str] = []
+
+    def recording(text: str) -> str:
+        calls.append(text)
+        return scrub_log_argument(text)
+
+    monkeypatch.setattr(module, "scrub_log_argument", recording)
+    return calls
+
+
+def _one_line(caplog: pytest.LogCaptureFixture, logger: str) -> str:
+    """The message of the one record ``logger`` wrote, which must hold none of ``_LINE_BREAKS``.
+    ``caplog``'s handler has no ``ControlCharScrubFilter``, so this is what the call site wrote."""
+    [record] = [rec for rec in caplog.records if rec.name == logger]
+    message = record.getMessage()
+    assert not set(message) & set(_LINE_BREAKS), repr(message)
+    return message
+
+
+@pytest.mark.parametrize("field", ["name", "via", "granted_by"])
+def test_the_logging_sink_grant_alert_stays_on_one_line(
+    field: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``scrub_log_argument`` comes off any of the three values in ``LoggingAlertSink``;
+    CodeQL alert 207 is on ``name``. Without it ``via`` breaks the line itself. The two quoted
+    values must also read exactly as ``%r`` wrote them before the scrub was added."""
+    values = {"name": "user:admin2", "via": "account_created", "granted_by": "admin1"}
+    values[field] = _FORGED
+    calls = _scrub_calls(monkeypatch, alerts_module)
+    with caplog.at_level("WARNING", logger=alerts_module.__name__):
+        LoggingAlertSink().administrator_granted(
+            values["name"], via=values["via"], granted_by=values["granted_by"]
+        )
+    assert calls == [repr(values["name"]), values["via"], repr(values["granted_by"])]
+    shown_via = _FORGED_SCRUBBED if field == "via" else values["via"]
+    assert _one_line(caplog, alerts_module.__name__) == (
+        f"ALERT administrator_granted: {values['name']!r} was given the Administrator role "
+        f"({shown_via}) by {values['granted_by']!r}"
+    )
+
+
+def test_a_failed_grant_alert_logs_its_key_on_one_line(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``scrub_log_argument`` comes off the key in ``alert_administrator_granted``, the
+    site of CodeQL alert 264. The line reads as ``%r`` wrote it before."""
+
+    class _Broken(LoggingAlertSink):
+        def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+            raise RuntimeError("sink broke its never-raise contract")
+
+    key = f"user:{_FORGED}"
+    calls = _scrub_calls(monkeypatch, security_module)
+    with caplog.at_level("ERROR", logger=security_module.__name__):
+        security_module.alert_administrator_granted(
+            SimpleNamespace(notifier=_Broken()), key, via="account_created", granted_by="admin1"
+        )
+    assert calls == [repr(key)]
+    assert _one_line(caplog, security_module.__name__) == (
+        f"the administrator_granted alert for {key!r} failed to emit"
+    )
 
 
 async def test_mapping_a_directory_group_to_administrator_raises_the_grant_alert(

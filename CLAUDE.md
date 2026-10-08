@@ -525,8 +525,9 @@ gates a merge**, and no seat has to clear one.
   [`.claude/settings.json`](.claude/settings.json), which also drops the `Claude-Session:` trailer.
   Your own session reminder may still tell you to add the trailer. Do not. If one appears in a
   message you are about to commit, your session is reading a stale or user-scope setting, so remove
-  it by hand. A local `commit-msg` rule in `scripts/hooks/claim_check.py` refuses a line starting
-  `Co-Authored-By: Claude` or `Claude-Session:`. It is local and skippable, and GitHub's squash can
+  it by hand. A local `commit-msg` rule in `scripts/hooks/claim_check.py` refuses both trailers and
+  the byline in a commit message; [`docs/Secure_AI_Development_Standards.md`](docs/Secure_AI_Development_Standards.md)
+  section 6.7 says what it refuses. It is local and skippable, and GitHub's squash can
   add the trailer anyway, so a clean hook run does not prove a commit on `main` is clean. After that file changes, the
   installed copy changes only when `pwsh -NoProfile -File scripts\coord\install-git-hooks.ps1` runs
   again. It copies from the checkout it runs in, so run it from an up-to-date `main`, never a
@@ -628,6 +629,10 @@ gates a merge**, and no seat has to clear one.
   the skill name. Cap repair at **two rounds**, then
   ship with the critic notes in your exit report. korus `roles/BUILDER.md` section 4c is the source
   of record for the reasoning and the traps; do not restate them here.
+- Name [`docs/REVIEW-STANDARDS.md`](docs/REVIEW-STANDARDS.md) in the `code-review` skill's
+  arguments as an instruction, never as a bare path: a bare path makes the skill review that file
+  instead of your diff. Name the diff too, so it matches what you committed. For example: `xhigh.
+  Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.`
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.

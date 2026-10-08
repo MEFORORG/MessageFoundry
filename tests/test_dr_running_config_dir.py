@@ -430,7 +430,7 @@ async def test_an_alert_rule_restart_on_a_dr_parked_outbound_is_logged_and_does_
     message_id = await _activate_with_a_held_row(engine)
 
     with caplog.at_level(logging.INFO, logger="messagefoundry.api.app"):
-        await _alert_control_action(engine, "restart_outbound", "OB_NORM_ADT")
+        await _alert_control_action(engine, "restart_outbound", "OB_NORM_ADT", default_target=False)
     refusals = [r for r in caplog.records if "DR run-profile parks it" in r.getMessage()]
     assert len(refusals) == 1 and refusals[0].levelno == logging.INFO
     await _assert_still_parked(engine, message_id)
@@ -450,7 +450,7 @@ async def test_an_alert_rule_restart_of_a_dr_parked_inbound_does_nothing(box: _B
     await coord.activate(actor="alice")
     assert rr.inbound_filtered(_NORM) is not None  # control: the profile parked it
 
-    await _alert_control_action(engine, "restart_inbound", _NORM)
+    await _alert_control_action(engine, "restart_inbound", _NORM, default_target=False)
     assert not rr.inbound_running(_NORM)
     assert rr.inbound_filtered(_NORM) is not None
 
@@ -467,7 +467,7 @@ async def test_an_operator_pause_from_before_the_activation_survives_the_release
     assert rr is not None
     await rr.stop_outbound("OB_NORM_ADT")  # the operator's pause, before any DR
     message_id = await _activate_with_a_held_row(engine)
-    await _alert_control_action(engine, "restart_outbound", "OB_NORM_ADT")
+    await _alert_control_action(engine, "restart_outbound", "OB_NORM_ADT", default_target=False)
 
     coord = engine.dr_coordinator
     assert coord is not None

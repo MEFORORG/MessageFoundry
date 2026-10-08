@@ -137,7 +137,7 @@ from messagefoundry.parsing.sniff import (
     b64_head,
     text_sniff_head,
 )
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.ingress_guards import (
@@ -629,8 +629,9 @@ class _RefusalLog:
 
 
 # A queue_buildup alert re-fires at most this often per connection while the lane stays over threshold,
-# so an ongoing stall reminds the operator without spamming on every backed-off retry.
-_BUILDUP_REALERT_SECONDS = 300.0
+# so an ongoing stall reminds the operator without spamming on every backed-off retry. The value is
+# shared with the intake pause's reminder (BACKLOG #2272).
+_BUILDUP_REALERT_SECONDS = REMINDER_SECONDS
 
 # Bound on the in-runner connection-event queue (#46). A flood of refused/garbage connections can't grow
 # memory without limit — excess events are dropped + counted (a diagnostic log, not a reliability surface).
@@ -2347,8 +2348,13 @@ class RegistryRunner:
         """Raise :class:`KeyError` for a name that is neither a declared nor a still-draining outbound,
         so the API 404s an unknown connection. A reload-dropped outbound still in ``_destinations`` is
         controllable while it drains."""
-        if name not in self.registry.outbound and name not in self._destinations:
+        if not self.knows_outbound(name):
             raise KeyError(name)
+
+    def knows_outbound(self, name: str) -> bool:
+        """Whether ``name`` is a declared outbound or a reload-dropped one still draining: the set
+        :meth:`_validate_outbound` admits, as a predicate for callers outside the runner."""
+        return name in self.registry.outbound or name in self._destinations
 
     def _mark_outbound_quiesced(self, name: str) -> None:
         """The outbound ``name`` lane has DRAINED to zero in-flight. Set its quiescence Event so

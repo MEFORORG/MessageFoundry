@@ -352,19 +352,24 @@ from typing import Any
 #: ``RepeatedCredentialError`` and ``record_repeated_credential``, so a repeated cookie is logged
 #: and audited by the same handler as a repeated header.
 #:
-#: Vault BACKLOG #3259 / #3260: ``update_user``, ``delete_user``, ``reset_user_password``,
-#: ``reset_user_mfa``, ``bind_user_federated_identity`` and ``unbind_user_federated_identity`` now
-#: take ``request``, for the address on their ``auth.self_target_refused`` row, and the console
-#: passes it on each call. Same blind spot as #2346: the digest records an ``AdminHandlers`` field's
-#: name, not its parameters, so it did not move. A console without this change calls those six with
-#: no ``request`` and gets a TypeError, which the handshake does not catch.
+#: Vault BACKLOG #2144: ``AuthService`` gained ``admin_write_retry_after``, which ``require_ui``
+#: calls to fill the ``Retry-After`` of a throttled ``/ui`` write. A method the console calls, so a
+#: skew would be an AttributeError where the 429 belongs; it forces a bump. Re-derived on the
+#: tree merged with BACKLOG #2454, so the value below covers both.
+#:
+#: Vault BACKLOG #3259 / #3260: six ``AdminHandlers`` now take ``request``. They are ``update_user``,
+#: ``delete_user``, ``reset_user_password``, ``reset_user_mfa``, ``bind_user_federated_identity`` and
+#: ``unbind_user_federated_identity``. The address goes on their ``auth.self_target_refused`` row,
+#: and the console passes it on each call. Same blind spot as #2346, so the digest did not move. A
+#: skew in either direction raises TypeError on those six calls, which the handshake does not catch:
+#: an older console omits ``request``, and a newer console passes it to an engine that lacks it.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "c44474a7b5777455"
+ENGINE_UI_SEAM: str = "24e0fac6107b4433"
 
 
 @dataclass(frozen=True, slots=True)
