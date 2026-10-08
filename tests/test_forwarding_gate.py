@@ -17,6 +17,7 @@ import pytest
 
 from messagefoundry.config import settings as settings_module
 from messagefoundry.config.settings import LoggingSettings, forwarding_gate_refusal
+from tests._content_free import assert_chain_severed
 
 
 def _log(**kwargs: Any) -> LoggingSettings:
@@ -372,9 +373,26 @@ def _assert_the_validator_does_not_echo(host: str, needle: str) -> None:
     assert not _echoes(message, host)
     # No chain either. The codec's error holds the whole host on `.object`, and `from None` would
     # leave it on `__context__`, so the refusal is raised after the handler has ended.
-    assert raw.value.__cause__ is None and raw.value.__context__ is None
+    assert_chain_severed(raw.value)
     assert _echoes(f"{message}: {host!r}", host)
     assert _echoes(f"{message}: {host}", host)
+
+
+@pytest.mark.parametrize("setting", ["forward_host", "ntp_peer"])
+def test_the_error_a_real_load_keeps_carries_no_host(setting: str) -> None:
+    """The same chain check on the path a real load takes, for both settings. The model strips
+    the input from each error but KEEPS the validator's own exception under ``ctx``, so that
+    object is what a serializer or crash reporter would walk. With ``from None`` it held the
+    whole host on ``__context__.object`` (measured against the earlier shape)."""
+    from pydantic import ValidationError
+
+    host = "siem" + chr(0xFFFD) + ".corp"
+    with pytest.raises(ValidationError) as refused:
+        _log(**{setting: host})
+    kept = [err["ctx"]["error"] for err in refused.value.errors() if "ctx" in err]
+    assert len(kept) == 1 and isinstance(kept[0], ValueError)
+    assert_chain_severed(kept[0])
+    assert not _echoes(str(kept[0]), host)
 
 
 #: Host text the socket layer's "idna" encoding refuses. Each loaded before and then raised
