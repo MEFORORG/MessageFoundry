@@ -211,6 +211,12 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         "run_kwargs passes the floored http and ws protocols (api/protocol_headers.py); "
         "tests/test_api_tls.py pins both arms of the client-cert shim.",
     ),
+    Site("messagefoundry/api/protocol_floor_selftest.py", "_drive_all", "asgi-server"): (
+        1,
+        "A uvicorn.Config and no Server: the startup self-test hands it to the floored classes' own "
+        "constructors and reads their answers from an in-memory transport. Nothing is served from "
+        "it; tests/test_protocol_floor_selftest.py shows it opens no socket.",
+    ),
     Site(_APP, "create_app._unhandled_exception", "error-handler"): (
         1,
         "Runs in ServerErrorMiddleware, outside every user middleware, so it sets "

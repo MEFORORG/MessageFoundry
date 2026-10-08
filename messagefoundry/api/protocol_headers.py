@@ -48,6 +48,13 @@ fallback to the server's own protocol and no opt-out: a server that would answer
 without these headers does not start. So a WebSocket base without ``write_http_response`` (the
 sans-I/O protocol, or wsproto) is refused rather than served with its handshake answers bare.
 
+**Then measure, and refuse on that too.** The checks above read shape, and a hook can keep its shape
+and stop adding the headers. So ``serve`` and ``supervise`` next run
+:func:`messagefoundry.api.protocol_floor_selftest.selftest_protocol_floor` on the classes built here.
+It drives each family's response in memory and raises the same
+:class:`ProtocolFloorUnavailable` when one goes out without a header. That module says what it
+drives and what it does not prove.
+
 **Per-response steps degrade, and say so.** Once the class is built, a step this module adds to one
 response (the transport swap and restore, the status-line injection, the 500 hook and its header
 extension, the handshake header addition) catches ``Exception``, logs the type once per family and
@@ -60,8 +67,9 @@ response would change its status, which the floor must never do. The overrides t
 ``pyproject.toml`` bounds uvicorn below the next minor and does not bound websockets.
 ``tests/test_header_floor_wire.py`` fails unless the installed versions are the ones it measured,
 ``_MEASURED_UVICORN`` and ``_MEASURED_WEBSOCKETS``, and drives every family on the wire against a
-control. The startup check is what holds between those: an upgrade that removes a hook stops the
-engine instead of shipping responses without the headers.
+control. The two startup checks are what hold between those. An upgrade that removes a hook, or
+leaves one in place that no longer adds the headers to the families the self-test drives, stops the
+engine instead of shipping those responses without them.
 """
 
 from __future__ import annotations
@@ -87,6 +95,7 @@ from messagefoundry.api.header_floor import (
 __all__ = [
     "PROTOCOL_SECURITY_HEADERS",
     "ProtocolFloorUnavailable",
+    "floor_unavailable",
     "floored_http_protocol_class",
     "floored_ws_protocol_class",
 ]
@@ -143,11 +152,19 @@ class ProtocolFloorUnavailable(RuntimeError):
 
 
 def _refusal(base: type[Any], hook: str) -> ProtocolFloorUnavailable:
+    return floor_unavailable(
+        f"cannot be built on {base.__module__}.{base.__qualname__}: it has no {hook}", hook
+    )
+
+
+def floor_unavailable(problem: str, hook: str) -> ProtocolFloorUnavailable:
+    """The one refusal both startup checks raise: the class build here, and the self-test in
+    :mod:`messagefoundry.api.protocol_floor_selftest`. ``problem`` completes "the protocol header
+    floor ...", and ``hook`` is what :attr:`ProtocolFloorUnavailable.hook` holds."""
     # Built here rather than in an __init__ override, so the exception keeps RuntimeError's own
     # (message,) args and pickles and copies like any other.
     refused = ProtocolFloorUnavailable(
-        f"the protocol header floor (BACKLOG #1120) cannot be built on "
-        f"{base.__module__}.{base.__qualname__}: it has no {hook} "
+        f"the protocol header floor (BACKLOG #1120) {problem} "
         f"(uvicorn {_installed('uvicorn')}, websockets {_installed('websockets')}). The responses "
         "the server writes below the app would go out without nosniff. Re-read the server's "
         "protocol modules and update messagefoundry/api/protocol_headers.py, or install the uvicorn "

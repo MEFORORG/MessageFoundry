@@ -4424,7 +4424,13 @@ def _protocol_floor_or_refusal(refusing_to: str) -> tuple[Any, Any] | None:
 
     BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py. Fail
     closed, no opt-out: a uvicorn that moved a hook the floor overrides would otherwise serve its own
-    400s and 500s without nosniff."""
+    400s and 500s without nosniff.
+
+    Two checks, and both refuse. The class build reads the shape of the hooks. The self-test then
+    drives the built classes' own 400, 500 and handshake answers in memory and reads the headers off
+    what they wrote, so a hook that kept its shape and stopped working is refused too, on whichever
+    uvicorn and websockets are installed (api/protocol_floor_selftest.py)."""
+    from messagefoundry.api.protocol_floor_selftest import selftest_protocol_floor
     from messagefoundry.api.protocol_headers import (
         ProtocolFloorUnavailable,
         floored_http_protocol_class,
@@ -4432,7 +4438,9 @@ def _protocol_floor_or_refusal(refusing_to: str) -> tuple[Any, Any] | None:
     )
 
     try:
-        return floored_http_protocol_class(), floored_ws_protocol_class()
+        floored_http, floored_ws = floored_http_protocol_class(), floored_ws_protocol_class()
+        selftest_protocol_floor(floored_http, floored_ws)
+        return floored_http, floored_ws
     except ProtocolFloorUnavailable as exc:
         print(f"error: {exc}; refusing to {refusing_to}.", file=sys.stderr)
         return None
