@@ -169,6 +169,23 @@ def _anchor() -> dict:
     return parse_source(INSERT_SOURCE)[0]["rows"][0]
 
 
+# An ``occurrence={"expr": "i"}`` names a For-Each loop index, so the insert lands inside the loop:
+# a name nothing binds is refused (Manager decision 2026-10-07, Lander review of PR 2155).
+LOOP_SOURCE = """\
+from messagefoundry import handler, set_field
+
+
+@handler("H")
+def h(msg):
+    for i in range(1, msg.count_segments("OBX") + 1):
+        set_field(msg, "PID-3.1", "X")
+"""
+
+
+def _loop_anchor() -> dict:
+    return next(r for r in parse_source(LOOP_SOURCE)[0]["rows"] if r["kind"] == "action")
+
+
 def test_template_if_inserts_a_control_block() -> None:
     out = _template(
         INSERT_SOURCE, _anchor(), template="if", field="PID-3.1", operator="equals", value="A"
@@ -355,9 +372,9 @@ def test_insert_db_lookup_assigned_round_trips_as_lookup_row() -> None:
         _anchor(),
         action="db_lookup",
         assign_to="row",
-        params={"connection": "MPI", "statement": "select 1", "params": {"expr": '["A"]'}},
+        params={"connection": "MPI", "statement": "select 1", "params": {"expr": '{"id": "A"}'}},
     )
-    assert 'row = db_lookup("MPI", "select 1", ["A"])' in out
+    assert 'row = db_lookup("MPI", "select 1", {"id": "A"})' in out
     assert "from messagefoundry import db_lookup" in out
     ast.parse(out)
     rows = parse_source(out)[0]["rows"]
@@ -392,9 +409,11 @@ def test_insert_fhir_lookup_assigned_round_trips_as_lookup_row() -> None:
 
 
 def test_insert_code_lookup_bare_round_trips_as_lookup_row() -> None:
+    # The table must be a module-level code_set capture: a name nothing binds is refused.
+    src = 'from messagefoundry import code_set\n\nGENDER = code_set("gender")\n' + INSERT_SOURCE
     out = _insert_edit(
-        INSERT_SOURCE,
-        _anchor(),
+        src,
+        parse_source(src)[0]["rows"][0],
         action="code_lookup",
         params={"path": "PID-8", "table": {"expr": "GENDER"}},
     )
@@ -429,7 +448,7 @@ def test_insert_lookup_does_not_double_inject_existing_import() -> None:
         anchor,
         action="db_lookup",
         assign_to="row",
-        params={"connection": "MPI", "statement": "select 1", "params": {"expr": '["A"]'}},
+        params={"connection": "MPI", "statement": "select 1", "params": {"expr": '{"id": "A"}'}},
     )
     assert out.count("import db_lookup") == 1  # already in scope → no second import
 
@@ -545,8 +564,8 @@ def test_insert_add_segment_refuses_assign_to() -> None:
 
 def test_insert_set_field_with_occurrence_binds_loop_var() -> None:
     out = _insert_edit(
-        INSERT_SOURCE,
-        _anchor(),
+        LOOP_SOURCE,
+        _loop_anchor(),
         action="set_field",
         params={"path": "OBX-5", "value": "F", "occurrence": {"expr": "i"}},
     )
@@ -563,8 +582,8 @@ def test_insert_set_field_with_occurrence_binds_loop_var() -> None:
 
 def test_insert_copy_field_with_occurrence_applies_to_read_and_write() -> None:
     out = _insert_edit(
-        INSERT_SOURCE,
-        _anchor(),
+        LOOP_SOURCE,
+        _loop_anchor(),
         action="copy_field",
         params={"src": "OBX-5", "dst": "OBX-6", "occurrence": {"expr": "i"}},
     )
@@ -577,8 +596,8 @@ def test_insert_copy_field_with_occurrence_applies_to_read_and_write() -> None:
 
 def test_insert_add_repetition_with_occurrence() -> None:
     out = _insert_edit(
-        INSERT_SOURCE,
-        _anchor(),
+        LOOP_SOURCE,
+        _loop_anchor(),
         action="add_repetition",
         params={"path": "PID-3", "value": "X", "occurrence": {"expr": "i"}},
     )
