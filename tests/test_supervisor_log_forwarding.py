@@ -53,6 +53,10 @@ class _Recorder:
         return [kw["forward"] for _, kw in self.logging_calls if kw.get("forward") is not None]
 
 
+#: ``_run``'s default for ``allowed_syslog``: keep what the forwarding provision set.
+_PROVISIONED = "<provisioned>"
+
+
 def _no_network(*args: Any, **kwargs: Any) -> Any:
     raise AssertionError("a start gate or the supervisor touched the network")
 
@@ -64,13 +68,13 @@ def _run(
     toml: str = "",
     *,
     verified_forwarding: bool = False,
-    allowed_syslog: str | None = VERIFIED_LOG_FORWARDING_HOST,
+    allowed_syslog: str | None = _PROVISIONED,
     provisions: str = PHI_GATE_PROVISIONS_TOML,
 ) -> tuple[int, _Recorder]:
     """Run ``serve`` or ``supervise`` as a prod instance with every OTHER gate pre-cleared.
 
-    ``allowed_syslog`` is the ``[egress].allowed_syslog`` value a verified-forwarding run starts
-    with; ``None`` leaves the list unset. It defaults to the collector the provision names."""
+    ``allowed_syslog`` overrides the ``[egress].allowed_syslog`` value the forwarding provision
+    sets, which lists its own collector; ``None`` leaves the list unset."""
     from messagefoundry.__main__ import main
 
     recorder = _Recorder()
@@ -80,7 +84,7 @@ def _run(
         setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path))
         if allowed_syslog is None:
             monkeypatch.delenv("MEFOR_EGRESS_ALLOWED_SYSLOG")
-        else:
+        elif allowed_syslog is not _PROVISIONED:
             monkeypatch.setenv("MEFOR_EGRESS_ALLOWED_SYSLOG", allowed_syslog)
     (tmp_path / "messagefoundry.toml").write_text(provisions + toml, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.__main__.configure_logging", recorder.configure_logging)
@@ -177,12 +181,6 @@ def test_the_supervisor_is_refused_by_each_gate_exactly_as_serve_is(
     assert recorder.forwards == [], "the supervisor installed a forwarder past a refused gate"
 
 
-def test_the_gates_under_test_can_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The control for the refusals above: the same fixture, with verified forwarding, starts."""
-    rc, recorder = _run("supervise", tmp_path, monkeypatch, verified_forwarding=True)
-    assert rc == 0 and recorder.spawned == 1
-
-
 # --- forwarding not configured ------------------------------------------------------------------
 
 
@@ -196,3 +194,30 @@ def test_with_no_collector_the_supervisor_logs_as_it_did(
     assert recorder.forwards == []
     assert recorder.logging_calls == [(("INFO",), {}), (("INFO",), {"forward": None})]
     assert "does not forward its logs off-box over verified TLS" in capsys.readouterr().err
+
+
+# --- the readings logged before the forwarder exists --------------------------------------------
+
+
+@pytest.mark.parametrize("verified_forwarding", [True, False])
+def test_an_early_security_reading_is_logged_again_only_once_a_forwarder_is_installed(
+    verified_forwarding: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The supervisor reports its remote-debugging reading before it has read any settings, so
+    before a forwarder can exist. With one installed the line is logged a second time, so the
+    off-box copy has it. With none it is logged once, as before."""
+    monkeypatch.setattr(
+        "messagefoundry.__main__.remote_debug_loosening", lambda posture: ("probe_key", "a probe")
+    )
+    toml = "" if verified_forwarding else 'security.enforcement = "warn"\n'
+    with caplog.at_level("WARNING", logger="messagefoundry.__main__"):
+        rc, recorder = _run(
+            "supervise", tmp_path, monkeypatch, toml, verified_forwarding=verified_forwarding
+        )
+    assert rc == 0 and len(recorder.forwards) == int(verified_forwarding)
+    lines = [r.getMessage() for r in caplog.records if "probe_key" in r.getMessage()]
+    assert len(lines) == (2 if verified_forwarding else 1), lines
+    assert all(line.startswith("[security] probe_key: a probe.") for line in lines)

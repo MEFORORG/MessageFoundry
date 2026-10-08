@@ -4691,18 +4691,25 @@ def _supervise(args: argparse.Namespace) -> int:
     # and before the renewal below, so a refused start changes nothing on disk. The logging call
     # is the bare one at the top plus the forwarder. `--env` is what each shard is started with,
     # so it names the environment here as well.
+    forwarder_installed = False
+
+    def configure_with_forwarder(forward: SyslogForward | None) -> bool:
+        nonlocal forwarder_installed
+        forwarder_installed = configure_logging("INFO", forward=forward)
+        return forwarder_installed
+
     logging_refused = _start_logging(
         settings,
         env_name=args.env or settings.ai.environment,
         enforcing=enforcing,
         spool_dir=_supervisor_forward_spool_dir(settings, db_base),
-        configure=lambda forward: configure_logging("INFO", forward=forward),
+        configure=configure_with_forwarder,
     )
     if logging_refused is not None:
         return logging_refused
-    if settings.logging.forward_enabled and settings.logging.forward_host:
+    if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
-        # off-box copy has them; with no collector configured this writes nothing.
+        # off-box copy has them. With no forwarder installed this writes nothing.
         for security_line in security_lines:
             logging.getLogger(__name__).warning(
                 "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
