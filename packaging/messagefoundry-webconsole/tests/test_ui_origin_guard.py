@@ -160,7 +160,7 @@ async def test_login_with_neither_header_fails_closed_without_setting_a_cookie(
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
-        for headers in ({}, {"Origin": ""}):
+        for headers in ({}, {"Origin": ""}, {"Sec-Fetch-Site": ""}):
             r = await c.post("/ui/login", data=_creds(), headers=headers, extensions=HEADERLESS)
             assert r.status_code == 403, headers
             assert "neither Sec-Fetch-Site nor Origin" in r.text

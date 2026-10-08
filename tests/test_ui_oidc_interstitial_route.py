@@ -56,7 +56,11 @@ def _client(**policy: Any) -> TestClient:
     oidc_routes.register(app, deps)
     app.state.auth = _FakeAuth()
     app.state.public_origin = ""  # start leg bails before the IdP; we assert on the interstitial
-    return TestClient(app, follow_redirects=False)
+    # A browser's own request names its provenance. Without this default every start-leg request
+    # here is refused for carrying neither Sec-Fetch-Site nor Origin (BACKLOG #1116, #1124), and a
+    # test asserting only "not the interstitial" or "not 405" would pass on that 403. A test that
+    # sends its own Sec-Fetch-Site replaces this one.
+    return TestClient(app, follow_redirects=False, headers={"Sec-Fetch-Site": "same-origin"})
 
 
 def test_an_external_idp_gets_the_interstitial_not_a_redirect() -> None:
@@ -192,8 +196,8 @@ def test_the_interstitial_page_carries_no_destination_url_to_post_back() -> None
 def test_a_cross_site_post_to_the_start_leg_is_refused() -> None:
     """⛔ ASVS 3.5.1 — the assertion the rest of this file could not make.
 
-    Every other test here sends NO `Sec-Fetch-*` headers, so the origin guard never fires and they
-    would all pass just as happily with it deleted. This one supplies the header a real browser sends
+    Every other test here sends the client's default `Sec-Fetch-Site: same-origin`, so the origin
+    guard never refuses and they would all pass just as happily with it deleted. This one supplies the header a real browser sends
     on a cross-site form submission and asserts the 403.
 
     Why it matters specifically to 3.7.3: the GET/POST split moved flow-minting behind a POST, and a

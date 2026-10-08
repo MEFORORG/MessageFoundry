@@ -691,8 +691,9 @@ def assert_same_origin(request: Request) -> None:
     first-party client posts to ``/ui`` without a browser, so the refusal costs a conforming client
     nothing; a script that drives ``/ui`` must send ``Origin``.
     """
-    sec_fetch_site = request.headers.get("sec-fetch-site")
-    if sec_fetch_site is not None:
+    # An EMPTY Sec-Fetch-Site names no provenance, so it is absence, as an empty Origin is below. A
+    # present value this code does not know (anything but cross-site/same-site) still passes here.
+    if request.headers.get("sec-fetch-site"):
         assert_not_cross_site(request)
         return
     origin = request.headers.get("origin")
