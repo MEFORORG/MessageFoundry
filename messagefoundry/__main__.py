@@ -2403,23 +2403,14 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Vault BACKLOG #2375: the gate's own-host check FAILS OPEN and logs a WARNING when it does,
     # which ADR 0200 Amendment A calls the record of that pass. Logged here it would reach bare
-    # stderr only, since configure_logging has not run. So the lines are held and written TWICE,
-    # as the #1989 static-credential lines are: to stderr now, and to the configured handlers below.
-    from logging.handlers import BufferingHandler
+    # stderr only, since configure_logging has not run. So the gate hands the notes back as text
+    # and each is written TWICE, as the #1989 static-credential lines are: to stderr now, and to
+    # the configured handlers below.
+    from messagefoundry.config.settings import forwarding_gate_check
 
-    from messagefoundry.config.settings import forwarding_gate_refusal
-
-    _gate_log = logging.getLogger(forwarding_gate_refusal.__module__)
-    _gate_held = BufferingHandler(64)  # two lines at most; never reaches capacity
-    _gate_held.setLevel(logging.WARNING)
-    _gate_log.addHandler(_gate_held)
-    try:
-        _forwarding_gap = forwarding_gate_refusal(settings.logging)
-    finally:
-        _gate_log.removeHandler(_gate_held)
-    _gate_warnings = list(_gate_held.buffer)
-    for _gate_record in _gate_warnings:
-        print(f"warning: {scrub_control_chars(_gate_record.getMessage())}", file=sys.stderr)
+    _forwarding_gap, _gate_notes = forwarding_gate_check(settings.logging)
+    for _gate_note in _gate_notes:
+        print(f"warning: {scrub_control_chars(_gate_note)}", file=sys.stderr)
     if _forwarding_gap is not None:
         _forwarding_fix = (
             "Set [logging].forward_host to a collector on another host, "
@@ -2515,10 +2506,10 @@ def _serve(args: argparse.Namespace) -> int:
             _credlog.warning("%s", line)
         if sc_outcome.refusal is not None:
             _credlog.warning("%s", sc_outcome.refusal)
-    # Vault BACKLOG #2375: the forwarding gate's fail-open lines, held above, logged here for the
-    # same reason. Each record goes back through its own logger, so it keeps its name and level.
-    for _gate_record in _gate_warnings:
-        _gate_log.handle(_gate_record)
+    # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged here for the same reason,
+    # at WARNING and the ordinary way, so [logging].level applies to them as it does to those.
+    for _gate_note in _gate_notes:
+        _credlog.warning("%s", _gate_note)
 
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and

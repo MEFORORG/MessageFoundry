@@ -43,6 +43,7 @@ import re
 import string
 import tomllib
 from collections.abc import Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
@@ -2426,29 +2427,17 @@ class LoggingSettings(_Section):
     @field_validator("forward_host")
     @classmethod
     def _check_forward_host(cls, value: str | None) -> str | None:
-        # Vault BACKLOG #2375, review round 2. A NUL or an undecodable byte can never name a
-        # collector. Before this, one raised out of the #1966 gate, or passed it and then raised
-        # out of the forwarder's own socket call, so the start died with a traceback either way.
-        if value is None:
-            return value
-        if has_lone_surrogate(value) or has_control_char(value):
-            raise ValueError(
-                "[logging].forward_host must not contain a control character or an undecodable byte"
-            )
-        # The forwarder hands this text to the socket layer, which encodes a host with the
-        # "idna" codec before it resolves or connects. Text that codec refuses raised
-        # UnicodeEncodeError out of the start, since it is not an OSError: at least an empty label
-        # ("a..b"), a label over 63 characters and a C1 control. So the same encoding is tried
-        # here. An IP literal and an ordinary name both pass it. The value is not quoted.
-        try:
-            value.encode("idna")
-        except UnicodeError:
-            raise ValueError(
-                "[logging].forward_host is not a host name the network layer can encode: each "
-                "dot-separated label must be 1 to 63 characters and hold no control or other "
-                "character IDNA prohibits"
-            ) from None
-        return value
+        # Vault BACKLOG #2375. Before this, such text raised out of the #1966 gate, or passed it
+        # and then raised out of the forwarder's own socket call, so the start died with a
+        # traceback either way.
+        return _checked_host_text(value, "[logging].forward_host")
+
+    @field_validator("ntp_peer")
+    @classmethod
+    def _check_ntp_peer(cls, value: str | None) -> str | None:
+        # The same text reaches the socket layer through the time-sync probe, whose caller catches
+        # OSError only, so the same fault stopped a require_time_sync start with a traceback.
+        return _checked_host_text(value, "[logging].ntp_peer")
 
     @field_validator("forward_tls_crl_file")
     @classmethod
@@ -4169,9 +4158,66 @@ def _names_this_host(host: str) -> bool:
     return addr is not None and (addr.is_loopback or addr.is_unspecified)
 
 
+def _checked_host_text(value: str | None, setting: str) -> str | None:
+    """``value`` unchanged, or a ``ValueError`` naming ``setting`` when it is text that cannot name
+    a host. The message never quotes the value.
+
+    Two refusals. A control character or a lone surrogate can never be part of a host name. And
+    the socket layer encodes a host with the "idna" codec before it resolves or connects, so text
+    that codec refuses raised ``UnicodeEncodeError`` out of the start, which is not an ``OSError``
+    and so was caught nowhere. At least an empty label (``a..b``), an encoded label over 63
+    characters and a C1 control are such text. An IP literal and an ordinary name both pass."""
+    if value is None:
+        return value
+    if has_lone_surrogate(value) or has_control_char(value):
+        raise ValueError(f"{setting} must not contain a control character or an undecodable byte")
+    try:
+        value.encode("idna")
+    except UnicodeError:
+        raise ValueError(
+            f"{setting} is not a host name the network layer can encode (its IDNA encoding "
+            "refuses it). Look for an empty label, a label that is too long once encoded, or an "
+            "invisible or prohibited character. A non-ASCII name may be written in its xn-- form"
+        ) from None
+    return value
+
+
+def _socket_form(host: str) -> str:
+    """``host`` as the socket layer will read it: trimmed, and passed through the "idna" encoding
+    that layer applies before it resolves or connects (review of vault BACKLOG #2375).
+
+    The gate must compare THIS form. Compared raw, ``127.0.0.1`` typed in full-width digits, or
+    ``localhost`` with a soft hyphen inside, read as some other host while the socket layer
+    dialled loopback (measured). ASCII text comes back unchanged, case included, so an IPv6 zone
+    keeps its case. Text the encoding refuses comes back as it was: the load refuses it for
+    ``[logging].forward_host``, and another caller still gets an answer."""
+    text = host.strip()
+    try:
+        return text.encode("idna").decode("ascii")
+    except UnicodeError:
+        return text
+
+
 def _bare_host(host: str) -> str:
-    """``host`` as the two predicates here compare it: trimmed, lowercased, no trailing dot."""
-    return host.strip().rstrip(".").lower()
+    """``host`` as the two predicates here compare it: its :func:`_socket_form`, lowercased, with
+    no trailing dot."""
+    return _socket_form(host).rstrip(".").lower()
+
+
+#: Where a fail-open note goes while :func:`forwarding_gate_check` runs: a list it returns to its
+#: caller. Unset, a note is logged at once, which is what a direct caller of the helpers gets.
+_gate_notes: ContextVar[list[str] | None] = ContextVar("_gate_notes", default=None)
+
+
+def _fail_open_note(note: str) -> None:
+    """Record that an own-host check could not be made. Never silent: the same config can pass
+    before an interface is up and refuse at the next start, and this note is the only record of
+    which happened. It carries no configured value; the refusal text names the setting."""
+    held = _gate_notes.get()
+    if held is None:
+        _log.warning("%s", note)
+    else:
+        held.append(note)
 
 
 def _host_ip_literal(h: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -4200,10 +4246,9 @@ def _own_host_names() -> frozenset[str]:
     try:
         name = _bare_host(_socket.gethostname())
     except OSError as exc:
-        _log.warning(
-            "the OS gave no host name (%s), so the ASVS 16.4.3 forwarding gate cannot compare "
-            "[logging].forward_host with it; the gate decides without that check",
-            type(exc).__name__,
+        _fail_open_note(
+            f"the OS gave no host name ({type(exc).__name__}), so the ASVS 16.4.3 forwarding gate "
+            "cannot compare [logging].forward_host with it; the gate decides without that check"
         )
         return frozenset()
     return frozenset({name, name.partition(".")[0]}) - {""}
@@ -4227,14 +4272,10 @@ def _local_source_address(
             # A link-local answer carries its zone ("fe80::1%eth0"), which ip_address reads.
             return ipaddress.ip_address(probe.getsockname()[0])
     except (OSError, ValueError, TypeError) as exc:  # TypeError: a NUL in an IPv6 zone
-        # Logged, not silent: the same config can pass here before an interface is up and refuse
-        # at the next start, and this line is the only record of which happened. The address is
-        # not echoed; the operator set it and the refusal text names the setting.
-        _log.warning(
-            "the OS gave no source address for [logging].forward_host (%s), so the ASVS 16.4.3 "
-            "forwarding gate cannot tell whether that address is this host's own; the gate "
-            "decides without that check",
-            type(exc).__name__,
+        _fail_open_note(
+            f"the OS gave no source address for [logging].forward_host ({type(exc).__name__}), "
+            "so the ASVS 16.4.3 forwarding gate cannot tell whether that address is this host's "
+            "own; the gate decides without that check"
         )
         return None
 
@@ -4267,7 +4308,7 @@ def _is_own_name_or_address(host: str) -> bool:
     if h in _own_host_names():
         return True
     # Not lowercased: an IPv6 zone is an interface name, and those are case-sensitive on Linux.
-    addr = _host_ip_literal(host.strip().rstrip("."))
+    addr = _host_ip_literal(_socket_form(host).rstrip("."))
     if addr is None:
         return False
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
@@ -4275,6 +4316,27 @@ def _is_own_name_or_address(host: str) -> bool:
     source = _local_source_address(addr)
     # Zones are compared away: "fe80::1" and "fe80::1%eth0" are one address on this host.
     return source is not None and int(source) == int(addr) and source.version == addr.version
+
+
+def forwarding_gate_check(log: LoggingSettings) -> tuple[str | None, list[str]]:
+    """:func:`forwarding_gate_refusal` for ``log``, plus the fail-open notes it made, as text.
+
+    For a caller that runs the gate BEFORE logging is configured, which ``serve`` does. A note
+    logged there would reach bare stderr only, never the log file or the off-box collector, and
+    ADR 0200 Amendment A calls that note the record of a fail-open pass. So the notes come back to
+    the caller, which writes each where it can be kept, as ``serve`` does with the #1989
+    static-credential lines. If the gate raises, the notes are logged at once before the error
+    leaves, so they are never dropped."""
+    notes: list[str] = []
+    token = _gate_notes.set(notes)
+    try:
+        return forwarding_gate_refusal(log), notes
+    except BaseException:
+        for note in notes:
+            _log.warning("%s", note)
+        raise
+    finally:
+        _gate_notes.reset(token)
 
 
 def forwarding_gate_refusal(log: LoggingSettings) -> str | None:

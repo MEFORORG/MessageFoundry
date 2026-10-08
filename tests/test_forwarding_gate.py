@@ -353,27 +353,34 @@ def test_host_text_that_can_name_no_collector_is_refused_at_load(tmp_path: Path,
     _assert_the_validator_does_not_echo(host, "control character or an undecodable byte")
 
 
+def _echoes(message: str, host: str) -> bool:
+    """Whether ``message`` carries ``host`` in any of the forms an error would quote it in."""
+    return host in message or ascii(host) in message or repr(host) in message
+
+
 def _assert_the_validator_does_not_echo(host: str, needle: str) -> None:
     """The validator's OWN message, read off a direct call. The loaded model strips every input
-    from its errors, so an assertion on that error could never fail; this one can. The control at
-    the end shows the search finds the value when a message does carry it."""
+    from its errors, so an assertion on that error could never fail; this one can. The last two
+    lines are the control: the same search finds the value in a message that does quote it."""
     with pytest.raises(ValueError) as raw:
         settings_module.LoggingSettings._check_forward_host(host)
     message = str(raw.value)
     assert needle in message
-    assert host not in message and ascii(host) not in message and repr(host) not in message
-    assert host in f"{message} {host}"
+    assert not _echoes(message, host)
+    assert _echoes(f"{message}: {host!r}", host)
+    assert _echoes(f"{message}: {host}", host)
 
 
 #: Host text the socket layer's "idna" encoding refuses. Each loaded before and then raised
-#: UnicodeEncodeError out of the start (on main too): an empty label, a leading dot, a label over
-#: 63 characters, a C1 control, and a character IDNA prohibits.
+#: UnicodeEncodeError out of the start (on main too). At least: an empty label, a leading dot, a
+#: label over 63 characters, a C1 control (U+0085), and a character IDNA prohibits (U+FFFD).
+#: Built with chr(), so no invisible character sits in this file.
 _IDNA_INVALID_HOSTS = [
     "siem..corp.test",
     ".siem",
     "x" * 64 + ".corp.test",
-    "siem\x85.corp",
-    "​.corp",
+    "siem" + chr(0x85) + ".corp",
+    "siem" + chr(0xFFFD) + ".corp",
 ]
 
 
@@ -388,23 +395,80 @@ def test_a_host_the_network_layer_cannot_encode_is_refused_at_load(
     _assert_the_validator_does_not_echo(host, "network layer can encode")
 
 
+def test_each_idna_refusal_is_a_different_fault() -> None:
+    """The five entries above are five faults, not one fault spelt five ways. The prohibited
+    character is refused as itself, and not as the empty label an invisible one would leave."""
+
+    def reason(host: str) -> str:
+        with pytest.raises(UnicodeError) as refused:
+            host.encode("idna")
+        return str(refused.value)
+
+    prohibited = reason(_IDNA_INVALID_HOSTS[4])
+    assert "empty" not in prohibited and "too long" not in prohibited
+    assert "empty" in reason(_IDNA_INVALID_HOSTS[0])
+
+
 @pytest.mark.parametrize(
     "host",
     [
         "siem.corp.test",
         "siem.corp.test.",
         "x" * 63 + ".corp.test",
-        "bücher.example",
+        "b" + chr(0xFC) + "cher.example",
         "a_b.example",
         "10.0.0.5",
         "::1",
         "fe80::1%eth0",
         "[2001:db8::1]",
+        "::ffff:10.0.0.5",
     ],
 )
 def test_an_encodable_host_still_loads(tmp_path: Path, host: str) -> None:
-    """The control: an ordinary name, an internationalised one and every IP-literal form load."""
+    """The control: an ordinary name, an internationalised one and at least these IP-literal
+    forms load."""
     assert _verified(tmp_path, host=host).forward_host == host
+
+
+@pytest.mark.parametrize("peer", [*_IDNA_INVALID_HOSTS, "ntp\x00"])
+def test_the_time_sync_peer_gets_the_same_host_text_check(peer: str) -> None:
+    """``[logging].ntp_peer`` reaches the socket layer too, through a caller that catches OSError
+    only, so the same text stopped a ``require_time_sync`` start with a traceback."""
+    with pytest.raises(ValueError, match=r"\[logging\]\.ntp_peer"):
+        LoggingSettings(ntp_peer=peer)
+    assert LoggingSettings(ntp_peer="time.corp.test").ntp_peer == "time.corp.test"
+
+
+def _fullwidth(text: str) -> str:
+    """``text`` with its digits and dots as full-width forms, which the "idna" encoding folds back."""
+    return "".join(
+        chr(0xFF0E) if c == "." else chr(0xFF10 + int(c)) if c.isdigit() else c for c in text
+    )
+
+
+def test_the_gate_compares_the_form_the_socket_layer_will_dial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate compared raw text while the socket layer encodes with "idna" first. So loopback
+    typed in full-width digits, ``localhost`` with a soft hyphen inside, and this host's own name
+    with a zero-width space inside each read as another host, and the forwarder then dialled this
+    one (review, measured). Each loads, and each is now refused by the gate."""
+    _as_this_host(monkeypatch, names=("eng1",), addresses=(_OWN_V4,))
+    wide_loopback = _fullwidth("127.0.0.1")
+    soft_localhost = "local" + chr(0xAD) + "host"
+    spaced_own_name = "en" + chr(0x200B) + "g1"
+    wide_own_address = _fullwidth(_OWN_V4)
+    assert wide_loopback.encode("idna") == b"127.0.0.1"  # the premise
+    for host, needle in (
+        (wide_loopback, "loopback"),
+        (soft_localhost, "loopback"),
+        (spaced_own_name, "own name"),
+        (wide_own_address, "own name or one of its own addresses"),
+    ):
+        reason = forwarding_gate_refusal(_verified(tmp_path, host=host))
+        assert reason is not None and needle in reason, ascii(host)
+    # The control: a full-width address that is NOT this host still passes.
+    assert forwarding_gate_refusal(_verified(tmp_path, host=_fullwidth("10.20.30.41"))) is None
 
 
 @pytest.mark.parametrize("host", _UNUSABLE_HOSTS)
@@ -578,13 +642,93 @@ def test_a_fail_open_pass_is_recorded_by_the_configured_log_handlers(
     )
 
 
-def test_a_start_whose_probe_answers_records_no_fail_open_line(
+def test_a_named_collector_records_no_fail_open_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The control: the same start with a collector given by name runs no probe and logs no line."""
+    """A control: a collector given by name runs no probe and logs no line."""
     assert _serve(tmp_path, monkeypatch, forwarding=True) == 0
     captured = capsys.readouterr()
     assert _FAIL_OPEN_LINE not in captured.out + captured.err
+
+
+def test_an_address_collector_whose_probe_answers_records_no_fail_open_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control that matters: the same IP-literal start, with a probe that ANSWERS. The line
+    is for a fail-open pass only, so a start that logged it for every address collector reds here.
+    The probe's answer is faked, so no route is needed; the forwarder's own connect is refused."""
+
+    class _Routable(socket.socket):
+        _probed = False
+
+        def connect(self, address: Any) -> None:
+            if address[0] != _NO_ROUTE_HOST:
+                super().connect(address)
+            elif self.type == socket.SOCK_DGRAM:
+                self._probed = True  # the gate's probe: "connected", nothing sent
+            else:
+                raise OSError("connection refused")  # the forwarder: the collector is down
+
+        def getsockname(self) -> Any:
+            return ("10.9.9.9", 50000) if self._probed else super().getsockname()
+
+    monkeypatch.setattr(socket, "socket", _Routable)
+    assert _serve(tmp_path, monkeypatch, forwarding=True, host=_NO_ROUTE_HOST) == 0
+    captured = capsys.readouterr()
+    assert "ASVS 16.4.3" not in captured.err
+    assert _FAIL_OPEN_LINE not in captured.out + captured.err
+
+
+def test_the_fail_open_line_honours_the_configured_log_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The re-emitted line is an ordinary WARNING. With ``[logging].level = "ERROR"`` the handlers
+    do not get it, as they would not get any other WARNING; stderr, where the gate ran, still does."""
+    monkeypatch.setenv("MEFOR_LOGGING_LEVEL", "ERROR")
+    code, out, err = _serve_with_a_failing_probe(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    assert _FAIL_OPEN_LINE not in out
+    assert f"warning: the OS gave {_FAIL_OPEN_LINE}" in err
+
+
+def test_a_gate_that_raises_still_logs_its_notes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """``forwarding_gate_check`` holds the notes for its caller. If the gate raises after making
+    one, the caller never gets the list, so the note is logged before the error leaves."""
+
+    def _note_then_raise(host: str) -> bool:
+        settings_module._fail_open_note("a note made before the fault")
+        raise RuntimeError("a fault in the gate")
+
+    monkeypatch.setattr(settings_module, "_is_own_name_or_address", _note_then_raise)
+    with (
+        caplog.at_level("WARNING", logger=settings_module.__name__),
+        pytest.raises(RuntimeError),
+    ):
+        settings_module.forwarding_gate_check(_verified(tmp_path))
+    assert "a note made before the fault" in caplog.text
+    # And the hold is released: a later note is logged at once again, not appended to a dead list.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=settings_module.__name__):
+        settings_module._fail_open_note("a later note")
+    assert "a later note" in caplog.text
+
+
+def test_the_check_returns_its_notes_and_logs_none(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """The other half: on a normal return the notes come back as text and are NOT also logged, so
+    a caller that writes them does not double them."""
+    monkeypatch.setattr(_FakeUdp, "calls", [])
+    monkeypatch.setattr(_FakeUdp, "sources", {})
+    monkeypatch.setattr(socket, "socket", _FakeUdp)
+    monkeypatch.setattr(settings_module, "_own_host_names", lambda: frozenset())
+    with caplog.at_level("WARNING", logger=settings_module.__name__):
+        refusal, notes = settings_module.forwarding_gate_check(_verified(tmp_path, host=_OWN_V4))
+    assert refusal is None
+    assert len(notes) == 1 and "no source address" in notes[0] and _OWN_V4 not in notes[0]
+    assert caplog.text == ""
 
 
 def test_serve_under_warn_warns_instead_of_refusing(
