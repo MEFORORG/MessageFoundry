@@ -26,6 +26,12 @@ this line.**
   table on `/ui/status` showed `allow_keeping_phi_indefinitely` only. It now also shows the
   transform-state, search-preset, app-log and backup-archive switches, each on its own row. The
   table stays read-only. (BACKLOG #2280)
+- **The status page and the health indicator show the off-box log forwarder.** With a forwarder
+  configured, the engine table on `/ui/status` has an "Off-box log forwarding" row. It reads
+  `healthy`, or says that forwarding is not running or is degraded, with how many records were
+  lost since the process started. The health indicator turns to warn in the second and third
+  cases. With no forwarder configured there is no row. Under engine shards the row describes the
+  process that answered. (`BACKLOG #2612`)
 - **The audit, security-event and event-log pages page past their first window.** `/ui/audit`,
   `/ui/security-events` and `/ui/events` take `limit` and `offset` and draw the shared pager, so
   each says which rows of how many it shows, with Previous and Next links. They used to show only
