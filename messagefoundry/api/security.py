@@ -372,13 +372,14 @@ async def bearer_token_dependency(request: Request) -> str | None:
     return bearer_token(request)
 
 
-def client_ip(conn: Request | WebSocket) -> str | None:
+def client_ip(conn: HTTPConnection) -> str | None:
     """The caller's client address: the one login records on the session as its anchor, on both
     the JSON auth routes and the console. Used by the WP-L3-13 new-client-IP risk signal so the
     comparison is apples-to-apples, and — since ADR 0150 — as the ``client`` recorded on audit rows.
-    The per-IP rate limiters key on it too. Since BACKLOG #2289 it is the only reader of
-    ``.client.host`` in ``api/`` and the console, and ``tests/test_client_ip_single_extractor.py``
-    holds that line; the two kept exceptions are listed there with their reasons. It is public
+    The per-IP rate limiters and the ``[security].allowed_client_networks`` gate (with its
+    ``/health`` echo) read it too. Since BACKLOG #2289 nothing else in ``messagefoundry/``, the
+    console or the harness reads the ASGI client address, and
+    ``tests/test_client_ip_single_extractor.py`` holds that line for the shapes it can see. It is public
     (not ``_``-prefixed) precisely so audit callers REUSE this one extraction rather than growing a
     second, divergent notion of "the client address": two extractors would eventually disagree about
     proxy handling and the audit trail would contradict the risk signal.
@@ -389,7 +390,9 @@ def client_ip(conn: Request | WebSocket) -> str | None:
     notion this docstring forbids. Widening costs nothing structural: ``client`` is ONE property on
     starlette's ``HTTPConnection``, which both classes inherit unchanged, so this is the same read on
     both planes rather than two reads that agree today. The parameter is ``conn`` rather than
-    ``request`` for the same reason, matching ``_auth.session_cookie_name``.
+    ``request`` for the same reason, matching ``_auth.session_cookie_name``. It is typed as that base
+    class so the raw-ASGI network gate, which holds a scope and no Request, can pass
+    ``HTTPConnection(scope)`` rather than read the scope a second way (BACKLOG #2289).
 
     Behind a declared trusted proxy this already resolves to the real client:
     uvicorn runs with ``forwarded_allow_ips = settings.api.trusted_proxies`` (``__main__.py``;

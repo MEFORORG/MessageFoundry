@@ -441,7 +441,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def login(
         body: LoginRequest, request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:
-        if not service.allow_login_attempt(client_ip(request)):
+        client = client_ip(request)
+        if not service.allow_login_attempt(client):
             raise _rate_limited(request, "login")
         try:
             provider = AuthProvider(body.provider)
@@ -462,7 +463,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             body.username,
             body.password,
             provider=provider,
-            client=client_ip(request),
+            client=client,
             supersedes=body.supersedes,
             totp_code=body.totp_code,
         )
@@ -490,7 +491,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def negotiate(
         request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:
-        if not service.allow_login_attempt(client_ip(request)):
+        client = client_ip(request)
+        if not service.allow_login_attempt(client):
             raise _rate_limited(request, "negotiate")
         header = request.headers.get("Authorization", "")
         if not header.startswith("Negotiate "):
@@ -506,7 +508,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # it proves opens the window (verify_mfa). One that owes none meets 403 +
         # X-Step-Up-Required on its first gated action and answers with POST /me/reauth, a live
         # directory re-bind.
-        outcome = await service.authenticate_kerberos(token_bytes, client=client_ip(request))
+        outcome = await service.authenticate_kerberos(token_bytes, client=client)
         alert_directory_administrator_granted(
             request.app.state, outcome, via="directory_sign_in_negotiate"
         )
@@ -708,12 +710,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         The session is RE-KEYED on success (ASVS 7.2.4) and the new bearer token is in the body:
         this is the exact transition — pre-MFA to MFA-satisfied — that must not happen in place."""
-        if not service.allow_login_attempt(client_ip(request)):
+        client = client_ip(request)
+        if not service.allow_login_attempt(client):
             raise _rate_limited(request, "mfa-verify")
         token = bearer_token(request)
         if token is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
-        elevation = await service.verify_mfa(token, body.code, client=client_ip(request))
+        elevation = await service.verify_mfa(token, body.code, client=client)
         if elevation.token is None:
             if elevation.directory_unconfirmed:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
