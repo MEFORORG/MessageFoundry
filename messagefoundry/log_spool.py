@@ -16,12 +16,17 @@ unredacted; this one cannot be, because it only ever sees the queue's side of th
 Each line is one UTF-8 JSON object, ``{"v": 1, "level": "<levelname>", "line": "<rendered text>"}``,
 ending in ``\\n``. JSON escaping keeps one entry on one physical line whatever the rendered text holds.
 ``level`` is kept because the syslog priority is derived from it when the entry is finally sent.
+Text is written as itself, in UTF-8, so its cost against the cap is its real size. The one exception
+is an entry holding a lone surrogate, which has no UTF-8 form and is written with ASCII escapes.
 
 **Rotation and bound.** Appends go to the newest segment until it reaches ``segment_bytes``; the next
 append opens a new one. The whole directory is capped at ``max_bytes`` on disk. An append that would
 cross the cap is DROPPED and counted, newest first, which keeps the oldest evidence -- the same
 choice the in-memory queue makes, for the same reason. A segment is deleted as soon as every entry in
-it has been sent, so a drained spool holds no files.
+it has been sent, so a drained spool holds no files. A sent segment whose delete FAILED is out of
+the replay order but still on disk, so it stays counted against the cap, and an append that would
+otherwise drop tries the delete again. A write the disk refused is dropped and counted; the empty
+segment it would have started is removed, so a full disk does not fill the directory with empty files.
 
 **Replay order.** Strictly first in, first out: segments in sequence order, lines in file order. While
 anything is spooled, the forwarder appends new records to the spool rather than sending them live,
@@ -118,6 +123,17 @@ def _segment_seq(path: Path) -> int | None:
     return int(digits) if len(digits) == 12 and digits.isascii() and digits.isdigit() else None
 
 
+def count_segments(directory: str | Path) -> int:
+    """How many spool segment files ``directory`` holds. ``0`` if it is missing or cannot be listed.
+
+    Reads names only, takes no lock and changes nothing, so it is safe on a directory another
+    process is spooling into."""
+    try:
+        return sum(1 for path in Path(directory).iterdir() if _segment_seq(path) is not None)
+    except OSError:
+        return 0
+
+
 def _try_lock(fd: int) -> bool:
     """Take a non-blocking exclusive lock on ``fd``; ``False`` if another process holds it."""
     if sys.platform == "win32":
@@ -182,6 +198,10 @@ class LogSpool:
         #: Sent segments whose file would not delete (BACKLOG #2279). Out of the replay order, but
         #: still on disk, so their bytes stay in :attr:`_sizes` and count against the cap.
         self._undeleted: list[int] = []
+        #: Whether :meth:`open` made the directory, and the lock file, itself. :meth:`discard_unused`
+        #: removes only what this object created.
+        self._created_dir = False
+        self._created_lock = False
 
     # --- lifecycle ------------------------------------------------------------------------------
 
@@ -189,9 +209,12 @@ class LogSpool:
         """Create the directory, take its lock, and index any segments a previous process left.
 
         Raises :class:`SpoolUnavailable` when the directory cannot be used by this process."""
+        lock_path = self.directory / _LOCK_NAME
         try:
+            self._created_dir = not self.directory.exists()
+            self._created_lock = not lock_path.exists()
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd = os.open(self.directory / _LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError as exc:
             raise SpoolUnavailable(
                 f"log spool directory {self.directory} is not usable: {exc}"
@@ -235,6 +258,33 @@ class LogSpool:
             with contextlib.suppress(OSError):
                 os.close(self._lock_fd)
             self._lock_fd = None
+
+    def discard_unused(self) -> None:
+        """Close, and remove the lock file and directory this :meth:`open` created, if the spool
+        holds nothing (BACKLOG #2279).
+
+        For a caller that opened the spool and then found it has no forwarder to put behind it.
+        Without this, a start that failed left an empty directory and a ``spool.lock`` behind for
+        a spool that never ran. Nothing that was there before is removed: not a directory that
+        already existed, not a lock file an earlier run left, and never a directory holding a
+        segment, which is undelivered evidence. Only the leaf directory is removed, not parents
+        ``open`` created on the way to it."""
+        empty = not self._sizes
+        lock_path = self.directory / _LOCK_NAME
+        if empty and self._created_lock and sys.platform != "win32":
+            # POSIX: unlink while the lock is still held, so no other process can lock a file
+            # that is about to vanish. Windows cannot delete an open file; it goes after close().
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+        self.close()
+        if not empty:
+            return
+        if self._created_lock and sys.platform == "win32":
+            with contextlib.suppress(OSError):  # held open by another process: theirs now, keep it
+                lock_path.unlink()
+        if self._created_dir:
+            with contextlib.suppress(OSError):  # rmdir refuses a directory that is not empty
+                self.directory.rmdir()
 
     # --- state ----------------------------------------------------------------------------------
 

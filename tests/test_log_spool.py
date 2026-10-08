@@ -27,6 +27,7 @@ from messagefoundry.logging_setup import (
     _build_queued_forwarder,
     _ForwardQueueHandler,
     _ForwardQueueListener,
+    _open_forward_spool,
     _TimeoutSysLogHandler,
     _TlsSysLogHandler,
     configure_logging,
@@ -720,3 +721,95 @@ def test_a_failed_write_that_left_bytes_keeps_the_segment_and_counts_them(
         assert spool.unreadable == 1
     finally:
         spool.close()
+
+
+def _bad_certificate(self: Any) -> None:
+    raise ssl.SSLCertVerificationError("certificate verify failed")
+
+
+def _forward_to(spool_dir: Path, *, spool_max_bytes: int = 1_000_000) -> SyslogForward:
+    return SyslogForward(
+        host="siem.example.org",
+        port=6514,
+        protocol="tcp",
+        spool_dir=str(spool_dir),
+        spool_max_bytes=spool_max_bytes,
+    )
+
+
+def test_a_handler_that_fails_to_build_leaves_no_spool_directory_or_lock_behind(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spool is opened before the handler is built. When the build fails for good, the
+    directory and ``spool.lock`` that open created must not outlive it."""
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _bad_certificate)
+    assert configure_logging("INFO", forward=_forward_to(spool_dir)) is False
+    assert not spool_dir.exists()
+
+
+def test_that_cleanup_never_removes_a_directory_or_segments_that_were_there_before(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: undelivered segments from an earlier run, and the directory that holds them,
+    are kept. An empty directory that already existed is kept too, without the new lock file."""
+    earlier = LogSpool(spool_dir, max_bytes=100_000)
+    earlier.open()
+    earlier.append(_entry(0))
+    earlier.close()
+    (spool_dir / "spool.lock").unlink()  # so the open below is the one that creates it
+    kept = [(p.name, p.read_bytes()) for p in _segments(spool_dir)]
+    assert kept
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _bad_certificate)
+    assert configure_logging("INFO", forward=_forward_to(spool_dir)) is False
+    assert [(p.name, p.read_bytes()) for p in _segments(spool_dir)] == kept
+
+    empty = spool_dir.parent / "already-there"
+    empty.mkdir()
+    assert configure_logging("INFO", forward=_forward_to(empty)) is False
+    assert empty.is_dir() and list(empty.iterdir()) == []
+
+
+@pytest.mark.parametrize("leftover", [2, 0], ids=["segments-left", "nothing-left"])
+def test_a_spool_turned_off_warns_once_about_segments_it_leaves_and_deletes_none(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture, leftover: int
+) -> None:
+    earlier = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=1)
+    earlier.open()
+    for n in range(leftover):
+        earlier.append(_entry(n))
+    earlier.close()
+    before = [(p.name, p.read_bytes()) for p in _segments(spool_dir)]
+    assert len(before) == leftover
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        assert _open_forward_spool(_forward_to(spool_dir, spool_max_bytes=0)) is None
+    warnings = [r.getMessage() for r in caplog.records if "turned off" in r.getMessage()]
+    assert len(warnings) == (1 if leftover else 0)
+    if leftover:
+        assert str(spool_dir) in warnings[0] and "2 spool segment(s)" in warnings[0]
+    assert [(p.name, p.read_bytes()) for p in _segments(spool_dir)] == before
+
+
+def test_records_spooled_at_shutdown_are_reported_once_with_their_count(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    fwd = _build_queued_forwarder(_FlakyCollector(), fmt="text", spool=spool)
+    listener = fwd._listener
+    assert listener.stop_within(1.0)  # the thread has ended; drive the listener by hand
+    listener._drain_deadline = time.monotonic() - 1.0  # the drain window has closed
+    for n in range(3):
+        listener.handle(
+            logging.makeLogRecord({"msg": f"late {n}", "levelname": "WARNING", "levelno": 30})
+        )
+    assert listener.spooled_at_stop == 3
+    with caplog.at_level(logging.INFO, logger="messagefoundry.logging_setup"):
+        fwd.close()
+        fwd.close()  # idempotent: no second report
+    reports = [r.getMessage() for r in caplog.records if "kept" in r.getMessage()]
+    assert len(reports) == 1
+    assert "kept 3 queued record(s)" in reports[0] and str(spool_dir) in reports[0]
+    assert "late" not in caplog.text  # a count and a directory, never a record
+    assert len(_segments(spool_dir)) == 1  # and they are on disk for the next start

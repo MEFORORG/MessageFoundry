@@ -1233,6 +1233,15 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
             # thread still appending would race. A thread that outlived its join keeps the lock
             # until the process exits, which is when the OS releases it anyway.
             spool.close()
+        kept = self._listener.spooled_at_stop
+        if spool is not None and kept:
+            # Not a loss, so INFO: these were still queued at the drain deadline and went to disk.
+            _log.info(
+                "off-box log forwarding kept %d queued record(s) in the on-disk spool at %s at "
+                "shutdown; they are sent after the next start.",
+                kept,
+                spool.directory,
+            )
         if not drained or undelivered:
             _log.warning(
                 "off-box log forwarding shut down with at least %d record(s) undelivered after "
@@ -1269,7 +1278,23 @@ def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     A spool that cannot be opened (an unwritable directory, or one another process holds) warns and
     leaves the forwarder spool-less rather than refusing to start: the spool adds durability to a
     best-effort stream, and losing it must not cost the message path its start (BACKLOG #1966)."""
-    if not forward.spool_dir or forward.spool_max_bytes <= 0:
+    if not forward.spool_dir:
+        return None
+    if forward.spool_max_bytes <= 0:
+        from messagefoundry.log_spool import count_segments
+
+        leftover = count_segments(forward.spool_dir)
+        if leftover:
+            # Warn, never delete: these are records that were not delivered, and a delete cannot
+            # be undone (BACKLOG #2279).
+            _log.warning(
+                "the on-disk log spool is turned off ([logging].forward_spool_max_bytes = 0), but "
+                "%s still holds %d spool segment(s) "
+                "from an earlier run. They are not sent and not deleted. Turn the spool back on "
+                "to send them, or remove them by hand once they are no longer needed.",
+                forward.spool_dir,
+                leftover,
+            )
         return None
     spool = LogSpool(forward.spool_dir, max_bytes=forward.spool_max_bytes)
     try:
@@ -1408,7 +1433,11 @@ def configure_logging(
             fwd_handler = _build_syslog_handler(forward, defer_connect=spool is not None)
         except BaseException as exc:
             if spool is not None:
-                spool.close()  # on ANY failure, or the lock outlives it (InsecureHopRefused too)
+                # On ANY failure, or the lock outlives it (InsecureHopRefused too). The spool was
+                # opened first because whether to defer the connect depends on having one; with no
+                # forwarder to put behind it, take back the directory and lock file this call
+                # created. Segments an earlier run left are kept (BACKLOG #2279).
+                spool.discard_unused()
             if not isinstance(exc, OSError):
                 raise
             if is_permanent_connect_error(exc):
