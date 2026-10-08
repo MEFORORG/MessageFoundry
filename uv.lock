@@ -1409,7 +1409,7 @@ requires-dist = [
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30" },
     { name = "atheris", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'fuzz'", specifier = ">=3.1.0" },
     { name = "cryptography", specifier = ">=48.0.1" },
-    { name = "fastapi", specifier = ">=0.140.0" },
+    { name = "fastapi", specifier = ">=0.142.0" },
     { name = "fhir-core", marker = "extra == 'fhir'", specifier = ">=1.1.11" },
     { name = "fhir-resources", marker = "extra == 'fhir'", specifier = ">=7.1.0" },
     { name = "fhirpathpy", marker = "extra == 'fhir'", specifier = ">=2.2.0" },
