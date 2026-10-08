@@ -378,7 +378,8 @@ from typing import Any
 #:
 #: BACKLOG #2612: ``SystemStatus`` gained ``log_forwarder``, a ``LogForwarderInfo`` the console's
 #: status page and health indicator render. A DTO the console reads by attribute, so it forces a
-#: bump. Re-derived on the tree merged with BACKLOG #2337, so the value below covers both.
+#: bump. Re-derived on the tree merged with BACKLOG #2337, and again on the tree merged with vault
+#: BACKLOG #3259 / #3260, which did not move it. The value below covers all three.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
