@@ -3532,6 +3532,7 @@ jobs:
           # engine reports it at ERROR and starts. The CA+CRL is minted in the run block below.
           MEFOR_LOGGING_FORWARD_HOST: siem.invalid
           MEFOR_LOGGING_FORWARD_PROTOCOL: tls
+          MEFOR_EGRESS_ALLOWED_SYSLOG: siem.invalid  # BACKLOG #2356: the collector is an egress destination
         run: |
           set -o pipefail
           mkdir -p out/load
@@ -4087,6 +4088,7 @@ jobs:
             "MEFOR_RETENTION_SEARCH_PRESET_DAYS=30" `
             "MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true" `
             "MEFOR_LOGGING_FORWARD_HOST=siem.invalid" `
+            "MEFOR_EGRESS_ALLOWED_SYSLOG=siem.invalid" `
             "MEFOR_LOGGING_FORWARD_PROTOCOL=tls" `
             "MEFOR_LOGGING_FORWARD_TLS_CA_FILE=$syslogCa" `
             "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=$syslogCa" `
@@ -4790,6 +4792,7 @@ jobs:
             -e MEFOR_RETENTION_SEARCH_PRESET_DAYS=30 \
             -e MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true \
             -e MEFOR_LOGGING_FORWARD_HOST=siem.invalid \
+            -e MEFOR_EGRESS_ALLOWED_SYSLOG=siem.invalid \
             -e MEFOR_LOGGING_FORWARD_PROTOCOL=tls \
             -e MEFOR_LOGGING_FORWARD_TLS_CA_FILE=/syslog-ca/syslog_ca_and_crl.pem \
             -e MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=/syslog-ca/syslog_ca_and_crl.pem \

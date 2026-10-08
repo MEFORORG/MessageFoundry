@@ -4308,6 +4308,15 @@ class EgressSettings(_Section):
     # to combine it with proxy credentials, so that path mints no `Proxy-Authorization`.
     # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.
     allowed_proxy: list[str] = []
+    # Allowed SYSLOG collectors for the off-box log forwarder (``[logging].forward_host`` and
+    # ``forward_port``; BACKLOG #2356): each entry is "host" (any port) or "host:port". The forwarder
+    # is not a connection, so no graph check sees it; ``serve`` and ``supervise`` check it at start,
+    # before the forwarder opens a socket, through ``syslog_forward_refusal`` in
+    # messagefoundry/transports/egress.py. Empty and unset mean what they mean for ``allowed_tcp``:
+    # refused while ``deny_by_default`` is on, unrestricted under the audited opt-out. It never
+    # counts toward serve's open-egress start gate, because it names no message destination.
+    # Env (comma-separated): MEFOR_EGRESS_ALLOWED_SYSLOG.
+    allowed_syslog: list[str] = []
 
     # Deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every destination
     # of that type instead of allowing any, and so do at least the DATABASE/REMOTEFILE sources and the
@@ -4334,6 +4343,7 @@ class EgressSettings(_Section):
         "allowed_recipient_domains",
         "proxy_no_proxy",
         "allowed_proxy",
+        "allowed_syslog",
         mode="before",
     )
     @classmethod

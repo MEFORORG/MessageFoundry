@@ -1942,6 +1942,23 @@ def _start_logging(
             file=sys.stderr,
         )
 
+    # BACKLOG #2356: the collector is an outbound destination, and until this check no [egress]
+    # list governed it. The forwarder is not a connection, so the graph's egress check never sees
+    # it. Decided here, last of the forwarding gates and before the handler is installed, so a
+    # refused collector is never dialled. It refuses under either enforcement dial, as every
+    # [egress] list does.
+    if log_forward is not None:
+        from messagefoundry.transports.egress import syslog_forward_refusal
+
+        _egress_gap = syslog_forward_refusal(log_forward.host, log_forward.port, settings.egress)
+        if _egress_gap is not None:
+            print(
+                f"error: {_egress_gap}; refusing to start. List the collector in "
+                "[egress].allowed_syslog as 'host' (any port) or 'host:port'.",
+                file=sys.stderr,
+            )
+            return 2
+
     try:
         forwarder_live = configure(log_forward)
     except OSError as exc:

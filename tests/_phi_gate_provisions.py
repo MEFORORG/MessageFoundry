@@ -217,13 +217,16 @@ _SYSLOG_CLIENT_PEM = "syslog_client.pem"
 
 
 def verified_log_forwarding_env(bundle: str) -> dict[str, str]:
-    """The environment that satisfies the #1966 gate, given a CA+CRL bundle path."""
+    """The environment that satisfies the #1966 gate and lists its collector in
+    ``[egress].allowed_syslog``, given a CA+CRL bundle path."""
     return {
         "MEFOR_LOGGING_FORWARD_HOST": VERIFIED_LOG_FORWARDING_HOST,
         "MEFOR_LOGGING_FORWARD_PROTOCOL": "tls",
         "MEFOR_LOGGING_FORWARD_TLS_CA_FILE": bundle,
         "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE": bundle,
         "MEFOR_LOGGING_FORWARD_TLS_CLIENT_CERT": str(Path(bundle).with_name(_SYSLOG_CLIENT_PEM)),
+        # BACKLOG #2356: the collector is an egress destination, refused at start unless listed.
+        "MEFOR_EGRESS_ALLOWED_SYSLOG": VERIFIED_LOG_FORWARDING_HOST,
     }
 
 

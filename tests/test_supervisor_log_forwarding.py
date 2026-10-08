@@ -64,8 +64,13 @@ def _run(
     toml: str = "",
     *,
     verified_forwarding: bool = False,
+    allowed_syslog: str | None = VERIFIED_LOG_FORWARDING_HOST,
+    provisions: str = PHI_GATE_PROVISIONS_TOML,
 ) -> tuple[int, _Recorder]:
-    """Run ``serve`` or ``supervise`` as a prod instance with every OTHER gate pre-cleared."""
+    """Run ``serve`` or ``supervise`` as a prod instance with every OTHER gate pre-cleared.
+
+    ``allowed_syslog`` is the ``[egress].allowed_syslog`` value a verified-forwarding run starts
+    with; ``None`` leaves the list unset. It defaults to the collector the provision names."""
     from messagefoundry.__main__ import main
 
     recorder = _Recorder()
@@ -73,7 +78,11 @@ def _run(
     setenv_retention_windows(monkeypatch)
     if verified_forwarding:
         setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path))
-    (tmp_path / "messagefoundry.toml").write_text(PHI_GATE_PROVISIONS_TOML + toml, encoding="utf-8")
+        if allowed_syslog is None:
+            monkeypatch.delenv("MEFOR_EGRESS_ALLOWED_SYSLOG")
+        else:
+            monkeypatch.setenv("MEFOR_EGRESS_ALLOWED_SYSLOG", allowed_syslog)
+    (tmp_path / "messagefoundry.toml").write_text(provisions + toml, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.__main__.configure_logging", recorder.configure_logging)
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", recorder.supervise)
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())

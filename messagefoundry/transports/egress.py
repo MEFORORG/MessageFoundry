@@ -577,6 +577,31 @@ def _refuse_email_recipient(name: str, why: str) -> NoReturn:
     )
 
 
+def syslog_forward_refusal(host: str, port: int, egress: EgressSettings) -> str | None:
+    """Why ``[egress].allowed_syslog`` refuses the off-box log forwarder's collector, or ``None``
+    when the forwarder may dial it (BACKLOG #2356).
+
+    The forwarder is configured in ``[logging]``, not in the graph, so no connector build reaches
+    it. ``serve`` and ``supervise`` call this at start, before the forwarder opens a socket. The
+    rule is the raw-TCP destination's (:func:`check_egress_allowed`): an empty list refuses while
+    ``deny_by_default`` is on and is unrestricted under the audited opt-out, and a set list
+    refuses a collector that is not on it. Like every check here it reads the configured host
+    string and resolves nothing. This is the predicate; the caller prints the refusal."""
+    if not egress.allowed_syslog:
+        if not egress.deny_by_default:
+            return None
+        return (
+            f"{BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and [egress].allowed_syslog is empty, so the "
+            f"syslog collector [logging].forward_host {host!r} port {port} is refused"
+        )
+    if host_port_allowed(host, port, egress.allowed_syslog):
+        return None
+    return (
+        f"the syslog collector [logging].forward_host {host!r} port {port} is not in the "
+        "[egress].allowed_syslog allowlist"
+    )
+
+
 def host_port_allowed(host: str, port: object, allowed: list[str]) -> bool:
     host = host.lower()
     for entry in allowed:
