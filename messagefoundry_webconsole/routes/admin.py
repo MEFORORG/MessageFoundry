@@ -352,7 +352,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if notify_changed:
                 fields["notify_email"] = typed_notify
             body = UserUpdateRequest.model_validate(fields)
-            await admin.update_user(user_id, body=body, service=service, identity=identity)
+            await admin.update_user(
+                user_id, body=body, request=request, service=service, identity=identity
+            )
         except (ValidationError, HTTPException) as exc:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
@@ -532,7 +534,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # newer engine would read `expires_at` off an older one and raise AttributeError at
             # reset time — the exact skew SUPPORTED_ENGINE_SEAMS exists to refuse loudly at startup.
             result: PasswordResetResponse = await admin.reset_user_password(
-                user_id, service=service, identity=identity
+                user_id, request=request, service=service, identity=identity
             )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
@@ -563,7 +565,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         assert_same_origin(request)
         try:
             reset: MfaResetResponse = await admin.reset_user_mfa(
-                user_id, service=service, identity=identity
+                user_id, request=request, service=service, identity=identity
             )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
@@ -709,7 +711,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         try:
             await admin.bind_user_federated_identity(
-                user_id, body=body, service=service, identity=identity
+                user_id, body=body, request=request, service=service, identity=identity
             )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
@@ -765,7 +767,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         try:
             await admin.unbind_user_federated_identity(
-                user_id, body=shown, service=service, identity=identity
+                user_id, body=shown, request=request, service=service, identity=identity
             )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
@@ -801,7 +803,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         try:
-            await admin.delete_user(user_id, service=service, identity=identity)
+            await admin.delete_user(user_id, request=request, service=service, identity=identity)
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise

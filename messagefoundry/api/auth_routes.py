@@ -251,11 +251,16 @@ def _current_user(identity: Identity) -> CurrentUser:
     )
 
 
+#: The two federated-identity routes refuse the caller's own account in the same words.
+_OWN_BINDING = "another administrator must change your own binding"
+
+
 async def _refuse_if_self(
+    request: Request,
     service: AuthService,
     identity: Identity,
     user_id: str,
-    target: UserRecord | None,
+    target: UserRecord | None = None,
     *,
     op: SelfTargetOp,
     detail: str,
@@ -263,13 +268,18 @@ async def _refuse_if_self(
     """Raise the 400 when an admin route targets the caller's own account, after the refusal's own
     audit row (vault BACKLOG #3260).
 
-    The stored id decides, not only the path's spelling (vault BACKLOG #3259). A store whose id
-    column compares case-insensitively (SQL Server) finds the caller's row from another spelling,
-    and the console's ``/ui/users/{user_id}/`` routes pass the path to these handlers as a plain
-    str, past the JSON plane's ``ResourceId`` pattern. ``target`` is the row the path resolves to."""
-    if user_id == identity.user_id or (target is not None and target.id == identity.user_id):
-        await service.audit_self_target_refused(identity, op=op)
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
+    The path's spelling OR the stored id decides (vault BACKLOG #3259). A store whose id column
+    compares case-insensitively (SQL Server) finds the caller's row from another spelling, and the
+    console's ``/ui/users/{user_id}/`` routes pass the path to these handlers as a plain str, past
+    the JSON plane's ``ResourceId`` pattern. ``target`` is the row the path resolves to, when the
+    caller has read it; otherwise it is read here, and only when the path spelling did not match."""
+    if user_id != identity.user_id:
+        if target is None:
+            target = await service.store.get_user(user_id)
+        if target is None or target.id != identity.user_id:
+            return
+    await service.audit_self_target_refused(identity, op=op, client=_client(request))
+    raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
 
 
 def _login_response(
@@ -1193,6 +1203,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def update_user(
         user_id: ResourceId,
         body: UserUpdateRequest,
+        request: Request,
         service: AuthService = Depends(_service),
         # 7.5.1 (ASVS): the one broad-admin route promoted to ACTION-binding (fresh single-use grant
         # bound to admin_user_update, not the shared login window). The other USERS_MANAGE routes keep
@@ -1206,6 +1217,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
         if body.disabled:
             await _refuse_if_self(
+                request,
                 service,
                 identity,
                 user_id,
@@ -1253,12 +1265,19 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.delete("/users/{user_id}", response_model=SimpleMessage)
     async def delete_user(
         user_id: ResourceId,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         target = await service.store.get_user(user_id)
         await _refuse_if_self(
-            service, identity, user_id, target, op="delete", detail="cannot delete your own account"
+            request,
+            service,
+            identity,
+            user_id,
+            target,
+            op="delete",
+            detail="cannot delete your own account",
         )
         if target is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -1321,6 +1340,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     )
     async def reset_user_password(
         user_id: ResourceId,
+        request: Request,
         service: AuthService = Depends(_service),
         # BACKLOG #1148 (ASVS 7.5.1): the proof must be BOUND TO THIS ACTION and single-use, not
         # the login-seeded window. require_step_up_ACTION, never the reauth_only variant -- that
@@ -1339,10 +1359,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         gate stops accepting this credential, so the administrator conveying it out-of-band can state
         the deadline. Nothing else on this path ever reaches the holder."""
         await _refuse_if_self(
+            request,
             service,
             identity,
             user_id,
-            await service.store.get_user(user_id),
             op="password_reset",
             detail="use change-password for your own account",
         )
@@ -1382,6 +1402,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     )
     async def reset_user_mfa(
         user_id: ResourceId,
+        request: Request,
         service: AuthService = Depends(_service),
         # BACKLOG #1148 (ASVS 7.5.1). This is the sharper of the two: one call clears the TOTP
         # secret, every recovery code and every passkey on the target account.
@@ -1413,10 +1434,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # Copied in shape from reset_user_password above, which has carried the same guard since
         # ASVS 6.4.6 -- the two admin routes now refuse the same case the same way.
         await _refuse_if_self(
+            request,
             service,
             identity,
             user_id,
-            await service.store.get_user(user_id),
             op="mfa_reset",
             detail="use the self-service MFA settings for your own account",
         )
@@ -1482,6 +1503,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def bind_user_federated_identity(
         user_id: ResourceId,
         body: FederatedIdentityRequest,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
@@ -1496,12 +1518,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # federated identity ends every session you hold, the calling one included, and on a site
         # where you sign in only through the IdP it can leave the last administrator locked out.
         await _refuse_if_self(
+            request,
             service,
             identity,
             user_id,
-            await service.store.get_user(user_id),
             op="federated_bind",
-            detail="another administrator must change your own binding",
+            detail=_OWN_BINDING,
         )
         try:
             bound = await service.bind_federated_subject(
@@ -1531,6 +1553,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def unbind_user_federated_identity(
         user_id: ResourceId,
         body: ExpectedFederatedPair,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
@@ -1541,12 +1564,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         pair the caller saw; a stored pair that differs is refused 409 with nothing changed
         (BACKLOG #2026)."""
         await _refuse_if_self(
+            request,
             service,
             identity,
             user_id,
-            await service.store.get_user(user_id),
             op="federated_unbind",
-            detail="another administrator must change your own binding",
+            detail=_OWN_BINDING,
         )
         try:
             revoked = await service.unbind_federated_subject(
