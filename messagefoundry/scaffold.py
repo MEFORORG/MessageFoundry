@@ -113,14 +113,17 @@ port = 8765
 # EVERY instance carries patient data (ADR 0186) - there is no data-class switch to set here, and the
 # retired one is REFUSED at load. To relax a specific PHI gate, name that gate's own switch.
 # block_unlisted_outbound = false     # the audited opt-out: an empty [egress] list allows any destination
-# Transform state has no retention window by default. Under the default `enforcement = "enforce"`,
-# `serve` refuses to start, and `messagefoundry check` fails, on a tier with neither a window nor
-# its acknowledgement; under "warn" both only warn. This is the acknowledgement. The window is
-# `[retention].state_max_age_days`, and it deletes state by the time it was last WRITTEN, so it can
-# remove an entry a Handler still reads.
-# It is an audited loosening; `serve` writes an AUDIT line for it at each start. REVIEW THIS SWITCH
-# before you copy this file to a production instance: a Handler that keys state on an identifier
-# such as an MRN stores that key in plaintext. See the engine's docs/PHI.md, section 2.
+# Transform state has no retention window by default, and each such tier needs a window or its
+# own acknowledgement. Under the default `enforcement = "enforce"`, `serve` refuses to start
+# without one and `messagefoundry check` fails. Under "warn", `serve` warns and starts, and
+# `check` passes with the warning on its line.
+# The switch below is the acknowledgement, and it is an audited loosening. While state has no
+# window, `serve` logs a WARNING-level AUDIT line for it at each start.
+# The other answer is the window, `[retention].state_max_age_days`. It deletes state by the time
+# it was last WRITTEN, so it can remove an entry a Handler still reads.
+# REVIEW THIS SWITCH before you copy this file to a production instance. It keeps state forever,
+# and a state key is stored in plaintext whatever this switch says. Key state on a surrogate,
+# never on a patient identifier. See the engine's docs/PHI.md, section 2.
 allow_keeping_transform_state_indefinitely = true
 
 [retention]
