@@ -82,7 +82,8 @@ this line.**
   standard defines.
   A current browser sends `Sec-Fetch-Site` on every request, so the console's pages are unaffected
   there. A browser that sends neither header on its own form POST could not sign in with a
-  password; `docs/BROWSER-SUPPORT.md` says what is and is not measured about such a browser. A
+  password or change anything, sign-out included; `docs/BROWSER-SUPPORT.md` says what is and is
+  not measured about such a browser. A
   script that drives `/ui` must now send `Origin`. The CSP report sink `/ui/csp-report` still
   accepts a report with neither. A GET is not held to this: three sign-in GETs are deliberately
   not blocked for missing fetch metadata, under owner rulings R4 and R4b of 2026-09-28: `GET

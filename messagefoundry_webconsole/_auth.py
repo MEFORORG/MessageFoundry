@@ -675,7 +675,8 @@ def assert_same_origin(request: Request) -> None:
 
     The **primary** CSRF defense is the SameSite=Strict session cookie: a cross-site POST carries no
     ``mf_session`` cookie, so ``require_ui`` already fails it (303 to login) before any action runs.
-    This adds an explicit origin check on top: modern browsers send ``Sec-Fetch-Site`` on every request
+    This adds an explicit origin check on top, whose exact rule is the table below. In outline:
+    modern browsers send ``Sec-Fetch-Site`` on every request
     (reject ``cross-site``/``same-site``); for older clients that omit it, fall back to comparing the
     ``Origin`` to our own origin (``[api].public_origin`` when set, else the request ``Host``, except
     behind a proxy in front of a loopback bind, where nothing matches). A same-origin form POST (the
@@ -688,13 +689,24 @@ def assert_same_origin(request: Request) -> None:
     (by design — a must-change-confined session must be able to revoke itself, ASVS 7.4.4) and so has
     no other request-provenance control.
 
-    **THE RULE, stated once.** This table is the one complete statement of what the check does.
-    Other documents say the one fact they need and point here. ``test_ui_origin_guard.py`` reads the
-    table out of this docstring and drives the function over every row, so the two cannot drift.
-    A refusal is a 403. "write" is any method but GET, to match ``require_ui``. "matches" means
-    :func:`_origin_matches` accepts the ``Origin``; ``Origin: null`` does not match. "any other
-    value" is any non-empty value outside the four named, compared exactly: another letter case or
-    padding is another value.
+    **THE RULE, stated once.** This table is the one statement of what the check does with the
+    method and ONE line of each header. Other documents say the one fact they need and point here.
+    ``test_ui_origin_guard.py`` reads the table out of this docstring and drives the function over
+    every row, on the Host-fallback posture; a change to the table or to these branches that
+    leaves the other behind fails there.
+
+    What the table does not state, so it is not read as covering it:
+
+    * "matches" means :func:`_origin_matches` accepts the ``Origin``. What that function compares
+      is its own subject (a configured public origin, the ``Host`` fallback, the proxied-loopback
+      refusal) and is not restated or re-tested by the table.
+    * A repeated ``Sec-Fetch-Site`` line: this function reads the first, and
+      :class:`._security.UiFetchMetadataMiddleware` keeps the last.
+    * Values are compared as this function receives them. "any other value" is any non-empty value
+      outside the four named, so another letter case or padding is another value HERE; an HTTP
+      server may trim padding before the request arrives.
+
+    A refusal is a 403. "write" is any method but GET, to match ``require_ui``.
 
     ======  =======================  ===============  =======
     Method  Sec-Fetch-Site           Origin           Verdict

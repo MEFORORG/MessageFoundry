@@ -245,7 +245,11 @@ def test_a_get_with_any_sec_fetch_site_line_deliberately_does_not_read_origin() 
 
 # --- the rule table in the assert_same_origin docstring, driven row by row --------------------------
 
-_TABLE_METHODS = {"write": ("POST", "PUT", "DELETE", "PATCH"), "GET": ("GET",)}
+#: "write" is any method but GET, so the safe-looking HEAD and OPTIONS are writes here too.
+_TABLE_METHODS = {
+    "write": ("POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"),
+    "GET": ("GET",),
+}
 #: Each table state as the header values that realise it. ``None`` is "no such line".
 _TABLE_SITES: dict[str, tuple[str | None, ...]] = {
     "absent": (None,),
@@ -304,7 +308,12 @@ def test_the_docstring_rule_table_is_what_the_function_does() -> None:
     is driven over every row, with several concrete header values per state.
 
     It also checks the table is COMPLETE: every method, ``Sec-Fetch-Site`` state and ``Origin``
-    state is covered by exactly one row, so a case cannot be left out of the statement."""
+    state is covered by exactly one row, so a case cannot be left out of the statement.
+
+    Scope: one posture, the ``Host`` fallback with no public origin and no proxy. What "matches"
+    means under a configured public origin or behind a proxied loopback bind is
+    ``_origin_matches``'s subject and is tested where that function is (the BACKLOG #2217 tests
+    below), not here."""
     rows = _rule_table()
     # positive controls: the parse found real rows, and both verdicts appear, so a table that
     # parsed to nothing or a function that accepted everything could not pass
