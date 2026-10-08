@@ -6064,9 +6064,10 @@ class BackupSettings(_Section):
     # REFUSES to write an unencrypted archive (fail-closed). With it on, any keyless instance writes
     # one: the check reads no synthetic or non-PHI condition, and every instance carries patient data
     # since BACKLOG #1279 (ADR 0186), so a cleartext archive can hold PHI. Each backup's `dr_backup`
-    # audit row carries `encrypted: false`; security_loosenings() does not name this flag. Naming it
-    # is owed (vault BACKLOG #2302): the registry takes each section as a required argument, so it
-    # needs a `backup` one passed at every call site. docs/SECURITY-LOOSENING.md has the entry.
+    # audit row carries `encrypted: false`. Setting it is a LOOSENING: security_loosenings() names it
+    # as `backup.allow_unencrypted` (vault BACKLOG #2302), so the serve-time warning,
+    # `messagefoundry security show` and GET /security/posture report it. No instance is refused for
+    # setting it. docs/SECURITY-LOOSENING.md has the entry.
     allow_unencrypted: bool = False
 
     @field_validator("schedule_at")
@@ -8003,6 +8004,7 @@ def security_loosenings(
     api: ApiSettings,
     approvals: ApprovalsSettings,
     cert_monitor: CertMonitorSettings,
+    backup: BackupSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
@@ -8025,6 +8027,7 @@ def security_loosenings(
     (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
     #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
+    ``[backup].allow_unencrypted`` (vault BACKLOG #2302),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
     leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
@@ -8072,7 +8075,8 @@ def security_loosenings(
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
-    ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227).
+    ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
+    ``[backup].allow_unencrypted`` (vault BACKLOG #2302).
 
     **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
     settings silence one or more of them with no refusal, and each is named here, so the serve-time
@@ -8465,6 +8469,23 @@ def security_loosenings(
                 "it is the deploying site's job. At least sign-in credentials, session tokens and "
                 "PHI reads cross that hop unencrypted; isolating the hop limits who can read them "
                 "but encrypts nothing (set [api].tls_cert_file to serve it over TLS instead)",
+            )
+        )
+    # Vault BACKLOG #2302: the cleartext-archive escape. Named whenever it is set, with or without
+    # a store key, because it relaxes a refusal in both cases: the write-side one with no key, and
+    # the restore-verify downgrade one with a key. No instance is refused for setting it (a Manager
+    # decision recorded on engine PR 2183), so this entry and the `dr_backup` audit row are its
+    # records. The name carries its section because [security] has an `allow_unencrypted_phi`.
+    if backup.allow_unencrypted:
+        out.append(
+            (
+                "backup.allow_unencrypted",
+                "with no store key the backup runner writes its archive in CLEARTEXT "
+                "(.mfbak.plain) instead of refusing -- on a SQLite store that archive holds a "
+                "full snapshot, message bodies included, so it can hold PHI. With a store key the "
+                "archive is still sealed, but the restore-verify accepts a plaintext archive it "
+                "would otherwise refuse as a possible downgrade. Nothing refuses this flag, under "
+                "enforcement = enforce or otherwise",
             )
         )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the

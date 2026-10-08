@@ -2590,6 +2590,7 @@ def _serve(args: argparse.Namespace) -> int:
         api=settings.api,
         approvals=settings.approvals,
         cert_monitor=settings.cert_monitor,
+        backup=settings.backup,
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
@@ -9754,6 +9755,7 @@ def _security(args: argparse.Namespace) -> int:
         ApiSettings,
         ApprovalsSettings,
         AuthSettings,
+        BackupSettings,
         CertMonitorSettings,
         SecretRotationSettings,
         SecuritySettings,
@@ -9765,7 +9767,7 @@ def _security(args: argparse.Namespace) -> int:
     path = args.service_config
 
     # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api]/[approvals]/[cert_monitor] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup] deviations (ADR 0148: one posture). Resolve those from the whole file so the
     # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
@@ -9782,6 +9784,8 @@ def _security(args: argparse.Namespace) -> int:
     _approvals = ApprovalsSettings()
     # BACKLOG #2227: [cert_monitor].warn_days = 0 turns the certificate reminder off. Same read and marker.
     _cert_monitor = CertMonitorSettings()
+    # Vault BACKLOG #2302: [backup].allow_unencrypted is a loosening too. Same read and marker.
+    _backup = BackupSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -9793,6 +9797,7 @@ def _security(args: argparse.Namespace) -> int:
             _api = _full.api
             _approvals = _full.approvals
             _cert_monitor = _full.cert_monitor
+            _backup = _full.backup
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -9828,6 +9833,7 @@ def _security(args: argparse.Namespace) -> int:
                 api=_api,
                 approvals=_approvals,
                 cert_monitor=_cert_monitor,
+                backup=_backup,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
@@ -9855,7 +9861,7 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
-            "[cert_monitor]); the "
+            "[cert_monitor]/[backup]); the "
             "per-connection "
             "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
             "generic-ODBC database TLS, "

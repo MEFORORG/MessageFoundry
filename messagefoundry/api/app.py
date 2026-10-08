@@ -1285,6 +1285,10 @@ def _posture_loosenings(
             # shipped default, the stash-or-default rule [secret_rotation] follows above. KNOWN
             # GAP: such an engine may run no cert monitor at all, and this then reads it as on.
             cert_monitor=getattr(state, "cert_monitor_settings", None) or CertMonitorSettings(),
+            # Vault BACKLOG #2302: the cleartext-archive escape, off the [backup] section the
+            # managed lifespan stashed. The same stash-or-default rule: an app built without it
+            # is read at the shipped default, which names nothing.
+            backup=getattr(state, "backup_settings", None) or BackupSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -9932,6 +9936,10 @@ def create_managed_app(
             # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
             # for a monitoring signal, and byte-identical to before.
             app.state.cert_monitor_settings = cert_monitor_settings
+            # Vault BACKLOG #2302: back GET /security/posture's backup.allow_unencrypted entry.
+            # None (direct create_app / embedding) leaves the route on the shipped [backup]
+            # defaults, which report nothing.
+            app.state.backup_settings = backup_settings
             # BACKLOG #1004: back GET /security/posture's enforce_store_key_expiry loosening entry.
             # None (direct create_app / embedding) leaves the route on shipped defaults, which report
             # nothing — correct, because an app built without [secret_rotation] has not opted out.

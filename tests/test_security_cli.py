@@ -252,6 +252,22 @@ def test_show_reports_the_credential_reminders_turned_off(
     assert "cert_monitor.warn_days" not in [e["switch"] for e in data["loosenings"]]
 
 
+def test_show_reports_the_backup_cleartext_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #2302: [backup] is resolved from the whole file too, so the cleartext-archive
+    escape is listed. The same key at its shipped value is the control."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[backup]\nallow_unencrypted = true\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False
+    assert "backup.allow_unencrypted" in [e["switch"] for e in data["loosenings"]]
+    assert "[backup]" in data["loosenings_scope"]
+    toml.write_text("[backup]\nallow_unencrypted = false\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert "backup.allow_unencrypted" not in [e["switch"] for e in data["loosenings"]]
+
+
 def test_show_declares_a_partial_report_when_the_file_will_not_load(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

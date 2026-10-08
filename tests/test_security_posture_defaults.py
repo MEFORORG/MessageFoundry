@@ -35,6 +35,7 @@ from messagefoundry.config.settings import (
     ApiSettings,
     ApprovalsSettings,
     AuthSettings,
+    BackupSettings,
     CertMonitorSettings,
     EgressSettings,
     SecretRotationSettings,
@@ -78,6 +79,7 @@ def _pairs(
     api: ApiSettings | None = None,
     approvals: ApprovalsSettings | None = None,
     cert_monitor: CertMonitorSettings | None = None,
+    backup: BackupSettings | None = None,
 ) -> list[tuple[str, str]]:
     """The loosening ``(switch, risk)`` pairs for a settings combination (defaults where not
     overridden)."""
@@ -97,6 +99,7 @@ def _pairs(
         api=api or ApiSettings(),
         approvals=approvals or ApprovalsSettings(),
         cert_monitor=cert_monitor or CertMonitorSettings(),
+        backup=backup or BackupSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
@@ -151,6 +154,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -185,6 +189,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -216,6 +221,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -308,6 +314,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -447,6 +454,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1014,6 +1022,7 @@ def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
     named = dict(
         _pairs(
             cert_monitor=CertMonitorSettings(warn_days=0),
+            backup=BackupSettings(),
             rotation=SecretRotationSettings(warn_days=0),
         )
     )
@@ -1025,6 +1034,7 @@ def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
     for cert, rotation in ((30, 14), (90, 60)):
         on = _names(
             cert_monitor=CertMonitorSettings(warn_days=cert),
+            backup=BackupSettings(),
             rotation=SecretRotationSettings(warn_days=rotation),
         )
         assert "cert_monitor.warn_days" not in on and "secret_rotation.warn_days" not in on
@@ -1035,6 +1045,7 @@ def test_a_reminder_lead_below_its_default_is_a_named_loosening() -> None:
     named = dict(
         _pairs(
             cert_monitor=CertMonitorSettings(warn_days=29),
+            backup=BackupSettings(),
             rotation=SecretRotationSettings(warn_days=1),
         )
     )
@@ -1278,6 +1289,7 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             api=_proxied(*entries),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1311,6 +1323,7 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             api=_proxied("::/0", "::/0"),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1376,6 +1389,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             api=_terminated(ack=True),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2069,6 +2083,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2115,6 +2130,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2152,6 +2168,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2186,6 +2203,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2738,28 +2756,47 @@ async def test_posture_route_reads_the_docs_switch_off_the_app_in_both_direction
     assert "expose_docs" in named
 
 
-def test_the_backup_cleartext_flag_is_documented_as_not_yet_reported() -> None:
-    """``[backup].allow_unencrypted`` lets a keyless instance write a cleartext archive, and the
-    registry cannot see ``[backup]`` (vault BACKLOG #2302). The guide says so in two places.
-
-    A tripwire, not a decision: once the registry takes a ``backup`` section this reds, and the
-    guide's row and entry must then say the flag IS reported."""
-    import inspect
-
-    from messagefoundry.config.settings import BackupSettings
-
+def test_the_backup_cleartext_flag_is_named_and_its_default_is_not() -> None:
+    """``[backup].allow_unencrypted = true`` lets a keyless instance write a cleartext archive, so
+    the registry names it (vault BACKLOG #2302). The control is the shipped default, which names
+    nothing: an entry that fired on every ``[backup]`` section would pass the first half alone."""
     assert BackupSettings.model_fields["allow_unencrypted"].default is False
-    # Whatever the argument ends up being called: no parameter mentions backup, none is typed as
-    # the section, and the registry's source never names the switch.
-    params = inspect.signature(security_loosenings).parameters
-    assert not [name for name in params if "backup" in name.lower()]
-    assert not [p for p in params.values() if "BackupSettings" in str(p.annotation)]
-    assert '"allow_unencrypted"' not in inspect.getsource(security_loosenings)
+    assert "backup.allow_unencrypted" not in _names()
+    assert "backup.allow_unencrypted" not in _names(backup=BackupSettings(allow_unencrypted=False))
+    risk = dict(_pairs(backup=BackupSettings(allow_unencrypted=True)))["backup.allow_unencrypted"]
+    assert "CLEARTEXT" in risk
+    assert "PHI" in risk
+    # Named with a store key too: the flag also relaxes the restore-verify downgrade refusal.
+    keyed = _names(
+        store=StoreSettings(encryption_key="k" * 44),
+        backup=BackupSettings(allow_unencrypted=True),
+    )
+    assert "backup.allow_unencrypted" in keyed
+    # No other [backup] setting at a non-default value produces this entry.
+    assert "backup.allow_unencrypted" not in _names(
+        backup=BackupSettings(retention_keep=0, verify_after_backup=False)
+    )
+
+
+async def test_posture_route_reports_the_backup_cleartext_flag(engine: Engine) -> None:
+    """``GET /security/posture`` reads the stashed ``[backup]`` section, and an app with none
+    stashed is read at the shipped default, which names nothing."""
+    body = await _posture_body(engine, backup_settings=BackupSettings(allow_unencrypted=True))
+    assert "backup.allow_unencrypted" in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+    control = await _posture_body(engine)
+    assert "backup.allow_unencrypted" not in [e["switch"] for e in control["loosenings"]]  # type: ignore[index,union-attr]
+
+
+def test_the_guide_says_the_backup_cleartext_flag_is_reported() -> None:
+    """The guide's row and entry for the flag name the registry entry, and no longer say it is
+    unreported. Reads two places in one document; it does not prove the prose is right elsewhere."""
     guide = (Path(__file__).parents[1] / "docs" / "SECURITY-LOOSENING.md").read_text("utf-8")
     row = next(line for line in guide.splitlines() if line.startswith("| | `[backup].allow_un"))
-    assert "**Not reported yet**" in row
+    assert "Not reported yet" not in row
+    assert "`backup.allow_unencrypted`" in row
     entry = guide.split("### `[backup].allow_unencrypted = true`", 1)[1].split("\n### ", 1)[0]
-    assert "**not yet** in `security_loosenings()`" in entry
+    assert "not yet" not in entry
+    assert "`backup.allow_unencrypted`" in entry
     assert "`encrypted: false`" in entry
 
 
@@ -2803,6 +2840,9 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
             ad_session_recheck_seconds=0, require_mfa=False, notify_security_events=False
         ),
         egress_settings=EgressSettings(deny_by_default=False),
+        # Vault BACKLOG #2302: the same lifespan must stash [backup]. The section stays
+        # disabled, so no backup runs; only the flag is read.
+        backup_settings=BackupSettings(allow_unencrypted=True),
     )
     transport = httpx.ASGITransport(app=app, client=_DEFAULT_PEER)
     async with (
@@ -2816,3 +2856,4 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
     assert resp.status_code == 200, resp.text
     switches = [entry["switch"] for entry in resp.json()["loosenings"]]
     assert "ad_session_recheck_seconds" in switches
+    assert "backup.allow_unencrypted" in switches

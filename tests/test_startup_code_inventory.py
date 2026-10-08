@@ -912,6 +912,7 @@ import json
 from messagefoundry.config.settings import (
     AlertsSettings, ApiSettings, AuthSettings, SecretRotationSettings, SecuritySettings,
     ApprovalsSettings,
+    BackupSettings,
     CertMonitorSettings,
     StoreSettings, security_loosenings,
 )
@@ -926,6 +927,7 @@ names = [name for name, _ in security_loosenings(
     unverified_db_hops=(), attested_hops=(), revocation_attested_hops=(), api=ApiSettings(),
     approvals=ApprovalsSettings(),
     cert_monitor=CertMonitorSettings(),
+    backup=BackupSettings(),
     store_privilege=None, audit_chain_unkeyed=None, remote_debug=remote_debug_posture(),
     startup=startup,
 )]
