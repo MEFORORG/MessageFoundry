@@ -39,8 +39,8 @@ already appended. A power loss can lose a tail the OS had not yet written.
 **Delivery is best effort, not at least once.** After a TCP or TLS collector resets, the first send
 on the dead connection can succeed into the local kernel buffer, so that entry is marked sent and
 lost. The read position is kept in memory, so after a restart the oldest segment is replayed from its
-start: a collector can see up to one segment (one eighth of the cap, 12.5 MB at the default 100 MB)
-twice. Over UDP no send failure is detectable at all. ADR 0200 states the same limits. A torn or unreadable line (a crash mid-write) is skipped
+start: a collector can see at least one segment (one eighth of the cap, 12.5 MB at the default
+100 MB) twice, and also every sent segment whose delete failed and that is still on disk. Over UDP no send failure is detectable at all. ADR 0200 states the same limits. A torn or unreadable line (a crash mid-write) is skipped
 and counted, never guessed at. After a restart, appends always start a NEW segment, so they never
 extend a file whose tail may be torn.
 
@@ -78,6 +78,10 @@ _LOCK_NAME = "spool.lock"
 
 class SpoolUnavailable(OSError):
     """The spool directory could not be opened for this process (unwritable, or locked by another)."""
+
+    #: Whether the cause is another process holding the lock. That process sends whatever the
+    #: directory holds; in every other case nothing does.
+    in_use = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,8 +226,15 @@ class LogSpool:
                 missing.append(node)
                 node = node.parent
             self._created_lock = not lock_path.exists()
-            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self._created_dirs = missing
+            # One level at a time, recording a directory only when THIS call made it: a level
+            # another process created in between is not ours to remove, and a failure partway
+            # leaves a true list of what to take back. Owner-only for the leaf, as before.
+            for directory in reversed(missing):
+                try:
+                    os.mkdir(directory, 0o700 if directory == self.directory else 0o777)
+                except FileExistsError:
+                    continue
+                self._created_dirs.insert(0, directory)
             fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError as exc:
             self._remove_created_dirs()  # no lock file was made, so they are empty, or stay
@@ -232,9 +243,11 @@ class LogSpool:
             ) from exc
         if not _try_lock(fd):
             os.close(fd)
-            raise SpoolUnavailable(
+            in_use = SpoolUnavailable(
                 f"log spool directory {self.directory} is in use by another process"
             )
+            in_use.in_use = True
+            raise in_use
         self._lock_fd = fd
         try:
             for path in self.directory.iterdir():
