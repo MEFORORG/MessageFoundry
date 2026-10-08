@@ -91,7 +91,7 @@ async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_criti
         await engine._dr_release_drain()  # what POST /dr/release runs
         assert not await _accepts(crit_port)
         # An alert rule's restart is the engine, not an operator, so it leaves the feed down.
-        await _alert_control_action(engine, "restart_inbound", _CRIT)
+        await _alert_control_action(engine, "restart_inbound", _CRIT, default_target=False)
         assert not await _accepts(crit_port)
 
         await engine.reload_detail(cfg)
@@ -124,7 +124,7 @@ async def test_only_an_operator_start_binds_a_listener_on_a_passive_standby(
         rr = engine.registry_runner
         assert rr is not None
         await rr.start_inbound(_NORM)  # the scheduler's call: an engine door
-        await _alert_control_action(engine, "restart_inbound", _NORM)
+        await _alert_control_action(engine, "restart_inbound", _NORM, default_target=False)
         assert not await _accepts(norm_port)
         # The door holds without the marker the scheduler and the alert action read first.
         rr._filtered.clear()
@@ -228,7 +228,7 @@ async def test_a_failed_release_leaves_the_box_active_with_the_profile_parks(
 
         assert engine.dr_active and rr.dr_standby is None
         assert rr.filtered_inbound() == parks_before  # the profile's parks, reasons and all
-        await _alert_control_action(engine, "restart_inbound", _NORM)
+        await _alert_control_action(engine, "restart_inbound", _NORM, default_target=False)
         assert not await _accepts(norm_port)
         await engine.reload_detail(cfg)
         assert await _accepts(crit_port) and not await _accepts(norm_port)
@@ -262,7 +262,7 @@ async def test_a_failed_release_parks_a_normal_feed_a_reload_added_during_the_dr
         with pytest.raises(OSError):
             await engine._dr_release_drain()
         assert set(rr.filtered_inbound()) == {_NORM, "IB_NORM2_ADT"}
-        await _alert_control_action(engine, "restart_inbound", "IB_NORM2_ADT")
+        await _alert_control_action(engine, "restart_inbound", "IB_NORM2_ADT", default_target=False)
         assert not await _accepts(added_port)
         await engine.reload_detail(cfg)
         assert await _accepts(crit_port) and not await _accepts(added_port)
@@ -296,7 +296,7 @@ async def test_a_failed_release_parks_a_feed_an_operator_started_before_it(
         assert engine.dr_active and rr.dr_standby is None
         assert set(rr.filtered_inbound()) == {_NORM}
         assert not await _accepts(norm_port)  # the park unbound it
-        await _alert_control_action(engine, "restart_inbound", _NORM)
+        await _alert_control_action(engine, "restart_inbound", _NORM, default_target=False)
         assert not await _accepts(norm_port)
         await engine.reload_detail(cfg)
         assert await _accepts(crit_port) and not await _accepts(norm_port)
@@ -326,10 +326,10 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
         engine._set_dr_active(True)  # the activation's flip, before its reload takes the lock
         assert rr.dr_standby is None
         assert set(rr.filtered_inbound()) == {_NORM}
-        await _alert_control_action(engine, "restart_inbound", _NORM)
+        await _alert_control_action(engine, "restart_inbound", _NORM, default_target=False)
         assert not await _accepts(norm_port)
 
         await engine._dr_activate_profile()
         assert set(rr.filtered_inbound()) == {_NORM}
-        await _alert_control_action(engine, "restart_inbound", _NORM)
+        await _alert_control_action(engine, "restart_inbound", _NORM, default_target=False)
         assert not await _accepts(norm_port)
