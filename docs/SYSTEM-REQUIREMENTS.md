@@ -114,6 +114,78 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 | Service manager (Windows) | **NSSM** (auto-provisioned, SHA-256-pinned, by the installer; or pre-staged). Requires administrator / elevation to register the service. |
 | C compiler | Not required for the default install with standard CPython 3.14 on x86-64 Windows, glibc Linux (x86-64 or arm64) or arm64 macOS. The locked runtime dependencies ship wheels there (read from `uv.lock`, 2026-09-30). At least two other interpreters build packages from source. arm64 Windows builds `cryptography` and `httptools`. x86-64 macOS builds `cryptography` and `argon2-cffi-bindings`. Building `cryptography` needs a C compiler, a Rust toolchain and OpenSSL headers. |
 
+## Host clock
+
+**Every engine host must keep its clock synchronized to a time reference.** This is a deployment
+requirement. The engine reads the host's wall clock and trusts it. It never sets the clock, and by
+default it does not check it.
+
+The requirement covers each host that runs an engine process, on Windows and on Linux.
+
+### What reads the clock
+
+At least these parts of the engine read the host's wall clock:
+
+| What | Where | What a wrong clock would do |
+|---|---|---|
+| Session expiry | `messagefoundry/auth/service.py` | A session's expiry is stamped from `time.time()`, and each request checks it and the idle timeout against the same clock. A forward step would end sessions early. A backward step past a session's last use revokes it, because validation fails closed. A smaller backward step would stretch the idle and absolute windows by the step. |
+| TOTP codes | `messagefoundry/auth/totp.py`, called from `messagefoundry/auth/service.py` | A code covers a 30-second step (`DEFAULT_PERIOD`). The engine passes `[auth].totp_skew_steps` as the tolerance, and its default is `0`: only the current step verifies. So any offset would refuse correct codes for part of each step, and an offset of 30 seconds would refuse all of them. [CONFIGURATION.md](CONFIGURATION.md) owns that key. |
+| OIDC sign-in | `messagefoundry/auth/oidc/claims.py` | The engine checks a token's `exp`, `iat` and `nbf` against the host clock, with `[auth].oidc_clock_skew_seconds` of grace: 60 by default, 300 at most. Past that grace, federated sign-in would fail. At least the `auth_time` plus `max_age` check has no grace, so a smaller offset can refuse a sign-in too. |
+| Log time stamps | `messagefoundry/logging_setup.py` | Each log line carries a UTC stamp made from the host clock. A wrong clock would put the engine's lines out of order against a collector's and against other hosts'. |
+| Retention | `messagefoundry/pipeline/retention.py` | The retention pass works out its cutoffs from the wall clock. A clock that jumps forward would purge rows before their window has passed. |
+| Certificate expiry warnings | `messagefoundry/pipeline/cert_expiry.py` | The monitor counts the days a certificate has left from the host clock, so its warning would come early or late. |
+| Cluster row leases and node heartbeats | [CLUSTERING.md, *Operational assumptions*](CLUSTERING.md#operational-assumptions-honor-these) | That page owns the rule for a cluster: keep node clocks well within `[store].lease_ttl_seconds`. Skew between nodes would mistime a lease expiry. |
+
+### This page sets no drift number
+
+The engine has no single tolerance, so this page does not invent one. The numbers above are the
+ones the code and its settings hold. For sign-in the tightest is TOTP: with the default of zero
+steps of tolerance, every second of offset costs a second of each code's life. The start-up check
+below is tighter still where it is turned on: it calls a difference over 2 seconds skewed, by
+default.
+
+### Check it on Windows
+
+Run both commands on the engine host. If one answers `Access is denied. (0x80070005)`, run it
+again from an elevated prompt.
+
+```powershell
+w32tm /query /source
+w32tm /query /status
+```
+
+A healthy host answers like this:
+
+- `/query /source` names a time server or a domain controller. On a virtual machine it may name
+  the hypervisor's time provider instead, such as `VM IC Time Synchronization Provider`.
+- `/query /status` shows `Leap Indicator: 0(no warning)`, a `Source` that matches the first command,
+  and a recent `Last Successful Sync Time`.
+
+Where the Windows Time service is the host's time agent, at least these answers mean the clock
+is **not** disciplined:
+
+- `The service has not been started. (0x80070426)`. The Windows Time service is stopped.
+- A source of `Local CMOS Clock` or `Free-running System Clock`. The host follows only its own
+  hardware clock.
+- `Leap Indicator: 3` in the status output. The service has not synchronized.
+
+### Check it on Linux
+
+On a systemd host, run `timedatectl`. A healthy host shows `System clock synchronized: yes` and
+`NTP service: active`. Where chrony is the time service, `chronyc tracking` shows the current
+offset, and a healthy host shows a `Leap status` of `Normal`.
+
+### The engine can check at start, if you ask it to
+
+`[logging].require_time_sync` with `[logging].ntp_peer` makes `serve` compare the host clock with
+that peer before any listener starts. It warns when the difference passes
+`time_sync_max_skew_seconds`, or when the peer does not answer. With `time_sync_fail_closed` it
+refuses to start. It is off by default, because the engine cannot pick a time reference for you.
+The keys are in [CONFIGURATION.md, `[logging]`](CONFIGURATION.md#logging).
+
+That check runs once, at start. It does not replace a time service on the host. It sends an SNTP
+query to the peer, so the host must be able to reach the peer on UDP port 123.
+
 ## Databases (message store)
 
 | Database | Status | Driver / prerequisite |
