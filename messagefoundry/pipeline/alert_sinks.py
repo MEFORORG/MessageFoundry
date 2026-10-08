@@ -915,8 +915,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self, name: str, *, reason: str, value: int, limit: int, store_kind: str
     ) -> None:
         # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>[@<process>]` stands in for
-        # "connection", so each bound on each engine process is its own instance and throttle key. `detail` is what the instance's reason
-        # column shows, built by the same helper the logging sink uses. The monitor re-raises this
+        # "connection", so each bound on each engine process is its own instance and throttle key.
+        # `detail` is what the instance's reason column shows, built by the same helper the logging
+        # sink uses. The monitor re-raises this
         # while a pause holds, and _emit's (type, connection) throttle collapses the repeats, as
         # for queue_buildup. Counts and sizes only: no message content, no PHI.
         self._emit(
@@ -1530,6 +1531,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # The alert-instance write is a side observer: a store error must never wedge a delivery
             # worker or drop the notification. Log metadata only (no event body).
             log.warning("alert-instance state write failed", exc_info=True)
+
+    async def drain_state(self, timeout: float) -> None:
+        """Wait up to ``timeout`` seconds for the alert-instance writes already scheduled. The engine
+        calls it before it closes the store, so a clear raised on the way out (an unpinned cluster
+        node's intake_resumed, BACKLOG #2272) is written rather than lost to the close. A write
+        still running at the deadline is left to fail as before; this never raises."""
+        pending = set(self._state_tasks)
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 

@@ -117,6 +117,10 @@ __all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
 
 log = logging.getLogger(__name__)
 
+#: How long stop waits for alert-instance writes already scheduled before it closes the store
+#: (BACKLOG #2272). Short: a write that has not landed by then is logged and lost, as before.
+_ALERT_STATE_DRAIN_SECONDS = 5.0
+
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
 #: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
 #: (``api/request_timeout.py``) with room for the release hook's default 30 s bound and the
@@ -1511,9 +1515,11 @@ class Engine:
                 # BACKLOG #2272 defects 4 to 6: each process names itself in its alert subjects, so
                 # it raises and clears only its own pause. An unpinned cluster node gets a new id on
                 # every start, so it clears its own alerts at stop; nothing could clear them later.
+                # Read once: serve hands the engine its graph before start, so a shard id is known
+                # here, and a reload re-applies the same shard filter, so the identity does not move.
                 node=self.instance_identity,
                 resolve_on_stop=(
-                    self._coordinator.is_clustered() and self._cluster_settings.node_id is None
+                    self._coordinator.is_clustered() and not self._cluster_settings.node_id
                 ),
             )
             # Always measured once, even with both bounds off: a bound that is off reports itself
@@ -2929,6 +2935,11 @@ class Engine:
         if self._intake_monitor is not None:
             await self._intake_monitor.stop()
             self._intake_monitor = None
+            # An unpinned cluster node clears its intake alerts at stop (BACKLOG #2272). The clear is
+            # a background write, so give it a bounded chance to land before the store closes below.
+            drain = getattr(self._alert_sink, "drain_state", None)
+            if drain is not None:
+                await drain(_ALERT_STATE_DRAIN_SECONDS)
         # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
         # unused remainder of this process's reserved block and unhooks the refill signal, so anything
         # that encrypts after it runs is charged against no reservation with no checkpointer left to

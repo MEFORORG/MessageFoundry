@@ -659,6 +659,55 @@ async def test_an_engine_shard_names_itself_in_its_intake_subjects(
         await engine.stop()
 
 
+async def test_drain_state_lands_a_clear_raised_on_the_way_out() -> None:
+    """Engine.stop drains the sink's scheduled state writes before it closes the store, so an
+    unpinned node's stop-time clear is written rather than lost to the close."""
+    import asyncio
+
+    class _SlowStore(_RecordingStore):
+        async def resolve_alert_instances_for(
+            self, *, event_type: str, connection: str, now: float | None = None
+        ) -> int:
+            await asyncio.sleep(0.05)
+            return await super().resolve_alert_instances_for(
+                event_type=event_type, connection=connection, now=now
+            )
+
+    store = _SlowStore()
+    sink = NotifierAlertSink([], store=store)
+    subject = intake_alert_subject(DEPTH_REASON, "node:h:1:aa")
+    sink.intake_resumed(subject, reason=DEPTH_REASON, value=0, limit=10, store_kind="postgres")
+    assert store.resolves == []
+    await sink.drain_state(5.0)
+    assert [r["connection"] for r in store.resolves] == [subject]
+    await sink.drain_state(5.0)  # nothing pending: returns at once
+
+
+async def test_a_cluster_node_with_an_empty_node_id_clears_at_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty ``[cluster].node_id`` pins nothing: the coordinator falls back to a fresh id, so
+    the engine treats the node as unpinned and clears its intake alerts at stop."""
+    from messagefoundry.config.settings import ClusterSettings
+    from messagefoundry.pipeline import cluster as cluster_mod
+    from messagefoundry.pipeline.engine import Engine
+
+    monkeypatch.setattr(cluster_mod.NullCoordinator, "is_clustered", lambda _self: True)
+    sink = _RecordingSink()
+    engine = await Engine.create(
+        tmp_path / "engine4.db",
+        alert_sink=cast(AlertSink, sink),
+        egress_settings=EgressSettings(deny_by_default=False),
+        cluster_settings=ClusterSettings(node_id=""),
+    )
+    await engine.start()
+    try:
+        monitor = engine._intake_monitor
+        assert monitor is not None and monitor._resolve_on_stop
+    finally:
+        await engine.stop()
+
+
 async def test_an_engine_with_both_bounds_off_still_clears_both(tmp_path: Path) -> None:
     from messagefoundry.pipeline.engine import Engine
 

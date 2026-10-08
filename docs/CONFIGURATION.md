@@ -1287,7 +1287,9 @@ raises at once, but the throttle may hold its page; a later reminder in that pau
 `shard:<id>` on an engine shard. A lone engine that owns its store drops the suffix:
 `intake:staged_depth` or `intake:disk_floor`. So each bound on each process is its own alert. Every
 process sharing a store pauses its own listeners, and each one raises and clears only its own
-alert, so one node's clear never resolves another node's pause. A subject longer than 200
+alert, so one node's clear never resolves another node's pause. The pause is not leader-gated, so
+a cluster standby measures too and raises its own alert while the shared backlog is over the bound,
+even with nothing of its own to pause. A subject longer than 200
 characters keeps a prefix of the process label plus a checksum of the whole label.
 A rule cannot attach a `control_action` to `intake_paused`, because it is not a connection-scoped
 event (see `control_action` in the rule table below).
@@ -1308,8 +1310,9 @@ limit. This clears a pause that an earlier run of the same process left open whe
 That relies on the process keeping its name across a restart. An engine shard does. A cluster node
 does only when `[cluster].node_id` is pinned; otherwise its id is new on every start. An unpinned
 node therefore clears its own open pause alerts when it stops, since its next start reports under a
-new name. An unpinned node that crashes while paused leaves its alert open; resolve it in the alert
-list, or pin `[cluster].node_id`.
+new name. The stop waits up to 5 seconds for that write before it closes the store. An unpinned node
+that crashes while paused, or whose clear does not land in time, leaves its alert open; resolve it
+in the alert list, or pin `[cluster].node_id`.
 
 **`config_changed` says a start loaded different config bytes than the store's baseline** (vault
 BACKLOG #2597). At each start the engine compares its config fingerprint (ADR 0041 D1) with the
