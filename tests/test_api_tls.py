@@ -231,9 +231,9 @@ def test_serve_allows_non_loopback_bind_with_tls(
 
 
 def _serve_mtls_with_cert_map(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str = "serve"
 ) -> tuple[int, dict[str, Any]]:
-    """Run ``serve`` with in-process mTLS and a cert-identity map. Returns the exit code and what
+    """Run ``command`` with in-process mTLS and a cert-identity map. Returns the exit code and what
     reached ``uvicorn.run``."""
     from messagefoundry.store.crypto import generate_key
 
@@ -256,7 +256,7 @@ def _serve_mtls_with_cert_map(
         '{ "CN:svc" = "0123456789abcdef0123456789abcdef" } }\n',
         encoding="utf-8",
     )
-    return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]), captured
+    return main([command, "--config", str(SAMPLES_CONFIG), "--env", "dev"]), captured
 
 
 def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
@@ -273,13 +273,26 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
     assert "send_400_response" in vars(http_cls.__mro__[1])
 
 
-def test_serve_refuses_when_the_shim_it_serves_answers_bare(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("command", "refusing_to"), [("serve", "start."), ("supervise", "start the fleet.")]
+)
+def test_a_shim_that_answers_bare_is_refused_before_any_side_effect(
+    command: str,
+    refusing_to: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """BACKLOG #1120: with the shim stacked on, the shim is the class uvicorn serves, so the startup
-    self-test drives it too. A shim that shadowed the floor's 400 writer is refused. The test above
-    is the control: the same fixture with the real shim starts."""
+    self-test drives it too. A shim that shadowed the floor's 400 writer is refused, by ``serve``
+    and by ``supervise`` before it spawns a shard that would refuse. The test above is the control:
+    the same fixture with the real shim starts, and it creates files."""
     from messagefoundry.api import tls_client_cert
+
+    def _no_spawn(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("supervise spawned shards")
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", _no_spawn)
 
     real = tls_client_cert.client_cert_http_protocol_class
 
@@ -289,12 +302,16 @@ def test_serve_refuses_when_the_shim_it_serves_answers_bare(
         return shim
 
     monkeypatch.setattr(tls_client_cert, "client_cert_http_protocol_class", _shadowing_shim)
-    rc, captured = _serve_mtls_with_cert_map(tmp_path, monkeypatch)
+    rc, captured = _serve_mtls_with_cert_map(tmp_path, monkeypatch, command)
     assert rc == 2
     assert captured == {}, "uvicorn.run was reached"
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert left == ["cert.pem", "key.pem", "messagefoundry.toml"], (
+        f"a side effect came first: {left}"
+    )
     err = capsys.readouterr().err
     assert "failed its startup self-test: the malformed-request 400 lacked" in err, err
-    assert "refusing to start." in err, err
+    assert f"refusing to {refusing_to}" in err, err
 
 
 def test_serve_mtls_without_cert_map_gets_no_shim(

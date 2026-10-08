@@ -208,8 +208,20 @@ def test_a_drive_that_raises_is_refused_by_type_only(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(http, "data_received", _raises)
     message = _refusal(http, ws)
-    assert "the drive raised ValueError" in message, message
+    assert "the drive raised ValueError at test_protocol_floor_selftest.py:" in message, message
     assert "synthetic text" not in message
+
+
+def test_the_private_loop_raises_when_asked_to_wait() -> None:
+    """The backstop no drive reaches: awaiting real time on the no-I/O loop ends at once."""
+    loop = protocol_floor_selftest._NoIOLoop()
+    waits = asyncio.sleep(60)
+    try:
+        with pytest.raises(RuntimeError, match="asked to wait"):
+            loop.run_until_complete(waits)
+    finally:
+        waits.close()
+        loop.close()
 
 
 async def test_a_loop_already_running_is_a_failed_drive() -> None:

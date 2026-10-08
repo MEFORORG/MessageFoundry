@@ -22,8 +22,10 @@ The last two are skipped when there is no WebSocket protocol, which uvicorn read
 
 **No socket, and nothing that can block.** The transport is an in-memory buffer. The event loop is a
 private one with no selector and no self-pipe, so the test opens no socket of any kind; a stock
-asyncio loop opens a loopback socket pair for its own wake-up. That loop refuses to wait: every turn
-is a zero-timeout turn, and a drive that would need to wait is a failed drive.
+asyncio loop opens a loopback socket pair for its own wake-up. Nothing here waits: the drive
+yields with a zero sleep, so every loop turn is a zero-timeout turn, and ``_MAX_TURNS`` is what ends a
+drive whose response never comes. The loop's selector also raises if it is ever asked to wait. That
+is a backstop for a later edit to this module, and no drive reaches it today.
 
 **Fail closed.** A missing header, an unexpected status, a response that never arrives and an
 exception from the drive itself all raise
@@ -38,9 +40,9 @@ It never quotes the bytes written, and it names an exception by type only.
 * The settings ``serve`` runs with. The drives use a plain ``uvicorn.Config``: no TLS, no server-wide
   default headers, one worker, and nothing read from the environment. A header merge that depended
   on those would not show here.
-* Any class other than the two it is handed. ``serve`` runs it a second time on the
-  client-certificate shim when it stacks that on the floored class, because the shim is then the
-  class served.
+* Any class other than the two it is handed. ``serve`` and ``supervise`` run it a second time on
+  the client-certificate shim when the settings ask for one, because the shim is then the class
+  served.
 
 The header set comes from
 :data:`~messagefoundry.api.protocol_headers.PROTOCOL_SECURITY_HEADERS`, the floor's one definition.
@@ -57,6 +59,7 @@ import asyncio
 import logging
 from collections.abc import Container, Iterator
 from contextlib import contextmanager
+from pathlib import PurePath
 from typing import Any, NamedTuple
 
 from messagefoundry.api.protocol_headers import PROTOCOL_SECURITY_HEADERS, floor_unavailable
@@ -120,8 +123,9 @@ async def _failing_app(scope: Any, receive: Any, send: Any) -> None:
 
 
 class _NeverWaits:
-    """The private loop's selector. There is no I/O to wait for, so a turn that would wait is a
-    stalled drive, and raising here ends it instead of hanging the start."""
+    """The private loop's selector. There is no I/O to wait for, so being asked to wait means
+    this module awaited something that cannot finish. Raising ends that instead of hanging the
+    start. No drive reaches it as written; ``_MAX_TURNS`` is the bound they hit."""
 
     def select(self, timeout: float | None = None) -> list[Any]:
         if timeout is None or timeout > 0:
@@ -277,7 +281,11 @@ async def _drive_all(http_class: type[Any], ws_class: type[Any] | None) -> list[
             if b"\r\n\r\n" in transport.written:
                 break
             await asyncio.sleep(0)
-        if drive.websocket and not isinstance(transport.protocol, ws_class or ()):
+        if (
+            ws_class is not None
+            and drive.websocket
+            and not isinstance(transport.protocol, ws_class)
+        ):
             # A floored answer from the HTTP protocol would otherwise pass for the WebSocket one.
             problems.append(f"the {drive.response} drive never reached the WebSocket protocol")
         else:
@@ -292,6 +300,17 @@ async def _drive_all(http_class: type[Any], ws_class: type[Any] | None) -> list[
         task.cancel()
     await _turns(_TEARDOWN_TURNS)
     return problems
+
+
+def _raised_at(exc: BaseException) -> str:
+    """Where ``exc`` was raised, as ``file.py:line``. A place and no text, so the refusal can tell
+    a server fault from one in this module without carrying the exception's message."""
+    frame = exc.__traceback__
+    if frame is None:
+        return "an unknown place"
+    while frame.tb_next is not None:
+        frame = frame.tb_next
+    return f"{PurePath(frame.tb_frame.f_code.co_filename).name}:{frame.tb_lineno}"
 
 
 def selftest_protocol_floor(http_class: type[Any], ws_class: type[Any] | None) -> None:
@@ -318,8 +337,8 @@ def selftest_protocol_floor(http_class: type[Any], ws_class: type[Any] | None) -
         # exception is not on its chain. The cause may be this harness and not the server, so the
         # message points here as well.
         problems = [
-            f"the drive raised {type(exc).__name__} before a response could be read, in the "
-            "server or in messagefoundry/api/protocol_floor_selftest.py itself"
+            f"the drive raised {type(exc).__name__} at {_raised_at(exc)} before a response could be "
+            "read, in the server or in messagefoundry/api/protocol_floor_selftest.py itself"
         ]
     if problems:
         found = "; ".join(problems)

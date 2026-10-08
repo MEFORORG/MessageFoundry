@@ -6,5 +6,6 @@
   and a WebSocket app error. It reads the headers off each answer. If one is missing, the engine
   names the response and the header and exits with code 2, before it mints a certificate or opens
   the store. It opens no socket and added about 7 ms to a start when measured. It covers those
-  four response families only. With a client-certificate identity map set, `serve` runs it again
-  on the class it then serves, after TLS setup. There is no opt-out. (`BACKLOG #1120`)
+  four response families only. With a client CA and a certificate identity map both set, it runs
+  a second time, on the client-certificate class the engine then serves. There is no opt-out.
+  (`BACKLOG #1120`)
