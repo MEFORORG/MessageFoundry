@@ -552,7 +552,9 @@ the time until that actor's next write would be admitted, in whole seconds, roun
 below 1. When the count refused the write, that is the time until the actor's oldest counted write
 leaves the window, so at most `admin_write_rate_limit_window_seconds`, rounded up. When the minimum gap refused
 it, that is the rest of the gap, which rounds up to 1 at the default. The JSON API and the `/ui`
-console send the same value for the same refusal. The limiter has no cross-actor dimension, so the
+console send the same value for the same refusal. It is the wait in the engine process that
+refused the write, and it holds only if the account makes no other write meanwhile; the limiter is
+counted in-process. The limiter has no cross-actor dimension, so the
 value depends only on that account's own admitted writes, never on another account's. A second
 session on the same account does read them, as it already could from which writes are refused.
 That includes a password-only session on a route that charges the floor before its factor check;

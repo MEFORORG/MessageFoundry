@@ -1655,8 +1655,9 @@ async def test_backlog_287_routes_are_paced(
         assert throttled.status_code == 429
         # BACKLOG #2144: the wait, not a literal. Its value is pinned under a faked clock in
         # test_admin_write_429_retry_after_is_the_actors_wait; here the real clock has moved a
-        # little since the first write, so the header is the 60 s window less at most that.
-        assert 1 <= int(throttled.headers["Retry-After"]) <= 60
+        # little since the first write, so the header is the 60 s window less at most that. The
+        # lower bound is above both retired literals (1 and 10), so neither can pass here.
+        assert 10 < int(throttled.headers["Retry-After"]) <= 60
 
 
 async def test_admin_write_429_retry_after_is_the_actors_wait(

@@ -1440,9 +1440,10 @@ def _enforce_admin_write_pacing(request: Request, auth: AuthService, identity: I
     guards that). A throttled write is logged (not silent) and refused early with 429 BEFORE any
     further work. Its Retry-After is the actor's own wait until the next write would be admitted,
     in whole seconds (:meth:`AuthService.admin_write_retry_after`, BACKLOG #2144); the console's
-    ``require_ui`` sends the same value. Shared by :func:`require_step_up` (the sensitive step-up
-    surface) and :func:`require_paced` (the state-changing surface that needs pacing WITHOUT a
-    step-up re-proof), so both gates key on the SAME per-actor limiter (one bucket per actor)."""
+    ``require_ui`` sends the same value. Shared by at least :func:`require_step_up` (the sensitive
+    step-up surface), :func:`require_step_up_action` and :func:`require_paced` (the state-changing
+    surface that needs pacing WITHOUT a step-up re-proof), so every gate that calls it keys on the
+    SAME per-actor limiter (one bucket per actor)."""
     if request.method != "GET" and not auth.allow_admin_write(identity.user_id):
         log.warning(
             "admin-write throttled (anti-automation): actor=%s path=%s",
