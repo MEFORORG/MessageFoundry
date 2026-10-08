@@ -1458,8 +1458,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
             # re-open of the SAME key starts un-suspended at the base tier (the durable suspended_until /
             # escalation_tier were on the now-resolved row and never return via list_active).
-            self._suspended.pop(f"{inverse_of}:{connection}", None)
-            self._occurrences.pop(f"{inverse_of}:{connection}", None)
+            self._suspended.pop(key, None)
+            self._occurrences.pop(key, None)
             coro = store.resolve_alert_instances_for(
                 event_type=inverse_of, connection=connection, now=now
             )
@@ -1475,11 +1475,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 escalation_tier=escalation_tier,
                 now=now,
             )
+        wrapper = self._run_state(coro, key)
         try:
-            task = asyncio.ensure_future(self._run_state(coro, key))
+            task = asyncio.ensure_future(wrapper)
         except RuntimeError:
             # No running loop (e.g. an emit on a non-async test path) — the state write is best-effort,
             # so drop it rather than raise into the caller. The notification path is unaffected.
+            # Close both coroutines so neither warns "never awaited".
+            wrapper.close()
             coro.close()
             return
         self._state_tasks.add(task)

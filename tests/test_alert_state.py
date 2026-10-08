@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import sqlite3
+import threading
 import warnings
 from pathlib import Path
 from typing import Any
@@ -689,24 +690,28 @@ async def test_cancelled_holder_releases_the_next_write() -> None:
 
 
 async def test_cancelled_middle_waiter_keeps_later_writes_in_order() -> None:
-    # A slow upsert holds the key and a resolve waits behind it. Cancelling the waiting resolve
-    # must not let a later write for the key jump ahead of the upsert still running.
+    # A slow upsert holds the key with three writes queued behind it. Cancelling the middle one must
+    # leave the other two in emit order, and a write emitted after the cancel must still queue last.
     store = _GatedStore(slow="upsert")
     sink = NotifierAlertSink([], store=store)
-    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")  # A: stalls
+    await _spin()  # A now holds the lock and waits on the gate
+    store.slow = "none"  # so only A stalls; later upserts run once they hold the lock
+    sink.connection_restored("OB_X")  # B: waits
     before = set(sink._state_tasks)
-    sink.connection_restored("OB_X")
+    sink.connection_error("OB_X", kind="connection_lost", detail="again")  # C: cancelled below
     middle = _new_state_task(sink, before)
+    sink.connection_error("OB_X", kind="connection_lost", detail="last")  # D: waits
     await _spin()
     middle.cancel()
     await _spin()
     assert middle.cancelled()
-    sink.connection_restored("OB_X")  # a later clear for the same key
+    sink.connection_restored("OB_X")  # E: emitted after the cancel
     await _spin()
-    assert store.log == []  # still queued behind the stalled upsert
+    assert store.log == []  # everything still queued behind the stalled upsert
     store.gate.set()
     await _drain(sink)
-    assert store.log == ["upsert OB_X", "resolve OB_X"]
+    assert store.log == ["upsert OB_X", "resolve OB_X", "upsert OB_X", "resolve OB_X"]
     assert store.open == set()
     assert sink._state_locks == {}
 
@@ -727,8 +732,40 @@ async def test_write_cancelled_before_it_starts_closes_its_coroutine() -> None:
         assert all(task.cancelled() for task in tasks)
         del tasks  # drop the last references so the store coroutines are collected here
         gc.collect()
-    assert not [w for w in caught if "never awaited" in str(w.message)]
+    assert not _store_coroutine_leaks(caught)
     assert store.log == []
+
+
+def _store_coroutine_leaks(caught: list[warnings.WarningMessage]) -> list[str]:
+    # Match only this sink's coroutines: the session-scoped loop may collect an unrelated test's
+    # leak inside the same block.
+    names = ("upsert_alert_instance", "resolve_alert_instances_for", "_run_state")
+    return [
+        str(w.message)
+        for w in caught
+        if "never awaited" in str(w.message) and any(n in str(w.message) for n in names)
+    ]
+
+
+def test_emit_with_no_running_loop_leaks_no_coroutine() -> None:
+    # An emit off any event loop drops the state write. Neither the store coroutine nor the
+    # wrapper around it may be left to warn "never awaited".
+    store = _GatedStore(slow="none")
+    sink = NotifierAlertSink([], store=store)
+
+    def emit() -> None:
+        sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+        sink.connection_restored("OB_X")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        # A fresh thread has no event loop at all; the test thread may hold the session loop.
+        worker = threading.Thread(target=emit)
+        worker.start()
+        worker.join()
+        gc.collect()
+    assert not _store_coroutine_leaks(caught)
+    assert sink._state_tasks == set()
 
 
 # --- three-backend parity (AC-8) ---------------------------------------------
