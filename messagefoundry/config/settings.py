@@ -4179,14 +4179,21 @@ def _checked_host_text(value: str | None, setting: str, *, ascii_too: bool = Tru
         raise ValueError(f"{setting} must not contain a control character or an undecodable byte")
     if not ascii_too and value.isascii():
         return value
+    # Raised OUTSIDE the handler, on purpose. The codec's error keeps the whole host text on
+    # `.object`, and `from None` would hide it from the traceback printer only: the refusal's
+    # `__context__` would still hold it. Raised after the handler ends, the refusal has no chain
+    # (tests/test_from_none_is_not_redaction.py says why this shape is the safe one).
+    encodable = True
     try:
         value.encode("idna")
     except UnicodeError:
+        encodable = False
+    if not encodable:
         raise ValueError(
             f"{setting} is not a host name the network layer can encode (its IDNA encoding "
             "refuses it). Look for an empty label, a label that is too long once encoded, or an "
             "invisible or prohibited character. A non-ASCII name may be written in its xn-- form"
-        ) from None
+        )
     return value
 
 

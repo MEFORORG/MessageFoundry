@@ -370,6 +370,9 @@ def _assert_the_validator_does_not_echo(host: str, needle: str) -> None:
     message = str(raw.value)
     assert needle in message
     assert not _echoes(message, host)
+    # No chain either. The codec's error holds the whole host on `.object`, and `from None` would
+    # leave it on `__context__`, so the refusal is raised after the handler has ended.
+    assert raw.value.__cause__ is None and raw.value.__context__ is None
     assert _echoes(f"{message}: {host!r}", host)
     assert _echoes(f"{message}: {host}", host)
 
