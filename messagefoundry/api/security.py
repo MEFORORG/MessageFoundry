@@ -18,13 +18,23 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, get_args
 
-from fastapi import HTTPException, Request, Response, WebSocket, WebSocketException, status
+from fastapi import (
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketException,
+    status,
+)
 from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
+from pydantic import BaseModel
 from starlette.requests import HTTPConnection
 
+from messagefoundry.api.auth_models import CredentialReply
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
     peercert_from_ssl_object,
@@ -33,6 +43,7 @@ from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.config.tls_policy import HopDisposition
+from messagefoundry.controlchars import scrub_log_argument
 
 # Imported, not redefined: the cert->principal matchers live in the neutral package-root leaf, which
 # the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. This plane keys by issuer first
@@ -40,6 +51,7 @@ from messagefoundry.config.tls_policy import HopDisposition
 from messagefoundry.credential import client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store.store import UserRecord
 
 log = logging.getLogger(__name__)
@@ -71,7 +83,11 @@ def alert_administrator_granted(state: Any, key: str, *, via: str, granted_by: s
         alert_sink_for(state).administrator_granted(key, via=via, granted_by=granted_by)
     except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not 500 a
         # call whose write is already committed and audited.
-        log.exception("the administrator_granted alert for %r failed to emit", key)
+        # Scrubbed for CodeQL py/log-injection (alert 264); scrub_log_argument says why. Over
+        # ``repr``, as in ``LoggingAlertSink.administrator_granted``, so the line reads as before.
+        log.exception(
+            "the administrator_granted alert for %s failed to emit", scrub_log_argument(repr(key))
+        )
 
 
 def alert_directory_administrator_granted(state: Any, outcome: LoginOutcome, *, via: str) -> None:
@@ -352,9 +368,97 @@ def _audit_all_authz(app_state: object) -> bool:
     return bool(getattr(app_state, "audit_all_authz", False))
 
 
+#: The 400 detail for a request carrying more than one ``Authorization`` header (BACKLOG #2454).
+#: A fixed string: it names the rule, never a value.
+REPEATED_AUTHORIZATION_DETAIL = "more than one Authorization header"
+
+
+def sole_authorization(conn: HTTPConnection) -> str | None:
+    """The request's one ``Authorization`` value, ``""`` when absent, ``None`` when it is repeated.
+
+    Every read of ``Authorization`` on the engine and the web console goes through here
+    (BACKLOG #2454, the mirror of #2051 at HTTP intake). Starlette's ``headers.get`` returns the
+    FIRST of two same-named lines, while a front end may have checked the LAST, so the two would
+    authenticate different credentials. A repeat is refused even when the values are identical,
+    because a proxy may still split, merge or rewrite them. Takes either plane, as
+    :func:`client_ip` does, so the WebSocket path cannot grow a second rule."""
+    values = conn.headers.getlist("Authorization")
+    if len(values) > 1:
+        return None
+    return values[0] if values else ""
+
+
+class RepeatedCredentialError(HTTPException):
+    """A 400 for a request carrying a credential more than once (BACKLOG #2454).
+
+    ``credential`` names WHICH credential was repeated, as a fixed label (``authorization`` or
+    ``session_cookie``), never its value. The exception handler ``add_auth_routes`` installs
+    answers it with :func:`record_repeated_credential` and then the ordinary 400. It carries no
+    ``WWW-Authenticate``: a 400 is not an authentication challenge."""
+
+    def __init__(self, credential: str, detail: str) -> None:
+        super().__init__(status.HTTP_400_BAD_REQUEST, detail)
+        self.credential = credential
+
+
+#: How much of the request path the repeated-credential line and row keep.
+_REPEATED_PATH_MAX = 256
+
+
+async def record_repeated_credential(conn: Request | WebSocket, credential: str) -> None:
+    """Make a repeated-credential refusal visible, as #2051's intake refusal is (BACKLOG #2454).
+
+    A WARNING line always, and an ``auth.repeated_credential`` audit row when an auth service is
+    attached. Neither carries the header or cookie value: the line and the row name the credential
+    by label, the path and the caller's address. The row is charged to its own limiter first
+    (``AuthService.allow_repeated_credential_audit``), as #2051 charges its refusal to a budget,
+    because this is an unauthenticated request and an uncharged row would let anyone grow
+    ``audit_log`` without bound. That budget is NOT the sign-in one, so a flood of these refusals
+    cannot refuse a sign-in. Over budget, the line is written and the row is not, which is how
+    ``GET /ui/sso`` treats its own refusals. The audit write is fail-soft: a store fault cannot
+    turn the 400 into a 500."""
+    client = client_ip(conn)
+    # Starlette has already percent-decoded the path, so it can hold a line break or run long.
+    # Bounded for both sinks. The log line passes it, and the peer, through scrub_log_argument.
+    path = conn.url.path[:_REPEATED_PATH_MAX]
+    auth: AuthService | None = getattr(conn.app.state, "auth", None)
+    audited = False
+    if auth is not None and auth.allow_repeated_credential_audit(client):
+        try:
+            await auth.audit_repeated_credential(credential, path, client=client)
+            audited = True
+        except Exception as exc:  # noqa: BLE001 - fail-soft, as #2051's sink is
+            log.warning("repeated-credential audit write failed: %s", safe_exc(exc))
+    # Every request-derived value is scrubbed at the call site for CodeQL py/log-injection;
+    # scrub_log_argument says why. The peer can come from X-Forwarded-For behind a trusted proxy.
+    # The label is one of this module's fixed strings, and `audited` is a bool.
+    log.warning(
+        "API credential refused: repeated %s; peer=%s path=%s audited=%s",
+        scrub_log_argument(credential),
+        scrub_log_argument(client or "unknown"),
+        scrub_log_argument(path),
+        audited,
+    )
+
+
+def authorization_header(request: Request) -> str:
+    """:func:`sole_authorization` for an HTTP route: a repeated header is refused with 400.
+
+    400 and not 401, as #2051 answers at intake: the request is malformed, and no credential in it
+    was compared. The header name is public here, so unlike #2051's configurable intake header the
+    refusal tells a caller nothing it did not know. The raise is a :class:`RepeatedCredentialError`,
+    which the handler logs, audits and charges (:func:`record_repeated_credential`)."""
+    value = sole_authorization(request)
+    if value is None:
+        raise RepeatedCredentialError("authorization", REPEATED_AUTHORIZATION_DETAIL)
+    return value
+
+
 def bearer_token(request: Request) -> str | None:
-    """Extract a ``Bearer`` token from the Authorization header, if present."""
-    header = request.headers.get("Authorization", "")
+    """Extract a ``Bearer`` token from the Authorization header, if present.
+
+    Raises 400 when the header is repeated (:func:`authorization_header`)."""
+    header = authorization_header(request)
     if header.startswith("Bearer "):
         return header[len("Bearer ") :].strip() or None
     return None
@@ -713,6 +817,38 @@ def steps_before_body(dependant: Dependant) -> tuple[tuple[Callable[..., Any], _
     return ()
 
 
+async def no_store_reply(response: Response) -> None:
+    """Forbid caching a reply whose BODY carries a live credential (ASVS 7.2.4 delivery, 14.2.2).
+
+    A session token, a staged TOTP seed, one-time recovery codes and an admin-issued temporary
+    password all have to reach the client somehow, and the body is the only channel a bearer client
+    has. So none of those replies may sit in a proxy or browser cache, where a later reader could
+    lift a working credential out of one.
+
+    No route declares this. :class:`AuthenticatedBeforeBodyRoute` adds it to every route whose
+    response model is a ``CredentialReply`` (BACKLOG #2372), which before that each credential
+    route had to name for itself. A refusal raises before the reply is built, and FastAPI drops the
+    header with it, which is fine: a refusal carries no credential. The web console calls some of
+    these handlers as plain functions, and its HTML replies under ``/ui`` are already ``no-store``
+    by the security-header middleware."""
+    response.headers["Cache-Control"] = "no-store"
+
+
+def carries_credential(annotation: object, _seen: frozenset[int] = frozenset()) -> bool:
+    """Whether a route's response model is, or contains, a ``CredentialReply`` (BACKLOG #2372).
+
+    Walks type arguments and model fields, so ``list[X]``, ``X | None`` and a model with an ``X``
+    field all count when ``X`` does."""
+    if id(annotation) in _seen:
+        return False
+    seen = _seen | {id(annotation)}
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        if issubclass(annotation, CredentialReply):
+            return True
+        return any(carries_credential(f.annotation, seen) for f in annotation.model_fields.values())
+    return any(carries_credential(arg, seen) for arg in get_args(annotation))
+
+
 class AuthenticatedBeforeBodyRoute(APIRoute):
     """Refuse a caller the gate would refuse for having no identity BEFORE the body is read.
 
@@ -742,7 +878,29 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
     middleware, so the response is the one the gate gives a request whose body had no problem.
 
     A dependency a test or an embedder overrides through ``dependency_overrides`` is skipped here.
-    The override decides in its place, where FastAPI runs it."""
+    The override decides in its place, where FastAPI runs it.
+
+    IT ALSO SERVES EVERY CREDENTIAL REPLY ``no-store`` (BACKLOG #2372). A route whose response
+    model is a :class:`~messagefoundry.api.auth_models.CredentialReply` gets
+    :func:`no_store_reply` as a route dependency, so no route has to remember to declare it.
+    It reads the response model, so at least these escape it: a route added through
+    ``include_router``; a route with ``response_model=None`` or a ``Response`` return that hands
+    back a credential model anyway; and a pydantic generic model such as ``Page[X]``, whose type
+    arguments ``get_args`` does not report. ``tests/test_credential_reply_no_store.py`` checks
+    every route on the built app, including each endpoint's return annotation."""
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(path, endpoint, **kwargs)
+        if not carries_credential(self.response_model):
+            return
+        if any(d.dependency is no_store_reply for d in self.dependencies):
+            return
+        # Built again rather than patched: FastAPI derives the dependant, the flattened dependency
+        # list and the handler from ``dependencies`` inside ``__init__``, so appending afterwards
+        # would leave each of those without the step. ``self.response_model`` is only known after
+        # the first build, because FastAPI may infer it from the endpoint's return annotation.
+        kwargs["dependencies"] = [*(kwargs.get("dependencies") or ()), Depends(no_store_reply)]
+        super().__init__(path, endpoint, **kwargs)
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         handler = super().get_route_handler()
@@ -1531,10 +1689,17 @@ async def optional_identity(request: Request) -> Identity | None:
     not PHI. The ASVS 6.3.3 **MFA access gate is excluded for the same reason, deliberately**: this
     resolver answers tokenless callers by contract, so a second-factor gate here could only ever
     downgrade an already-public answer, never protect anything. Both consumers (``GET /health``,
-    ``GET /ai/policy``) are non-PHI."""
+    ``GET /ai/policy``) are non-PHI.
+
+    A repeated ``Authorization`` header (BACKLOG #2454) reads as no token here rather than a 400,
+    to keep the never-raises contract: the caller gets the tokenless answer, which grants nothing.
+    It is still logged and audited like every other refusal (:func:`record_repeated_credential`)."""
     auth = get_auth(request)
     if auth is None:
         return _SYSTEM_IDENTITY if _allow_no_auth(request.app.state) else None
+    if sole_authorization(request) is None:
+        await record_repeated_credential(request, "authorization")
+        return None
     return await auth.identity_for_token(bearer_token(request))
 
 
@@ -1546,8 +1711,13 @@ def ws_token(websocket: WebSocket) -> str | None:
     web console does not authenticate here: a browser cannot set the header on a WebSocket
     handshake, so its same-origin handshake uses the session cookie through the console's own hook
     (``authorize_ui_ws``). When that hook declines, the route still calls this, finds no header and
-    gets ``None``."""
-    header = websocket.headers.get("Authorization", "")
+    gets ``None``.
+
+    A repeated header also gives ``None`` (BACKLOG #2454), so :func:`authorize_ws` refuses the
+    handshake: a 403 denial where the server supports one, else a 1008 policy-violation close."""
+    header = sole_authorization(websocket)
+    if header is None:
+        return None
     if header.startswith("Bearer "):
         return header[len("Bearer ") :].strip() or None
     return None
@@ -1583,6 +1753,11 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     auth: AuthService | None = getattr(websocket.app.state, "auth", None)
     if auth is None:
         return _SYSTEM_IDENTITY if _allow_no_auth(websocket.app.state) else None
+    if sole_authorization(websocket) is None:
+        # BACKLOG #2454: refused like the HTTP reads, and recorded here because a handshake has no
+        # exception handler to do it. ws_token below would read the repeat as no token anyway.
+        await record_repeated_credential(websocket, "authorization")
+        return None
     identity = await auth.identity_for_token(ws_token(websocket))
     if identity is None:
         return None

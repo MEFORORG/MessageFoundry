@@ -335,6 +335,15 @@ dev = [
     # earlier releases format some exponents differently, so an older one would fail those tests
     # while blaming the engine.
     "prometheus-client>=0.26.0",
+    # An INDEPENDENT JOSE implementation that verifies the PS256 and RS256 JWS transports/signing.py
+    # mints (tests/test_interop_lab_proxy.py, ASVS 11.3.1 lab proxy, BACKLOG #2377). Test-only: the
+    # engine deliberately signs on core `cryptography` with no JWT library (ADR 0018/0024), so a
+    # runtime dependency here would reverse that decision. PyJWT rather than jwcrypto or joserfc
+    # because uv.lock already resolved it (sigstore needs it in the release-tools group), so uv.lock
+    # gains no new package; requirements.lock and constraints.lock gain this one entry. Floor 2.10.1
+    # excludes CVE-2022-29217 (algorithm confusion, fixed in 2.4.0) and CVE-2024-53861 (partial `iss`
+    # match, fixed in 2.10.1); the tests need no newer API.
+    "pyjwt>=2.10.1",
     # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it
     # is no longer declared here.
 ]
