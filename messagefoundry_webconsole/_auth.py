@@ -589,12 +589,13 @@ def require_ui(
         if not write:
             return identity
         # Its own `if`, not `write and ...`: tests/test_security_doc_rate_limits.py reads this exact
-        # test line to plant its mutations.
+        # test line to plant its mutations. It reads the Retry-After line below the same way.
         if not auth.allow_admin_write(identity.user_id):
+            # BACKLOG #2144: the actor's own wait, the same value the JSON floor sends.
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "too many requests; please slow down",
-                headers={"Retry-After": "10"},
+                headers={"Retry-After": str(auth.admin_write_retry_after(identity.user_id))},
             )
         return identity
 

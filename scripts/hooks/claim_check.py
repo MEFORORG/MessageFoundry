@@ -25,10 +25,12 @@ subject never blocks the work itself.
 
 A third rule rides the same hook because only commit-msg sees the message (CLAUDE.md section 5):
 
-    No line may START with `Co-Authored-By: Claude` (any case) or `Claude-Session:`.
+    No line may START with a `Co-Authored-By:` trailer naming Claude, a `Claude-Session:` trailer,
+    or the `Generated with Claude Code` byline. Any case.
 
-It reads the whole message, fires on every commit, and runs before any git read. Indented or
-backticked, a body may still quote either trailer. It is inert on a box until
+The prose statement of the shapes is docs/Secure_AI_Development_Standards.md section 6.7.
+It reads the whole message, fires on every commit, and runs before any git read. A line that does
+not start with one of them, such as an indented or backticked quote, passes. It is inert on a box until
 ``scripts/coord/install-git-hooks.ps1`` re-copies this file into the shared ``.git/hooks``.
 
 Three scoping decisions for the claim rule, each load-bearing:
@@ -110,14 +112,41 @@ _SQUASH_SUFFIX = re.compile(r"\s*\(#\d{1,6}\)\"?\s*\Z")
 # git will drop, which costs a reword -- the other reading would pass the `-m` case silently.
 _COMMENT_LINE = re.compile(r"#(?!\d)")
 
-# THE ATTRIBUTION TRAILERS CLAUDE.md SECTION 5 SAYS TO OMIT. `.claude/settings.json` turns them off at
+# THE ATTRIBUTION LINES CLAUDE.md SECTION 5 SAYS TO OMIT. `.claude/settings.json` turns them off at
 # source, but a session reading a stale or user-scope setting still writes them, and until this rule a
 # Lander caught them by reading commit bodies by hand. Anchored at the start of a line, so a body may
-# still QUOTE either trailer when it is indented or set in backticks.
+# still QUOTE any of them when it is indented, blockquoted or set in backticks.
+#
+# Three arms; docs/Secure_AI_Development_Standards.md section 6.7 is the prose statement of them.
 # Whitespace is allowed before the colon because git's trailer parser accepts it there.
-_ATTRIBUTION_TRAILER = re.compile(
-    r"^(?:Co-Authored-By\s*:\s*Claude\b|Claude-Session\s*:)", re.IGNORECASE
+#
+# The `Co-Authored-By:` arm is two steps, so an email is never read BY CONSTRUCTION rather than by a
+# character class: take the text before any `<`, drop every whitespace token holding an `@`, and
+# refuse when a remaining token holds `Claude` as a word not glued to the word before it
+# (`Jean-Claude`, `a.claude`).
+_COAUTHOR_LINE = re.compile(r"^Co-Authored-By\s*:(?P<rest>.*)", re.IGNORECASE)
+_CLAUDE_WORD = re.compile(r"(?<![\w.-])Claude\b", re.IGNORECASE)
+# The byline has a fixed shape: the name in a markdown link, or the bare name ending the line. That
+# keeps prose such as "Generated with Claude Code's help" out. Its optional U+1F916 lead (and U+FE0F)
+# is built with chr() so this file carries no non-cp1252 literal for the console gate to flag.
+_BYLINE_LEAD = "(?:" + chr(0x1F916) + chr(0xFE0F) + r"?\s*)?"
+_ATTRIBUTION_LINE = re.compile(
+    r"^(?:Claude-Session\s*:"
+    r"|" + _BYLINE_LEAD + r"Generated\s+with\s+(?:\[Claude\s+Code\]\(|\[?Claude\s+Code\]?\s*$))",
+    re.IGNORECASE,
 )
+
+
+def _is_attribution_line(line: str) -> bool:
+    """True if *line* starts with an attribution line CLAUDE.md section 5 says to omit."""
+    if _ATTRIBUTION_LINE.match(line):
+        return True
+    coauthor = _COAUTHOR_LINE.match(line)
+    if coauthor is None:
+        return False
+    name = coauthor.group("rest").split("<", 1)[0]
+    return any(_CLAUDE_WORD.search(tok) for tok in name.split() if "@" not in tok)
+
 
 # A commit touching ONLY these is documentation/ledger work: it may cite an item without implementing it.
 _DOC_PREFIXES = ("docs/", ".github/")
@@ -407,24 +436,29 @@ def _attribution_trailers(message: str) -> list[tuple[int, str]]:
     hits: list[tuple[int, str]] = []
     # No scissors handling is needed: every line `git commit -v` writes below the scissors starts
     # with a diff marker, so the anchored pattern cannot match one.
-    for n, line in enumerate(message.splitlines(), 1):
-        if _ATTRIBUTION_TRAILER.match(line):
+    # Split on "\n" only, as git does. str.splitlines() also breaks on U+2028, form feed and others,
+    # so it would see a line start git does not, and number lines differently from the editor.
+    # main() reads the file without newline translation, so a lone "\r" is not a line break either.
+    for n, line in enumerate(message.split("\n"), 1):
+        if _is_attribution_line(line):
             hits.append((n, line))
     return hits
 
 
 def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
+    # No ASCII escape is needed for the byline's U+1F916: sys.stderr always uses backslashreplace.
     rows = "\n".join(f"      line {n}: {_safe_for_message(line, 120)}" for n, line in hits)
     sys.stderr.write(
         f"\nMessageFoundry attribution-trailer check\n\n"
-        f"  The message carries a trailer CLAUDE.md section 5 says to omit (standing owner\n"
-        f"  preference). It refuses a line starting 'Co-Authored-By: Claude' or 'Claude-Session:'.\n"
+        f"  The message carries a line CLAUDE.md section 5 says to omit (standing owner\n"
+        f"  preference). It refuses a 'Co-Authored-By:' line naming Claude, a 'Claude-Session:'\n"
+        f"  line, and the 'Generated with Claude Code' byline.\n"
         f"{rows}\n\n"
         f"  Delete those lines from the message file, then commit again:\n"
         f"      git commit -F <file>\n"
-        f"  .claude/settings.json turns both off at source with `attribution`. If your session\n"
+        f"  .claude/settings.json turns all of these off at source with `attribution`. If your session\n"
         f"  added one anyway, it is reading a stale or user-scope setting.\n"
-        f"  To QUOTE a trailer in a body, indent it or put it in backticks.\n"
+        f"  To QUOTE one in a body, indent it, put it in backticks, or start the line with '> '.\n"
         f"  This check reads the whole message and fires whatever the commit touches.\n\n"
     )
     return 1
@@ -434,7 +468,9 @@ def main() -> int:
     if len(sys.argv) < 2:
         return 0  # not wired as a commit-msg hook; do nothing rather than guess
     try:
-        message = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+        # Bytes, then decode: read_text's universal newlines would turn a lone "\r" into a line break
+        # that git does not see.
+        message = Path(sys.argv[1]).read_bytes().decode("utf-8", errors="replace")
     except OSError:
         return 0
 

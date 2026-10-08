@@ -22,6 +22,10 @@ this line.**
 
 ### Added
 
+- **The status page shows the four per-tier retention acknowledgements.** The security posture
+  table on `/ui/status` showed `allow_keeping_phi_indefinitely` only. It now also shows the
+  transform-state, search-preset, app-log and backup-archive switches, each on its own row. The
+  table stays read-only. (BACKLOG #2280)
 - **The audit, security-event and event-log pages page past their first window.** `/ui/audit`,
   `/ui/security-events` and `/ui/events` take `limit` and `offset` and draw the shared pager, so
   each says which rows of how many it shows, with Previous and Next links. They used to show only
@@ -60,6 +64,10 @@ this line.**
 
 ### Fixed
 
+- **A throttled `/ui` write now says how long to wait.** The admin-write `429` carried a literal
+  `Retry-After: 10`, whatever the engine's window was. It now carries the time until that account's
+  next write would be admitted, in whole seconds, the same value the JSON API sends. Seam change:
+  the console calls the new `AuthService.admin_write_retry_after`. (vault BACKLOG #2144)
 - **A temporary password's deadline is stated in the past tense once it has passed.** The factor
   page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
   working" at an instant already gone. They now say it stopped working then, and to ask an

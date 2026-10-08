@@ -760,9 +760,14 @@ def enforce_secret_expiry(
     if not opted:
         return
     if enforcement is not SecurityEnforcement.ENFORCE:
+        # BACKLOG #2320: "only alerts" was the whole of this line, and it is true only where a class
+        # can alert at all. A store that fingerprints nothing tracks no non-DEK class, and
+        # warn_days = 0 turns the reminder runner off, so the line names both conditions.
         log.warning(
             "[secret_rotation].enforce_secret_expiry_classes is set but [security].enforcement is not "
-            "enforce, so an expired secret in those classes only alerts"
+            "enforce, so an expired secret in those classes does not refuse. It alerts only while "
+            "the store fingerprints secrets (not keyless or vault_transit) and "
+            "[secret_rotation].warn_days is above 0"
         )
         return
     sink = alert_sink or LoggingAlertSink()

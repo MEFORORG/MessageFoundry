@@ -2,7 +2,10 @@
 
 - **Status:** Accepted (2026-07-17) — demand-gate build (lane `dg-s1a`); pushes/PR owner-approved.
   Amended 2026-09-30 (BACKLOG #1898): `control_action` is refused at load on an event type that is not
-  connection-scoped. See the amendment under §1.
+  connection-scoped. See the amendment under §1. Amended 2026-10-08 (BACKLOG #2527): no action
+  fires on an event whose `connection` key is not a connection name. Amended 2026-10-08 (BACKLOG
+  #2528): with no `control_target`, the restart runs only when the name is declared on the action's
+  side alone.
 - **Built:** Yes — additive. `AlertRule.control_action` / `control_target` in
   [`config/settings.py`](../../messagefoundry/config/settings.py), carried through
   `AlertRuleSet.decide → _RuleDecision`, dispatched by
@@ -44,6 +47,23 @@ that has a `control_action`. `NotifierAlertSink._emit` also skips the action, lo
 outside the set; that reaches only a rule built past the validator. At least two gaps stay open, and
 the comment on the set names them: stand-ins raised under `connection_stopped`, and an inbound or
 outbound name reaching the restart for the other side.
+
+**Amendment (BACKLOG #2527, 2026-10-08).** The first of those two gaps is closed.
+`NotifierAlertSink._emit` skips the action, logged, for an event whose `connection` key is not a
+connection name, and that holds even when the rule sets `control_target`. A stand-in raised under a
+connection-scoped type must therefore keep a colon: `reference:<name>` already did, and the
+transform-state convergence alert moved from `transform-state` to `cluster:transform-state`. Moving
+the two emitters to their own event types was the other option. It was not taken because it changes
+the `AlertSink` protocol and every sink that implements it, for the same outcome.
+
+**Amendment (BACKLOG #2528, 2026-10-08).** The second gap is closed, and it changes the default
+target this section set. Inbound and outbound names are separate namespaces, and an event does not
+say which one its `connection` key came from. With no `control_target`, the control callback in
+`api/app.py` now restarts the bare name only when the running graph declares it on the action's side
+and not on the other; then the event can only have come from that side. A name declared on both
+sides, or only on the other, is skipped with a WARNING that says to set `control_target`. The sink
+tells the callback which case it is through a `default_target` keyword on `ControlCallback`. This is
+not a config-load refusal: a rule does not know the graph, and a reload can change it.
 
 ### §2 — The sink is DECOUPLED from the runner: an INJECTED async callback
 
