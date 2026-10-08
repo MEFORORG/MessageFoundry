@@ -43,8 +43,8 @@ export function testBenchScript(token: string): string {
     function isObj(x){ return !!x && typeof x === 'object' && !Array.isArray(x); }
     function isArrOf(x, f){
       if (!Array.isArray(x)) { return false; }
-      // By index, not every(): every() skips holes, and so does the map() each renderer walks with, so
-      // a sparse array would pass and render with rows missing. Same walk as mfArrOf (webviewMessaging.ts).
+      // By index, not every(): every() skips holes, so a sparse array would pass with an element no
+      // check ever saw. Same walk as mfArrOf (webviewMessaging.ts).
       for (let i = 0; i < x.length; i++) { if (f(x[i]) !== true) { return false; } }
       return true;
     }

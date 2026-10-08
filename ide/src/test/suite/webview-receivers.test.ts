@@ -473,6 +473,9 @@ const security: Receiver = {
       ["a bool value is null", variant(STATE_OK, (c) => (c.state.values.local_access_only = null))],
       ["an int value is a string", variant(STATE_OK, (c) => (c.state.values.max_session_hours = "12"))],
       ["an int value is fractional", variant(STATE_OK, (c) => (c.state.values.max_session_hours = 1.5))],
+      // null is not "absent": an empty number control reads back as 0, which here means keep forever.
+      ["an int value is null", variant(STATE_OK, (c) => (c.state.values.delete_message_bodies_after_days = null))],
+      ["a string value is null", variant(STATE_OK, (c) => (c.state.values.listen_address = null))],
       ["a string value is a number", variant(STATE_OK, (c) => (c.state.values.listen_address = 127))],
       ["a tristate value is a string", variant(STATE_OK, (c) => (c.state.values.production_instance = "true"))],
       ["a bool default is a number", variant(STATE_OK, (c) => (c.state.defaults.require_mfa = 1))],
@@ -631,7 +634,9 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     // FIELDS entry). Both rendered before the check and both must render after it. This is also the
     // control for the wrongly typed cases above, which change a key's TYPE rather than remove it.
     for (const [why, change] of [
-      ["an absent switch", (c: Payload) => { delete c.state.values.max_session_hours; delete c.state.defaults.max_session_hours; }],
+      ["an absent int switch", (c: Payload) => { delete c.state.values.max_session_hours; delete c.state.defaults.max_session_hours; }],
+      ["an absent Yes/No switch", (c: Payload) => { delete c.state.values.serve_web_console; delete c.state.defaults.serve_web_console; }],
+      ["a switch with a value and no default", (c: Payload) => { delete c.state.defaults.listen_address; }],
       ["an unknown key of another type", (c: Payload) => { c.state.values.a_future_switch = { nested: [1] }; c.state.defaults.a_future_switch = 7; }],
       ["a tristate that is set", (c: Payload) => { c.state.values.production_instance = true; }],
     ] as [string, (c: Payload) => void][]) {

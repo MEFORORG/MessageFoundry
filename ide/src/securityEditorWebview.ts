@@ -197,14 +197,19 @@ export function securityEditorScript(token: string, fields: unknown): string {
       string: mfStr,
       tristate: (x) => x === null || mfBool(x),
     };
-    // Every switch this form has, read the way render() and collectUpdates() read it. A switch the
-    // engine did not report (undefined) passes and renders as the empty control it always did; one it
-    // reported with the wrong type fails. null is a value only for a tristate: on a Yes/No it would
-    // render as "No" and be saved as one. Keys with no FIELDS entry are never read, so never checked.
+    // Every switch this form has, read the way render() and collectUpdates() read it. One the engine
+    // reported with the wrong type fails. null is a value only for a tristate: elsewhere it would
+    // render as "No" or as an empty number, and Save would write that as false or 0.
+    // A switch the engine did not report (undefined) passes, as it did before this check: the installed
+    // engine can be older than this form. setValue() still shows such a Yes/No as "No". That is not a
+    // type error, so it is not refused here. Keys with no FIELDS entry are never read, so never checked.
     function fieldTypesOk(o) {
       for (const f of FIELDS) {
         const v = o[f.key];
-        if (v !== undefined && TYPE_OK[f.type](v) !== true) { return false; }
+        if (v === undefined) { continue; }
+        // Own-property lookup, so a FIELDS type with no entry here fails closed and does not throw.
+        const ok = Object.prototype.hasOwnProperty.call(TYPE_OK, f.type) ? TYPE_OK[f.type] : null;
+        if (!ok || ok(v) !== true) { return false; }
       }
       return true;
     }
