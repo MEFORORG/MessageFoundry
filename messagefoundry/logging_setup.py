@@ -877,6 +877,9 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         self._last_undeliverable_report: float | None = None
         self._spool_drops_reported = 0
         self._last_spool_drop_report: float | None = None
+        #: ``spool.read_errors`` as of the last read-fault report (BACKLOG #2278).
+        self._spool_read_errors_reported = 0
+        self._last_spool_read_report: float | None = None
 
     def handle(self, record: logging.LogRecord) -> None:
         deadline = self._drain_deadline
@@ -900,6 +903,9 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             self._spool_record(record)
             self._replay()
             return
+        # `pending` is False for an unreadable spool as well as a drained one. On a busy engine the
+        # idle poll never runs, so this is the only place that fault would be noticed.
+        self._report_spool_read_fault()
         if not self._send(record):
             self._spool_record(record)
             self._collector_failed()
@@ -975,6 +981,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
                 return  # shutdown began mid-batch: stop sending, keep the rest on disk
             entry = spool.peek()
             if entry is None:
+                # Drained, or unreadable just now. Only the second is a fault, and peek() counts it.
+                self._report_spool_read_fault()
                 return
             level = logging.getLevelName(entry.level)
             replayed = logging.makeLogRecord(
@@ -1001,13 +1009,53 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         self._last_spool_drop_report = now
         total = self.spool.dropped
         batch, self._spool_drops_reported = total - self._spool_drops_reported, total
+        read_errors = self.spool.read_errors
+        # A segment that cannot be read is never sent, so it is never deleted, and its bytes stay
+        # counted against the cap. Say so, or a lasting read fault is blamed on a full spool
+        # (BACKLOG #2278).
+        cause = (
+            f" {read_errors} read(s) of the spool have failed, and a segment that cannot be read "
+            "is never freed, so a read fault may be what filled it."
+            if read_errors
+            else ""
+        )
         _log.warning(
             "off-box log forwarding dropped %d record(s): the on-disk spool at %s is full (%d bytes "
-            "cap) or refused the write; %d dropped since this process started. Evidence for this "
-            "window does not reach the collector.",
+            "cap) or refused the write; %d dropped since this process started.%s Evidence for "
+            "this window does not reach the collector.",
             batch,
             self.spool.directory,
             self.spool.max_bytes,
+            total,
+            cause,
+        )
+
+    def _report_spool_read_fault(self) -> None:
+        """Report new spool read faults at most once per :data:`_FORWARD_DROP_REPORT_INTERVAL`
+        (BACKLOG #2278).
+
+        :meth:`LogSpool.peek` keeps every file when a read fails for a reason other than a missing
+        file, and returns ``None``, which is also what a drained spool returns. Without this report
+        the only sign was the "spool is full" drop warning, long after and naming the wrong cause.
+        The line carries a count and a directory, never a record. It is rate limited for the same
+        reason as :meth:`_report_spool_drop`: it comes back through this listener, and every pass
+        over an unreadable segment counts one more fault."""
+        assert self.spool is not None
+        total = self.spool.read_errors
+        if total == self._spool_read_errors_reported:
+            return
+        now = time.monotonic()
+        last = self._last_spool_read_report
+        if last is not None and now - last < _FORWARD_DROP_REPORT_INTERVAL:
+            return
+        self._last_spool_read_report = now
+        batch, self._spool_read_errors_reported = total - self._spool_read_errors_reported, total
+        _log.warning(
+            "off-box log forwarding could not read its on-disk spool at %s: %d read(s) failed (%d "
+            "since this process started), for a reason other than a missing file. The segments are "
+            "kept, and what they hold is not sent until a read succeeds.",
+            self.spool.directory,
+            batch,
             total,
         )
 

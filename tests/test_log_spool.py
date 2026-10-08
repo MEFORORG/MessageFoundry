@@ -19,11 +19,13 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import log_spool
 from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_setup import (
     SyslogForward,
     _build_queued_forwarder,
     _ForwardQueueHandler,
+    _ForwardQueueListener,
     _TimeoutSysLogHandler,
     _TlsSysLogHandler,
     configure_logging,
@@ -460,12 +462,14 @@ def _not_yet_valid() -> ssl.SSLCertVerificationError:
     ("error", "permanent"),
     [
         (socket.gaierror(11001, "host not found"), True),
+        # The platform's own EAI_NONAME: -2 on Linux, where a bare 11001 exercises nothing.
+        (socket.gaierror(socket.EAI_NONAME, "name or service not known"), True),
         (socket.gaierror(getattr(socket, "EAI_AGAIN", -3), "temporary failure"), False),
         (ssl.SSLCertVerificationError("certificate verify failed"), True),
         (_not_yet_valid(), False),
         (ConnectionRefusedError("refused"), False),
     ],
-    ids=["no-such-name", "dns-try-again", "bad-cert", "clock-not-synced", "refused"],
+    ids=["no-such-name", "eai-noname", "dns-try-again", "bad-cert", "clock-not-synced", "refused"],
 )
 def test_only_a_missing_name_or_a_bad_certificate_is_permanent(
     error: OSError, permanent: bool
@@ -473,3 +477,126 @@ def test_only_a_missing_name_or_a_bad_certificate_is_permanent(
     """A temporary DNS failure or a not-yet-valid certificate (a clock not synced at boot) must be
     deferred to the spool, not turn the forwarder off for the life of the process."""
     assert is_permanent_connect_error(error) is permanent
+
+
+# --- BACKLOG #2278: a read fault is kept, counted and reported as a read fault ----------------------
+
+
+def _deny_open(*args: Any, **kwargs: Any) -> Any:
+    raise PermissionError(13, "sharing violation")
+
+
+def test_a_read_that_fails_for_another_reason_keeps_every_segment(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """peek()'s split: only a segment that is GONE is retired. A revert to "retire on any error"
+    would delete undelivered records, and this is the test that would see it."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        before = _segments(spool_dir)
+        assert len(before) > 1
+        with monkeypatch.context() as patch:
+            patch.setattr(log_spool, "open", _deny_open, raising=False)
+            assert spool.peek() is None
+            assert spool.peek() is None
+        assert spool.read_errors == 2
+        assert spool.unreadable == 0
+        assert _segments(spool_dir) == before
+        # The fault cleared: everything is still there, in order.
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.close()
+
+
+def test_a_segment_that_is_gone_is_retired_and_the_rest_still_replays(spool_dir: Path) -> None:
+    """The other arm of the split, and the control for the test above: a missing file IS retired,
+    counted as unreadable and not as a read error."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        first = _segments(spool_dir)[0]
+        lost = [json.loads(line)["line"] for line in first.read_bytes().splitlines()]
+        first.unlink()
+        assert spool.peek() is None  # the pass that finds it gone
+        assert spool.unreadable == 1
+        assert spool.read_errors == 0
+        expected = [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
+        assert lost and _drain(spool) == expected
+    finally:
+        spool.close()
+
+
+def _idle_listener(spool: LogSpool) -> tuple[_ForwardQueueListener, _FlakyCollector]:
+    """A listener that is never started, so the test drives it on its own thread."""
+    collector = _FlakyCollector()
+    return _ForwardQueueListener(queue.Queue(), collector, spool=spool), collector
+
+
+def test_a_spool_read_fault_is_reported_as_one_rate_limited_and_without_record_text(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    try:
+        assert spool.append(SpoolEntry(level="ERROR", line="secret-marker-2278"))
+        monkeypatch.setattr(log_spool, "open", _deny_open, raising=False)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            for _ in range(5):
+                listener._replay()
+        reports = [r.getMessage() for r in caplog.records if "could not read" in r.getMessage()]
+        assert len(reports) == 1  # five faults, one line
+        assert str(spool_dir) in reports[0] and "1 read(s) failed" in reports[0]
+        assert "is full" not in reports[0]
+        assert "secret-marker-2278" not in caplog.text
+        assert spool.read_errors == 5
+
+        # Past the interval the next report carries what the first one did not.
+        listener._last_spool_read_report = time.monotonic() - 3600
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            listener._replay()
+        (later,) = [r.getMessage() for r in caplog.records if "could not read" in r.getMessage()]
+        assert "5 read(s) failed (6 since this process started)" in later
+    finally:
+        spool.close()
+
+
+def test_a_drained_spool_reports_no_read_fault(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control: peek() also returns None for a drained spool, and that is not a fault."""
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            listener._replay()
+        assert "could not read" not in caplog.text
+    finally:
+        spool.close()
+
+
+@pytest.mark.parametrize("faulted", [True, False], ids=["after-a-read-fault", "plain-full"])
+def test_the_full_spool_report_names_a_read_fault_only_when_there_was_one(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture, faulted: bool
+) -> None:
+    size = len(_entry(0).encode())
+    spool = LogSpool(spool_dir, max_bytes=size)
+    spool.open()
+    listener, _ = _idle_listener(spool)
+    try:
+        assert spool.append(_entry(0))
+        spool.read_errors = 3 if faulted else 0
+        record = logging.makeLogRecord({"msg": "next", "levelname": "WARNING", "levelno": 30})
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            assert listener._spool_record(record) is False
+        (report,) = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+        assert ("3 read(s) of the spool have failed" in report) is faulted
+    finally:
+        spool.close()
