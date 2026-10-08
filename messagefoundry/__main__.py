@@ -2407,14 +2407,22 @@ def _serve(args: argparse.Namespace) -> int:
     # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
     # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
     # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
-    # ONLY: it opens no socket and resolves no name, so a collector that is down cannot hold a
-    # clinical message path from starting through this gate. It keys on forwarding, not on the
-    # spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not this gate.
-    # Placed BEFORE configure_logging, beside the #200 hop gate, so a refused start opens no spool
-    # and contacts no collector.
-    from messagefoundry.config.settings import forwarding_gate_refusal
+    # and local host state: it sends no packet and resolves no name, so a collector that is down
+    # cannot hold a clinical message path from starting through this gate. It keys on forwarding,
+    # not on the spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not
+    # this gate. Placed BEFORE configure_logging, beside the #200 hop gate, so a refused start
+    # opens no spool and contacts no collector.
+    #
+    # Vault BACKLOG #2375: the gate's own-host check FAILS OPEN and logs a WARNING when it does,
+    # which ADR 0200 Amendment A calls the record of that pass. Logged here it would reach bare
+    # stderr only, since configure_logging has not run. So the gate hands the notes back as text
+    # and each is written TWICE, as the #1989 static-credential lines are: to stderr now, and to
+    # the configured handlers below.
+    from messagefoundry.config.settings import forwarding_gate_check
 
-    _forwarding_gap = forwarding_gate_refusal(settings.logging)
+    _forwarding_gap, _gate_notes = forwarding_gate_check(settings.logging)
+    for _gate_note in _gate_notes:
+        print(f"warning: {scrub_control_chars(_gate_note)}", file=sys.stderr)
     if _forwarding_gap is not None:
         _forwarding_fix = (
             "Set [logging].forward_host to a collector on another host, "
@@ -2510,6 +2518,10 @@ def _serve(args: argparse.Namespace) -> int:
             _credlog.warning("%s", line)
         if sc_outcome.refusal is not None:
             _credlog.warning("%s", sc_outcome.refusal)
+    # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged here for the same reason,
+    # at WARNING and the ordinary way, so [logging].level applies to them as it does to those.
+    for _gate_note in _gate_notes:
+        _credlog.warning("%s", _gate_note)
 
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and

@@ -43,6 +43,7 @@ import re
 import string
 import tomllib
 from collections.abc import Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
@@ -96,7 +97,7 @@ from messagefoundry.config.tls_policy import (
     validate_tls_ciphers,
 )
 from messagefoundry.connection_names import is_connection_name
-from messagefoundry.controlchars import has_lone_surrogate
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
@@ -1233,7 +1234,9 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
-    expose_docs: bool = False  # serve /docs, /redoc, /openapi.json (off by default; widens surface)
+    # Serve the API documentation routes, at least /docs, /redoc and /openapi.json, with no sign-in.
+    # Off by default; on, it widens the surface and security_loosenings() names it (#2385).
+    expose_docs: bool = False
     # Serve the same-origin browser ops console under /ui (ADR 0065, BACKLOG #75). On by default (ADR
     # 0143 — the console is the operator UI, effectively core); disable with [security].serve_web_console=
     # false (a surface-reducing opt-out). When on, the engine mounts /ui + /ui/static and accepts an
@@ -2421,6 +2424,23 @@ class LoggingSettings(_Section):
             raise ValueError("[logging].forward_port must be between 1 and 65535")
         return value
 
+    @field_validator("forward_host")
+    @classmethod
+    def _check_forward_host(cls, value: str | None) -> str | None:
+        # Vault BACKLOG #2375. Before this, such text raised out of the #1966 gate, or passed it
+        # and then raised out of the forwarder's own socket call, so the start died with a
+        # traceback either way.
+        return _checked_host_text(value, "[logging].forward_host")
+
+    @field_validator("ntp_peer")
+    @classmethod
+    def _check_ntp_peer(cls, value: str | None) -> str | None:
+        # The time-sync probe hands this text to the socket layer, and its caller catches OSError
+        # only. A NUL, or non-ASCII text the encoding refuses, raised TypeError there, so a
+        # require_time_sync start died with a traceback (measured). ASCII text with a bad label is
+        # a gaierror, which that caller already warns on or refuses cleanly, so it is left to it.
+        return _checked_host_text(value, "[logging].ntp_peer", ascii_too=False)
+
     @field_validator("forward_tls_crl_file")
     @classmethod
     def _forward_tls_crl_file_exists(cls, value: str | None) -> str | None:
@@ -2775,6 +2795,13 @@ EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 #: real directory round trip and far below the point where a socket timeout overflows.
 _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
+#: Upper bound for the three ``[auth]`` rate-limit windows (vault BACKLOG #2466). A window holds each
+#: counted attempt for its whole length, so one far longer than the process lives acts as a NaN one
+#: does: the count fills once and then refuses every later attempt. One day is a JUDGMENT with no
+#: measured anchor. It is 1440 times the sign-in default, and at the cap a filled count still
+#: refuses for up to a day, so a long window is a choice to make with care at any length.
+_RATE_WINDOW_MAX_SECONDS = 86400.0
+
 #: The widest ``[auth].oidc_issuer`` the engine loads, in UTF-16 units (BACKLOG #2331): the width of
 #: the narrowest issuer column a federated binding is stored in, SQL Server ``NVARCHAR(256)``.
 _OIDC_ISSUER_MAX = 256
@@ -3034,7 +3061,8 @@ class AuthSettings(_Section):
     # a block-forever operation — AuthService dispatches each LDAP call through a bare asyncio.to_thread
     # with no wait_for, so one wedged DC pinned a thread-pool worker indefinitely instead of failing the
     # login. 10 s each is well above a healthy on-prem DC round trip and well below any human patience
-    # for a login. Both must be > 0: a 0/negative value would restore the unbounded wait.
+    # for a login. Both must be > 0: a 0/negative value would restore the unbounded wait. A value
+    # above 10 s is a LOOSENING that security_loosenings() names while AD is on (vault BACKLOG #2567).
     ad_connect_timeout: float = 10.0  # seconds — bound the LDAP/LDAPS TCP connect
     ad_receive_timeout: float = 10.0  # seconds — bound each LDAP response read (bind + search)
 
@@ -3234,7 +3262,14 @@ class AuthSettings(_Section):
     login_rate_limit_enabled: bool = True
     login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
     login_rate_limit_global: int = 60  # max attempts across all clients per window
-    login_rate_limit_window_seconds: float = 60.0
+    # No nan/inf (vault BACKLOG #2466): the limiter prunes a hit once it is older than the window,
+    # and no hit is ever older than a NaN or +inf one. The counts then fill once and never drain, so
+    # after login_rate_limit_global attempts every sign-in would be refused until a restart. A huge
+    # finite window does the same in practice, so it is capped (_RATE_WINDOW_MAX_SECONDS). -inf is
+    # refused with them; 0 and a finite negative still load, as the named off value above.
+    login_rate_limit_window_seconds: float = Field(
+        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
 
     # Anti-automation on the authenticated PHI-read endpoints (WP-8, ASVS 2.4.1): a per-actor sliding
     # window over /messages, /messages/{id}, /dead-letters — bounds scripted PHI harvesting on top of
@@ -3243,7 +3278,11 @@ class AuthSettings(_Section):
     phi_read_rate_limit_enabled: bool = True
     phi_read_rate_limit_per_actor: int = 120  # max PHI reads per user per window
     phi_read_rate_limit_global: int = 0  # max PHI reads across all users per window (0 = off)
-    phi_read_rate_limit_window_seconds: float = 60.0
+    # No nan/inf, for the reason login_rate_limit_window_seconds gives: the count would fill once
+    # and then refuse every PHI read until a restart. Capped for the same reason.
+    phi_read_rate_limit_window_seconds: float = Field(
+        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
 
     # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
     # sliding window folded into the step-up gate (require_step_up) for every NON-GET sensitive op —
@@ -3281,7 +3320,9 @@ class AuthSettings(_Section):
     )
     # gt=0 and no nan/inf: a zero window turns the floor off silently, and a nan one never prunes, so
     # every write after the twelfth would be refused for the life of the process.
-    admin_write_rate_limit_window_seconds: float = Field(default=15.0, gt=0, allow_inf_nan=False)
+    admin_write_rate_limit_window_seconds: float = Field(
+        default=15.0, gt=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
     # THE MINIMUM GAP BETWEEN TWO WRITES BY ONE ACTOR, AND IT IS PROVISIONAL TOO (BACKLOG #2301, ASVS
     # 2.4.2; owner ruling R7 of 2026-09-23). The count above admits its twelve writes back to back;
     # this refuses a write that lands sooner than this after the same actor's last admitted one. It
@@ -4109,21 +4150,209 @@ def _names_this_host(host: str) -> bool:
     """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
     :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
     where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
-    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS."""
-    import ipaddress
-    import socket as _socket
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS.
 
-    h = host.strip().rstrip(".").lower()
+    The host's own name and its own non-loopback addresses are :func:`_is_own_name_or_address`."""
+    h = _bare_host(host)
     if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
         return True
+    addr = _host_ip_literal(h)
+    return addr is not None and (addr.is_loopback or addr.is_unspecified)
+
+
+def _checked_host_text(value: str | None, setting: str, *, ascii_too: bool = True) -> str | None:
+    """``value`` unchanged, or a ``ValueError`` naming ``setting`` when it is text that cannot name
+    a host. The message never quotes the value.
+
+    Two refusals. A control character or a lone surrogate can never be part of a host name. And
+    the socket layer encodes a host with the "idna" codec before it resolves or connects, so text
+    that codec refuses raised ``UnicodeEncodeError`` out of the start, which is not an ``OSError``
+    and so was caught nowhere. At least an empty label (``a..b``), an encoded label over 63
+    characters and a C1 control are such text. An IP literal and an ordinary name both pass.
+
+    ``ascii_too=False`` runs the encoding check on non-ASCII text only. That is for a setting whose
+    caller hands ASCII text to the socket layer on a path that reports a bad label as an
+    ``OSError``, which that caller already handles."""
+    if value is None:
+        return value
+    if has_lone_surrogate(value) or has_control_char(value):
+        raise ValueError(f"{setting} must not contain a control character or an undecodable byte")
+    if not ascii_too and value.isascii():
+        return value
+    # Raised OUTSIDE the handler, on purpose. The codec's error keeps the whole host text on
+    # `.object`, and `from None` would hide it from the traceback printer only: the refusal's
+    # `__context__` would still hold it. Raised after the handler ends, the refusal has no chain
+    # (tests/test_from_none_is_not_redaction.py says why this shape is the safe one).
+    encodable = True
     try:
-        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(h.strip("[]"))
+        value.encode("idna")
+    except UnicodeError:
+        encodable = False
+    if not encodable:
+        raise ValueError(
+            f"{setting} is not a host name the network layer can encode (its IDNA encoding "
+            "refuses it). Look for an empty label, a label that is too long once encoded, or an "
+            "invisible or prohibited character. A non-ASCII name may be written in its xn-- form"
+        )
+    return value
+
+
+def _socket_form(host: str) -> str:
+    """``host`` as the socket layer will read it: trimmed, and passed through the "idna" encoding
+    that layer applies before it resolves or connects (review of vault BACKLOG #2375).
+
+    The gate must compare THIS form. Compared raw, ``127.0.0.1`` typed in full-width digits, or
+    ``localhost`` with a soft hyphen inside, read as some other host while the socket layer
+    dialled loopback (measured). ASCII text comes back unchanged, case included, so an IPv6 zone
+    keeps its case. Text the encoding refuses comes back as it was: the load refuses it for
+    ``[logging].forward_host``, and another caller still gets an answer."""
+    text = host.strip()
+    try:
+        # Trimmed again: the encoding drops an invisible character, which can uncover a space.
+        return text.encode("idna").decode("ascii").strip()
+    except UnicodeError:
+        return text
+
+
+def _bare_host(host: str) -> str:
+    """``host`` as the two predicates here compare it: its :func:`_socket_form`, lowercased, with
+    no trailing dot."""
+    return _socket_form(host).rstrip(".").lower()
+
+
+#: Where a fail-open note goes while :func:`forwarding_gate_check` runs: a list it returns to its
+#: caller. Unset, a note is logged at once, which is what a direct caller of the helpers gets.
+_gate_notes: ContextVar[list[str] | None] = ContextVar("_gate_notes", default=None)
+
+
+def _fail_open_note(note: str) -> None:
+    """Record that an own-host check could not be made. Never silent: the same config can pass
+    before an interface is up and refuse at the next start, and this note is the only record of
+    which happened. It carries no configured value; the refusal text names the setting."""
+    held = _gate_notes.get()
+    if held is None:
+        _log.warning("%s", note)
+    else:
+        held.append(note)
+
+
+def _host_ip_literal(h: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """``h`` as an address when it is an IP literal, else None. Reads the IPv4 shorthand a resolver
+    also accepts (``127.1``, ``0``), and a bracketed IPv6 literal. No DNS."""
+    import socket as _socket
+
+    try:
+        return ipaddress.ip_address(h.strip("[]"))
     except ValueError:
         try:
-            addr = ipaddress.IPv4Address(_socket.inet_aton(h))  # 127.1, 0 and friends; no DNS
-        except OSError:
-            return False
-    return addr.is_loopback or addr.is_unspecified
+            return ipaddress.IPv4Address(_socket.inet_aton(h))
+        except (OSError, ValueError):  # ValueError: a NUL, or text the OS cannot encode
+            return None
+
+
+def _own_host_names() -> frozenset[str]:
+    """This host's name as the OS holds it, and that name's first label, both lowercased.
+
+    ``gethostname`` reads local state, so this asks no resolver. It does NOT learn a domain the OS
+    name leaves out: on a host named ``eng1``, ``eng1.example.org`` is not in the set. On Linux that
+    form needs a lookup, which the gate that calls this must not make. On Windows the OS holds the
+    qualified name locally (``GetComputerNameExW``); reading it there is owed work, not built."""
+    import socket as _socket
+
+    try:
+        name = _bare_host(_socket.gethostname())
+    except OSError as exc:
+        _fail_open_note(
+            f"the OS gave no host name ({type(exc).__name__}), so the ASVS 16.4.3 forwarding gate "
+            "cannot compare [logging].forward_host with it; the gate decides without that check"
+        )
+        return frozenset()
+    return frozenset({name, name.partition(".")[0]}) - {""}
+
+
+def _local_source_address(
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address this host would send FROM to reach ``addr``, or None when the OS will not say.
+
+    Connecting a UDP socket sends no packet. It only asks the routing table for a source address,
+    so it waits on nothing and resolves no name (measured well under a millisecond). The answer for
+    one of the host's own addresses is that same address. Asked instead of bound, because a host
+    with ``net.ipv4.ip_nonlocal_bind`` set (common beside a floating VIP) can bind any address."""
+    import socket as _socket
+
+    family = _socket.AF_INET6 if addr.version == 6 else _socket.AF_INET
+    try:
+        with _socket.socket(family, _socket.SOCK_DGRAM) as probe:
+            probe.connect((str(addr), 9))  # discard port; nothing is sent
+            # A link-local answer carries its zone ("fe80::1%eth0"), which ip_address reads.
+            return ipaddress.ip_address(probe.getsockname()[0])
+    except (OSError, ValueError, TypeError) as exc:  # TypeError: a NUL in an IPv6 zone
+        _fail_open_note(
+            f"the OS gave no source address for [logging].forward_host ({type(exc).__name__}), "
+            "so the ASVS 16.4.3 forwarding gate cannot tell whether that address is this host's "
+            "own; the gate decides without that check"
+        )
+        return None
+
+
+def _is_own_name_or_address(host: str) -> bool:
+    """Whether ``host`` is this host's own name or one of its own non-loopback addresses (vault
+    BACKLOG #2375). The #1966 gate refused loopback only, so a collector at the engine's own LAN
+    address passed although it is the same system.
+
+    **It fails OPEN, on purpose.** When the OS gives no name or no source address, this returns
+    False and the gate passes as it did before. Owner ruling R4 (a) keyed that gate on configuration
+    so a fault cannot hold a clinical message path down, and a refusal resting on a failed probe
+    would be such a fault. The cost is that a broken probe hides this one case. It never loosens
+    the loopback, TLS or verification checks, which do not come through here.
+
+    **What it does not catch, at least:** a name that is not the OS host name but resolves to this
+    host (an alias, or the fully qualified form on a host whose OS name is short), and an address
+    held by this host that the routing table does not treat as local. Both need a lookup, and
+    ADR 0200 leaves the collector-separation probe to #1199's remainder.
+
+    **Where it refuses a collector that IS separate:** an address the routing table treats as local
+    although another system answers on it. A virtual address bound on every node is the known
+    case: a Kubernetes Service address under kube-proxy's IPVS mode, read from the node's own
+    network namespace, or a direct-server-return address held on ``lo``. Reasoned, not measured.
+    A DNS name for that collector passes, since a name is compared with the OS name only. The
+    refusal text points at ADR 0200 Amendment A instead of saying so itself: the same step would
+    let a collector that really is this host through, and a refusal must not teach that."""
+    h = _bare_host(host)
+    # The name first, so an all-digit OS name such as "1234" is not read as an address instead.
+    if h in _own_host_names():
+        return True
+    # Not lowercased: an IPv6 zone is an interface name, and those are case-sensitive on Linux.
+    addr = _host_ip_literal(_socket_form(host).rstrip("."))
+    if addr is None:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    source = _local_source_address(addr)
+    # Zones are compared away: "fe80::1" and "fe80::1%eth0" are one address on this host.
+    return source is not None and int(source) == int(addr) and source.version == addr.version
+
+
+def forwarding_gate_check(log: LoggingSettings) -> tuple[str | None, list[str]]:
+    """:func:`forwarding_gate_refusal` for ``log``, plus the fail-open notes it made, as text.
+
+    For a caller that runs the gate BEFORE logging is configured, which ``serve`` does. A note
+    logged there would reach bare stderr only, never the log file or the off-box collector, and
+    ADR 0200 Amendment A calls that note the record of a fail-open pass. So the notes come back to
+    the caller, which writes each where it can be kept, as ``serve`` does with the #1989
+    static-credential lines. If the gate raises, the notes are logged at once before the error
+    leaves, so they are never dropped."""
+    notes: list[str] = []
+    token = _gate_notes.set(notes)
+    try:
+        return forwarding_gate_refusal(log), notes
+    except BaseException:
+        for note in notes:
+            _log.warning("%s", note)
+        raise
+    finally:
+        _gate_notes.reset(token)
 
 
 def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
@@ -4134,14 +4363,19 @@ def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
     configured with verified TLS to a collector that is not on loopback. This is the predicate; the
     caller owns the refuse/warn split.
 
-    **It reads configuration only.** It opens no socket and resolves no name, so a collector that is
-    down, or a DNS server that is slow, can never stop a start through it: the ruling keys the gate
-    on configuration precisely so a network fault cannot hold a clinical message path down.
+    **It reads configuration and local host state only.** It sends no packet and resolves no name,
+    so a collector that is down, or a DNS server that is slow, can never stop a start through it:
+    the ruling keys the gate on configuration precisely so a network fault cannot hold a clinical
+    message path down. The local state is the OS host name and, for an IP-literal collector, the
+    routing table's source address (:func:`_is_own_name_or_address`, vault BACKLOG #2375); a probe
+    that fails there passes the gate rather than refusing.
 
-    Two things do NOT pass it, on purpose. **Loopback**, because 16.4.3 asks for a logically separate
+    Three things do NOT pass it, on purpose. **Loopback**, because 16.4.3 asks for a logically separate
     system, and a local agent on 127.0.0.1 is the same host; :func:`is_loopback_hop_host` never
     resolves DNS, so a NAME that resolves to loopback does pass, and the collector-separation probe
-    that would catch it is #1199's remainder. **``forward_hop_attested``**, because it attests that an
+    that would catch it is #1199's remainder. **This host's own name or own address**, for the same
+    reason: the engine's LAN address is no more a separate system than 127.0.0.1 is.
+    **``forward_hop_attested``**, because it attests that an
     unprotected hop is secure by other means, and this gate asks whether verified TLS is configured
     at all; letting one flag answer the other's question is how a flag silently widens."""
     if not log.forward_enabled or not log.forward_host:
@@ -4154,6 +4388,12 @@ def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
         return (
             f"[logging].forward_host {log.forward_host!r} is loopback or unspecified, which is this "
             "host and not a logically separate collector"
+        )
+    if _is_own_name_or_address(log.forward_host):
+        return (
+            f"[logging].forward_host {log.forward_host!r} is this host's own name or one of its "
+            "own addresses, which is this host and not a logically separate collector (ADR 0200 "
+            "Amendment A covers a virtual address that another system answers on)"
         )
     return None
 
@@ -5824,7 +6064,9 @@ class BackupSettings(_Section):
     # REFUSES to write an unencrypted archive (fail-closed). With it on, any keyless instance writes
     # one: the check reads no synthetic or non-PHI condition, and every instance carries patient data
     # since BACKLOG #1279 (ADR 0186), so a cleartext archive can hold PHI. Each backup's `dr_backup`
-    # audit row carries `encrypted: false`; security_loosenings() does not name this flag.
+    # audit row carries `encrypted: false`; security_loosenings() does not name this flag. Naming it
+    # is owed (vault BACKLOG #2302): the registry takes each section as a required argument, so it
+    # needs a `backup` one passed at every call site. docs/SECURITY-LOOSENING.md has the entry.
     allow_unencrypted: bool = False
 
     @field_validator("schedule_at")
@@ -7127,10 +7369,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
-      older than the window, so a SHORTER window admits more, and one of 0 or less (``-inf`` included)
-      prunes each hit before it is counted. A negative count refuses more, and a NaN or ``+inf``
-      window never prunes, so none of those is named. A ``min_interval_seconds`` of 0 turns the gap
-      off, and a shorter gap admits a faster burst.
+      older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
+      before it is counted. A negative count refuses more, so it is not named. A NaN or infinite
+      window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
+      ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
+      admits a faster burst.
     * ``next_lockout_state`` ends a lock at now + ``lockout_minutes`` (shorter is looser; 0 or less
       ends it at once) and arms it at ``lockout_threshold`` failures (higher is looser; 0 or less locks
       on the first failure). An escalating lock doubles up to ``lockout_max_minutes`` (ADR 0197), so a
@@ -7152,6 +7395,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       looser and 0 is off. A higher floor is stricter, and is not named.
     * ``oidc_callback_floor_exempt_amr`` (BACKLOG #2388) skips the federated floor for a matching
       ``amr``, so any value listed is looser, named while that floor is on.
+    * ``ad_connect_timeout`` and ``ad_receive_timeout`` (vault BACKLOG #2567) bound how long one
+      directory call may hold a worker thread, so a value above its default is looser, named while
+      AD is on. They are timeouts and not rate limits; they sit here because they are read the same
+      way, against the shipped default.
 
     ``[approvals].min_dwell_seconds``, the dual-control approval floor, is another time floor of the
     same kind. It lives in its own section, so :func:`_approvals_loosenings` names it, read the same
@@ -7509,6 +7756,34 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             ),
             off=None,
         )
+
+    # --- the directory timeouts (vault BACKLOG #2567, ASVS 13.1.3). LdapAuthenticator hands them to
+    # every ldap3 Server and Connection, and each directory call runs in a worker thread until it
+    # answers or times out. A longer timeout holds that thread longer, so only a value above the
+    # default is looser. The load refuses 0, a negative, inf and NaN, so there is no off value.
+    # Named only with AD on, as ad_session_recheck_seconds is: with no directory nothing reads them.
+    if auth.ad_enabled:
+        for field, what in (
+            ("ad_connect_timeout", "the LDAP connect timeout"),
+            # auth/ldap.py hands ldap3 this value rounded UP to a whole second.
+            (
+                "ad_receive_timeout",
+                "the LDAP response-read timeout (applied rounded up to a whole second)",
+            ),
+        ):
+            value, default = getattr(auth, field), _auth_default(field)
+            if value > default:
+                out.append(
+                    (
+                        field,
+                        # repr round-trips, so a value one step past the default never prints as it.
+                        f"{what} is {value!r} s, above the default of {default:g} s, so a "
+                        "directory call (at least a sign-in, a step-up and a session recheck) to "
+                        "a domain controller that has stopped answering holds a worker thread "
+                        "longer before it fails -- stalled calls then tie up the thread pool that "
+                        "sign-in shares for longer",
+                    )
+                )
     return out
 
 
@@ -7743,11 +8018,13 @@ def security_loosenings(
     ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
     bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap and OIDC flow-cache
+    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache
+    and AD timeout
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
     (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
-    ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
+    ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
+    #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
     leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
@@ -8160,6 +8437,19 @@ def security_loosenings(
                 "address of their family, so X-Forwarded-For is trusted from EVERY such peer, as the "
                 "refused '*' would be -- any client can declare its own source address, poisoning "
                 "the audit trail, the per-address sign-in limit and the new-client-IP step-up signal",
+            )
+        )
+    # Vault BACKLOG #2385: the [api] bools are under a completeness floor now, and this is the one
+    # that was a deviation with no entry. create_app registers the documentation routes only when
+    # it is on, and none of them asks for sign-in.
+    if api.expose_docs:
+        out.append(
+            (
+                "expose_docs",
+                "the engine serves its API documentation routes (at least /docs, /redoc and "
+                "/openapi.json) with NO sign-in -- anyone who can reach the API socket reads "
+                "every route, parameter and response shape the engine has (the schema, not "
+                "message data)",
             )
         )
     # BACKLOG #1179, owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS

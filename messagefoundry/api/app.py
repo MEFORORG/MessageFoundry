@@ -1226,6 +1226,12 @@ def _posture_loosenings(
     # resolved settings serve stashed, the #1989 object; an app built without them (the
     # embedding/test path) reports the shipped [api] defaults, which acknowledge nothing.
     api_settings = cred_settings.api if cred_settings is not None else ApiSettings()
+    # Vault BACKLOG #2385: the docs routes are built from create_app's own argument, not from
+    # [api]. So what THIS app serves is read off the app, as allow_no_auth is below, and it wins
+    # in both directions over a stashed [api] value the app was not built with.
+    serves_docs = getattr(state, "expose_docs", None)
+    if serves_docs is not None and serves_docs != api_settings.expose_docs:
+        api_settings = api_settings.model_copy(update={"expose_docs": serves_docs})
     # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
     # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
     # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
@@ -2693,7 +2699,7 @@ def create_app(
             "create_app: allow_no_auth=True was passed beside an auth service; pass the opt-in "
             "only with no service, since a service always requires sign-in"
         )
-    # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
+    # The interactive docs (at least /docs and /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
     #
@@ -2800,6 +2806,8 @@ def create_app(
     app.state.client_address_monoculture = False
     # Fail-closed when no auth is attached unless explicitly opted out (embedding/dev) — SYS-1.
     app.state.allow_no_auth = allow_no_auth
+    # Whether THIS app serves its API documentation routes, for the posture read-out (#2385).
+    app.state.expose_docs = expose_docs
     # ASVS 16.3.2 (#244): audit every authorization grant, not just the sensitive set. ON by default
     # since BACKLOG #1277; `serve` passes the resolved [diagnostics].audit_all_authz over the top.
     app.state.audit_all_authz = audit_all_authz

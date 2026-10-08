@@ -72,6 +72,7 @@ section reference.
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
+| | `[auth].ad_connect_timeout`, `ad_receive_timeout` | `10` s / `10` s (*conditional* — a loosening only once `ad_enabled`; a timeout above `10` s is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
 | | `[auth].admin_new_ip_step_up` | `true` |
 | | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
 | | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
@@ -87,6 +88,8 @@ section reference.
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
+| | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
+| | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive. **Not reported yet** — see its entry below) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
@@ -99,22 +102,26 @@ section reference.
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
-`[auth].ad_allow_insecure_ldap`, `[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
+`[auth].ad_allow_insecure_ldap`, `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
+`[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
 keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
-`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies` and
-`[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
-settings at all. They are listed here anyway, and all but `update_url_form` are reported, because the rule is *one shipped
+`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
+`[api].plaintext_upstream_hop_acknowledged` and `[api].expose_docs` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
+settings at all. They are listed here anyway, and all but `update_url_form` and
+`[backup].allow_unencrypted` are reported, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot). At least one per-connection row is not passed in
-yet: `update_url_form`, whose entry names the two records it does have.
+yet: `update_url_form`, whose entry names the two records it does have. At least one section
+setting is not passed in yet either: `[backup].allow_unencrypted`, whose entry names the one record
+it has.
 
 **One row is not a setting at all.** `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is an environment variable.
 `security_loosenings()` reads it from the environment of the process that renders the report, and
@@ -127,7 +134,8 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one), the connection
 > factories' TLS-shaped parameters (a second floor in the same file censuses the factory signatures,
 > because a per-connection deviation is outside `model_fields`' reach by construction) and the
-> enumerated deviations above, except `update_url_form` (its entry says which records it has). It is
+> enumerated deviations above, except `update_url_form` and `[backup].allow_unencrypted` (each entry
+> says which records it has). It is
 > **not yet** an exhaustive register of every security-relevant
 > switch in every section: `[store].encrypt` / `trust_server_certificate` and
 > `[auth].ad_tls_verify` are gated by their own serve-time refusals and are **not** reported here.
@@ -139,6 +147,8 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > `require_mfa` itself is reported: see its entry below.
 > That gap is enumerated in the floor test's exemption set, so it is a written decision rather than an
 > accident, and a *new* switch in either section cannot join it silently. Closing it is owed work.
+> The `[api]` bools have a floor of their own in the same file (vault BACKLOG #2385): each one is
+> named here or sits on that floor's exemption list with its reason.
 
 `enforcement` (ADR 0148 GIVEN 2) is the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 escape-clamp key, defaulting to `enforce` (byte-identical to the former production-tier refusal). It is
@@ -650,6 +660,23 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   is written, as for the other settings-scoped loosenings.
 - **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
 
+### `[auth].ad_connect_timeout` or `ad_receive_timeout` above `10` s **with `ad_enabled`** — a stalled directory call holds a thread longer
+> **Conditional** on `[auth].ad_enabled`, since nothing reads the timeouts with no directory (vault
+> BACKLOG #2567, ASVS 13.1.3). Each is named on its own once it is above `10` s. A shorter timeout
+> fails a stalled call sooner, which is stricter, and is not named. Neither has an off value: the
+> row in the table above gives what the load refuses.
+- **What you lose:** each directory call runs in a worker thread until the domain controller answers
+  or a timeout ends. That covers at least a sign-in, a step-up and a session recheck. One call can
+  wait on several connects and reads, each bounded on its own. With a longer timeout, a controller
+  that has stopped answering holds each thread longer, so stalled calls tie up the thread pool that
+  sign-in shares for longer.
+- **When acceptable:** a directory reached over a slow link, where `10` s is measured to be too short
+  for a healthy round trip.
+- **Compensating controls:** none bounds how many calls stall at once. The sign-in rate limit paces
+  how many start per window, not how many are held, and a session recheck does not pass it. So
+  raise the timeout only as far as the measured round trip needs.
+- **Reversible:** yes, immediately — restore `10` (or delete the line) and restart.
+
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
 > Reported whenever it is `false`. No sign-in condition applies, since no setting turns sign-in off
 > (vault BACKLOG #2825). The default is `true` since BACKLOG #288
@@ -689,8 +716,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > it paces is `0`, since it then paces nothing; each zeroed count is named instead. **The cutoff is the shipped default, not a
 > judged threshold.** Any value looser than the default is named, so a huge count or a tiny window is
 > reported like an off value, with text that says *looser than the default of* rather than *off*. A
-> value at or stricter than the default is not reported. That includes a **negative** count, and a
-> window that is not a number or is `+inf`, each of which refuses *more* attempts, not fewer.
+> value at or stricter than the default is not reported. That includes a **negative** count, which
+> refuses *more* attempts, not fewer. A window that is not a number, or is infinite, does not load
+> (vault BACKLOG #2466): a `NaN` or `+inf` window never ages an attempt out, so once the count filled
+> the limiter would refuse every sign-in until a restart. A window above `86400` s (one day) does
+> not load either, since a huge finite one does the same in practice. Both rules hold for
+> `phi_read_rate_limit_window_seconds` and `admin_write_rate_limit_window_seconds` too.
 - **What you lose:** a password spray across many usernames never trips one account's lockout, and these
   limits are what slow it. With the per-address limit off, one client may try as fast as the all-clients
   limit allows. With the all-clients limit off, a spray spread across many addresses grows with the number
@@ -892,6 +923,37 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Reversible:** yes. Supply `[api].tls_cert_file` and restart; the acknowledgement then does nothing
   and may stay. To drop the terminator instead, remove `tls_terminated_upstream`, the acknowledgement
   and `trusted_proxies` together, or the load refuses.
+
+### `[api].expose_docs = true` — the API schema is served with no sign-in
+> **Not conditional** (vault BACKLOG #2385). The documentation routes exist only while the switch is
+> on, and none of them asks for sign-in, on a loopback bind or off it.
+- **What you lose:** the engine serves at least `/docs`, `/redoc` and `/openapi.json` to anyone who
+  can reach the API socket. They show every route, parameter and response shape. They hold the schema, not
+  message data.
+- **When acceptable:** a development engine on a loopback bind, while you write a client against it.
+- **Compensating controls:** keep the bind loopback, or list only trusted networks in
+  `[security].allowed_client_networks`. Neither hides the schema from a client that is allowed in.
+- **Reversible:** yes, immediately. Delete the line, or set it to `false`, and restart.
+
+### `[backup].allow_unencrypted = true` — a keyless instance writes its backup archive in cleartext
+> **Not conditional on the data** (vault BACKLOG #2302). The flag reads no synthetic or non-PHI
+> condition, and every instance carries patient data
+> ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)).
+> It does not ask `[security].enforcement` either, so `enforce` does not refuse it.
+- **What you lose:** with no store key, the backup runner writes a `.mfbak.plain` archive instead of
+  refusing. On a SQLite store that archive holds a full snapshot, message bodies included, and the
+  config bundle, with nothing encrypting it. With a store key the engine still writes a sealed
+  `.mfbak`, so the flag then changes nothing a backup writes.
+- **When acceptable:** the backup destination is itself encrypted and access-controlled, and the site
+  has accepted that the archive is cleartext. Prefer configuring a store key.
+- **Compensating controls:** encrypt the destination volume, and restrict who can read it. Treat
+  every `.mfbak.plain` file as PHI.
+- **Where it is NOT reported:** it is **not yet** in `security_loosenings()`, so
+  `GET /security/posture`, `messagefoundry security show` and the serve-time loosening warning do not
+  name it. Its one record today is the `dr_backup` audit row of each backup, which carries
+  `encrypted: false`. Adding it to the registry is owed work.
+- **Reversible:** yes. Configure a store key, set the flag back to `false` (or delete the line) and
+  restart. Archives already written in cleartext stay cleartext; delete them once a sealed one exists.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**
@@ -1518,6 +1580,7 @@ chapter was not part of the verification above.
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].ad_allow_insecure_ldap` (plain `ldap://` AD bind) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(d) Person or Entity Authentication |
+| `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout` (bound on one directory call) | V13 Configuration (13.1.3) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
 | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` (config-source check downgraded to a warning) | V13 Configuration | **CM-5** Access Restrictions for Change · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold`, `[auth].lockout_max_minutes` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
@@ -1527,6 +1590,7 @@ chapter was not part of the verification above.
 | `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, `[[alerts.rules]]` (credential reminders off, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
 | `[api].trusted_proxies` (trust-every-peer forwarded header) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
+| `[api].expose_docs` (API schema and interactive docs served with no sign-in) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `url_query_credential` (per-connection credential in an endpoint URL's query) | V14 Data Protection (14.2.1) | **SC-8** Transmission Confidentiality and Integrity · **IA-5(7)** No Embedded Unencrypted Static Authenticators | §164.312(d) Person or Entity Authentication · §164.312(e)(1) Transmission Security |

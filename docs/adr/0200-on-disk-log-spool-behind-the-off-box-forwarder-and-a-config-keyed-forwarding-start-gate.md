@@ -168,3 +168,53 @@ changes no decision above.
   so sharing it is a design question.
 - A lone surrogate can still be lost at send time by a caller that puts raw text into `LogSpool`.
   The engine's own path spells it as text before the queue, so it does not arise there.
+
+## Amendment A (2026-10-08, PROPOSED) -- the gate also refuses this host's own name and addresses (vault BACKLOG #2375)
+
+**Status: built, and not yet ruled on by the owner.** Owner ruling R4 (a) keyed the gate on
+forwarding configuration. This amendment makes it read local host state as well, which is a
+Builder's design inside that ruling and not part of it. The fail-open choice below is an open
+owner question.
+
+Decision 2 refused loopback only. A `forward_host` set to the engine's own LAN address passed,
+although it is no more a separate system than 127.0.0.1 is.
+
+The gate now also refuses a `forward_host` that is:
+
+- this host's OS name, or that name's first label; or
+- an IP literal that is one of this host's own addresses.
+
+**What moved in decision 2's wording.** It said the gate "reads settings only". It now also reads
+local host state: the OS host name, and, for an IP literal, the source address the routing table
+gives for it. That read is a UDP socket connected and closed with nothing sent. The property the
+ruling asked for is unchanged: the gate sends no packet, resolves no name and opens no connection
+to the collector, so a down collector or a slow DNS server still cannot block a start.
+
+**A failed read passes the gate, and logs a WARNING.** If the OS gives no name or no source
+address, the gate decides as it did before this amendment. The same config can therefore pass
+before an interface is up and refuse at the next start; the WARNING is the record of which.
+The gate runs before logging is configured, so `serve` writes that line twice: to stderr where
+the gate runs, and again through the configured log handlers once they exist. The second copy
+is an ordinary WARNING, so `[logging].level = "ERROR"` keeps it out of the log file and off the
+collector, and stderr then holds the only copy. A caller other
+than `serve` gets it on its own logger only. A refusal resting on a failed probe would be the kind of fault
+R4 (a) keyed the gate on configuration to avoid. Whether it should refuse instead is an open
+question for the owner.
+
+**Still not caught, at least:** an alias that resolves to this host, and the fully qualified name
+on a host whose OS name is short. On Linux both need a lookup, so they stay with the
+collector-separation probe that #1199 names. On Windows the OS holds the qualified name locally;
+reading it there is owed work.
+
+**It can refuse a collector that is separate.** The address test asks the routing table, and the
+routing table calls an address local when it is bound on this host, even if another system
+answers on it. A virtual address bound on every node is the known case: a Kubernetes Service
+address under kube-proxy's IPVS mode, read from the node's own network namespace, or a
+direct-server-return address held on `lo`. This is reasoned, not measured. A DNS name for that
+collector passes. Use one only when another system really answers on the address. The refusal
+text points here and does not give that step itself, because the same step would let a collector
+that is this host through.
+
+**The Consequences line on start-time cost moved too.** It called the gate "a settings read". For
+an IP-literal collector it is now also one local socket call, measured at well under a
+millisecond on a Windows host. For a name it is one `gethostname` call.

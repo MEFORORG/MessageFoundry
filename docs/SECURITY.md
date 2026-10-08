@@ -5044,10 +5044,19 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
 - **Forwarding start gate (owner ruling R4 (a), ASVS 16.4.3).** A PHI instance under
   `[security].enforcement = "enforce"` refuses to start unless `[logging]` forwards over verified TLS
   (`forward_protocol = "tls"`, verification on) to a `forward_host` that is not loopback; under `warn`
-  it warns. It reads configuration only and opens no connection, so a down collector never blocks a
-  start. `forward_hop_attested` does not satisfy it, and neither does a local agent on 127.0.0.1. It
+  it warns. It opens no connection to the collector and resolves no name, so a down collector never
+  blocks a start. `forward_hop_attested` does not satisfy it, and neither does a local agent on 127.0.0.1. It
   keys on forwarding, not the spool: `forward_spool_max_bytes = 0` turns off loss protection, not the
   gate. A host NAME that resolves to loopback does pass, because the check never resolves DNS; that residual belongs to #1199's collector-separation probe.
+  The gate also refuses a `forward_host` that is this host's own OS name, or an IP literal that is
+  one of its own addresses (vault BACKLOG #2375). For that it reads the OS host name and asks the
+  routing table for a source address; it still sends no packet and resolves no name. If that local
+  read fails, the gate logs a WARNING and passes as before. At least two forms still pass: an alias
+  that resolves to this host, and the fully qualified name on a host whose OS name is short. One
+  form is refused although the collector is separate: a virtual address the routing table treats
+  as local, such as a Kubernetes Service address under IPVS read from the node's own network
+  namespace. ADR 0200, Amendment A, records the reasoning and what to do; it is proposed, and not
+  yet ruled on by the owner.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
 committed audit row ships as metadata, with only best-effort PHI redaction
