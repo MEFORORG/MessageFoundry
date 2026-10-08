@@ -2492,6 +2492,26 @@ def test_exposed_api_docs_are_a_named_loosening() -> None:
     assert "NO sign-in" in risk
 
 
+def test_the_backup_cleartext_flag_is_documented_as_not_yet_reported() -> None:
+    """``[backup].allow_unencrypted`` lets a keyless instance write a cleartext archive, and the
+    registry cannot see ``[backup]`` (vault BACKLOG #2302). The guide says so in two places.
+
+    A tripwire, not a decision: once the registry takes a ``backup`` section this reds, and the
+    guide's row and entry must then say the flag IS reported."""
+    import inspect
+
+    from messagefoundry.config.settings import BackupSettings
+
+    assert BackupSettings.model_fields["allow_unencrypted"].default is False
+    assert "backup" not in inspect.signature(security_loosenings).parameters
+    guide = (Path(__file__).parents[1] / "docs" / "SECURITY-LOOSENING.md").read_text("utf-8")
+    row = next(line for line in guide.splitlines() if line.startswith("| | `[backup].allow_un"))
+    assert "**Not reported yet**" in row
+    entry = guide.split("### `[backup].allow_unencrypted = true`", 1)[1].split("\n### ", 1)[0]
+    assert "**not yet** in `security_loosenings()`" in entry
+    assert "`encrypted: false`" in entry
+
+
 async def test_posture_route_declares_its_scope_when_no_graph_is_loaded(engine: Engine) -> None:
     """An engine with no registry runner cannot see the connection-scoped declarations, so it SAYS so.
 

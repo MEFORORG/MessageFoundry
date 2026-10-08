@@ -87,6 +87,7 @@ section reference.
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | | `[api].expose_docs` | `false` (`true` serves `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
+| | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive. **Not reported yet** — see its entry below) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
@@ -108,13 +109,16 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
 `[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged` and `[api].expose_docs` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
-settings at all. They are listed here anyway, and all but `update_url_form` are reported, because the rule is *one shipped
+settings at all. They are listed here anyway, and all but `update_url_form` and
+`[backup].allow_unencrypted` are reported, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[api]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot). At least one per-connection row is not passed in
-yet: `update_url_form`, whose entry names the two records it does have.
+yet: `update_url_form`, whose entry names the two records it does have. At least one section
+setting is not passed in yet either: `[backup].allow_unencrypted`, whose entry names the one record
+it has.
 
 **One row is not a setting at all.** `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is an environment variable.
 `security_loosenings()` reads it from the environment of the process that renders the report, and
@@ -127,7 +131,8 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one), the connection
 > factories' TLS-shaped parameters (a second floor in the same file censuses the factory signatures,
 > because a per-connection deviation is outside `model_fields`' reach by construction) and the
-> enumerated deviations above, except `update_url_form` (its entry says which records it has). It is
+> enumerated deviations above, except `update_url_form` and `[backup].allow_unencrypted` (each entry
+> says which records it has). It is
 > **not yet** an exhaustive register of every security-relevant
 > switch in every section: `[store].encrypt` / `trust_server_certificate` and
 > `[auth].ad_tls_verify` are gated by their own serve-time refusals and are **not** reported here.
@@ -881,6 +886,26 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Compensating controls:** keep the bind loopback, or list only trusted networks in
   `[security].allowed_client_networks`. Neither hides the schema from a client that is allowed in.
 - **Reversible:** yes, immediately. Delete the line, or set it to `false`, and restart.
+
+### `[backup].allow_unencrypted = true` — a keyless instance writes its backup archive in cleartext
+> **Not conditional on the data** (vault BACKLOG #2302). The flag reads no synthetic or non-PHI
+> condition, and every instance carries patient data
+> ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)).
+> It does not ask `[security].enforcement` either, so `enforce` does not refuse it.
+- **What you lose:** with no store key, the backup runner writes a `.mfbak.plain` archive instead of
+  refusing. On a SQLite store that archive holds a full snapshot, message bodies included, and the
+  config bundle, with nothing encrypting it. With a store key the engine still writes a sealed
+  `.mfbak`, so the flag then changes nothing a backup writes.
+- **When acceptable:** the backup destination is itself encrypted and access-controlled, and the site
+  has accepted that the archive is cleartext. Prefer configuring a store key.
+- **Compensating controls:** encrypt the destination volume, and restrict who can read it. Treat
+  every `.mfbak.plain` file as PHI.
+- **Where it is NOT reported:** it is **not yet** in `security_loosenings()`, so
+  `GET /security/posture`, `messagefoundry security show` and the serve-time loosening warning do not
+  name it. Its one record today is the `dr_backup` audit row of each backup, which carries
+  `encrypted: false`. Adding it to the registry is owed work.
+- **Reversible:** yes. Configure a store key, set the flag back to `false` (or delete the line) and
+  restart. Archives already written in cleartext stay cleartext; delete them once a sealed one exists.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**

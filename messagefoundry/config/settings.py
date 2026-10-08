@@ -5799,7 +5799,9 @@ class BackupSettings(_Section):
     # REFUSES to write an unencrypted archive (fail-closed). With it on, any keyless instance writes
     # one: the check reads no synthetic or non-PHI condition, and every instance carries patient data
     # since BACKLOG #1279 (ADR 0186), so a cleartext archive can hold PHI. Each backup's `dr_backup`
-    # audit row carries `encrypted: false`; security_loosenings() does not name this flag.
+    # audit row carries `encrypted: false`; security_loosenings() does not name this flag. Naming it
+    # is owed (vault BACKLOG #2302): the registry takes each section as a required argument, so it
+    # needs a `backup` one passed at every call site. docs/SECURITY-LOOSENING.md has the entry.
     allow_unencrypted: bool = False
 
     @field_validator("schedule_at")
