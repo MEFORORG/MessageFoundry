@@ -11,8 +11,11 @@ disk, no store.
 cluster standby and every engine shard has its own, and each watches its own. That is why this is
 an engine maintenance task, like the certificate monitor, and not part of the message graph.
 
-**What fires, and how often.** At least these kinds, each its own alert key
-(``forwarder:<kind>``):
+**What fires, and how often.** At least these kinds, each its own alert key: ``forwarder:<kind>``
+on a lone engine, and ``forwarder:<kind>@node:<node_id>`` or ``forwarder:<kind>@shard:<id>`` where
+several engine processes share the store, so each process has its own alert row and the row says
+which process lost its forwarder. The suffix is the intake alert's (BACKLOG #2272), built by the
+same :func:`~messagefoundry.pipeline.intake_bound.process_alert_subject`.
 
 * ``not_installed``: a forwarder was configured and is not attached, or its listener thread has
   ended. At once when it is first seen absent, then again every :data:`REALERT_SECONDS` while it
@@ -32,7 +35,9 @@ forwarder that is already losing them.
 **Over UDP only queue and spool losses can fire.** No failed send is counted over UDP, so a collector
 that is down looks the same as one that is up (:attr:`ForwarderStatus.delivery_confirmed`).
 
-The alert carries counts and fixed words only: never a record, a host name or an error text.
+The alert carries counts, fixed words and this process's own label only: never a record, the
+collector's host name or an error text. An unpinned cluster node's label holds this engine's own
+host name, as its ``node_id`` does everywhere else.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from collections.abc import Callable
 
 from messagefoundry.logging_setup import FORWARD_LOSS_COUNTERS, ForwarderStatus, forwarder_status
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.intake_bound import process_alert_subject
 
 __all__ = ["CHECK_INTERVAL_SECONDS", "REALERT_SECONDS", "LogForwardWatch"]
 
@@ -83,8 +89,12 @@ class LogForwardWatch:
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.monotonic,
         read: Callable[[], ForwarderStatus] = forwarder_status,
+        node: str | None = None,
     ) -> None:
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
+        #: Which engine process this is (``Engine.instance_identity``), or ``None`` for a lone
+        #: engine. Fixed for the watch's life, so a re-fire lands on the same alert row.
+        self._node = node
         self._clock = clock
         self._read = read
         self._stop = asyncio.Event()
@@ -175,5 +185,8 @@ class LogForwardWatch:
 
     def _fire(self, kind: str, reason: str, count: int = 0) -> None:
         # The kind is in the key because the notifier throttles and de-duplicates on it: two
-        # kinds raised in one pass would otherwise be one notification and one alert row.
-        self._alert_sink.log_forward_failed(f"{_LABEL}:{kind}", reason=reason, count=count)
+        # kinds raised in one pass would otherwise be one notification and one alert row. The
+        # process is in it for the same reason: every process on a store watches its own forwarder.
+        self._alert_sink.log_forward_failed(
+            process_alert_subject(f"{_LABEL}:{kind}", self._node), reason=reason, count=count
+        )

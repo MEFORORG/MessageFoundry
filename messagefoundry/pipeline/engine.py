@@ -1230,7 +1230,8 @@ class Engine:
         A cluster node's id is the same after a restart only when ``[cluster].node_id`` is pinned.
         The shard id is known once the engine holds its graph (:meth:`start` or ``add_registry``).
         Read by the approval gate to mark the releases it claims (BACKLOG #1562), and by the intake
-        monitor to name this process in its alert subjects (BACKLOG #2272)."""
+        monitor (BACKLOG #2272) and the log forwarder watch (BACKLOG #2612) to name this process in
+        their alert subjects."""
         if self._coordinator.is_clustered():
             return f"node:{self._coordinator.node_id}"
         runner = self._registry_runner
@@ -1644,7 +1645,12 @@ class Engine:
         # sending. NOT leader-gated, for the certificate monitor's reason: the forwarder is this
         # process's own, so a standby and every engine shard watches its own.
         if self._log_forward_watch is None:
-            self._log_forward_watch = LogForwardWatch(alert_sink=self._alert_sink)
+            # The process names itself in the alert key, as the intake monitor does (BACKLOG
+            # #2272): otherwise every process on the store shares one alert row per kind, and the
+            # row cannot say which process lost its forwarder. Read once, for that monitor's reason.
+            self._log_forward_watch = LogForwardWatch(
+                alert_sink=self._alert_sink, node=self.instance_identity
+            )
             self._log_forward_watch.start()
         # BACKLOG #299: apply a replaced CRL file to the running hops that hold the old copy. Not
         # gated on [cert_monitor]: turning the expiry alert off must not also stop a revocation

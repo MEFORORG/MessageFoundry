@@ -185,11 +185,13 @@ class AlertSink(Protocol):
 
     def log_forward_failed(self, name: str, *, reason: str, count: int = 0) -> None:
         """The **off-box log forwarder** is absent, losing records or not sending (BACKLOG #2612).
-        ``name`` is ``forwarder:<kind>``, so each kind is its own alert; ``reason`` is fixed words
-        naming the cause; ``count`` is a count since the process started. The kinds, and when
-        each fires: ``pipeline/log_forward_watch.py``, which emits this.
+        ``name`` is ``forwarder:<kind>``, with ``@node:<node_id>`` or ``@shard:<id>`` appended where
+        several engine processes share the store, so each kind on each process is its own alert.
+        ``reason`` is fixed words naming the cause; ``count`` is a count since the process started.
+        The kinds, and when each fires: ``pipeline/log_forward_watch.py``, which emits this.
 
-        Counts and fixed words only: never a record, a host name or an exception text."""
+        Counts, fixed words and this process's own label only: never a record, the collector's
+        host name or an exception text."""
         ...
 
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:

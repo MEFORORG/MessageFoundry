@@ -878,8 +878,13 @@ A configured forwarder whose collector cannot be reached or verified at start do
 engine. A hop the start gate refuses still does; see `forward_spool_max_bytes` above. The engine tells you
 about a missing or failing forwarder two ways (BACKLOG #2612).
 
-- **The `log_forward_failed` alert.** It is keyed on `forwarder:<kind>`. The engine checks every 30
-  seconds, and `kind` is a fixed word, at least one of these.
+- **The `log_forward_failed` alert.** Its `connection` names the kind and the engine process:
+  `forwarder:<kind>@<process>`, where `<process>` is `node:<node_id>` on a cluster node or
+  `shard:<id>` on an engine shard. A lone engine that owns its store drops the suffix:
+  `forwarder:<kind>`. So each process sharing a store has its own alert, and the alert says which
+  process lost its forwarder. The suffix is built the way the `intake_paused` suffix is, with the
+  same 200-character cap. The engine checks every 30 seconds, and `kind` is a fixed word, at
+  least one of these.
   - `not_installed`: the forwarder is not attached, so this process sends nothing off the host.
     It fires when the engine first finds it absent, then again about every five minutes while it
     stays absent. The reason is `permanent` or `transient` for a failed start, or `stopped`.
@@ -891,7 +896,9 @@ about a missing or failing forwarder two ways (BACKLOG #2612).
 
   The four kinds share one five-minute window: after any of them fires, none fires again until
   it ends. The one exception is the first check that finds the forwarder absent.
-  Nothing closes the alert when the forwarder recovers; resolve it by hand.
+  Nothing closes the alert when the forwarder recovers; resolve it by hand. A cluster node keeps
+  its name across a restart only when `[cluster].node_id` is pinned. An unpinned node gets a new
+  id on every start, so a fault that outlasts a restart opens a new alert beside the old one.
 - **`log_forwarder` on `GET /status`.** It is `null` when no forwarder is configured. Otherwise
   `state` is `healthy`, `unconfirmed`, `degraded` or `not_installed`, beside `delivery_confirmed`,
   `send_failing`, `spool_read_faulted` and the counts: `lost`, `queued`, `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped`,

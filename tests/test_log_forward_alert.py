@@ -27,6 +27,7 @@ from messagefoundry.config.settings import (
     AlertRule,
     EgressSettings,
 )
+from messagefoundry.connection_names import is_connection_name
 from messagefoundry.logging_setup import (
     ForwarderStatus,
     SyslogForward,
@@ -39,6 +40,7 @@ from messagefoundry.logging_setup import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.intake_bound import INTAKE_SUBJECT_MAX_LENGTH
 from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.store.store import MessageStore
 
@@ -249,13 +251,16 @@ class _Clock:
 
 
 def _watch(
-    sink: AlertSink, *, readings: list[ForwarderStatus] | None = None
+    sink: AlertSink, *, readings: list[ForwarderStatus] | None = None, node: str | None = None
 ) -> tuple[LogForwardWatch, _Clock]:
     clock = _Clock()
     if readings is None:
-        return LogForwardWatch(alert_sink=sink, clock=clock), clock
+        return LogForwardWatch(alert_sink=sink, clock=clock, node=node), clock
     feed = iter(readings)
-    return LogForwardWatch(alert_sink=sink, clock=clock, read=lambda: next(feed)), clock
+    return (
+        LogForwardWatch(alert_sink=sink, clock=clock, read=lambda: next(feed), node=node),
+        clock,
+    )
 
 
 def test_a_failed_start_raises_the_alert_and_raises_it_again_each_window(
@@ -498,6 +503,104 @@ async def test_the_loop_checks_at_once_survives_a_bad_pass_and_stops() -> None:
     assert watch._task is not None and not watch._task.done()  # and the loop outlived it
     await watch.stop()
     await watch.stop()
+
+
+# --- one alert key per process -------------------------------------------------------------------
+
+_ABSENT = ForwarderStatus(configured=True, installed=False)
+
+
+def _keys(sink: _RecordingSink) -> list[str]:
+    return [name for name, _reason, _count in sink.forward_failures]
+
+
+def test_two_processes_on_one_store_raise_under_their_own_keys() -> None:
+    """Every process on a store watches its own forwarder. Two that share one sink, as two engine
+    shards share one alert table, must not share one alert key: the row has to say which process
+    lost its forwarder."""
+    sink = _RecordingSink()
+    for node in ("shard:a", "shard:b", "node:h1:42:ab12cd34"):
+        watch, _clock = _watch(sink, readings=[_ABSENT], node=node)
+        watch.run_once()
+    assert sink.forward_failures == [
+        ("forwarder:not_installed@shard:a", "stopped", 0),
+        ("forwarder:not_installed@shard:b", "stopped", 0),
+        ("forwarder:not_installed@node:h1:42:ab12cd34", "stopped", 0),
+    ]
+
+
+def test_one_process_keeps_one_key_per_kind_across_re_fires() -> None:
+    """A re-fire must land on the same alert row, so the key does not move while the watch lives.
+    Each kind still has its own key under the process suffix."""
+    sink = _RecordingSink()
+    watch, clock = _watch(sink, readings=[_ABSENT] * 3, node="shard:a")
+    for now in (0.0, 330.0, 660.0):
+        clock.now = now
+        watch.run_once()
+    assert _keys(sink) == ["forwarder:not_installed@shard:a"] * 3
+
+    both = _RecordingSink()
+    watch2, _clock2 = _watch(
+        both, readings=[_reading(queue_dropped=1, spool_read_errors=1)], node="shard:a"
+    )
+    watch2.run_once()
+    assert _keys(both) == ["forwarder:dropping@shard:a", "forwarder:spool_unreadable@shard:a"]
+
+
+def test_a_lone_engine_keeps_the_bare_key_and_a_long_label_is_capped() -> None:
+    sink = _RecordingSink()
+    # ``[cluster].node_id`` has no length limit; the alert column does.
+    for node in (None, "node:" + "x" * 400 + "1", "node:" + "x" * 400 + "2"):
+        watch, _clock = _watch(sink, readings=[_ABSENT], node=node)
+        watch.run_once()
+    bare, long_one, long_two = _keys(sink)
+    assert bare == "forwarder:not_installed"
+    assert len(long_one) == len(long_two) == INTAKE_SUBJECT_MAX_LENGTH
+    assert long_one != long_two
+    # Still no connection name, so the type keeps taking no control_action.
+    assert not is_connection_name("forwarder:dropping@shard:a")
+    assert not is_connection_name(long_one)
+
+
+async def test_two_processes_on_one_store_write_two_alert_rows(tmp_path: Path) -> None:
+    """On a real store: two processes' alerts are two ``alert_instance`` rows, and one process's
+    re-fire stays on its own row."""
+    store = await MessageStore.open(tmp_path / "shared.db")
+    try:
+        for node in ("shard:a", "shard:b"):
+            sink = NotifierAlertSink([], store=store)
+            watch, clock = _watch(sink, readings=[_ABSENT] * 2, node=node)
+            watch.run_once()
+            clock.now = 330.0
+            watch.run_once()
+            await sink.drain_state(5.0)
+        rows = await store.list_active_alert_instances(allowed_channels=None)
+        mine = sorted(
+            (row.connection, row.count) for row in rows if row.event_type == "log_forward_failed"
+        )
+        assert mine == [
+            ("forwarder:not_installed@shard:a", 2),
+            ("forwarder:not_installed@shard:b", 2),
+        ]
+    finally:
+        await store.close()
+
+
+async def test_the_engine_names_itself_in_the_watch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Engine, "instance_identity", property(lambda _self: "shard:a"))
+    store = await MessageStore.open(tmp_path / "named.db")
+    try:
+        engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
+        await engine.start()
+        try:
+            watch = engine._log_forward_watch
+            assert watch is not None and watch._node == "shard:a"
+        finally:
+            await engine.stop()
+    finally:
+        await store.close()
 
 
 async def test_the_engine_runs_the_watch_and_stops_it(tmp_path: Path) -> None:
