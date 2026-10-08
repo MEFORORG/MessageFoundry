@@ -118,6 +118,10 @@ __all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
 
 log = logging.getLogger(__name__)
 
+#: How long stop waits for alert-instance writes already scheduled before it closes the store
+#: (BACKLOG #2272). Short: a write that has not landed by then is logged and lost, as before.
+_ALERT_STATE_DRAIN_SECONDS = 5.0
+
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
 #: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
 #: (``api/request_timeout.py``) with room for the release hook's default 30 s bound and the
@@ -816,8 +820,11 @@ class Engine:
 
         It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
         (vault BACKLOG #2184, engine PR 2070). The preflight reads anchor files, which can change
-        after the graph loaded. The guard ``serve`` wires, the static-credential guard, judges only
-        the graph and the startup settings, and neither has changed. It already judged this graph
+        after the graph loaded. Skipping the guard is safe only while every guard in the
+        chain reads just the graph and the startup settings, because neither input has changed.
+        The two ``serve`` chains today do: the static-credential guard and, since vault BACKLOG
+        #2368, the per-connection keep-forever retention guard. A guard that reads anything else
+        would need to run here. The chain already judged this graph
         when it loaded, through :meth:`reload_detail` or the managed app's first load, over the
         whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
         filtered graph, so a guard here would judge less than that load did. A graph an embedder
@@ -1223,7 +1230,8 @@ class Engine:
 
         A cluster node's id is the same after a restart only when ``[cluster].node_id`` is pinned.
         The shard id is known once the engine holds its graph (:meth:`start` or ``add_registry``).
-        Read by the approval gate to mark the releases it claims (BACKLOG #1562)."""
+        Read by the approval gate to mark the releases it claims (BACKLOG #1562), and by the intake
+        monitor to name this process in its alert subjects (BACKLOG #2272)."""
         if self._coordinator.is_clustered():
             return f"node:{self._coordinator.node_id}"
         runner = self._registry_runner
@@ -1518,6 +1526,15 @@ class Engine:
                 # Slice 3: intake_paused / intake_resumed. None (no notifier) raises nothing: the
                 # monitor's own log lines already record each pause.
                 alert_sink=self._alert_sink,
+                # BACKLOG #2272 defects 4 to 6: each process names itself in its alert subjects, so
+                # it raises and clears only its own pause. An unpinned cluster node gets a new id on
+                # every start, so it clears its own alerts at stop; nothing could clear them later.
+                # Read once: serve hands the engine its graph before start, so a shard id is known
+                # here, and a reload re-applies the same shard filter, so the identity does not move.
+                node=self.instance_identity,
+                resolve_on_stop=(
+                    self._coordinator.is_clustered() and not self._cluster_settings.node_id
+                ),
             )
             # Always measured once, even with both bounds off: a bound that is off reports itself
             # clear, which resolves a pause alert an earlier run left open (slice 3).
@@ -2955,4 +2972,10 @@ class Engine:
             self._warm_pool_task.cancel()
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
+        # Clears raised on the way out are background writes: an unpinned cluster node's intake
+        # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
+        # to land before the store closes. Last, so it covers every stop step above.
+        drain = getattr(self._alert_sink, "drain_state", None)
+        if drain is not None:
+            await drain(_ALERT_STATE_DRAIN_SECONDS)
         await self.store.close()

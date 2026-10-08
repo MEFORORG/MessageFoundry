@@ -6,10 +6,15 @@ client sends to the engine. It does not cover message payloads. Those are the da
 have their own documents: [HL7-VALIDATION.md](HL7-VALIDATION.md) and [CODESETS.md](CODESETS.md).
 
 The rules live in one module, [`messagefoundry/api/validation.py`](../messagefoundry/api/validation.py).
-Everything below is quoted from it, and `tests/test_api_input_validation.py` fails if this page and
-that module ever disagree. The connection-name pattern is the one exception to where it is written:
+The rules table below is quoted from it. `tests/test_api_input_validation.py` checks that six
+phrases on this page still match the code, and fails if the page drops one. It does not check every
+number on this page. The connection-name pattern is the one exception to where it is written:
 it is defined in [`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and
 imported by that module, because the config loader enforces the same rule.
+
+Two later sections quote rules held in other files: the items checked behind a route, and the rules
+over two or more items. Each entry there names the code that holds its rule. No test compares those
+sections with the code, so read the named code when a number matters.
 
 A value that breaks one of these rules gets an HTTP 422 with the field named. The engine refuses it
 before the value reaches a database query, a filesystem path, a log line or a CSV export.
@@ -34,6 +39,14 @@ before the value reaches a database query, a filesystem path, a log line or a CS
 | Control id | Printable text, no control characters, up to 256 characters | `control_id`, and `actor` on the audit routes |
 | HL7 field path | A three-character segment id, a field number, then optional component and subcomponent numbers, such as `PID-3` or `PID-5.1` | `field_path` |
 | Email address | One `@`, a local part with no spaces, and a dotted domain, up to 254 characters | `recipient_override` |
+| Idempotency key | Printable text, no control characters, 1 to 256 characters | `idempotency_key` on `POST /messages/{message_id}/resend` and `POST /messages/{message_id}/edit-resend` |
+| Audit action filter | Printable text, no control characters, 1 to 128 characters | `action` on `GET /audit` and `GET /audit/export` |
+| Display label | Printable text, no control characters, 1 to 128 characters | `name` on `POST /search/presets` |
+| Filesystem path | Printable text, no control characters, 1 to 4096 characters | `config_dir` on `POST /config/reload`, and `archive` on `POST /dr/activate` |
+| Layered preset ids | Resource ids joined by single commas with no spaces, up to 1024 characters in all | `presets` on `GET /search/layered` |
+
+The email-address row covers `recipient_override` only. The account email fields follow a different
+rule, set out under [Items checked a second time](#items-checked-a-second-time-behind-the-route).
 
 "Printable text, no control characters" means every character except the C0 range, DEL, and the C1
 range. In practice: no NUL, no tab, no carriage return, no line feed.
@@ -45,6 +58,225 @@ group mapping, and a counter-reset request, may carry at most 1000 entries.
 **Which words and codes exist is not decided here.** The role names, the permission catalog and the
 status vocabulary belong to the engine. These rules decide only the shape a value may take, so a
 value that could not be a member is refused early and one that merely does not exist gets a 404.
+
+---
+
+## Items checked a second time, behind the route
+
+**This section gives the rule on the structure of eight items, one at a time.** Three of them have
+a rule in the request model and nothing more. The other five are checked again by the route, a
+service or the store, and that second check is not a pattern.
+
+A model refusal is a 422. A later refusal is a 400, unless a line below gives another code. Each
+entry names the code that holds its rule. A route can refuse a request for reasons that are not about
+an item's structure, such as a missing permission or a stopped connection. Those are not listed.
+
+### Idempotency key
+
+The client mints this value, so the client chooses its alphabet. The model asks only for printable
+text of 1 to 256 characters, and the field is required on both routes.
+
+The store then ties the key to the message and the target it was first used for.
+
+1. The same key for the same message and target is not an error. Once the request reaches the
+   store, the engine answers `duplicate` and queues nothing new, even where the rest of the request
+   differs.
+2. The same key for a different message or target gets a 409.
+
+That rule is in `resend_to` and `reingress`, in
+[`messagefoundry/store/store.py`](../messagefoundry/store/store.py).
+
+### Audit action filter
+
+`action` narrows the audit list to one event name, such as `user.updated`. The rule is the table's
+audit action row, which is the `ActionFilter` type in the validation module. The model is the only
+check. The store matches the name exactly.
+
+### Preset name
+
+`name` on `POST /search/presets` is a label the operator types. The rule is the table's display
+label row, which is the `DisplayLabel` type in the validation module. The model is the only check on
+its shape. A name the caller already uses is not refused: the new criteria replace that preset's.
+
+### DR archive path
+
+`archive` on `POST /dr/activate` names a file on the standby. The model checks the shape, which is
+the table's filesystem path row. **The control is the second check, which confines the path.** It
+runs when a standby that is not yet active starts an activation.
+
+1. The path must lie under the directory `[dr].seed_dir` names.
+2. With `[dr].seed_dir` unset, a request may name no archive at all.
+
+A path outside the directory aborts the activation with a 422. That refusal has one message, which
+names the setting and no part of the path. A `[dr].seed_dir` the standby cannot resolve is a
+different 422 with its own message, and it also names no part of the path. The rule is in `DrCoordinator._confine_request_archive`, in
+[`messagefoundry/pipeline/dr.py`](../messagefoundry/pipeline/dr.py).
+
+### Layered preset ids
+
+`presets` on `GET /search/layered` is one value holding several resource ids. The model checks the
+shape in the table above. The route then splits the value and applies two more rules. The route is
+`layered_search`, in [`messagefoundry/api/app.py`](../messagefoundry/api/app.py), and it also sets
+the 1024-character ceiling.
+
+1. At most 8 ids may be layered. A longer list gets a 400. A list too long for the ceiling gets a
+   422 first.
+2. Each id must name a preset the caller owns. Any other id gets a 404.
+
+How the named presets must agree with each other is a combined rule. It is under
+[Rules over two or more items](#rules-over-two-or-more-items).
+
+### Notification address
+
+The engine sends an account's security notices to its notification address. At least these four
+fields can set one:
+
+| Field | Route |
+|---|---|
+| `email` (required) | `POST /users` |
+| `email` | `POST /me/notify-email` |
+| `notify_email` | `PATCH /users/{user_id}` |
+| `notify_email` | `POST /users/directory` |
+
+The model allows up to 256 characters. The service then strips the spaces around the value and
+requires one plain mailbox. That means all of these:
+
+1. The value is not blank.
+2. It has exactly one `@`, with text on both sides.
+3. Every character is printable, and none is whitespace.
+4. It holds none of `,` `;` `<` `>` `"` `(` `)` `[` `]` `:` `\`.
+5. The domain has a dot inside it, and no dot at its start or end.
+6. The whole address is at most 254 characters, and the part before the `@` is at most 64.
+7. The part before the `@` is ASCII letters, digits and ``#$&'*+-^_`{}~``, in runs split by single
+   dots. It does not start with a hyphen.
+8. The domain is shaped like a host name. The exact rule is `domain_shape_problem`, in
+   [`messagefoundry/domainshape.py`](../messagefoundry/domainshape.py).
+9. Python's `email.utils.parseaddr` reads the address back unchanged.
+
+Rules 1 to 5 are `_require_single_mailbox` and `_is_single_mailbox`, in
+[`messagefoundry/auth/service.py`](../messagefoundry/auth/service.py). Rules 6 to 9 are
+`envelope_address_problem`, in
+[`messagefoundry/transports/email.py`](../messagefoundry/transports/email.py). That function is the
+rule the mail sender applies to every recipient, so an address accepted here can be sent to.
+
+Three routes add a rule of their own:
+
+- `PATCH /users/{user_id}` leaves the address alone when `notify_email` is omitted. An explicit
+  `null` gets a 400, because the address can be changed but not cleared. A value equal to the stored
+  address is accepted without a second check.
+- `POST /users/directory` requires `notify_email` when the directory supplies no usable address, and
+  refuses it when the directory supplies one.
+- `POST /me/notify-email` fills a missing address only. An account that already has a different one
+  gets a 409.
+
+### User email
+
+`email` on `PATCH /users/{user_id}` is the profile address. It does not move the notification
+address.
+
+**This field has a length rule and no shape rule.** The model is `UserUpdateRequest`, in
+[`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py), and it allows up to 256
+characters. Neither
+the model nor the service checks what the characters are, so the engine stores the value as sent.
+Omitting the field keeps the stored value, and an explicit `null` clears it.
+
+`email` on `POST /users` is a different case. It seeds the notification address as well, so it takes
+the whole notification-address rule above.
+
+### Federated subject
+
+`subject` on `PUT /users/{user_id}/federated-identity` is the `sub` value the identity provider
+issues for the account.
+
+1. The model requires 1 to 255 characters.
+2. The service requires printable ASCII with no space at the start or the end. A space inside the
+   value is allowed.
+
+The engine matches this value exactly against a verified token, so a stray space would make a
+binding nobody could present. The second rule is in `AuthService.bind_federated_subject`, in
+[`messagefoundry/auth/service.py`](../messagefoundry/auth/service.py). That method refuses a bind
+for other reasons too, such as a subject another account holds, which is also a 409. Its docstring
+lists them.
+
+The same route, and `DELETE` on the same path, also take `expected_issuer` and `expected_subject`.
+Both keys are required and each may be `null`. They carry a length rule only: up to 256 characters
+for the issuer and up to 255 for the subject. They need no shape rule, because the engine only
+compares them with the stored pair. A pair that differs gets a 409 and nothing changes.
+
+There is no issuer field to send. The service binds under the issuer `[auth].oidc_issuer` names.
+
+---
+
+## Rules over two or more items
+
+**Some rules read two or more items together.** Each item can pass its own rule and the request can
+still be refused, because the items do not fit each other. ASVS 2.1.2 calls these combined data
+items.
+
+**The table lists at least the combined rules a search of the code found. It is not a complete
+list.** How the search ran, and what it could miss, is below the table.
+
+| Surface | Items | Rule | When the rule is broken |
+|---|---|---|---|
+| API | `content` and `field_path`, on `POST /messages/search` | Send exactly one. | 400 |
+| API | The same pair, on `POST /messages/export` with no `ids` | Send exactly one. With `ids`, the engine reads neither. | 400 |
+| API | The same pair, on `POST /uploads/{file_id}/messages/search` and in the criteria on `POST /search/presets` | Send one or neither. Both together are refused. | 400 |
+| API | `field_value`, beside that pair | The engine reads it only beside `field_path`. Beside `content` it is ignored. | Nothing is refused |
+| API | The presets named in `presets`, on `GET /search/layered` | Exactly one preset carries a content term. | 400 |
+| API | The same presets | Two presets that both set `channel_id`, `status`, `message_type` or `control_id` must set the same value. | 400 |
+| API | `to` and `reroute`, on `POST /messages/{message_id}/edit-resend` | With `to`, the engine delivers to that outbound and ignores `reroute`. Without `to`, `reroute` must be true. | 400 |
+| API | `current_password` and `new_password`, on `POST /me/password` | The two values must differ. | 400 |
+| API | `role` and `destination`, in each target on `POST /statistics/reset` | A `destination` target must name its `destination`. A `source` target does not need one. With `all` set, the engine reads no target. | 422 |
+| Console | `new_password` and `new_password2`, on `POST /ui/account/password` | The two values must be equal. | 400, and the form comes back empty with the reason |
+
+Where each rule lives:
+
+- Content search: `make_spec`, in
+  [`messagefoundry/store/content_search.py`](../messagefoundry/store/content_search.py). The routes
+  in the first three rows call it. `GET /messages/search` takes `field_path` alone, so the pair
+  cannot clash there.
+- Blank values in a content search: `make_spec` strips each value, so a value of only spaces
+  counts as not sent. An empty `content` never reaches it: the model refuses that with a 422. On the
+  two one-or-neither routes, a pair holding only spaces gets a 400.
+- The console search form: it calls the API's search handler, so a clash gets the same answer.
+  With no criteria at all it shows the empty form and does not search.
+- Layered search: `_compose_preset_layers`, in
+  [`messagefoundry/api/app.py`](../messagefoundry/api/app.py). A content term is a `content` value
+  or a `field_path` saved in a preset.
+- Edit and resubmit, and the statistics reset: each route itself, in the same file.
+- Password change: the API rule is in the route, in
+  [`messagefoundry/api/auth_routes.py`](../messagefoundry/api/auth_routes.py). The API takes no
+  second copy of the new password.
+- Password confirmation: the console route, in
+  [`messagefoundry_webconsole/routes/account.py`](../messagefoundry_webconsole/routes/account.py).
+  It compares the two copies, then calls the API's password change, so both rules apply to the
+  form.
+
+**A rule that compares one item with stored state is not listed here.** Examples are the federated
+pair a caller expects, and an idempotency key used twice. Those are under
+[Items checked a second time](#items-checked-a-second-time-behind-the-route).
+
+**The search found no rule that compares the two ends of a time range.** `received_from` and
+`received_to` are each checked alone, and so are `since` and `until`.
+
+### How the search ran
+
+The search read three places: the request models under `messagefoundry/api/`, the console routes
+under `messagefoundry_webconsole/routes/`, and the command-line handling in
+`messagefoundry/__main__.py`. It looked for three things.
+
+1. A validator declared on a whole request model. The API and console models declare none, so every
+   rule above sits in a route, a service or a store helper.
+2. Refusal text holding words such as "exactly one", "both", "either", "mutually exclusive",
+   "match", "conflict" and "only valid with".
+3. A direct comparison of two request fields or two form fields.
+
+A rule worded another way, or one built from a helper the search did not open, would not be found.
+
+The command-line rules the search found are in the
+[User Guide](USER-GUIDE.md#command-options-that-depend-on-each-other). Combined checks on message
+payloads are in [HL7-VALIDATION.md](HL7-VALIDATION.md), under Tier 3, and the User Guide says what
+exists for payloads that are not HL7.
 
 ---
 
@@ -84,7 +316,9 @@ That rule costs one capability, and this page states it rather than hiding it: a
 longer span an HL7 segment separator, because that separator is a carriage return. The console's
 search box is a single-line input, so no shipped client could send one.
 
-**Two items keep a rule that is not a pattern, and the pattern in front of them does not replace it.**
+**At least three items keep a rule that is not a pattern, and the pattern in front of them does not
+replace it.** The first two are below. The third is the DR archive path, under
+[Items checked a second time](#items-checked-a-second-time-behind-the-route).
 
 1. A reload `config_dir` is confined by an allow-list, because the loader executes Python from that
    directory. The shape rule adds the NUL a path check can be truncated by. **The allow-list is still

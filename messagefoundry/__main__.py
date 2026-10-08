@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings, StoreSettings
     from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.config.wiring import Registry
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
     from messagefoundry.store.store import UserRecord
@@ -2085,8 +2086,8 @@ def _serve(args: argparse.Namespace) -> int:
     # the environment label, and since BACKLOG #1279 it is not gated on a data class either: every
     # instance carries patient data, so a custom-named dev/test box holding near-real PHI is covered
     # exactly as prod is, with no declaration able to exempt it.
-    # An explicit [security].allow_unencrypted_phi=true is the loud, audited override that lets an
-    # instance start keyless (warn); under enforce it also needs
+    # An explicit [security].allow_unencrypted_phi=true, or [security].encrypt_stored_data=false, is
+    # the loud, audited override that lets an instance start keyless (warn); under enforce it also needs
     # [security].allow_unencrypted_phi_under_strict_enforcement=true. It is the per-gate switch that
     # replaced the old blanket opt-out, and [store].require_encryption forces the refusal even when
     # that opt-out is set. A DPAPI-protected key
@@ -2096,6 +2097,7 @@ def _serve(args: argparse.Namespace) -> int:
         # The refuse-or-proceed DECISION is shared with provision-admin (BACKLOG #1905); the wording
         # below stays serve's own, because the remedy differs by command.
         keyless_gate = _keyless_store_gate(settings)
+        opt_out_switches = _keyless_opt_out_switches(settings)
         if keyless_gate == KEYLESS_REFUSED_BY_UNREAD_KEY:
             print(f"error: {_unread_key_text(settings)} Refusing to start.", file=sys.stderr)
             return 2
@@ -2127,11 +2129,11 @@ def _serve(args: argparse.Namespace) -> int:
             # KEYLESS_REFUSED_BY_NO_STRICT_ACK, and deliberately the catch-all: a refusal value this block does not
             # name must still refuse, never fall through to the keyless start below.
             # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
-            # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi — the highest-
+            # requires a SECOND acknowledgment beyond the opt-out switch — the highest-
             # risk posture (real PHI + strict enforcement) is never one flag away from plaintext at
             # rest. Under warn enforcement PHI keeps the single-flag audited override below.
             print(
-                "error: [security].allow_unencrypted_phi=true on a PHI instance under strict "
+                f"error: {opt_out_switches} on a PHI instance under strict "
                 f"enforcement (environment {env_name!r}), but "
                 "[security].allow_unencrypted_phi_under_strict_enforcement is not set; refusing to "
                 "start — PHI bodies and the summary/metadata (MRN + patient name) and "
@@ -2148,19 +2150,21 @@ def _serve(args: argparse.Namespace) -> int:
         # never silent. (Logging isn't configured yet here, so this goes through the root logger,
         # which emits >=WARNING to stderr by default — a durable startup audit line.) Under strict
         # enforcement the second ack ([security].allow_unencrypted_phi_under_strict_enforcement=true)
-        # was verified above, so the AUDIT line names both flags; the warn posture names just the one.
+        # was verified above, so the AUDIT line names it too; the warn posture names the opt-out alone.
+        # The opt-out is named as the operator wrote it (vault BACKLOG #2340).
         logging.getLogger(__name__).warning(
             "AUDIT: starting keyless on a %sPHI instance (environment %r) because "
-            "[security].allow_unencrypted_phi=true%s — PHI is stored UNENCRYPTED at rest "
+            "%s%s — PHI is stored UNENCRYPTED at rest "
             "(at-rest encryption opt-out override).",
             "production " if production else "",
             env_name,
+            opt_out_switches,
             " + [security].allow_unencrypted_phi_under_strict_enforcement=true"
             if enforcing
             else "",
         )
         print(
-            f"warning: [security].allow_unencrypted_phi=true — starting a "
+            f"warning: {opt_out_switches} — starting a "
             f"{'production ' if production else ''}PHI environment "
             f"({env_name!r}) keyless; PHI bodies and the summary/metadata (MRN + patient name) and "
             "error/last_error/detail columns are stored UNENCRYPTED at rest (only volume "
@@ -3632,6 +3636,20 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # Vault BACKLOG #2368: a connection may override either body window, and its own 0 keeps that
+    # connection's bodies forever. Those overrides are in the graph, which this function does not
+    # load, so the gate above cannot see them. A registry guard judges them, at least at the first
+    # load and on every reload. What it refuses, warns and audits, and how that differs from the
+    # gate above, is stated once, on make_retention_override_guard.
+    from messagefoundry.config.retention_classification import make_retention_override_guard
+
+    retention_override_guard = make_retention_override_guard(
+        acknowledged=settings.retention.allow_unbounded_phi,
+        enforcing=enforcing,
+        env_name=env_name,
+        log=_credlog,
+    )
+
     # BACKLOG #1967, owner ruling R4 (b) of 2026-09-24 (ASVS 14.2.7): each warn-only tier needs a
     # window OR its own acknowledgement. Under `enforce` a tier with neither REFUSES, naming the tier
     # and its switch; under `warn` it warns, the refuse/warn split every posture gate here shares.
@@ -4190,7 +4208,7 @@ def _serve(args: argparse.Namespace) -> int:
         # shard closure below raises it, so binding it here keeps this block self-contained. Relying
         # on the earlier binding would make an unrelated reorder turn the no-split-store refusal into
         # a NameError, on a path only `serve --shard` against a mismatched store reaches.
-        from messagefoundry.config.wiring import Registry, WiringError
+        from messagefoundry.config.wiring import WiringError
         from messagefoundry.pipeline.sharding import (
             filter_registry_for_shard,
             require_unified_store,
@@ -4309,7 +4327,7 @@ def _serve(args: argparse.Namespace) -> int:
         security_settings=settings.security,
         config_dir=config_dir,
         registry_filter=registry_filter,
-        registry_guard=static_credential_guard,
+        registry_guard=_chain_registry_guards(static_credential_guard, retention_override_guard),
         static_credential_settings=settings,
         config_reload_roots=settings.api.config_reload_roots,
         inbound_bind_host=settings.inbound.bind_host,
@@ -6708,6 +6726,39 @@ def _unread_key_text(settings: ServiceSettings) -> str:
         unread_key_refusal(settings.store)
         or "[store].key_provider does not read the key that is set."
     )
+
+
+def _chain_registry_guards(
+    *guards: Callable[[Registry], None] | None,
+) -> Callable[[Registry], None]:
+    """One registry guard that runs each given guard in order; ``None`` entries are skipped.
+
+    The engine takes a single guard. Each raises ``WiringError`` to refuse a graph, so the first
+    refusal wins and the later guards do not run on that load."""
+    live = [guard for guard in guards if guard is not None]
+
+    def chained(registry: Registry) -> None:
+        for guard in live:
+            guard(registry)
+
+    return chained
+
+
+def _keyless_opt_out_switches(settings: ServiceSettings) -> str:
+    """The at-rest opt-out as the operator wrote it, for the keyless messages (vault BACKLOG #2340).
+
+    Two ``[security]`` switches set the one ``[store].allow_unencrypted_phi`` the gate reads:
+    ``encrypt_stored_data = false`` and ``allow_unencrypted_phi = true``. The messages used to name
+    the second whichever was set, so an operator who wrote only the first was told about a key that
+    is not in their file. Both are named when both are set. With neither set, the store flag was set
+    some other way, and the text falls back to the switch that would set it."""
+    security = settings.security
+    switches = []
+    if not security.encrypt_stored_data:
+        switches.append("[security].encrypt_stored_data=false")
+    if security.allow_unencrypted_phi or not switches:
+        switches.append("[security].allow_unencrypted_phi=true")
+    return " and ".join(switches)
 
 
 def _keyless_store_gate(settings: ServiceSettings) -> str | None:
@@ -9136,9 +9187,15 @@ def _connection(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from messagefoundry.config import connections_edit
+    from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.environments import (
         load_environment_values,
         resolve_values_base_dir,
+    )
+    from messagefoundry.config.retention_classification import (
+        BODY_ACKNOWLEDGEMENT_SETTING,
+        keep_forever_override_refusal,
+        keep_forever_overrides,
     )
     from messagefoundry.config.settings import (
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
@@ -9212,6 +9269,16 @@ def _connection(args: argparse.Namespace) -> int:
             # This command has no --allow-insecure-bind, so pass the settings half serve folds in.
             allow_insecure_bind=insecure_bind_escape(settings),
         )
+        # Vault BACKLOG #2368: a connection's own keep-forever retention override is refused here
+        # as the engine's registry guard refuses it, so an edit a reload would reject is not
+        # written. Refusal only: the guard's warning and AUDIT line belong to a graph load.
+        kept = keep_forever_overrides(registry)
+        if (
+            kept
+            and settings.security.enforcement is SecurityEnforcement.ENFORCE
+            and not settings.retention.allow_unbounded_phi
+        ):
+            raise WiringError(keep_forever_override_refusal(kept, env_name=env_name))
 
     try:
         if args.action == "upsert":
@@ -9229,7 +9296,14 @@ def _connection(args: argparse.Namespace) -> int:
         # The deny default (vault BACKLOG #2605) refuses an unlisted outbound. With no
         # --service-config, the IDE's usual call, the edit was checked against whatever settings
         # load_settings found, so say where the list belongs rather than leave the analyst guessing.
-        if args.service_config is None and BLOCK_UNLISTED_OUTBOUND_IN_FORCE in message:
+        # The keep-forever retention refusal (vault BACKLOG #2368) reads [security] the same way, so
+        # it gets the same account of which settings were read.
+        advice = None
+        if BLOCK_UNLISTED_OUTBOUND_IN_FORCE in message:
+            advice = "list the connection's host in that file's [egress] allowed_* list for its transport"
+        elif BODY_ACKNOWLEDGEMENT_SETTING in message:
+            advice = "this edit is then checked against that instance's [security] settings"
+        if args.service_config is None and advice is not None:
             # load_settings falls back to ./messagefoundry.toml, so say which case this was.
             local = Path("messagefoundry.toml")
             read = (
@@ -9239,8 +9313,7 @@ def _connection(args: argparse.Namespace) -> int:
             )
             message += (
                 f". No --service-config was given, so this edit was checked {read}. Pass "
-                "--service-config <path to the instance's messagefoundry.toml>, and list the "
-                "connection's host in that file's [egress] allowed_* list for its transport"
+                f"--service-config <path to the instance's messagefoundry.toml>, and {advice}"
             )
         return _emit_error(message, as_json=args.json)
     except OSError as exc:

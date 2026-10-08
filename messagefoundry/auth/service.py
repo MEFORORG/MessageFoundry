@@ -25,7 +25,6 @@ import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import (
-    AsyncIterator,
     Awaitable,
     Callable,
     Coroutine,
@@ -33,9 +32,9 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cache
 from types import MappingProxyType
@@ -124,6 +123,8 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
+from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
+from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.store.base import AdminStore, store_driver_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
@@ -1659,36 +1660,6 @@ def _directory_answer_mismatch(principal: AdPrincipal, object_id: str) -> str | 
     return None
 
 
-@dataclass
-class _KeyedLock:
-    """One entry of a per-account lock table, with a count of the tasks holding or awaiting it so the
-    entry can be dropped when the last one leaves. The re-proof table, the credential table and the
-    lock-notice table (BACKLOG #2216) each use it (:func:`_hold_keyed_lock`)."""
-
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    users: int = 0
-
-
-@asynccontextmanager
-async def _hold_keyed_lock(table: dict[str, _KeyedLock], key: str) -> AsyncIterator[None]:
-    """Hold ``table``'s lock for ``key``, creating the entry on first use and dropping it once no
-    task holds or awaits it, so the table never outgrows the attempts in flight.
-
-    ``asyncio.Lock`` wakes its waiters in arrival order, so the attempts queued on one key run in the
-    order they arrived."""
-    entry = table.get(key)
-    if entry is None:
-        entry = table[key] = _KeyedLock()
-    entry.users += 1
-    try:
-        async with entry.lock:
-            yield
-    finally:
-        entry.users -= 1
-        if entry.users == 0:
-            del table[key]
-
-
 #: How much of a typed username :func:`_credential_lock_key` reads (BACKLOG #1943). Four times the
 #: 256-character column the store keeps, so no real name is cut.
 _CREDENTIAL_KEY_INPUT_MAX = 1024
@@ -2017,6 +1988,13 @@ _REMINDER_ISSUER_ACTION: Final = "auth.temporary_credential_expiring_issuer"
 #: :meth:`initial_credential_reminded` reads. Each credential writes about one such row, and the
 #: current credential's is the newest, so a page this size is ample.
 _REMINDER_MARK_PAGE: Final = 50
+
+#: Vault BACKLOG #3260: the row an admin route writes when it refuses the caller's own account.
+#: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
+SELF_TARGET_REFUSED_ACTION: Final = "auth.self_target_refused"
+SelfTargetOp = Literal[
+    "password_reset", "mfa_reset", "federated_bind", "federated_unbind", "disable", "delete"
+]
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -11824,6 +11802,27 @@ class AuthService:
             "auth.mfa_denied",
             actor=identity.username,
             detail=_json({"path": path}),
+            client=client,
+        )
+
+    async def audit_self_target_refused(
+        self, identity: Identity, *, op: SelfTargetOp, client: str | None
+    ) -> None:
+        """Audit an administrator route refused because it targets the caller's own account (vault
+        BACKLOG #3260, ASVS 16.3.2). ``op`` names the route.
+
+        The refusal is an authorization decision of its own. Before this row, the JSON plane kept
+        only the step-up gate's ``auth.permission_granted`` for the attempt, and the console plane
+        kept nothing. The API handlers write it, so a console call through the seam writes it too.
+
+        ``user_id`` is the caller's stored id, never the path's spelling, which on the console is
+        an unbounded caller string (``api.auth_routes._refuse_if_self`` says why the two differ).
+        ``client`` is required, not defaulted: both planes reach this from a request, and
+        :meth:`audit_permission_denied` says what a row that omits a known address costs."""
+        await self._audit(
+            SELF_TARGET_REFUSED_ACTION,
+            actor=identity.username,
+            detail=_json({"op": op, "user_id": identity.user_id}),
             client=client,
         )
 

@@ -50,6 +50,9 @@ venv interpreter) and the per-connection firewall openings the service needs.
 3. **An elevated PowerShell** (Run as Administrator) — required to register a service.
    `messagefoundry service install --env <name>` elevates for you (a UAC prompt) and runs the
    install script below in a visible window so you can read its output.
+4. **A synchronized host clock.** The engine trusts the host's wall clock and does not set it.
+   [SYSTEM-REQUIREMENTS.md, *Host clock*](SYSTEM-REQUIREMENTS.md#host-clock) states the
+   requirement and how to check it with `w32tm`.
 
 ## Install
 

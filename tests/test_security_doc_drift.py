@@ -2989,8 +2989,9 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
 #: not seen: a refusal added elsewhere in the function, and a skip hidden in a helper the slice
 #: calls. The behavioural pins in `tests/test_cli.py`, which run `serve`, cover part of that. The test
 #: below checks only that each pin still EXISTS, not what it asserts, and none of them exercises
-#: `reference_snapshot_days`. The row's third claim, that the gate does not read a per-outbound
-#: override, is prose only: nothing here binds it to the code.
+#: `reference_snapshot_days`. The row's third claim, that a per-outbound override of 0 meets its
+#: own gate (vault BACKLOG #2368), is prose only: nothing binds that doc sentence to the code.
+#: `tests/test_retention_override_gate.py` tests the guard's behaviour and never reads the doc.
 
 _CONFIG_DOC = _ROOT / "docs" / "CONFIGURATION.md"
 _RETENTION_HEADING = "### `[retention]`"
@@ -3255,7 +3256,9 @@ def _retention_doc_findings(section: str, days: int, auto_bounded: tuple[str, ..
         "rows at **every stage**",
         "Unset or `0`, this global window meets the startup posture gate described above this table",
         "`0` = keep only where that gate allows it",
-        "The gate does not read that override",
+        # Vault BACKLOG #2368: a per-outbound override of 0 is gated when `serve` loads the graph. The row used to
+        # say the gate does not read the override, which was true and was the defect.
+        "An override of `0` meets its own gate, described there",
     ):
         if phrase not in notes:
             findings.append(f"the `{_DEAD_LETTER_WINDOW}` row no longer says {phrase!r}")
@@ -3389,11 +3392,11 @@ def test_retention_gate_reader_detects_a_planted_violation() -> None:
             "null the bodies of **dead-lettered** outbound rows",
             "scopes the purge to outbound rows again",
         ),
-        # The row claiming the gate reads a per-outbound override.
-        "override-gated": (
+        # The retired row: a per-outbound override of 0 that no gate reads (vault BACKLOG #2368).
+        "override-ungated": (
+            "An override of `0` meets its own gate, described there",
             "The gate does not read that override",
-            "The gate refuses on that override too",
-            "does not read that override",
+            "meets its own gate",
         ),
         # A window dropped from the posture paragraph while a table row still names it.
         "window-unnamed": (

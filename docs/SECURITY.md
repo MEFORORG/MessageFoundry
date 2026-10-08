@@ -679,6 +679,14 @@ gate `authorize_ws` fires once per *handshake*. Setting `[security].audit_all_au
 behaviour and is reported as a loosening; the volume it trades away is one row per authenticated request
 per `require()`-gated route, on the JSON API.
 
+An admin route that refuses the caller's own account writes `auth.self_target_refused` on both
+planes (vault BACKLOG #3260). The routes are reset-password, reset-mfa, the federated-identity
+bind and unbind, disable and delete. The row names the actor, the route as `op`, the caller's
+stored id and the caller's address. The guard refuses when the path's spelling or the stored id
+matches the caller (vault BACKLOG #3259); `_refuse_if_self` in `api/auth_routes.py` says why the
+stored id matters on the console. The `404` that `DELETE /me/sessions/{session_id}` answers for
+another account's session still writes no row of its own.
+
 **Delegated identity & admin device posture (#193 sibling; ASVS 13.2.1 / 13.3.2 / 8.4.2 — the delegation
 boundary).** Three controls whose enforcement is largely the deploying organization's to provide.
 MessageFoundry states the boundary and adds one opt-in precondition check (#203):
@@ -4683,7 +4691,7 @@ Every authentication and authorization event is written to the durable `audit_lo
 user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.logout` /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
-`auth.permission_denied` / `auth.channel_denied`, the 6.3.5 events `auth.account_locked` /
+`auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. PHI access (viewing a raw message or displaying patient summaries) is recorded

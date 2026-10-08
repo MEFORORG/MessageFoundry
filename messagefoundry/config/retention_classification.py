@@ -32,8 +32,14 @@ rather than restating it here, because four copies of it are how the records dri
 
 from __future__ import annotations
 
+import logging
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from messagefoundry.config.wiring import Registry
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,3 +273,118 @@ def unbounded_windows(read: object) -> tuple[RetentionWindow, ...]:
         if isinstance(value, int) and value <= 0:
             out.append(window)
     return tuple(out)
+
+
+#: The switch that acknowledges a connection's own keep-forever override. The same switch covers the
+#: global body windows; the ``serve`` gate for those spells it out in its own messages.
+BODY_ACKNOWLEDGEMENT_SETTING: Final[str] = "[security].allow_keeping_phi_indefinitely"
+
+
+def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
+    """Each connection in ``registry`` whose own retention override keeps its PHI bodies forever.
+
+    A connection may override either PL-1 body window (ADR 0027): an inbound sets ``messages_days``,
+    an outbound sets ``dead_letter_days``. ``None`` inherits the global window and a positive number
+    bounds it. ``0`` keeps that connection's bodies forever, whatever the global window says, so it
+    is the same choice as a global ``0`` made for one connection. The global windows live in the
+    service settings, where :func:`unbounded_windows` reads them; these live in the graph, so the
+    start gate cannot see them and a registry guard must (vault BACKLOG #2368).
+
+    The test is ``<= 0``, as the purge reads it: the factories refuse a negative override, but a
+    registry built without them would keep those bodies forever too.
+
+    Each entry reads ``inbound 'NAME' (messages_days = 0)``, sorted, inbounds first."""
+    inbound = sorted(
+        (c.name, c.messages_days)
+        for c in registry.inbound.values()
+        if c.messages_days is not None and c.messages_days <= 0
+    )
+    outbound = sorted(
+        (c.name, c.dead_letter_days)
+        for c in registry.outbound.values()
+        if c.dead_letter_days is not None and c.dead_letter_days <= 0
+    )
+    return tuple(
+        [f"inbound {name!r} (messages_days = {days})" for name, days in inbound]
+        + [f"outbound {name!r} (dead_letter_days = {days})" for name, days in outbound]
+    )
+
+
+def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None) -> str:
+    """The refusal text for ``kept``, the non-empty result of :func:`keep_forever_overrides`.
+
+    Shared by the registry guard and ``connection upsert``, so an edit is refused in the words a
+    reload would use. ``env_name`` is ``None`` where no environment is active."""
+    where = f" ({env_name!r})" if env_name is not None else ""
+    # Only the auto-bounded windows lose a default. Naming them keeps an operator from setting a
+    # window on a tier where a window is the wrong answer, such as transform state.
+    auto_bounded = ", ".join(w.setting for w in auto_bounded_windows())
+    return (
+        "a per-connection retention override keeps PHI message bodies indefinitely on a PHI "
+        f"instance{where}: {'; '.join(kept)} (unbounded PHI at rest, ASVS 14.2.4/14.2.7). Set "
+        "each override to a positive number of days, or remove it to inherit the global "
+        f"window; or, to deliberately retain forever, set {BODY_ACKNOWLEDGEMENT_SETTING}=true "
+        "(audited). That switch covers the whole instance: it also turns off the default bound "
+        f"on each of these windows that is unset: {auto_bounded}. Set each of them to an "
+        "explicit number of days first"
+    )
+
+
+def make_retention_override_guard(
+    *, acknowledged: bool, enforcing: bool, env_name: str, log: logging.Logger
+) -> Callable[[Registry], None]:
+    """The engine registry guard for a connection's own keep-forever retention override.
+
+    The graph half of the body-window gate in ``serve``, with the same refuse-or-warn split.
+    Without the acknowledgement (``acknowledged``, the loaded
+    ``[security].allow_keeping_phi_indefinitely``) an enforcing instance refuses the graph by
+    raising ``WiringError``: a first load fails the start, and a ``/config/reload`` is refused with
+    the running graph kept. Without it under ``enforcement = warn``, the guard warns. With the
+    acknowledgement the guard passes the graph and a WARNING-level ``AUDIT:`` line names each
+    connection, on either dial.
+
+    It is not a copy of the body-window gate. At least this differs: that gate writes its AUDIT
+    line only under ``enforce``, and this guard writes one on either dial.
+
+    It runs only where the engine calls its registry guard. At least these do not:
+    ``Engine.add_registry`` called by an embedder, the DR re-apply path, and
+    ``messagefoundry check``.
+
+    The AUDIT line is written each time the guard passes such a graph. That includes a dry-run
+    reload, and a reload a later check then refuses, so the line says the gate passed the graph and
+    never that the graph went live.
+
+    The AUDIT line and the warning go to the logger AND to stderr. A
+    ``[logging].level`` above WARNING would otherwise drop the only record of an acknowledged
+    override. Under NSSM both streams are captured, so a line can appear in both.
+
+    Like the static-credential guard, it judges every graph against the settings the process started
+    with: a reload re-reads the graph and never ``[security]``."""
+
+    def report(line: str) -> None:
+        log.warning("%s", line)
+        print(f"warning: {line}", file=sys.stderr)
+
+    def guard(registry: Registry) -> None:
+        kept = keep_forever_overrides(registry)
+        if not kept:
+            return
+        if acknowledged:
+            report(
+                f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a "
+                "graph with per-connection unbounded data retention "
+                f"({BODY_ACKNOWLEDGEMENT_SETTING}=true; {'; '.join(kept)}) -- once that graph is "
+                "live, these connections' PHI message bodies are retained INDEFINITELY (retention "
+                "opt-out override)."
+            )
+            return
+        reason = keep_forever_override_refusal(kept, env_name=env_name)
+        if enforcing:
+            # Imported here: wiring is the heavy end of the config package, and this module is
+            # otherwise a leaf the settings model can read.
+            from messagefoundry.config.wiring import WiringError
+
+            raise WiringError(reason)
+        report(reason)
+
+    return guard
