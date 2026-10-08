@@ -502,6 +502,26 @@ class CipherError(Exception):
     JSON. The message says which, so an operator is not sent looking for a missing key."""
 
 
+class AuditKeyVersionRefusedError(CipherError):
+    """Transit refused an audit MAC pinned to one key version, and still answers under the latest.
+
+    The pinned version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
+    So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
+    a walk that could not run. Transit also refuses a version its policy retires, so the break says
+    both."""
+
+    def __init__(self, version: int) -> None:
+        # The version alone in ``args``, so a copy or pickle rebuilds the same exception.
+        super().__init__(version)
+        self.version = version
+
+    def __str__(self) -> str:
+        return (
+            f"Transit refused audit key version {self.version}: the key does not hold it, or its "
+            "policy retires it"
+        )
+
+
 class StoreKeylessError(RuntimeError):
     """A store eager-read seam met an **encrypted** value (an ``mfenc:`` marker) but **no store key is
     configured** — a keyless (mis)configured open of a store that carries key-encrypted rows at rest.
@@ -1486,6 +1506,9 @@ class CipherInfo:
 
     encrypts: bool
     active_key_id: str | None
+    # The Transit data-key NAME on a `vault_transit` store, else None (BACKLOG #2337). A name, not key
+    # material: the start gate and the posture compare it with the recorded attestation.
+    transit_key_name: str | None = None
 
 
 def cipher_info(cipher: Cipher) -> CipherInfo:
@@ -1495,4 +1518,8 @@ def cipher_info(cipher: Cipher) -> CipherInfo:
     # active_key_id is a property only on the real keyring cipher (AesGcmCipher); the identity cipher has
     # no key, so report None. getattr keeps this duck-typed against the Cipher protocol.
     active_key_id = getattr(cipher, "active_key_id", None) if cipher.encrypts else None
-    return CipherInfo(encrypts=cipher.encrypts, active_key_id=active_key_id)
+    return CipherInfo(
+        encrypts=cipher.encrypts,
+        active_key_id=active_key_id,
+        transit_key_name=getattr(cipher, "transit_key_name", None),
+    )
