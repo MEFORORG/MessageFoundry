@@ -29,6 +29,9 @@ one exception is the first pass that finds the forwarder absent, which fires wha
 throttle says. The default sink's alert is a log line, and a log line is one more record for a
 forwarder that is already losing them.
 
+**Over UDP only queue and spool losses can fire.** A UDP send reports no failure, so a collector
+that is down looks the same as one that is up (:attr:`ForwarderStatus.delivery_confirmed`).
+
 The alert carries counts and fixed words only: never a record, a host name or an error text.
 """
 

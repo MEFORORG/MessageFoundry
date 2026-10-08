@@ -33,6 +33,17 @@ HELD = LogForwarderInfo(
 # A read fault that cleared: the count stays, and the sentence must not name the spool.
 CLEARED = LogForwarderInfo(state="degraded", installed=True, lost=1, unsent=1, spool_read_errors=2)
 HEALTHY = LogForwarderInfo(state="healthy", installed=True)
+#: UDP: no fault seen, and none could have been.
+UDP = LogForwarderInfo(state="unconfirmed", installed=True, delivery_confirmed=False)
+UDP_DROPPING = LogForwarderInfo(
+    state="degraded", installed=True, delivery_confirmed=False, lost=2, queue_dropped=2
+)
+
+
+def _row(html: str) -> str:
+    """The forwarder row's own markup, so a word elsewhere on the page cannot answer for it."""
+    start = html.index("Off-box log forwarding")
+    return html[start : html.index("</tr>", start)]
 
 
 def _sys(forwarder: LogForwarderInfo | None) -> SystemStatus:
@@ -107,7 +118,7 @@ def test_an_absent_or_degraded_forwarder_turns_the_heart_to_warn(
     )
 
 
-@pytest.mark.parametrize("forwarder", [None, HEALTHY])
+@pytest.mark.parametrize("forwarder", [None, HEALTHY, UDP])
 def test_no_forwarder_and_a_healthy_one_leave_the_heart_ok(
     forwarder: LogForwarderInfo | None,
 ) -> None:
@@ -118,6 +129,15 @@ def test_the_status_page_row() -> None:
     assert "Off-box log forwarding" not in _page(None)  # not configured: no row
     healthy = _page(HEALTHY)
     assert "Off-box log forwarding" in healthy and "status-failed" not in healthy
+    assert "healthy" in healthy
+    # UDP: a row in plain words, never "healthy", and no warning that could never clear.
+    udp = _page(UDP)
+    assert "running; delivery is not confirmed over UDP" in udp
+    assert "status-failed" not in udp and "healthy" not in _row(udp)
+    assert _log_forwarder_reason(UDP_DROPPING) == (
+        "off-box log forwarding is degraded: 2 record(s) lost since start; "
+        "delivery is not confirmed over UDP"
+    )
     failed = _page(NOT_INSTALLED)
     assert "off-box log forwarding is not running (permanent failure at start)" in failed
     assert "status-failed" in failed

@@ -29,7 +29,8 @@ this line.**
 - **The status page and the health indicator show the off-box log forwarder.** With a forwarder
   configured, the engine table on `/ui/status` has an "Off-box log forwarding" row. It reads
   `healthy`, or says that forwarding is not running or is degraded, with how many records were
-  lost since the process started. The health indicator turns to warn in the second and third
+  lost since the process started. A UDP forwarder is never called healthy: the row says that
+  delivery is not confirmed, because a UDP send reports no failure. The health indicator turns to warn in the second and third
   cases. With no forwarder configured there is no row. Under engine shards the row describes the
   process that answered. (`BACKLOG #2612`)
 - **The audit, security-event and event-log pages page past their first window.** `/ui/audit`,

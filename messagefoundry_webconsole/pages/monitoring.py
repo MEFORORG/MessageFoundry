@@ -36,6 +36,7 @@ from .._html import Markup, el, page, register_nav, rows_table
 from ._common import (
     _failed_inbound_reason,
     _log_forwarder_reason,
+    _log_forwarder_text,
     _pager,
     _reveal_cell,
     _window_note,
@@ -513,7 +514,7 @@ def status(
         else [
             [
                 "Off-box log forwarding",
-                "healthy"
+                _log_forwarder_text(sys.log_forwarder)
                 if forwarder_reason is None
                 else el("span", forwarder_reason, class_="status status-failed"),
             ]

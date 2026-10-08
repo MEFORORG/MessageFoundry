@@ -60,6 +60,7 @@ def _no_network_and_no_forwarder_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", _no_dns)
     monkeypatch.setattr(logging_setup, "_forward_configured", False)
     monkeypatch.setattr(logging_setup, "_forward_start_failure", "")
+    monkeypatch.setattr(logging_setup, "_forward_delivery_confirmed", True)
 
 
 class _RecordingSink(LoggingAlertSink):
@@ -165,6 +166,43 @@ def test_a_healthy_forwarder_reads_healthy() -> None:
     assert (status.installed, status.lost, status.queued, status.state) == (True, 0, 0, "healthy")
     info = _log_forwarder_health()
     assert info is not None and info.state == "healthy"
+
+
+def test_a_udp_forwarder_is_never_called_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
+    # UDP reports no failed send, so "no fault seen" is not "the collector has the records".
+    udp = SyslogForward(host="collector.invalid", port=514)
+    assert udp.protocol == "udp"  # the default, which is why the reading must be honest
+    built = _Collector()
+    monkeypatch.setattr(logging_setup, "_build_syslog_handler", lambda *a, **k: built)
+    assert configure_logging("INFO", forward=udp) is True
+    status = forwarder_status()
+    assert (status.installed, status.delivery_confirmed, status.lost) == (True, False, 0)
+    assert status.state == "unconfirmed"
+    info = _log_forwarder_health()
+    assert info is not None
+    assert (info.state, info.delivery_confirmed) == ("unconfirmed", False)
+    # A loss the engine CAN see still reads degraded, and the flag stays down beside it.
+    lossy = ForwarderStatus(
+        configured=True, installed=True, delivery_confirmed=False, queue_dropped=1
+    )
+    assert lossy.state == "degraded"
+    # A stream forwarder, where a failed send is seen, is confirmed again.
+    assert configure_logging("INFO", forward=FORWARD) is True
+    assert forwarder_status().delivery_confirmed is True
+    assert forwarder_status().state == "healthy"
+
+
+def test_a_udp_forwarder_that_fails_at_start_keeps_the_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _refuse(*args: Any, **kwargs: Any) -> Any:
+        raise socket.gaierror(11001, "no such name")
+
+    monkeypatch.setattr(logging_setup, "_build_syslog_handler", _refuse)
+    configure_logging("INFO", forward=SyslogForward(host="collector.invalid", port=514))
+    status = forwarder_status()
+    assert (status.installed, status.delivery_confirmed) == (False, False)
+    assert status.state == "not_installed"
 
 
 def test_a_full_queue_is_counted_and_reads_degraded() -> None:

@@ -1416,6 +1416,8 @@ def _forward_targets(logger: logging.Logger) -> list[logging.Handler]:
 #: Module state because the forwarder is process-wide, like the root logger it hangs on.
 _forward_configured = False
 _forward_start_failure = ""
+#: False for a UDP forwarder. See :attr:`ForwarderStatus.delivery_confirmed`.
+_forward_delivery_confirmed = True
 
 #: The :class:`ForwarderStatus` counts that are LOSSES, each with the fixed word an alert names it
 #: by. The one list: :attr:`ForwarderStatus.lost` adds these up, and the watch names the ones that
@@ -1445,6 +1447,10 @@ class ForwarderStatus:
     #: verification or a name that does not resolve), ``"transient"`` (the collector did not answer
     #: and there is no spool to wait behind), or ``""``.
     start_failure: str = ""
+    #: Whether a send that does not reach the collector is visible here at all. ``False`` over
+    #: UDP, which reports no failed send: ``send_failing``, ``unsent`` and so ``lost`` then stay
+    #: at zero while every record is lost on the wire, and only queue and spool losses count.
+    delivery_confirmed: bool = True
     #: Whether the last send hit a network error. With a spool the records are kept meanwhile.
     send_failing: bool = False
     #: Sends that hit a network error, whether or not a spool kept the record.
@@ -1473,18 +1479,19 @@ class ForwarderStatus:
 
     @property
     def state(self) -> str:
-        """``"off"``, ``"not_installed"``, ``"degraded"`` or ``"healthy"``.
+        """``"off"``, ``"not_installed"``, ``"degraded"``, ``"unconfirmed"`` or ``"healthy"``.
 
         ``degraded`` means the last send failed, the spool cannot be read, or a record was lost
         since this process started. The last one does not clear until a restart: the records are
-        still missing at the collector."""
+        still missing at the collector. ``unconfirmed`` is a forwarder with no fault seen whose
+        protocol cannot show one (:attr:`delivery_confirmed`), so it is never called healthy."""
         if not self.configured:
             return "off"
         if not self.installed:
             return "not_installed"
         if self.send_failing or self.spool_read_faulted or self.lost:
             return "degraded"
-        return "healthy"
+        return "healthy" if self.delivery_confirmed else "unconfirmed"
 
 
 def forwarder_status() -> ForwarderStatus:
@@ -1494,21 +1501,27 @@ def forwarder_status() -> ForwarderStatus:
     The counters belong to other threads and are read without their locks. Each is one integer
     that only goes up, so a reading is at worst one record behind."""
     configured, start_failure = _forward_configured, _forward_start_failure
+    confirmed = _forward_delivery_confirmed
     for handler in logging.getLogger().handlers:
         if isinstance(handler, _ForwardQueueHandler) and handler._accepting:
             break
     else:
-        return ForwarderStatus(configured=configured, start_failure=start_failure)
+        return ForwarderStatus(
+            configured=configured, start_failure=start_failure, delivery_confirmed=confirmed
+        )
     listener = handler._listener
     thread = listener._thread
     if thread is not None and not thread.is_alive():
         # The listener thread ended without being stopped. The handler still queues, and
         # nothing takes a record off the queue, so this forwarder sends nothing.
-        return ForwarderStatus(configured=True, start_failure=start_failure)
+        return ForwarderStatus(
+            configured=True, start_failure=start_failure, delivery_confirmed=confirmed
+        )
     spool = listener.spool
     return ForwarderStatus(
         configured=True,
         installed=True,
+        delivery_confirmed=confirmed,
         send_failing=listener.send_failing,
         send_failures=listener.send_failures,
         queued=handler._records.qsize(),
@@ -1630,8 +1643,10 @@ def configure_logging(
     set_active_guard(guard)
 
     forwarder_installed = False
-    global _forward_configured, _forward_start_failure
+    global _forward_configured, _forward_start_failure, _forward_delivery_confirmed
     _forward_configured, _forward_start_failure = forward is not None, ""
+    # UDP is fire-and-forget (RFC 5426): a send that reaches nobody raises nothing here.
+    _forward_delivery_confirmed = forward is None or forward.protocol != "udp"
     if forward is not None:
         spool = _open_forward_spool(forward)
         try:

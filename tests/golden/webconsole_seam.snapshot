@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-24e0fac6107b4433
+288586ca6603bbc1
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -273,7 +273,7 @@ messagefoundry.api.models.GraphNode: kind, name, status
 messagefoundry.api.models.GraphResponse: dynamic, edges, nodes
 messagefoundry.api.models.IntegrityResult: detail, ok
 messagefoundry.api.models.InterpreterView: code_path_variables, ignore_environment, isolated, no_user_site, remote_debug_enabled, remote_debug_guard_installed, safe_path, startup_code, startup_dirs, unchecked_startup_dirs, writable_startup_dirs
-messagefoundry.api.models.LogForwarderInfo: installed, lost, queue_dropped, queued, send_failing, spool_dropped, spool_read_errors, spool_read_faulted, spool_skipped, start_failure, state, undeliverable, unsent
+messagefoundry.api.models.LogForwarderInfo: delivery_confirmed, installed, lost, queue_dropped, queued, send_failing, spool_dropped, spool_read_errors, spool_read_faulted, spool_skipped, start_failure, state, undeliverable, unsent
 messagefoundry.api.models.LogInfo: disk_free_bytes, path, size_bytes
 messagefoundry.api.models.LogSinkInfo: last_event, last_event_at, rolled_aside, rollovers, sink, state
 messagefoundry.api.models.MessageBody: message_id, raw

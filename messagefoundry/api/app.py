@@ -703,6 +703,7 @@ def _log_forwarder_health() -> LogForwarderInfo | None:
     return LogForwarderInfo(
         state=status.state,
         installed=status.installed,
+        delivery_confirmed=status.delivery_confirmed,
         start_failure=status.start_failure or None,
         send_failing=status.send_failing,
         lost=status.lost,

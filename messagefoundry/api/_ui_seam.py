@@ -357,12 +357,16 @@ from typing import Any
 #: skew would be an AttributeError where the 429 belongs; it forces a bump. Re-derived on the
 #: tree merged with BACKLOG #2454, so the value below covers both.
 #:
+#: BACKLOG #2612: ``SystemStatus`` gained ``log_forwarder``, a ``LogForwarderInfo`` the console's
+#: status page and health indicator render. A DTO the console reads by attribute, so it forces a
+#: bump. Derived on the tree that holds #2144, so the value below covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "24e0fac6107b4433"
+ENGINE_UI_SEAM: str = "288586ca6603bbc1"
 
 
 @dataclass(frozen=True, slots=True)

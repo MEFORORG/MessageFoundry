@@ -892,14 +892,21 @@ A configured forwarder that does not start never stops the engine. The engine te
   it ends. The one exception is the first check that finds the forwarder absent.
   Nothing closes the alert when the forwarder recovers; resolve it by hand.
 - **`log_forwarder` on `GET /status`.** It is `null` when no forwarder is configured. Otherwise
-  `state` is `healthy`, `degraded` or `not_installed`, beside `send_failing`, `spool_read_faulted`
-  and the counts: `lost`, `queued`, `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped`,
+  `state` is `healthy`, `unconfirmed`, `degraded` or `not_installed`, beside `delivery_confirmed`,
+  `send_failing`, `spool_read_faulted` and the counts: `lost`, `queued`, `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped`,
   `spool_skipped` and `spool_read_errors`. The web console's status page shows the same reading,
   and its health indicator turns to warn.
 
 `degraded` means the last send failed, the spool cannot be read, or a record was lost since the
 process started. A loss keeps the state `degraded` until a restart, because the records are still
 missing at the collector.
+
+**Over UDP the engine cannot see a lost record.** UDP is the default protocol, and a UDP send
+reports no failure, so a collector that is down looks the same as one that is up. The alert and
+the status row then report queue and spool losses only. `delivery_confirmed` is `false`, a
+forwarder with no fault seen reads `unconfirmed` and never `healthy`, and the console row says
+that delivery is not confirmed. The health indicator does not warn for it. Use `tcp` or `tls`
+where a silent loss must page.
 
 Both carry counts and fixed words only: never a record, the collector's address or an error text.
 Every count is since the process started. Each engine process has its own forwarder and watches

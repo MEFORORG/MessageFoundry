@@ -51,11 +51,19 @@ def root_logging_restored() -> Iterator[None]:
     guard = active_guard()
     # BACKLOG #2612: what the last configure_logging call was asked about a forwarder. Module
     # state, so it outlives the handlers; left behind, later tests read a forwarder that is gone.
-    forward_state = (logging_setup._forward_configured, logging_setup._forward_start_failure)
+    forward_state = (
+        logging_setup._forward_configured,
+        logging_setup._forward_start_failure,
+        logging_setup._forward_delivery_confirmed,
+    )
     try:
         yield
     finally:
-        logging_setup._forward_configured, logging_setup._forward_start_failure = forward_state
+        (
+            logging_setup._forward_configured,
+            logging_setup._forward_start_failure,
+            logging_setup._forward_delivery_confirmed,
+        ) = forward_state
         added = [h for h in root.handlers if h not in saved_state]
         root.handlers[:] = saved
         for handler, (filters, handler_level, formatter) in saved_state.items():

@@ -1015,16 +1015,22 @@ class LogForwarderInfo(BaseModel):
     """Health of the **off-box log forwarder** in THIS process (BACKLOG #2612).
 
     The pull-side counterpart of the ``log_forward_failed`` alert, read from process memory, so it
-    still answers when the collector does not. ``state`` is ``healthy``, ``degraded`` (the last
-    send failed, the spool cannot be read, or a record was lost since this process started; the
-    last does not clear until a restart) or ``not_installed`` (a forwarder was configured and did
-    not start, so nothing leaves the host). Every count is since this process started. Under
-    engine shards each process has its own forwarder, and this is the one that answered.
+    still answers when the collector does not. ``state`` is ``healthy``, ``unconfirmed``,
+    ``degraded`` (the last send failed, the spool cannot be read, or a record was lost since this
+    process started; the last does not clear until a restart) or ``not_installed`` (a forwarder
+    was configured and did not start, so nothing leaves the host). Every count is since this
+    process started. Under engine shards each process has its own forwarder, and this is the one
+    that answered.
+
+    **A UDP forwarder is never ``healthy``.** UDP reports no failed send, so the engine cannot see
+    a record lost on the wire. ``delivery_confirmed`` is then ``False``, a forwarder with no fault
+    seen reads ``unconfirmed``, and ``lost`` counts queue and spool losses only.
 
     **Counts and fixed words only**: never a record, a collector address or an error text."""
 
-    state: str  # "healthy" | "degraded" | "not_installed"
+    state: str  # "healthy" | "unconfirmed" | "degraded" | "not_installed"
     installed: bool
+    delivery_confirmed: bool = True  # False over UDP: a failed send is not visible at all
     start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
     send_failing: bool = False  # the last send hit a network error
     lost: int = 0  # the five loss counts below, added up; a floor
