@@ -20,6 +20,7 @@ import pytest
 
 import messagefoundry.config.settings as settings_module
 from messagefoundry.__main__ import main
+from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
 from messagefoundry.config.settings import (
     KEYLESS_REFUSED_BY_NO_STRICT_ACK,
     KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION,
@@ -538,9 +539,16 @@ def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
             "allow_single_factor_admin_when_exposed",
             SecuritySettings(allow_single_factor_admin_when_exposed=True),
         ),
+        # Vault BACKLOG #2280: every per-tier retention acknowledgement, read off the classification,
+        # so a tier given a switch there reds here until the editor has an entry for it.
+        *[
+            (w.acknowledged_by, SecuritySettings.model_validate({w.acknowledged_by: True}))
+            for w in PHI_RETENTION_WINDOWS
+            if w.acknowledged_by
+        ],
     ],
 )
-def test_ide_security_editor_risk_mirrors_the_mfa_advisories(
+def test_ide_security_editor_risk_mirrors_the_engine_text(
     switch: str, sec: SecuritySettings
 ) -> None:
     """Vault BACKLOG #1133. RED when the IDE Security Settings page drifts from the engine's text.
@@ -548,7 +556,8 @@ def test_ide_security_editor_risk_mirrors_the_mfa_advisories(
     ``ide/src/securityEditorWebview.ts`` says its ``risk`` strings are kept in step with
     ``security_loosenings()``, and nothing checked it: the page still said "the Administrator role is
     single-factor" after the engine text was corrected. TypeScript cannot import the Python, so this
-    reads the source. Scoped to the two MFA switches; other risks there are shorter on purpose."""
+    reads the source. Scoped to the two MFA switches and the per-tier retention acknowledgements
+    (vault BACKLOG #2280); other risks there are shorter on purpose."""
     source = (
         Path(__file__).resolve().parent.parent / "ide" / "src" / "securityEditorWebview.ts"
     ).read_text(encoding="utf-8")

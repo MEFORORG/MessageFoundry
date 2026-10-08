@@ -2704,6 +2704,20 @@ def test_status_builder_escapes_and_formats() -> None:
     off = ServiceStatusInfo(enabled=False, state="disabled", service_name="")
     assert "reporting is off" in str(status(sys_status, posture, cluster, nodes, dr, off))
 
+    # Vault BACKLOG #2280: each per-tier retention acknowledgement has its own row. The switches are
+    # read off the engine's classification, so a tier given one there reds here until the page shows
+    # it. A distinct marker per switch proves the row reads ITS key, not a neighbour's.
+    from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
+
+    switches = [w.acknowledged_by for w in PHI_RETENTION_WINDOWS if w.acknowledged_by]
+    assert len(switches) >= 4  # a floor, so an emptied classification cannot pass this vacuously
+    marked = posture.model_copy(update={"security": {s: f"marker-{s}" for s in switches}})
+    acked_html = str(status(sys_status, marked, cluster, nodes, dr, svc))
+    for switch in switches:
+        label = switch.removeprefix("allow_").replace("_", " ")
+        assert f"Allow {label}</td><td>marker-{switch}<" in acked_html, switch
+    assert "marker-" not in html  # the control: an unset switch renders no marker
+
 
 # --- L0b: register_ui_action write-action registry (the extensible step-up allow-list) ---------
 

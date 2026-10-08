@@ -69,6 +69,22 @@ export const FIELDS: Field[] = [
   { key: "allow_keeping_phi_indefinitely", label: "Allow keeping PHI indefinitely", type: "bool", group: "Data handling",
     desc: "Audited escape: unbounded PHI retention.",
     insecure: true, risk: "unbounded PHI retention is permitted" },
+  // The per-tier retention acknowledgements (BACKLOG #1967, #2280). 'Allow keeping PHI indefinitely'
+  // above covers the message-body tiers only and does NOT satisfy these. Each `risk` mirrors
+  // security_loosenings(), and tests/test_security_config.py reds when one drifts or a tier's switch
+  // is missing here.
+  { key: "allow_keeping_transform_state_indefinitely", label: "Allow keeping transform state indefinitely", type: "bool", group: "Data handling",
+    desc: "Audited acknowledgement: [retention].state_max_age_days may stay unset. Under strict enforcement the engine refuses to start without this or a window. A window deletes state by write time, so a Handler's correlation entry could vanish while in use; this is the safe answer for now.",
+    insecure: true, risk: "the PL-2 tier [retention].state_max_age_days may start with no retention window and accumulate without bound" },
+  { key: "allow_keeping_search_presets_indefinitely", label: "Allow keeping search presets indefinitely", type: "bool", group: "Data handling",
+    desc: "Audited acknowledgement: [retention].search_preset_days may stay unset. Under strict enforcement the engine refuses to start without this or a window.",
+    insecure: true, risk: "the PL-2 tier [retention].search_preset_days may start with no retention window and accumulate without bound" },
+  { key: "allow_keeping_app_logs_indefinitely", label: "Allow keeping app logs indefinitely", type: "bool", group: "Data handling",
+    desc: "Audited acknowledgement: [retention].app_log_days may stay unset while [logging].log_dir is set. Under strict enforcement the engine refuses to start without this or a window.",
+    insecure: true, risk: "the PL-1 tier [retention].app_log_days may start with no retention window and accumulate without bound" },
+  { key: "allow_keeping_backup_archives_indefinitely", label: "Allow keeping backup archives indefinitely", type: "bool", group: "Data handling",
+    desc: "Audited acknowledgement: [backup].retention_keep may be 0 while [backup].destination is set. Under strict enforcement the engine refuses to start without this or a keep count.",
+    insecure: true, risk: "the PL-1 tier [backup].retention_keep may start with no retention window and accumulate without bound" },
   { key: "audit_all_authorization_decisions", label: "Audit all authorization decisions", type: "bool", group: "Data handling",
     desc: "PHI access is ALWAYS audited; this records the grant for every authorization decision on top. On by default (BACKLOG #1277).",
     insecure: false, risk: "every authenticated READ is authorized but NOT recorded — what an account reached cannot be reconstructed afterwards" },

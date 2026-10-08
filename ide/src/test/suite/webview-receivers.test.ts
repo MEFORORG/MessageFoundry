@@ -614,6 +614,29 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.strictEqual(save.disabled, false, "a well-formed state did not turn Save on");
   });
 
+  test("Security Settings: every retention acknowledgement the engine reports has its own switch", () => {
+    // Vault BACKLOG #2280. The keys come from the recorded "security show", not from FIELDS, so a
+    // switch the engine reports and the editor lacks fails here instead of going unrendered.
+    const keys = Object.keys(SECURITY_SHOW.values).filter((k) => /^allow_keeping_.+_indefinitely$/.test(k));
+    assert.strictEqual(keys.length, 5, "the fixture lost a retention acknowledgement");
+    const p = security.load();
+    const doc = p.window.document;
+    p.deliver(variant(STATE_OK, (c) => { for (const k of keys) { c.state.values[k] = true; } }));
+    for (const k of keys) {
+      const field = FIELDS.find((f) => f.key === k);
+      assert.ok(field, `${k}: no FIELDS entry`);
+      assert.strictEqual(field.insecure, true, `${k}: true must read as a loosening`);
+      assert.ok(field.risk, `${k}: a loosening needs its risk text`);
+      assert.strictEqual(doc.getElementById("in-" + k).value, "true", `${k}: the state did not reach its control`);
+      assert.ok(doc.getElementById("field-" + k).classList.contains("loosened"), `${k}: not marked loosened`);
+    }
+    // The control: at the recorded values (all false) none is marked.
+    p.deliver(STATE_OK);
+    for (const k of keys) {
+      assert.ok(!doc.getElementById("field-" + k).classList.contains("loosened"), `${k}: marked while off`);
+    }
+  });
+
   for (const r of RECEIVERS) {
     for (const [type, fixtures] of Object.entries(r.wellFormed)) {
       test(`${r.panel}: ACCEPTS a well-formed "${type}"`, () => {

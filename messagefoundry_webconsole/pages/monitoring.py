@@ -645,6 +645,26 @@ def status(
             ["Block unlisted outbound", _sec("block_unlisted_outbound")],
             ["Delete message bodies after (days)", _sec("delete_message_bodies_after_days")],
             ["Allow keeping PHI indefinitely", _sec("allow_keeping_phi_indefinitely")],
+            # The per-tier retention acknowledgements (BACKLOG #1967, #2280). The switch above covers
+            # the message-body tiers only, so each of these is its own row. A literal list because a
+            # client may not import the engine's classification; test_webui.py pins it to that
+            # classification instead, so a tier given a switch there reds until it has a row here.
+            [
+                "Allow keeping transform state indefinitely",
+                _sec("allow_keeping_transform_state_indefinitely"),
+            ],
+            [
+                "Allow keeping search presets indefinitely",
+                _sec("allow_keeping_search_presets_indefinitely"),
+            ],
+            [
+                "Allow keeping app logs indefinitely",
+                _sec("allow_keeping_app_logs_indefinitely"),
+            ],
+            [
+                "Allow keeping backup archives indefinitely",
+                _sec("allow_keeping_backup_archives_indefinitely"),
+            ],
             ["Audit all authz decisions", _sec("audit_all_authorization_decisions")],
             ["Production instance", _sec("production_instance", "(derived from environment)")],
         ],
