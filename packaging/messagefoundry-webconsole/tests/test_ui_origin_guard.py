@@ -22,12 +22,16 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
+import pytest
 from _ui_clients import HEADERLESS_UI_REQUEST, create_local_user_chosen
+from fastapi import HTTPException
 from starlette.datastructures import Headers
 
 import messagefoundry_webconsole
+import messagefoundry_webconsole._auth as webconsole_auth
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
@@ -146,6 +150,57 @@ async def test_login_same_origin_succeeds_by_either_header(engine: Engine) -> No
         older = await c2.post("/ui/login", data=_creds(), headers={"Origin": "http://t"})
         assert older.status_code == 303
         assert (await c2.get("/ui")).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["x", "sameorigin", "Same-Origin", "SAME-ORIGIN", "NONE", "same-origin, none", "same-origin\t"],
+    ids=["unknown", "no-hyphen", "mixed-case", "upper-case", "upper-none", "list", "padded"],
+)
+async def test_a_write_with_an_unrecognised_sec_fetch_site_fails_closed(
+    engine: Engine, value: str
+) -> None:
+    """A write is accepted on ``Sec-Fetch-Site`` only for the two exact tokens ``same-origin`` and
+    ``none``. Any other non-empty value passed before, because the check refused two values and
+    allowed the rest. It is refused now, a matching ``Origin`` beside it changes nothing, and no
+    cookie is set.
+
+    The control is the same client and credentials with the exact token, which signs in."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        for extra in ({}, {"Origin": "http://t"}):
+            r = await c.post("/ui/login", data=_creds(), headers={"Sec-Fetch-Site": value, **extra})
+            assert r.status_code == 403, (value, extra, r.status_code)
+            assert "set-cookie" not in {k.lower() for k in r.headers}
+        for accepted in ("none", "same-origin"):
+            ok = await c.post("/ui/login", data=_creds(), headers={"Sec-Fetch-Site": accepted})
+            assert ok.status_code == 303, accepted
+
+
+def test_a_padded_sec_fetch_site_is_refused_by_the_check_itself() -> None:
+    """The HTTP layer may trim a header value before the route sees it, so the padded cases are
+    also put to ``assert_same_origin`` directly, where nothing trims them."""
+    state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
+
+    def request(method: str, value: str) -> Any:
+        return SimpleNamespace(
+            method=method,
+            headers=Headers({"sec-fetch-site": value, "host": "t"}),
+            app=SimpleNamespace(state=state),
+        )
+
+    for value in (" same-origin", "same-origin ", "\tnone", "Same-Origin", "x"):
+        with pytest.raises(HTTPException) as refused:
+            webconsole_auth.assert_same_origin(request("POST", value))
+        assert refused.value.status_code == 403, value
+        # A GET keeps its earlier rule: only cross-site and same-site are refused there.
+        webconsole_auth.assert_same_origin(request("GET", value))
+    for value in ("same-origin", "none"):
+        webconsole_auth.assert_same_origin(request("POST", value))
+    # control: the GET arm is live, so the passes above are the rule and not a dead branch
+    with pytest.raises(HTTPException):
+        webconsole_auth.assert_same_origin(request("GET", "cross-site"))
 
 
 async def test_login_with_neither_header_fails_closed_without_setting_a_cookie(

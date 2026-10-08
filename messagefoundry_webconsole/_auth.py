@@ -249,6 +249,9 @@ UI_CSP = (
 # state-changing /ui POSTs (M2). "same-site" (a sibling subdomain) is rejected too: /ui is strictly
 # same-origin. "same-origin" and "none" (a user-initiated navigation) are allowed.
 _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
+#: The ``Sec-Fetch-Site`` values a /ui WRITE is accepted with (:func:`assert_same_origin`): the
+#: browser calls the request same-origin, or user-initiated (``none``). A GET is not held to this.
+_SAME_ORIGIN_FETCH = frozenset({"same-origin", "none"})
 
 
 #: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
@@ -689,7 +692,8 @@ def assert_same_origin(request: Request) -> None:
     pass, on the reasoning that a browser attaches one of the two to every cross-site POST. That is an
     assumption about the browser, and nothing told the operator when it did not hold. No shipped
     first-party client posts to ``/ui`` without a browser, so the refusal costs a conforming client
-    nothing; a script that drives ``/ui`` must send ``Origin``.
+    nothing; a script that drives ``/ui`` must send ``Origin``. A write whose ``Sec-Fetch-Site`` is
+    present but is not exactly ``same-origin`` or ``none`` fails closed the same way.
 
     **A GET keeps the rule it had before that item, and must.** The one GET that reaches this check
     is ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in navigation. Owner rulings
@@ -708,10 +712,16 @@ def assert_same_origin(request: Request) -> None:
         if origin and not _origin_matches(request.app.state, origin, request.headers.get("host")):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-origin request rejected")
         return
-    # An EMPTY Sec-Fetch-Site names no provenance, so it is absence, as an empty Origin is below. A
-    # present value this code does not know (anything but cross-site/same-site) still passes here.
+    # An EMPTY Sec-Fetch-Site names no provenance, so it is absence, as an empty Origin is below.
     if site:
         assert_not_cross_site(request)
+        # An ALLOW set on a write, not only the two refused values above. The Fetch Metadata
+        # values are four exact lowercase tokens; anything else (an unknown token, another case,
+        # padding) is not a browser naming this request same-origin, so it fails closed.
+        if site not in _SAME_ORIGIN_FETCH:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "unrecognised Sec-Fetch-Site value rejected"
+            )
         return
     origin = request.headers.get("origin")
     if not origin:
