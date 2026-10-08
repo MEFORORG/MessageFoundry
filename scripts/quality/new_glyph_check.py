@@ -25,10 +25,9 @@ line in an exempt file feeds no pool, so a glyph cannot be laundered out of a da
 live doc, by moving a row or by renaming the file. The first draft judged every added line, and it
 would have refused all 7 of those commits.
 
-WHAT IT REFUSES: any codepoint in ``BANNED_RANGES``. That is Miscellaneous Symbols and Dingbats
-(U+2600-27BF), Miscellaneous Symbols and Arrows (U+2B00-2BFF), the emoji planes (U+1F000-1FAFF) and
-the emoji variation selector U+FE0F. Plain arrows (U+2190-21FF), box drawing and accented letters
-are outside every range on purpose: the operator docs carry many arrows legitimately.
+WHAT IT REFUSES: any character ``GLYPH`` matches, from ``scripts/quality/glyph_ranges.py``, the
+class ``scripts/telemetry/rule_telemetry.py`` matches with too. That module says what is in, what is out
+and why, and how to write a refused character instead.
 
 WHAT IT ALLOWS:
 
@@ -70,13 +69,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-#: Inclusive codepoint ranges a new line may not carry.
-BANNED_RANGES: tuple[tuple[int, int], ...] = (
-    (0x2600, 0x27BF),
-    (0x2B00, 0x2BFF),
-    (0x1F000, 0x1FAFF),
-    (0xFE0F, 0xFE0F),
-)
+# The shared definition sits beside this file. Appended, never prepended, and only once: a prepend
+# would put this directory in front of the stdlib for the rest of the run.
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.append(_HERE)
+from glyph_ranges import GLYPH  # noqa: E402
 
 #: Dated records, exempt by the owner ruling of 2026-09-30. Mirrors ``_DATED_RECORDS`` in
 #: ``tests/test_operator_docs_no_warning_sign.py``.
@@ -144,9 +142,8 @@ class Diff:
 
 
 def is_banned(ch: str) -> bool:
-    """Whether *ch* is in one of :data:`BANNED_RANGES`."""
-    cp = ord(ch)
-    return any(lo <= cp <= hi for lo, hi in BANNED_RANGES)
+    """Whether *ch* is one character of the shared ``GLYPH`` class."""
+    return GLYPH.fullmatch(ch) is not None
 
 
 def is_exempt(path: str) -> bool:
@@ -161,7 +158,7 @@ def banned_in(line: str, path: str = "") -> list[int]:
     if line.isascii():
         return []
     bare = _BACKTICK_SPAN.sub("", line) if path.lower().endswith(BACKTICK_IS_TOKEN) else line
-    return [ord(ch) for ch in bare if is_banned(ch)]
+    return [ord(ch) for ch in GLYPH.findall(bare)]
 
 
 def _run_git(*args: str) -> subprocess.CompletedProcess[bytes]:

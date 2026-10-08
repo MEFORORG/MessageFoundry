@@ -25,11 +25,15 @@ from tests.test_operator_docs_no_warning_sign import _DATED_RECORDS, _HELD
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CHECK = _ROOT / "scripts" / "quality" / "new_glyph_check.py"
+_RANGES = _ROOT / "scripts" / "quality" / "glyph_ranges.py"
+_TELEMETRY = _ROOT / "scripts" / "telemetry" / "rule_telemetry.py"
 
 _BALLOT_X = "\N{BALLOT X}"  # U+2717, one of the measured additions on main
 _NO_ENTRY = "\N{NO ENTRY}"  # U+26D4, another
 _ROCKET = "\N{ROCKET}"  # U+1F680, the emoji plane
 _VS16 = "\N{VARIATION SELECTOR-16}"
+_HOURGLASS = "\N{HOURGLASS WITH FLOWING SAND}"  # U+23F3, a status mark in CONNECTIONS.md
+_TRIANGLE = "\N{BLACK RIGHT-POINTING SMALL TRIANGLE}"  # U+25B8, from the shared set too
 _ARROW = "\N{RIGHTWARDS ARROW}"  # U+2192, deliberately allowed
 
 
@@ -86,7 +90,14 @@ def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 @pytest.mark.parametrize(
     ("glyph", "code"),
-    [(_BALLOT_X, "U+2717"), (_NO_ENTRY, "U+26D4"), (_ROCKET, "U+1F680"), (_VS16, "U+FE0F")],
+    [
+        (_BALLOT_X, "U+2717"),
+        (_NO_ENTRY, "U+26D4"),
+        (_ROCKET, "U+1F680"),
+        (_VS16, "U+FE0F"),
+        (_HOURGLASS, "U+23F3"),
+        (_TRIANGLE, "U+25B8"),
+    ],
 )
 def test_an_added_glyph_is_refused_and_named_by_codepoint(
     repo: Path, glyph: str, code: str
@@ -300,16 +311,59 @@ def test_the_report_counts_every_occurrence_and_is_pure_ascii() -> None:
 
 
 def _load_hook() -> Any:
-    spec = importlib.util.spec_from_file_location("new_glyph_check", _CHECK)
+    return _load(_CHECK, "new_glyph_check")
+
+
+def _load(path: Path, name: str) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
-    hook = importlib.util.module_from_spec(spec)
+    module = importlib.util.module_from_spec(spec)
+    # Both tools append scripts/quality to sys.path and import glyph_ranges by bare name. Restore
+    # both afterwards, so no later test can import a scripts/quality file by accident of order.
+    saved_path = list(sys.path)
+    saved_shared = sys.modules.get("glyph_ranges")
     # A dataclass resolves its module through sys.modules while the class body runs.
-    sys.modules[spec.name] = hook
+    sys.modules[spec.name] = module
     try:
-        spec.loader.exec_module(hook)
+        spec.loader.exec_module(module)
     finally:
         del sys.modules[spec.name]
-    return hook
+        sys.path[:] = saved_path
+        if saved_shared is None:
+            sys.modules.pop("glyph_ranges", None)
+        else:
+            sys.modules["glyph_ranges"] = saved_shared
+    return module
+
+
+def test_the_hook_and_telemetry_agree_in_and_around_the_glyph_ranges() -> None:
+    """Two copies of the class drifted once: the hook missed U+23F3, which telemetry caught.
+
+    Both tools now match with ``GLYPH`` from ``scripts/quality/glyph_ranges.py``. Comparing names
+    would pass a tool that kept the import but matched with something else, as telemetry did while
+    it also skipped the five banner glyphs. So this compares what each tool DOES, codepoint by
+    codepoint, over the symbol blocks the ranges sit in and a margin around each range.
+    """
+    hook = _load_hook()
+    telemetry = _load(_TELEMETRY, "rule_telemetry")
+    shared = _load(_RANGES, "glyph_ranges_under_test").GLYPH_RANGES
+    assert shared, "no ranges loaded -- the sweep below would be vacuous"
+
+    def telemetry_flags(ch: str) -> bool:
+        return bool(telemetry.check_no_glyphs([telemetry._ev_text(f"see {ch} here")]).violations)
+
+    swept = set(range(0x2000, 0x3000)) | set(range(0xFE00, 0xFE20)) | set(range(0x1EF00, 0x1FC00))
+    swept |= {cp for lo, hi in shared for cp in range(max(lo - 16, 0), hi + 17)}
+    disagree = [
+        f"U+{cp:04X}" for cp in sorted(swept) if hook.is_banned(chr(cp)) != telemetry_flags(chr(cp))
+    ]
+    assert not disagree, f"the hook and telemetry disagree on {disagree[:10]}"
+    inside = {cp for cp in swept if any(lo <= cp <= hi for lo, hi in shared)}
+    assert inside and all(hook.is_banned(chr(cp)) for cp in inside), "a shared codepoint is allowed"
+    outside = swept - inside
+    assert outside and not any(hook.is_banned(chr(cp)) for cp in outside), "an extra codepoint"
+    # Arrows stay out of the shared set, as the hook's negative control requires.
+    assert not hook.is_banned(_ARROW)
 
 
 def test_the_exempt_list_mirrors_the_warning_sign_guard() -> None:
@@ -323,3 +377,5 @@ def test_the_exempt_list_mirrors_the_warning_sign_guard() -> None:
 def test_the_script_source_is_ascii() -> None:
     """The hook names glyphs by codepoint, so its own source must carry none."""
     _CHECK.read_bytes().decode("ascii")
+    _RANGES.read_bytes().decode("ascii")
+    _TELEMETRY.read_bytes().decode("ascii")
