@@ -397,6 +397,10 @@ from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
+from messagefoundry.pipeline.security_signals import (
+    SecuritySignalThresholds,
+    install_security_signals,
+)
 from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
@@ -9720,6 +9724,19 @@ def create_managed_app(
         # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
         credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
+        # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
+        # adds no commit to the request path. Here, just above the span whose finally removes it,
+        # so no startup failure can leave it registered. Before the start's config_loaded row.
+        signal_settings = alerts_settings or AlertsSettings()
+        remove_security_signals = (
+            install_security_signals(
+                notifier or LoggingAlertSink(),
+                SecuritySignalThresholds.from_settings(signal_settings),
+                asyncio.get_running_loop(),
+            )
+            if signal_settings.security_signals
+            else None
+        )
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
@@ -10035,6 +10052,8 @@ def create_managed_app(
                         "window's audit row is lost; continuing the teardown"
                     )
             finally:
+                if remove_security_signals is not None:
+                    remove_security_signals()
                 await engine.stop()
                 # B11: shut down the harness-only instrumented executor (None in production / other tests).
                 # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
