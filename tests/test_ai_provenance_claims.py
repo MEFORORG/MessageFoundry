@@ -189,8 +189,8 @@ def test_section_6_7_states_the_status_and_dates_its_measurement() -> None:
     ), (
         "§6.7 does not state that the Co-Authored-By trailer is NOT in use. It is not prescribed, "
         "and a local commit-msg rule refuses its Claude form, so presenting the trailer block as the "
-        "commit convention makes this section fiction — and it is the section a contributor "
-        "actually follows."
+        "commit convention makes this section fiction. It is the section a contributor actually "
+        "follows."
     )
     assert re.search(r"re-?measured\s+20\d\d-\d\d-\d\d", low), (
         "§6.7 carries no DATED re-measurement. Trailer adoption here has already changed once without "
