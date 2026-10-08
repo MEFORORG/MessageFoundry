@@ -1291,10 +1291,10 @@ accepted, it is the record that the parked path was taken.
 ### G.5 A precondition this amendment does not meet
 
 Review finding R1 showed `lens rewrite` accepting arbitrary Python. Two changes to
-`messagefoundry/lens.py` answer it: the typed-only mode of G.6 and the R1 fix of G.7. **Both are
-being built separately, on their own branch, and neither has landed.** Until they do, a typed-row
-edit can carry code, and the analyst build's limit does not hold even inside the editor. ADR 0208
-makes both a condition of shipping the analyst build.
+`messagefoundry/lens.py` answer it: the typed-only mode of G.6 and the R1 fix of G.7. **Both landed
+in PR 2155, merged 2026-10-08 as `8280c3f42b`.** Before that, a typed-row edit could carry code, and
+the analyst build's limit would not have held even inside the editor. G.7, "Where the code stands",
+records what still differs. ADR 0208 makes both a condition of shipping the analyst build.
 
 **This amendment is the one statement of both.** ADR 0208 and its specification point here rather
 than restating them.
@@ -1324,9 +1324,9 @@ Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and
 
 **The owner ruled on 2026-10-07 that both close under a typed-only mode, and are otherwise kept.**
 
-- `lens rewrite` would gain a flag, working name `--typed-only`, off by default. Under it, the two
-  hatches above would be refused with the generic `refused` code, and nothing written.
-- **Also under the flag**, a move or delete that breaks the structure rule below would be refused
+- `lens rewrite` has a flag, `--typed-only`, off by default (PR 2155). Under it, the two hatches
+  above are refused with the generic `refused` code, and nothing is written.
+- **Also under the flag**, a move or delete that breaks the structure rule below is refused
   (Manager decision 2026-10-07, after adversarial review, part of the R1 fix).
 - Developers, the `ide/` extension and the ADR 0208 developer build keep the default. The ADR 0208
   analyst build always sets the flag and offers no way to turn it off.
@@ -1394,25 +1394,25 @@ This narrows, in typed-only mode only, at least: §2 Phase 3 and §5 of this ADR
 *Delete* and *Move* verbs of [ADR 0103](0103-steps-view-row-context-menu.md)'s row menu; and the
 `delete_row` of a whole `if`/`for` block from its header row, which the comment above the
 editable-kind guard in `rewrite_source` (`messagefoundry/lens.py`) calls the ADR 0089 block-cut a
-Steps cut reuses. None of those texts is changed; this amendment is the record. None of it has
-landed.
+Steps cut reuses. None of those texts is changed; this amendment is the record. The code landed in
+PR 2155; G.7, "Where the code stands", records where it still differs from this rule.
 
 ### G.7 The R1 fix: values a typed edit may write
 
 Amendment E's 2026-09-29 note (E.11, rule 3) records that structural inserts (`insert_row` and the
 insert templates) *"still splice an `{"expr": ...}` verbatim"*, and that the note does not cover
-them. The R1 fix would change that, in every mode, at least as follows:
+them. The R1 fix, which landed in PR 2155, changes that in every mode, at least as follows:
 
 - An `{"expr": ...}` on an `insert_row` (including its occurrence keywords), on `insert_code_lookup`
-  (including the code-lookup default), or on a send row's `set_params` destination would be refused
+  (including the code-lookup default), or on a send row's `set_params` destination is refused
   unless it is **inert**.
-- `set_params` on a send row would overwrite an existing destination only when that slot is a literal
+- `set_params` on a send row overwrites an existing destination only when that slot is a literal
   or an inert name. A destination computed by code, or held in a handler local, is refused, and so is
   a destination imported from another module, which cannot be retargeted yet (Manager decision
   2026-10-07, after review).
-- `assign_to` would refuse `msg`, builtins, reserved names, dunder names, and any name the handler
-  or module already binds or reads.
-- `set_params` on a `route` row whose base `handlers` is not a literal list would be refused
+- `assign_to` refuses `msg`, builtins, reserved names, dunder names, and any name the handler or
+  module already binds or reads.
+- `set_params` on a `route` row whose base `handlers` is not a literal list is refused
   (Manager decision 2026-10-07, after adversarial review).
 
 **The inert rule, stated once here.** The lens's own predicate decides what is inert; the list below
@@ -1486,13 +1486,39 @@ read and the FHIR value objects `FhirToken(...)` and `FhirRaw(<string literal>)`
   `FhirToken(literal, read)` or `FhirRaw(<string literal>)`.
 
 **Where the code stands.** The lens implementation of G.6 and G.7 is PR 2155
-(`messagefoundry/lens.py`). Its tests, `tests/test_lens_no_code_injection.py` and
-`tests/test_lens_typed_only_repair.py`, are the source of record for what the code enforces. Where
-the code and these rules differ, the stricter of the two governs, and each difference is recorded
-with its status on PR 2155 until it is reconciled (Manager decision 2026-10-07, PR 2154 review
-finding 4). The record is [PR 2155, comment
-6049435349](https://github.com/MEFORORG/MessageFoundry/pull/2155#issuecomment-6049435349).
-`set_params` on action, lookup and diagnostic rows already refuses a `dynamic` value (AC-M5).
+(`messagefoundry/lens.py`). **It merged on 2026-10-08 as `8280c3f42b`.** Its tests on `main`,
+`tests/test_lens_no_code_injection.py` and `tests/test_lens_typed_only_repair.py`, are the source of
+record for what the code enforces. Where the code and these rules differ, the stricter of the two
+governs, and each difference is a defect until it is reconciled (Manager decision 2026-10-07, PR 2154
+review finding 4). The differences were recorded with their status in [PR 2155, comment
+6049435349](https://github.com/MEFORORG/MessageFoundry/pull/2155#issuecomment-6049435349), and
+[comment 6049637950](https://github.com/MEFORORG/MessageFoundry/pull/2155#issuecomment-6049637950)
+corrects that table's row 5. `set_params` on action, lookup and diagnostic rows already refuses a
+`dynamic` value (AC-M5).
+
+**What still differs at `main`.** Each row of that table was re-measured on 2026-10-08 against
+`rewrite_source` at `main` (`8e5f429732`). One difference remains beyond the recorded limits:
+
+- **A row moved below a typed `return` is accepted, in both modes.** G.6 rule 8 refuses it, so the
+  rule is stricter and governs. Take a handler whose `if` guard ends in `return Send("OB", msg)` and
+  whose body ends in `return Send("OB2", msg)`. A `move_row` that swaps a `msg.set(...)` row below
+  the last `return`, or drops a row after either `return`, is accepted with `typed_only=True`. The
+  row would then never run. `_refuse_shifted_code` in `messagefoundry/lens.py` keeps a `return` or
+  `raise` on its own suite path, but nothing checks what lands after one. No test on `main` pins
+  this case.
+
+The recorded limits, which are not reconciled:
+
+- the static-check bypasses under "Limits of a static check", below;
+- a handler whose message parameter is not named `msg`. An inserted row writes `msg.*` there, so it
+  would raise NameError on every message. Reproduced at `8e5f429732` in both modes; no test pins it;
+- an imported send destination, which cannot be retargeted. The second bullet at the top of G.7
+  refuses it as well, so the two sides agree and the refusal is conservative.
+
+Two rows of the table are closed. A Set Field or Add Repetition value that is not text, such as a
+module `NONE = None`, is refused; `test_r11_an_inserted_field_value_must_be_text` and
+`test_r11_set_params_writes_only_text_into_a_field_value` in `tests/test_lens_typed_only_repair.py`
+show it. Row 5, `occurrence=OCC`, was never a difference: G.7 refuses it too.
 
 **Limits of a static check.** The predicate reads the source and runs nothing, so code that
 reaches module state by a route the source does not spell out can still defeat it. These remain, at
@@ -1501,17 +1527,17 @@ least: `getattr(h, "__globals__")`, `from sys import modules as mm`, and
 `code:edit` developer is out of scope (Manager ruling 2026-10-07 on PR 2155, made under the owner's
 delegation).
 
-**A gap in the projection today.** At `origin/main` (`ddf350e1d0`), `_rendered_param_nodes` drops the
+**A gap in the projection today.** At `main` (`8e5f429732`, re-measured 2026-10-08), `_rendered_param_nodes` drops the
 `msg` positional from a typed row's `params`, and `_callee_name` accepts any `X.attr` callee by its
 last name. So `set_field(__import__("os").getcwd() or msg, "PID-5.1", "X")` and `anything.Send("OB",
 msg)` read back as ordinary typed rows whose `params` look unchanged. The Steps view then shows code
 that runs as a typed step. ADR 0208's repository check would close this for itself, once built, by
 comparing each typed row's full statement (spec FR-40 item 5a). Whether the lens should refuse to
-project such a row as typed is open; [PR 2155, comment
+project such a row as typed is still open after PR 2155 merged; [PR 2155, comment
 6049435349](https://github.com/MEFORORG/MessageFoundry/pull/2155#issuecomment-6049435349) records it.
 
 That sentence of E.11 is not rewritten; the dated pointer appended to it sends the reader here. The
-change is being built separately and has not landed.
+change landed in PR 2155.
 
 ### Acceptance Criteria (Amendment G -- proposed, not ratified)
 
@@ -1520,8 +1546,18 @@ change is being built separately and has not landed.
   without opening one. The routes include at least an untitled buffer, *Save As*, *Compare*, a rename
   or copy into a `.py`, an upload, a drop into the navigator, and a move or copy of one `.py` over
   another. (Mechanism: ADR 0208 spec section 10. Spike S-2 closed the first three and a move or copy
-  from a file that is not a `.py` into a `.py`, on the browser build; the rest are open. Manager
-  decision 2026-10-07, from spike S-2.)
+  from a file that is not a `.py` into a `.py`, on the browser build. Manager decision 2026-10-07,
+  from spike S-2.)
+  The routes also include at least the Electron-only ones: *Open With System Editor*, *Reveal in
+  File Explorer*, `shell.openExternal` and `showItemInFolder`, `window.open` on a `file:` URL,
+  Developer Tools, Electron's default menu, the native menu bar and context menus, and native file
+  dialogs. A check that a name is a `.py` SHALL also catch the Windows spellings `x.py.`, `x.py `
+  and `x.py:stream`. The walk that tests this criterion SHALL pair every check with a control that
+  fires, and a menu read that returns no entries SHALL fail the walk rather than pass it. Spike S-2b
+  closed these routes, an upload and a drop of a `.py` into the navigator, and the Windows
+  spellings, on the Electron build. Its report does not name a move or copy of one `.py` over
+  another, and it guards the backend upload endpoint in the page only, so both stay open (Manager
+  decision 2026-10-08, from spike S-2b).
 - [ ] **AC-G2** -- WHEN a file fails `lens parse` in the analyst build, THE SYSTEM SHALL show a
   read-only notice that a developer must fix it, and SHALL NOT open a text editor.
 - [ ] **AC-G3** -- WHILE the editor is the ADR 0208 developer build or the `ide/` extension, THE
@@ -1534,8 +1570,9 @@ change is being built separately and has not landed.
   `template` or Else If `insert_clause` edit with a `test` key, or a move or delete that breaks the
   structure rule of G.6, THEN THE SYSTEM SHALL refuse it with the generic `refused` code and write
   nothing. R1 payloads 1 and 2 (G.5) are refusal tests, and so is a row using `occurrence=i`
-  moved out of its For Each loop (G.6 rule 6). The R1 fix's tests verify this; they land
-  separately.
+  moved out of its For Each loop (G.6 rule 6). The R1 fix's tests landed in PR 2155, in
+  `tests/test_lens_no_code_injection.py` and `tests/test_lens_typed_only_repair.py`. G.7, "What
+  still differs at `main`", names a structure-rule case the code still accepts.
 - [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL NOT refuse a
   `paste_block` or a raw `test` for being one; each still passes the checks the lens applies in every
   mode. Among those, a raw `test` SHALL be one condition on one line, with no `yield` and no `await`
