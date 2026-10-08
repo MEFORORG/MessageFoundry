@@ -794,6 +794,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
         self._store = store
         self._state_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #2272 defect 8: the newest pending state write per "<type>:<connection>" instance key.
+        # The next write for that key awaits it first, so a raise and its clear land in emit order;
+        # writes for different keys stay concurrent. An entry is dropped when its task finishes.
+        self._state_tails: dict[str, asyncio.Task[None]] = {}
         # #143 (ADR 0044 amendment): windowed NOTIFICATION-mute cache — (type:connection) → until-epoch.
         # The synchronous suspend gate _emit consults; in-memory + per-node (the same advisory posture as
         # the _last_sent throttle above). The DURABLE record is alert_instance.suspended_until; this cache
@@ -1442,6 +1446,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         connection = str(event.get("connection", ""))
         inverse_of = _AUTO_RESOLVE.get(etype)
         coro: Coroutine[Any, Any, Any]
+        # The instance key both writes touch: an upsert's own type, or the failure type a clear resolves.
+        key = f"{inverse_of or etype}:{connection}"
         if inverse_of is not None:
             # #143/#81: a resolved condition has nothing left to mute OR escalate — drop the windowed-
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
@@ -1461,18 +1467,37 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 reason=reason,
                 escalation_tier=escalation_tier,
             )
+        # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
+        # resolve emitted behind it and leave a cleared condition open (or the reverse). Chain behind
+        # the previous pending write for the same key so the store sees this key's writes in emit order.
+        prev = self._state_tails.get(key)
         try:
-            task = asyncio.ensure_future(self._run_state(coro))
+            task = asyncio.ensure_future(self._run_state(coro, prev))
         except RuntimeError:
             # No running loop (e.g. an emit on a non-async test path) — the state write is best-effort,
             # so drop it rather than raise into the caller. The notification path is unaffected.
             coro.close()
             return
         self._state_tasks.add(task)
-        task.add_done_callback(self._state_tasks.discard)
+        self._state_tails[key] = task
+
+        def _done(t: asyncio.Task[None]) -> None:
+            self._state_tasks.discard(t)
+            if self._state_tails.get(key) is t:
+                del self._state_tails[key]  # no newer write queued behind it
+
+        task.add_done_callback(_done)
 
     @staticmethod
-    async def _run_state(coro: Any) -> None:
+    async def _run_state(coro: Any, prev: asyncio.Task[None] | None = None) -> None:
+        if prev is not None:
+            try:
+                # asyncio.wait never raises for the awaited task's own outcome, so a cancelled or
+                # failed predecessor still lets this write run. Only cancelling THIS task stops it.
+                await asyncio.wait((prev,))
+            except BaseException:
+                coro.close()  # cancelled before the write started: no "never awaited" warning
+                raise
         try:
             await coro
         except Exception:

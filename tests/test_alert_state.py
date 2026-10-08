@@ -576,7 +576,129 @@ async def test_no_store_is_noop() -> None:
     assert sink._state_tasks == set()
 
 
-# --- three-backend parity (AC-8) ---------------------------------------------
+# --- per-key write ordering (BACKLOG #2272 defect 8) --------------------------
+
+
+class _GatedStore(_RecordingStore):
+    """A recording store that holds open instances by key and can stall one write kind on a gate.
+
+    ``open`` is the state a real store would end in; ``log`` is the order the writes landed."""
+
+    def __init__(self, *, slow: str) -> None:
+        super().__init__()
+        self.slow = (
+            slow  # "upsert" or "resolve": that kind waits on ``gate`` for one named connection
+        )
+        self.slow_connection = "OB_X"
+        self.gate = asyncio.Event()
+        self.open: set[str] = set()
+        self.log: list[str] = []
+
+    async def _maybe_wait(self, kind: str, connection: str) -> None:
+        if kind == self.slow and connection == self.slow_connection:
+            await self.gate.wait()
+
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = None,
+        escalation_tier: int = 0,
+        now: float | None = None,
+    ) -> None:
+        await self._maybe_wait("upsert", connection)
+        self.open.add(f"{event_type}:{connection}")
+        self.log.append(f"upsert {connection}")
+
+    async def resolve_alert_instances_for(
+        self, *, event_type: str, connection: str, now: float | None = None
+    ) -> int:
+        await self._maybe_wait("resolve", connection)
+        self.open.discard(f"{event_type}:{connection}")
+        self.log.append(f"resolve {connection}")
+        return 1
+
+
+async def _spin(turns: int = 20) -> None:
+    for _ in range(turns):
+        await asyncio.sleep(0)
+
+
+async def test_slow_raise_then_fast_clear_ends_resolved() -> None:
+    # The raise's upsert stalls; the clear emitted after it must not land first, or the store ends
+    # with a condition open that the engine already cleared.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    sink.connection_restored("OB_X")
+    await _spin()
+    assert store.log == []  # the resolve waits behind the stalled upsert for the same key
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["upsert OB_X", "resolve OB_X"]
+    assert store.open == set()
+    assert sink._state_tails == {}  # the per-key tail is dropped once the chain finishes
+
+
+async def test_slow_clear_then_fast_raise_ends_open() -> None:
+    # The reverse order: a clear stalls and a fresh raise follows. The raise must win.
+    store = _GatedStore(slow="resolve")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_restored("OB_X")
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    await _spin()
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["resolve OB_X", "upsert OB_X"]
+    assert store.open == {"connection_error:OB_X"}
+
+
+async def test_writes_for_different_keys_stay_concurrent() -> None:
+    # Control: a stalled write for OB_X must not hold up a write for OB_Y.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    sink.connection_error("OB_Y", kind="connection_lost", detail="refused")
+    await _spin()
+    assert store.log == ["upsert OB_Y"]  # OB_Y landed while OB_X is still stalled
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["upsert OB_Y", "upsert OB_X"]
+
+
+async def test_cancelled_predecessor_does_not_block_the_next_write() -> None:
+    # Shutdown cancels pending tasks. A cancelled write must release the one queued behind it, and a
+    # write cancelled before it started must close its coroutine rather than leak it.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    first = sink._state_tails["connection_error:OB_X"]
+    sink.connection_restored("OB_X")
+    await _spin()
+    first.cancel()
+    await _drain(sink)
+    assert store.log == ["resolve OB_X"]
+    assert store.open == set()
+
+    # Cancelling the waiting successor itself drops only that write.
+    store2 = _GatedStore(slow="upsert")
+    sink2 = NotifierAlertSink([], store=store2)
+    sink2.connection_error("OB_X", kind="connection_lost", detail="refused")
+    sink2.connection_restored("OB_X")
+    second = sink2._state_tails["connection_error:OB_X"]
+    await _spin()
+    second.cancel()
+    await _spin()
+    assert second.cancelled()
+    store2.gate.set()
+    await _drain(sink2)
+    assert store2.log == ["upsert OB_X"]
+    assert sink2._state_tails == {}
+
+
+# --- three-backend parity (AC-8)---------------------------------------------
 
 
 _ALERT_API = frozenset(
