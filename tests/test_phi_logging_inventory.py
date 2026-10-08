@@ -748,8 +748,8 @@ def _inventory_rows(section: str | None = None) -> list[str]:
 
 
 def _row_naming(token: str, section: str | None = None) -> str:
-    """The one inventory row whose FIRST cell names ``token``."""
-    rows = [row for row in _inventory_rows(section) if token in row.split("|")[1]]
+    """The one inventory row whose FIRST cell names ``token`` in backticks, exactly."""
+    rows = [row for row in _inventory_rows(section) if f"`{token}`" in row.split("|")[1]]
     assert len(rows) == 1, (
         f"the §7 logging inventory has {len(rows)} rows whose stream cell names {token!r}; "
         "it needs exactly one (ASVS 16.1.1)"
@@ -778,7 +778,27 @@ def test_the_tray_file_sink_has_an_inventory_row() -> None:
     )
 
 
-_IDE_CHANNEL = re.compile(r"createOutputChannel\(\s*\"([^\"]+)\"")
+#: The first argument of every ``createOutputChannel(`` call, whatever it is.
+_IDE_CHANNEL_ARG = re.compile(r"createOutputChannel\(\s*([^,)]+)")
+#: A plain string literal in any of the three TypeScript quote styles, with no interpolation.
+_IDE_LITERAL = re.compile(r"""(['"`])([^'"`$\\]+)\1""")
+
+
+def _channel_names(source: str) -> set[str]:
+    """The channel names ``source`` creates. A name that is not a plain literal fails loudly.
+
+    This is a text scan of TypeScript, which the suite has no parser for. A call left in a comment
+    over-fires, by asking for a row the code no longer needs.
+    """
+    names: set[str] = set()
+    for arg in _IDE_CHANNEL_ARG.findall(source):
+        literal = _IDE_LITERAL.fullmatch(arg.strip())
+        assert literal is not None, (
+            f"createOutputChannel({arg.strip()}) does not name its channel with a plain string "
+            "literal, so this test cannot tell whether docs/PHI.md has a row for it"
+        )
+        names.add(literal.group(2))
+    return names
 
 
 def _ide_output_channels() -> set[str]:
@@ -787,15 +807,17 @@ def _ide_output_channels() -> set[str]:
     for path in (_ROOT / "ide" / "src").rglob("*.ts"):
         if "test" in path.relative_to(_ROOT / "ide" / "src").parts:
             continue
-        names.update(_IDE_CHANNEL.findall(path.read_text(encoding="utf-8")))
+        names |= _channel_names(path.read_text(encoding="utf-8"))
     return names
 
 
 def test_every_ide_output_channel_has_an_inventory_row() -> None:
     """BACKLOG #2351. An output channel is a log sink on a developer's desktop, so each has a row.
 
-    The set is read from ``ide/src``, so a third channel reds this test until it gets a row. The
-    pattern sees a channel named by a string literal only; one named through a constant is missed.
+    The set is read from ``ide/src``, so a third channel reds this test until it gets a row. A
+    channel named through a constant or a template with a placeholder fails the reader, because
+    the name cannot be read. A call the pattern does not see at all, such as one made through an
+    alias of ``createOutputChannel``, is still missed.
     """
     channels = _ide_output_channels()
     assert {"MessageFoundry Engine", "MessageFoundry Checks"} <= channels, (
@@ -814,6 +836,22 @@ def test_the_ide_channel_reader_can_fail() -> None:
     _row_naming("MessageFoundry Engine", section)
     with pytest.raises(AssertionError, match="MessageFoundry Checks"):
         _row_naming("MessageFoundry Checks", section)
+    # A name that is only part of an existing row's name is not that row.
+    with pytest.raises(AssertionError, match="0 rows"):
+        _row_naming("Engine")
+
+
+def test_the_ide_channel_reader_sees_every_quote_style_and_refuses_a_constant() -> None:
+    """Planted source: the three literal forms are read, and a constant fails loudly."""
+    planted = (
+        'a = vscode.window.createOutputChannel("One", { log: true });\n'
+        "b = vscode.window.createOutputChannel('Two');\n"
+        "c = vscode.window.createOutputChannel(\n  `Three`,\n);\n"
+    )
+    assert _channel_names(planted) == {"One", "Two", "Three"}
+    for unreadable in ("createOutputChannel(NAME)", "createOutputChannel(`x ${y}`)"):
+        with pytest.raises(AssertionError, match="plain string"):
+            _channel_names(unreadable)
 
 
 def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:

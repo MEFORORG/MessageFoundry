@@ -128,21 +128,24 @@ At least these parts of the engine read the host's wall clock:
 
 | What | Where | What a wrong clock would do |
 |---|---|---|
-| Session expiry | `messagefoundry/auth/service.py` | Each request compares the session's absolute expiry and idle timeout with `time.time()`. A fast clock would end sessions early. A slow clock would keep them past their limit. A backward step revokes the session, because validation fails closed. |
-| TOTP codes | `messagefoundry/auth/totp.py` | A code covers a 30-second step (`DEFAULT_PERIOD`), and the engine accepts one step either side of its own (`DEFAULT_WINDOW = 1`). A host further out than that would refuse correct codes. |
+| Session expiry | `messagefoundry/auth/service.py` | A session's expiry is stamped from `time.time()`, and each request checks it and the idle timeout against the same clock. A forward step would end sessions early. A backward step revokes the session, because validation fails closed. A steady offset on one host does not move expiry by itself. |
+| TOTP codes | `messagefoundry/auth/totp.py`, called from `messagefoundry/auth/service.py` | A code covers a 30-second step (`DEFAULT_PERIOD`). The engine passes `[auth].totp_skew_steps` as the tolerance, and its default is `0`: only the current step verifies. So any offset would refuse correct codes for part of each step, and an offset of 30 seconds would refuse all of them. [CONFIGURATION.md](CONFIGURATION.md) owns that key. |
 | OIDC sign-in | `messagefoundry/auth/oidc/claims.py` | The engine checks a token's `exp`, `iat` and `nbf` against the host clock, with `[auth].oidc_clock_skew_seconds` of grace: 60 by default, 300 at most. Past that grace, federated sign-in would fail. |
 | Log time stamps | `messagefoundry/logging_setup.py` | Each log line carries a UTC stamp made from the host clock. A wrong clock would put the engine's lines out of order against a collector's and against other hosts'. |
 | Retention | `messagefoundry/pipeline/retention.py` | The retention pass works out its cutoffs from the wall clock. A clock that jumps forward would purge rows before their window has passed. |
 | Certificate expiry warnings | `messagefoundry/pipeline/cert_expiry.py` | The monitor counts the days a certificate has left from the host clock, so its warning would come early or late. |
+| Cluster row leases and node heartbeats | [CLUSTERING.md, *Operational assumptions*](CLUSTERING.md#operational-assumptions-honor-these) | That page owns the rule for a cluster: keep node clocks well within `[store].lease_ttl_seconds`. Skew between nodes would mistime a lease expiry. |
 
 ### This page sets no drift number
 
 The engine has no single tolerance, so this page does not invent one. The numbers above are the
-ones the code holds. The tightest is the start-up check below, at 2 seconds by default.
+ones the code and its settings hold. The tightest is TOTP: with the default of zero steps of
+tolerance, every second of offset costs a second of each code's life.
 
 ### Check it on Windows
 
-Run both commands on the engine host:
+Run both commands on the engine host. If one answers `Access is denied. (0x80070005)`, run it
+again from an elevated prompt.
 
 ```powershell
 w32tm /query /source
@@ -151,11 +154,12 @@ w32tm /query /status
 
 A healthy host answers like this:
 
-- `/query /source` names a time server or a domain controller.
+- `/query /source` names a time server or a domain controller. On a virtual machine it may name
+  the hypervisor's time provider instead, such as `VM IC Time Synchronization Provider`.
 - `/query /status` shows `Leap Indicator: 0(no warning)`, a `Source` that matches the first command,
   and a recent `Last Successful Sync Time`.
 
-These answers mean the clock is **not** disciplined:
+At least these answers mean the clock is **not** disciplined:
 
 - `The service has not been started. (0x80070426)`. The Windows Time service is stopped.
 - A source of `Local CMOS Clock` or `Free-running System Clock`. The host follows only its own

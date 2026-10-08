@@ -1507,10 +1507,6 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
     ("test_phi_logging_inventory.py", "_sink_modules"): (
         "a text pre-filter before the AST verdict: every code hit is a text hit, so it drops none"
     ),
-    ("test_phi_logging_inventory.py", "_ide_output_channels"): (
-        "reads TypeScript, which this suite has no parser for; a channel named only in a comment "
-        "can only over-fire, by asking for an inventory row the code no longer needs"
-    ),
     ("test_phi_at_rest_inventory.py", "test_plaintext_key_columns_are_inventoried"): (
         "the claim is that config/state.py's own prose describes patient-id correlation"
     ),
