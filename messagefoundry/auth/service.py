@@ -25,7 +25,6 @@ import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import (
-    AsyncIterator,
     Awaitable,
     Callable,
     Coroutine,
@@ -33,9 +32,9 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cache
 from types import MappingProxyType
@@ -124,6 +123,8 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
+from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
+from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.store.base import AdminStore, store_driver_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
@@ -1657,36 +1658,6 @@ def _directory_answer_mismatch(principal: AdPrincipal, object_id: str) -> str | 
     if principal.directory_object_id != (normalise_object_guid(object_id) or object_id):
         return DIRECTORY_IDENTITY_CONFLICT
     return None
-
-
-@dataclass
-class _KeyedLock:
-    """One entry of a per-account lock table, with a count of the tasks holding or awaiting it so the
-    entry can be dropped when the last one leaves. The re-proof table, the credential table and the
-    lock-notice table (BACKLOG #2216) each use it (:func:`_hold_keyed_lock`)."""
-
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    users: int = 0
-
-
-@asynccontextmanager
-async def _hold_keyed_lock(table: dict[str, _KeyedLock], key: str) -> AsyncIterator[None]:
-    """Hold ``table``'s lock for ``key``, creating the entry on first use and dropping it once no
-    task holds or awaits it, so the table never outgrows the attempts in flight.
-
-    ``asyncio.Lock`` wakes its waiters in arrival order, so the attempts queued on one key run in the
-    order they arrived."""
-    entry = table.get(key)
-    if entry is None:
-        entry = table[key] = _KeyedLock()
-    entry.users += 1
-    try:
-        async with entry.lock:
-            yield
-    finally:
-        entry.users -= 1
-        if entry.users == 0:
-            del table[key]
 
 
 #: How much of a typed username :func:`_credential_lock_key` reads (BACKLOG #1943). Four times the

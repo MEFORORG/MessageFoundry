@@ -53,6 +53,7 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
+from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
     config_changed_detail,
     crl_expiry_detail,
@@ -794,10 +795,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
         self._store = store
         self._state_tasks: set[asyncio.Task[None]] = set()
-        # BACKLOG #2272 defect 8: the newest pending state write per "<type>:<connection>" instance key.
-        # The next write for that key awaits it first, so a raise and its clear land in emit order;
-        # writes for different keys stay concurrent. An entry is dropped when its task finishes.
-        self._state_tails: dict[str, asyncio.Task[None]] = {}
+        # BACKLOG #2272 defect 8: a FIFO lock per "<type>:<connection>" instance key. Each state write
+        # holds its key's lock, so a raise and its clear land in emit order; writes for different keys
+        # stay concurrent. An entry is dropped once no write holds or awaits it.
+        self._state_locks: dict[str, KeyedLock] = {}
         # #143 (ADR 0044 amendment): windowed NOTIFICATION-mute cache — (type:connection) → until-epoch.
         # The synchronous suspend gate _emit consults; in-memory + per-node (the same advisory posture as
         # the _last_sent throttle above). The DURABLE record is alert_instance.suspended_until; this cache
@@ -1448,6 +1449,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         coro: Coroutine[Any, Any, Any]
         # The instance key both writes touch: an upsert's own type, or the failure type a clear resolves.
         key = f"{inverse_of or etype}:{connection}"
+        # Stamp the row with the emit time: a write may now wait behind a slow one for the same key,
+        # and first_seen / last_seen / resolved_at should say when the condition changed, not when
+        # the store caught up.
+        now = time.time()
         if inverse_of is not None:
             # #143/#81: a resolved condition has nothing left to mute OR escalate — drop the windowed-
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
@@ -1455,7 +1460,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # escalation_tier were on the now-resolved row and never return via list_active).
             self._suspended.pop(f"{inverse_of}:{connection}", None)
             self._occurrences.pop(f"{inverse_of}:{connection}", None)
-            coro = store.resolve_alert_instances_for(event_type=inverse_of, connection=connection)
+            coro = store.resolve_alert_instances_for(
+                event_type=inverse_of, connection=connection, now=now
+            )
         else:
             # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
             raw_reason = event.get("detail") or event.get("reason")
@@ -1466,40 +1473,33 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 severity=severity,
                 reason=reason,
                 escalation_tier=escalation_tier,
+                now=now,
             )
-        # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
-        # resolve emitted behind it and leave a cleared condition open (or the reverse). Chain behind
-        # the previous pending write for the same key so the store sees this key's writes in emit order.
-        prev = self._state_tails.get(key)
         try:
-            task = asyncio.ensure_future(self._run_state(coro, prev))
+            task = asyncio.ensure_future(self._run_state(coro, key))
         except RuntimeError:
             # No running loop (e.g. an emit on a non-async test path) — the state write is best-effort,
             # so drop it rather than raise into the caller. The notification path is unaffected.
             coro.close()
             return
         self._state_tasks.add(task)
-        self._state_tails[key] = task
 
         def _done(t: asyncio.Task[None]) -> None:
             self._state_tasks.discard(t)
-            if self._state_tails.get(key) is t:
-                del self._state_tails[key]  # no newer write queued behind it
+            # A task cancelled before its first step never reached the await; close the store
+            # coroutine so it does not warn "never awaited". Closing a finished coroutine is a no-op.
+            coro.close()
 
         task.add_done_callback(_done)
 
-    @staticmethod
-    async def _run_state(coro: Any, prev: asyncio.Task[None] | None = None) -> None:
-        if prev is not None:
-            try:
-                # asyncio.wait never raises for the awaited task's own outcome, so a cancelled or
-                # failed predecessor still lets this write run. Only cancelling THIS task stops it.
-                await asyncio.wait((prev,))
-            except BaseException:
-                coro.close()  # cancelled before the write started: no "never awaited" warning
-                raise
+    async def _run_state(self, coro: Coroutine[Any, Any, Any], key: str) -> None:
+        # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
+        # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
+        # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
+        # they queue on the lock in emit order, and a waiter cancelled mid-queue keeps the rest in order.
         try:
-            await coro
+            async with hold_keyed_lock(self._state_locks, key):
+                await coro
         except Exception:
             # The alert-instance write is a side observer: a store error must never wedge a delivery
             # worker or drop the notification. Log metadata only (no event body).

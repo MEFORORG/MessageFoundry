@@ -12,7 +12,9 @@ finalizer touched / never raises into ``_emit``), and three-backend schema/metho
 from __future__ import annotations
 
 import asyncio
+import gc
 import sqlite3
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -586,9 +588,8 @@ class _GatedStore(_RecordingStore):
 
     def __init__(self, *, slow: str) -> None:
         super().__init__()
-        self.slow = (
-            slow  # "upsert" or "resolve": that kind waits on ``gate`` for one named connection
-        )
+        # "upsert" or "resolve": that kind waits on ``gate`` for one named connection.
+        self.slow = slow
         self.slow_connection = "OB_X"
         self.gate = asyncio.Event()
         self.open: set[str] = set()
@@ -639,7 +640,7 @@ async def test_slow_raise_then_fast_clear_ends_resolved() -> None:
     await _drain(sink)
     assert store.log == ["upsert OB_X", "resolve OB_X"]
     assert store.open == set()
-    assert sink._state_tails == {}  # the per-key tail is dropped once the chain finishes
+    assert sink._state_locks == {}  # the per-key lock entry is dropped once nothing holds it
 
 
 async def test_slow_clear_then_fast_raise_ends_open() -> None:
@@ -668,13 +669,17 @@ async def test_writes_for_different_keys_stay_concurrent() -> None:
     assert store.log == ["upsert OB_Y", "upsert OB_X"]
 
 
-async def test_cancelled_predecessor_does_not_block_the_next_write() -> None:
-    # Shutdown cancels pending tasks. A cancelled write must release the one queued behind it, and a
-    # write cancelled before it started must close its coroutine rather than leak it.
+def _new_state_task(sink: NotifierAlertSink, before: set[asyncio.Task[None]]) -> asyncio.Task[None]:
+    (task,) = sink._state_tasks - before
+    return task
+
+
+async def test_cancelled_holder_releases_the_next_write() -> None:
+    # A write cancelled while it holds the key must let the one queued behind it run.
     store = _GatedStore(slow="upsert")
     sink = NotifierAlertSink([], store=store)
     sink.connection_error("OB_X", kind="connection_lost", detail="refused")
-    first = sink._state_tails["connection_error:OB_X"]
+    first = _new_state_task(sink, set())
     sink.connection_restored("OB_X")
     await _spin()
     first.cancel()
@@ -682,23 +687,51 @@ async def test_cancelled_predecessor_does_not_block_the_next_write() -> None:
     assert store.log == ["resolve OB_X"]
     assert store.open == set()
 
-    # Cancelling the waiting successor itself drops only that write.
-    store2 = _GatedStore(slow="upsert")
-    sink2 = NotifierAlertSink([], store=store2)
-    sink2.connection_error("OB_X", kind="connection_lost", detail="refused")
-    sink2.connection_restored("OB_X")
-    second = sink2._state_tails["connection_error:OB_X"]
+
+async def test_cancelled_middle_waiter_keeps_later_writes_in_order() -> None:
+    # A slow upsert holds the key and a resolve waits behind it. Cancelling the waiting resolve
+    # must not let a later write for the key jump ahead of the upsert still running.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    before = set(sink._state_tasks)
+    sink.connection_restored("OB_X")
+    middle = _new_state_task(sink, before)
     await _spin()
-    second.cancel()
+    middle.cancel()
     await _spin()
-    assert second.cancelled()
-    store2.gate.set()
-    await _drain(sink2)
-    assert store2.log == ["upsert OB_X"]
-    assert sink2._state_tails == {}
+    assert middle.cancelled()
+    sink.connection_restored("OB_X")  # a later clear for the same key
+    await _spin()
+    assert store.log == []  # still queued behind the stalled upsert
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["upsert OB_X", "resolve OB_X"]
+    assert store.open == set()
+    assert sink._state_locks == {}
 
 
-# --- three-backend parity (AC-8)---------------------------------------------
+async def test_write_cancelled_before_it_starts_closes_its_coroutine() -> None:
+    # Loop shutdown cancels fresh tasks before their first step. The store coroutine they carry
+    # must be closed, not left to warn "never awaited" at garbage collection.
+    store = _GatedStore(slow="upsert")
+    sink = NotifierAlertSink([], store=store)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+        sink.connection_restored("OB_X")
+        tasks = list(sink._state_tasks)
+        for task in tasks:
+            task.cancel()
+        await _spin()
+        assert all(task.cancelled() for task in tasks)
+        del tasks  # drop the last references so the store coroutines are collected here
+        gc.collect()
+    assert not [w for w in caught if "never awaited" in str(w.message)]
+    assert store.log == []
+
+
+# --- three-backend parity (AC-8) ---------------------------------------------
 
 
 _ALERT_API = frozenset(
