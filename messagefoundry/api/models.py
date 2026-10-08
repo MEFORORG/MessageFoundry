@@ -1414,6 +1414,26 @@ class SecurityLoosening(BaseModel):
 STORE_PRIVILEGE_NOT_PROBED = "not_probed"
 
 
+class TransitBoundAttestationView(BaseModel):
+    """The ``vault_transit`` AES-GCM bound attestation, as ``serve`` reads it at start (BACKLOG
+    #2337). Present only when the store cipher is ``vault_transit``.
+
+    ``attested`` is true only when the recorded row names ``key_name``, the configured Transit data
+    key, and its audit row backs it. A backed row for another key is reported in the ``attested_*``
+    fields with ``attested`` false. A row its audit row does not back leaves them empty, because a
+    writer with DML chose their values. Either way ``gap`` says why. Under
+    ``[security].enforcement = enforce`` a false here means the engine would refuse its next start.
+    Non-secret: names, a reason, who and when."""
+
+    key_name: str
+    attested: bool
+    gap: str | None = None
+    attested_key_name: str | None = None
+    attested_by: str | None = None
+    attested_at: float | None = None
+    reason: str | None = None
+
+
 class StorePrivilegeView(BaseModel):
     """What the startup preflight OBSERVED about the store principal's effective privileges (#1008,
     ASVS 13.2.2).
@@ -1651,6 +1671,9 @@ class SecurityPosture(BaseModel):
     client_network_denials: int = 0
     client_denied_last: str | None = None
     client_address_monoculture: bool = False
+    # BACKLOG #2337: the recorded attestation of the vault_transit AES-GCM bound. None when the store
+    # cipher is not vault_transit, where the engine counts the bound itself.
+    transit_bound_attestation: TransitBoundAttestationView | None = None
 
 
 class ConnectionMetadata(PhiGatedModel):

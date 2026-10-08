@@ -64,6 +64,12 @@ this line.**
   `caller_is_requester` and `gated`. The console also imports `ResolveOutcome` from
   `messagefoundry.api.models`, so on an older engine it fails at import, before the seam check.
 
+### Changed
+
+- **Seam only: the engine's posture model grew.** `SecurityPosture` gains
+  `transit_bound_attestation`, a `TransitBoundAttestationView` (`BACKLOG #2337`). The console
+  renders nothing new, but the field is on the seam it pins, so the supported digest moved.
+
 ### Fixed
 
 - **A throttled `/ui` write now says how long to wait.** The admin-write `429` carried a literal

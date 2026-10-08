@@ -110,6 +110,8 @@ CLI_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         # Store, backup and restore.
         "store": "production",
         "store provision-schema": "production",
+        "store attest-transit-bound": "production",  # serve on vault_transit needs it (#2337)
+        "store withdraw-transit-bound": "production",
         "check-privileges": "production",
         "backup": "production",
         "restore-verify": "production",

@@ -112,6 +112,7 @@ from messagefoundry.store.store import (
     parse_audit_anchor,
     read_audit_anchor_file,
 )
+from messagefoundry.store.transit_attestation import enforce_transit_bound_attestation
 from messagefoundry.transports.base import IntakeGate
 
 __all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
@@ -1427,6 +1428,16 @@ class Engine:
         self.started_at = time.time()
         # Before anything reads the store, so a refusal during recovery alerts too (BACKLOG #1169).
         self._arm_cipher_refusal_alert()
+        # BACKLOG #2337 (owner rulings 2026-10-07): on `vault_transit` the engine counts no AES-GCM
+        # invocations, so a recorded, audited operator attestation must name the configured Transit
+        # data key. It refuses under enforce and warns otherwise. First, before recovery or any
+        # listener, so a refused start has touched nothing; outside any handler, so it propagates
+        # out of start() and aborts the lifespan.
+        await enforce_transit_bound_attestation(
+            self.store,
+            self.store.cipher_info().transit_key_name,
+            enforcement=self._security_enforcement,
+        )
         # All-stages recovery: returns any row a crash left `inflight` — ingress rows mid-route and
         # outbound rows mid-delivery alike — to `pending` so the staged workers re-claim them
         # (staged pipeline, ADR 0001). The handoff/delivery transactions make the re-run idempotent.

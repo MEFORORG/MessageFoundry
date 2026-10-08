@@ -14,8 +14,10 @@ That count was right when taken. The *explanation* attached to it was not, and t
 encode the wrong one. The standard said the trailer was **structurally blocked** — ``cla.yml``
 allowlists three identities, ``cla`` is a required check, so adding the trailer supposedly reds the
 merge gate — and the assertion below pinned that sentence, which made this test a guard REQUIRING the
-document to keep asserting it. Re-measured 2026-08-13: 15 commits carrying the trailer are on
-``origin/main``, dated 2026-07-30 to 2026-08-09, merged through ordinary PRs. Nothing blocked them.
+document to keep asserting it. Re-measured 2026-08-13: 15 commits carrying the trailer were on
+``origin/main``, merged through ordinary PRs. Nothing blocked them. CORRECTED 2026-10-08: that 15 was
+an undercount, and the trailer did not stop on 2026-08-09. §6.7 and A.6 hold the current count and
+dates; this module does not repeat them.
 
 So the assertions here pin the *discipline* rather than any one causal story: the section must state
 the status, must carry a DATED measurement, and must not restate the withdrawn "blocked" claim. A
@@ -205,9 +207,10 @@ def test_section_6_7_states_the_status_and_dates_its_measurement() -> None:
     prose = re.sub(r"`[^`]*`", "", low)
     assert not re.search(r"structurally blocked|cannot be, as things stand", prose), (
         "§6.7 has reinstated the withdrawn claim that the trailer is structurally blocked by the "
-        "required `cla` check. It is not: 15 trailer-bearing commits merged to origin/main between "
-        "2026-07-30 and 2026-08-09. Whatever the CLA action reads to decide who must sign, it is not "
-        "this trailer. Restating a refuted cause in a published standard is the SDS-3.7 defect."
+        "required `cla` check. It is not: trailer-bearing commits merged to origin/main through "
+        "ordinary PRs from 2026-07-30 on (§6.7 and A.6 hold the count). Whatever the CLA action reads "
+        "to decide who must sign, it is not this trailer. Restating a refuted cause in a published "
+        "standard is the SDS-3.7 defect."
     )
 
 
@@ -215,9 +218,9 @@ def test_the_cla_allowlist_still_exists_and_names_the_maintainer() -> None:
     """The allowlist is the CLA gate's shape. It is NOT what keeps the trailer out.
 
     This test used to be named for the claim that the allowlist made the trailer unusable, and it
-    passed throughout the eleven days when trailer-bearing commits were merging — because what it
-    actually checks is that `cla.yml` declares an allowlist naming the maintainer, which was true the
-    whole time and says nothing about trailers. Keeping the old name meant a green test appeared to
+    passed throughout the weeks when trailer-bearing commits were merging (§6.7 has the dates) —
+    because what it actually checks is that `cla.yml` declares an allowlist naming the maintainer,
+    which was true the whole time and says nothing about trailers. Keeping the old name meant a green test appeared to
     corroborate a refuted claim.
 
     The assertions are worth keeping on their own terms: if the allowlist disappears or stops naming
