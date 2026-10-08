@@ -211,10 +211,32 @@ any runtime change (the app only *loads* the files).
 
 ## Logs
 
-The tray logs to `%LOCALAPPDATA%\MessageFoundry\tray.log` (rotating, INFO). It records at least
-startup, the resolved config, state **transitions** (never per-tick), user actions, elevation
-outcomes, and the status-check failures below — and never a message body, a token, or PHI (it has
-none by construction).
+The tray logs to `%LOCALAPPDATA%\MessageFoundry\tray.log` (rotating, INFO). The tray never
+signs in, so it holds no session token, message body or PHI to write. The file holds at least
+these:
+
+- Two lines at startup. The first gives the tray module's own version number, which is not the
+  installed package version. The second gives the engine URL, the service name and `monitor_only`
+  as the tray resolved them. The URL is written much as it was set, so keep credentials out of
+  `engine_url`. Some service names of two or more capitalized words are written as `[redacted]`.
+- From a second tray that finds one already running: the version line, then a line saying so.
+  It then exits.
+- Some menu actions that were refused or failed: `Console not opened` and `Service log not opened`,
+  each with the reason, and `autostart not turned on` when the login command is too long.
+- A traceback when a menu action or a double-click raises.
+- A warning at startup when the pinned engine certificate cannot be loaded. Later, a line when the
+  tray reads a certificate file that differs from the one it holds, saying whether it loads.
+- The status-check failures and their recovery, described below. A check or icon update that raises
+  while the tray is stopping gets one INFO line with no traceback.
+- `tray crashed`, with a traceback, when the tray stops on an unhandled error.
+
+`tray.log` does **not** hold state transitions, menu actions that worked, or the result of a
+service Start, Stop or Restart. That includes whether the UAC prompt was accepted. It also holds
+no line for a status check that completes and finds the engine down, a failed certificate
+verification included. Where the tray reports one of these, it uses the icon, the tooltip or a
+balloon, and it keeps no record: see [What the icon shows](#what-the-icon-shows) and
+[Menu](#menu). Exit has no line of its own. The branded-launcher step writes nothing here either,
+because it runs before the tray opens the file.
 
 Every record also passes the engine's PHI redaction, credential scrub and control-character scrub
 before it is written, tracebacks included. So a traceback that quotes engine reply text or a
