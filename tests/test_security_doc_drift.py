@@ -950,6 +950,19 @@ def test_route_count_parity_with_the_console_mounted() -> None:
         "the /ui plane's route count changed; update docs/SECURITY.md's counting basis and the "
         "'N routes + one /ui/static mount' statement in the same change."
     )
+    # The prose counts are derived, not pinned: when two branches each add a /ui route, git merges
+    # their identical doc bumps cleanly and leaves every sentence one short while the constant
+    # above is fixed by hand. Only a check against the live rows catches that.
+    rows = _ui_route_rows()
+    console, gated = len(rows), sum(1 for row in rows if row[3] is not None)
+    doc = " ".join(_doc_text().split())
+    for sentence in (
+        f"`create_app(serve_ui=True)` yields {_ROUTES_WITH_UI}",
+        f"({_ROUTES_DEFAULT} + the {console} console routes + the `/ui/static` mount)",
+        f"the `/ui` plane adds **{console} routes + one `/ui/static` mount**",
+        f"{gated} of the {console} carry a gate",
+    ):
+        assert sentence in doc, f"docs/SECURITY.md should read: {sentence}"
 
 
 #: Gate names that appear in the doc but are not the wrapper the introspection reports, because the

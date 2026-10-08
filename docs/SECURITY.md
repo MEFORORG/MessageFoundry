@@ -4665,8 +4665,8 @@ are never logged** (only ids/counts land in `detail`).
 
 **Lock rows are read only with `users:manage` (owner ruling 2026-09-28, BACKLOG #1131).** The engine
 still writes every lock row (ADR 0197 AC-10), and an Administrator reads them all. A reader without
-`users:manage`, the built-in Auditor included, does not see these rows in `GET /audit`,
-`GET /audit/export` or the console's `/ui/audit`:
+`users:manage`, the built-in Auditor included, does not see these rows in at least `GET /audit`,
+`GET /audit/export`, the console's `/ui/audit` and its `/ui/audit/export`:
 
 | Hidden row | Why a reader could use it |
 |---|---|

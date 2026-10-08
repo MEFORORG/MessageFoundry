@@ -331,7 +331,7 @@ from typing import Any
 #: Vault BACKLOG #2625: ``AuthService`` gained ``holds_action_step_up``, which the console's
 #: message editor calls to ask for an action-bound proof without spending it, and the console imports
 #: five new step-up action constants, for the resend, edit-resend, upload-resend, purge and reload
-#: lanes (export has no console route). A method the console calls, so a skew would be an
+#: lanes (message export has no console route). A method the console calls, so a skew would be an
 #: AttributeError at request time; it forces a bump. Unnumbered, as above. Re-derived on the tree
 #: merged with vault BACKLOG #3062 (``AuthService.enabled`` removed), which moved the digest on its
 #: own; the value below covers both changes. ``CoreHandlers`` then gained the REQUIRED
@@ -341,7 +341,7 @@ from typing import Any
 #: mount first. Re-derived again on the tree merged with the #2460 / #2458 change above, so the value
 #: below covers #3062, #2460 / #2458 and #2625 together.
 #:
-#: BACKLOG #2438 / #2446 merged with #2625: the audit paging and export surface above and the
+#: BACKLOG #2438 / #2446 merged with vault BACKLOG #2625: the audit paging and export surface above and the
 #: action-bound step-up surface each moved the digest on its own branch. The value below was
 #: re-derived on the merged tree, so it covers both.
 #:
