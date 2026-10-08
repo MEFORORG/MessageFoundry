@@ -9176,7 +9176,12 @@ async def _remind_expiring_initial_credentials(
     ``warned`` maps a user id to the deadline already reminded about. A new credential on the same
     account has a new deadline, so it is reminded about again. An entry is dropped once its account
     leaves every window (claimed, lapsed, disabled or deleted), so the map stays as small as the set
-    of live reminders."""
+    of live reminders.
+
+    The map is only a cache. The once-only mark is the holder's reminder audit row (BACKLOG #2303),
+    so an account missing from the map is checked against the store before anything is sent. A
+    restart inside the window therefore sends nothing again. A failed read sends the reminders, so
+    a store fault costs a duplicate rather than a credential that lapses with nobody told."""
     now = time.time() if now is None else now
     live: set[str] = set()
     for user in await auth.store.list_users():
@@ -9188,24 +9193,42 @@ async def _remind_expiring_initial_credentials(
         live.add(user.id)
         if warned.get(user.id) == deadline:
             continue
+        try:
+            reminded = await auth.initial_credential_reminded(user, deadline=deadline)
+        except Exception as exc:  # noqa: BLE001 - a failed read must not cost the reminder
+            # Read as not reminded: a duplicate reminder is the cheap failure, a missing one before
+            # the credential lapses the costly. The class only, since a driver message can quote
+            # bound values.
+            _log.warning(
+                "initial credential reminder: could not read whether %s was reminded (%s), so it "
+                "is reminded now",
+                scrub_log_argument(user.username),
+                type(exc).__name__,
+            )
+            reminded = False
+        if reminded:
+            warned[user.id] = deadline
+            continue
         expires = deadline_utc(deadline)
         if expires is None:
             continue
-        sink.initial_credential_expiring(
-            f"user:{user.username}",
-            expires_at=expires,
-            hours_remaining=max(0, int((deadline - now) // 3600)),
-        )
         warned[user.id] = deadline
-        # BACKLOG #2007: the holder and the issuing administrator, under the same once-per-credential
-        # mark as the operator reminder above. A failure here is logged per account, so it neither
-        # repeats the operator reminder nor stops the pass for the accounts after this one.
+        # BACKLOG #2007: the holder and the issuing administrator. This writes the once-only mark
+        # (BACKLOG #2303) before any notice, so it runs before the operator reminder below: a crash
+        # between the two then loses that reminder rather than repeating all three. A failure here
+        # is logged per account, so it neither stops the operator reminder nor the pass for the
+        # accounts after this one.
         try:
             await auth.remind_expiring_initial_credential(user, deadline=deadline)
         except Exception:
             _log.exception(
                 "initial credential reminder: the security notices for %s failed", user.username
             )
+        sink.initial_credential_expiring(
+            f"user:{user.username}",
+            expires_at=expires,
+            hours_remaining=max(0, int((deadline - now) // 3600)),
+        )
     for user_id in warned.keys() - live:
         del warned[user_id]
 
@@ -9789,6 +9812,7 @@ def create_managed_app(
                         alerts_settings,
                         secret_provider=secret_provider,
                         trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                        audit=store,
                     )
                 auth = AuthService(
                     store,
