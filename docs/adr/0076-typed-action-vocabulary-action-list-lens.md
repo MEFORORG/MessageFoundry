@@ -1368,28 +1368,22 @@ invariant rather than a property of the moved row):
    the read. An `if` whose every arm binds the name, with an `else`, dominates a later read; an `if`
    with an arm that neither binds the name nor leaves the body does not. A loop target (`for x in
    ...`) does not dominate a read after the loop, because a loop may run zero times. A binding inside
-   a `with` body does not dominate a read after the block (Manager decision 2026-10-07, after review,
-   adopting the R1 code's stricter rule). The R1 code's dominance check differs from this text in
-   both directions: it is stricter for at least a `match` walrus, which it refuses, and laxer for at
-   least an `except ... as e` name, whose later read it accepts though Python unbinds `e` when the
-   handler ends. This text is the target. A For Each header dominates only reads inside its own body,
-   so a row that uses its index, such as `occurrence=i`, may not move out of the loop (Manager
-   decision 2026-10-07, after review). A move of either end, a binding or a reading row, that breaks
-   this is refused, and so is a delete of a binding that leaves a read undominated. Each of those
-   would leave a read unbound, at least whenever a condition is false. A block that holds a Read
-   Field or assigned lookup row is also never moved or deleted; that refusal is conservative, and
-   applies even when every read sits inside the block.
+   a `with` body does not dominate a read after the block (Manager decision 2026-10-07, after
+   review). A For Each header dominates only reads inside its own body, so a row that uses its index,
+   such as `occurrence=i`, may not move out of the loop (Manager decision 2026-10-07, after review).
+   A move of either end, a binding or a reading row, that breaks this is refused, and so is a delete
+   of a binding that leaves a read undominated. Each of those would leave a read unbound, at least
+   whenever a condition is false. A block that holds a Read Field or assigned lookup row is also
+   never moved or deleted; that refusal is conservative, and applies even when every read sits inside
+   the block.
 7. A typed row never moves past at least a `code` row, a dynamic row, a hand-written header or the
    fan-out `return sends`, and never moves into or out of a typed block that holds a `code` row
-   (Manager decision 2026-10-07, after review, adopting the R1 code's stricter rule). This answers
-   the Lander's PR 2155 finding 1. An insert at the same place is still allowed; a move is refused
-   because the lens checks that every protected statement keeps the statements before it, and a move
-   past one changes them.
+   (Manager decision 2026-10-07, after review). This answers
+   the Lander's PR 2155 finding 1. An insert at the same place is still allowed.
 8. A typed `return` or `raise` keeps its whole suite path, top level included: lifted out of its
    guard, a filter or a raise would run on every message. A typed row never moves below a typed
    `return` or `raise` in its suite, where it would never run. A row never moves past the fan-out
-   `return sends`, though it may move past `sends = []` (Manager decision 2026-10-07,
-   after review, adopting the R1 code's stricter rule).
+   `return sends`, though it may move past `sends = []` (Manager decision 2026-10-07, after review).
 
 A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
 block whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager
@@ -1403,22 +1397,6 @@ editable-kind guard in `rewrite_source` (`messagefoundry/lens.py`) calls the ADR
 Steps cut reuses. None of those texts is changed; this amendment is the record. None of it has
 landed.
 
-**Where the rule and the R1 code stand.** Read at R1 head `71fe1207f4`, `_refuse_untyped_structure`
-refuses a move or delete of any row that is not wholly typed, and `_refuse_typed_only_result` then
-checks the result with `_refuse_shifted_code` and an unbound-read check.
-`tests/test_lens_typed_only_repair.py` pins cases of rules 6 to 8: the `else` binding moved below
-its use, an insert reading a `with` binding after the block (an insert, not a move, and run without
-typed-only mode), a drop past code, a drop into a typed block that holds code, and a raise lifted
-out of its guard. Where the R1 code is
-stricter than this text, this text adopts the code's rule, because the code is tested and fails
-closed (Manager decision 2026-10-07, after review, adopting the R1 code's stricter rule). At least
-two of its refusals are conservative, refusing some edits that would be safe:
-
-- an edit that renumbers a block with the same header as another, a delete included, is refused
-  when one of the renumbered blocks holds a typed `return` or `raise`, or a `code` row;
-- a new read after a `with` block of its `as` target is refused, though Python binds the `as`
-  target before the body runs.
-
 ### G.7 The R1 fix: values a typed edit may write
 
 Amendment E's 2026-09-29 note (E.11, rule 3) records that structural inserts (`insert_row` and the
@@ -1431,7 +1409,7 @@ them. The R1 fix would change that, in every mode, at least as follows:
 - `set_params` on a send row would overwrite an existing destination only when that slot is a literal
   or an inert name. A destination computed by code, or held in a handler local, is refused, and so is
   a destination imported from another module, which cannot be retargeted yet (Manager decision
-  2026-10-07, after review, adopting the R1 code's stricter rule).
+  2026-10-07, after review).
 - `assign_to` would refuse `msg`, builtins, reserved names, dunder names, and any name the handler
   or module already binds or reads.
 - `set_params` on a `route` row whose base `handlers` is not a literal list would be refused
@@ -1448,18 +1426,15 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
 - a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
 - `+` and `-` over numbers and numeric names; `*`, `/` and `//` over number literals only, with a
   non-zero divisor; never `%` or `**`. Arithmetic takes only names bound to a number, never a name
-  that may hold text (Manager decision 2026-10-07, after review, adopting the R1 code's stricter
-  rule);
+  that may hold text (Manager decision 2026-10-07, after review);
 - for an `occurrence` or `repetition` keyword, only a value that is 1 or more on every message:
   integer arithmetic over literals whose result is 1 or more (so `2 * 3`, but not `1 - 1`), a 1-based
   loop index (every loop binding it is `range(k, n)` or `range(k, n, step)` with literal `k` and
-  `step` of 1 or more), or that index plus integer-literal arithmetic of 0 or more.
-  `repetition=None` is allowed (Manager decision 2026-10-07, after review, adopting the R1 code's
-  stricter rule). So a name such as `occurrence=OCC`, bound to a module-level number, is refused.
-  This is the rule the ADR requires; R1 does not yet apply it everywhere (see the gap list below);
+  `step` of 1 or more), or that index plus integer-literal arithmetic of 0 or more. `repetition=None`
+  is allowed (Manager decision 2026-10-07, after review). So a name such as `occurrence=OCC`, bound
+  to a module-level number, is refused;
 - for the value of Set Field and Add Repetition, only a value that is text: a string literal, a name
-  or read that may hold text, or a template. A number, `None` or a list is refused. R1 does not yet
-  apply this to every name (see the gap list below);
+  or read that may hold text, or a template. A number, `None`, a tuple or a list is refused;
 - a plain name other than `msg`, not a dunder, that cannot hold message content:
   - a For Each `range` loop index;
   - a module-level name bound exactly once, to a literal of an immutable type: a `str`, number,
@@ -1481,9 +1456,7 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
     as the bullet above defines *mutates*. Any other way of obtaining a `CodeSet`, such as an import
     from a helper module, `X.code_set(...)`, `code_set(NAME)` with a non-literal argument, an alias,
     or a rebound name, is not admitted, so it is refused. The rule fails closed rather than missing
-    those. The lens's `_codeset_binding` accepts any `X.code_set(...)` callee through `_callee_name`,
-    skips bindings that are not a `code_set` capture, returns at the first one that is, and never
-    looks for a later binding, so an R1 fix cannot reuse it unchanged. Value params refuse a
+    those. Value params refuse a
     `code_set` name because a code set is a table, not a value (the same Manager decision). No engine
     change is made for this.
     **What the `table` use leaves.** `code_set` returns the shared active `CodeSet`, whose storage is
@@ -1500,9 +1473,8 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
     one message's data into the next;
   - **these bullets are a ceiling, on every path, value params included: the predicate SHALL NOT
     admit a name beyond a handler local, a For Each `range` index, a module-level name the
-    immutable-literal bullet admits, or a `code_set` name as `code_lookup`'s `table`, whatever the
-    R1 tests say**
-    (Manager decision 2026-10-07, after review, adopting R1 head `c172beda9c`'s rule; this reverses
+    immutable-literal bullet admits, or a `code_set` name as `code_lookup`'s `table`**
+    (Manager decision 2026-10-07, after review; this reverses
     the round-6 decision that scoped the ceiling to non-value params);
 - a list, tuple, set or dict built only from inert values, with no splat;
 - in value params only, a bounded field read (`msg.field(...)` taking only `occurrence` and
@@ -1510,60 +1482,26 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
 - for lookup `params`, a dict with literal keys and literal or read values, and in a FHIR lookup,
   `FhirToken(literal, read)` or `FhirRaw(<string literal>)`.
 
-**The source of record is the R1 fix's tests** (`tests/test_lens_no_code_injection.py` on the R1
-branch, not yet merged), except for the name ceiling. Elsewhere, where this list and
-those tests differ, the tests win. `set_params` on action, lookup and diagnostic rows already
-refuses a `dynamic` value (AC-M5).
-
-**Where the R1 branch stands on the ceiling.** Read at R1 head `71fe1207f4`, `_message_scope` builds
-an allow list: handler locals, For Each `range` indexes, and module-level names
-`_inert_module_literals` admits, with `code_set` captures held apart and admitted only for
-`code_lookup`'s `table` (`_table_scope`). The `reads_ok` path admits only those names and handler
-locals, so `SEEN` and a `code_set` name are refused there too; `tests/test_lens_typed_only_repair.py`
-pins `SEEN` in `set_field.value` as refused. The four differences recorded against `c172beda9c`
-are closed at `71fe1207f4`: a name must have exactly one module-level binding; a `global`-declared
-name is not a handler local (`test_g7_a_global_declared_name_is_not_a_handler_local`); a `code_set`
-capture counts only when `code_set` is imported unaliased from `messagefoundry`
-(`_imported_from_messagefoundry`); and `_literal_kind` refuses `frozenset()`, a nested tuple and a
-tuple holding a `frozenset`.
+**Where the code stands.** The lens implementation of G.6 and G.7 is PR 2155
+(`messagefoundry/lens.py`). Its tests, `tests/test_lens_no_code_injection.py` and
+`tests/test_lens_typed_only_repair.py`, are the source of record for what the code enforces. Where
+the code and these rules differ, PR 2155's comments record each difference and its status.
+`set_params` on action, lookup and diagnostic rows already refuses a `dynamic` value (AC-M5).
 
 **Limits of a static check.** The predicate reads the source and runs nothing, so code that
 reaches module state by a route the source does not spell out can still defeat it. These remain, at
 least: `getattr(h, "__globals__")`, `from sys import modules as mm`, and
-`importlib.import_module(__name__)`. Each needs a hand-written `code` row.
+`importlib.import_module(__name__)`. Each needs a hand-written `code` row. A deliberate bypass by a
+`code:edit` developer is out of scope (Manager ruling 2026-10-07 on PR 2155, made under the owner's
+delegation).
 
-**Gaps and limits in the R1 code at `71fe1207f4`.** Items 1 to 7 are places where this amendment
-is stricter than the code; item 8 is a limit. The list is at least these, not a complete one:
-
-1. A `msg.field(...)` read inside a Set Field value accepts `occurrence=0`, `occurrence=OCC` and
-   `repetition=0`. With `0`, or with `OCC` bound below 1, the insert writes a `msg.set` that raises
-   ValueError on every message; with any `OCC`, it admits a module-level name the rule refuses. Being
-   closed in PR 2155's current repair round, as of 2026-10-07.
-2. `_read_sites` scoping: a lambda default such as `col=col`, a comprehension's first iterable, an
-   attribute or subscript target in a comprehension, and a lambda nested in a default are not
-   scoped correctly. Being closed in PR 2155's current repair round, as of 2026-10-07.
-3. Alias forms of `builtins` do not void inert names, as `builtins.globals` does. Being closed in PR
-   2155's current repair round, as of 2026-10-07.
-4. `range(1, *rest)` is read as a 1-based loop. Being closed in PR 2155's current repair round, as of
-   2026-10-07.
-5. `_refuse_non_text_value` refuses non-string literals and numeric names but admits any other
-   name, so a module-level `NONE = None`, `FLAG = True` or `TUP = ("a", "b")` passes as a Set
-   Field or Add Repetition value and writes a `msg.set` that fails on every message.
-6. A typed row may move below a typed `return Send(...)`, a typed `raise` or a filter `return []`,
-   where it never runs (rule 8).
-7. Only `set_params` honours a message parameter that is not named `msg`. The other edits assume
-   `msg`, so an `insert_row` into `def h(message)` writes `msg.set(...)`, which raises NameError on
-   every message unless a global `msg` exists. This needs no hand-written row.
-8. An imported send destination cannot be retargeted yet.
-
-**A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
+**A gap in the projection today.** At `origin/main` (`ddf350e1d0`),
 `_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
 accepts any `X.attr` callee by its last name. So `set_field(__import__("os").getcwd() or msg,
 "PID-5.1", "X")` and `anything.Send("OB", msg)` read back as ordinary typed rows whose `params` look
 unchanged. The Steps view then shows code that runs as a typed step. ADR 0208's repository check
 would close this for itself, once built, by comparing each typed row's full statement (spec FR-40
-item 5a). Whether the lens should refuse to project such a row as typed is open work for the R1
-fix.
+item 5a). Whether the lens should refuse to project such a row as typed is recorded on PR 2155.
 
 That sentence of E.11 is not rewritten; the dated pointer appended to it sends the reader here. The
 change is being built separately and has not landed.
@@ -1593,9 +1531,9 @@ change is being built separately and has not landed.
   separately.
 - [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL NOT refuse a
   `paste_block` or a raw `test` for being one; each still passes the checks the lens applies in every
-  mode. Among those, the R1 branch's `_validated_raw_test` refuses a raw `test` that is not one
-  condition on one line, or that holds a `yield`, or an `await` outside an `async def` element. THE
-  SYSTEM SHALL accept every typed `template` edit in either mode, subject to G.7.
+  mode. Among those, a raw `test` SHALL be one condition on one line, with no `yield` and no `await`
+  outside an `async def` element. THE SYSTEM SHALL accept every typed `template` edit in either mode,
+  subject to G.7.
 - [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite`
   call.
 - [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`

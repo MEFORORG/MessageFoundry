@@ -178,7 +178,7 @@ site's ordinary review is what would catch these (D-C):
   a Read Field row for this reason (the `read_field` gate in `rewrite_source`,
   `messagefoundry/lens.py`). That gate keys on `read_field` alone, because it was written for Read
   Field rows (ADR 0089 row 4, BACKLOG #1505), so it does not yet cover a lookup's `assign_to`.
-  Where the R1 branch stands on rule 6 is recorded once, in Amendment G, G.6.
+  What the lens implementation enforces is recorded by PR 2155's tests (Amendment G, G.7).
 
 **What already gates what runs, under both:** a change reaches a running engine only when someone with
 `config:deploy` reloads it, under the existing step-up and the site's `[approvals]` dual control. That
@@ -564,8 +564,7 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
 
   FR-41 does not list a row using `occurrence=i` moved out of its For Each loop. The repository
   check has no FR-40 item that tests for an unbound read (section 5.2), so it would pass that move.
-  The lens refuses it (Amendment G, G.6 rule 6; at R1 head `71fe1207f4` it does so in every
-  mode, not only typed-only).
+  G.6 rule 6 refuses it in the lens (Amendment G).
 
   It SHALL pass an ordinary Steps edit, an insert above a `code` row, and one of each sanctioned shape
   in items 2 and 3 (spike S-4).
@@ -982,7 +981,7 @@ was checked against `messagefoundry/lens.py` at `origin/main` and on the R1 bran
 | F12. ADR 0103 Delete and Move, ADR 0089 block-cut | Amendment G, G.6 |
 | F13. Stale-base test never resets | FR-39 |
 | F14. Block rule restated; stale index rows | Amendment G, G.6 states it once; G.1, AC-G5, FR-20, section 8.2, ADR AC-12 point there; `docs/adr/README.md` rows |
-| F15. Deleted-lookup residual | Amendment G, G.6 rule 6; G.6 also records where the R1 branch stands |
+| F15. Deleted-lookup residual | Amendment G, G.6 rule 6 |
 | Spike S-4 findings | FR-40 items 2 to 6, the false-failure and public-surface notes, FR-41, section 17 |
 | Spike S-1 findings | FR-26, sections 8.1, 8.2, 9, 10, 11.2, 12, 16 and 17; ADR D3, D9 and AC-10 |
 | Spike S-2 findings | FR-17, section 10, section 17; Amendment G AC-G1 |
