@@ -12,7 +12,9 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -260,3 +262,28 @@ def test_setup_holds_httpx_request_lines_back(tray_log: tuple[Path, logging.Hand
     handler.flush()
     assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
     assert "HTTP Request" not in path.read_text(encoding="utf-8")
+
+
+def test_tray_log_lines_carry_a_utc_stamp(tray_log: tuple[Path, logging.Handler]) -> None:
+    # BACKLOG #2349. The record is given a fixed instant, so the assertion is on the VALUE: local
+    # digits with a Z appended would match the shape and still be wrong by the host's offset.
+    path, handler = tray_log
+    record = logging.LogRecord(
+        "messagefoundry.tray", logging.INFO, __file__, 1, "synthetic line", (), None
+    )
+    record.created = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC).timestamp()
+    handler.handle(record)
+    handler.flush()
+
+    assert path.read_text(encoding="utf-8").splitlines() == [
+        "2026-01-02T03:04:05Z INFO messagefoundry.tray: synthetic line"
+    ]
+    assert handler.formatter is not None
+    assert handler.formatter.converter is time.gmtime
+
+
+def test_the_tray_stamp_format_is_the_engines() -> None:
+    # The tray cannot import logging_setup, so it spells the format itself. This is the drift alarm.
+    from messagefoundry import logging_setup
+
+    assert tray_main._DATE_FORMAT == logging_setup._DATE_FORMAT
