@@ -1721,7 +1721,7 @@ still default to `0`, but `serve` applies a posture gate on top of them:
 - The explicit, **audited** opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
   suppresses the auto-bound **and** downgrades the refusal to a loud audited warning.
 - A connection's own override of `0` (`messages_days` on an inbound, `dead_letter_days` on an
-  outbound) meets its own gate when the engine loads the graph. That gate is described under
+  outbound) meets its own gate when `serve` loads the graph. That gate is described under
   *Per-connection overrides* in [CONFIGURATION.md](CONFIGURATION.md#retention).
 - The canonical operator-facing home of the message-body window is now
   **`[security].delete_message_bodies_after_days`**; its *model* default is 30, but the desugar

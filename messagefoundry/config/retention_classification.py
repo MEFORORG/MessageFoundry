@@ -316,14 +316,17 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
     Shared by the registry guard and ``connection upsert``, so an edit is refused in the words a
     reload would use. ``env_name`` is ``None`` where no environment is active."""
     where = f" ({env_name!r})" if env_name is not None else ""
+    # Only the auto-bounded windows lose a default. Naming them keeps an operator from setting a
+    # window on a tier where a window is the wrong answer, such as transform state.
+    auto_bounded = ", ".join(w.setting for w in auto_bounded_windows())
     return (
         "a per-connection retention override keeps PHI message bodies indefinitely on a PHI "
         f"instance{where}: {'; '.join(kept)} (unbounded PHI at rest, ASVS 14.2.4/14.2.7). Set "
         "each override to a positive number of days, or remove it to inherit the global "
         f"window; or, to deliberately retain forever, set {BODY_ACKNOWLEDGEMENT_SETTING}=true "
         "(audited). That switch covers the whole instance: it also turns off the default bound "
-        "on every unset global window, so set each global window to an explicit number of days "
-        "first"
+        f"on each of these windows that is unset: {auto_bounded}. Set each of them to an "
+        "explicit number of days first"
     )
 
 
@@ -332,10 +335,14 @@ def make_retention_override_guard(
 ) -> Callable[[Registry], None]:
     """The engine registry guard for a connection's own keep-forever retention override.
 
-    The graph half of the body-window gate in ``serve``, with the same posture. Without the
+    The graph half of the body-window gate in ``serve``, with the same refuse-or-warn split. It
+    differs in one way: the body-window gate writes its AUDIT line only under ``enforce``, and this
+    guard writes one on either dial. Without the
     acknowledgement (``acknowledged``, the loaded ``[security].allow_keeping_phi_indefinitely``) an
     enforcing instance refuses the graph by raising ``WiringError``: a first load fails the start,
-    and a ``/config/reload`` is refused with the running graph kept. Under ``enforcement = warn`` it
+    and a ``/config/reload`` is refused with the running graph kept. It runs only where the engine
+    calls its registry guard. At least these do not: ``Engine.add_registry`` called by an embedder,
+    the DR re-apply path, and ``messagefoundry check``. Under ``enforcement = warn`` it
     warns. With the acknowledgement the guard passes the graph and a WARNING-level ``AUDIT:`` line
     names each connection, on either dial.
 
@@ -343,7 +350,7 @@ def make_retention_override_guard(
     reload, and a reload a later check then refuses, so the line says the gate passed the graph and
     never that the graph went live.
 
-    The AUDIT line and the warning go to the logger AND to stderr, as the body-window gate's do. A
+    The AUDIT line and the warning go to the logger AND to stderr. A
     ``[logging].level`` above WARNING would otherwise drop the only record of an acknowledged
     override. Under NSSM both streams are captured, so a line can appear in both.
 

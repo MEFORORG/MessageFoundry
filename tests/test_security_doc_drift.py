@@ -2990,8 +2990,8 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
 #: calls. The behavioural pins in `tests/test_cli.py`, which run `serve`, cover part of that. The test
 #: below checks only that each pin still EXISTS, not what it asserts, and none of them exercises
 #: `reference_snapshot_days`. The row's third claim, that a per-outbound override of 0 meets its
-#: own gate (vault BACKLOG #2368), is bound to the code by `tests/test_retention_override_gate.py`,
-#: not here.
+#: own gate (vault BACKLOG #2368), is prose only: nothing binds that doc sentence to the code.
+#: `tests/test_retention_override_gate.py` tests the guard's behaviour and never reads the doc.
 
 _CONFIG_DOC = _ROOT / "docs" / "CONFIGURATION.md"
 _RETENTION_HEADING = "### `[retention]`"

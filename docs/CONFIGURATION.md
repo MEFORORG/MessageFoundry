@@ -939,7 +939,7 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 >
 > **An override of `0` needs the same acknowledgement as a global `0`** (BACKLOG #2368). It keeps that
 > connection's PHI bodies forever, whatever the global window says. The overrides live in the graph, so
-> the engine checks them when it loads the graph, at startup and on every config reload:
+> `serve` checks them when it loads the graph, at least at startup and on a config reload:
 >
 > - Without `[security].allow_keeping_phi_indefinitely = true`, under `enforce`, the engine refuses the
 >   graph and names each connection. At startup the engine does not start. On a reload the running
@@ -948,9 +948,10 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection,
 >   each time it passes one. A dry-run reload counts.
 >
-> **That switch is not scoped to one connection.** It also turns off the 30-day default for every
-> unset global window, and it acknowledges every connection's `0`, including one added by a later
-> reload. Before you set it for one feed, set each global window to an explicit number of days.
+> **That switch is not scoped to one connection.** It also turns off the 30-day default for each
+> unset window that carries one (the three named in the posture paragraph above), and it acknowledges
+> every connection's `0`, including one added by a later reload. Before you set it for one feed, set
+> each of those three windows to an explicit number of days.
 >
 > The acknowledgement is read once, at startup. `messagefoundry connection upsert` and `remove` refuse
 > an edit an enforcing engine would refuse. `messagefoundry check` does not run this gate.

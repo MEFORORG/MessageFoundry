@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -222,6 +223,31 @@ def test_serve_reads_the_acknowledgement_into_the_guard(
     guard(_graph(tmp_path / "cfg", inbound_days=0, outbound_days=0))
 
 
+@_SERVE_PROVISIONS
+def test_serve_keeps_the_static_credential_guard_in_the_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The chain test above uses made-up guards. This one pins the real wiring: the guard serve
+    # hands the managed app still calls the guard the static-credential factory returned.
+    judged: list[Registry] = []
+    monkeypatch.setattr(
+        "messagefoundry.config.static_credentials.make_static_credential_guard",
+        lambda settings, *, enforcing, log: judged.append,
+    )
+    guard = _served_guard(tmp_path, monkeypatch, "")
+    registry = _graph(tmp_path / "cfg", inbound_days=None, outbound_days=30)
+    guard(registry)
+    assert judged == [registry]
+
+
+def _clear_posture_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop any ``MEFOR_SECURITY_*`` / ``MEFOR_RETENTION_*`` override the host or an earlier
+    fixture set, so the edit is judged against the settings file the test wrote and nothing else."""
+    for name in list(os.environ):
+        if name.startswith(("MEFOR_SECURITY_", "MEFOR_RETENTION_")):
+            monkeypatch.delenv(name)
+
+
 _EDIT_LOGIC = (
     "from messagefoundry import handler, router\n"
     "@router('r')\n"
@@ -242,8 +268,13 @@ _EDIT_LOGIC = (
     ],
 )
 def test_connection_upsert_refuses_what_an_enforcing_reload_would(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], service_toml: str, accepted: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    service_toml: str,
+    accepted: bool,
 ) -> None:
+    _clear_posture_env(monkeypatch)
     (tmp_path / "logic.py").write_text(_EDIT_LOGIC, encoding="utf-8")
     svc = tmp_path / "svc.toml"
     svc.write_text(service_toml, encoding="utf-8")
@@ -275,6 +306,7 @@ def test_connection_upsert_says_which_settings_it_read_when_none_were_named(
     # The IDE's usual call names no --service-config, so the edit is judged against the defaults
     # (enforce, no acknowledgement). The refusal must say so, or it names a switch the instance
     # may already have set.
+    _clear_posture_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "logic.py").write_text(_EDIT_LOGIC, encoding="utf-8")
     edit = {
@@ -289,4 +321,5 @@ def test_connection_upsert_says_which_settings_it_read_when_none_were_named(
         ["connection", "upsert", "--config", str(tmp_path), "--data", json.dumps(edit), "--json"]
     )
     out = capsys.readouterr().out
-    assert rc == 1 and "No --service-config was given" in out and "[security]" in out
+    assert rc == 1 and "No --service-config was given" in out
+    assert "this edit is then checked against that instance's [security] settings" in out
