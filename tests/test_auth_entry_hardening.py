@@ -281,6 +281,16 @@ def test_limiter_retry_after_is_the_wait_of_the_gate_that_fired(
     clock[0] = 3010.0
     assert not negative.allow("a")
     assert negative.retry_after("a") == 27.5
+    # At the window's edge the wait and the gate must round the same way. A hit time whose sum
+    # with the window is not exact used to read 0.0, "admitted now", while the gate still refused.
+    edge = SlidingWindowRateLimiter(per_key=1, glob=0, window_seconds=60.0)
+    for hit in (1011.8644575581972, 4000.1, 5000.7, 6000.3):
+        clock[0] = hit
+        assert edge.allow("k")
+        clock[0] = hit + 60.0
+        assert (edge.retry_after("k") == 0.0) is edge.would_allow("k"), hit
+        clock[0] = hit + 61.0
+        assert edge.retry_after("k") == 0.0  # and the bucket is clear for the next hit time
 
 
 def test_limiter_retry_after_hides_other_keys_when_the_global_budget_is_full(

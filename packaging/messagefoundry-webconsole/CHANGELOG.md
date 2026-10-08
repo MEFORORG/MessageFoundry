@@ -20,13 +20,6 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
-### Fixed
-
-- **A throttled `/ui` write now says how long to wait.** The admin-write `429` carried a literal
-  `Retry-After: 10`, whatever the engine's window was. It now carries the time until that account's
-  next write would be admitted, in whole seconds, the same value the JSON API sends. Seam change:
-  the console calls the new `AuthService.admin_write_retry_after`. (vault BACKLOG #2144)
-
 ### Added
 
 - **The audit, security-event and event-log pages page past their first window.** `/ui/audit`,
@@ -61,6 +54,10 @@ this line.**
 
 ### Fixed
 
+- **A throttled `/ui` write now says how long to wait.** The admin-write `429` carried a literal
+  `Retry-After: 10`, whatever the engine's window was. It now carries the time until that account's
+  next write would be admitted, in whole seconds, the same value the JSON API sends. Seam change:
+  the console calls the new `AuthService.admin_write_retry_after`. (vault BACKLOG #2144)
 - **A temporary password's deadline is stated in the past tense once it has passed.** The factor
   page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
   working" at an instant already gone. They now say it stopped working then, and to ask an
