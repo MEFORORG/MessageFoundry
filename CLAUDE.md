@@ -496,76 +496,19 @@ gates a merge**, and no seat has to clear one.
 - **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and
   waits for the owner's explicit "go". Point the brief at the relevant existing code; it measurably
   improves the result.
-- One brief per Builder. After about two failed attempts at the same problem, dispatch a fresh Builder
-  with a better brief rather than reuse a poisoned context. A Builder cannot do this. When you are
-  stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.
-- **Your workers die when you do, and that is the one way work is lost here.** A subagent that has
-  not pushed has produced nothing -- not a branch, not a stash, not a file anyone can find later. So
-  every brief ends with push, then report; never "finish and I will push for you", never "hold this
-  until I say". Check before you close the instance. **You open the PR afterwards**, verifying the
-  branch with `git ls-remote --heads origin` rather than trusting the worker's report. You also
-  decide when to open it and which branches it carries; see the batching bullet under *Branch,
-  commit one layer, open the PR*.
-- **Say who else is running, in three fields that are always present, including when the answer is
-  nobody:** who is working, what paths they touch, and **whether they share this worktree.** The
-  third field is the whole of the collision -- two workers given one worktree each reported the
-  other's output as an unexplained intruder, because neither was told the other existed.
-- **Hand down readings, not conclusions.** A worker told what you concluded applies your conclusion,
-  and its own correct evidence loses. That has happened. Mark a conclusion as yours and say what the
-  worker should do if it does not hold.
-- **Announce the files a wave's PRs will CHANGE, never the items' subjects.** A dispatch announce
-  naming three engine modules was read downstream as a collision forecast; the PRs touched
-  `docs/BACKLOG.md` and one test file, and those modules were only what the items were *about*.
-- **If you take back part of a brief you already dispatched, mail the receiver, because you cannot
-  update the chip.** `dismiss_task` withdraws only a chip the user has **not** acted on, so a
-  started one stays live and frozen around your stale text, and no channel carries the correction.
-  Say which item is already done and where it landed. **This binds whichever seat dispatched:** any
-  seat can raise a chip, and in the 2026-09-04 case above the spawner was
-  the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
-  still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
-- **Give each session its own git worktree, and START the session in it.** `scripts/worktree/new.ps1
-  -Name <x>` creates one (cleanup with `remove.ps1`); `spawn.ps1 -Name <x>` creates it *and* opens an
-  editor window on it, which is the entry point to reach for. Each gets an isolated checkout, branch
-  and `.venv` on the same remote and the same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
-  The AI project memory is shared across sessions, so coordinate memory writes.
-- **Never brief a worker to RELOCATE into a worktree -- from a subagent it cannot work.** A
-  subagent's `EnterWorktree` call into a `new.ps1` sibling is **refused outright** (the path is outside
-  `.claude/worktrees/`), so the brief burns the worker's one turn on a call that cannot succeed. From a
-  session the same call instead raises an owner prompt that no `permissions.allow` rule can suppress.
-  Start the session in its worktree (`spawn.ps1`), or dispatch a file-editing subagent with
-  `isolation: worktree` and have it run `pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1`
-  **before its first `pytest`/`mypy`/`ruff` run** -- a managed worktree arrives with no `.venv`, and
-  without one `pytest` dies at import rather than running slowly. The measurements, the cost of that
-  bootstrap, and why not to engineer around the check are stated once in
-  [`docs/WORKTREES.md`](docs/WORKTREES.md) section "Start the session in the worktree".
-- **Put the prompt FIRST when you spawn, or close the flags with `--`.** At least `--allowedTools`,
-  `--disallowedTools`, `--tools`, `--add-dir`, `--mcp-config`, `--betas` and `--file` take lists, so
-  `claude --bg --allowedTools Bash Edit "do the work"` swallows the prompt as a third tool name. The
-  session starts with nothing to do, exits 0, then lists as `state=blocked`, which is also what a
-  real permission block looks like. The lane reads as alive and does nothing.
-- **In the `--allowedTools` FLAG, grant tools by BARE NAME, never scoped to a command.**
-  `--allowedTools Bash PowerShell` works.
-  `--allowedTools "PowerShell(pwsh:*)"` silently disables the PowerShell tool: every command it
-  sends comes back `Command contains malformed syntax that cannot be parsed: pwsh exited with code
-  1: The command line is too long.` Consistent with the tool spawning `pwsh` to test a command
-  against a scoped pattern, and that spawn failing when the inherited environment is near the
-  8191-byte command-line limit. Nobody has read the tool's source, so the mechanism is inferred;
-  the paired test establishes only that the GRANT FORM is causal. An environment block is
-  per-PROCESS, not per-machine: one session measured 8105 bytes, and the size varies with config
-  root, worktree path and inherited `PATH`. A bare grant needs no parse.
-  **The careful spelling is the broken one**, which is why this cost four Builder launches before
-  anyone looked. Measured 2026-09-02, one variable, environment held constant. Bash is unaffected.
-  **The two rule sources are known asymmetrically, so do not generalise:** command-scoping is
-  measured to break BOTH the flag and a `settings.json` rule (a matching `Bash(git add:*)` executed
-  while its `PowerShell` twin died at the parse). A BARE name is measured to work **in the flag
-  only** -- nobody has put a bare tool name in a `settings.json` `permissions.allow` and spawned
-  without a flag. Do not "fix" a config root by bare-naming its rules on the strength of this line.
-  Three refusals that must not be conflated: `malformed syntax ... too long` is the parse dying and
-  says nothing about your rules; `This command requires approval` is a real permission decision;
-  `The term 'X' is not recognized` means the command RAN and the PATH is wrong.
-- Rules a Builder needs belong in the **account's** `settings.json`, outside git.
-  `.claude/settings.json` is tracked, and every worktree carries its own copy from its own branch, so
-  an uncommitted edit to the primary checkout reaches nothing else.
+- The rest of the Manager's dispatch rules bind only that seat, and korus `roles/MANAGER.md` carries
+  them, read at `origin/main`: every brief ends with push, then report; a brief names who else is
+  running, what paths they touch, and whether they share the worktree; hand down readings, not
+  conclusions; announce the files a wave changes, never the items' subjects.
+- Four more live in this repository. Dispatch a fresh Builder after about two failed attempts. Mail
+  the receiver when you take back a dispatched brief, because you cannot update a chip (BACKLOG
+  #1448). Put the prompt first when you spawn. Grant `--allowedTools` by bare name, never scoped to
+  a command. The text is in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 2*,
+  and [`docs/WORKTREES.md`](docs/WORKTREES.md).
+- Give each session its own git worktree and start the session in it (`spawn.ps1`). Never brief a
+  subagent to relocate into one; give it `isolation: worktree` and have it run `ensure-venv.ps1`
+  before its first `pytest`. [`docs/WORKTREES.md`](docs/WORKTREES.md), "Start the session in the
+  worktree", says why. The AI project memory is shared across sessions, so coordinate memory writes.
 - Read a role playbook from the **`MEFORORG/korus`** repository, and read it at `origin/main`
   rather than out of a working tree. Owner ruling 2026-09-04.
 

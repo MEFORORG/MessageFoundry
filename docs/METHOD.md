@@ -751,3 +751,35 @@ resolve or to hand over.**
 touches code in this repository or the vault, does the Lander resolve it under korus 4c-quinquies,
 or does this file's Must-not clause stand and the pull request route elsewhere -- and which applies
 until you answer?* Whoever asks it should paste the two verbatim sentences above and nothing else.
+
+## CLAUDE.md text moved in wave 2, kept verbatim
+
+These blocks moved out of the root `CLAUDE.md` on 2026-10-07, in a second pass after the section
+above, word for word. The reason is the same: `CLAUDE.md` loads into every session, and each block
+binds only one seat or one kind of work. `CLAUDE.md` keeps the lines that change what a reader does
+and points here.
+
+Read each block as `CLAUDE.md` at `d62308d8be`. There, *above*, *below*, *this file*, *this
+section* and a bare section number mean `CLAUDE.md` and its sections, not this page. Where a block
+and `CLAUDE.md` now disagree, `CLAUDE.md` wins.
+
+### The Manager's dispatch rules, from section 5
+
+From *The Manager plans, dispatches, and holds the owner's attention*. The `--allowedTools`
+bullet went to [`WORKTREES.md`](WORKTREES.md), beside the prompt-first section. The bullets
+korus `roles/MANAGER.md` already carries were not copied: push then report, the three
+who-else-is-running fields, readings not conclusions, and announcing files rather than subjects.
+
+- One brief per Builder. After about two failed attempts at the same problem, dispatch a fresh Builder
+  with a better brief rather than reuse a poisoned context. A Builder cannot do this. When you are
+  stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.
+- **If you take back part of a brief you already dispatched, mail the receiver, because you cannot
+  update the chip.** `dismiss_task` withdraws only a chip the user has **not** acted on, so a
+  started one stays live and frozen around your stale text, and no channel carries the correction.
+  Say which item is already done and where it landed. **This binds whichever seat dispatched:** any
+  seat can raise a chip, and in the 2026-09-04 case above the spawner was
+  the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
+  still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
+- Rules a Builder needs belong in the **account's** `settings.json`, outside git.
+  `.claude/settings.json` is tracked, and every worktree carries its own copy from its own branch, so
+  an uncommitted edit to the primary checkout reaches nothing else.
