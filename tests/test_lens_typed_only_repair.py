@@ -776,7 +776,7 @@ def h(msg):
     else:
         x = "none"
     with open("f") as fh:
-        y = fh.read()
+        y = "z"
     return Send("OB", msg)
 """
 
@@ -1313,3 +1313,92 @@ def test_r10_a_literal_route_name_voids_inert_names(write: str) -> None:
     )
     line = len(src.splitlines())
     _refused(src, _edit("set_params", line, params={"to": {"expr": "OB_DEST"}}), match=REFUSED)
+
+
+# --- Lander review of PR 2154: a field value must be text ---------------------------------------
+
+_TEXT = """\
+TAGS = ("a", "b")
+FROZ = frozenset({"a"})
+NONE = None
+LIMIT = 3
+TXT = "t"
+
+
+@handler("H")
+def h(msg):
+    pid5 = msg.field("PID-5")
+    row = db_lookup("C", "s", {"a": 1})
+    msg.set("A", "1")
+    msg.add_repetition("B", "x")
+    code_lookup(msg, "PID-8", GENDER, default="U")
+    return Send("OB", msg)
+"""
+_TEXT_ANCHOR = 12
+
+
+@pytest.mark.parametrize("action", ["set_field", "add_repetition"])
+@pytest.mark.parametrize(
+    ("expr", "ok"),
+    [
+        ("TAGS", False),
+        ("FROZ", False),
+        ("NONE", False),
+        ("LIMIT", False),
+        ("row", False),  # a lookup result is not known to be text
+        ("TXT", True),
+        ("pid5", True),
+        ('"x"', True),
+        ('f"{msg["PID-3"]}-x"', True),
+        ('msg["PID-3"] or ""', True),
+    ],
+)
+def test_r11_an_inserted_field_value_must_be_text(action: str, expr: str, ok: bool) -> None:
+    edit = _edit(
+        "insert_row",
+        _TEXT_ANCHOR,
+        position="before",
+        action=action,
+        params={"path": "PID-3", "value": {"expr": expr}},
+    )
+    if ok:
+        assert expr in rewrite_source(_TEXT, edit)
+    else:
+        with pytest.raises(LensRewriteError, match="not text"):
+            rewrite_source(_TEXT, edit)
+
+
+@pytest.mark.parametrize(("line", "pname"), [(12, "value"), (13, "value"), (14, "default")])
+@pytest.mark.parametrize("value", [5, None, True, {"expr": "1"}, {"expr": "TAGS"}])
+def test_r11_set_params_writes_only_text_into_a_field_value(
+    line: int, pname: str, value: Any
+) -> None:
+    edit = _edit("set_params", line, params={pname: value})
+    with pytest.raises(LensRewriteError):
+        rewrite_source(_TEXT, edit, contract=2)
+
+
+@pytest.mark.parametrize(("line", "pname"), [(12, "value"), (13, "value"), (14, "default")])
+def test_r11_control_set_params_still_writes_a_string(line: int, pname: str) -> None:
+    out = rewrite_source(_TEXT, _edit("set_params", line, params={pname: "ok"}), contract=2)
+    assert '"ok"' in out.splitlines()[line - 1]
+
+
+@pytest.mark.parametrize(
+    ("default", "ok"),
+    [({"expr": '("a", "b")'}, False), ({"expr": "TAGS"}, False), (1, False), ("U", True)],
+)
+def test_r11_a_code_lookup_default_must_be_text(default: Any, ok: bool) -> None:
+    edit = _edit(
+        "insert_code_lookup",
+        _TEXT_ANCHOR,
+        position="before",
+        code_set="gender",
+        path="PID-9",
+        default=default,
+    )
+    if ok:
+        assert 'default="U"' in rewrite_source(_TEXT, edit)
+    else:
+        with pytest.raises(LensRewriteError, match="not text"):
+            rewrite_source(_TEXT, edit)

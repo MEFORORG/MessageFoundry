@@ -3405,6 +3405,7 @@ def _apply_set_params(
             f"row at lines {line_start}-{line_end}: its message argument is not 'msg', which the "
             "Steps view does not show - editing it would keep that hidden argument; edit it as text"
         )
+    _refuse_non_text_set_params(row, params)
     if row["kind"] == "send":
         for pname, node in slots.items():
             literal = isinstance(node, ast.Constant) or (
@@ -4549,6 +4550,9 @@ class _Scope(NamedTuple):
     #: Names the handler itself binds that no function declares ``global``: the only names a
     #: value may carry beyond ``inert`` (ADR 0076 G.7). A ``global`` name is module state.
     handler_locals: frozenset[str] = frozenset()
+    #: Names known to hold text: a module ``str`` literal, or a handler local every binding of which
+    #: is a string literal, an f-string or a message read (:func:`_text_locals`).
+    text: frozenset[str] = frozenset()
 
 
 def _is_shadowed(name: str, scope: _Scope) -> bool:
@@ -4680,7 +4684,38 @@ def _message_scope(
         frozenset(loop_indexes - zero_based),
         _module_shadows(tree),
         frozenset(set(bound) - loop_indexes - globals_ - {"msg"}),
+        frozenset(
+            {n for n, kind in unshadowed.items() if kind == "text"}
+            | (_text_locals(func) - globals_ - {"msg"})
+        ),
     )
+
+
+def _text_locals(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """The handler names every binding of which is ``NAME = <text>``: a string literal, an f-string
+    or a ``msg`` read (``pid5 = msg.field("PID-5")``). Any other binding of the name, such as a
+    lookup result, a loop target or an augmented assignment, leaves it out."""
+    text: dict[str, bool] = {}
+    for n in ast.walk(func):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            v = n.value
+            is_text = (
+                (isinstance(v, ast.Constant) and isinstance(v.value, str))
+                or isinstance(v, ast.JoinedStr)
+                or _is_bounded_message_read(v)
+                or _is_empty_fallback_read(v)
+            )
+            name = n.targets[0].id
+            text[name] = text.get(name, True) and is_text
+    stores = Counter(
+        n.id for n in ast.walk(func) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+    )
+    assigns = Counter(
+        n.targets[0].id
+        for n in ast.walk(func)
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+    )
+    return {name for name, ok in text.items() if ok and stores[name] == assigns[name]}
 
 
 def _is_one_based_range(node: ast.expr) -> bool:
@@ -4713,6 +4748,8 @@ def _literal_kind(node: ast.expr, *, frozenset_ok: bool) -> str | None:
     if isinstance(node, ast.Constant):
         if type(node.value) in (int, float):
             return "number"
+        if isinstance(node.value, str):
+            return "text"
         return "other" if isinstance(node.value, _INERT_CONSTANT_TYPES) else None
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub | ast.UAdd):
         operand = node.operand
@@ -4908,7 +4945,10 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
                 if code_set_ok:
                     out[name] = "code_set"
             else:
-                out[name] = "number" if all(k == "number" for k in kinds) else "other"
+                same = set(kinds)
+                out[name] = (
+                    "number" if same == {"number"} else "text" if same == {"text"} else "other"
+                )
     return out
 
 
@@ -6505,23 +6545,61 @@ def _native_write_method(value: ast.expr, dst: ast.expr) -> str:
     return _template_write_method(value, dst)
 
 
-def _refuse_non_text_value(rendered: str, scope: _Scope) -> None:
-    """Refuse a Set Field or Add Repetition value that cannot be text.
+def _refuse_non_text_value(rendered: str, scope: _Scope, pname: str = "value") -> None:
+    """Refuse a Set Field or Add Repetition value, or a Code Lookup default, that may not be text.
 
-    ``Message.set`` and ``add_repetition`` take a ``str`` and raise TypeError on a number, ``None``, a
-    list or a dict, so such a value fails on every message (review of head 513797260a, finding 5).
-    Admitted: a string literal, an f-string, a message read, or a name. A read that finds no field
-    returns None, which is the pre-existing behaviour of a bare read and is not narrowed here."""
+    ``Message.set`` and ``add_repetition`` take a ``str`` and raise TypeError on a number or
+    ``None``. A tuple is worse: ``add_repetition`` writes ``str(("a", "b"))`` into a populated
+    field and the message is delivered with ``('a', 'b')`` in it, and ``code_lookup`` does the same
+    with ``str(default)`` (Lander review of PR 2154). So, in every mode, admitted: a string
+    literal, an f-string, a message read, or a name :func:`_message_scope` lists as ``text``. A
+    read that finds no field returns None, which is the pre-existing behaviour of a bare read and
+    is not narrowed here."""
     node = ast.parse(rendered, mode="eval").body
     text = (
         (isinstance(node, ast.Constant) and isinstance(node.value, str))
         or isinstance(node, ast.JoinedStr)
-        or (isinstance(node, ast.Name) and node.id not in scope.numeric)
+        or (isinstance(node, ast.Name) and node.id in scope.text)
         or _is_field_read(node, scope=scope)
     )
     if not text:
         raise LensRewriteError(
-            f"parameter 'value': {rendered} is not text, and a field value must be text - "
+            f"parameter {pname!r}: {rendered} is not text, and a field value must be text - "
+            "write it as a string"
+        )
+
+
+#: The ``(call, parameter)`` pairs whose value ends up as a field's text.
+_TEXT_VALUE_PARAMS = frozenset(
+    {("set_field", "value"), ("add_repetition", "value"), ("code_lookup", "default")}
+)
+
+
+def _refuse_non_text_set_params(row: dict[str, Any], params: dict[str, Any]) -> None:
+    """``set_params`` on a Set Field or Add Repetition value, or a Code Lookup default, may not write
+    a number, ``None`` or a boolean, as a JSON scalar or as an ``{"expr": ...}`` literal (Lander
+    review of PR 2154). Every mode refuses them. Every other shape is left to the moded splice,
+    which takes only a literal and refuses the rest with its own message (ADR 0076 Amendment E)."""
+    call = row.get("action") or row.get("call")
+    for pname, value in params.items():
+        if (call, pname) not in _TEXT_VALUE_PARAMS:
+            continue
+        literal: object = value
+        if isinstance(value, dict):
+            expr = value.get("expr") if set(value) == {"expr"} else None
+            if not isinstance(expr, str):
+                continue
+            try:
+                node = ast.parse(expr.strip(), mode="eval").body
+            except (SyntaxError, *_PARSER_REFUSALS):
+                continue  # the splice refuses it with its own message
+            if not isinstance(node, ast.Constant):
+                continue
+            literal = node.value
+        if not (literal is None or isinstance(literal, bool | int | float)):
+            continue
+        raise LensRewriteError(
+            f"parameter {pname!r}: {value!r} is not text, and a field value must be text - "
             "write it as a string"
         )
 
@@ -6808,6 +6886,8 @@ def _render_insert_call(
         rendered_kw = _render_insert_value(
             val, pn, policy=_insert_value_policy(name, pn), scope=_param_scope(name, pn, scope)
         )
+        if (name, pn) in _TEXT_VALUE_PARAMS:
+            _refuse_non_text_value(rendered_kw, scope, pn)
         args.append(f"{pn}={rendered_kw}")
     call = f"{name}({', '.join(args)})"
     if assign_to is not None:
