@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 import httpx
 import pytest
 from _ui_clients import create_local_user_chosen, issue_continuation
+from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -1482,7 +1483,9 @@ class _FakeWS:
         app: object,
         peer: tuple[str, int] = ("127.0.0.1", 123),
     ) -> None:
-        self.headers = {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
+        self.headers = Headers(  # has getlist (BACKLOG #2454)
+            {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
+        )
         self.app = app
         # ``.client`` is what ``client_ip`` reads for the denial rows (ADR 0150, BACKLOG #1644). A
         # real address by default, never None, so a client assertion cannot pass as None == None.
@@ -8724,6 +8727,12 @@ async def test_a_cookie_replayed_from_a_second_address_is_sent_to_reauth(engine:
             "/ui/reauth", data={"next": f"/ui/messages/{mid}", "password": PW}, headers=same
         )
         assert (done.status_code, done.headers["location"]) == (303, f"/ui/messages/{mid}")
+        # Keep only the rotated cookie. The jar files the hand-set copy and the server's under
+        # different domains, so both would ride the next request, and two copies are refused
+        # (BACKLOG #2454). A browser holds one: the engine's cookie is host-only.
+        rotated = done.cookies["mf_session"]
+        b.cookies.clear()
+        b.cookies.set("mf_session", rotated)
         # The re-auth re-anchored the session at this address.
         assert (await b.get(f"/ui/messages/{mid}")).status_code == 200
     seen = [

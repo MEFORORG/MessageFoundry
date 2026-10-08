@@ -615,6 +615,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "match the 'lens parse --contract' that produced them, so a v1 client's coordinates resolve "
         "against the v1 partition and a v2 client's against the v2 one",
     )
+    lens_rewrite.add_argument(
+        "--typed-only",
+        action="store_true",
+        help="refuse at least the edits known to carry raw Python source - a 'paste_block', an "
+        "if/elif 'test', and a move or delete of code not shown as typed steps (default off; an "
+        "analyst-facing editor must set it)",
+    )
     # `lens rewrite` has no --json flag, yet every error it reports is JSON on stdout. Setting the
     # attribute lets `main` treat it as a --json command: its logging goes to stderr (BACKLOG #1489),
     # and an uncaught exception still yields `{"error": ...}` (#1863). `_lens_rewrite` never reads it.
@@ -5041,9 +5048,17 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
 
     try:
         if stdin_source is not None:
-            rewritten = rewrite_source(stdin_source, edit, module="<stdin>", contract=args.contract)
+            rewritten = rewrite_source(
+                stdin_source,
+                edit,
+                module="<stdin>",
+                contract=args.contract,
+                typed_only=args.typed_only,
+            )
         else:
-            rewritten = rewrite_module(args.module, edit, contract=args.contract)
+            rewritten = rewrite_module(
+                args.module, edit, contract=args.contract, typed_only=args.typed_only
+            )
     except LensRewriteError as exc:
         # The code is the refusal family the IDE branches on (BACKLOG #237); the message stays prose.
         return _emit_error(str(exc), as_json=True, code=exc.code)

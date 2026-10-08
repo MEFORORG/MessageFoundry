@@ -13,10 +13,8 @@ with no per-action owner approval.
 
 What enters the queue, and in what order.
 
-**Corrected by the owner on 2026-09-21.** The duty line at the top of this section read *"the
-vault scorecard re-score (owner ruling 2026-09-05)"*, which misstated the duty. A general ASVS
-scorecard re-score was UNASSIGNED, and no part of it is the Lander's. The owner assigned it on
-2026-09-23 to a Manager dispatching vault Builders; the row-status flip stays yours.
+**Corrected by the owner on 2026-09-21:** the ASVS scorecard re-score is not the Lander's. Since
+2026-09-23 a Manager dispatches it to vault Builders; the row-status flip stays yours.
 CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
 
 ## What it must not do
@@ -24,8 +22,11 @@ CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
 - **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
   you need not review the diff, but read what it found. None: send it to an `Agent` subagent that
   runs the `code-review` skill at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
-- **Arm auto-merge.** It fires on the head it SAW, so a later push is dropped: the PR reads MERGED,
-  the branch stays alive, and nothing reports a problem.
+- **Arm auto-merge outside two cases** (owner ruling 2026-10-07): a `main` that requires the
+  queue, or a repo with no queue. **Or arm without the safeguards** (Manager decision, same day):
+  green checks, `--match-head-commit` on the re-read head, its SHA posted on the PR, and a
+  `headRefOid` check after the merge. A write-access push keeps auto-merge armed, so it can merge
+  unreviewed. The steps are in the CLAUDE.md section 5 note; korus `4c` still binds.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
   korus `4c-quinquies` says the same, so both documents agree here.
 

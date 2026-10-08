@@ -29,7 +29,7 @@ import httpx
 import pytest
 from _totp_clock import fresh_totp
 from pydantic import ValidationError
-from starlette.datastructures import Address
+from starlette.datastructures import Address, Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.api.app import _session_reaper
@@ -981,7 +981,8 @@ class _FakeWS:
         self.query_params: dict[str, str] = {}
         # The token rides the Authorization header — the deprecated ?token= query fallback was
         # removed (WP-1, ASVS Session Management): a token in a URL leaks into proxy/access logs.
-        self.headers: dict[str, str] = {"Authorization": f"Bearer {token}"} if token else {}
+        # starlette's Headers, which has the ``getlist`` the repeat check reads (BACKLOG #2454).
+        self.headers = Headers({"Authorization": f"Bearer {token}"} if token else {})
         self.url = _FakeURL()
         # BACKLOG #1644: authorize_ws now stamps the peer address onto its three audit rows, so a
         # double without this attribute raises AttributeError rather than failing an assertion.
@@ -1083,7 +1084,7 @@ class _FakeRequest:
     def __init__(self, auth: object, token: str | None, *, method: str, path: str) -> None:
         self.app = _FakeApp(auth)
         self.method = method
-        self.headers: dict[str, str] = {"Authorization": f"Bearer {token}"} if token else {}
+        self.headers = Headers({"Authorization": f"Bearer {token}"} if token else {})
         self.url = _FakeReqURL(path)
         self.client = _PEER  # BACKLOG #1644 — see the note on :class:`_FakeWS`
 

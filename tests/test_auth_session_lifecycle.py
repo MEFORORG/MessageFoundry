@@ -10,6 +10,7 @@ import json
 import time
 
 import pytest
+from starlette.datastructures import Headers
 
 from messagefoundry.api.security import ws_token
 from messagefoundry.auth import totp
@@ -823,7 +824,7 @@ async def test_ad_login_success_audit_detail_is_byte_identical() -> None:
 
 class _FakeWS:
     def __init__(self, headers: dict[str, str], query: dict[str, str]) -> None:
-        self.headers = headers
+        self.headers = Headers(headers)  # has the getlist the repeat check reads (BACKLOG #2454)
         self.query_params = query
 
 

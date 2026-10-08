@@ -370,17 +370,25 @@ jobs:
             --evidence "jscpd analysed ${FILES:-0} files; found ${CLONES:-0} clones" \
             --extra "{\"clones\":${CLONES:-0}}"
 
-  coverage:
-    # Signal 8 - diff-coverage visibility. Runs the suite under coverage, then reports coverage of the
-    # lines CHANGED by this PR (diff-cover) -- never a whole-repo % gate, which the rubric (section 4.1)
-    # calls a gameable signal. ADVISORY: --fail-under=0 + `|| true` so it never fails a build, and this
-    # job is not a required status check. PR-only (needs a base ref to diff against). It re-runs the
-    # ubuntu suite (~a few min) per PR; add a paths filter if that cost bites. (This used to say
-    # "move it to the mirror" -- there is no mirror since the cutover; development happens directly
-    # on the public repo.)
-    name: diff-coverage (advisory)
+  coverage-shard:
+    # Signal 8, part 1 of 2: run the suite under coverage, split across a matrix of jobs. The
+    # `coverage` job below is part 2: it combines the shards' data and runs diff-cover. Read that
+    # job's header for what the signal reports; this one only measures.
+    #
+    # A NEW JOB NAME, ON PURPOSE. The `coverage` job keeps `diff-coverage (advisory)` and its
+    # trigger, so nothing that already reads that context moves. These shards report under their
+    # own names, and none of them is a required context.
+    name: diff-coverage shard ${{ matrix.shard }} (advisory)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      # Every shard runs to the end. One shard's infrastructure failure must not cancel the
+      # others, or one apt hiccup would throw away the other three shards' measurement.
+      fail-fast: false
+      matrix:
+        # The shard count is the matrix length; the step reads it as `strategy.job-total`, so
+        # this list is the one place to change it.
+        shard: [1, 2, 3, 4]
     # SIZED FROM A MEASUREMENT, NOT FROM A GUESS (BACKLOG #1409). This cap was 20 from the
     # 2026-07-26 publish snapshot until 2026-09-01, and it was never edited. The SUITE grew into
     # it: the job took 9.7 minutes on 2026-07-26, 14.8 on 2026-08-06, and 19m36s on its LAST GREEN
@@ -438,21 +446,56 @@ jobs:
     #     opposite of what 21m35s implied.
     #   "ESTIMATED 18 to 20 minutes for the narrowed serial run" -- superseded by the 14m33s above.
     #
-    # NEXT LEVER IF IT DRIFTS AGAIN: pytest-xdist. ci.yml's engine leg runs `-n 4 --dist loadfile`
-    # and this job does not. Adding it here needs `[tool.coverage.run] parallel = true` plus a
-    # combine before --cov-report=xml, so it is a separate change with its own verification --
-    # deliberately NOT bundled here, or a shifted coverage number would have two possible causes.
+    # IT DRIFTED AGAIN, AND THE LEVER NAMED HERE WAS PULLED: the step now runs under pytest-xdist.
+    # The serial pytest step, sampled three jobs a day: 20.4 to 22.0 minutes on 2026-09-23, 27.7
+    # to 28.0 on 2026-09-26, the first cap kill on 2026-09-27, and from 2026-10-03 on every sampled
+    # job that ran to the cap was cancelled there (the shorter cancels are this file's concurrency
+    # group, not the cap). The cause is suite growth, not one slow test and not the runner: `11510
+    # passed` in 13m43s on 2026-09-01, `15926 passed` in 20m02s on 2026-09-23 (job 107432259490),
+    # `22043 passed` in 27m45s on 2026-09-28 (job 109189388475), and in that last job no test in
+    # the slowest 40 took more than 19.05s. The "re-derive at 20 minutes" trigger above had already fired by
+    # 2026-09-23 and nobody read it, so a trigger written into a comment is not a watch.
+    #
+    # THIS PARAGRAPH USED TO SAY xdist "needs `[tool.coverage.run] parallel = true` plus a combine".
+    # It does not: pytest-cov collects each worker's data and combines it in the controller.
+    # Measured 2026-10-07 on 12 test files, serial against `-n 4 --dist loadfile`: both coverage.xml
+    # files report 326 measured files and 15568 covered lines. That subset, run on Windows, shows the
+    # combine works; it does not show the full-suite number is unchanged, which only the first
+    # ubuntu run of this step can. Why `--dist loadfile` and
+    # `--max-worker-restart=0` and not xdist's defaults is in ci.yml's engine step; the reasons
+    # are the same here and are not restated.
+    #
+    # XDIST ALONE DID NOT BUY THE MARGIN, SO THE CAP MOVED FROM 30 TO 45. First run under `-n 4`
+    # (PR 2170, job 113084365613, 2026-10-08): `33861 passed` in 25m50s, job 26m39s, so 3m21s
+    # under the old cap. The suite was 22043 tests nine days earlier, and a serial run at that
+    # job's rate would be about 42 minutes, so xdist bought about 1.6x on this 4 vCPU runner. 45
+    # is 1.7x the measured job. At this growth rate that margin lasts days to weeks, not months;
+    # the next lever is sharding the step across jobs and combining the coverage data. (That 45
+    # was this job's cap while it ran the whole suite. It now runs a quarter; see below.)
+    #
+    # SHARDED, BECAUSE THE GROWTH OUTRAN ONE RUNNER. The suite now runs as four jobs of `-n 4
+    # --dist loadfile` each, a whole test FILE per shard (scripts/quality/shard_tests.py says why
+    # a file and not a test). A file goes to shard `crc32(path) mod 4`.
+    #
+    # WHY A HASH AND NOT pytest-split's DURATIONS. Measured 2026-10-08 on a local `-n 12` run of
+    # the same `not tooling` selection (`34064 passed`, junit times summed per file, 1019 files
+    # with tests): the hash split's slowest shard carries 1.083x an even quarter (shards of 4050,
+    # 4634, 4754 and 4114 seconds), and a duration-packed split would carry 1.000x. On the 25m50s
+    # job above that is about 7.0 minutes against 6.5, so under a minute per run. The hash needs
+    # no new dependency, no committed durations file to go stale, and no edit when a test file is
+    # added. Those weights are relative, from one Windows box, not this runner's absolute times.
+    # The largest file, test_webui.py, is 5 percent of the total, so no single file sets a floor.
+    #
+    # 30 MINUTES IS ABOUT 4x A SHARD'S EXPECTED RUN. Re-measure from the first green run of this
+    # matrix; the per-shard pytest time is the number to watch, not the combine job's.
     timeout-minutes: 30
     permissions:
       contents: read
-    outputs:
-      receipt: ${{ steps.receipt.outputs.receipt }}
     steps:
       - name: Check out the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
       - name: Set up Python 3.14
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -481,7 +524,10 @@ jobs:
           exit 1
       - name: Install project + coverage tools
         run: |
-          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp]" -e packaging/messagefoundry-webconsole
+          # THE EXTRAS MATCH ci.yml's ENGINE LEG, `vault,sftp` included. Without them 11 tests failed
+          # here and nowhere else (job 113084365613: 6 `No module named 'requests'`, 5 `urllib3 is not
+          # importable`), and the vault modules they exercise went unmeasured.
           # HASH-PINNED from the CI toolchain lock (ADR 0034 §3). These tools now DO live in
           # pyproject.toml ([dependency-groups].ci-quality, where each pin's rationale sits) and DEP-1
           # re-exports this lock by design -- superseding the note that used to sit here claiming they
@@ -506,6 +552,8 @@ jobs:
         continue-on-error: true
         env:
           QT_QPA_PLATFORM: offscreen
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ strategy.job-total }}
         # `-m 'not tooling'` DESELECTS THE TOOLING TIER, AND IT COSTS THIS GATE NOTHING (#1409).
         # The mark is applied at runtime by tests/conftest.py from tests/tooling_manifest.txt (132
         # files), not by decorators, so grepping for `pytest.mark.tooling` finds 2 hits and badly
@@ -571,7 +619,100 @@ jobs:
         # so a reader who asks the tree for 16 test files does not find them. The web console leg
         # measures 130-140s on ubuntu across the last 10 green ci.yml runs on main, and 114 is below
         # every sample taken. The conclusion "a cheap price" survives at 140s.
-        run: pytest -q -m 'not tooling' --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered --durations=40 || true
+        #
+        # `-n 4` MATCHES THE HOSTED RUNNER'S 4 vCPUs, the same count ci.yml's ubuntu engine leg uses.
+        # The header above `timeout-minutes` has the measurements behind it.
+        #
+        # THIS SHARD RUNS ONLY ITS OWN FILES, and writes no report: `--cov-report=` leaves the raw
+        # `.coverage` data, which the `coverage` job combines with the other shards'. The file list
+        # comes from scripts/quality/shard_tests.py; an empty list exits non-zero there, because
+        # pytest given no paths would collect the WHOLE suite and quietly undo the split.
+        run: |
+          python3 scripts/quality/shard_tests.py --shard "$SHARD" --of "$SHARDS" > shard-files.txt || exit 0
+          mapfile -t FILES < shard-files.txt
+          echo "shard ${SHARD} of ${SHARDS}: ${#FILES[@]} test files"
+          RC=0
+          pytest -q -n 4 --dist loadfile --max-worker-restart=0 -m 'not tooling' --cov=messagefoundry --cov-report= --durations=20 "${FILES[@]}" || RC=$?
+          echo "pytest exited ${RC}"
+          # 0 is all passed and 1 is some failed; both ran every file, so the data is whole. Any
+          # other code (interrupted, internal error, usage error, nothing collected) can leave a
+          # PARTIAL .coverage, and uploading that would make a gap look like a measurement. So it
+          # is not uploaded, and the `coverage` job counts this shard as missing.
+          if [ "$RC" -le 1 ] && [ -s .coverage ]; then mv .coverage "coverage-shard-${SHARD}.data"; fi
+      - name: Upload this shard's coverage data
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: coverage-shard-${{ matrix.shard }}.data
+          # `warn`, not `error`: a shard that produced no data is the `coverage` job's to judge, and
+          # it records that as a dead gate. Failing here would only add a second red saying less.
+          if-no-files-found: warn
+          # The `coverage` job reads it minutes later in the same run; nothing reads it after that.
+          retention-days: 1
+
+  coverage:
+    # Signal 8 - diff-coverage visibility. Combines the shards' coverage, then reports coverage of the
+    # lines CHANGED by this PR (diff-cover) -- never a whole-repo % gate, which the rubric (section 4.1)
+    # calls a gameable signal. ADVISORY: --fail-under=0 + `|| true` so it never fails a build, and this
+    # job is not a required status check. PR-only (needs a base ref to diff against). The shards
+    # re-run the ubuntu suite per PR; add a paths filter if that cost bites. (This used to say
+    # "move it to the mirror" -- there is no mirror since the cutover; development happens directly
+    # on the public repo.)
+    #
+    # IT RUNS NO TEST ITSELF. The `coverage-shard` matrix above runs the suite; this job downloads
+    # their data, combines it into coverage.xml, and runs diff-cover on that, so its own time is
+    # a few minutes and does not grow with the suite. `!cancelled()` and not `always()`: a shard
+    # that FAILED still lets this job run and record the gap as a dead gate, while a run cancelled
+    # by a newer push skips it, which `liveness` already treats as did-not-run.
+    name: diff-coverage (advisory)
+    needs: coverage-shard
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Must equal the length of `coverage-shard`'s matrix. tests/test_quality_advisory_invariants.py
+      # holds the two together, because a count this job does not expect reads as a dead gate.
+      SHARDS: "4"
+    permissions:
+      contents: read
+    outputs:
+      receipt: ${{ steps.receipt.outputs.receipt }}
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install coverage tools
+        # Only the toolchain lock. This job runs no test, so it needs coverage and diff-cover and
+        # not the project: `coverage xml` reads the measured source from the checkout above.
+        run: python -m pip install --require-hashes -r ci/locks/ci-quality.lock
+      - name: Download the shards' coverage data
+        # Never fails the job: the combine step counts what arrived, and the receipt judges it.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-shard-*
+          path: shard-data
+          merge-multiple: true
+      - name: Combine the shards into coverage.xml (advisory - never fails)
+        continue-on-error: true
+        run: |
+          # The receipt step needs to know how many shards actually arrived, not how many ran.
+          shopt -s nullglob
+          DATA=(shard-data/coverage-shard-*.data)
+          ARRIVED="${#DATA[@]}"
+          echo "SHARDS_ARRIVED=${ARRIVED}" >> "$GITHUB_ENV"
+          echo "${ARRIVED} shard data file(s) arrived"
+          if [ "$ARRIVED" -eq 0 ]; then exit 0; fi
+          # The shards ran on runners with this same checkout path, so no [paths] remap is needed.
+          coverage combine "${DATA[@]}" || true
+          coverage xml -o coverage.xml || true
+          echo "combined line coverage: $(coverage report --format=total 2>/dev/null || echo unknown)%"
       - name: Diff-coverage vs the PR base (advisory - never fails)
         continue-on-error: true
         env:
@@ -588,7 +729,7 @@ jobs:
           # summary shows a bare heading that reads as "nothing uncovered".
           git fetch --no-tags origin "$BASE_REF" || true
           if [ ! -s coverage.xml ]; then
-            echo "::notice title=Diff coverage skipped::coverage.xml was not produced (the test step did not complete)"
+            echo "::notice title=Diff coverage skipped::coverage.xml was not produced (no shard data was combined)"
             exit 0
           fi
           # `github-annotations:notice` writes `::notice file=...,line=N,endLine=M` workflow commands to
@@ -638,6 +779,15 @@ jobs:
           if [ ! -s coverage.xml ]; then
             python3 scripts/quality/liveness.py record --signal coverage --status failed \
               --reason "coverage.xml was not produced; the measurement never happened"
+            exit 0
+          fi
+          # A MISSING SHARD IS A DEAD GATE TOO, not a smaller measurement. The combined file would
+          # still list the source files the other shards measured, so the file count below cannot
+          # see it; only the lines that shard's tests covered vanish, and diff-cover would then flag
+          # covered lines as uncovered.
+          if [ "${SHARDS_ARRIVED:-0}" -ne "$SHARDS" ]; then
+            python3 scripts/quality/liveness.py record --signal coverage --status failed \
+              --reason "${SHARDS_ARRIVED:-0} of ${SHARDS} coverage shards delivered data; the combined coverage.xml is partial"
             exit 0
           fi
           MEASURED_FILES="$(grep -c '<class ' coverage.xml || true)"

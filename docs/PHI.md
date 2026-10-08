@@ -139,7 +139,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `queue.handler_name` / `destination_name` / `channel_id` | all three | No — names, not bodies | No (metadata, deliberately not ciphered) | **PL-4** | The handler the transform worker runs; the destination the delivery worker drains | `n/a — not PHI` |
 | `messages.control_id`, `messages.message_type` | all three | Low (MSH-10/MSH-9) | **No** — plaintext by design | **PL-4** | Needed plaintext for dedup/routing/indexes (`ix_messages_control`). Covered only by the whole-DB / volume layer | `keep-forever by design` — dedup/routing keys that live and die with the message row |
 | `messages.origin`, `messages.origin_actor` (vault BACKLOG #2615) | all three | **No** — a fixed label and a username, never message content | **No** — plaintext by design | **PL-4** | How the row came to exist: `partner`, `operator_edit`, `operator_upload` or `reingress`, and for the two operator origins the acting user. Written at insert and never updated. Plain on purpose, because it must outlive the body and the ciphered `metadata`, which retention blanks. `NULL` on a row written before the column existed means not recorded. See [§6](#6-audit--accountability) | `keep-forever by design` — provenance that lives and dies with the message row |
-| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access*, not the PHI itself. Its writers only ever store filter shapes, counts and ids, plus at least these exceptions: an edit-resend row holds **keyed** HMAC-SHA256 digests of the original and the edited body, and an upload-inject row one of the injected body. Without the store key a digest cannot be recovered or tested against a guess ([§6](#6-audit--accountability), vault BACKLOG #2615) | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
+| `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access* and other actions, not the PHI itself. Its writers store at least filter shapes, counts and ids. Some also store more: an edit-resend row holds **keyed** HMAC-SHA256 digests of the original and the edited body, and an upload-inject row one of the injected body. Without the store key a digest cannot be recovered or tested against a guess ([§6](#6-audit--accountability), vault BACKLOG #2615). And some store bounded engine-authored text: at least the `connection_test` and `connection_credential_test` rows carry the probe outcome, a fixed line or `safe_text()`/`safe_exc()`-scrubbed connector error text (BACKLOG #2372). None stores a message body. *Corrected 2026-10-07:* this said the writers "only ever store filter shapes, counts and ids" | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
 | `audit_log.client` (ADR 0150) | all three | **No** — a network address; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The caller's client address — the "from where" of an audited action; `NULL` for engine-internal/`system` writes. **Personal data, but not PHI**, and exactly what HIPAA §164.312(b) audit controls exist to capture. Plaintext by decision: it must stay greppable/indexable for incident response, it already appears in the clear in `sessions.client`, and it is folded **inside** the tamper-evident hash chain — so it carries **integrity** protection even without confidentiality. Widens a store-file compromise from *who did what* to *who did what from where*; volume encryption + owner-only ACLs on whichever host owns the files — the engine's own `_secure_file` covers the **SQLite** store only ([§10](#10-secure-deployment--operations-checklist)) — are the control | `keep-forever by design` — same `audit_log` row lifetime as `detail`; the value is folded **inside** the hash chain |
 | `delivered_keys` (H2 idempotency ledger) | all three | **No** — hashes + ids only | No (deliberately not ciphered — nothing to protect) | **PL-4** | One row per completed outbound delivery: a SHA-256 `delivery_key` over non-PHI ids + a replay-stable seq, plus `outbox_id`/`message_id`/`destination_name`/`delivery_seq`. **Never a body or any PHI** — `control_id` is only *folded into the hash input*, never stored in the clear here. Lets the FIFO claim skip-and-complete a re-claimed already-delivered head without re-sending | `keep-forever by design` — the idempotency ledger a re-claimed already-delivered row checks instead of re-sending |
 | `state.namespace` / `state.key` | all three | **Possibly** — a Handler that keys correlation state on a raw MRN stores that identifier here in the clear | **No** — plaintext by construction: the pair is the composite primary key **and** the AAD input for `state.value`, so it cannot be ciphered without losing the lookup | **PL-4** | Authors must key state on a **surrogate, never a raw identifier**. Covered only by the whole-DB / volume layer. Rides `[retention].state_max_age_days` with its value | ``rides `[retention].state_max_age_days` `` |
@@ -193,6 +193,23 @@ and whole only on the audited `reveal=<connection name>` act on `GET /connection
 `reveal=true` act on `GET /connections/{name}/metadata`. *Corrected 2026-10-01:* this said that
 field was not yet gated; the gate change that closed it is in [SECURITY.md](SECURITY.md)
 "Field-level (property) authorization".
+
+**`ConnectionTestResult.detail` is rated PL-4, the level of `audit_log.detail` (BACKLOG #2372).** It
+is the reply of `POST /connections/{name}/test` and `POST /connections/{name}/test-credential`, a
+live string with no table row. Its stored copy is `audit_log.detail`: both routes write it into
+their `connection_test` or `connection_credential_test` audit row. It says why a reachability
+probe failed or could not run. The probe sends no message, so no message content can reach it.
+`_run_connection_test` in `api/app.py` fills it with a fixed line (not deployed, timed out, or the
+trust-anchor refusal) or with a wiring or connector error passed through `safe_text()` or
+`safe_exc()`. The connector errors name the endpoint, an HTTP status, or a socket or driver error.
+No probe echoes a reply body. At least the REST, FHIR and DATABASE probes are a `HEAD`, a
+`GET /metadata` and a `SELECT 1`. A peer can still choose some of the text, such as a database
+server's error string or a socket error reason. That text is bounded and holds nothing from the
+engine's messages. **So the field carries operational metadata, and no `no-store` is stamped on
+either route.** Both routes need `connections:test`. The rating leans on the rule that a connector's
+exception never interpolates a credential value: `safe_*` scrubs PHI shapes and bounds the length,
+and has no notion of a credential. `tests/test_no_store_phi_coverage.py` binds the field to
+`audit_log.detail`.
 
 **Per-backend cipher coverage, stated exactly.** The store cipher covers **18** `(table, column)`
 pairs on SQLite. **SQL Server** covers 17 = the SQLite set **minus** `shared_body.body` (never written
@@ -1202,12 +1219,15 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   `tests/test_no_store_phi_coverage.py` walks every registered route. It fails when a PHI-gated route,
   or one whose response projects a PL-1/PL-2/PL-3 column, lands outside that set. That is what keeps
   a new PHI surface from shipping header-free, the way `/search/layered`, `/logs/tail` and
-  `/uploads/{file_id}/messages` each did. Credential-bearing replies are served `no-store` by the
-  auth routes themselves: a session token, a staged TOTP seed, recovery codes, a temporary password.
-  `tests/test_credential_reply_no_store.py` drives each of those routes. **What the two tests cannot
-  see.** The route test reads a field only when its name is a rated column's name. The credential
-  test reads only the credential field names it lists. A route outside the prefix families with no
-  response model is outside both. Those shapes rest on review.
+  `/uploads/{file_id}/messages` each did. Credential-bearing replies are served `no-store` because
+  their response model subclasses `CredentialReply`: a session token, a staged TOTP seed, recovery
+  codes, a temporary password. The engine's route class adds the no-store step to every route
+  returning one, so no route declares it (BACKLOG #2372). `tests/test_credential_reply_no_store.py`
+  drives each of those routes, and fails when a model with a credential field name is unmarked.
+  **What the two tests cannot see.** The route test reads a field only when its name is a rated
+  column's name. The credential test reads only the credential field names it lists, so an unmarked
+  model returning a credential under a new name escapes it. A route outside the prefix families
+  with no response model is outside both. Those shapes rest on review.
 - **Audited raw view only.** A raw message body is shown only via the same audited body fetch the
   JSON API serves at `GET /messages/{id}/raw` (record_view + a tamper-evident `message_body_view` audit
   row whose `surface` is `console`); there is no second, unaudited PHI render path.
