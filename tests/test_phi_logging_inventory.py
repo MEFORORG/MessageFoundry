@@ -229,9 +229,12 @@ def test_out_of_scope_streams_are_scoped_out_explicitly() -> None:
     paragraph still left ``"tee" in section`` True — the tee relay's scope-out, which discloses an
     unfiltered ``basicConfig`` sink holding full message bodies under ``--capture-bodies``, was the
     one thing this test claimed to pin and did not.
+
+    ``"tray.log"`` left this list with BACKLOG #2351: the tray has a row now, and
+    ``test_the_tray_file_sink_has_an_inventory_row`` pins it.
     """
     section = _inventory_section()
-    for token in ("/metrics", "/ws/stats", "relay_capture", "--capture-bodies", "tray.log"):
+    for token in ("/metrics", "/ws/stats", "relay_capture", "--capture-bodies"):
         assert token in section, f"§7 no longer states why {token} is outside the inventory"
 
 
@@ -589,7 +592,7 @@ _ALLOWED_SINK_MODULES: dict[str, str] = {
         "stream 1 — the guarded handler classes for stdout and the opt-in `[logging].file`"
     ),
     "messagefoundry/tray/__main__.py": (
-        "the tray's RotatingFileHandler — named in 'Not in this inventory, and why'"
+        "stream 15 — the tray's RotatingFileHandler, tray.log (BACKLOG #2351)"
     ),
     # The ADR 0087 sandbox child is deliberately ABSENT (BACKLOG #1054): it no longer constructs a sink
     # of its own. It calls logging_setup's `configure_stderr_logging`, so the handler — and the filter
@@ -738,21 +741,137 @@ def _gates_on_debug(source: str) -> bool:
     )
 
 
-def test_the_tray_file_sink_is_scoped_out_by_name() -> None:
-    """It ships in the wheel, so silence is not an option — it is named, with its real posture."""
-    section = _section_7()
-    for token in ("tray.log", "RotatingFileHandler"):
-        assert token in section, (
-            f"§7 does not name {token!r}. messagefoundry.tray ships INSIDE the wheel as the "
-            "messagefoundry-tray gui-script and writes a rotating log file. Since BACKLOG #2092 that "
-            "file carries tray/logscrub.py's PHI, credential and control-character scrub, but not "
-            "the OIDC query-string filter, and it sits outside the NSSM DataDir ACL and outside "
-            "every [retention] window."
+def _inventory_rows(section: str | None = None) -> list[str]:
+    """Every numbered stream row of the inventory table, one string per row."""
+    body = _inventory_section() if section is None else section
+    return [line for line in body.splitlines() if re.match(r"\|\s*\*\*\d+\. ", line)]
+
+
+def _row_naming(token: str, section: str | None = None) -> str:
+    """The one inventory row whose FIRST cell names ``token`` in backticks, exactly."""
+    rows = [row for row in _inventory_rows(section) if f"`{token}`" in row.split("|")[1]]
+    assert len(rows) == 1, (
+        f"the §7 logging inventory has {len(rows)} rows whose stream cell names {token!r}; "
+        "it needs exactly one (ASVS 16.1.1)"
+    )
+    return rows[0]
+
+
+def _cells(row: str) -> list[str]:
+    """The cells of one table row."""
+    return row.strip().strip("|").split("|")
+
+
+def test_every_inventory_row_has_the_headers_cell_count() -> None:
+    """A row one cell too wide shifts every later fact a column right, and the last is dropped.
+
+    Row 17 shipped that way for one commit with this file green: the sensitive-data cell did not
+    render. No cell of this table may hold a literal pipe, so a plain split counts cells.
+    """
+    section = _inventory_section()
+    width = len(_header_cells(section))
+    rows = _inventory_rows(section)
+    assert width >= 8 and len(rows) >= 17, f"read {width} header cells and {len(rows)} rows"
+    wrong = {_cells(row)[0].strip()[:30]: len(_cells(row)) for row in rows}
+    wrong = {name: count for name, count in wrong.items() if count != width}
+    assert not wrong, f"inventory rows whose cell count is not the header's {width}: {wrong}"
+
+
+def test_the_tray_file_sink_has_an_inventory_row() -> None:
+    """It ships in the wheel and writes a file, so it has a row, with its real posture.
+
+    It was a named exclusion until BACKLOG #2351. A row is checked, and not the whole section, so
+    prose that merely mentions the file cannot stand in for the row.
+    """
+    row = _row_naming("tray.log")
+    for token in ("RotatingFileHandler", "TrayLogScrubFilter", "[retention]", "%LOCALAPPDATA%"):
+        assert token in row, (
+            f"the tray's inventory row does not name {token!r}. messagefoundry.tray ships INSIDE "
+            "the wheel as the messagefoundry-tray gui-script and writes a rotating log file. Since "
+            "BACKLOG #2092 that file carries tray/logscrub.py's PHI, credential and "
+            "control-character scrub, but not the OIDC query-string filter, and it sits outside the "
+            "NSSM DataDir ACL and outside every [retention] window."
         )
     tray = (_ROOT / "messagefoundry" / "tray" / "__main__.py").read_text(encoding="utf-8")
     assert source_calls(tray, "RotatingFileHandler"), (
-        "the tray no longer writes a rotating log file; remove the scope-out in the same change."
+        "the tray no longer writes a rotating log file; remove its inventory row in the same change."
     )
+
+
+#: The first argument of every ``createOutputChannel(`` call, whatever it is.
+_IDE_CHANNEL_ARG = re.compile(r"createOutputChannel\(\s*([^,)]+)")
+#: A plain string literal in any of the three TypeScript quote styles, with no interpolation.
+_IDE_LITERAL = re.compile(r"""(['"`])([^'"`$\\]+)\1""")
+
+
+def _channel_names(source: str) -> set[str]:
+    """The channel names ``source`` creates. A name that is not a plain literal fails loudly.
+
+    This is a text scan of TypeScript, which the suite has no parser for. A call left in a comment
+    over-fires, by asking for a row the code no longer needs.
+    """
+    names: set[str] = set()
+    for arg in _IDE_CHANNEL_ARG.findall(source):
+        literal = _IDE_LITERAL.fullmatch(arg.strip())
+        assert literal is not None, (
+            f"createOutputChannel({arg.strip()}) does not name its channel with a plain string "
+            "literal, so this test cannot tell whether docs/PHI.md has a row for it"
+        )
+        names.add(literal.group(2))
+    return names
+
+
+def _ide_output_channels() -> set[str]:
+    """Every output channel name the VS Code extension creates, read from its shipped source."""
+    names: set[str] = set()
+    for path in (_ROOT / "ide" / "src").rglob("*.ts"):
+        if "test" in path.relative_to(_ROOT / "ide" / "src").parts:
+            continue
+        names |= _channel_names(path.read_text(encoding="utf-8"))
+    return names
+
+
+def test_every_ide_output_channel_has_an_inventory_row() -> None:
+    """BACKLOG #2351. An output channel is a log sink on a developer's desktop, so each has a row.
+
+    The set is read from ``ide/src``, so a third channel reds this test until it gets a row. A
+    channel named through a constant or a template with a placeholder fails the reader, because
+    the name cannot be read. A call the pattern does not see at all, such as one made through an
+    alias of ``createOutputChannel``, is still missed.
+    """
+    channels = _ide_output_channels()
+    assert {"MessageFoundry Engine", "MessageFoundry Checks"} <= channels, (
+        f"the reader found only {sorted(channels)} in ide/src; it no longer sees the two channels "
+        "this test was written against, so it would pass a third one unseen"
+    )
+    for name in sorted(channels):
+        _row_naming(name)
+
+
+def test_the_ide_channel_reader_can_fail() -> None:
+    """A planted omission: with one channel's row removed, the row lookup raises."""
+    section = "\n".join(
+        line for line in _inventory_section().splitlines() if "MessageFoundry Checks" not in line
+    )
+    _row_naming("MessageFoundry Engine", section)
+    with pytest.raises(AssertionError, match="MessageFoundry Checks"):
+        _row_naming("MessageFoundry Checks", section)
+    # A name that is only part of an existing row's name is not that row.
+    with pytest.raises(AssertionError, match="0 rows"):
+        _row_naming("Engine")
+
+
+def test_the_ide_channel_reader_sees_every_quote_style_and_refuses_a_constant() -> None:
+    """Planted source: the three literal forms are read, and a constant fails loudly."""
+    planted = (
+        'a = vscode.window.createOutputChannel("One", { log: true });\n'
+        "b = vscode.window.createOutputChannel('Two');\n"
+        "c = vscode.window.createOutputChannel(\n  `Three`,\n);\n"
+    )
+    assert _channel_names(planted) == {"One", "Two", "Three"}
+    for unreadable in ("createOutputChannel(NAME)", "createOutputChannel(`x ${y}`)"):
+        with pytest.raises(AssertionError, match="plain string"):
+            _channel_names(unreadable)
 
 
 def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
