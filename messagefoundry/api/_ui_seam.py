@@ -352,12 +352,17 @@ from typing import Any
 #: ``RepeatedCredentialError`` and ``record_repeated_credential``, so a repeated cookie is logged
 #: and audited by the same handler as a repeated header.
 #:
+#: Vault BACKLOG #2144: ``AuthService`` gained ``admin_write_retry_after``, which ``require_ui``
+#: calls to fill the ``Retry-After`` of a throttled ``/ui`` write. A method the console calls, so a
+#: skew would be an AttributeError where the 429 belongs; it forces a bump. Re-derived on the
+#: tree merged with BACKLOG #2454, so the value below covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "c44474a7b5777455"
+ENGINE_UI_SEAM: str = "24e0fac6107b4433"
 
 
 @dataclass(frozen=True, slots=True)

@@ -1653,7 +1653,66 @@ async def test_backlog_287_routes_are_paced(
             assert admitted.status_code == admitted_status, admitted.text
         throttled = await c.request(method, path, json=body, headers=h)
         assert throttled.status_code == 429
-        assert throttled.headers.get("Retry-After") == "1"
+        # BACKLOG #2144: the wait, not a literal. Its value is pinned under a faked clock in
+        # test_admin_write_429_retry_after_is_the_actors_wait; here the real clock has moved a
+        # little since the first write, so the header is the 60 s window less at most that. The
+        # lower bound is above both retired literals (1 and 10), so neither can pass here.
+        assert 10 < int(throttled.headers["Retry-After"]) <= 60
+
+
+async def test_admin_write_429_retry_after_is_the_actors_wait(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2144. The JSON floor sent a literal `Retry-After: 1` whatever the window was, so a
+    # client that honoured it retried inside the window and was refused again. The header is now
+    # the time until this actor's next write would be admitted, rounded up to whole seconds. The
+    # window is not the default, so a pass cannot come from a literal that happens to match. The
+    # limiter's own clock is faked, so no test sleeps.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    service = await _service(
+        engine,
+        AuthSettings(
+            admin_write_min_interval_seconds=2.5,
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+            admin_write_rate_limit_per_actor=2,
+            admin_write_rate_limit_window_seconds=37.5,
+        ),
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    await _add(service, "other", Role.ADMINISTRATOR)
+
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "adm")).json()["token"])
+
+        async def write() -> httpx.Response:
+            return await c.post("/statistics/reset", json=_RESET_BODY, headers=h)
+
+        assert (await write()).status_code == 200  # t=1000
+        clock[0] += 0.4
+        gap = await write()  # 2.1 s of the 2.5 s gap is left
+        assert (gap.status_code, gap.headers["Retry-After"]) == (429, "3")
+        clock[0] = 1010.0
+        assert (await write()).status_code == 200  # the second and last of the budget
+        clock[0] = 1020.0
+        full = await write()  # the t=1000 write leaves the window at 1037.5: 17.5 s away
+        assert (full.status_code, full.headers["Retry-After"]) == (429, "18")
+        # Another actor's writes change nothing about this actor's wait.
+        other = _auth((await _login(c, "other")).json()["token"])
+        assert (
+            await c.post("/statistics/reset", json=_RESET_BODY, headers=other)
+        ).status_code == 200
+        assert (await write()).headers["Retry-After"] == "18"
+        # The header is honest: a client that waits that long is admitted, and one that leaves a
+        # moment early is still refused, with the 1 s minimum rather than 0.
+        clock[0] = 1037.4
+        early = await write()
+        assert (early.status_code, early.headers["Retry-After"]) == (429, "1")
+        clock[0] = 1038.0
+        assert (await write()).status_code == 200
 
 
 async def test_change_own_password_revokes_sessions(engine: Engine) -> None:
