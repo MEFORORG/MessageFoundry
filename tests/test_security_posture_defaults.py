@@ -2354,6 +2354,69 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
             )
 
 
+#: ``[api]`` bools the floor below does not require, each with its reason (vault BACKLOG #2385).
+_API_BOOLS_EXEMPT = {
+    # The desugared copy of [security].serve_web_console, which the [security] floor exempts for the
+    # same reason: turning the console off SHRINKS the surface.
+    "serve_ui": "surface-reducing when flipped",
+    # A topology declaration, not a weakening by itself, and its lone flip does not load (it needs
+    # trusted_proxies). The plaintext hop it can create is named through the acknowledgement below.
+    "tls_terminated_upstream": "topology declaration; its plaintext hop is named by the next entry",
+    # REPORTED, so not an owed gap: named only beside a terminator with no operator certificate, and
+    # its lone flip is refused at load. The plaintext-hop section above pins it (#1179).
+    "plaintext_upstream_hop_acknowledged": "reported, conditional on the topology",
+}
+
+
+def _unreported_api_bools(model: type[ApiSettings]) -> list[str]:
+    """The ``[api]`` bools of ``model`` that, flipped alone from their default, are neither named by
+    ``security_loosenings()`` nor exempt. Takes the model so the control below can add a field."""
+    return [
+        field
+        for field, info in model.model_fields.items()
+        if field not in _API_BOOLS_EXEMPT
+        and isinstance(info.default, bool)
+        and field not in _names(api=model(**{field: not info.default}))
+    ]
+
+
+def test_every_api_bool_is_reported_or_exempt() -> None:
+    """The completeness floor over ``[api]`` (vault BACKLOG #2385).
+
+    The two floors above reach ``[security]``, ``[store]`` and ``[auth]``. The registry takes ``api``
+    too, and nothing looked at its bools, so a new one could ship at an insecure value unnamed."""
+    assert _unreported_api_bools(ApiSettings) == [], (
+        "an [api] bool at its non-default value is NOT named by security_loosenings(). Add it to "
+        "the registry, or to _API_BOOLS_EXEMPT with the reason -- silence is not an option."
+    )
+
+
+def test_the_api_floor_fires_on_an_unlisted_bool() -> None:
+    """The control that makes the empty list above mean something: a made-up ``[api]`` bool that the
+    registry does not name, and nobody exempted, is the one field the floor returns."""
+
+    class _ApiWithANewSwitch(ApiSettings):
+        made_up_allow_anonymous_stats: bool = False
+
+    assert _unreported_api_bools(_ApiWithANewSwitch) == ["made_up_allow_anonymous_stats"]
+
+
+def test_no_api_exemption_outlives_its_field() -> None:
+    """An exemption for a field that is gone, or is no longer a bool, would exempt nothing and read
+    as a decision. Each one must still name a bool ``[api]`` field."""
+    bools = {f for f, info in ApiSettings.model_fields.items() if isinstance(info.default, bool)}
+    assert set(_API_BOOLS_EXEMPT) <= bools
+
+
+def test_exposed_api_docs_are_a_named_loosening() -> None:
+    """``[api].expose_docs`` was the one ``[api]`` bool the new floor found unnamed. The text says
+    what is served and that it asks for no sign-in, and the default names nothing."""
+    assert "expose_docs" not in _names()
+    risk = dict(_pairs(api=ApiSettings(expose_docs=True)))["expose_docs"]
+    assert "/openapi.json" in risk
+    assert "NO sign-in" in risk
+
+
 async def test_posture_route_declares_its_scope_when_no_graph_is_loaded(engine: Engine) -> None:
     """An engine with no registry runner cannot see the connection-scoped declarations, so it SAYS so.
 

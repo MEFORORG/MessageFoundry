@@ -85,6 +85,7 @@ section reference.
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
+| | `[api].expose_docs` | `false` (`true` serves `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
@@ -103,8 +104,8 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
-`[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies` and
-`[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
+`[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies`,
+`[api].plaintext_upstream_hop_acknowledged` and `[api].expose_docs` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed here anyway, and all but `update_url_form` are reported, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
@@ -136,6 +137,8 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > `require_mfa` itself is reported: see its entry below.
 > That gap is enumerated in the floor test's exemption set, so it is a written decision rather than an
 > accident, and a *new* switch in either section cannot join it silently. Closing it is owed work.
+> The `[api]` bools have a floor of their own in the same file (vault BACKLOG #2385): each one is
+> named here or sits on that floor's exemption list with its reason.
 
 `enforcement` (ADR 0148 GIVEN 2) is the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 escape-clamp key, defaulting to `enforce` (byte-identical to the former production-tier refusal). It is
@@ -848,6 +851,17 @@ This section is kept rather than deleted, because the claim it used to make is t
   and may stay. To drop the terminator instead, remove `tls_terminated_upstream`, the acknowledgement
   and `trusted_proxies` together, or the load refuses.
 
+### `[api].expose_docs = true` — the API schema is served with no sign-in
+> **Not conditional** (vault BACKLOG #2385). The three routes exist only while the switch is on, and
+> none of them asks for sign-in, on a loopback bind or off it.
+- **What you lose:** the engine serves `/docs`, `/redoc` and `/openapi.json` to anyone who can reach
+  the API socket. They show every route, parameter and response shape. They hold the schema, not
+  message data.
+- **When acceptable:** a development engine on a loopback bind, while you write a client against it.
+- **Compensating controls:** keep the bind loopback, or list only trusted networks in
+  `[security].allowed_client_networks`. Neither hides the schema from a client that is allowed in.
+- **Reversible:** yes, immediately. Delete the line, or set it to `false`, and restart.
+
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**
 > (vault BACKLOG #2599). It is honoured only when `MEFOR_SECURITY_ENFORCEMENT=warn` is set in the
@@ -1481,6 +1495,7 @@ chapter was not part of the verification above.
 | `[auth].oidc_flow_cache_max` (pending federated sign-in bound) | V2 Validation and Business Logic (anti-automation) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
 | `[api].trusted_proxies` (trust-every-peer forwarded header) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
+| `[api].expose_docs` (API schema and interactive docs served with no sign-in) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `url_query_credential` (per-connection credential in an endpoint URL's query) | V14 Data Protection (14.2.1) | **SC-8** Transmission Confidentiality and Integrity · **IA-5(7)** No Embedded Unencrypted Static Authenticators | §164.312(d) Person or Entity Authentication · §164.312(e)(1) Transmission Security |

@@ -7602,7 +7602,8 @@ def security_loosenings(
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
     (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
-    ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
+    ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
+    #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS
@@ -7997,6 +7998,18 @@ def security_loosenings(
                 "address of their family, so X-Forwarded-For is trusted from EVERY such peer, as the "
                 "refused '*' would be -- any client can declare its own source address, poisoning "
                 "the audit trail, the per-address sign-in limit and the new-client-IP step-up signal",
+            )
+        )
+    # Vault BACKLOG #2385: the [api] bools are under a completeness floor now, and this is the one
+    # that was a deviation with no entry. create_app registers the three routes only when it is on,
+    # and none of them asks for sign-in.
+    if api.expose_docs:
+        out.append(
+            (
+                "expose_docs",
+                "the engine serves /docs, /redoc and /openapi.json with NO sign-in -- anyone who "
+                "can reach the API socket reads every route, parameter and response shape the "
+                "engine has (the schema, not message data)",
             )
         )
     # BACKLOG #1179, owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS
