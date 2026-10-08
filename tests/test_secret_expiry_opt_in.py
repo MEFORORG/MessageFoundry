@@ -432,9 +432,9 @@ async def test_a_vault_transit_engine_with_an_opt_in_says_nothing_alerts(
         security_enforcement=SecurityEnforcement.ENFORCE,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
-        await engine.start()
     try:
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await engine.start()
         _assert_the_line_says_nothing_alerts(engine, caplog.text)
     finally:
         await engine.stop()

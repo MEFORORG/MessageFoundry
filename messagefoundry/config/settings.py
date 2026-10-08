@@ -7689,12 +7689,15 @@ def security_loosenings(
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
     ``cert_monitor`` joins them for ``warn_days = 0`` (BACKLOG #2227).
 
-    **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** Three settings each
-    silence one or more of them with no refusal, and each is named here, so the serve-time warning
-    says so: ``[cert_monitor].warn_days = 0``, ``[secret_rotation].warn_days = 0``, and an
-    ``[[alerts.rules]]`` entry that can send a reminder event to no transport
-    (:func:`reminder_silencing_rules`). ``[auth].initial_password_expiry_hours = 0`` is the fourth
-    way to stop a reminder, and it stays unreported for the reason the paragraph above gives.
+    **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
+    settings silence one or more of them with no refusal, and each is named here, so the serve-time
+    warning says so: ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` at ``0`` or
+    below their defaults, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
+    transport (:func:`reminder_silencing_rules`). Not every way is named.
+    ``[auth].initial_password_expiry_hours = 0`` also stops a reminder and is unreported, as the
+    paragraph above records. ``[alerts].security_notifications_required = false`` with no recipient
+    sends every reminder to the log alone; serve audits that waiver, and this registry does not
+    list it.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -7989,6 +7992,9 @@ def security_loosenings(
     # off with only a debug line from the runner. BACKLOG #2008 step 4: so did an alert rule that sends
     # a reminder event nowhere. Owner answer to #2006 (a): a silent weakening keeps the cell at
     # partial, so each is named here and reaches the serve-time warning and GET /security/posture.
+    # A lead shorter than the shipped default is named too, as #1131 names a limit looser than its
+    # default: a reminder one day ahead leaves no time to renew.
+    cert_default = CertMonitorSettings.model_fields["warn_days"].default
     if cert_monitor.warn_days == 0:
         out.append(
             (
@@ -7999,13 +8005,39 @@ def security_loosenings(
                 "caller's client certificate is never flagged as near expiry",
             )
         )
+    elif cert_monitor.warn_days < cert_default:
+        out.append(
+            (
+                "cert_monitor.warn_days",
+                f"[cert_monitor].warn_days = {cert_monitor.warn_days}, shorter than the default "
+                f"of {cert_default} -- a certificate or CRL file is first flagged only "
+                f"{cert_monitor.warn_days} day(s) before it expires, which may leave too little "
+                "time to renew it",
+            )
+        )
+    rotation_default = SecretRotationSettings.model_fields["warn_days"].default
     if secret_rotation.warn_days == 0:
+        # Not "no alert at all": under enforce, an expired store key and an opted-in expired class
+        # still raise an enforced alert at start (reconcile_rotation_meta, enforce_store_key_expiry,
+        # enforce_secret_expiry), whatever warn_days is. What goes is the periodic reminder.
         out.append(
             (
                 "secret_rotation.warn_days",
-                "[secret_rotation].warn_days = 0 turns the secret-rotation reminder off -- no "
-                "secret_rotation reminder is raised for the store key or any tracked credential, "
-                "however overdue. The start-time expiry refusals still run",
+                "[secret_rotation].warn_days = 0 turns the periodic secret-rotation reminder off "
+                "-- no secret_rotation alert is raised ahead of a due date or while a secret runs "
+                "overdue. Only the start-time checks under enforcement = enforce still alert: a "
+                "store key past its grace, and an expired class listed in "
+                "enforce_secret_expiry_classes",
+            )
+        )
+    elif secret_rotation.warn_days < rotation_default:
+        out.append(
+            (
+                "secret_rotation.warn_days",
+                f"[secret_rotation].warn_days = {secret_rotation.warn_days}, shorter than the "
+                f"default of {rotation_default} -- a secret is first flagged only "
+                f"{secret_rotation.warn_days} day(s) before it is due, which may leave too little "
+                "time to rotate it",
             )
         )
     silencing = reminder_silencing_rules(alerts)

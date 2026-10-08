@@ -1429,7 +1429,10 @@ transports = []   # suppress every event for this connection
 > with `transports = []`. The serve-time loosening warning and `GET /security/posture` list it as
 > `alerts.rules`. The check reads each rule alone, so the last example above is named too: its
 > `connection` glob decides whether a reminder ever matches it, and the check does not try to tell.
-> Give such a rule an `event_type` other than `any` to keep it off the list.
+> An earlier rule that routes the reminders does not clear the entry either. The only way off the
+> list is a rule that cannot match a reminder event: one rule per non-reminder `event_type` you want
+> suppressed, in place of the one `any` rule. That is more rules, and the warning is the cost of the
+> shorter form.
 
 > A rule routing to a transport that isn't configured (e.g. `transports = ["email"]` with a webhook
 > but no SMTP settings) is rejected at startup, so a typo can't silently black-hole an alert.
@@ -1548,7 +1551,7 @@ window and alerts on every scan.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `warn_days` | int | 30 | alert when a served cert expires within this many days; **`0` disables** the monitor, and is named as the security loosening `cert_monitor.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
+| `warn_days` | int | 30 | alert when a served cert expires within this many days; **`0` disables** the monitor. `0`, or any value below `30`, is named as the security loosening `cert_monitor.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
 | `check_interval_seconds` | num | 43200 | rescan cadence (default 12h); the per-cert re-alert throttle is `[alerts].realert_seconds` |
 | `crl_max_reloads` | int | 10000 | how many replaced copies of one CRL file a running hop takes before it refuses the next and asks for a restart (BACKLOG #299). Must be above 0. The CRL reload reads it even when `warn_days` is `0`. The default outlasts a year of hourly CRLs (8,760). **What each held copy costs**, measured on CPython 3.14 / OpenSSL 3.5.7: about four times the CRL file's size plus about 1.5 KB of memory. Each handshake takes about 2 microseconds longer per copy held for its issuer. So 10,000 copies of a 1 KB CRL hold about 40 MB and add about 20 ms to each handshake. Lower it for a large CRL that is reissued often. |
 
@@ -1650,7 +1653,8 @@ refuses to start the engine, with an `enforced = true` alert. So does a listed c
 a keyed store with no recorded age, which means the rotation-meta reconcile failed. The error names each
 class, its age, the limit and the two ways out. Rotate the secret, and the next start detects the new
 value and resets its clock. Or remove the class from the list, and it goes back to alert-only. The list
-ships empty, so a class you do not list only alerts, as before. Under `enforcement = warn` the list does
+ships empty, so a class you do not list only alerts, as before. "Alert-only" holds while `warn_days` is
+above `0`; with `warn_days = 0` the periodic reminder is off and an unlisted class does not alert at all. Under `enforcement = warn` the list does
 nothing but log a warning. A keyless store, and a `vault_transit` store, fingerprint no secrets, so
 the engine tracks no non-DEK class there at all. On those stores the list refuses nothing, **and no
 non-DEK class raises a rotation alert either**, listed or not; the engine logs a warning saying so
@@ -1672,7 +1676,7 @@ tracked; set `warn_days = 0` to disable the reminder.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `warn_days` | int | 14 | alert when a tracked secret is due within this many days; **`0` disables** the reminder, and is named as the security loosening `secret_rotation.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
+| `warn_days` | int | 14 | alert when a tracked secret is due within this many days; **`0` disables** the reminder. `0`, or any value below `14`, is named as the security loosening `secret_rotation.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
 | `check_interval_seconds` | num | 86400 | rescan cadence (default 24h); the per-secret re-alert throttle is `[alerts].realert_seconds` |
 | `store_key_last_rotated` | str | — | ISO `YYYY-MM-DD` the store DEK was last rotated; **unset ⇒ the DEK is still tracked live-by-default** off a persisted first-seen stamp (this date is an override) |
 | `store_key_max_age_days` | int | 365 | rotate the store DEK within this many days of its effective last-rotated (the operator date if set, else the persisted stamp) |

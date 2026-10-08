@@ -1147,8 +1147,8 @@ class Engine:
                 "[secret_rotation].enforce_secret_expiry_classes is set but this store does not "
                 "fingerprint secrets (keyless, or vault_transit, which keeps the store key out of "
                 "this process). The engine tracks no rotation age for the non-DEK secret classes "
-                "here, so those classes neither refuse nor alert: no secret_rotation_due reminder "
-                "fires for them on this store"
+                "here, so those classes neither refuse nor alert: no secret_rotation alert fires "
+                "for them on this store"
             )
             return frozenset()
         return frozenset(held_env_secret_values()) | frozenset(self._connector_secret_env_values())

@@ -84,7 +84,7 @@ section reference.
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
-| | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
+| | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
@@ -569,21 +569,24 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart. Nothing
   about the key or the store changes either way; only whether the engine agrees to start.
 
-### `[cert_monitor].warn_days = 0` or `[secret_rotation].warn_days = 0` — a credential reminder is off
-Named as `cert_monitor.warn_days` and `secret_rotation.warn_days` (ASVS 6.4.5, BACKLOG #2227).
-- **What you lose:** the renewal reminder. With the cert monitor off, no `cert_expiry` alert is raised
-  for any certificate or CRL file the monitor watches, and a service caller's client certificate is
-  never flagged as near expiry. With the rotation reminder off, no `secret_rotation` alert is raised for
-  the store key or any tracked credential, however overdue. Before this entry, each showed only as a
-  debug line from its runner.
-- **What you keep:** the start-time expiry refusals. A calendar-expired store key still refuses to start
-  under `enforce_store_key_expiry`, and so does an opted-in class under `enforce_secret_expiry_classes`.
-  The `[alerts]` recipient gate also counts each reminder separately, so turning one off does not hide
-  the others.
+### `[cert_monitor].warn_days` or `[secret_rotation].warn_days` at `0`, or below its default — a credential reminder is off or late
+Named as `cert_monitor.warn_days` and `secret_rotation.warn_days` (ASVS 6.4.5, BACKLOG #2227). A
+value below the shipped default (`30` and `14` days) is named too, as the sign-in limits are when looser
+than theirs: a reminder one day ahead leaves no time to renew.
+- **What you lose:** the renewal reminder, or the time it gives. At `0`, the cert monitor raises no
+  `cert_expiry` alert for any certificate or CRL file it watches, and a service caller's client
+  certificate is never flagged as near expiry. At `0`, the rotation reminder raises no
+  `secret_rotation` alert ahead of a due date or while a secret runs overdue. Before this entry, each
+  showed only as a debug line from its runner.
+- **What you keep:** the start-time checks under `enforcement = enforce`, whatever `warn_days` is. A
+  store key past `store_key_max_age_days + enforce_grace_days` still raises an enforced alert and
+  refuses to start under `enforce_store_key_expiry`, and an expired class listed in
+  `enforce_secret_expiry_classes` does the same. The `[alerts]` recipient gate also counts each
+  reminder separately, so turning one off does not hide the others.
 - **When acceptable:** an instance where something outside the engine tracks the same certificates or
   secrets and reminds a person in time.
 - **Compensating controls:** that outside tracker, and a calendar entry per credential.
-- **Reversible:** yes. Set a value above `0`, or delete the line, and restart.
+- **Reversible:** yes. Set the default or more, or delete the line, and restart.
 
 ### `[[alerts.rules]]` that send a credential reminder to no transport — the reminder is recorded but nobody is told
 Named as `alerts.rules`, with each rule's position, its `id`, and the reminder events it can match
@@ -599,7 +602,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **When acceptable:** a reminder already reaches people some other way, and the rule exists to stop a
   duplicate.
 - **Compensating controls:** route the reminder events to a transport somebody reads, ahead of the
-  silencing rule, since the first matching rule wins.
+  silencing rule, since the first matching rule wins. The entry stays listed even so, because the check
+  reads each rule alone.
 - **Reversible:** yes. Remove the rule, narrow its `event_type`, or give it a transport, and restart.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating

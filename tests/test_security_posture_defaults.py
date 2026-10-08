@@ -910,13 +910,28 @@ def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
         )
     )
     assert "cert_expiry reminder" in named["cert_monitor.warn_days"]
-    assert "secret_rotation reminder" in named["secret_rotation.warn_days"]
-    # The control: any value above 0 keeps the reminder on and names nothing.
-    on = _names(
-        cert_monitor=CertMonitorSettings(warn_days=1),
-        rotation=SecretRotationSettings(warn_days=1),
+    assert "no secret_rotation alert" in named["secret_rotation.warn_days"]
+    # Not "however overdue": under enforce the start-time checks still alert, and the text says so.
+    assert "start-time checks" in named["secret_rotation.warn_days"]
+    # The control: the shipped leads, and longer ones, name nothing.
+    for cert, rotation in ((30, 14), (90, 60)):
+        on = _names(
+            cert_monitor=CertMonitorSettings(warn_days=cert),
+            rotation=SecretRotationSettings(warn_days=rotation),
+        )
+        assert "cert_monitor.warn_days" not in on and "secret_rotation.warn_days" not in on
+
+
+def test_a_reminder_lead_below_its_default_is_a_named_loosening() -> None:
+    """As #1131 names a limit looser than its default: a one-day lead leaves no time to renew."""
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(warn_days=29),
+            rotation=SecretRotationSettings(warn_days=1),
+        )
     )
-    assert "cert_monitor.warn_days" not in on and "secret_rotation.warn_days" not in on
+    assert "warn_days = 29, shorter than the default of 30" in named["cert_monitor.warn_days"]
+    assert "warn_days = 1, shorter than the default of 14" in named["secret_rotation.warn_days"]
 
 
 def _rules(*rules: dict[str, object]) -> AlertsSettings:
