@@ -341,9 +341,21 @@ def initial_credential_window_hours(auth: AuthService) -> float | None:
     return None if deadline is None else deadline / 3600.0
 
 
-def _allow_no_auth(app_state: object) -> bool:
-    """Whether this app explicitly opted out of auth (embedding/dev). Default: fail-closed."""
-    return bool(getattr(app_state, "allow_no_auth", False))
+#: The 503 detail every route gives when no auth service is attached and the app did not opt in to
+#: the open mode. One text (vault BACKLOG #3216): the sign-in routes used to say "not enabled",
+#: which named a switch that no longer exists.
+AUTH_NOT_CONFIGURED = "authentication is not configured"
+
+
+def open_mode(app_state: object) -> bool:
+    """Whether this app runs in the open mode: no auth service attached, AND the opt-in flag set.
+
+    The one spelling of the check (vault BACKLOG #3216). The request gates and the posture all ask
+    here, so they cannot drift apart. Both halves are read every time: a service beside the flag
+    still requires sign-in, and no service without the flag fails closed (503)."""
+    return getattr(app_state, "auth", None) is None and bool(
+        getattr(app_state, "allow_no_auth", False)
+    )
 
 
 def _audit_all_authz(app_state: object) -> bool:
@@ -963,9 +975,9 @@ async def _session_caller(
     the same way and leaves its idle clock alone."""
     auth = get_auth(request)
     if auth is None:
-        if _allow_no_auth(request.app.state):
+        if open_mode(request.app.state):
             return None, _SYSTEM_IDENTITY
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not configured")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AUTH_NOT_CONFIGURED)
     identity = await auth.identity_for_token(bearer_token(request), activity=activity)
     if identity is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
@@ -1721,7 +1733,7 @@ async def optional_identity(request: Request) -> Identity | None:
     It is still logged and audited like every other refusal (:func:`record_repeated_credential`)."""
     auth = get_auth(request)
     if auth is None:
-        return _SYSTEM_IDENTITY if _allow_no_auth(request.app.state) else None
+        return _SYSTEM_IDENTITY if open_mode(request.app.state) else None
     if sole_authorization(request) is None:
         await record_repeated_credential(request, "authorization")
         return None
@@ -1777,7 +1789,7 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
         return None  # cross-site / disallowed browser Origin — reject before accept()
     auth: AuthService | None = getattr(websocket.app.state, "auth", None)
     if auth is None:
-        return _SYSTEM_IDENTITY if _allow_no_auth(websocket.app.state) else None
+        return _SYSTEM_IDENTITY if open_mode(websocket.app.state) else None
     if sole_authorization(websocket) is None:
         # BACKLOG #2454: refused like the HTTP reads, and recorded here because a handshake has no
         # exception handler to do it. ws_token below would read the repeat as no token anyway.

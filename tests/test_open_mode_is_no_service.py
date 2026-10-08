@@ -19,9 +19,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+from starlette.datastructures import State
 from starlette.testclient import TestClient, WebSocketDenialResponse
 
 from messagefoundry.api import create_app, create_managed_app
+from messagefoundry.api.security import AUTH_NOT_CONFIGURED, open_mode
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
@@ -32,6 +34,7 @@ from messagefoundry.config.settings import (
     ServiceSettings,
     _removed_key_message,
     _section_models,
+    load_settings,
 )
 from messagefoundry.pipeline import Engine
 from tests._ast_sites import callee_name
@@ -158,6 +161,9 @@ async def e(request):
         return
     auth, identity = await _session_caller(request)
     return auth.enabled or get_auth(request).enabled or self.auth.enabled or self._auth.enabled
+def f(deps):
+    held = deps.auth_service
+    return held.enabled or deps.auth_service.enabled
 def control(dr, service):
     return dr.enabled and service.enabled and getattr(dr, "enabled", False)
 """
@@ -172,8 +178,10 @@ def test_the_scanner_finds_every_binding_form() -> None:
         "auth",
         "auth",
         "current",
+        "deps.auth_service",
         "found",
         "get_auth(request)",
+        "held",
         "self._auth",
         "self.auth",
         "service",
@@ -206,15 +214,50 @@ def test_every_removed_key_is_refused_by_the_section_built_in_code(section: str,
     is refused by ``tests/test_settings_unknown_kwargs.py``."""
     model = _section_models()[section]
     model()  # control: the same section builds without the key
-    # The loader's own message. `[auth].enabled` alone keeps the older, more specific refusal
-    # AuthSettings carries (vault BACKLOG #2825), which runs first.
-    message = re.escape(_removed_key_message(section, key, _REMOVED_KEYS[section, key]))
-    if (section, key) == ("auth", "enabled"):
-        message = "AuthSettings has no `enabled` field"
+    # One refusal for every key, `[auth].enabled` included (vault BACKLOG #3216): AuthSettings no
+    # longer carries a second validator of its own.
+    reason = _REMOVED_KEYS[section, key]
+    message = re.escape(_removed_key_message(section, key, reason, built_directly=True))
     with pytest.raises(ValueError, match=message):
         model.model_validate({key: False})
     with pytest.raises(ValueError, match=message):
         ServiceSettings.model_validate({section: {key: False}})
+
+
+@pytest.mark.parametrize(("section", "key"), sorted(_REMOVED_KEYS))
+def test_each_refusal_names_only_the_places_the_key_could_be(section: str, key: str) -> None:
+    """The removal step fits the surface that refused (vault BACKLOG #3216).
+
+    The loader reads the file and the environment, so its message names the variable. A section
+    built directly reads no environment, so its message names none: four of the six reasons used
+    to carry the loader's "unset MEFOR_..." step into a refusal an environment variable cannot
+    cause."""
+    variable = f"MEFOR_{section.upper()}_{key.upper()}"
+    reason = _REMOVED_KEYS[section, key]
+    assert "MEFOR_" + section.upper() not in reason, "the reason carries the decision only"
+    assert variable in _removed_key_message(section, key, reason), "control: the loader names it"
+    with pytest.raises(ValueError) as built:
+        _section_models()[section].model_validate({key: False})
+    assert variable not in str(built.value)
+    assert "built directly" in str(built.value)
+    assert f"Remove `{key}`" in str(built.value)
+    # The loader's own refusal, from the environment: it names the variable that set the key.
+    with pytest.raises(ValueError, match=variable):
+        load_settings(environ={variable: "false"}, default_file=False)
+
+
+def test_only_the_auth_switch_in_code_is_pointed_at_the_open_mode() -> None:
+    """``AuthSettings(enabled=False)`` in code most likely wanted no sign-in, so the refusal says how.
+
+    The loader's refusal of the same key does not: ``serve`` never reaches the open mode."""
+    with pytest.raises(ValueError, match="allow_no_auth=True and no auth settings"):
+        AuthSettings.model_validate({"enabled": False})
+    with pytest.raises(ValueError) as loaded:
+        load_settings(environ={"MEFOR_AUTH_ENABLED": "false"}, default_file=False)
+    assert "allow_no_auth" not in str(loaded.value)
+    with pytest.raises(ValueError) as security:
+        SecuritySettings.model_validate({"require_sign_in": False})
+    assert "allow_no_auth" not in str(security.value)
 
 
 def test_a_subclass_of_a_section_inherits_its_refusals() -> None:
@@ -314,3 +357,104 @@ async def test_console_pages_ask_for_a_session_in_the_open_mode(tmp_path: Path, 
         answer = await c.get(page)
     assert answer.status_code == 303
     assert answer.headers["location"].startswith("/ui/login")
+
+
+# --- vault BACKLOG #3216: every open-mode check, in every state ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("service", "flag", "protected", "is_open"),
+    [
+        pytest.param(False, False, 503, False, id="no-service"),
+        pytest.param(False, True, 200, True, id="no-service-flag"),
+        pytest.param(True, False, 401, False, id="service"),
+        pytest.param(True, True, 401, False, id="service-flag"),
+    ],
+)
+def test_every_open_mode_check_agrees_in_every_state(
+    tmp_path: Path, service: bool, flag: bool, protected: int, is_open: bool
+) -> None:
+    """The open mode is no service AND the flag, at every place that asks.
+
+    Four places ask: the ``require`` gate, ``optional_identity``, ``authorize_ws`` and the posture.
+    Each is read here in all four states, so a check that drifts from the others turns one row red.
+    The flag is set on ``app.state`` after the build, because both factories refuse it beside a
+    service."""
+    app = create_managed_app(
+        db_path=tmp_path / "matrix.db",
+        poll_interval=0.05,
+        auth_settings=(
+            AuthSettings(require_mfa=False, notify_security_events=False) if service else None
+        ),
+        egress_settings=_EGRESS,
+    )
+    with TestClient(app) as tc:
+        app.state.allow_no_auth = flag
+        assert tc.get("/stats").status_code == protected  # the `require` gate
+        # optional_identity: the build version goes only to an identified caller.
+        assert (tc.get("/health").json()["version"] is not None) is is_open
+        if is_open:  # authorize_ws
+            with tc.websocket_connect("/ws/stats") as ws:
+                assert "outbox_by_status" in ws.receive_json()
+        else:
+            with (
+                pytest.raises(WebSocketDenialResponse) as denied,
+                tc.websocket_connect("/ws/stats"),
+            ):
+                pass
+            assert denied.value.status_code == 403
+        # The posture: a signed-in read where a service is attached, so the row is read, not refused.
+        headers: dict[str, str] = {}
+        if service:
+            assert tc.portal is not None
+            tc.portal.call(functools.partial(_add, app.state.auth, "root", Role.ADMINISTRATOR))
+            login = tc.post(
+                "/auth/login", json={"username": "root", "password": PW, "provider": "local"}
+            )
+            assert login.status_code == 200, login.text
+            headers = _auth(login.json()["token"])
+        posture = tc.get("/security/posture", headers=headers)
+        if service or is_open:
+            assert ("allow_no_auth" in _switches(posture)) is is_open
+        else:
+            assert posture.status_code == 503, "fail closed: no service and no opt-in"
+
+
+@pytest.mark.parametrize(
+    ("auth", "flag", "expected"),
+    [
+        pytest.param(None, False, False, id="no-service"),
+        pytest.param(None, True, True, id="no-service-flag"),
+        pytest.param(object(), False, False, id="service"),
+        pytest.param(object(), True, False, id="service-flag"),
+        pytest.param(None, "yes", True, id="truthy-flag"),
+    ],
+)
+def test_the_helper_reads_both_halves(auth: object, flag: object, expected: bool) -> None:
+    """``open_mode`` is no service AND the flag. A state that never set either is closed."""
+    assert open_mode(State({"auth": auth, "allow_no_auth": flag})) is expected
+    assert open_mode(State()) is False, "fail closed: an app that set neither"
+    assert open_mode(State({"allow_no_auth": True})) is True, "an unset service is no service"
+
+
+def test_no_service_answers_one_503_text_on_every_surface(tmp_path: Path) -> None:
+    """With no service and no opt-in, each provider gives the same 503 detail.
+
+    The sign-in routes and the console's account pages used to say "authentication is not enabled",
+    which named a switch that vault BACKLOG #2825 removed. The gate already said "not configured"."""
+    assert AUTH_NOT_CONFIGURED == "authentication is not configured"
+    app = create_managed_app(
+        db_path=tmp_path / "text.db", poll_interval=0.05, serve_ui=True, egress_settings=_EGRESS
+    )
+    with TestClient(app) as tc:
+        assert tc.get("/health").status_code == 200, "control: the app is serving"
+        gate = tc.get("/stats")  # api.security._session_caller
+        sign_in = tc.post(  # api.auth_routes._service
+            "/auth/login", json={"username": "root", "password": PW, "provider": "local"}
+        )
+        console = tc.get("/ui/account", follow_redirects=False)  # the console's own _service
+    for answer in (gate, sign_in):
+        assert (answer.status_code, answer.json()["detail"]) == (503, AUTH_NOT_CONFIGURED)
+    assert console.status_code == 503
+    assert AUTH_NOT_CONFIGURED in console.text
+    assert "not enabled" not in console.text

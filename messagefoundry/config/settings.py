@@ -411,10 +411,14 @@ class _Section(_InputHidingModel):
         section built in code skips the loader, and ``extra="ignore"`` would drop the key, so
         ``SecuritySettings(require_sign_in=False)`` would quietly keep sign-in on. Unlike a blanket
         ``extra="forbid"``, this names only keys that were removed, and its message carries no value.
-        So ``security show`` on a file still holding one refuses with the fix in its message, and the
-        operator removes the line, by hand or with ``security set`` and a ``null`` value.
+        ``security show`` builds ``[security]`` this way, so on a file still holding one of that
+        section's removed keys it refuses with the fix in its message. The operator removes the
+        line, by hand or with ``security set`` and a ``null`` value. The other sections' removed
+        keys reach this refusal only from code.
 
-        Keys are checked in ``_REMOVED_KEYS`` order, so the key named is the one the loader names."""
+        Keys are checked in ``_REMOVED_KEYS`` order, so the key named is the one the loader names.
+        The removal step differs from the loader's, because a section built here read no
+        environment variable (:func:`_removed_key_message`)."""
         if isinstance(data, Mapping) and (removed := _removed_keys_for(cls)):
             for key, refusal in removed.items():
                 if key in data:
@@ -2802,23 +2806,8 @@ class AuthSettings(_Section):
 
     There is no sign-in switch here (vault BACKLOG #2825). Settings that exist build an auth service,
     and a service always requires sign-in. The open mode is the app factories' ``allow_no_auth=True``
-    with no settings at all."""
-
-    @model_validator(mode="before")
-    @classmethod
-    def _refuse_the_removed_sign_in_switch(cls, data: Any) -> Any:
-        """Refuse ``enabled`` loudly rather than drop it (vault BACKLOG #2825).
-
-        ``extra="ignore"`` would drop it, so settings built in code with ``enabled=False`` would
-        silently require sign-in after all. The loader already refuses the key from a file or the
-        environment as REMOVED (``_REMOVED_KEYS``), before any model is built."""
-        if isinstance(data, Mapping) and "enabled" in data:
-            raise ValueError(
-                "AuthSettings has no `enabled` field: sign-in cannot be turned off (vault BACKLOG "
-                "#2825). For an app with no sign-in, pass the app factory allow_no_auth=True and no "
-                "auth settings"
-            )
-        return data
+    with no settings at all. ``enabled`` passed in code is refused by the base class, like every
+    other removed key (``_Section._refuse_removed_keys``)."""
 
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
@@ -6829,53 +6818,79 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "allow_single_factor_admin_when_exposed, allow_unverified_alert_smtp_tls, "
         "[alerts].security_notifications_required, a per-connection cleartext_accepted, "
         "tls_hop_attested or tls_revocation_attested (each with its reason), the process-wide "
-        "MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Relax the one you mean, "
-        "or delete this line"
+        "MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Relax the one you mean"
     ),
     ("ai", "data_class"): (
         "the data class was removed, not relocated: every instance now carries patient data "
         "(BACKLOG #1279). [ai].data_class had already moved to "
-        "[security].handles_real_patient_data under ADR 0118, and that key is retired too — delete "
-        "this line"
+        "[security].handles_real_patient_data under ADR 0118, and that key is retired too"
     ),
     # BACKLOG #2000. It was loader plumbing that an operator could also set, and setting it changed
     # startup while [security] reported no choice. `serve` now reads the same fact from what
     # [security] was given (SecuritySettings.serve_web_console_explicit), so nothing writes this key.
     ("api", "serve_ui_explicit"): (
         "it was an internal marker the loader set, never an operator setting (BACKLOG #2000). "
-        "Remove it from the config file, or unset MEFOR_API_SERVE_UI_EXPLICIT if the environment "
-        "sets it. To request the web console explicitly, set [security].serve_web_console"
+        "To request the web console explicitly, set [security].serve_web_console"
     ),
     # Vault BACKLOG #2719. Named here rather than left to the unknown-key refusal, because that one
     # offers the nearest spelling, and for this key the nearest is `require_mfa`: an operator following
     # the hint would swap one loosening for another.
     ("security", "require_sign_in"): (
         "`serve` always requires sign-in, on every bind, and this switch was removed rather than "
-        "relocated (vault BACKLOG #2719). Remove this line, or unset MEFOR_SECURITY_REQUIRE_SIGN_IN "
-        "if the environment sets it. On a store with no Administrator yet, create the first one "
-        "with `messagefoundry provision-admin`"
+        "relocated (vault BACKLOG #2719). On a store with no Administrator yet, create the first "
+        "one with `messagefoundry provision-admin`"
     ),
     # Vault BACKLOG #2719. It had moved to [security].require_sign_in under ADR 0118, and that key is
     # gone too, so the relocation notice would have named a key that no longer exists.
     ("auth", "enabled"): (
         "`serve` always requires sign-in, and the switch that turned it off was removed (vault "
         "BACKLOG #2719). ADR 0118 had relocated it to [security].require_sign_in, and that key is "
-        "retired too. Remove this line, or unset MEFOR_AUTH_ENABLED if the environment sets it"
+        "retired too"
     ),
     # BACKLOG #2090 (ADR 0066 §12): `false` could only start the mode that deadlocks.
     ("pipeline", "require_rcsi_for_pooled"): (
         "a SQL Server store no longer opens with READ_COMMITTED_SNAPSHOT off. The pooled start "
         "check also always fails closed, so this key has nothing left to relax (BACKLOG #2090, "
-        "ADR 0066 section 12). Remove it from the config file, or unset "
-        "MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED if the environment sets it. To run pooled on SQL "
-        "Server, turn READ_COMMITTED_SNAPSHOT on for the database"
+        "ADR 0066 section 12). To run pooled on SQL Server, turn READ_COMMITTED_SNAPSHOT on for "
+        "the database"
     ),
 }
 
 
-def _removed_key_message(section: str, key: str, reason: str) -> str:
+#: What an embedder who passed a removed key in code most likely wanted, where that differs from
+#: what an operator wanted. Added only to the refusal a section built directly gives: `serve` cannot
+#: reach the open mode, so the loader's message does not offer it.
+_REMOVED_KEY_BUILT_DIRECTLY_HINT: dict[tuple[str, str], str] = {
+    ("auth", "enabled"): (
+        "For an app with no sign-in, pass the app factory allow_no_auth=True and no auth settings"
+    ),
+}
+
+
+def _removed_key_message(
+    section: str, key: str, reason: str, *, built_directly: bool = False
+) -> str:
+    """The refusal for a removed key: the decision (``reason``), then how to remove the key.
+
+    The removal step depends on where the key came from (vault BACKLOG #3216). The loader reads a
+    file and the environment, so it names both. A section built directly reads neither: code
+    passed the key, or ``security show`` read it from the file's table. Naming an environment
+    variable there would send the reader to a place the key cannot be."""
+    if built_directly:
+        fix = (
+            "This section was built directly, not by the config loader, so no environment "
+            f"variable set it. Remove `{key}` from the arguments or the file table it was built "
+            "from"
+        )
+        if hint := _REMOVED_KEY_BUILT_DIRECTLY_HINT.get((section, key)):
+            fix = f"{fix}. {hint}"
+    else:
+        fix = (
+            f"Remove it from the config file, or unset {_ENV_PREFIX}{section.upper()}_{key.upper()} "
+            "if the environment sets it"
+        )
     return (
-        f"[{section}].{key} was REMOVED and is no longer accepted: {reason} "
+        f"[{section}].{key} was REMOVED and is no longer accepted: {reason}. {fix} "
         "(see docs/CONFIGURATION.md)."
     )
 
@@ -6890,7 +6905,7 @@ def _removed_keys_for(model: type[BaseModel]) -> dict[str, str]:
     then. A section built at module level anywhere above this function would raise ``NameError``."""
     sections = {name for name, m in _section_models().items() if issubclass(model, m)}
     return {
-        key: _removed_key_message(section, key, reason)
+        key: _removed_key_message(section, key, reason, built_directly=True)
         for (section, key), reason in _REMOVED_KEYS.items()
         if section in sections
     }
