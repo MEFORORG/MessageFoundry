@@ -2435,9 +2435,11 @@ class LoggingSettings(_Section):
     @field_validator("ntp_peer")
     @classmethod
     def _check_ntp_peer(cls, value: str | None) -> str | None:
-        # The same text reaches the socket layer through the time-sync probe, whose caller catches
-        # OSError only, so the same fault stopped a require_time_sync start with a traceback.
-        return _checked_host_text(value, "[logging].ntp_peer")
+        # The time-sync probe hands this text to the socket layer, and its caller catches OSError
+        # only. A NUL, or non-ASCII text the encoding refuses, raised TypeError there, so a
+        # require_time_sync start died with a traceback (measured). ASCII text with a bad label is
+        # a gaierror, which that caller already warns on or refuses cleanly, so it is left to it.
+        return _checked_host_text(value, "[logging].ntp_peer", ascii_too=False)
 
     @field_validator("forward_tls_crl_file")
     @classmethod
@@ -4158,7 +4160,7 @@ def _names_this_host(host: str) -> bool:
     return addr is not None and (addr.is_loopback or addr.is_unspecified)
 
 
-def _checked_host_text(value: str | None, setting: str) -> str | None:
+def _checked_host_text(value: str | None, setting: str, *, ascii_too: bool = True) -> str | None:
     """``value`` unchanged, or a ``ValueError`` naming ``setting`` when it is text that cannot name
     a host. The message never quotes the value.
 
@@ -4166,11 +4168,17 @@ def _checked_host_text(value: str | None, setting: str) -> str | None:
     the socket layer encodes a host with the "idna" codec before it resolves or connects, so text
     that codec refuses raised ``UnicodeEncodeError`` out of the start, which is not an ``OSError``
     and so was caught nowhere. At least an empty label (``a..b``), an encoded label over 63
-    characters and a C1 control are such text. An IP literal and an ordinary name both pass."""
+    characters and a C1 control are such text. An IP literal and an ordinary name both pass.
+
+    ``ascii_too=False`` runs the encoding check on non-ASCII text only. That is for a setting whose
+    caller hands ASCII text to the socket layer on a path that reports a bad label as an
+    ``OSError``, which that caller already handles."""
     if value is None:
         return value
     if has_lone_surrogate(value) or has_control_char(value):
         raise ValueError(f"{setting} must not contain a control character or an undecodable byte")
+    if not ascii_too and value.isascii():
+        return value
     try:
         value.encode("idna")
     except UnicodeError:
@@ -4193,7 +4201,8 @@ def _socket_form(host: str) -> str:
     ``[logging].forward_host``, and another caller still gets an answer."""
     text = host.strip()
     try:
-        return text.encode("idna").decode("ascii")
+        # Trimmed again: the encoding drops an invisible character, which can uncover a space.
+        return text.encode("idna").decode("ascii").strip()
     except UnicodeError:
         return text
 

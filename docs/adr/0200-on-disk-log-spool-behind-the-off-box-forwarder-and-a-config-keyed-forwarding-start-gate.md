@@ -194,7 +194,9 @@ to the collector, so a down collector or a slow DNS server still cannot block a 
 address, the gate decides as it did before this amendment. The same config can therefore pass
 before an interface is up and refuse at the next start; the WARNING is the record of which.
 The gate runs before logging is configured, so `serve` writes that line twice: to stderr where
-the gate runs, and again through the configured log handlers once they exist. A caller other
+the gate runs, and again through the configured log handlers once they exist. The second copy
+is an ordinary WARNING, so `[logging].level = "ERROR"` keeps it out of the log file and off the
+collector, and stderr then holds the only copy. A caller other
 than `serve` gets it on its own logger only. A refusal resting on a failed probe would be the kind of fault
 R4 (a) keyed the gate on configuration to avoid. Whether it should refuse instead is an open
 question for the owner.

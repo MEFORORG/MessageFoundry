@@ -186,6 +186,9 @@ def test_a_short_os_name_does_not_claim_a_qualified_one(
         ("Eng1.Corp.Test.", {"eng1.corp.test", "eng1"}),
         ("ENG1", {"eng1"}),
         ("", set()),
+        # A non-ASCII OS name is held in the form the socket layer dials, so it meets a collector
+        # written either way.
+        ("B" + chr(0xDC) + "cher.Corp.Test", {"xn--bcher-kva.corp.test", "xn--bcher-kva"}),
     ],
 )
 def test_the_own_names_come_from_the_os_name_alone(
@@ -395,18 +398,22 @@ def test_a_host_the_network_layer_cannot_encode_is_refused_at_load(
     _assert_the_validator_does_not_echo(host, "network layer can encode")
 
 
-def test_each_idna_refusal_is_a_different_fault() -> None:
-    """The five entries above are five faults, not one fault spelt five ways. The prohibited
-    character is refused as itself, and not as the empty label an invisible one would leave."""
+def test_the_prohibited_character_case_is_not_an_empty_label_in_disguise() -> None:
+    """The prohibited character is refused as itself. An invisible one would be dropped by the
+    encoding and refused as the empty label it leaves, which an earlier version of this list
+    used by mistake."""
 
     def reason(host: str) -> str:
         with pytest.raises(UnicodeError) as refused:
             host.encode("idna")
         return str(refused.value)
 
-    prohibited = reason(_IDNA_INVALID_HOSTS[4])
-    assert "empty" not in prohibited and "too long" not in prohibited
-    assert "empty" in reason(_IDNA_INVALID_HOSTS[0])
+    empty_label = reason("siem..corp.test")
+    prohibited = reason("siem" + chr(0xFFFD) + ".corp")
+    invisible = reason(chr(0x200B) + ".corp")  # maps to nothing, so it fails as an empty label
+    # Compared with each other, never with CPython's wording, which has changed between versions.
+    assert prohibited != empty_label
+    assert invisible.split(":", 1)[-1] == reason(".corp").split(":", 1)[-1]
 
 
 @pytest.mark.parametrize(
@@ -430,13 +437,20 @@ def test_an_encodable_host_still_loads(tmp_path: Path, host: str) -> None:
     assert _verified(tmp_path, host=host).forward_host == host
 
 
-@pytest.mark.parametrize("peer", [*_IDNA_INVALID_HOSTS, "ntp\x00"])
-def test_the_time_sync_peer_gets_the_same_host_text_check(peer: str) -> None:
-    """``[logging].ntp_peer`` reaches the socket layer too, through a caller that catches OSError
-    only, so the same text stopped a ``require_time_sync`` start with a traceback."""
+@pytest.mark.parametrize("peer", ["ntp\x00", "ntp" + chr(0x85) + ".corp", "ntp" + chr(0xFFFD)])
+def test_the_time_sync_peer_refuses_text_that_raised_a_traceback(peer: str) -> None:
+    """``[logging].ntp_peer`` reaches the socket layer through a caller that catches OSError only.
+    A NUL, or non-ASCII text the encoding refuses, raised TypeError there (measured)."""
     with pytest.raises(ValueError, match=r"\[logging\]\.ntp_peer"):
         LoggingSettings(ntp_peer=peer)
-    assert LoggingSettings(ntp_peer="time.corp.test").ntp_peer == "time.corp.test"
+
+
+@pytest.mark.parametrize("peer", ["time.corp.test", "ntp..corp.test", ".ntp", "x" * 64 + ".corp"])
+def test_the_time_sync_peer_leaves_an_ascii_typo_to_the_probe(peer: str) -> None:
+    """The control, and a promise kept: an ASCII name with a bad label is a ``gaierror`` at the
+    probe, which ``serve`` warns on, or refuses cleanly under ``time_sync_fail_closed``. Refusing
+    it at load would turn that warning into a refused start, so it still loads."""
+    assert LoggingSettings(ntp_peer=peer).ntp_peer == peer
 
 
 def _fullwidth(text: str) -> str:
@@ -464,6 +478,9 @@ def test_the_gate_compares_the_form_the_socket_layer_will_dial(
         (soft_localhost, "loopback"),
         (spaced_own_name, "own name"),
         (wide_own_address, "own name or one of its own addresses"),
+        # A space the encoding uncovers, once the invisible character beside it is dropped.
+        ("localhost " + chr(0x200B), "loopback"),
+        (chr(0x200B) + " 127.0.0.1", "loopback"),
     ):
         reason = forwarding_gate_refusal(_verified(tmp_path, host=host))
         assert reason is not None and needle in reason, ascii(host)
