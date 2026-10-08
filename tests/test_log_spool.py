@@ -622,3 +622,37 @@ def test_the_full_spool_report_names_a_read_fault_only_when_there_was_one(
         assert ("3 read(s) of the spool have failed" in report) is faulted
     finally:
         spool.close()
+
+
+# --- BACKLOG #2279: follow-ups from the two review rounds of engine PR 1725 -------------------------
+
+
+def _deny_unlink(self: Path, missing_ok: bool = False) -> None:
+    raise PermissionError(13, "file in use")
+
+
+def test_a_segment_whose_delete_failed_still_counts_against_the_cap(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sent segment that would not delete is still on disk. Forgetting its size let the directory
+    grow past the cap by one segment per failed delete."""
+    size = len(_entry(0).encode())
+    spool = LogSpool(spool_dir, max_bytes=size * 2, segment_bytes=size)
+    spool.open()
+    try:
+        assert spool.append(_entry(0)) and spool.append(_entry(1))
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", _deny_unlink)
+            assert _drain(spool) == ["record 0000", "record 0001"]
+            assert spool.undeleted_segments == 2
+            on_disk = sum(p.stat().st_size for p in _segments(spool_dir))
+            assert spool.bytes_used == on_disk == size * 2
+            assert spool.append(_entry(2)) is False  # the cap still holds
+            assert spool.dropped == 1
+        # Deletes work again: an append that would have dropped reclaims the space first.
+        assert spool.append(_entry(2))
+        assert spool.undeleted_segments == 0
+        assert spool.bytes_used == sum(p.stat().st_size for p in _segments(spool_dir)) == size
+        assert _drain(spool) == ["record 0002"]  # the sent entries are not sent again
+    finally:
+        spool.close()

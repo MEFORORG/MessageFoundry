@@ -179,6 +179,9 @@ class LogSpool:
         #: The highest segment number ever seen or issued. Never reused: a segment whose unlink
         #: failed stays on disk, and reusing its number would collide with it on O_EXCL for good.
         self._last_seq = 0
+        #: Sent segments whose file would not delete (BACKLOG #2279). Out of the replay order, but
+        #: still on disk, so their bytes stay in :attr:`_sizes` and count against the cap.
+        self._undeleted: list[int] = []
 
     # --- lifecycle ------------------------------------------------------------------------------
 
@@ -241,6 +244,12 @@ class LogSpool:
         return sum(self._sizes.values())
 
     @property
+    def undeleted_segments(self) -> int:
+        """Sent segments still on disk because their delete failed. Their bytes count in
+        :attr:`bytes_used` until a later delete succeeds (:meth:`append` retries when full)."""
+        return len(self._undeleted)
+
+    @property
     def pending(self) -> bool:
         """Whether anything is waiting to be sent."""
         return self.peek() is not None
@@ -254,6 +263,8 @@ class LogSpool:
         """Append ``entry`` at the tail. ``False`` (and counted in :attr:`dropped`) when it would
         cross :attr:`max_bytes` or the disk refuses the write."""
         data = entry.encode()
+        if self._undeleted and self.bytes_used + len(data) > self.max_bytes:
+            self._reclaim()  # only when it would otherwise drop: one unlink try per leftover
         if self.bytes_used + len(data) > self.max_bytes:
             self.dropped += 1
             return False
@@ -380,10 +391,30 @@ class LogSpool:
                 self._reader.close()
             self._reader = None
             self._read_seq = None
-        with contextlib.suppress(OSError):
-            self._path(seq).unlink()
         self._segments.remove(seq)
-        self._sizes.pop(seq, None)
+        if self._unlink(seq):
+            self._sizes.pop(seq, None)
+        else:
+            # Still on disk, so still counted. Dropping its size here would let the directory
+            # grow past the cap by one segment for every delete that failed (BACKLOG #2279).
+            self._undeleted.append(seq)
+
+    def _unlink(self, seq: int) -> bool:
+        """Delete segment ``seq``'s file. Whether it is gone afterwards."""
+        try:
+            self._path(seq).unlink()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _reclaim(self) -> None:
+        """Try again to delete the segments whose delete failed, and stop counting those now gone."""
+        for seq in list(self._undeleted):
+            if self._unlink(seq):
+                self._undeleted.remove(seq)
+                self._sizes.pop(seq, None)
 
 
 #: ``O_BINARY`` on Windows (no newline translation), zero elsewhere.
