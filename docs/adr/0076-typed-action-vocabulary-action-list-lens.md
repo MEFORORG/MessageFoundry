@@ -1328,7 +1328,7 @@ Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and
   above are refused with the generic `refused` code, and nothing is written.
 - **Also under the flag**, a move or delete that breaks the structure rule below is refused
   (Manager decision 2026-10-07, after adversarial review, part of the R1 fix). G.7, "What still
-  differs at `main`", records the one case the code accepted, now closed.
+  differs at `main`", records the one case the code accepted and the tests that now pin it.
 - Developers, the `ide/` extension and the ADR 0208 developer build keep the default. The ADR 0208
   analyst build always sets the flag and offers no way to turn it off.
 
@@ -1385,6 +1385,14 @@ invariant rather than a property of the moved row):
    guard, a filter or a raise would run on every message. A typed row never moves below a typed
    `return` or `raise` in its suite, where it would never run. A row never moves past the fan-out
    `return sends`, though it may move past `sends = []` (Manager decision 2026-10-07, after review).
+   Every typed-only edit keeps each row able to run, whichever verb places it: a move, an
+   `insert_row`, or a raise, filter or send `template` (Manager decision 2026-10-08, after review).
+   A row never runs below a statement that never falls through. That is a `return`, `raise`,
+   `break` or `continue`, a `while True:` with no `break`, or a block whose every path ends in one.
+   An `if` with an `else` whose every arm returns or raises is such a block (same decision). Each
+   statement is matched by its occurrence, not by its text alone (same decision). A row already
+   dead before the edit does not count, so a row may move out of a dead block. A dead `pass` seed
+   does not count either. The default mode applies none of this rule (same decision; AC-G7).
 
 A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
 block whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager
@@ -1498,24 +1506,30 @@ corrects that table's row 5. `set_params` on action, lookup and diagnostic rows 
 `dynamic` value (AC-M5).
 
 **What still differs at `main`.** Each row of that table was re-measured on 2026-10-08 against
-`rewrite_source` at `main` (`8e5f429732`). One difference remained beyond the recorded limits, and
-it is now closed:
+`rewrite_source` at `main` (`8e5f429732`). One difference remained beyond the recorded limits. It
+is closed for the cases its tests pin:
 
-- **CLOSED 2026-10-08: a row moved below a typed `return` or `raise` was accepted, in both modes.**
-  G.6 rule 8 refuses it, so the rule is stricter and governs. Take a handler whose `if` guard ends
-  in `return Send("OB", msg)` and whose body ends in `return Send("OB2", msg)`. A `move_row` that
-  swapped a `msg.set(...)` row below the last `return`, or dropped a row after either `return`, was
-  accepted with `typed_only=True`. So was a swap below a closing `raise ValueError("x")`. The row
-  would then never run. `_refuse_shifted_code` in `messagefoundry/lens.py` keeps a `return` or
+- **Closed 2026-10-08 for the pinned cases: a row moved below a typed `return` or `raise` was
+  accepted, in both modes.** G.6 rule 8 refuses it, so the rule is stricter and governs. Take a
+  handler whose `if` guard ends in `return Send("OB", msg)` and whose body ends in `return
+  Send("OB2", msg)`. A `move_row` that swapped a `msg.set(...)` row below the last `return`, or
+  dropped a row after either `return`, was accepted with `typed_only=True`. So was a swap below a
+  closing `raise ValueError("x")`. The row would then never run. `_refuse_shifted_code` in `messagefoundry/lens.py` keeps a `return` or
   `raise` on its own suite path. Apart from the fan-out `return sends`, which
   `test_finding_9_the_scaffold_itself_still_holds` guards, nothing checked what lands after one.
-  `_refuse_rows_below_a_terminal` in `messagefoundry/lens.py` now refuses, in both modes, a
-  `move_row` whose result has a statement below a `return` or `raise` in its suite that was not
-  there before. `test_rule_8_refuses_a_row_moved_below_a_terminal` in
-  `tests/test_lens_typed_only_repair.py` pins those moves, and a `return` moved up past a row, in
-  both modes. A typed `return` or `raise` therefore never moves up its own suite, since that
-  strands what it passes. Five older tests made such a move as a control. Each now expects the
-  refusal or uses a move that strands nothing.
+  `_refuse_rows_that_never_run` in `messagefoundry/lens.py` now refuses it in typed-only mode, for
+  any edit, under rule 8 as amended on 2026-10-08. The default mode still accepts it, as G.6 scopes
+  the rule. `tests/test_lens_typed_only_repair.py` pins at least these cases:
+  - the moves above, and a `return` moved up past a row;
+  - a row moved below an `if` and `else` whose arms both end;
+  - an insert after the last `return`, and a filter, raise or send template above a row;
+  - `break`, `continue` and `while True:` as statements that never fall through.
+
+  So a typed `return` or `raise` never moves up its own suite in typed-only mode. Two limits
+  remain. First, `_bound_after` judges a `with`, a loop, a `match`, and a `try` that only its
+  `else` ends, as falling through. A row placed after one of those that never falls through is not
+  caught. Second, a live row inserted above a dead row with the same text is refused, because the
+  two are matched by occurrence. That refusal is the safe direction.
 
 The recorded limits, which are not reconciled:
 
@@ -1588,13 +1602,14 @@ change landed in PR 2155.
   structure rule of G.6, THEN THE SYSTEM SHALL refuse it with the generic `refused` code and write
   nothing. R1 payloads 1 and 2 (G.5) are refusal tests, and so is a row using `occurrence=i`
   moved out of its For Each loop (G.6 rule 6). The R1 fix's tests landed in PR 2155, in
-  `tests/test_lens_no_code_injection.py` and `tests/test_lens_typed_only_repair.py`. G.7, "What
-  still differs at `main`", names a structure-rule case the code still accepts.
+  `tests/test_lens_no_code_injection.py` and `tests/test_lens_typed_only_repair.py`. The same holds
+  for any edit that leaves a row unable to run (G.6 rule 8). G.7, "What still differs at `main`",
+  records that case and its limits.
 - [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL NOT refuse a
   `paste_block` or a raw `test` for being one; each still passes the checks the lens applies in every
   mode. Among those, a raw `test` SHALL be one condition on one line, with no `yield` and no `await`
   outside an `async def` element. THE SYSTEM SHALL accept every typed `template` edit in either mode,
-  subject to G.7.
+  subject to G.7 and, in typed-only mode, to G.6 rule 8.
 - [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite`
   call.
 - [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`
