@@ -5310,9 +5310,10 @@ def _cert(args: argparse.Namespace) -> int:
 def _cert_import(args: argparse.Namespace) -> int:
     """`cert import` — import a PKCS#12/.pfx bundle into the PEM files the TLS loaders read.
 
-    The bundle passphrase comes ONLY from ``MEFOR_PFX_PASSWORD`` (absent or empty means ``password=None``,
-    which only an unencrypted bundle with no MAC can use, BACKLOG #1352); it is never a CLI arg and
-    never echoed. A bad password / malformed bundle is
+    The bundle passphrase comes ONLY from ``MEFOR_PFX_PASSWORD``. Unset means ``password=None``, which
+    only an unencrypted bundle with no MAC can use (BACKLOG #1352). Set but empty is the empty
+    passphrase, so a bundle whose PBMAC1 MAC used one can be imported (BACKLOG #2456). It is never
+    a CLI arg and never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
     public; key.pem is written by :func:`_write_private_key`, which refuses to overwrite."""
     import os
@@ -5327,7 +5328,7 @@ def _cert_import(args: argparse.Namespace) -> int:
         return _cert_fail(f"cannot read --pfx {args.pfx!r}: {exc}", as_json=args.json)
 
     pw_env = os.environ.get("MEFOR_PFX_PASSWORD")
-    password = pw_env.encode() if pw_env else None
+    password = None if pw_env is None else pw_env.encode()
     from messagefoundry.keywrap import KeyWrapRefused
 
     try:
@@ -8432,7 +8433,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     Run **offline** (engine stopped): set ``MEFOR_STORE_ENCRYPTION_KEY`` to the NEW active key and keep
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
-    rotate. After it finishes, the retired key can be removed.
+    rotate. After it finishes and the engine has started once, the retired key can be removed; that
+    start re-keys the secret-rotation fingerprints (BACKLOG #2242).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see
@@ -8531,7 +8533,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
         from messagefoundry.pipeline.secret_rotation import fingerprints_equal
         from messagefoundry.store.store import SecretRotationMetaStore
 
-        store = await open_store(settings.store)
+        # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
+        # at resolve_active_key above, so its refusal needs the same clean exit 2.
+        store = await _open_store_or_refuse_the_key(open_store(settings.store))
         try:
             count = await store.reencrypt_to_active()
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
@@ -8580,8 +8584,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    # #1780: no store there. #3054: a key error the open raises before it reads a row, a key that is
-    # not base64 of 32 bytes among them, which `resolve_active_key` above does not decode.
+    # #1780: no store there. #3054: a key error, a key that is not base64 of 32 bytes among them,
+    # which `resolve_active_key` above does not decode. One the OPEN raises arrives wrapped as
+    # `_StoreKeyUnresolved` (#2109, below). Nothing after the open is known to raise these classes;
+    # they stay here so one that does still exits 2 rather than reaching the dispatch floor.
     could_not_start: tuple[type[Exception], ...] = (
         NotImplementedError,
         StoreNotFoundError,
@@ -8603,6 +8609,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
         return 1
     except could_not_start as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except _StoreKeyUnresolved as exc:  # #2109: the open refused the key; nothing was changed
+        print(f"error: cannot open the store for rotation: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
@@ -9804,11 +9813,11 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
     """Await a store open, turning a key that cannot be resolved into :class:`_StoreKeyUnresolved`.
 
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
-    code, and for ``admin-unlock`` and ``admin-set-notify-email`` (vault BACKLOG #3054, item 11).
-    Only the OPEN is wrapped: ``open_store`` resolves the key before the backend reads a row, so
-    nothing a database holds can turn a finding into "could not start". A malformed key is caught
-    as ``StoreCipherConfigError``, never as the bare ``ValueError`` the open raises for other
-    reasons too.
+    code, for ``admin-unlock`` and ``admin-set-notify-email`` (vault BACKLOG #3054, item 11), and
+    for ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). Only the OPEN is wrapped:
+    ``open_store`` resolves the key before the backend reads a row, so nothing a database holds can
+    turn a finding into "could not start". A malformed key is caught as ``StoreCipherConfigError``,
+    never as the bare ``ValueError`` the open raises for other reasons too.
     """
     try:
         return await opening

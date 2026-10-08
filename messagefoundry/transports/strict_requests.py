@@ -69,6 +69,14 @@ anything enters the tunnel, and
 ``urllib3`` calling ``http.client``'s own ``_tunnel``, as it does on the Python this engine requires.
 ``tests/test_proxy_connect_reply_head.py`` measures it on the wire, so a ``urllib3`` that brought its
 own would turn that test red.
+
+**A refusal of the hop is one type at both phases (BACKLOG #2318).** Every check on the hop itself,
+its address, its proxy, its TLS leg or its pool, raises
+:class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, whether it fires when the client is
+built or before a send. A refusal of the REPLY is an
+:class:`~messagefoundry.transports.bounded_read.EgressReplyError`. Both carry fixed text only, and
+:func:`vault_failure_text` is how the providers' catch-all handlers keep that text rather than
+shrinking it to a type name.
 """
 
 from __future__ import annotations
@@ -109,6 +117,7 @@ __all__ = [
     "MAX_VAULT_REPLY_BYTES",
     "StrictReplyAdapter",
     "mount_strict_reply_adapter",
+    "vault_failure_text",
 ]
 
 #: Ceiling on one reply body on the Vault or OpenBao Transit client.
@@ -177,6 +186,14 @@ def _narrowed_pool_classes(
     time. A later urllib3 that stopped loading it on the Vault leg as well would fail closed, since
     the factory's contexts require a verified peer, and the on-wire tests would go red.
 
+    **The proxy leg shares the Vault anchor on purpose, and has no setting of its own (BACKLOG
+    #2318).** That leg does not protect the token: the Vault leg's own TLS, end to end inside the
+    tunnel, does. So a proxy whose certificate comes from another CA needs no second anchor. Use an
+    ``http://`` proxy for it instead, which the hop allows in front of an ``https://`` Vault and
+    which still refuses credentials in its URL (BACKLOG #2547). Never add the proxy's CA to the
+    Vault CA file. The Vault leg would then accept a certificate that CA issued for the Vault host
+    name, so the proxy's CA could stand in for Vault.
+
     requests forwards through an ``https://`` proxy only for an ``http://`` Vault, and that shape is
     refused below, before any socket opens.
 
@@ -203,7 +220,7 @@ def _narrowed_pool_classes(
 
         def connect(self) -> None:
             if resolve_cert_reqs(self.cert_reqs) == ssl.CERT_NONE:
-                raise EgressReplyError(
+                raise InsecureHopRefused(
                     f"{connector} would open a TLS session that verifies no peer; "
                     "refusing to connect"
                 )
@@ -256,7 +273,7 @@ def _narrowed_pool_classes(
             if isinstance(leg, ssl.SSLSocket):
                 leg.close()
             self.close()
-            raise EgressReplyError(
+            raise InsecureHopRefused(
                 f"{connector}: the TLS leg to its https:// proxy did not run on the engine's "
                 "narrowed, verifying context; refusing to send"
             )
@@ -380,13 +397,13 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
             issubclass(pool.ConnectionCls, _STRICT_CONNECTIONS)
             and issubclass(pool.ConnectionCls.response_class, StrictHTTPResponse)
         ):
-            raise EgressReplyError(
+            raise InsecureHopRefused(
                 f"{self._connector} would read its reply head with a connection the engine cannot "
                 "make strict; refusing to send"
             )
         # BACKLOG #300, the same fail-closed shape: an https pool must be the narrowed one.
         if pool.scheme == "https" and not getattr(type(pool), _NARROWED_POOL_MARK, False):
-            raise EgressReplyError(
+            raise InsecureHopRefused(
                 f"{self._connector} would handshake on a TLS context the engine did not narrow; "
                 "refusing to send"
             )
@@ -396,7 +413,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         url = request.url or ""
         if _scheme_of(url) != "https":
             if pool.scheme == "https":
-                raise EgressReplyError(_unverifiable_proxy_leg(self._connector))
+                raise InsecureHopRefused(_unverifiable_proxy_leg(self._connector))
             # BACKLOG #2317: a non-https request carries the token in cleartext unless it stays
             # on the box. Checked at construction too; this catches a proxy that appeared since.
             _refuse_a_cleartext_vault_hop(
@@ -471,6 +488,27 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # their end. Closing the reply closes its buffered reader, not urllib3's socket.
         reply.close()
         return body
+
+
+def vault_failure_text(exc: BaseException) -> str:
+    """What a Vault provider's catch-all handler may say about ``exc`` (BACKLOG #2318).
+
+    A refusal from this hop keeps its own text: an
+    :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` from the hop checks, or an
+    :class:`~messagefoundry.transports.bounded_read.EgressReplyError` from the reply reader. Both
+    are built here and in ``bounded_read`` from the hop's fixed connector label and fixed reason
+    text. They name no part of the address, the proxy URL, the token or the reply. Any other
+    failure gives only its type name, as before, because its text can echo ciphertext, a
+    request body or a URL.
+
+    **The test is by type, so it holds only where those are the only sources.** Call it only from
+    a handler around an hvac call on a client :func:`mount_strict_reply_adapter` mounted, which is
+    the six Vault provider handlers today. Elsewhere in the engine an ``InsecureHopRefused`` can
+    echo a host (``transports/rest.py``), so a handler around other code must not use this.
+    """
+    if isinstance(exc, (InsecureHopRefused, EgressReplyError)):
+        return str(exc)
+    return type(exc).__name__
 
 
 def _scheme_of(url: str | None) -> str:

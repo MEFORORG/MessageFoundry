@@ -33,7 +33,9 @@ cannot run the operation asked of it (BACKLOG #1166) raises
 :class:`~messagefoundry.store.keyprovider.KeyProviderError` at construction (``open_store`` propagates it
 → ``serve`` refuses to start, never an in-process fallback). A per-operation Transit failure raises :class:`CipherError` — the
 store's existing at-rest error discipline. **No plaintext/PHI is EVER placed in a message** (only the
-exception TYPE): the base64 plaintext handed to Transit is the message body.
+exception TYPE): the base64 plaintext handed to Transit is the message body. The one exception is a
+refusal of the Vault hop or its reply, whose text is fixed and is kept whole (BACKLOG #2318; see
+:func:`~messagefoundry.store.keyprovider_vault.vault_failure_text`).
 
 ``hvac`` is the optional ``[vault]`` extra, lazy-imported via
 :func:`~messagefoundry.store.keyprovider_vault._build_client` (shared with the KEK-unwrap provider so there
@@ -63,6 +65,7 @@ from messagefoundry.store.keyprovider_vault import (
     TRANSIT_MOUNT,
     _build_client,
     require_transit_key_type,
+    vault_failure_text,
 )
 
 if TYPE_CHECKING:
@@ -135,7 +138,7 @@ class TransitCipher(_UnmarkedPolicy):
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
             raise CipherError(
-                f"Transit encrypt failed (key={self._key!r}): {type(exc).__name__}"
+                f"Transit encrypt failed (key={self._key!r}): {vault_failure_text(exc)}"
             ) from exc
         if not isinstance(ciphertext, str) or not ciphertext:
             raise CipherError(f"Transit returned an empty ciphertext (key={self._key!r})")
@@ -167,7 +170,7 @@ class TransitCipher(_UnmarkedPolicy):
             # Covers a failed AEAD tag (wrong cell AAD / corrupt blob) AND transport failure — both fail
             # closed. Type-only: a Transit error can echo ciphertext, and we never surface key material.
             raise CipherError(
-                f"Transit decrypt failed (key={self._key!r}): {type(exc).__name__}"
+                f"Transit decrypt failed (key={self._key!r}): {vault_failure_text(exc)}"
             ) from exc
         # Refused OUTSIDE the handler: a UnicodeDecodeError's .object is the decrypted plaintext, so
         # chaining it would put the PHI this cipher protects on the error (BACKLOG #2085).
@@ -215,7 +218,7 @@ class TransitCipher(_UnmarkedPolicy):
             mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
             raise CipherError(
-                f"Transit audit HMAC failed (key={self._audit_key!r}): {type(exc).__name__}"
+                f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
             ) from exc
         if not isinstance(mac, str) or not mac:
             raise CipherError(f"Transit returned an empty audit HMAC (key={self._audit_key!r})")
@@ -301,7 +304,7 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
     except Exception as exc:
         raise KeyProviderError(
             f"[store].cipher_provider={PROVIDER_NAME!r} could not reach a Vault transit key "
-            f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {type(exc).__name__}."
+            f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {vault_failure_text(exc)}."
         ) from exc
     return TransitCipher(
         client, key_name, audit_key=audit_key, allow_unmarked=settings.allow_unmarked_ciphertext

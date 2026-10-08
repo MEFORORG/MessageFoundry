@@ -93,10 +93,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # /ui/connection/{name}/events/{event_id}/reason. The JSON reveal is a query parameter.
 # BACKLOG #2460 added one /ui route and no JSON route: POST /ui/approvals/{approval_id}/resolve/
 # {outcome}, the console's resolve of an interrupted release.
+# Vault BACKLOG #2625 added one /ui route and no JSON route: GET /ui/messages/{message_id}/resend-done.
 # BACKLOG #2331 added one JSON route: GET /users/{user_id}/federated-identity, users:manage.
 _ROUTES_DEFAULT = 116
 _ROUTES_WITH_DOCS = 120
-_ROUTES_WITH_UI = 241
+_ROUTES_WITH_UI = 242
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -144,6 +145,11 @@ _MULTI_PERMISSION_ROUTES = frozenset(
         ("GET", "/ui/alerts/{alert_id}/reason"),
         ("GET", "/ui/events/{event_id}/reason"),
         ("GET", "/ui/connection/{name}/events/{event_id}/reason"),
+        # Vault BACKLOG #2625: an upload resend injects a message, so it needs messages:edit beside
+        # files:browse, on the JSON route, on the console POST and on the console confirm page.
+        ("POST", "/uploads/{file_id}/resend"),
+        ("POST", "/ui/uploaded-logs/file/{file_id}/resend"),
+        ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"),
     }
 )
 

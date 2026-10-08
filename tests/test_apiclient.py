@@ -1143,3 +1143,36 @@ def test_release_raising_frames_breaks_a_raise_a_local_cycle_and_spares_the_call
     finally:
         if was_enabled:
             gc.enable()
+
+
+@pytest.mark.parametrize(
+    ("stashed", "purpose", "sent"),
+    [
+        (None, "config_reload", "config_reload"),  # named up front, before any refusal
+        ("message_export", "config_reload", "config_reload"),  # the caller's name wins
+        ("message_export", None, "message_export"),  # control: the stash still rides alone
+        (None, None, None),  # control: a window re-proof posts no purpose
+    ],
+)
+def test_reauth_sends_a_purpose_named_up_front(
+    monkeypatch: pytest.MonkeyPatch, stashed: str | None, purpose: str | None, sent: str | None
+) -> None:
+    """Vault BACKLOG #2625: a caller that proves BEFORE a bound route (the connscale reload timer)
+    names the action itself, since no refusal has stashed one yet."""
+    from messagefoundry.apiclient.client import EngineClient
+
+    client = EngineClient("http://127.0.0.1:8765")
+    bodies: list[dict[str, object]] = []
+
+    def _record(method: str, path: str, **kw: object) -> httpx.Response:
+        assert (method, path) == ("POST", "/me/reauth")
+        body = kw["json"]
+        assert isinstance(body, dict)
+        bodies.append(body)
+        return httpx.Response(200, json={"detail": "re-verified", "token": "rotated"})
+
+    monkeypatch.setattr(client, "_request", _record)
+    client._pending_step_up_action = stashed
+    client.reauth("pw", purpose=purpose)
+    assert bodies[0].get("purpose") == sent
+    assert client._pending_step_up_action is None  # single use, whichever name rode

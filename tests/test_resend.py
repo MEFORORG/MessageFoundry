@@ -417,7 +417,11 @@ async def test_resend_requires_access_to_the_alternate_outbound_channel(tmp_path
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        # The bound proof is not this test's subject, so it keeps the session window.
+        # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
+        service = AuthService(
+            engine.store, AuthSettings(require_mfa=False, require_action_step_up=False)
+        )
         await service.initialize()
         uid = await create_local_user_chosen(
             service,
@@ -474,7 +478,11 @@ async def test_resend_denied_without_the_resend_permission(tmp_path: Path) -> No
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        # The bound proof is not this test's subject, so it keeps the session window.
+        # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
+        service = AuthService(
+            engine.store, AuthSettings(require_mfa=False, require_action_step_up=False)
+        )
         await service.initialize()
         uid = await create_local_user_chosen(
             service,
@@ -533,7 +541,11 @@ async def test_resend_grant_is_audited_even_when_it_fails_downstream(tmp_path: P
         _running_registry(tmp_path)
     )  # registered but engine NOT started -> not running
     try:
-        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        # The bound proof is not this test's subject, so it keeps the session window.
+        # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
+        service = AuthService(
+            engine.store, AuthSettings(require_mfa=False, require_action_step_up=False)
+        )
         await service.initialize()
         uid = await create_local_user_chosen(
             service,

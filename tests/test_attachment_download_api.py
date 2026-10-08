@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import gzip
 import json
 import logging
 import mimetypes
@@ -52,8 +53,11 @@ from messagefoundry.api.svg_sanitize import SvgRejected
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no vendor terms — satisfies the ASVS policy
@@ -955,9 +959,10 @@ async def test_svg_label_on_non_markup_bytes_is_served_unchanged(
 async def test_non_svg_xml_is_served_byte_for_byte(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
-    """An XML document whose root is not ``svg`` is not the sanitizer's business, even if it embeds one."""
+    """An XML document whose root is not ``svg`` and which holds no SVG element is not the sanitizer's
+    business. This is the control for the refusal below."""
     prefix, suffix = (
-        b'<?xml version="1.0"?><ClinicalDocument><svg onload="x"/><note>',
+        b'<?xml version="1.0"?><ClinicalDocument><note kind="svg">',
         b"</note></ClinicalDocument>",
     )
     mid, ref = await _seed_labelled(
@@ -966,6 +971,117 @@ async def test_non_svg_xml_is_served_byte_for_byte(
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
     assert r.content == prefix + b"synthetic document cda not real PHI" + suffix
+    (row,) = [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
+    assert "sanitized-svg" not in (row["detail"] or "")
+
+
+async def test_xml_embedding_svg_below_another_root_is_refused(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """BACKLOG #2391: an SVG element under a root that is not ``svg`` is refused, not served raw.
+    Rewriting the document around it would change verbatim clinical content that is not SVG."""
+    before_marker = b"synthetic document cda-svg not real PHI"
+    mid, ref = await _seed_labelled(
+        engine,
+        "application/xml",
+        marker="cda-svg",
+        prefix=b'<?xml version="1.0"?><ClinicalDocument><svg onload="x"/><note>',
+        suffix=b"</note></ClinicalDocument>",
+    )
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 422
+    assert before_marker not in r.content
+    await _assert_one_refusal_row(engine, mid, ref, "svg_unsanitizable")
+
+
+# --- BACKLOG #2391: SVGZ, settled end to end through ingress detach and the download ---------------
+
+#: A hostile SVG padded with a unique comment, so each case seeds its own content address.
+_GZ_HOSTILE = _HOSTILE_SVG.replace(b"</svg>", b"<!--{marker}--></svg>")
+
+
+def _detach_ic() -> InboundConnection:
+    """A streaming inbound that detaches any OBX-5 document over a tiny threshold."""
+    return InboundConnection(
+        name="IB_SVGZ",
+        spec=ConnectionSpec(ConnectorType.MLLP, {"port": 0}),
+        router="r",
+        content_type=ContentType.HL7V2,
+        stream_threshold_bytes=100,
+    )
+
+
+async def _ingest_document(engine: Engine, label: str, document: bytes) -> tuple[str, str, str]:
+    """Run ``document`` under OBX-5.2 ``label`` through the real ingress detach. Returns
+    ``(message_id, attachment_ref, stored content_type)``."""
+    ic = _detach_ic()
+    reg = Registry()
+    reg.add_inbound(ic)
+    reg.add_router(ic.router, lambda m: [])
+    runner = RegistryRunner(reg, engine.store, egress=EgressSettings(deny_by_default=False))
+    b64 = base64.b64encode(document).decode("ascii")
+    raw = (
+        "MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||MDM^T02|MSGSVGZ|P|2.5\r"
+        "PID|1||MRN0^^^FAC||DOE^SYNTHETIC\r"
+        f"OBX|1|ED|IMG^Drawing||^{label}^SVG^Base64^{b64}||||||F\r"
+    )
+    await runner._handle_inbound(ic, raw.encode("utf-8"))
+    (row,) = await engine.store.list_messages(channel_id=ic.name, allowed_channels=None)
+    mid = row["id"]
+    (att,) = await engine.store.attachments_for(mid)
+    return mid, att["attachment_id"], att["content_type"]
+
+
+@pytest.mark.parametrize(
+    ("label", "stored"),
+    [
+        # A +xml label on bytes that do not start with '<' is relabelled at detach.
+        ("image/svg+xml", _OCTET),
+        # A label outside every sniffable family is stored as the sender wrote it.
+        ("image/svg+xml-compressed", "image/svg+xml-compressed"),
+        ("application/gzip", "application/gzip"),
+    ],
+)
+async def test_svgz_through_ingress_is_served_sanitized_and_gzipped(
+    engine: Engine, client: httpx.AsyncClient, label: str, stored: str
+) -> None:
+    """The ADR 0105 amendment of 2026-09-28 read the relabel as covering SVGZ. It covers only the
+    label: the stored bytes are still gzip, and before BACKLOG #2391 the download served them as
+    stored, under ``application/octet-stream``, unsanitized. They are now inflated, sanitized and
+    gzipped again; the stored value stays verbatim."""
+    document = gzip.compress(_GZ_HOSTILE.replace(b"{marker}", label.encode()), mtime=0)
+    mid, ref, stored_ct = await _ingest_document(engine, label, document)
+    assert stored_ct == stored
+    before = await _stored_value(engine, ref)
+    assert base64.b64decode(before) == document
+
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert r.content.startswith(b"\x1f\x8b")
+    served = gzip.decompress(r.content)
+    for needle in (b"script", b"onload", b"foreignObject", b"javascript", b"evil.example"):
+        assert needle not in served, needle
+    assert b'<rect id="kept" width="5" height="5" fill="#123456">' in served
+    # The declared type, the download name and the CSP are the same as for any refused label.
+    assert _base_media_type(r) == _OCTET
+    assert r.headers["content-disposition"] == _disposition(ref, _OCTET_EXT)
+    assert r.headers["content-security-policy"] == _ATTACHMENT_CSP
+    assert await _stored_value(engine, ref) == before
+    (row,) = [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
+    assert '"served": "sanitized-svg"' in (row["detail"] or "")
+
+
+async def test_gzip_of_a_non_svg_document_is_served_byte_for_byte(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """The control: a gzip body that does not inflate to SVG is served as stored."""
+    document = gzip.compress(b"%PDF-1.4\nsynthetic gzipped report, not real PHI\n%%EOF\n", mtime=0)
+    mid, ref, _ = await _ingest_document(engine, "application/gzip", document)
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert r.content == document
+    (row,) = [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
+    assert "sanitized-svg" not in (row["detail"] or "")
 
 
 # NOTE: test_runbook_documents_the_shipped_download_safety_mechanism moved to tests/test_off_loopback_runbook.py (2026-07-26). They asserted against
