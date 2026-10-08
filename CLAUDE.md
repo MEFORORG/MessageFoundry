@@ -492,7 +492,12 @@ gates a merge**, and no seat has to clear one.
   [`.claude/settings.json`](.claude/settings.json), which also drops the `Claude-Session:` trailer.
   Your own session reminder may still tell you to add the trailer. Do not. If one appears in a
   message you are about to commit, your session is reading a stale or user-scope setting, so remove
-  it by hand.
+  it by hand. A local `commit-msg` rule in `scripts/hooks/claim_check.py` refuses a line starting
+  `Co-Authored-By: Claude` or `Claude-Session:`. It is local and skippable, and GitHub's squash can
+  add the trailer anyway, so a clean hook run does not prove a commit on `main` is clean. After that file changes, the
+  installed copy changes only when `pwsh -NoProfile -File scripts\coord\install-git-hooks.ps1` runs
+  again. It copies from the checkout it runs in, so run it from an up-to-date `main`, never a
+  Builder's branch.
 - A long commit message can fail to parse. The harness reported a 1015-byte ceiling when it refused
   one on 2026-09-02; that number is not recorded anywhere in this repository, so treat it as a
   measurement rather than a contract. Write the message to a uniquely-named file **inside your own
@@ -744,9 +749,12 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   of one file once disagreed on exactly that. Emoji also need variation-selector handling in every regex, and
   they raise `UnicodeEncodeError` on a stock Windows cp1252 console.
 
-  **No NEW glyph vocabulary may be introduced anywhere.** The former status glyphs still in the tree
-  are decoration. Removing them is a migration with its own item, so do not sweep them out of files
-  you are editing for another reason.
+  **No NEW glyph vocabulary may be introduced anywhere.** The local `new-glyph` pre-commit hook
+  catches part of this. It refuses a staged diff whose added lines carry more glyphs from the hook's
+  banned ranges than the removed lines held. It skips exempt paths, has no CI mirror, and does not
+  read commit messages. The former status glyphs still in the tree are decoration. Removing them is
+  a migration with its own item, so do not sweep them out of files you are editing for another
+  reason.
 
   **Do not delete `.github/workflows/backlog-hygiene.yml`, rename its job, or drop either trigger.**
   The job's `name:` is a REQUIRED status-check context, and a required context that never reports
