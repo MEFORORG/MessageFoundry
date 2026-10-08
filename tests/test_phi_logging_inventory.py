@@ -229,9 +229,12 @@ def test_out_of_scope_streams_are_scoped_out_explicitly() -> None:
     paragraph still left ``"tee" in section`` True — the tee relay's scope-out, which discloses an
     unfiltered ``basicConfig`` sink holding full message bodies under ``--capture-bodies``, was the
     one thing this test claimed to pin and did not.
+
+    ``"tray.log"`` left this list with BACKLOG #2351: the tray has a row now, and
+    ``test_the_tray_file_sink_has_an_inventory_row`` pins it.
     """
     section = _inventory_section()
-    for token in ("/metrics", "/ws/stats", "relay_capture", "--capture-bodies", "tray.log"):
+    for token in ("/metrics", "/ws/stats", "relay_capture", "--capture-bodies"):
         assert token in section, f"§7 no longer states why {token} is outside the inventory"
 
 
@@ -589,7 +592,7 @@ _ALLOWED_SINK_MODULES: dict[str, str] = {
         "stream 1 — the guarded handler classes for stdout and the opt-in `[logging].file`"
     ),
     "messagefoundry/tray/__main__.py": (
-        "the tray's RotatingFileHandler — named in 'Not in this inventory, and why'"
+        "stream 15 — the tray's RotatingFileHandler, tray.log (BACKLOG #2351)"
     ),
     # The ADR 0087 sandbox child is deliberately ABSENT (BACKLOG #1054): it no longer constructs a sink
     # of its own. It calls logging_setup's `configure_stderr_logging`, so the handler — and the filter
@@ -738,21 +741,79 @@ def _gates_on_debug(source: str) -> bool:
     )
 
 
-def test_the_tray_file_sink_is_scoped_out_by_name() -> None:
-    """It ships in the wheel, so silence is not an option — it is named, with its real posture."""
-    section = _section_7()
-    for token in ("tray.log", "RotatingFileHandler"):
-        assert token in section, (
-            f"§7 does not name {token!r}. messagefoundry.tray ships INSIDE the wheel as the "
-            "messagefoundry-tray gui-script and writes a rotating log file. Since BACKLOG #2092 that "
-            "file carries tray/logscrub.py's PHI, credential and control-character scrub, but not "
-            "the OIDC query-string filter, and it sits outside the NSSM DataDir ACL and outside "
-            "every [retention] window."
+def _inventory_rows(section: str | None = None) -> list[str]:
+    """Every numbered stream row of the inventory table, one string per row."""
+    body = _inventory_section() if section is None else section
+    return [line for line in body.splitlines() if re.match(r"\|\s*\*\*\d+\. ", line)]
+
+
+def _row_naming(token: str, section: str | None = None) -> str:
+    """The one inventory row whose FIRST cell names ``token``."""
+    rows = [row for row in _inventory_rows(section) if token in row.split("|")[1]]
+    assert len(rows) == 1, (
+        f"the §7 logging inventory has {len(rows)} rows whose stream cell names {token!r}; "
+        "it needs exactly one (ASVS 16.1.1)"
+    )
+    return rows[0]
+
+
+def test_the_tray_file_sink_has_an_inventory_row() -> None:
+    """It ships in the wheel and writes a file, so it has a row, with its real posture.
+
+    It was a named exclusion until BACKLOG #2351. A row is checked, and not the whole section, so
+    prose that merely mentions the file cannot stand in for the row.
+    """
+    row = _row_naming("tray.log")
+    for token in ("RotatingFileHandler", "TrayLogScrubFilter", "[retention]", "%LOCALAPPDATA%"):
+        assert token in row, (
+            f"the tray's inventory row does not name {token!r}. messagefoundry.tray ships INSIDE "
+            "the wheel as the messagefoundry-tray gui-script and writes a rotating log file. Since "
+            "BACKLOG #2092 that file carries tray/logscrub.py's PHI, credential and "
+            "control-character scrub, but not the OIDC query-string filter, and it sits outside the "
+            "NSSM DataDir ACL and outside every [retention] window."
         )
     tray = (_ROOT / "messagefoundry" / "tray" / "__main__.py").read_text(encoding="utf-8")
     assert source_calls(tray, "RotatingFileHandler"), (
-        "the tray no longer writes a rotating log file; remove the scope-out in the same change."
+        "the tray no longer writes a rotating log file; remove its inventory row in the same change."
     )
+
+
+_IDE_CHANNEL = re.compile(r"createOutputChannel\(\s*\"([^\"]+)\"")
+
+
+def _ide_output_channels() -> set[str]:
+    """Every output channel name the VS Code extension creates, read from its shipped source."""
+    names: set[str] = set()
+    for path in (_ROOT / "ide" / "src").rglob("*.ts"):
+        if "test" in path.relative_to(_ROOT / "ide" / "src").parts:
+            continue
+        names.update(_IDE_CHANNEL.findall(path.read_text(encoding="utf-8")))
+    return names
+
+
+def test_every_ide_output_channel_has_an_inventory_row() -> None:
+    """BACKLOG #2351. An output channel is a log sink on a developer's desktop, so each has a row.
+
+    The set is read from ``ide/src``, so a third channel reds this test until it gets a row. The
+    pattern sees a channel named by a string literal only; one named through a constant is missed.
+    """
+    channels = _ide_output_channels()
+    assert {"MessageFoundry Engine", "MessageFoundry Checks"} <= channels, (
+        f"the reader found only {sorted(channels)} in ide/src; it no longer sees the two channels "
+        "this test was written against, so it would pass a third one unseen"
+    )
+    for name in sorted(channels):
+        _row_naming(name)
+
+
+def test_the_ide_channel_reader_can_fail() -> None:
+    """A planted omission: with one channel's row removed, the row lookup raises."""
+    section = "\n".join(
+        line for line in _inventory_section().splitlines() if "MessageFoundry Checks" not in line
+    )
+    _row_naming("MessageFoundry Engine", section)
+    with pytest.raises(AssertionError, match="MessageFoundry Checks"):
+        _row_naming("MessageFoundry Checks", section)
 
 
 def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
