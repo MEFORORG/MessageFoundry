@@ -33,6 +33,7 @@ from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.config.tls_policy import HopDisposition
+from messagefoundry.controlchars import scrub_log_argument
 
 # Imported, not redefined: the cert->principal matchers live in the neutral package-root leaf, which
 # the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. This plane keys by issuer first
@@ -71,7 +72,11 @@ def alert_administrator_granted(state: Any, key: str, *, via: str, granted_by: s
         alert_sink_for(state).administrator_granted(key, via=via, granted_by=granted_by)
     except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not 500 a
         # call whose write is already committed and audited.
-        log.exception("the administrator_granted alert for %r failed to emit", key)
+        # Scrubbed for CodeQL py/log-injection (alert 264); scrub_log_argument says why. Over
+        # ``repr``, as in ``LoggingAlertSink.administrator_granted``, so the line reads as before.
+        log.exception(
+            "the administrator_granted alert for %s failed to emit", scrub_log_argument(repr(key))
+        )
 
 
 def alert_directory_administrator_granted(state: Any, outcome: LoginOutcome, *, via: str) -> None:
