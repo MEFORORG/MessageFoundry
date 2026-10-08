@@ -43,6 +43,11 @@ PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the A
 #: RFC 5737 TEST-NET-2 has no hostname form; use a reserved example domain for the hostile origin.
 EVIL_ORIGIN = "http://evil.example"
 
+#: The refusal each branch of ``assert_same_origin`` gives, so a test can say WHICH branch refused.
+_CROSS_SITE = "cross-site request rejected"
+_CROSS_ORIGIN = "cross-origin request rejected"
+_UNRECOGNISED = "unrecognised Sec-Fetch-Site value rejected"
+
 #: Sends one request with no fetch metadata at all; the suite's browser stand-in leaves it alone.
 HEADERLESS = {HEADERLESS_UI_REQUEST: True}
 
@@ -194,15 +199,16 @@ def test_a_padded_sec_fetch_site_is_refused_by_the_check_itself() -> None:
         with pytest.raises(HTTPException) as refused:
             webconsole_auth.assert_same_origin(request("POST", value))
         assert refused.value.status_code == 403, value
+        assert refused.value.detail == _UNRECOGNISED, (value, refused.value.detail)
         # A GET keeps its earlier rule: only cross-site and same-site are refused there.
         webconsole_auth.assert_same_origin(request("GET", value))
     for value in ("same-origin", "none"):
         webconsole_auth.assert_same_origin(request("POST", value))
     # control: the GET arm is live, so the passes above are the rule and not a dead branch
-    with pytest.raises(HTTPException):
-        webconsole_auth.assert_same_origin(request("GET", "cross-site"))
-    with pytest.raises(HTTPException):
-        webconsole_auth.assert_same_origin(request("GET", "same-site"))
+    for value in ("cross-site", "same-site"):
+        with pytest.raises(HTTPException) as refused:
+            webconsole_auth.assert_same_origin(request("GET", value))
+        assert (refused.value.status_code, refused.value.detail) == (403, _CROSS_SITE), value
 
 
 def test_a_get_with_any_sec_fetch_site_line_deliberately_does_not_read_origin() -> None:
@@ -225,12 +231,132 @@ def test_a_get_with_any_sec_fetch_site_line_deliberately_does_not_read_origin() 
             app=SimpleNamespace(state=state),
         )
 
-    for value in ("", "x"):
+    # Which branch refuses the POST differs: an empty line is absence, so Origin decides; an
+    # unknown value is refused before Origin is read.
+    for value, branch in (("", _CROSS_ORIGIN), ("x", _UNRECOGNISED)):
         webconsole_auth.assert_same_origin(request("GET", {"sec-fetch-site": value}))
-        with pytest.raises(HTTPException):
+        with pytest.raises(HTTPException) as refused:
             webconsole_auth.assert_same_origin(request("POST", {"sec-fetch-site": value}))
-    with pytest.raises(HTTPException):
+        assert (refused.value.status_code, refused.value.detail) == (403, branch), value
+    with pytest.raises(HTTPException) as refused:
         webconsole_auth.assert_same_origin(request("GET", {}))
+    assert (refused.value.status_code, refused.value.detail) == (403, _CROSS_ORIGIN)
+
+
+# --- the rule table in the assert_same_origin docstring, driven row by row --------------------------
+
+_TABLE_METHODS = {"write": ("POST", "PUT", "DELETE", "PATCH"), "GET": ("GET",)}
+#: Each table state as the header values that realise it. ``None`` is "no such line".
+_TABLE_SITES: dict[str, tuple[str | None, ...]] = {
+    "absent": (None,),
+    "empty": ("",),
+    "cross-site or same-site": ("cross-site", "same-site"),
+    "same-origin or none": ("same-origin", "none"),
+    "any other value": ("x", "Same-Origin", "NONE", " same-origin", "same-origin, none"),
+}
+_TABLE_ORIGINS: dict[str, tuple[str | None, ...]] = {
+    "absent or empty": (None, ""),
+    "matches": ("http://t",),
+    "does not match": (EVIL_ORIGIN, "null", "http://t.evil.example"),
+}
+_TABLE_ORIGINS["any"] = tuple(v for values in list(_TABLE_ORIGINS.values()) for v in values)
+
+
+def _rule_table() -> list[tuple[str, str, str, str]]:
+    """The rows of the simple table in ``assert_same_origin``'s docstring."""
+    lines = (webconsole_auth.assert_same_origin.__doc__ or "").splitlines()
+    rules = [i for i, line in enumerate(lines) if line.strip().startswith("======")]
+    assert len(rules) == 3, "the docstring no longer holds one simple table"
+    widths = [len(part) for part in lines[rules[0]].split()]
+    assert len(widths) == 4, widths
+    rows: list[tuple[str, str, str, str]] = []
+    for line in lines[rules[1] + 1 : rules[2]]:
+        cells, at = [], len(line) - len(line.lstrip())
+        for width in widths:
+            cells.append(line[at : at + width].strip())
+            at += width + 2
+        rows.append((cells[0], cells[1], cells[2], cells[3]))
+    return rows
+
+
+def _verdict(method: str, site: str | None, origin: str | None) -> str:
+    headers = {"host": "t"}
+    if site is not None:
+        headers["sec-fetch-site"] = site
+    if origin is not None:
+        headers["origin"] = origin
+    state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
+    request: Any = SimpleNamespace(
+        method=method, headers=Headers(headers), app=SimpleNamespace(state=state)
+    )
+    try:
+        webconsole_auth.assert_same_origin(request)
+    except HTTPException as refused:
+        assert refused.status_code == 403, (method, site, origin, refused.status_code)
+        return "refuse"
+    return "accept"
+
+
+def test_the_docstring_rule_table_is_what_the_function_does() -> None:
+    """The docstring of ``assert_same_origin`` is the ONE complete statement of the /ui origin
+    rule, and every other document points at it. Hand-written copies of that rule disagreed with
+    the code three times on this branch. So the table is read out of the docstring and the function
+    is driven over every row, with several concrete header values per state.
+
+    It also checks the table is COMPLETE: every method, ``Sec-Fetch-Site`` state and ``Origin``
+    state is covered by exactly one row, so a case cannot be left out of the statement."""
+    rows = _rule_table()
+    # positive controls: the parse found real rows, and both verdicts appear, so a table that
+    # parsed to nothing or a function that accepted everything could not pass
+    assert len(rows) >= 12, rows
+    assert {row[3] for row in rows} == {"accept", "refuse"}, rows
+    covered: dict[tuple[str, str, str], int] = {}
+    for method, site, origin, verdict in rows:
+        assert method in _TABLE_METHODS and site in _TABLE_SITES and origin in _TABLE_ORIGINS, (
+            method,
+            site,
+            origin,
+        )
+        states = [s for s in _TABLE_ORIGINS if s != "any"] if origin == "any" else [origin]
+        for state in states:
+            covered[(method, site, state)] = covered.get((method, site, state), 0) + 1
+        for verb in _TABLE_METHODS[method]:
+            for site_value in _TABLE_SITES[site]:
+                for origin_value in _TABLE_ORIGINS[origin]:
+                    got = _verdict(verb, site_value, origin_value)
+                    assert got == verdict, (
+                        f"the docstring table says {method} / Sec-Fetch-Site {site} / Origin "
+                        f"{origin} is a {verdict}, but {verb} with Sec-Fetch-Site={site_value!r} "
+                        f"Origin={origin_value!r} is a {got}"
+                    )
+    expected = {
+        (method, site, origin)
+        for method in _TABLE_METHODS
+        for site in _TABLE_SITES
+        for origin in _TABLE_ORIGINS
+        if origin != "any"
+    }
+    assert set(covered) == expected, sorted(expected ^ set(covered))
+    assert set(covered.values()) == {1}, {k: v for k, v in covered.items() if v != 1}
+
+
+def test_a_post_with_origin_null_and_no_sec_fetch_site_is_refused() -> None:
+    """``docs/BROWSER-SUPPORT.md`` leans on this: a browser that sends ``Origin: null`` on its form
+    POST and no ``Sec-Fetch-Site`` is refused as a mismatch, by the Origin branch and not by the
+    neither-header one. The control is the same POST with a matching ``Origin``."""
+    state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
+
+    def request(origin: str) -> Any:
+        return SimpleNamespace(
+            method="POST",
+            headers=Headers({"host": "t", "origin": origin}),
+            app=SimpleNamespace(state=state),
+        )
+
+    with pytest.raises(HTTPException) as refused:
+        webconsole_auth.assert_same_origin(request("null"))
+    assert (refused.value.status_code, refused.value.detail) == (403, _CROSS_ORIGIN)
+    webconsole_auth.assert_same_origin(request("http://t"))
 
 
 async def test_login_with_neither_header_fails_closed_without_setting_a_cookie(

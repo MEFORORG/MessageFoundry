@@ -688,20 +688,46 @@ def assert_same_origin(request: Request) -> None:
     (by design — a must-change-confined session must be able to revoke itself, ASVS 7.4.4) and so has
     no other request-provenance control.
 
-    A WRITE carrying NEITHER header **fails closed** with 403 (BACKLOG #1116, #1124). It used to
-    pass, on the reasoning that a browser attaches one of the two to every cross-site POST. That is an
-    assumption about the browser, and nothing told the operator when it did not hold. No shipped
-    first-party client posts to ``/ui`` without a browser, so the refusal costs a conforming client
-    nothing; a script that drives ``/ui`` must send ``Origin``. A write whose ``Sec-Fetch-Site`` is
-    present but is not exactly ``same-origin`` or ``none`` fails closed the same way.
+    **THE RULE, stated once.** This table is the one complete statement of what the check does.
+    Other documents say the one fact they need and point here. ``test_ui_origin_guard.py`` reads the
+    table out of this docstring and drives the function over every row, so the two cannot drift.
+    A refusal is a 403. "write" is any method but GET, to match ``require_ui``. "matches" means
+    :func:`_origin_matches` accepts the ``Origin``; ``Origin: null`` does not match. "any other
+    value" is any non-empty value outside the four named, compared exactly: another letter case or
+    padding is another value.
 
-    **A GET keeps the rule it had before that item, and must.** At least one GET reaches this
-    check: ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in navigation. Owner
-    rulings R4 and R4b of 2026-09-28 hold that a sign-in GET is never blocked for missing fetch
-    metadata. So on a GET an absent, empty or unknown ``Sec-Fetch-Site`` raises nothing by itself.
-    ``cross-site`` and ``same-site`` are still refused there. A non-matching ``Origin`` is refused
-    there only when NO ``Sec-Fetch-Site`` line was sent at all, as before: on a GET any such line,
-    even an empty one, settles the check and ``Origin`` is not read.
+    ======  =======================  ===============  =======
+    Method  Sec-Fetch-Site           Origin           Verdict
+    ======  =======================  ===============  =======
+    write   absent                   absent or empty  refuse
+    write   absent                   matches          accept
+    write   absent                   does not match   refuse
+    write   empty                    absent or empty  refuse
+    write   empty                    matches          accept
+    write   empty                    does not match   refuse
+    write   cross-site or same-site  any              refuse
+    write   same-origin or none      any              accept
+    write   any other value          any              refuse
+    GET     absent                   absent or empty  accept
+    GET     absent                   matches          accept
+    GET     absent                   does not match   refuse
+    GET     empty                    any              accept
+    GET     cross-site or same-site  any              refuse
+    GET     same-origin or none      any              accept
+    GET     any other value          any              accept
+    ======  =======================  ===============  =======
+
+    The write rows fail closed where the request names no provenance this code recognises
+    (BACKLOG #1116, #1124). Before that change a write was refused only for ``cross-site``,
+    ``same-site`` or a non-matching ``Origin`` with no ``Sec-Fetch-Site`` line; every other write
+    row passed, on the reasoning that a browser attaches one of the two headers to every cross-site
+    POST. That is an assumption about the browser, and nothing told the operator when it did not
+    hold. No shipped first-party client posts to ``/ui`` without a browser.
+
+    **The GET rows are the rule a GET had before that change, and must stay.** At least one GET
+    reaches this check: ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in
+    navigation. Owner rulings R4 and R4b of 2026-09-28 hold that a sign-in GET is never blocked for
+    missing fetch metadata.
     """
     # "GET" and nothing wider, to match require_ui's own definition of a write.
     write = request.method != "GET"
