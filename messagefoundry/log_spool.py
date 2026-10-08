@@ -274,7 +274,7 @@ class LogSpool:
             writer.flush()
         except OSError:
             self.dropped += 1
-            self._close_writer()
+            self._abandon_write()
             return False
         assert self._write_seq is not None
         self._sizes[self._write_seq] += len(data)
@@ -290,13 +290,42 @@ class LogSpool:
         ):
             self._close_writer()
         if self._writer is None:
-            seq = self._last_seq = self._last_seq + 1
-            fd = os.open(self._path(seq), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY, 0o600)
+            seq = self._last_seq + 1
+            try:
+                fd = os.open(self._path(seq), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY, 0o600)
+            except FileExistsError:
+                self._last_seq = seq  # a leftover holds this number: step past it, or stick here
+                raise
+            # Taken only once the file exists, so a create the disk refused costs no number.
+            self._last_seq = seq
             self._writer = os.fdopen(fd, "ab")
             self._write_seq = seq
             self._segments.append(seq)
             self._sizes[seq] = 0
         return self._writer
+
+    def _abandon_write(self) -> None:
+        """Close the write segment after a failed write, and leave no empty file behind.
+
+        The writer is closed, not kept: a failed write may have put part of a line on disk, and an
+        append after it would join two entries into one unreadable line. So the next append opens
+        a new segment. While a disk stays full that used to leave one EMPTY file, and burn one
+        sequence number, for every record (BACKLOG #2279). An empty segment is deleted here and
+        its number handed back; one that holds bytes is kept and its real size counted."""
+        seq = self._write_seq
+        self._close_writer()
+        if seq is None:
+            return  # the create itself failed: there is no file
+        try:
+            on_disk = self._path(seq).stat().st_size
+        except OSError:
+            return
+        if on_disk:
+            self._sizes[seq] = max(self._sizes[seq], on_disk)
+            return
+        self._retire(seq)
+        if seq == self._last_seq and seq not in self._undeleted:
+            self._last_seq = seq - 1  # the file is gone, so the number cannot collide
 
     def _close_writer(self) -> None:
         if self._writer is not None:

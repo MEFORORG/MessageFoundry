@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import socket
 import ssl
@@ -654,5 +655,68 @@ def test_a_segment_whose_delete_failed_still_counts_against_the_cap(
         assert spool.undeleted_segments == 0
         assert spool.bytes_used == sum(p.stat().st_size for p in _segments(spool_dir)) == size
         assert _drain(spool) == ["record 0002"]  # the sent entries are not sent again
+    finally:
+        spool.close()
+
+
+class _FullDiskWriter:
+    """A segment writer on a full disk: the file was created, and every write is refused."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def write(self, data: bytes) -> int:
+        raise OSError(28, "No space left on device")
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        os.close(self._fd)
+
+
+def test_a_full_disk_leaves_no_empty_segments_and_burns_no_sequence_numbers(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "fdopen", lambda fd, mode: _FullDiskWriter(fd))
+            assert [spool.append(_entry(n)) for n in range(3)] == [False, False, False]
+        assert spool.dropped == 3
+        assert _segments(spool_dir) == []  # was: three empty files
+        assert spool.bytes_used == 0
+        # The disk has room again: the first real segment takes the first number.
+        assert spool.append(_entry(3))
+        assert [p.name for p in _segments(spool_dir)] == ["spool-000000000001.jsonl"]
+        assert _drain(spool) == ["record 0003"]
+    finally:
+        spool.close()
+
+
+def test_a_failed_write_that_left_bytes_keeps_the_segment_and_counts_them(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: only an EMPTY segment is removed. A torn write stays on
+    disk, is counted against the cap, and is skipped as unreadable on replay."""
+
+    class _TornWriter(_FullDiskWriter):
+        def write(self, data: bytes) -> int:
+            os.write(self._fd, data[:5])
+            raise OSError(28, "No space left on device")
+
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "fdopen", lambda fd, mode: _TornWriter(fd))
+            assert spool.append(_entry(0)) is False
+        assert len(_segments(spool_dir)) == 1
+        assert spool.bytes_used == 5
+        assert spool.append(_entry(1))
+        assert len(_segments(spool_dir)) == 2  # never appended after the torn line
+        assert _drain(spool) == ["record 0001"]
+        assert spool.unreadable == 1
     finally:
         spool.close()
