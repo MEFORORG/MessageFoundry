@@ -342,9 +342,10 @@ export const STARTUP_BANNERS = `<style>${SCRIPT_BANNER_KEYFRAMES}</style>
  * Place it right after `acquireVsCodeApi()`, so a script that dies acquiring the API leaves the
  * banner up. A block, so its `const` cannot collide with a panel's own names.
  *
- * The id goes in through `embedJson`, as every value this module writes into a script does. A bare
- * `JSON.stringify` leaves `<` unescaped, so a value could close the script tag it sits in. The id
- * is a constant today; the escape is what keeps that from being an assumption.
+ * The id goes into the script through `embedJson`, as at least the channel token and the canary's
+ * id do. A bare `JSON.stringify` leaves `<` unescaped, so a value could close the script tag it
+ * sits in. This covers the script text only: the same id is written raw into an `id="..."`
+ * attribute in `STARTUP_BANNERS`, which is safe because it is a constant.
  */
 export const SCRIPT_STARTED_MARK = `
     { const mfBanner = document.getElementById(${embedJson(SCRIPT_BANNER_ID)}); if (mfBanner) { mfBanner.hidden = true; } }`;

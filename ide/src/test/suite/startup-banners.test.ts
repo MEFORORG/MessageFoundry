@@ -149,8 +149,9 @@ suite("startup banners: what the user sees", () => {
   });
 
   test("the canary is un-nonced, and the banners need no script or stylesheet to read", () => {
-    // Parsed, not pattern-matched: a parser finds a script element however its tag is spelled.
-    // Scripts are off here, so nothing in the markup runs.
+    // The script COUNT is parsed, not pattern-matched: a parser finds a script element however
+    // its tag is spelled. (The checks further down still read the markup as text.) Scripts are
+    // off here, so nothing in the markup runs.
     const parsed = new JSDOM(`<!DOCTYPE html><body>${STARTUP_BANNERS}</body>`).window;
     openWindows.push(parsed);
     const scripts = [...parsed.document.querySelectorAll("script")] as DomNode[];
@@ -160,6 +161,12 @@ suite("startup banners: what the user sees", () => {
       scripts.map((s) => s.getAttributeNames()),
       [[]],
     );
+    // Nothing in the helper writes a value into script text with a bare JSON.stringify, which
+    // leaves "<" unescaped. embedJson is the one place that call may appear.
+    const helper = fs.readFileSync(path.join(SRC, "webviewMessaging.ts"), "utf8");
+    assert.ok(helper.includes("${embedJson(SCRIPT_BANNER_ID)}"));
+    assert.ok(helper.includes("${embedJson(CSP_BANNER_ID)}"));
+    assert.strictEqual(helper.split("JSON.stringify(").length - 1, 1, "a bare JSON.stringify");
     assert.ok(STARTUP_BANNERS.includes(`id="${SCRIPT_BANNER_ID}" role="alert" style=`));
     assert.ok(STARTUP_BANNERS.includes(`id="${CSP_BANNER_ID}" role="alert" hidden style=`));
     // The script banner must not start hidden, by attribute or by inline style.
