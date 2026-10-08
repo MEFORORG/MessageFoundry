@@ -5016,6 +5016,7 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
         rewrite_module,
         rewrite_source,
     )
+    from messagefoundry.redaction import safe_exc
 
     # Read stdin as raw UTF-8 (never the Windows locale codepage) so source bytes round-trip exactly —
     # byte-stability (gate 2) would break if a non-ASCII char (the samples carry — and → in comments)
@@ -5040,7 +5041,7 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
         stdin_source = _read_stdin() if args.module == "-" else None
     except UnicodeDecodeError as exc:
         return _emit_error(
-            f"<stdin>: cannot read (not UTF-8 at byte {exc.start}: {exc.reason})",
+            f"<stdin>: cannot read (not UTF-8: {safe_exc(exc)})",
             as_json=True,
             code=REFUSAL_GENERIC,
         )
@@ -5719,6 +5720,7 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
     # itself, because the engine's `[integrity].audit_anchor_file` startup check consumes the SAME
     # artifact (BACKLOG #328). A copy here would be the one place a later hardening -- of the refusals,
     # the encoding handling, or the byte bound -- could reach the CLI and miss the engine.
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.store import parse_audit_anchor, read_audit_anchor_file
 
     raw: str | None
@@ -5732,7 +5734,8 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
             # would have read a file-encoding problem as a detected tamper. PowerShell 5.1's `>`
             # writes UTF-16LE, so this is the likely file, not an exotic one.
             print(
-                f"error: cannot read --expected-anchor-file {args.expected_anchor_file!r}: {exc}. "
+                f"error: cannot read --expected-anchor-file {args.expected_anchor_file!r}: "
+                f"{codec_safe_str(exc)}. "
                 "It must be a UTF-8 text file holding the COUNT:HEAD line; PowerShell 5.1's '>' "
                 "writes UTF-16 — pipe to 'Set-Content -Encoding utf8' there.",
                 file=sys.stderr,

@@ -106,6 +106,7 @@ from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fro
 from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
 from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.message import Message
+from messagefoundry.redaction import codec_safe_str, safe_exc
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
     from collections.abc import Callable
@@ -2902,7 +2903,7 @@ def import_corepoint(
         # non-UTF-8 export escape as a raw traceback instead of the clean `CorepointImportError` this
         # function's own docstring promises. Same shape as `__main__.py`'s audit-anchor file reader.
         # Raised after the handler: the decode error's `.object` is the whole export (BACKLOG #2085).
-        unreadable = f"cannot read export {epath}: {exc}"
+        unreadable = f"cannot read export {epath}: {codec_safe_str(exc)}"
     if unreadable is not None:
         raise CorepointImportError(unreadable)
 
@@ -3217,7 +3218,7 @@ def _assert_encodable(text: str, where: str) -> None:
     try:
         text.encode("utf-8")
     except UnicodeEncodeError as exc:
-        unencodable = str(exc)  # names one code point and its position, never the text around it
+        unencodable = safe_exc(exc)  # the position only: str() names the code point itself
     else:
         return
     # Raised after the handler: the encode error's `.object` is the whole value (BACKLOG #2085).
