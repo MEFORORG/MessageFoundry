@@ -194,7 +194,7 @@ G.7 for the R1 fix and its *inert* rule, and G.5 for the R1 payloads. This spec 
 them. G.7, "What still differs at `main`", records where the code and those rules still differ;
 the stricter of the two governs, and each difference is a defect until it is reconciled.
 
-The analyst build must not ship before the lens meets the payloads as refusal tests (ADR AC-3), and
+The analyst build must not ship before the lens meets ADR AC-3, with the payloads as refusal tests, and
 before it passes typed-only mode on every `lens rewrite` call (FR-25).
 
 ### 5.4 Preconditions for the repository check to hold against a deliberate change
@@ -810,7 +810,7 @@ route work.
 
 ## 14. Engine changes, and what is out of scope
 
-**Engine changes this design needs.** All but the R1 fix are still to be built:
+**Engine changes this design needs.** All but the R1 fix and typed-only mode are still to be built:
 
 - the `code:steps` permission and the built-in Analyst role (section 4). With the `dryrun`
   generator-spec change below and, only if no existing route fits, one start-up probe route (FR-6),

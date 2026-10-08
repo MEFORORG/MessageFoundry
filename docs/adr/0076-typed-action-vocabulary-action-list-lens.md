@@ -1327,7 +1327,8 @@ Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and
 - `lens rewrite` has a flag, `--typed-only`, off by default (PR 2155). Under it, the two hatches
   above are refused with the generic `refused` code, and nothing is written.
 - **Also under the flag**, a move or delete that breaks the structure rule below is refused
-  (Manager decision 2026-10-07, after adversarial review, part of the R1 fix).
+  (Manager decision 2026-10-07, after adversarial review, part of the R1 fix). G.7, "What still
+  differs at `main`", names the one case the code still accepts.
 - Developers, the `ide/` extension and the ADR 0208 developer build keep the default. The ADR 0208
   analyst build always sets the flag and offers no way to turn it off.
 
