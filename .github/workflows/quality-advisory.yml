@@ -640,7 +640,7 @@ jobs:
           # is not uploaded, and the `coverage` job counts this shard as missing.
           if [ "$RC" -le 1 ] && [ -s .coverage ]; then mv .coverage "coverage-shard-${SHARD}.data"; fi
       - name: Upload this shard's coverage data
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-shard-${{ matrix.shard }}
           path: coverage-shard-${{ matrix.shard }}.data
