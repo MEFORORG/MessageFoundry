@@ -883,8 +883,12 @@ about a missing or failing forwarder two ways (BACKLOG #2612).
   `shard:<id>` on an engine shard. A lone engine that owns its store drops the suffix:
   `forwarder:<kind>`. So each process sharing a store has its own alert, and the alert says which
   process lost its forwarder. The suffix is built the way the `intake_paused` suffix is, with the
-  same 200-character cap. The engine checks every 30 seconds, and `kind` is a fixed word, at
-  least one of these.
+  same 200-character cap. An `[[alerts.rules]]` rule matches its `connection` glob against the
+  whole key, so where a suffix applies write `forwarder:not_installed*`; a rule on the bare
+  `forwarder:not_installed` matches a lone engine only. On a cluster node with no pinned
+  `[cluster].node_id` the suffix holds this engine's own host name and process id, and it goes to
+  every alert transport with the key. The engine checks every 30 seconds, and `kind` is a fixed
+  word, at least one of these.
   - `not_installed`: the forwarder is not attached, so this process sends nothing off the host.
     It fires when the engine first finds it absent, then again about every five minutes while it
     stays absent. The reason is `permanent` or `transient` for a failed start, or `stopped`.
