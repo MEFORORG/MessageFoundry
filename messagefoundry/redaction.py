@@ -89,10 +89,16 @@ from typing import Any
 
 __all__ = [
     "clamp_untrusted",
+    "codec_safe_line",
+    "codec_safe_line",
+    "codec_safe_line",
     "codec_safe_str",
     "json_loads_or_refusal",
     "log_timestamp",
     "prepare_log_record",
+    "prints_a_codec_error",
+    "prints_a_codec_error",
+    "prints_a_codec_error",
     "redact",
     "redact_untrusted",
     "safe_error",
@@ -2315,7 +2321,13 @@ _EXC_ARGS: Any = BaseException.__dict__["args"]
 _GROUP_MEMBERS: Any = BaseExceptionGroup.__dict__["exceptions"]
 _DEQUE_MAXLEN: Any = deque.__dict__["maxlen"]
 _DEFAULT_FACTORY: Any = defaultdict.__dict__["default_factory"]
-_OS_FILENAMES: tuple[Any, ...] = (OSError.__dict__["filename"], OSError.__dict__["filename2"])
+#: What an ``OSError`` prints beside its ``.args``: none of the three need be in them.
+_OS_PRINTED: tuple[Any, ...] = tuple(
+    OSError.__dict__[name] for name in ("strerror", "filename", "filename2")
+)
+#: How many objects one scan reads by attribute. Past it the rest are left as they are with no
+#: filter, so a log argument that is a large graph of dataclasses cannot hold the logging thread.
+_ATTRIBUTE_BUDGET = 512
 _TYPE_MRO: Any = type.__dict__["__mro__"]
 _TYPE_DICT: Any = type.__dict__["__dict__"]
 _NOT_FOUND: Any = object()
@@ -2331,19 +2343,39 @@ def _class_attribute(kind: type[Any], name: str) -> Any:
     return _NOT_FOUND
 
 
+#: ``id(class)`` -> (the class, its :func:`_slot_names` answer). Keyed by id because hashing a
+#: class runs its metaclass; the class is held, so its id cannot be reused while the entry lives.
+_SLOT_NAMES: dict[int, tuple[type[Any], tuple[str, ...] | None]] = {}
+_SLOT_NAMES_MAX = 1024
+
+
 def _slot_names(kind: type[Any]) -> tuple[str, ...] | None:
     """The slots a render of a ``kind`` instance may print, or None when ``kind`` is not read by
     attribute. A dataclass's are its field names, since ``slots=True`` keeps each field in one; a
-    ``UserDict`` view's is the mapping it prints. The instance ``__dict__`` is read as well."""
-    # One pass, with identity tests along the real MRO: this runs for every log argument that
-    # is neither a scalar nor a builtin container.
+    ``UserDict`` view's is the mapping it prints; an exception's own ``__str__`` may print any
+    attribute it set. The instance ``__dict__`` is read as well.
+
+    The answer is kept per class, since this runs for every log argument that is not a scalar. A
+    class made a dataclass after an instance of it was first logged keeps its first answer."""
+    cached = _SLOT_NAMES.get(id(kind))
+    if cached is not None and cached[0] is kind:
+        return cached[1]
+    names = _read_slot_names(kind)
+    if len(_SLOT_NAMES) >= _SLOT_NAMES_MAX:
+        _SLOT_NAMES.clear()
+    _SLOT_NAMES[id(kind)] = (kind, names)
+    return names
+
+
+def _read_slot_names(kind: type[Any]) -> tuple[str, ...] | None:
+    # One pass, with identity tests along the real MRO, so no caller code answers for the class.
     for base in _TYPE_MRO.__get__(kind):
         fields = _TYPE_DICT.__get__(base).get("__dataclass_fields__")
         if type(fields) is dict:
             return tuple(name for name in fields if type(name) is str)
         if base is MappingView:
             return ("_mapping",)
-        if base is SimpleNamespace or base is ChainMap:
+        if base is SimpleNamespace or base is ChainMap or base is BaseException:
             return ()
     return None
 
@@ -2466,8 +2498,8 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
         # Both: a subclass may print its .args, and the caller's list in .args can differ from them.
         return [*_GROUP_MEMBERS.__get__(arg), *_EXC_ARGS.__get__(arg)]
     if issubclass(kind, OSError):
-        # str() prints .filename and .filename2 by repr, and neither is in .args.
-        return [*_EXC_ARGS.__get__(arg), *(name.__get__(arg) for name in _OS_FILENAMES)]
+        # str() prints .strerror, and .filename and .filename2 by repr, whatever .args holds.
+        return [*_EXC_ARGS.__get__(arg), *(name.__get__(arg) for name in _OS_PRINTED)]
     if issubclass(kind, BaseException):
         return list(_EXC_ARGS.__get__(arg))  # str() and repr() print .args
     if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
@@ -2487,21 +2519,21 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
     return []
 
 
-def _attribute_children(arg: Any, kind: type[Any], slots: tuple[str, ...]) -> list[Any]:
-    try:
-        return _attribute_values(arg, kind, slots)
-    except Exception:  # noqa: BLE001 -- unreadable storage: left as it is, as with no filter
-        return []
-
-
 def prints_a_codec_error(exc: BaseException) -> bool:
-    """True when ``exc`` is not a ``UnicodeError`` but its own ``str()`` may print one: one sits in
-    its ``.args``, at any depth, or is an ``OSError``'s ``.filename`` (vault BACKLOG #3295).
+    """True when ``exc`` is not a ``UnicodeError`` but its own ``str()`` may print one (vault
+    BACKLOG #3295). It looks, at any depth, in at least: its ``.args``; the attributes in its
+    instance ``__dict__``, which a ``__str__`` of its own may print; its fields, when it is a
+    dataclass; and an ``OSError``'s ``.strerror``, ``.filename`` and ``.filename2``.
+
+    IT IS NOT A PROOF THAT ``str(exc)`` IS SAFE. It does not read at least a ``SyntaxError``'s
+    ``.msg`` and ``.text``, another C-level attribute, an object of a class that is not read by
+    attribute, or text already built from the error.
 
     ``str(RuntimeError(exc))`` is ``str(exc)``, which names the character or byte, and
     ``str(ValueError("bad", exc))`` prints ``repr(exc)``, the whole input. A caller prints the
     class and :data:`_HOLDER_TEXT` instead, never the other arguments, since the class may keep
-    them out of its own message.
+    them out of its own message. An exception that only keeps the error on an attribute, and does
+    not print it, loses its message the same way.
 
     An exception group whose ``str()`` is the builtin one prints only its message and a count, so
     it is False however its members read; a traceback prints each member on its own line. It never
@@ -2524,7 +2556,11 @@ class _Scan:
     It walks at any depth, without recursion, and visits each container once, so a cycle or a shared
     container costs nothing extra. Each container's elements are kept as read, so the rebuild works
     from the same objects (a dict view's items are new tuples on every read). A container whose read
-    fails counts as holding an error: it might."""
+    fails counts as holding an error: it might.
+
+    An object read by attribute (:func:`_slot_names`) adds what its attributes hold to its
+    elements. A dataclass that is also an exception or a container has both. At most
+    :data:`_ATTRIBUTE_BUDGET` objects are read that way in one scan."""
 
     __slots__ = ("holds", "nodes")
 
@@ -2534,6 +2570,7 @@ class _Scan:
         nodes: dict[int, tuple[Any, list[Any] | None, str]] = {}
         seeds: list[int] = []
         pending = [root]
+        budget = _ATTRIBUTE_BUDGET
         while pending:
             arg = pending.pop()
             kind = type(arg)
@@ -2544,14 +2581,15 @@ class _Scan:
                 nodes[key] = (arg, [], "")
                 seeds.append(key)
                 continue
-            if not issubclass(kind, _ARG_WALKED):
-                slots = _slot_names(kind)
-                if slots is not None:
-                    nodes[key] = (arg, _attribute_children(arg, kind, slots), "")
-                    pending.extend(c for c in nodes[key][1] or () if type(c) not in _ARG_SCALARS)
+            walked = issubclass(kind, _ARG_WALKED)
+            slots = _slot_names(kind) if budget else None
+            if not walked and slots is None:
                 continue
             try:
-                children = _children(arg, kind)
+                children = _children(arg, kind) if walked else []
+                if slots is not None:
+                    budget -= 1
+                    children += _attribute_values(arg, kind, slots)
             except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
                 nodes[key] = (arg, None, type(exc).__name__)
                 seeds.append(key)
@@ -2761,7 +2799,7 @@ class _Rebuild:
 
     def _render(self, arg: Any, kind: type[Any], children: list[Any], depth: int) -> _Rendered:
         # An exception, or an object read by attribute: never printed through its own code.
-        if issubclass(kind, BaseException) or not issubclass(kind, _ARG_WALKED):
+        if not issubclass(kind, _ARG_WALKED) or _slot_names(kind) is not None:
             return _holder_note(kind)
         if issubclass(kind, UserDict):
             own: Any = kind.__repr__
@@ -2778,13 +2816,64 @@ class _Rebuild:
 
     def pairs(self, root: Any) -> list[tuple[Any, Any]]:
         """The root mapping's keys and values, rebuilt, for :class:`_RenderedMapping`'s storage."""
-        if issubclass(type(root), ChainMap):
-            return []  # its maps are not flattened: "%(key)s" asks the ChainMap itself
+        kind = type(root)
         flat = self.scan.nodes[id(root)][1] or []
-        if issubclass(type(root), UserDict):
+        if issubclass(kind, ChainMap):
+            return self._chain_pairs(flat)
+        if _slot_names(kind) is not None:
+            return []  # a dataclass that is a mapping: its elements are not only keys and values
+        if issubclass(kind, UserDict):
             data = self.scan.nodes.get(id(flat[0])) if flat else None
             flat = (data[1] or []) if data is not None and issubclass(type(data[0]), dict) else []
         return _pairs([self.arg(child, 1) for child in flat])
+
+    def _chain_pairs(self, attributes: list[Any]) -> list[tuple[Any, Any]]:
+        """A ``ChainMap``'s plain-dict maps, last map first, so a later ``dict()`` of the pairs
+        lets the first map win as the ChainMap's own lookup does. A map that is not read as a
+        plain dict contributes nothing."""
+        nodes = self.scan.nodes
+        found: list[tuple[Any, Any]] = []
+        for held in attributes:  # .maps is the one list among them
+            maps = nodes.get(id(held)) if type(held) is list else None
+            for mapping in reversed(maps[1] or []) if maps is not None else ():
+                kind = type(mapping)
+                node = nodes.get(id(mapping))
+                if node is None or not issubclass(kind, dict) or _slot_names(kind) is not None:
+                    continue
+                found.extend(_pairs([self.arg(child, 1) for child in node[1] or []]))
+        return found
+
+    def _chain_pairs(self, attributes: list[Any]) -> list[tuple[Any, Any]]:
+        """A ``ChainMap``'s plain-dict maps, last map first, so a later ``dict()`` of the pairs
+        lets the first map win as the ChainMap's own lookup does. A map that is not read as a
+        plain dict contributes nothing."""
+        nodes = self.scan.nodes
+        found: list[tuple[Any, Any]] = []
+        for held in attributes:  # .maps is the one list among them
+            maps = nodes.get(id(held)) if type(held) is list else None
+            for mapping in reversed(maps[1] or []) if maps is not None else ():
+                kind = type(mapping)
+                node = nodes.get(id(mapping))
+                if node is None or not issubclass(kind, dict) or _slot_names(kind) is not None:
+                    continue
+                found.extend(_pairs([self.arg(child, 1) for child in node[1] or []]))
+        return found
+
+    def _chain_pairs(self, attributes: list[Any]) -> list[tuple[Any, Any]]:
+        """A ``ChainMap``'s plain-dict maps, last map first, so a later ``dict()`` of the pairs
+        lets the first map win as the ChainMap's own lookup does. A map that is not read as a
+        plain dict contributes nothing."""
+        nodes = self.scan.nodes
+        found: list[tuple[Any, Any]] = []
+        for held in attributes:  # .maps is the one list among them
+            maps = nodes.get(id(held)) if type(held) is list else None
+            for mapping in reversed(maps[1] or []) if maps is not None else ():
+                kind = type(mapping)
+                node = nodes.get(id(mapping))
+                if node is None or not issubclass(kind, dict) or _slot_names(kind) is not None:
+                    continue
+                found.extend(_pairs([self.arg(child, 1) for child in node[1] or []]))
+        return found
 
 
 def _safe_arg(arg: Any, depth: int) -> Any:

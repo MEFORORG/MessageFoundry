@@ -1500,9 +1500,14 @@ of the tray's. It prints such an error from its class, codec and position:
   fixed note.
 
 An exception that holds one prints as its class and a fixed note too, never its other arguments.
-That covers `RuntimeError(exc)`, `ValueError("bad", exc)` and an `OSError` whose `filename` is the
-error. It applies in a traceback, as a log argument, in `safe_exc()`, and in the error text a
-sandboxed Handler reports across the process boundary.
+That covers at least `RuntimeError(exc)`, `ValueError("bad", exc)`, an exception that keeps the
+error on an attribute of its own, and an `OSError` whose `strerror` or `filename` is the error. It
+applies in a traceback, as a log argument, in `safe_exc()` and `codec_safe_str()`, and in the error
+text a sandboxed Handler reports across the process boundary. An exception that only stores the
+error, and never prints it, loses its own message the same way.
+
+The filter reads at most 512 objects by attribute in one argument. Past that it leaves the rest
+as they are.
 
 **What stays the caller's job, at least:**
 
@@ -1512,7 +1517,9 @@ sandboxed Handler reports across the process boundary.
   returns text made from a stored error: `"%(key)s"` asks that lookup, and the filter walks only
   what it returns.
 - **Objects the filter does not read.** At least a `MappingProxyType`, a `slice`, and an object of
-  your own class that is not a dataclass. An error held in one still prints raw.
+  your own class that is not a dataclass or an exception. An error held in one still prints raw,
+  and so does a dataclass or a list that holds such an object. The same goes for an exception
+  that keeps the error where only C code can reach it, such as a `SyntaxError`'s `msg`.
 - **An argument that renders differently the second time.** The three later filters render the
   message again, so an object whose `__repr__` changes or raises on a later call can still raise
   from the log call, or print what the first step did not see.

@@ -1437,6 +1437,104 @@ def test_an_object_holding_a_unicode_error_in_an_attribute_prints_its_class_and_
         assert inside.getMessage() == f"got [1, {note}] end"
 
 
+@dataclasses.dataclass
+class _FieldError(Exception):
+    cause: object = None
+
+
+@dataclasses.dataclass
+class _FieldDict(dict[str, object]):
+    cause: object = None
+
+
+class _AttributeError(Exception):
+    """Keeps the error on an attribute and prints it from its own ``__str__``."""
+
+    def __init__(self, cause: object) -> None:
+        super().__init__("bad frame")
+        self.cause = cause
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.cause}"
+
+
+def _strerror_holder() -> OSError:
+    error = OSError(2, "cannot open")
+    error.strerror = _encode_error()  # type: ignore[assignment]
+    return error
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: _FieldError(cause=_encode_error()),
+        lambda: _AttributeError(_encode_error()),
+        _strerror_holder,
+    ],
+    ids=["dataclass-exception", "attribute-printed-by-str", "os-strerror"],
+)
+def test_an_exception_holding_a_unicode_error_outside_its_args_is_a_note(make: Any) -> None:
+    error = make()
+    assert any(s in f"{error} {error!r}" for s in _CHAR_SPELLINGS)  # control: raw with no filter
+    name = type(error).__name__
+    assert redaction.safe_exc(error) == f"{name}: {_HOLDER}"
+    assert codec_safe_str(error) == _HOLDER
+    out = safe_traceback((type(error), error, None))
+    assert out.endswith(f"{name}: {_HOLDER}")
+    record = _record("got %s and %r", (error, error))
+    prepare_log_record(record)
+    note = f"[{name} holding a codec error, not rendered]"
+    assert record.getMessage() == f"got {note} and {note}"
+
+
+def test_an_exception_with_clean_attributes_keeps_its_own_message() -> None:
+    error = _AttributeError("plain")
+    assert redaction.safe_exc(error) == "_AttributeError: bad frame: plain"
+    record = _record("got %s", (error,))
+    args = record.args
+    prepare_log_record(record)
+    assert record.args is args
+
+
+def test_a_dataclass_that_is_a_dict_is_read_by_field_too() -> None:
+    held = _FieldDict(cause=_encode_error())
+    held["k"] = 1
+    assert "caf" in repr(held)  # control
+    record = _record("got %r", ([held],))
+    prepare_log_record(record)
+    assert record.getMessage() == "got [[_FieldDict holding a codec error, not rendered]]"
+    record = _record("%(k)s", (held,))  # as the single mapping: its own lookup still answers
+    prepare_log_record(record)
+    assert record.getMessage() == "1"
+
+
+def test_the_attribute_walk_stops_at_its_budget_and_never_raises() -> None:
+    # Past the budget an object is left as it is with no filter: a stated limit, pinned here.
+    chain: object = _Outcome("leaf", _encode_error())
+    for _ in range(redaction._ATTRIBUTE_BUDGET + 1):
+        chain = _Outcome("n", chain)
+    record = _record("got %s", (chain,))
+    args = record.args
+    prepare_log_record(record)
+    assert record.args is args
+    near: object = _Outcome("leaf", _encode_error())
+    for _ in range(3):
+        near = _Outcome("n", near)
+    record = _record("got %s", (near,))
+    prepare_log_record(record)
+    assert record.getMessage() == "got [_Outcome holding a codec error, not rendered]"
+
+
+def test_a_chain_map_rebuilt_as_the_single_mapping_keeps_its_keys_for_a_later_reader() -> None:
+    held = collections.ChainMap[str, object]({"a": 1}, {"a": 2, "e": _encode_error()})
+    record = _record("%(a)s", (held,))
+    prepare_log_record(record)
+    stored: Any = record.args
+    assert stored is not held
+    assert stored.get("a") == 1 and set(stored) == {"a", "e"}  # the first map wins, as it does
+    _assert_encode_safe(str(stored.get("e")))
+
+
 def test_a_dataclass_field_kept_out_of_its_repr_is_still_a_note() -> None:
     # The walk reads the instance's attributes, not the generated repr's field list, so it errs
     # toward the note. Nothing the class hid is printed.
@@ -1539,15 +1637,15 @@ def test_a_non_utf8_code_set_csv_is_refused_by_name_without_the_byte(tmp_path: P
     with pytest.raises(CodeSetError) as caught:
         load_code_set(bad)
     text = str(caught.value)
-    assert text.startswith(
-        "code set 'diets.csv': invalid CSV \u2014 UnicodeDecodeError: 'utf-8' codec cannot decode at"
-    )
-    for spelling in _BYTE_SPELLINGS:
-        assert spelling not in text
+    assert text == "code set 'diets.csv': invalid CSV \u2014 the file is not valid UTF-8"
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     good = tmp_path / "ok.csv"
     good.write_text("code,label\nA,café\n", encoding="utf-8")
     assert load_code_set(good)["A"] == "café"
+    wide = tmp_path / "wide.csv"  # the csv module's own refusal escaped the same way
+    wide.write_text("code,label\nA," + "x" * 131073 + "\n", encoding="utf-8")
+    with pytest.raises(CodeSetError, match="code set 'wide.csv': invalid CSV \u2014 field larger"):
+        load_code_set(wide)
 
 
 # --- the guard: a new site cannot render a caught UnicodeError raw ----------------------------------
