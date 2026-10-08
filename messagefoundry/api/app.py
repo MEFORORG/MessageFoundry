@@ -3012,7 +3012,7 @@ def create_app(
         # gate (api/client_networks.py), which is what lets a locked-out operator curl it and discover
         # which address the engine is matching — the difference between a diagnosable 403 and a
         # console that looks dead. It reads through client_ip, as the gate itself does, so the echo
-        # names the address the gate matched (BACKLOG #2289).
+        # names the address the gate would match on any other path (BACKLOG #2289).
         networks = getattr(request.app.state, "client_networks", ())
         observed = client_ip(request) if networks else None
         return Health(

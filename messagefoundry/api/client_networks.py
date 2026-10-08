@@ -183,9 +183,8 @@ class ClientNetworkMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Through client_ip, the one client-address extractor (BACKLOG #2289), so this gate, the
-        # /health echo, the rate limiters, the audit rows and the session anchor cannot disagree.
-        # HTTPConnection is the base of Request and WebSocket and reads the same scope["client"].
+        # Through client_ip, the one client-address extractor (BACKLOG #2289; its docstring lists
+        # who else reads it). HTTPConnection is the base of Request and WebSocket.
         host = client_ip(HTTPConnection(scope))
         _record_observation(state, host)
         if client_network_allowed(host, networks):

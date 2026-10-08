@@ -461,6 +461,33 @@ async def test_unparseable_client_fails_closed(engine: Engine) -> None:
     assert (await _client(_app(engine, []), "testclient").get("/health")).status_code == 200
 
 
+@pytest.mark.parametrize(
+    ("peer", "denied"),
+    [
+        pytest.param((), True, id="empty-tuple"),
+        pytest.param(("10.1.2.3",), True, id="one-item"),
+        pytest.param(("::1", 12345, 0, 0), True, id="four-item"),
+        pytest.param(("10.1.2.3", 12345), False, id="control-a-pair-inside"),
+    ],
+)
+async def test_a_malformed_client_tuple_is_refused_not_crashed(
+    engine: Engine, peer: tuple[Any, ...], denied: bool
+) -> None:
+    """RED when: a scope["client"] that is not exactly a pair escapes the gate as a 500.
+
+    The gate reads through ``api.security.client_ip`` since BACKLOG #2289. starlette's
+    ``conn.client`` builds ``Address(*scope["client"])`` and raises ``TypeError`` on these shapes.
+    Uncaught, that turns the gate's 403 into a 500 with no denial marker, no counter and no
+    ``observed_client``. client_ip answers ``None`` instead, which the gate refuses: fail closed,
+    even for an in-network first item. The well-formed pair is the control: a gate that denied
+    everything would pass the other three."""
+    transport = httpx.ASGITransport(app=_app(engine, WARD), client=peer)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        resp = await c.get("/status")
+    assert resp.status_code != 500, resp.text
+    assert (resp.headers.get(DENIAL_HEADER) == DENIAL_MARKER) is denied, resp.status_code
+
+
 async def test_denial_carries_the_baseline_security_headers(engine: Engine) -> None:
     """The gate is the OUTERMOST middleware, so a denial short-circuits both the engine's
     security-headers middleware and the console's — it must set the baseline itself."""

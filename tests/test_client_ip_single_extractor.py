@@ -37,7 +37,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 #: Every package that serves or handles an HTTP or WebSocket request. The harness is a CLIENT of the
 #: engine and reads no peer address today; it is scanned so that stays true.
-_SCANNED = ("messagefoundry", "messagefoundry_webconsole", "harness")
+_SCANNED = ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit", "harness")
 
 #: Names a route, dependency or middleware gives a Starlette connection. ``req`` and ``connection``
 #: are left out: the engine uses them for request-body models and for connection config, where a
@@ -48,8 +48,8 @@ _CONN_NAMES = frozenset({"request", "websocket", "conn", "ws"})
 #: moves or goes away reds here too and the list cannot go stale. A new entry needs a stated reason
 #: that the site wants the raw peer rather than the client address.
 _ALLOWED: dict[tuple[str, str], int] = {
-    # The extractor itself: ``conn.client.host if conn.client else None`` is three matching nodes.
-    ("messagefoundry/api/security.py", "client_ip"): 3,
+    # The extractor itself, which reads ``conn.client`` once.
+    ("messagefoundry/api/security.py", "client_ip"): 1,
 }
 
 
