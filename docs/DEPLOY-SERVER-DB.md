@@ -28,7 +28,7 @@ Both server backends are **production-supported** (no "experimental" label):
 Configure `[store]` in the service settings (full reference: [`CONFIGURATION.md`](CONFIGURATION.md)
 `[store]`). The essentials:
 
-- `[store].type` — `postgres` or `sqlserver` (vs the default `sqlite`).
+- `[store].backend` — `postgres` or `sqlserver` (vs the default `sqlite`).
 - The connection target (host/port/database/auth) — supply secrets via `MEFOR_*` env, never the file.
 - `[store].encrypt` (default **true**) + `[store].trust_server_certificate` (default **false**) —
   encrypt the DB connection; only weaken with `MEFOR_ALLOW_INSECURE_TLS` on a trusted lab segment.
@@ -583,11 +583,11 @@ A host that only runs a CLI command against the SQL Server store, such as
 
 **The policy to set wherever one of these hops would run:**
 
-1. Allow only AEAD cipher suites at TLS 1.2. An AEAD suite has `GCM`, `CCM` or `CHACHA20_POLY1305`
-   in its name. A CBC suite is not AEAD.
+1. Allow only AEAD cipher suites at TLS 1.2. An AEAD suite has `GCM`, `CCM`, or `CHACHA20` with
+   `POLY1305`, in its name. A CBC suite is not AEAD.
 2. Turn TLS 1.0 and TLS 1.1 off. No suite at those versions is AEAD.
 
-TLS 1.3 suites are all AEAD, so TLS 1.3 needs no suite change for this step.
+TLS 1.3 suites are all AEAD, so this step asks for no TLS 1.3 change. Keep TLS 1.3 on.
 
 AEAD-only is the floor this step asks for. The engine's own approved list is narrower, and it is
 stated once, under `tls_ciphers` in [`CONFIGURATION.md`](CONFIGURATION.md). The ruling does not decide
@@ -597,9 +597,10 @@ check tests only the floor.
 **Why the engine does not do this itself.** The native driver terminates TLS, so no Python-side TLS
 context exists for the engine to narrow or check
 ([ADR 0180](adr/0180-asserting-tls-suites-on-a-library-that-exposes-no-sslcontext.md), *ODBC Driver
-18*). The engine does refuse `Encrypt=no` and `TrustServerCertificate=yes` on the secure posture. It
-would not notice a host that still allows a CBC suite. The owner declined a startup check that reads
-the host policy, so nothing in the engine would warn about a missed step.
+18*). The engine's own checks on these hops cover whether the hop is encrypted and whether the server
+certificate is validated. They do not cover cipher suites, so the engine would not notice a host that
+still allows a CBC suite. The owner declined a startup check that reads the host policy, so nothing in
+the engine would warn about a missed step.
 
 **How far the statements below are proven.** The load-bearing ones carry one of three labels:
 
@@ -620,12 +621,18 @@ MDM and the TLS PowerShell module. It says editing the cipher-suite registry ord
 supported.
 
 - Group Policy: **Computer Configuration > Administrative Templates > Network > SSL Configuration
-  Settings > SSL Cipher Suite Order**. Enable it and list only AEAD suites.
+  Settings > SSL Cipher Suite Order**. Enable it and list only AEAD suites. SChannel keeps one list
+  for every TLS version, so keep the TLS 1.3 names in it. **Measured** on the host below: the TLS 1.3
+  names `TLS_AES_256_GCM_SHA384` and `TLS_AES_128_GCM_SHA256` sit in the same list as the TLS 1.2
+  names.
 - Or PowerShell, once for each suite name that check 1 below prints:
 
   ```powershell
   Disable-TlsCipherSuite -Name 'TLS_RSA_WITH_AES_256_CBC_SHA'
   ```
+
+If Group Policy already sets **SSL Cipher Suite Order** on the host, change that policy. How a local
+`Disable-TlsCipherSuite` interacts with an existing policy is **unmeasured**.
 
 **2. Turn TLS 1.0 and 1.1 off for the client role (vendor-documented).** Microsoft's
 [TLS registry settings](https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings)
@@ -650,6 +657,9 @@ take effect on the next boot." Restarting the engine service is not enough for t
 **4. Check it, after the reboot.** Both checks read state and change nothing.
 
 ```powershell
+# Control for check 1: the number of enabled suites. It must be above 0.
+(Get-TlsCipherSuite).Name.Count
+
 # Check 1, suites: every enabled suite that is not AEAD. A healthy host prints nothing.
 (Get-TlsCipherSuite).Name | Where-Object { $_ -notmatch 'GCM|CCM|CHACHA20_POLY1305' }
 
@@ -660,13 +670,17 @@ foreach ($v in 'TLS 1.0', 'TLS 1.1') {
 }
 ```
 
-**Measured**, on one stock Windows 11 host with no policy set: check 1 printed 18 names out of 28
-enabled suites, and check 2 printed nothing. So both checks report an unconfigured host. Their healthy
-answers are **unmeasured**, because this step changed no Windows setting.
+**Measured**, on one stock Windows 11 host with no policy set: the control printed `28`, check 1
+printed 18 names, and check 2 printed nothing. So both checks report an unconfigured host. Their
+healthy answers are **unmeasured**, because this step changed no Windows setting.
+
+Read the control first. Check 1 prints nothing when the suite list is empty or fails to load, so its
+silence means healthy only when the control is above 0.
 
 Keep check 1 in the form shown. **Measured** on the same host, in PowerShell 7.6 and Windows PowerShell
-5.1: piping `Get-TlsCipherSuite` straight into `Where-Object Name -NotMatch ...` did not filter by
-name. One spelling of it printed nothing on that unconfigured host, which reads as healthy.
+5.1: `Get-TlsCipherSuite` piped straight into `Where-Object Name -NotMatch` did not filter by name. It
+passed the whole list through. With `ForEach-Object Name` added on the end, it printed nothing on that
+unconfigured host, which reads as healthy.
 
 **What the Windows checks do not prove.**
 
@@ -675,7 +689,8 @@ name. One spelling of it printed nothing on that unconfigured host, which reads 
 - Before the reboot, check 1 may already print nothing while SChannel still uses the old suites. That
   is **unmeasured**, so run the checks after the reboot.
 - Check 1 tests the AEAD floor only. Suites it passes can still lie outside the engine's approved
-  list. To match that list, use the Group Policy route and list those suites by name.
+  list. That list is written in OpenSSL names, which SChannel does not accept, and this step gives no
+  SChannel equivalent of it.
 
 #### Linux: the host OpenSSL configuration binds the driver (measured)
 
@@ -708,18 +723,24 @@ MinProtocol = TLSv1.2
 ```
 
 Replace the line, do not add a second one: OpenSSL would take the last `CipherString` in the section.
-Keep the `@SECLEVEL=2` part, which the stock line carried. Then restart the engine service, so the
+Keep the `@SECLEVEL=2` part, which the stock line carried. The `Ciphersuites` line narrows TLS 1.3 to
+its 256-bit suites. The AEAD floor does not need it. Then restart the engine service, so the
 driver reads the file again.
 
-**Check it (measured).** Run both lines as the account the engine runs as, with the same environment:
+**Check it (measured).** Run these as the account the engine runs as, with the same environment:
 
 ```bash
 openssl ciphers -s -v | grep -c .        # every suite on offer: must be above 0
 openssl ciphers -s -v | grep -v -c AEAD  # suites that are not AEAD: must be 0
+grep -E '^(CipherString|Ciphersuites|MinProtocol)' /etc/ssl/openssl.cnf
 ```
 
 On the rig, the stock file printed `30` then `16`, and the policy above printed `6` then `0`. Under
 that policy, `openssl ciphers -s -v` listed exactly the six suites the driver then offered.
+
+The first two lines check suites only. They do not show the minimum version. The third line prints the
+policy lines from the file, and a healthy host shows one `CipherString` line and `MinProtocol = TLSv1.2`
+or higher. It reads the file, not the effective setting, so it would miss an `OPENSSL_CONF` override.
 
 The first line is the control. A host with no `openssl` command printed `0` for it on the rig, and it
 would print `0` for the second line too. So a `0` on the second line means nothing unless the first
@@ -737,18 +758,20 @@ too. That variable replaces the system file for the driver (measured, last table
 
 - Any other driver version, OpenSSL version or distribution. Re-run the check after a driver or
   operating-system upgrade.
-- RHEL-family hosts, where `update-crypto-policies` writes the system OpenSSL policy.
-  Whether this driver follows it was not run. The check command above still applies.
+- RHEL-family hosts, where `update-crypto-policies` writes the system OpenSSL policy. Neither the
+  set step nor the check was run there.
 - A completed connection to a real SQL Server. The rig recorded what the driver offered. A server can
   only choose a suite the client offered, so a suite missing from the offer cannot be negotiated.
 - The engine process itself. The rig drove the driver through `sqlcmd`, not through the engine.
-- `dialect="generic"` with another vendor's ODBC driver. That driver has its own TLS stack and its own
-  rules, so this step does not cover it.
+- `dialect="generic"` with another vendor's ODBC driver. Which TLS stack and which rules that driver
+  follows was not run, so this step does not cover it.
 
 #### Both platforms: what to expect afterwards
 
 - The policy is host-wide. It would narrow every other program on the host that uses the same TLS
-  stack, so apply it in a change window and test those programs too.
+  stack, so apply it in a change window and test those programs too. On Linux that can include the
+  engine's own TLS hops, where its Python uses the host OpenSSL. The `Ciphersuites` line would then
+  take `TLS_AES_128_GCM_SHA256` away from those hops as well.
 - Connect once after the change. If the database server shares no AEAD suite with the host, the
   connection would fail at the TLS handshake. Fix the server's suite list. Do not widen the host policy.
 - This step is a precondition, not a control the engine enforces. Re-check it after operating-system
@@ -758,7 +781,7 @@ too. That variable replaces the system file for the driver (measured, last table
 
 ## 6. Pre-flight checklist
 
-- [ ] `[store].type` set to `postgres`/`sqlserver`; connection + auth via `MEFOR_*` env.
+- [ ] `[store].backend` set to `postgres`/`sqlserver`; connection + auth via `MEFOR_*` env.
 - [ ] `[store].encrypt = true` (and **not** `MEFOR_ALLOW_INSECURE_TLS`) for any PHI deployment.
 - [ ] DB CA trusted so `trust_server_certificate = false` validates — Postgres `ssl_root_cert` **or**
       machine-store import; SQL Server **machine store only** (§5). Never `TrustServerCertificate=true`.

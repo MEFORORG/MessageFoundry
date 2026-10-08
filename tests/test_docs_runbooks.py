@@ -141,6 +141,8 @@ def test_odbc_cipher_step_states_the_precondition() -> None:
         "ruling R3 of 2026-09-28",
     ):
         assert term in step, f"the ODBC host cipher policy step lost {term!r}"
+    for label in ("- **Measured**:", "- **Vendor-documented**:", "- **Unmeasured**:"):
+        assert label in step, f"the step lost the {label} line of its label legend"
     # The engine's approved suite list is stated under tls_ciphers; the step links to it.
     assert "[`CONFIGURATION.md`](CONFIGURATION.md)" in step
 
@@ -187,7 +189,9 @@ def test_odbc_cipher_windows_check_enumerates_suite_names() -> None:
     step = _cipher_step(_deploy_db_text())
     check = "(Get-TlsCipherSuite).Name | Where-Object { $_ -notmatch 'GCM|CCM|CHACHA20_POLY1305' }"
     assert check in step
+    assert "(Get-TlsCipherSuite).Name.Count" in step, "check 1 lost its control line"
     assert "Get-TlsCipherSuite |" not in step
+    assert "Get-TlsCipherSuite|" not in step
 
 
 def test_odbc_cipher_step_is_linked_from_the_checklist_and_the_connector_reference() -> None:
@@ -200,3 +204,5 @@ def test_odbc_cipher_step_is_linked_from_the_checklist_and_the_connector_referen
     checklist = text.split("## 6. Pre-flight checklist", 1)[1]
     assert _CIPHER_ANCHOR in checklist
     assert "DEPLOY-SERVER-DB.md" + _CIPHER_ANCHOR in _CONNECTIONS.read_text(encoding="utf-8")
+    aoag = (_ROOT / "docs" / "AOAG-DEPLOYMENT.md").read_text(encoding="utf-8")
+    assert "DEPLOY-SERVER-DB.md" + _CIPHER_ANCHOR in aoag
