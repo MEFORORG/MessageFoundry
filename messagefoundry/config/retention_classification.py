@@ -294,8 +294,6 @@ class RetentionGateOutcome:
     refusal: str | None
     #: The lines the gate writes, in order. A refusal comes after all of them.
     lines: tuple[RetentionGateLine, ...]
-    #: The windows that were unset and are now set to their default bound on the settings.
-    defaulted: tuple[RetentionWindow, ...]
 
 
 def _auto_bound_notice(defaulted: list[RetentionWindow], env_name: str) -> str:
@@ -319,11 +317,9 @@ def _auto_bound_notice(defaulted: list[RetentionWindow], env_name: str) -> str:
     )
 
 
-def _outcome(
-    refusal: str | None, lines: list[RetentionGateLine], defaulted: list[RetentionWindow]
-) -> RetentionGateOutcome:
+def _outcome(refusal: str | None, lines: list[RetentionGateLine]) -> RetentionGateOutcome:
     """The gate's result so far. A ``refusal`` that is not ``None`` stops the start."""
-    return RetentionGateOutcome(refusal=refusal, lines=tuple(lines), defaulted=tuple(defaulted))
+    return RetentionGateOutcome(refusal=refusal, lines=tuple(lines))
 
 
 def evaluate_retention_gate(
@@ -373,7 +369,6 @@ def evaluate_retention_gate(
                 "configuration one — see messagefoundry/config/retention_classification.py."
             ),
             lines=(),
-            defaulted=(),
         )
 
     lines: list[RetentionGateLine] = []
@@ -430,7 +425,6 @@ def evaluate_retention_gate(
                     "(e.g. 30); or, to deliberately retain forever, set "
                     f"{BODY_ACKNOWLEDGEMENT_SETTING}=true (audited).",
                     lines,
-                    defaulted,
                 )
             lines.append(
                 RetentionGateLine(
@@ -498,7 +492,6 @@ def evaluate_retention_gate(
                 f"({env_name!r}) and would accumulate without bound; refusing to start, because each "
                 f"needs a window or its own audited acknowledgement (ASVS 14.2.7): {tiers}.",
                 lines,
-                defaulted,
             )
         lines.append(
             RetentionGateLine(
@@ -519,11 +512,11 @@ def evaluate_retention_gate(
         )
         for window in acknowledged
     )
-    return _outcome(None, lines, defaulted)
+    return _outcome(None, lines)
 
 
 #: The switch that acknowledges a connection's own keep-forever override. The same switch covers the
-#: global body windows; the ``serve`` gate for those spells it out in its own messages.
+#: global body windows, and :func:`evaluate_retention_gate` names it from this constant too.
 BODY_ACKNOWLEDGEMENT_SETTING: Final[str] = "[security].allow_keeping_phi_indefinitely"
 
 
@@ -581,8 +574,6 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
 class OverrideVerdict:
     """What :func:`judge_keep_forever_overrides` decided about one graph."""
 
-    #: :func:`keep_forever_overrides` for the graph. Empty when no override keeps bodies forever.
-    kept: tuple[str, ...]
     #: Why an enforcing instance refuses the graph, or ``None`` when it does not.
     refusal: str | None
     #: The line a graph load reports and still passes the graph: the ``AUDIT:`` line once
@@ -595,9 +586,10 @@ def judge_keep_forever_overrides(
 ) -> OverrideVerdict:
     """Decide a graph's keep-forever overrides: refuse, report, or neither.
 
-    The one decision behind :func:`make_retention_override_guard`, ``messagefoundry check`` and
-    the ``supervise`` pre-check (vault BACKLOG #2368), so those three reach the same verdict in
-    the same words for the same registry and switches. It prints and logs nothing.
+    The decision behind :func:`make_retention_override_guard`, ``messagefoundry check``, the
+    ``supervise`` pre-check and ``connection upsert`` and ``remove`` (vault BACKLOG #2368), so
+    each reaches the same verdict in the same words for the same registry and switches. It prints
+    and logs nothing.
 
     ``acknowledged`` is the loaded ``[security].allow_keeping_phi_indefinitely``. With it the
     graph passes and :attr:`OverrideVerdict.report` is the ``AUDIT:`` line, on either dial.
@@ -605,10 +597,9 @@ def judge_keep_forever_overrides(
     reported instead."""
     kept = keep_forever_overrides(registry)
     if not kept:
-        return OverrideVerdict(kept=kept, refusal=None, report=None)
+        return OverrideVerdict(refusal=None, report=None)
     if acknowledged:
         return OverrideVerdict(
-            kept=kept,
             refusal=None,
             report=(
                 f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a "
@@ -620,8 +611,8 @@ def judge_keep_forever_overrides(
         )
     reason = keep_forever_override_refusal(kept, env_name=env_name)
     if enforcing:
-        return OverrideVerdict(kept=kept, refusal=reason, report=None)
-    return OverrideVerdict(kept=kept, refusal=None, report=reason)
+        return OverrideVerdict(refusal=reason, report=None)
+    return OverrideVerdict(refusal=None, report=reason)
 
 
 def make_retention_override_guard(

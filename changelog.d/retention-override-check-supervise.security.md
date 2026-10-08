@@ -6,7 +6,9 @@
   on a first deployment each engine shard would have refused the graph and been restarted. It now
   refuses once, before it starts an engine shard, with exit code 2. Under `enforcement = warn`,
   or with the acknowledgement, both pass the graph; `check` shows the line the engine would
-  write, and neither writes the warning or the `AUDIT:` line itself.
+  write, and neither writes the warning or the `AUDIT:` line itself. `connection upsert` and
+  `remove` now read the same decision instead of their own copy of it; what they refuse is
+  unchanged.
   **Who this would bite on first deployment:** a config repository whose CI runs `check` on a
   graph with such an override and no acknowledgement. **Remedy:** the failure names each
   connection and the switch. Read *Per-connection overrides* in

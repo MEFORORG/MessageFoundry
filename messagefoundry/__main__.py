@@ -3491,11 +3491,13 @@ def _serve(args: argparse.Namespace) -> int:
         )
 
     # --- #186(a) secure-by-default data retention (ASVS 14.2.4) --------------------------------------
-    # Every PHI retention tier must be bounded or acknowledged. Each unset auto-bounded window takes
-    # its default bound here; an explicit 0 on one refuses under enforce and warns under
+    # The classified PHI retention tiers that can read as unbounded. Each unset auto-bounded window
+    # takes its default bound here; an explicit 0 on one refuses under enforce and warns under
     # enforcement = warn; a warn-only tier needs a window or its own acknowledgement (BACKLOG
-    # #1967). The decision, its order and its wording are in evaluate_retention_gate, which
-    # `messagefoundry check` calls too (vault BACKLOG #2280), so the two commands share one text.
+    # #1967). It does not reach a tier the classification leaves out, such as one PHI.md section 2
+    # marks as an honest gap. The decision, its order and its wording are in
+    # evaluate_retention_gate, which `messagefoundry check` calls too (vault BACKLOG #2280), so the
+    # two commands share one text.
     # Placed after the exposure gates so an exposed instance's cleartext/MFA refusals surface
     # first.
     # The gate sets the defaulted windows on `settings` in place. settings.retention is the same
@@ -9039,8 +9041,7 @@ def _connection(args: argparse.Namespace) -> int:
     )
     from messagefoundry.config.retention_classification import (
         BODY_ACKNOWLEDGEMENT_SETTING,
-        keep_forever_override_refusal,
-        keep_forever_overrides,
+        judge_keep_forever_overrides,
     )
     from messagefoundry.config.settings import (
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
@@ -9117,13 +9118,14 @@ def _connection(args: argparse.Namespace) -> int:
         # Vault BACKLOG #2368: a connection's own keep-forever retention override is refused here
         # as the engine's registry guard refuses it, so an edit a reload would reject is not
         # written. Refusal only: the guard's warning and AUDIT line belong to a graph load.
-        kept = keep_forever_overrides(registry)
-        if (
-            kept
-            and settings.security.enforcement is SecurityEnforcement.ENFORCE
-            and not settings.retention.allow_unbounded_phi
-        ):
-            raise WiringError(keep_forever_override_refusal(kept, env_name=env_name))
+        verdict = judge_keep_forever_overrides(
+            registry,
+            acknowledged=settings.retention.allow_unbounded_phi,
+            enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+            env_name=env_name,
+        )
+        if verdict.refusal is not None:
+            raise WiringError(verdict.refusal)
 
     try:
         if args.action == "upsert":

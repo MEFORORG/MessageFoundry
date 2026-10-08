@@ -382,7 +382,9 @@ def test_check_passes_and_carries_what_the_guard_would_write(
         _, leg = _overrides_leg(tmp_path / "cfg", 'ai.environment = "prod"\n' + switch)
 
     assert leg.ok and not leg.skipped
-    assert leg.detail.startswith(f"serve would load this graph and write: warning: {written}")
+    assert leg.detail.startswith(
+        f"the retention override guard would pass this graph and write: warning: {written}"
+    )
     assert "IB_FEED" in leg.detail
     # The leg reports what the guard would write. It writes no AUDIT line or warning of its own.
     assert "AUDIT:" not in capsys.readouterr().err
@@ -399,15 +401,31 @@ def test_check_passes_a_graph_with_no_keep_forever_override(
     assert leg.detail == "no connection's own retention override keeps its PHI bodies indefinitely"
 
 
+def test_check_judges_the_override_when_the_settings_name_no_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_posture_env(monkeypatch)
+    cfg = tmp_path / "cfg"
+    _graph(cfg, inbound_days=0, outbound_days=None)
+    # A site may name its environment only on `serve --env`. The verdict does not depend on it.
+    _, leg = _overrides_leg(cfg, "")
+    assert not leg.ok and not leg.skipped
+    assert "IB_FEED" in leg.detail and "('named by serve --env')" in leg.detail
+    assert "the environment name above is a placeholder" in leg.detail
+
+
 def test_check_skips_the_override_leg_where_serve_builds_no_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _clear_posture_env(monkeypatch)
     cfg = tmp_path / "cfg"
     _graph(cfg, inbound_days=0, outbound_days=None)
-    # No active environment: serve stops before it builds the guard.
-    _, leg = _overrides_leg(cfg, "")
-    assert leg.skipped and leg.detail == "no active environment set"
+    # A custom environment name with no declared tier: serve stops on the tier first, and the
+    # posture leg is the one that fails.
+    report, leg = _overrides_leg(cfg, 'ai.environment = "clinic-east"\n')
+    assert leg.skipped and "production tier is unresolved" in leg.detail
+    blocking = [r.name for r in report.results if r.blocking]
+    assert "posture" in blocking and "retention-overrides" not in blocking
     # No settings at all: a bare config dir declares no posture to judge the override against.
     monkeypatch.chdir(tmp_path)
     bare = run_checks(cfg, run_lint=False, suppress_service_toml_search=True)

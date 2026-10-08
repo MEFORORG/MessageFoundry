@@ -3455,6 +3455,40 @@ def _check_oidc_revocation(
     )
 
 
+#: The name the two retention legs print where ``serve`` would print the environment, when the
+#: settings they read name none. ``serve`` takes it from ``--env``, which ``check`` does not have.
+_UNNAMED_ENVIRONMENT = "named by serve --env"
+
+#: The SKIP text both retention legs give an unresolved production tier.
+_TIER_UNRESOLVED = "the production tier is unresolved; the posture check reports it"
+
+
+def _retention_posture(settings: ServiceSettings) -> tuple[str, bool, str] | None:
+    """``(env_name, production, note)`` for the two retention legs, or ``None`` to SKIP.
+
+    Neither leg's verdict depends on the environment name or the production tier. Both only word
+    the text. So with no active environment in the settings the legs still judge, because a site
+    that names its environment only on ``serve --env`` would otherwise get no parity from them.
+    They print :data:`_UNNAMED_ENVIRONMENT` for the name and leave out the word "production",
+    and ``note`` says so on the line, since ``serve`` would print the real name and tier.
+
+    ``None`` when the environment is named but its production tier is unresolved, a custom name
+    with no ``[security].production_instance``. ``serve`` stops on that before either retention
+    gate, and the ``posture`` leg fails on it."""
+    env_name = settings.ai.environment
+    if env_name is None:
+        return (
+            _UNNAMED_ENVIRONMENT,
+            False,
+            " [no active environment in the settings check read, so the environment name above "
+            "is a placeholder and the production tier is not known]",
+        )
+    try:
+        return env_name, settings.ai.require_posture(), ""
+    except ValueError:
+        return None
+
+
 def _check_retention(
     config_dir: str | Path,
     *,
@@ -3469,17 +3503,19 @@ def _check_retention(
     :func:`~messagefoundry.config.retention_classification.evaluate_retention_gate`, the function
     ``serve`` calls, so on the same settings the two agree and the refusal reads the same.
 
-    A refusal FAILS this leg. Under ``enforcement = warn`` that function refuses nothing, so the
-    leg passes and its line carries what ``serve`` would write, the warnings included.
+    A refusal FAILS this leg. Under ``enforcement = warn`` that function refuses only a
+    classification shorter than its floor, a build defect, so otherwise the leg passes and its
+    line carries what the gate would write, the warnings included. A pass is about this gate
+    alone: ``serve`` has other start gates this leg does not read.
 
     The function sets each unset auto-bounded window on the settings it is given. Those are this
     leg's own load, and nothing else reads them.
 
-    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`. It
-    also SKIPs with no active environment or an unresolved production tier: ``serve`` stops on
-    each of those before it reaches this gate, and the ``posture`` leg reports the second. The
-    settings are the ones this leg loads, so a start that sets the environment or a window on
-    ``serve``'s own command line or in its own environment can still decide differently."""
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`.
+    :func:`_retention_posture` says what it does with no active environment and with an
+    unresolved production tier. The settings are the ones this leg loads, so a start that sets a
+    window on ``serve``'s own command line or in its own environment can still decide
+    differently."""
     from pydantic import ValidationError
 
     from messagefoundry.config.retention_classification import evaluate_retention_gate
@@ -3506,21 +3542,10 @@ def _check_retention(
             required=True,
             detail=f"settings did not load: {_settings_error(exc)}",
         )
-    env_name = settings.ai.environment
-    if env_name is None:
-        return CheckResult(
-            name, ok=True, required=True, skipped=True, detail="no active environment set"
-        )
-    try:
-        production = settings.ai.require_posture()
-    except ValueError:
-        return CheckResult(
-            name,
-            ok=True,
-            required=True,
-            skipped=True,
-            detail="the production tier is unresolved; the posture check reports it",
-        )
+    posture = _retention_posture(settings)
+    if posture is None:
+        return CheckResult(name, ok=True, required=True, skipped=True, detail=_TIER_UNRESOLVED)
+    env_name, production, note = posture
     outcome = evaluate_retention_gate(
         settings,
         enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
@@ -3532,20 +3557,24 @@ def _check_retention(
             name,
             ok=False,
             required=True,
-            detail=f"serve would refuse to start (exit 2): {outcome.refusal}",
+            detail=f"serve would refuse to start (exit 2): {outcome.refusal}{note}",
         )
     if not outcome.lines:
         return CheckResult(
             name,
             ok=True,
             required=True,
-            detail="serve would start: no classified PHI retention tier reads as unbounded",
+            detail=f"the retention start gate would refuse nothing and write nothing{note}",
         )
     return CheckResult(
         name,
         ok=True,
         required=True,
-        detail="serve would start and write: " + " | ".join(line.text for line in outcome.lines),
+        detail=(
+            "the retention start gate would refuse nothing, and write: "
+            + " | ".join(line.text for line in outcome.lines)
+            + note
+        ),
     )
 
 
@@ -3572,8 +3601,8 @@ def _check_retention_overrides(
 
     Required, with the fail-safe SKIPs of :func:`_check_build`: no ``messagefoundry.toml`` and no
     ``MEFOR_AI_ENVIRONMENT`` → SKIP; a graph that won't load → SKIP (``validate`` reports it);
-    settings that won't load → FAIL (BACKLOG #1318). It also SKIPs with no active environment,
-    because ``serve`` stops there before it builds the guard."""
+    settings that won't load → FAIL (BACKLOG #1318). :func:`_retention_posture` says what it does
+    with no active environment and with an unresolved production tier."""
     from pydantic import ValidationError
 
     from messagefoundry.config.retention_classification import judge_keep_forever_overrides
@@ -3601,11 +3630,10 @@ def _check_retention_overrides(
             required=True,
             detail=f"settings did not load: {_settings_error(exc)}",
         )
-    env_name = settings.ai.environment
-    if env_name is None:
-        return CheckResult(
-            name, ok=True, required=True, skipped=True, detail="no active environment set"
-        )
+    posture = _retention_posture(settings)
+    if posture is None:
+        return CheckResult(name, ok=True, required=True, skipped=True, detail=_TIER_UNRESOLVED)
+    env_name, _production, note = posture
     try:
         # allow_empty: same reason as build-check (BACKLOG #1648). With zero connections there is
         # no override to judge and the leg passes, which is the honest answer.
@@ -3625,14 +3653,17 @@ def _check_retention_overrides(
             name,
             ok=False,
             required=True,
-            detail=f"serve would refuse this graph: {verdict.refusal}",
+            detail=f"serve would refuse this graph: {verdict.refusal}{note}",
         )
     if verdict.report is not None:
         return CheckResult(
             name,
             ok=True,
             required=True,
-            detail=f"serve would load this graph and write: warning: {verdict.report}",
+            detail=(
+                "the retention override guard would pass this graph and write: warning: "
+                f"{verdict.report}{note}"
+            ),
         )
     return CheckResult(
         name,

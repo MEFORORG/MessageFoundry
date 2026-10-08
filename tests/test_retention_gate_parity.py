@@ -8,8 +8,10 @@ Vault BACKLOG #2280 limb 1: ``serve`` refused a start over an unbounded PHI rete
 call it.
 
 The ``serve`` half of this module was written against the gate while it was still inline in
-``_serve``, and passed there. It pins each line the gate writes, whole, and the order, so the
-extraction is held to the text and the exit code it had before.
+``_serve``, and passed there. For seven arms of the gate it pins each stderr line whole and in
+order, each AUDIT record whole, and the exit code. It does not pin how the AUDIT records
+interleave with the stderr lines, because the two are read from different streams. The
+classification-floor refusal was added afterwards and has its own tests below.
 """
 
 from __future__ import annotations
@@ -256,6 +258,10 @@ _SCENARIOS = [
 ]
 
 
+_WRITES = "the retention start gate would refuse nothing, and write: "
+_SILENT = "the retention start gate would refuse nothing and write nothing"
+
+
 def _retention_leg(toml: Path) -> CheckResult:
     report = run_checks(SAMPLES_CONFIG, run_lint=False, service_config=toml)
     return next(r for r in report.results if r.name == "retention")
@@ -293,8 +299,8 @@ def test_check_reaches_serves_verdict_in_serves_words(
         assert leg.detail == "serve would refuse to start (exit 2): " + refusal[len("error: ") :]
     else:
         assert rc == 0 and leg.ok
-        assert leg.detail.startswith("serve would start and write: ")
-        written = leg.detail.removeprefix("serve would start and write: ").split(" | ")
+        assert leg.detail.startswith(_WRITES)
+        written = leg.detail.removeprefix(_WRITES).split(" | ")
         # Each line serve wrote, and no other. The two streams interleave, so compare sorted.
         assert sorted(written) == sorted(served + audits)
 
@@ -308,22 +314,85 @@ def test_check_says_so_when_nothing_reads_as_unbounded(tmp_path: Path) -> None:
     )
     leg = _retention_leg(toml)
     assert leg.ok and not leg.skipped
-    assert leg.detail == "serve would start: no classified PHI retention tier reads as unbounded"
+    assert leg.detail == _SILENT
 
 
-def test_check_skips_where_serve_stops_before_the_gate(tmp_path: Path) -> None:
+def test_a_silent_arm_is_not_reported_as_nothing_unbounded(tmp_path: Path) -> None:
+    """Under ``warn`` the body acknowledgement keeps every body window forever and the gate
+    writes nothing. The leg must say the gate is silent, not that no tier is unbounded."""
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(
+        'ai.environment = "staging"\nsecurity.enforcement = "warn"\n'
+        "security.allow_keeping_phi_indefinitely = true\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(config_path=toml)
+    assert settings.retention.messages_days == 0  # control: the bodies really are kept forever
+    leg = _retention_leg(toml)
+    assert leg.ok and leg.detail == _SILENT
+    assert "unbounded" not in leg.detail
+
+
+def test_check_judges_settings_that_name_no_environment(tmp_path: Path) -> None:
+    """A site may name its environment only on ``serve --env``. The verdict does not depend on
+    the name, so the leg still judges, and says the name it prints is a placeholder."""
     toml = tmp_path / "messagefoundry.toml"
     toml.write_text("security.delete_message_bodies_after_days = 0\n", encoding="utf-8")
     leg = _retention_leg(toml)
-    assert leg.skipped and leg.detail == "no active environment set"
+    assert not leg.ok and not leg.skipped
+    assert leg.detail.startswith(
+        "serve would refuse to start (exit 2): a data-retention window is explicitly disabled "
+        f"for {_BODY} on a PHI instance ('named by serve --env'); refusing to start"
+    )
+    assert leg.detail.endswith(
+        "[no active environment in the settings check read, so the environment name above is a "
+        "placeholder and the production tier is not known]"
+    )
 
+
+def test_check_skips_on_an_unresolved_production_tier(tmp_path: Path) -> None:
     # A custom environment name with no declared tier: serve refuses on the tier, not on retention.
+    toml = tmp_path / "messagefoundry.toml"
     toml.write_text(
         'ai.environment = "clinic-east"\nsecurity.delete_message_bodies_after_days = 0\n',
         encoding="utf-8",
     )
     leg = _retention_leg(toml)
     assert leg.skipped and "production tier is unresolved" in leg.detail
+
+
+# --- the classification floor -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("enforcing", [True, False])
+def test_a_shrunken_classification_refuses_on_either_dial(
+    monkeypatch: pytest.MonkeyPatch, enforcing: bool
+) -> None:
+    monkeypatch.setattr(retention_classification, "MIN_PHI_RETENTION_WINDOWS", 99)
+    settings = _dev_settings()
+    outcome = retention_classification.evaluate_retention_gate(
+        settings, enforcing=enforcing, production=False, env_name="dev"
+    )
+    count = len(retention_classification.PHI_RETENTION_WINDOWS)
+    assert outcome.lines == ()
+    assert outcome.refusal == (
+        f"the PHI retention classification has shrunk to {count} windows (floor 99); refusing "
+        "to start rather than gate on a partial classification. This is a build defect, not a "
+        "configuration one — see messagefoundry/config/retention_classification.py."
+    )
+    # It refuses before it defaults anything.
+    assert settings.retention.messages_days == 0
+
+
+def test_serve_prints_the_floor_refusal_and_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(retention_classification, "MIN_PHI_RETENTION_WINDOWS", 99)
+    rc, _ = _run_secure_serve(tmp_path, monkeypatch, _EGRESS + _SECURE_ALERTS)
+    assert rc == 2
+    (line,) = _gate_lines(capsys.readouterr().err)
+    assert line.startswith("error: the PHI retention classification has shrunk to ")
+    assert line.endswith("see messagefoundry/config/retention_classification.py.")
 
 
 def test_a_refusal_fails_the_whole_gate(tmp_path: Path) -> None:

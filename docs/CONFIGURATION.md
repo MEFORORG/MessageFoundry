@@ -903,8 +903,12 @@ these tiers, and one tier's switch does not cover another.
 
 `messagefoundry check` runs this gate as a required check, `retention`, through the function
 `serve` calls. So a refusal fails the check in the words `serve` would print. It reads the settings
-file `check` resolves and the environment `check` runs in, and it needs the active environment in
-one of them, because `check` has no `--env`. With no active environment the check is skipped.
+file `check` resolves and the environment `check` runs in. `check` has no `--env`, so settings that
+name no environment are still judged, and the line prints a placeholder where `serve` would print
+the name. A pass is about this gate alone; `serve` has other start gates.
+
+`supervise` does not pre-check this gate. On settings it refuses, each engine shard would refuse to
+start, and the supervisor would restart it until its crash-loop breaker trips. Run `check` first.
 
 | Tier | Applies when | Its acknowledgement |
 |---|---|---|
