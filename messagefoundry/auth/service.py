@@ -2599,6 +2599,20 @@ class AuthService:
             return True
         return self._admin_write_limiter.allow(actor)
 
+    def admin_write_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value, in whole seconds, for an admin write just refused for ``actor``.
+
+        The wait until this actor's next write would be admitted: the rest of the window when the
+        count fired, or the rest of the gap when the minimum interval did. Rounded UP and never
+        below 1, so a client that waits this long is admitted by THIS process's limiter, provided
+        the account makes no other write meanwhile. The limiter is in-process, so another engine
+        shard keeps its own count. It reflects this actor's own
+        writes only; the limiter has no cross-actor dimension (BACKLOG #2144). The JSON API and the
+        ``/ui`` console both send this value, so the same refusal reads the same on either."""
+        if self._admin_write_limiter is None:
+            return 1
+        return max(1, math.ceil(self._admin_write_limiter.retry_after(actor)))
+
     def attach_security_notifier(self, notifier: SecurityNotifier | None) -> None:
         """Wire the out-of-band notice channel after construction (BACKLOG #2081).
 
