@@ -1720,6 +1720,10 @@ still default to `0`, but `serve` applies a posture gate on top of them:
   safe answer, not a window, until state has an eviction key that a read moves (#1188).
 - The explicit, **audited** opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
   suppresses the auto-bound **and** downgrades the refusal to a loud audited warning.
+- A connection's own override of `0` (`messages_days` on an inbound, `dead_letter_days` on an
+  outbound) keeps that connection's bodies forever, so it needs the same opt-out. The engine checks
+  it when it loads the graph. The rule is stated once, under *Per-connection overrides* in
+  [CONFIGURATION.md](CONFIGURATION.md#retention).
 - The canonical operator-facing home of the message-body window is now
   **`[security].delete_message_bodies_after_days`**; its *model* default is 30, but the desugar
   is **presence-gated** — only an EXPLICITLY-set switch is written through — so an **unset**

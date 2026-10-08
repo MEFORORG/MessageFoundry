@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings, StoreSettings
     from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.config.wiring import Registry
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
     from messagefoundry.store.store import UserRecord
@@ -3569,6 +3570,20 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # Vault BACKLOG #2368: a connection may override either body window, and its own 0 keeps that
+    # connection's bodies forever. Those overrides are in the graph, which this function does not
+    # load, so the gate above cannot see them. A registry guard judges them at every graph load,
+    # with the posture of the gate above: refuse under enforce, warn under warn, and an AUDIT line
+    # naming each connection once [security].allow_keeping_phi_indefinitely acknowledges it.
+    from messagefoundry.config.retention_classification import make_retention_override_guard
+
+    retention_override_guard = make_retention_override_guard(
+        acknowledged=settings.retention.allow_unbounded_phi,
+        enforcing=enforcing,
+        env_name=env_name,
+        log=_credlog,
+    )
+
     # BACKLOG #1967, owner ruling R4 (b) of 2026-09-24 (ASVS 14.2.7): each warn-only tier needs a
     # window OR its own acknowledgement. Under `enforce` a tier with neither REFUSES, naming the tier
     # and its switch; under `warn` it warns, the refuse/warn split every posture gate here shares.
@@ -4121,7 +4136,7 @@ def _serve(args: argparse.Namespace) -> int:
         # shard closure below raises it, so binding it here keeps this block self-contained. Relying
         # on the earlier binding would make an unrelated reorder turn the no-split-store refusal into
         # a NameError, on a path only `serve --shard` against a mismatched store reaches.
-        from messagefoundry.config.wiring import Registry, WiringError
+        from messagefoundry.config.wiring import WiringError
         from messagefoundry.pipeline.sharding import (
             filter_registry_for_shard,
             require_unified_store,
@@ -4240,7 +4255,7 @@ def _serve(args: argparse.Namespace) -> int:
         security_settings=settings.security,
         config_dir=config_dir,
         registry_filter=registry_filter,
-        registry_guard=static_credential_guard,
+        registry_guard=_chain_registry_guards(static_credential_guard, retention_override_guard),
         static_credential_settings=settings,
         config_reload_roots=settings.api.config_reload_roots,
         inbound_bind_host=settings.inbound.bind_host,
@@ -6373,6 +6388,22 @@ def _unread_key_text(settings: ServiceSettings) -> str:
         unread_key_refusal(settings.store)
         or "[store].key_provider does not read the key that is set."
     )
+
+
+def _chain_registry_guards(
+    *guards: Callable[[Registry], None] | None,
+) -> Callable[[Registry], None]:
+    """One registry guard that runs each given guard in order; ``None`` entries are skipped.
+
+    The engine takes a single guard. Each raises ``WiringError`` to refuse a graph, so the first
+    refusal wins and the later guards do not run on that load."""
+    live = [guard for guard in guards if guard is not None]
+
+    def chained(registry: Registry) -> None:
+        for guard in live:
+            guard(registry)
+
+    return chained
 
 
 def _keyless_opt_out_switches(settings: ServiceSettings) -> str:

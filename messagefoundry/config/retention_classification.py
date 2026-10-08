@@ -32,8 +32,13 @@ rather than restating it here, because four copies of it are how the records dri
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from messagefoundry.config.wiring import Registry
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,3 +272,75 @@ def unbounded_windows(read: object) -> tuple[RetentionWindow, ...]:
         if isinstance(value, int) and value <= 0:
             out.append(window)
     return tuple(out)
+
+
+#: The switch that acknowledges keeping PHI bodies forever, for the two body windows and for a
+#: connection's own override of either.
+BODY_ACKNOWLEDGEMENT_SETTING: Final[str] = "[security].allow_keeping_phi_indefinitely"
+
+
+def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
+    """Each connection in ``registry`` whose own retention override keeps its PHI bodies forever.
+
+    A connection may override either PL-1 body window (ADR 0027): an inbound sets ``messages_days``,
+    an outbound sets ``dead_letter_days``. ``None`` inherits the global window and a positive number
+    bounds it. ``0`` keeps that connection's bodies forever, whatever the global window says, so it
+    is the same choice as a global ``0`` made for one connection. The global windows live in the
+    service settings, where :func:`unbounded_windows` reads them; these live in the graph, so the
+    start gate cannot see them and a registry guard must (vault BACKLOG #2368).
+
+    Each entry reads ``inbound 'NAME' (messages_days = 0)``, sorted, inbounds first."""
+    inbound = sorted(c.name for c in registry.inbound.values() if c.messages_days == 0)
+    outbound = sorted(c.name for c in registry.outbound.values() if c.dead_letter_days == 0)
+    return tuple(
+        [f"inbound {name!r} (messages_days = 0)" for name in inbound]
+        + [f"outbound {name!r} (dead_letter_days = 0)" for name in outbound]
+    )
+
+
+def make_retention_override_guard(
+    *, acknowledged: bool, enforcing: bool, env_name: str, log: logging.Logger
+) -> Callable[[Registry], None]:
+    """The engine registry guard for a connection's own keep-forever retention override.
+
+    The graph half of the body-window gate in ``serve``, with the same posture. Without the
+    acknowledgement (``acknowledged``, the loaded ``[security].allow_keeping_phi_indefinitely``) an
+    enforcing instance refuses the graph by raising ``WiringError``: a first load fails the start,
+    and a ``/config/reload`` is refused with the running graph kept. Under ``enforcement = warn`` it
+    warns. With the acknowledgement the graph loads and a WARNING-level ``AUDIT:`` line names each
+    connection, at every load, on either dial.
+
+    Like the static-credential guard, it judges every graph against the settings the process started
+    with: a reload re-reads the graph and never ``[security]``."""
+
+    def guard(registry: Registry) -> None:
+        kept = keep_forever_overrides(registry)
+        if not kept:
+            return
+        listed = "; ".join(kept)
+        if acknowledged:
+            log.warning(
+                "AUDIT: PHI instance (environment %r) loaded a graph with per-connection unbounded "
+                "data retention (%s=true; %s) -- these connections' PHI message bodies are "
+                "retained INDEFINITELY (retention opt-out override).",
+                env_name,
+                BODY_ACKNOWLEDGEMENT_SETTING,
+                listed,
+            )
+            return
+        reason = (
+            f"a per-connection retention override keeps PHI message bodies indefinitely on a PHI "
+            f"instance ({env_name!r}): {listed} (unbounded PHI at rest, ASVS 14.2.4/14.2.7). Set "
+            "each override to a positive number of days, or remove it to inherit the global "
+            f"window; or, to deliberately retain forever, set {BODY_ACKNOWLEDGEMENT_SETTING}=true "
+            "(audited)"
+        )
+        if enforcing:
+            # Imported here: wiring is the heavy end of the config package, and this module is
+            # otherwise a leaf the settings model can read.
+            from messagefoundry.config.wiring import WiringError
+
+            raise WiringError(reason)
+        log.warning("%s", reason)
+
+    return guard
