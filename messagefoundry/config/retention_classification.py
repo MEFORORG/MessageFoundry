@@ -33,6 +33,7 @@ rather than restating it here, because four copies of it are how the records dri
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
@@ -320,7 +321,9 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
         f"instance{where}: {'; '.join(kept)} (unbounded PHI at rest, ASVS 14.2.4/14.2.7). Set "
         "each override to a positive number of days, or remove it to inherit the global "
         f"window; or, to deliberately retain forever, set {BODY_ACKNOWLEDGEMENT_SETTING}=true "
-        "(audited)"
+        "(audited). That switch covers the whole instance: it also turns off the default bound "
+        "on every unset global window, so set each global window to an explicit number of days "
+        "first"
     )
 
 
@@ -340,22 +343,28 @@ def make_retention_override_guard(
     reload, and a reload a later check then refuses, so the line says the gate passed the graph and
     never that the graph went live.
 
+    The AUDIT line and the warning go to the logger AND to stderr, as the body-window gate's do. A
+    ``[logging].level`` above WARNING would otherwise drop the only record of an acknowledged
+    override. Under NSSM both streams are captured, so a line can appear in both.
+
     Like the static-credential guard, it judges every graph against the settings the process started
     with: a reload re-reads the graph and never ``[security]``."""
+
+    def report(line: str) -> None:
+        log.warning("%s", line)
+        print(f"warning: {line}", file=sys.stderr)
 
     def guard(registry: Registry) -> None:
         kept = keep_forever_overrides(registry)
         if not kept:
             return
         if acknowledged:
-            log.warning(
-                "AUDIT: the retention gate on a PHI instance (environment %r) passed a graph with "
-                "per-connection unbounded data retention (%s=true; %s) -- once that graph is live, "
-                "these connections' PHI message bodies are retained INDEFINITELY (retention "
-                "opt-out override).",
-                env_name,
-                BODY_ACKNOWLEDGEMENT_SETTING,
-                "; ".join(kept),
+            report(
+                f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a "
+                "graph with per-connection unbounded data retention "
+                f"({BODY_ACKNOWLEDGEMENT_SETTING}=true; {'; '.join(kept)}) -- once that graph is "
+                "live, these connections' PHI message bodies are retained INDEFINITELY (retention "
+                "opt-out override)."
             )
             return
         reason = keep_forever_override_refusal(kept, env_name=env_name)
@@ -365,6 +374,6 @@ def make_retention_override_guard(
             from messagefoundry.config.wiring import WiringError
 
             raise WiringError(reason)
-        log.warning("%s", reason)
+        report(reason)
 
     return guard

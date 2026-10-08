@@ -19,7 +19,7 @@ from typing import cast
 
 import pytest
 
-from messagefoundry.__main__ import main
+from messagefoundry.__main__ import _chain_registry_guards, main
 from messagefoundry.config.retention_classification import (
     keep_forever_overrides,
     make_retention_override_guard,
@@ -94,27 +94,37 @@ def test_enforce_refuses_an_unacknowledged_override_and_names_the_connection(
 
 
 def test_warn_enforcement_warns_instead_of_refusing(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
     registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=0)
+    capsys.readouterr()
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
         _guard(acknowledged=False, enforcing=False)(registry)
     (record,) = _guard_records(caplog)
     text = record.getMessage()
     assert "IB_FEED" in text and "OB_FEED" in text and not text.startswith("AUDIT:")
+    # The remedy names the switch and says how far it reaches.
+    assert f"{_ACK}=true" in text and "covers the whole instance" in text
+    # On stderr too, which no [logging].level can filter.
+    assert f"warning: {text}" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("enforcing", [True, False])
 def test_an_acknowledged_override_loads_and_is_audited_by_name(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, enforcing: bool
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    enforcing: bool,
 ) -> None:
     registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=0)
+    capsys.readouterr()
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
         _guard(acknowledged=True, enforcing=enforcing)(registry)
     (record,) = _guard_records(caplog)
     text = record.getMessage()
     assert record.levelno == logging.WARNING and text.startswith("AUDIT:")
     assert "IB_FEED" in text and "OB_FEED" in text and f"{_ACK}=true" in text
+    assert f"warning: {text}" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("acknowledged", [True, False])
@@ -125,6 +135,30 @@ def test_a_graph_with_no_keep_forever_override_is_silent(
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
         _guard(acknowledged=acknowledged, enforcing=True)(registry)
     assert _guard_records(caplog) == []
+
+
+def test_chained_guards_run_in_order_and_the_first_refusal_wins() -> None:
+    # serve hands the engine ONE guard built from several. A guard dropped from the chain would
+    # stop refusing with every other test still green, so the chain itself is pinned here.
+    calls: list[str] = []
+
+    def first(_: Registry) -> None:
+        calls.append("first")
+
+    def refuses(_: Registry) -> None:
+        calls.append("refuses")
+        raise WiringError("refused")
+
+    def never(_: Registry) -> None:
+        calls.append("never")
+
+    registry = Registry()
+    _chain_registry_guards(None, first, None)(registry)
+    assert calls == ["first"]
+    calls.clear()
+    with pytest.raises(WiringError, match="refused"):
+        _chain_registry_guards(first, refuses, never)(registry)
+    assert calls == ["first", "refuses"]
 
 
 def test_a_negative_override_built_past_the_factories_is_found(tmp_path: Path) -> None:
@@ -232,3 +266,27 @@ def test_connection_upsert_refuses_what_an_enforcing_reload_would(
     else:
         assert rc == 1 and not written
         assert "IB_FEED" in out and "allow_keeping_phi_indefinitely" in out
+        assert "No --service-config was given" not in out
+
+
+def test_connection_upsert_says_which_settings_it_read_when_none_were_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The IDE's usual call names no --service-config, so the edit is judged against the defaults
+    # (enforce, no acknowledgement). The refusal must say so, or it names a switch the instance
+    # may already have set.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "logic.py").write_text(_EDIT_LOGIC, encoding="utf-8")
+    edit = {
+        "direction": "inbound",
+        "name": "IB_FEED",
+        "transport": "mllp",
+        "router": "r",
+        "settings": {"port": 2614},
+        "messages_days": 0,
+    }
+    rc = main(
+        ["connection", "upsert", "--config", str(tmp_path), "--data", json.dumps(edit), "--json"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 1 and "No --service-config was given" in out and "[security]" in out

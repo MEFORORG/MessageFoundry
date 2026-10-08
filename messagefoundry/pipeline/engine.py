@@ -815,9 +815,10 @@ class Engine:
 
         It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
         (vault BACKLOG #2184, engine PR 2070). The preflight reads anchor files, which can change
-        after the graph loaded. Each guard ``serve`` wires (static credentials, and
-        per-connection keep-forever retention overrides since vault BACKLOG #2368) judges only
-        the graph and the startup settings, and neither has changed. It already judged this graph
+        after the graph loaded. Each guard ``serve`` wires today (at least the
+        static-credential guard and, since vault BACKLOG #2368, the per-connection keep-forever
+        retention guard) judges only the graph and the startup settings, and neither has changed.
+        A guard that reads anything else would need to run here. It already judged this graph
         when it loaded, through :meth:`reload_detail` or the managed app's first load, over the
         whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
         filtered graph, so a guard here would judge less than that load did. A graph an embedder

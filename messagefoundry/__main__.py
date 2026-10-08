@@ -8853,6 +8853,7 @@ def _connection(args: argparse.Namespace) -> int:
         resolve_values_base_dir,
     )
     from messagefoundry.config.retention_classification import (
+        BODY_ACKNOWLEDGEMENT_SETTING,
         keep_forever_override_refusal,
         keep_forever_overrides,
     )
@@ -8955,7 +8956,14 @@ def _connection(args: argparse.Namespace) -> int:
         # The deny default (vault BACKLOG #2605) refuses an unlisted outbound. With no
         # --service-config, the IDE's usual call, the edit was checked against whatever settings
         # load_settings found, so say where the list belongs rather than leave the analyst guessing.
-        if args.service_config is None and BLOCK_UNLISTED_OUTBOUND_IN_FORCE in message:
+        # The keep-forever retention refusal (vault BACKLOG #2368) reads [security] the same way, so
+        # it gets the same account of which settings were read.
+        advice = None
+        if BLOCK_UNLISTED_OUTBOUND_IN_FORCE in message:
+            advice = "list the connection's host in that file's [egress] allowed_* list for its transport"
+        elif BODY_ACKNOWLEDGEMENT_SETTING in message:
+            advice = "this edit is then checked against that instance's [security] settings"
+        if args.service_config is None and advice is not None:
             # load_settings falls back to ./messagefoundry.toml, so say which case this was.
             local = Path("messagefoundry.toml")
             read = (
@@ -8965,8 +8973,7 @@ def _connection(args: argparse.Namespace) -> int:
             )
             message += (
                 f". No --service-config was given, so this edit was checked {read}. Pass "
-                "--service-config <path to the instance's messagefoundry.toml>, and list the "
-                "connection's host in that file's [egress] allowed_* list for its transport"
+                f"--service-config <path to the instance's messagefoundry.toml>, and {advice}"
             )
         return _emit_error(message, as_json=args.json)
     except OSError as exc:

@@ -2989,8 +2989,9 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
 #: not seen: a refusal added elsewhere in the function, and a skip hidden in a helper the slice
 #: calls. The behavioural pins in `tests/test_cli.py`, which run `serve`, cover part of that. The test
 #: below checks only that each pin still EXISTS, not what it asserts, and none of them exercises
-#: `reference_snapshot_days`. The row's third claim, that the gate does not read a per-outbound
-#: override, is prose only: nothing here binds it to the code.
+#: `reference_snapshot_days`. The row's third claim, that a per-outbound override of 0 meets its
+#: own gate (vault BACKLOG #2368), is bound to the code by `tests/test_retention_override_gate.py`,
+#: not here.
 
 _CONFIG_DOC = _ROOT / "docs" / "CONFIGURATION.md"
 _RETENTION_HEADING = "### `[retention]`"
