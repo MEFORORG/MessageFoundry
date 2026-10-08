@@ -2,17 +2,20 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The R4 (a) forwarding start-gate predicate (BACKLOG #1966, ADR 0200, ASVS 16.4.3).
 
-The predicate passes only verified TLS to a non-loopback collector, and reads configuration alone.
+The predicate passes only verified TLS to a non-loopback collector that is not this host's own name
+or address. It reads configuration and local host state, sends no packet and resolves no name.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from messagefoundry.config import settings as settings_module
 from messagefoundry.config.settings import LoggingSettings, forwarding_gate_refusal
 
 
@@ -100,6 +103,173 @@ def test_the_gate_opens_no_connection_and_resolves_no_name(
     monkeypatch.setattr(socket, "gethostbyname", _no_network)
     assert forwarding_gate_refusal(settings) is None
     assert forwarding_gate_refusal(_log()) is not None
+
+
+# --- this host's own name and addresses (vault BACKLOG #2375) -----------------------------------
+#
+# Every test below injects the host's identity. None reads the runner's real name or routing table,
+# so none depends on where it runs.
+
+_OWN_V4 = "10.20.30.40"
+_OWN_V6 = "2001:db8::40"
+
+
+def _as_this_host(
+    monkeypatch: pytest.MonkeyPatch, *, names: tuple[str, ...] = (), addresses: tuple[str, ...] = ()
+) -> None:
+    """Make the gate see a host with these names, holding these addresses. Any other address is
+    reached FROM the first one, as a real routing table answers for a remote destination."""
+    own = [ipaddress.ip_address(a) for a in addresses]
+
+    def source(addr: Any) -> Any:
+        if addr in own:
+            return addr
+        return next((a for a in own if a.version == addr.version), None)
+
+    monkeypatch.setattr(settings_module, "_own_host_names", lambda: frozenset(names))
+    monkeypatch.setattr(settings_module, "_local_source_address", source)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [_OWN_V4, _OWN_V6, f"[{_OWN_V6}]", f"::ffff:{_OWN_V4}", "eng1", "ENG1.", "eng1.corp.test"],
+)
+def test_a_collector_at_this_hosts_own_name_or_address_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    """The defect: the gate refused loopback only, so the engine's own LAN address passed."""
+    _as_this_host(monkeypatch, names=("eng1.corp.test", "eng1"), addresses=(_OWN_V4, _OWN_V6))
+    reason = forwarding_gate_refusal(_verified(tmp_path, host=host))
+    assert reason is not None and "own name or one of its own addresses" in reason
+
+
+@pytest.mark.parametrize("host", ["10.20.30.41", "2001:db8::41", "siem.corp.test", "eng10"])
+def test_another_hosts_name_or_address_still_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    """The control: the same injected host does not refuse a neighbour one address or name away."""
+    _as_this_host(monkeypatch, names=("eng1.corp.test", "eng1"), addresses=(_OWN_V4, _OWN_V6))
+    assert forwarding_gate_refusal(_verified(tmp_path, host=host)) is None
+
+
+def test_a_probe_that_fails_passes_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail-open, by decision: with no host name and no source address the gate decides as it did
+    before the probe existed. The second half shows the same address refuses once the probe answers."""
+    monkeypatch.setattr(settings_module, "_own_host_names", lambda: frozenset())
+    monkeypatch.setattr(settings_module, "_local_source_address", lambda addr: None)
+    assert forwarding_gate_refusal(_verified(tmp_path, host=_OWN_V4)) is None
+    assert forwarding_gate_refusal(_verified(tmp_path, host="eng1")) is None
+    _as_this_host(monkeypatch, names=("eng1",), addresses=(_OWN_V4,))
+    assert forwarding_gate_refusal(_verified(tmp_path, host=_OWN_V4)) is not None
+
+
+def test_a_short_os_name_does_not_claim_a_qualified_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stated residue: the OS name is ``eng1``, so ``eng1.corp.test`` is not known to be this
+    host without a lookup, and the gate makes none."""
+    _as_this_host(monkeypatch, names=("eng1",), addresses=(_OWN_V4,))
+    assert forwarding_gate_refusal(_verified(tmp_path, host="eng1.corp.test")) is None
+
+
+@pytest.mark.parametrize(
+    ("os_name", "expected"),
+    [
+        ("Eng1.Corp.Test.", {"eng1.corp.test", "eng1"}),
+        ("ENG1", {"eng1"}),
+        ("", set()),
+    ],
+)
+def test_the_own_names_come_from_the_os_name_alone(
+    monkeypatch: pytest.MonkeyPatch, os_name: str, expected: set[str]
+) -> None:
+    monkeypatch.setattr(socket, "gethostname", lambda: os_name)
+    assert settings_module._own_host_names() == expected
+
+
+def test_no_os_name_means_no_own_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fails() -> str:
+        raise OSError("no host name")
+
+    monkeypatch.setattr(socket, "gethostname", _fails)
+    assert settings_module._own_host_names() == frozenset()
+
+
+class _FakeUdp:
+    """A UDP socket that answers ``getsockname`` from a table and records what it was asked."""
+
+    sources: dict[str, str] = {}
+    calls: list[tuple[str, Any]] = []
+
+    def __init__(self, family: int, kind: int) -> None:
+        self.calls.append(("socket", (family, kind)))
+
+    def __enter__(self) -> _FakeUdp:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.calls.append(("close", None))
+
+    def connect(self, address: tuple[str, int]) -> None:
+        self.calls.append(("connect", address))
+        if address[0] not in self.sources:
+            raise OSError("network is unreachable")
+        self._to = address[0]
+
+    def getsockname(self) -> tuple[str, int]:
+        return (self.sources[self._to], 50000)
+
+
+def test_the_source_address_probe_is_one_unsent_udp_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe is a UDP socket, connected and closed, with nothing sent. It reads a zoned answer,
+    and an OS error is None rather than a crash."""
+    monkeypatch.setattr(_FakeUdp, "calls", [])
+    monkeypatch.setattr(
+        _FakeUdp, "sources", {_OWN_V4: _OWN_V4, "192.0.2.9": _OWN_V4, "fe80::1": "fe80::1%eth0"}
+    )
+    monkeypatch.setattr(socket, "socket", _FakeUdp)
+    probe = settings_module._local_source_address
+    assert probe(ipaddress.ip_address(_OWN_V4)) == ipaddress.ip_address(_OWN_V4)
+    assert probe(ipaddress.ip_address("192.0.2.9")) == ipaddress.ip_address(_OWN_V4)
+    assert probe(ipaddress.ip_address("fe80::1")) == ipaddress.ip_address("fe80::1%eth0")
+    assert probe(ipaddress.ip_address("198.51.100.1")) is None  # connect raised OSError
+    assert _FakeUdp.calls[:3] == [
+        ("socket", (socket.AF_INET, socket.SOCK_DGRAM)),
+        ("connect", (_OWN_V4, 9)),
+        ("close", None),
+    ]
+    assert ("socket", (socket.AF_INET6, socket.SOCK_DGRAM)) in _FakeUdp.calls
+    assert {name for name, _ in _FakeUdp.calls} == {"socket", "connect", "close"}
+
+
+def test_a_zoned_link_local_address_of_this_host_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The OS may answer with or without a zone; either way it is the same address."""
+    monkeypatch.setattr(settings_module, "_own_host_names", lambda: frozenset())
+    monkeypatch.setattr(
+        settings_module, "_local_source_address", lambda addr: ipaddress.ip_address("fe80::1%eth0")
+    )
+    assert forwarding_gate_refusal(_verified(tmp_path, host="fe80::1")) is not None
+    assert forwarding_gate_refusal(_verified(tmp_path, host="fe80::2")) is None
+
+
+def test_a_name_collector_never_opens_the_probe_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A collector given by name is compared with the OS name only, so no socket is made for it."""
+
+    def _no_socket(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a name collector opened a socket")
+
+    monkeypatch.setattr(socket, "socket", _no_socket)
+    monkeypatch.setattr(socket, "gethostname", lambda: "eng1")
+    assert forwarding_gate_refusal(_verified(tmp_path, host="siem.corp.test")) is None
+    assert forwarding_gate_refusal(_verified(tmp_path, host="eng1")) is not None
 
 
 # --- the gate wired into serve ------------------------------------------------------------------

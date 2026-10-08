@@ -4116,21 +4116,95 @@ def _names_this_host(host: str) -> bool:
     """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
     :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
     where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
-    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS."""
-    import ipaddress
-    import socket as _socket
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS.
 
-    h = host.strip().rstrip(".").lower()
+    The host's own name and its own non-loopback addresses are :func:`_is_own_name_or_address`."""
+    h = _bare_host(host)
     if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
         return True
+    addr = _host_ip_literal(h)
+    return addr is not None and (addr.is_loopback or addr.is_unspecified)
+
+
+def _bare_host(host: str) -> str:
+    """``host`` as the two predicates here compare it: trimmed, lowercased, no trailing dot."""
+    return host.strip().rstrip(".").lower()
+
+
+def _host_ip_literal(h: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """``h`` as an address when it is an IP literal, else None. Reads the IPv4 shorthand a resolver
+    also accepts (``127.1``, ``0``), and a bracketed IPv6 literal. No DNS."""
+    import socket as _socket
+
     try:
-        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(h.strip("[]"))
+        return ipaddress.ip_address(h.strip("[]"))
     except ValueError:
         try:
-            addr = ipaddress.IPv4Address(_socket.inet_aton(h))  # 127.1, 0 and friends; no DNS
+            return ipaddress.IPv4Address(_socket.inet_aton(h))
         except OSError:
-            return False
-    return addr.is_loopback or addr.is_unspecified
+            return None
+
+
+def _own_host_names() -> frozenset[str]:
+    """This host's name as the OS holds it, and that name's first label, both lowercased.
+
+    ``gethostname`` reads local state, so this asks no resolver. It does NOT learn a domain the OS
+    name leaves out: on a host named ``eng1``, ``eng1.example.org`` is not in the set. Finding that
+    form needs a lookup, and the gate that calls this must not make one."""
+    import socket as _socket
+
+    try:
+        name = _bare_host(_socket.gethostname())
+    except OSError:
+        return frozenset()
+    return frozenset({name, name.partition(".")[0]}) - {""}
+
+
+def _local_source_address(
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address this host would send FROM to reach ``addr``, or None when the OS will not say.
+
+    Connecting a UDP socket sends no packet. It only asks the routing table for a source address,
+    so it waits on nothing and resolves no name (measured well under a millisecond). The answer for
+    one of the host's own addresses is that same address. Asked instead of bound, because a host
+    with ``net.ipv4.ip_nonlocal_bind`` set (common beside a floating VIP) can bind any address."""
+    import socket as _socket
+
+    family = _socket.AF_INET6 if addr.version == 6 else _socket.AF_INET
+    try:
+        with _socket.socket(family, _socket.SOCK_DGRAM) as probe:
+            probe.connect((str(addr), 9))  # discard port; nothing is sent
+            # A link-local answer carries its zone ("fe80::1%eth0"), which ip_address reads.
+            return ipaddress.ip_address(probe.getsockname()[0])
+    except (OSError, ValueError):
+        return None
+
+
+def _is_own_name_or_address(host: str) -> bool:
+    """Whether ``host`` is this host's own name or one of its own non-loopback addresses (vault
+    BACKLOG #2375). The #1966 gate refused loopback only, so a collector at the engine's own LAN
+    address passed although it is the same system.
+
+    **It fails OPEN, on purpose.** When the OS gives no name or no source address, this returns
+    False and the gate passes as it did before. Owner ruling R4 (a) keyed that gate on configuration
+    so a fault cannot hold a clinical message path down, and a refusal resting on a failed probe
+    would be such a fault. The cost is that a broken probe hides this one case. It never loosens
+    the loopback, TLS or verification checks, which do not come through here.
+
+    **What it does not catch, at least:** a name that is not the OS host name but resolves to this
+    host (an alias, or the fully qualified form on a host whose OS name is short), and an address
+    held by this host that the routing table does not treat as local. Both need a lookup, and
+    ADR 0200 leaves the collector-separation probe to #1199's remainder."""
+    h = _bare_host(host)
+    addr = _host_ip_literal(h)
+    if addr is None:
+        return h in _own_host_names()
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    source = _local_source_address(addr)
+    # Zones are compared away: "fe80::1" and "fe80::1%eth0" are one address on this host.
+    return source is not None and int(source) == int(addr) and source.version == addr.version
 
 
 def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
@@ -4141,14 +4215,19 @@ def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
     configured with verified TLS to a collector that is not on loopback. This is the predicate; the
     caller owns the refuse/warn split.
 
-    **It reads configuration only.** It opens no socket and resolves no name, so a collector that is
-    down, or a DNS server that is slow, can never stop a start through it: the ruling keys the gate
-    on configuration precisely so a network fault cannot hold a clinical message path down.
+    **It reads configuration and local host state only.** It sends no packet and resolves no name,
+    so a collector that is down, or a DNS server that is slow, can never stop a start through it:
+    the ruling keys the gate on configuration precisely so a network fault cannot hold a clinical
+    message path down. The local state is the OS host name and, for an IP-literal collector, the
+    routing table's source address (:func:`_is_own_name_or_address`, vault BACKLOG #2375); a probe
+    that fails there passes the gate rather than refusing.
 
-    Two things do NOT pass it, on purpose. **Loopback**, because 16.4.3 asks for a logically separate
+    Three things do NOT pass it, on purpose. **Loopback**, because 16.4.3 asks for a logically separate
     system, and a local agent on 127.0.0.1 is the same host; :func:`is_loopback_hop_host` never
     resolves DNS, so a NAME that resolves to loopback does pass, and the collector-separation probe
-    that would catch it is #1199's remainder. **``forward_hop_attested``**, because it attests that an
+    that would catch it is #1199's remainder. **This host's own name or own address**, for the same
+    reason: the engine's LAN address is no more a separate system than 127.0.0.1 is.
+    **``forward_hop_attested``**, because it attests that an
     unprotected hop is secure by other means, and this gate asks whether verified TLS is configured
     at all; letting one flag answer the other's question is how a flag silently widens."""
     if not log.forward_enabled or not log.forward_host:
@@ -4161,6 +4240,11 @@ def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
         return (
             f"[logging].forward_host {log.forward_host!r} is loopback or unspecified, which is this "
             "host and not a logically separate collector"
+        )
+    if _is_own_name_or_address(log.forward_host):
+        return (
+            f"[logging].forward_host {log.forward_host!r} is this host's own name or one of its "
+            "own addresses, which is this host and not a logically separate collector"
         )
     return None
 

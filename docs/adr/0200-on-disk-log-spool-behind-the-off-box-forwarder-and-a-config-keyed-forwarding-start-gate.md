@@ -114,3 +114,28 @@ the gate being keyed on configuration and not on the collector.
   2-second figure was costed against something else and does not apply to it.
 - Not built here: the shard supervisor and the sandbox child still have no forwarder path, and the
   collector-separation probe (every resolved address is this host's) stays unbuilt. #1199 names them.
+
+## Amendment A (2026-10-08) -- the gate also refuses this host's own name and addresses (vault BACKLOG #2375)
+
+Decision 2 refused loopback only. A `forward_host` set to the engine's own LAN address passed,
+although it is no more a separate system than 127.0.0.1 is.
+
+The gate now also refuses a `forward_host` that is:
+
+- this host's OS name, or that name's first label; or
+- an IP literal that is one of this host's own addresses.
+
+**What moved in decision 2's wording.** It said the gate "reads settings only". It now also reads
+local host state: the OS host name, and, for an IP literal, the source address the routing table
+gives for it. That read is a UDP socket connected and closed with nothing sent. The property the
+ruling asked for is unchanged: the gate sends no packet, resolves no name and opens no connection
+to the collector, so a down collector or a slow DNS server still cannot block a start.
+
+**A failed read passes the gate.** If the OS gives no name or no source address, the gate decides
+as it did before this amendment. A refusal resting on a failed probe would be the kind of fault
+R4 (a) keyed the gate on configuration to avoid. Whether it should refuse instead is an open
+question for the owner.
+
+**Still not caught, at least:** an alias that resolves to this host, and the fully qualified name
+on a host whose OS name is short. Both need a lookup. They stay with the collector-separation
+probe that #1199 names.
