@@ -102,6 +102,7 @@ from messagefoundry.api.validation import (
     EpochSeconds,
     ResourceId,
 )
+from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth import (
     BUILTIN_ROLE_PERMISSIONS,
     ROLE_METADATA,
@@ -271,14 +272,22 @@ async def _refuse_if_self(
     The path's spelling OR the stored id decides (vault BACKLOG #3259). A store whose id column
     compares case-insensitively (SQL Server) finds the caller's row from another spelling, and the
     console's ``/ui/users/{user_id}/`` routes pass the path to these handlers as a plain str, past
-    the JSON plane's ``ResourceId`` pattern. ``target`` is the row the path resolves to, when the
-    caller has read it; otherwise it is read here, and only when the path spelling did not match."""
+    the JSON plane's ``ResourceId`` pattern. ``target`` is the row the caller already read, if any.
+    When it is None the row is read here, and only when the path spelling did not match."""
     if user_id != identity.user_id:
         if target is None:
             target = await service.store.get_user(user_id)
         if target is None or target.id != identity.user_id:
             return
-    await service.audit_self_target_refused(identity, op=op, client=_client(request))
+    # Soft, with no defect re-raised: a raise here would replace the 400 the caller is owed with a
+    # 500. The refusal stands either way, and a lost row is logged at ERROR.
+    await write_audit_soft(
+        lambda: service.audit_self_target_refused(identity, op=op, client=client_ip(request)),
+        log=_log,
+        message="the %s self-target refusal stands, but its audit row failed",
+        args=(op,),
+        defects=(),
+    )
     raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
 
 

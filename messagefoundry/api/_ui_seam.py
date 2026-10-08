@@ -352,6 +352,13 @@ from typing import Any
 #: ``RepeatedCredentialError`` and ``record_repeated_credential``, so a repeated cookie is logged
 #: and audited by the same handler as a repeated header.
 #:
+#: Vault BACKLOG #3259 / #3260: ``update_user``, ``delete_user``, ``reset_user_password``,
+#: ``reset_user_mfa``, ``bind_user_federated_identity`` and ``unbind_user_federated_identity`` now
+#: take ``request``, for the address on their ``auth.self_target_refused`` row, and the console
+#: passes it on each call. Same blind spot as #2346: the digest records an ``AdminHandlers`` field's
+#: name, not its parameters, so it did not move. A console without this change calls those six with
+#: no ``request`` and gets a TypeError, which the handshake does not catch.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

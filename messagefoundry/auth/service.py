@@ -11796,8 +11796,8 @@ class AuthService:
         only the step-up gate's ``auth.permission_granted`` for the attempt, and the console plane
         kept nothing. The API handlers write it, so a console call through the seam writes it too.
 
-        ``user_id`` is the caller's stored id, never the path's spelling: the console passes the
-        path through as a plain str, and an unbounded caller string has no place in the chain.
+        ``user_id`` is the caller's stored id, never the path's spelling, which on the console is
+        an unbounded caller string (``api.auth_routes._refuse_if_self`` says why the two differ).
         ``client`` is required, not defaulted: both planes reach this from a request, and
         :meth:`audit_permission_denied` says what a row that omits a known address costs."""
         await self._audit(
