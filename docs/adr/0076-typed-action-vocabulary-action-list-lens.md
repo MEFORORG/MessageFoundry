@@ -1328,7 +1328,7 @@ Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and
   above are refused with the generic `refused` code, and nothing is written.
 - **Also under the flag**, a move or delete that breaks the structure rule below is refused
   (Manager decision 2026-10-07, after adversarial review, part of the R1 fix). G.7, "What still
-  differs at `main`", names the one case the code still accepts.
+  differs at `main`", records the one case the code accepted, now closed.
 - Developers, the `ide/` extension and the ADR 0208 developer build keep the default. The ADR 0208
   analyst build always sets the flag and offers no way to turn it off.
 
@@ -1498,17 +1498,24 @@ corrects that table's row 5. `set_params` on action, lookup and diagnostic rows 
 `dynamic` value (AC-M5).
 
 **What still differs at `main`.** Each row of that table was re-measured on 2026-10-08 against
-`rewrite_source` at `main` (`8e5f429732`). One difference remains beyond the recorded limits:
+`rewrite_source` at `main` (`8e5f429732`). One difference remained beyond the recorded limits, and
+it is now closed:
 
-- **A row moved below a typed `return` or `raise` is accepted, in both modes.** G.6 rule 8 refuses
-  it, so the rule is stricter and governs. Take a handler whose `if` guard ends in `return
-  Send("OB", msg)` and whose body ends in `return Send("OB2", msg)`. A `move_row` that swaps a
-  `msg.set(...)` row below the last `return`, or drops a row after either `return`, is accepted
-  with `typed_only=True`. So is a swap below a closing `raise ValueError("x")`. The row would then
-  never run. `_refuse_shifted_code` in `messagefoundry/lens.py` keeps a `return` or `raise` on its
-  own suite path. Apart from the fan-out `return sends`, which
-  `test_finding_9_the_scaffold_itself_still_holds` guards, nothing checks what lands after one. No
-  test on `main` pins this case.
+- **CLOSED 2026-10-08: a row moved below a typed `return` or `raise` was accepted, in both modes.**
+  G.6 rule 8 refuses it, so the rule is stricter and governs. Take a handler whose `if` guard ends
+  in `return Send("OB", msg)` and whose body ends in `return Send("OB2", msg)`. A `move_row` that
+  swapped a `msg.set(...)` row below the last `return`, or dropped a row after either `return`, was
+  accepted with `typed_only=True`. So was a swap below a closing `raise ValueError("x")`. The row
+  would then never run. `_refuse_shifted_code` in `messagefoundry/lens.py` keeps a `return` or
+  `raise` on its own suite path. Apart from the fan-out `return sends`, which
+  `test_finding_9_the_scaffold_itself_still_holds` guards, nothing checked what lands after one.
+  `_refuse_rows_below_a_terminal` in `messagefoundry/lens.py` now refuses, in both modes, a
+  `move_row` whose result has a statement below a `return` or `raise` in its suite that was not
+  there before. `test_rule_8_refuses_a_row_moved_below_a_terminal` in
+  `tests/test_lens_typed_only_repair.py` pins those moves, and a `return` moved up past a row, in
+  both modes. A typed `return` or `raise` therefore never moves up its own suite, since that
+  strands what it passes. Five older tests made such a move as a control. Each now expects the
+  refusal or uses a move that strands nothing.
 
 The recorded limits, which are not reconciled:
 
@@ -1526,7 +1533,7 @@ Three rows of the table are not open differences:
   show it.
 - Row 5, `occurrence=OCC`, was never a difference: G.7 refuses it too.
 
-Row 2 is the open difference above, and row 3 is the second recorded limit.
+Row 2 is the closed difference above, and row 3 is the second recorded limit.
 
 **Limits of a static check.** The predicate reads the source and runs nothing, so code that
 reaches module state by a route the source does not spell out can still defeat it. These remain, at
