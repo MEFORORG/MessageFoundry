@@ -65,7 +65,12 @@ from messagefoundry.logging_guard import (
     LogWriteGuard,
     set_active_guard,
 )
-from messagefoundry.redaction import redact_untrusted
+from messagefoundry.redaction import (
+    ExcInfo,
+    prepare_log_record,
+    redact_untrusted,
+    safe_traceback,
+)
 
 # THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
 # one place so the write-time filters here and the read-time support-bundle redactor cannot disagree
@@ -192,9 +197,13 @@ class ControlCharScrubFilter(logging.Filter):
         return True
 
 
-# A throwaway formatter used only to render a record's exception into text for redaction.
-# ``formatException`` is independent of any format string, so one shared instance is safe.
-_EXC_RENDERER = logging.Formatter()
+class _SafeExcFormatter(logging.Formatter):
+    """A formatter whose traceback prints a ``UnicodeError`` the way ``safe_exc`` does (vault BACKLOG
+    #3185). On the configured handlers :class:`RedactionFilter` renders the traceback first, so this
+    matters to a handler that carries no filter chain."""
+
+    def formatException(self, ei: ExcInfo) -> str:  # noqa: N802 - the stdlib's name
+        return safe_traceback(ei)
 
 
 class RedactionFilter(logging.Filter):
@@ -265,10 +274,20 @@ class RedactionFilter(logging.Filter):
         # `_rewrite_record`'s body, which is the shape BACKLOG #1478 records as a defect: four filters
         # with four copies, and the one field missing from one of them was invisible to a reviewer
         # comparing four `filter` methods. #1576 would have added a second thing to remember per field.
-        if not record.exc_text and record.exc_info:
-            record.exc_text = _EXC_RENDERER.formatException(record.exc_info)
-        record.exc_info = None
-        _rewrite_record(record, redact_untrusted)
+        #
+        # A UnicodeError prints from its attributes in the traceback and as a message or argument
+        # (vault BACKLOG #3185): its str() names the character or byte the codec failed on, which no
+        # pattern can tell from prose. The tray's chain shares the step, through the same function.
+        prepare_log_record(record)
+        try:
+            _rewrite_record(record, redact_untrusted)
+        except Exception as exc:  # noqa: BLE001 -- a log call must never raise, as in the tray's filter
+            # getMessage() runs the caller's % format and its arguments' own __str__/__repr__, and
+            # Handler.handle does not guard a filter. Fail closed: a fixed line, never the raw record.
+            record.msg = f"[log record dropped: {type(exc).__name__} while redacting it]"
+            record.args = ()
+            record.exc_text = None
+            record.stack_info = None
         return True
 
 
@@ -344,7 +363,7 @@ class CredentialScrubFilter(logging.Filter):
         return True
 
 
-class JsonFormatter(logging.Formatter):
+class JsonFormatter(_SafeExcFormatter):
     """Render each record as a single line of JSON — one object per line — for a log shipper / SIEM
     (sec-offbox-log).
 
@@ -760,7 +779,7 @@ def _make_formatter(fmt: str) -> logging.Formatter:
     """A JSON formatter for ``fmt == "json"``, else the human-readable text formatter (the default)."""
     if fmt == "json":
         return JsonFormatter()
-    formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
+    formatter = _SafeExcFormatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
     formatter.converter = time.gmtime  # emit UTC timestamps (16.2.2)
     return formatter
 
