@@ -4969,11 +4969,12 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   The gate also refuses a `forward_host` that is this host's own OS name, or an IP literal that is
   one of its own addresses (vault BACKLOG #2375). For that it reads the OS host name and asks the
   routing table for a source address; it still sends no packet and resolves no name. If that local
-  read fails, the gate passes as before. At least two forms still pass: an alias that resolves to
-  this host, and the fully qualified name on a host whose OS name is short. One form is refused
-  although the collector is separate: a virtual address the routing table treats as local, such as
-  a Kubernetes Service address under IPVS read from the node's own network namespace. Name such a
-  collector by DNS name. ADR 0200, Amendment A, records the reasoning.
+  read fails, the gate logs a WARNING and passes as before. At least two forms still pass: an alias
+  that resolves to this host, and the fully qualified name on a host whose OS name is short. One
+  form is refused although the collector is separate: a virtual address the routing table treats
+  as local, such as a Kubernetes Service address under IPVS read from the node's own network
+  namespace. ADR 0200, Amendment A, records the reasoning and what to do; it is proposed, and not
+  yet ruled on by the owner.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
 committed audit row ships as metadata, with only best-effort PHI redaction

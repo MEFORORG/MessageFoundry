@@ -86,7 +86,7 @@ section reference.
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
-| | `[api].expose_docs` | `false` (`true` serves `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
+| | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive. **Not reported yet** — see its entry below) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
@@ -880,10 +880,10 @@ This section is kept rather than deleted, because the claim it used to make is t
   and `trusted_proxies` together, or the load refuses.
 
 ### `[api].expose_docs = true` — the API schema is served with no sign-in
-> **Not conditional** (vault BACKLOG #2385). The three routes exist only while the switch is on, and
-> none of them asks for sign-in, on a loopback bind or off it.
-- **What you lose:** the engine serves `/docs`, `/redoc` and `/openapi.json` to anyone who can reach
-  the API socket. They show every route, parameter and response shape. They hold the schema, not
+> **Not conditional** (vault BACKLOG #2385). The documentation routes exist only while the switch is
+> on, and none of them asks for sign-in, on a loopback bind or off it.
+- **What you lose:** the engine serves at least `/docs`, `/redoc` and `/openapi.json` to anyone who
+  can reach the API socket. They show every route, parameter and response shape. They hold the schema, not
   message data.
 - **When acceptable:** a development engine on a loopback bind, while you write a client against it.
 - **Compensating controls:** keep the bind loopback, or list only trusted networks in

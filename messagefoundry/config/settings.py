@@ -2421,6 +2421,20 @@ class LoggingSettings(_Section):
             raise ValueError("[logging].forward_port must be between 1 and 65535")
         return value
 
+    @field_validator("forward_host")
+    @classmethod
+    def _check_forward_host(cls, value: str | None) -> str | None:
+        # Vault BACKLOG #2375, review round 2. A NUL or an undecodable byte can never name a
+        # collector. Before this, one raised out of the #1966 gate, or passed it and then raised
+        # out of the forwarder's own socket call, so the start died with a traceback either way.
+        if value is not None and (
+            has_lone_surrogate(value) or any(ord(c) < 0x20 or c == "\x7f" for c in value)
+        ):
+            raise ValueError(
+                "[logging].forward_host must not contain a control character or an undecodable byte"
+            )
+        return value
+
     @field_validator("forward_tls_crl_file")
     @classmethod
     def _forward_tls_crl_file_exists(cls, value: str | None) -> str | None:
@@ -4163,13 +4177,19 @@ def _own_host_names() -> frozenset[str]:
     """This host's name as the OS holds it, and that name's first label, both lowercased.
 
     ``gethostname`` reads local state, so this asks no resolver. It does NOT learn a domain the OS
-    name leaves out: on a host named ``eng1``, ``eng1.example.org`` is not in the set. Finding that
-    form needs a lookup, and the gate that calls this must not make one."""
+    name leaves out: on a host named ``eng1``, ``eng1.example.org`` is not in the set. On Linux that
+    form needs a lookup, which the gate that calls this must not make. On Windows the OS holds the
+    qualified name locally (``GetComputerNameExW``); reading it there is owed work, not built."""
     import socket as _socket
 
     try:
         name = _bare_host(_socket.gethostname())
-    except OSError:
+    except OSError as exc:
+        _log.warning(
+            "the OS gave no host name (%s), so the ASVS 16.4.3 forwarding gate cannot compare "
+            "[logging].forward_host with it; the gate decides without that check",
+            type(exc).__name__,
+        )
         return frozenset()
     return frozenset({name, name.partition(".")[0]}) - {""}
 
@@ -4191,7 +4211,16 @@ def _local_source_address(
             probe.connect((str(addr), 9))  # discard port; nothing is sent
             # A link-local answer carries its zone ("fe80::1%eth0"), which ip_address reads.
             return ipaddress.ip_address(probe.getsockname()[0])
-    except (OSError, ValueError, TypeError):  # TypeError: a NUL in an IPv6 zone
+    except (OSError, ValueError, TypeError) as exc:  # TypeError: a NUL in an IPv6 zone
+        # Logged, not silent: the same config can pass here before an interface is up and refuse
+        # at the next start, and this line is the only record of which happened. The address is
+        # not echoed; the operator set it and the refusal text names the setting.
+        _log.warning(
+            "the OS gave no source address for [logging].forward_host (%s), so the ASVS 16.4.3 "
+            "forwarding gate cannot tell whether that address is this host's own; the gate "
+            "decides without that check",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -4215,8 +4244,9 @@ def _is_own_name_or_address(host: str) -> bool:
     although another system answers on it. A virtual address bound on every node is the known
     case: a Kubernetes Service address under kube-proxy's IPVS mode, read from the node's own
     network namespace, or a direct-server-return address held on ``lo``. Reasoned, not measured.
-    Naming the collector by DNS name passes, since a name is compared with the OS name only; the
-    refusal text says so."""
+    A DNS name for that collector passes, since a name is compared with the OS name only. The
+    refusal text points at ADR 0200 Amendment A instead of saying so itself: the same step would
+    let a collector that really is this host through, and a refusal must not teach that."""
     h = _bare_host(host)
     # The name first, so an all-digit OS name such as "1234" is not read as an address instead.
     if h in _own_host_names():
@@ -4269,8 +4299,8 @@ def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
     if _is_own_name_or_address(log.forward_host):
         return (
             f"[logging].forward_host {log.forward_host!r} is this host's own name or one of its "
-            "own addresses, which is this host and not a logically separate collector (if it is "
-            "a virtual address that another system answers on, name the collector by DNS name)"
+            "own addresses, which is this host and not a logically separate collector (ADR 0200 "
+            "Amendment A covers a virtual address that another system answers on)"
         )
     return None
 
@@ -7610,7 +7640,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     if auth.ad_enabled:
         for field, what in (
             ("ad_connect_timeout", "the LDAP connect timeout"),
-            ("ad_receive_timeout", "the LDAP response-read timeout"),
+            # auth/ldap.py hands ldap3 this value rounded UP to a whole second.
+            ("ad_receive_timeout", "the LDAP response-read timeout (applied rounded up to 1 s)"),
         ):
             value, default = getattr(auth, field), _auth_default(field)
             if value > default:
@@ -8150,15 +8181,16 @@ def security_loosenings(
             )
         )
     # Vault BACKLOG #2385: the [api] bools are under a completeness floor now, and this is the one
-    # that was a deviation with no entry. create_app registers the three routes only when it is on,
-    # and none of them asks for sign-in.
+    # that was a deviation with no entry. create_app registers the documentation routes only when
+    # it is on, and none of them asks for sign-in.
     if api.expose_docs:
         out.append(
             (
                 "expose_docs",
-                "the engine serves /docs, /redoc and /openapi.json with NO sign-in -- anyone who "
-                "can reach the API socket reads every route, parameter and response shape the "
-                "engine has (the schema, not message data)",
+                "the engine serves its API documentation routes (at least /docs, /redoc and "
+                "/openapi.json) with NO sign-in -- anyone who can reach the API socket reads "
+                "every route, parameter and response shape the engine has (the schema, not "
+                "message data)",
             )
         )
     # BACKLOG #1179, owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS

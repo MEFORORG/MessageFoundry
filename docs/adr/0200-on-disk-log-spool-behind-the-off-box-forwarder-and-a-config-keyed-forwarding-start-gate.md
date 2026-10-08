@@ -115,7 +115,12 @@ the gate being keyed on configuration and not on the collector.
 - Not built here: the shard supervisor and the sandbox child still have no forwarder path, and the
   collector-separation probe (every resolved address is this host's) stays unbuilt. #1199 names them.
 
-## Amendment A (2026-10-08) -- the gate also refuses this host's own name and addresses (vault BACKLOG #2375)
+## Amendment A (2026-10-08, PROPOSED) -- the gate also refuses this host's own name and addresses (vault BACKLOG #2375)
+
+**Status: built, and not yet ruled on by the owner.** Owner ruling R4 (a) keyed the gate on
+forwarding configuration. This amendment makes it read local host state as well, which is a
+Builder's design inside that ruling and not part of it. The fail-open choice below is an open
+owner question.
 
 Decision 2 refused loopback only. A `forward_host` set to the engine's own LAN address passed,
 although it is no more a separate system than 127.0.0.1 is.
@@ -131,21 +136,25 @@ gives for it. That read is a UDP socket connected and closed with nothing sent. 
 ruling asked for is unchanged: the gate sends no packet, resolves no name and opens no connection
 to the collector, so a down collector or a slow DNS server still cannot block a start.
 
-**A failed read passes the gate.** If the OS gives no name or no source address, the gate decides
-as it did before this amendment. A refusal resting on a failed probe would be the kind of fault
+**A failed read passes the gate, and logs a WARNING.** If the OS gives no name or no source
+address, the gate decides as it did before this amendment. The same config can therefore pass
+before an interface is up and refuse at the next start; the WARNING is the record of which. A refusal resting on a failed probe would be the kind of fault
 R4 (a) keyed the gate on configuration to avoid. Whether it should refuse instead is an open
 question for the owner.
 
 **Still not caught, at least:** an alias that resolves to this host, and the fully qualified name
-on a host whose OS name is short. Both need a lookup. They stay with the collector-separation
-probe that #1199 names.
+on a host whose OS name is short. On Linux both need a lookup, so they stay with the
+collector-separation probe that #1199 names. On Windows the OS holds the qualified name locally;
+reading it there is owed work.
 
 **It can refuse a collector that is separate.** The address test asks the routing table, and the
 routing table calls an address local when it is bound on this host, even if another system
 answers on it. A virtual address bound on every node is the known case: a Kubernetes Service
 address under kube-proxy's IPVS mode, read from the node's own network namespace, or a
-direct-server-return address held on `lo`. This is reasoned, not measured. Naming the collector
-by DNS name passes, and the refusal text says so.
+direct-server-return address held on `lo`. This is reasoned, not measured. A DNS name for that
+collector passes. Use one only when another system really answers on the address. The refusal
+text points here and does not give that step itself, because the same step would let a collector
+that is this host through.
 
 **The Consequences line on start-time cost moved too.** It called the gate "a settings read". For
 an IP-literal collector it is now also one local socket call, measured at well under a

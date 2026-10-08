@@ -111,8 +111,10 @@ def test_the_gate_opens_no_connection_and_resolves_no_name(
 
 # --- this host's own name and addresses (vault BACKLOG #2375) -----------------------------------
 #
-# Every test below injects the host's identity. None reads the runner's real name or routing table,
-# so none depends on where it runs.
+# Most tests below inject the host's identity, so they read no runner state. At least three run the
+# REAL OS name and probe, and each is written so its answer is the same on any host: the
+# address-collector test (a documentation address no host holds), the loopback probe test, and the
+# odd-host-text test (text that is no host's name). They need a working socket layer.
 
 _OWN_V4 = "10.20.30.40"
 _OWN_V6 = "2001:db8::40"
@@ -248,6 +250,35 @@ def test_the_source_address_probe_is_one_unsent_udp_connect(
     ]
     assert ("socket", (socket.AF_INET6, socket.SOCK_DGRAM)) in _FakeUdp.calls
     assert {name for name, _ in _FakeUdp.calls} == {"socket", "connect", "close"}
+    # Only an IP LITERAL may reach connect(). CPython resolves a NAME inside connect() in C, where
+    # no Python-level patch of getaddrinfo can see it, so this is the check that holds "no lookup".
+    connected = [args[0] for name, args in _FakeUdp.calls if name == "connect"]
+    assert len(connected) == 4
+    for target in connected:
+        ipaddress.ip_address(target)
+
+
+def test_a_failed_probe_is_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fail-open is not silent. The same config can pass before an interface is up and refuse at
+    the next start, and the WARNING is the only record of which. It does not echo the address."""
+    monkeypatch.setattr(_FakeUdp, "calls", [])
+    monkeypatch.setattr(_FakeUdp, "sources", {})
+    monkeypatch.setattr(socket, "socket", _FakeUdp)
+    with caplog.at_level("WARNING", logger=settings_module.__name__):
+        assert settings_module._local_source_address(ipaddress.ip_address(_OWN_V4)) is None
+    assert "no source address" in caplog.text and "OSError" in caplog.text
+    assert _OWN_V4 not in caplog.text
+
+    def _fails() -> str:
+        raise OSError("no host name")
+
+    caplog.clear()
+    monkeypatch.setattr(socket, "gethostname", _fails)
+    with caplog.at_level("WARNING", logger=settings_module.__name__):
+        assert settings_module._own_host_names() == frozenset()
+    assert "no host name" in caplog.text
 
 
 def test_a_zoned_link_local_address_of_this_host_is_refused(
@@ -309,11 +340,32 @@ def test_the_real_probe_reads_a_loopback_address_as_local() -> None:
     assert settings_module._local_source_address(loopback) == loopback
 
 
-@pytest.mark.parametrize("host", ["a\x00b", "fe80::1%\x00", "\udcff", "1234", "999.1.1.1", "[zz::"])
-def test_odd_host_text_never_crashes_the_gate(tmp_path: Path, host: str) -> None:
-    """``[logging].forward_host`` has no validator, so the gate meets whatever was configured. A
-    NUL or an undecodable byte raised out of the address helpers (review round 1, measured). The
-    gate must answer, and for text that is neither this host's name nor an address it passes."""
+_UNUSABLE_HOSTS = ["a\x00b", "fe80::1%\x00", "\udcff", "siem\n.corp.test", "siem\x7f"]
+
+
+@pytest.mark.parametrize("host", _UNUSABLE_HOSTS)
+def test_host_text_that_can_name_no_collector_is_refused_at_load(tmp_path: Path, host: str) -> None:
+    """A NUL or an undecodable byte raised out of the gate (review round 1, measured), and once the
+    gate tolerated it, out of the forwarder's own socket call (round 2). The load refuses it, and
+    the message does not quote the value."""
+    with pytest.raises(ValueError, match="control character or an undecodable byte") as refused:
+        _verified(tmp_path, host=host)
+    assert host not in str(refused.value)
+
+
+@pytest.mark.parametrize("host", _UNUSABLE_HOSTS)
+def test_the_host_helpers_answer_for_text_the_load_refuses(host: str) -> None:
+    """Defence in depth: a caller that builds the helpers' input some other way gets an answer,
+    never an exception."""
+    assert settings_module._names_this_host(host) is False
+    assert settings_module._is_own_name_or_address(host) is False
+
+
+@pytest.mark.parametrize("host", ["1234", "999.1.1.1", "[zz::", "siem corp"])
+def test_odd_but_loadable_host_text_passes_the_gate(tmp_path: Path, host: str) -> None:
+    """Text that is neither this host's name nor one of its addresses passes; the forwarder then
+    reports the collector itself. ``1234`` reads as the IPv4 shorthand for 0.0.4.210, so this runs
+    the real probe toward an address no host holds."""
     assert forwarding_gate_refusal(_verified(tmp_path, host=host)) is None
 
 
@@ -341,15 +393,16 @@ def test_an_ipv6_zone_keeps_its_case(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert asked == ["fe80::1%enP4p65s0"]
 
 
-def test_the_own_address_refusal_says_how_to_name_a_virtual_address(
+def test_the_own_address_refusal_points_at_the_adr_for_a_virtual_address(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The routing table calls a virtual address local when it is bound here, even if another
-    system answers on it. The refusal names the way out, and that way out does pass."""
+    system answers on it. The refusal points at the ADR for that case. It does not print the step
+    itself, because the same step would let a collector that IS this host through (round 2)."""
     _as_this_host(monkeypatch, names=("eng1",), addresses=(_OWN_V4,))
     reason = forwarding_gate_refusal(_verified(tmp_path, host=_OWN_V4))
-    assert reason is not None and "name the collector by DNS name" in reason
-    assert forwarding_gate_refusal(_verified(tmp_path, host="siem.corp.test")) is None
+    assert reason is not None and "ADR 0200 Amendment A" in reason
+    assert "DNS name" not in reason
 
 
 # --- the gate wired into serve ------------------------------------------------------------------
@@ -414,8 +467,8 @@ def test_serve_starts_with_verified_forwarding_to_a_collector_that_is_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The pass, and the ruling's key property in one: the collector does not exist (a reserved
-    name that never resolves), and the start still succeeds, because the gate reads configuration
-    only. The forwarder reports the collector itself at ERROR and runs without it."""
+    name that never resolves), and the start still succeeds, because the gate never contacts or
+    resolves the collector. The forwarder reports the collector itself at ERROR and runs without it."""
     assert _serve(tmp_path, monkeypatch, forwarding=True) == 0
     captured = capsys.readouterr()
     assert "ASVS 16.4.3" not in captured.err

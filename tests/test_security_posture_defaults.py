@@ -635,15 +635,27 @@ def test_a_window_past_one_day_is_refused_at_load(field: str, value: float) -> N
     assert AuthSettings(**{field: 86400.0})  # type: ignore[arg-type]
 
 
+def test_the_guide_quotes_the_window_cap_the_load_applies() -> None:
+    """The guide restates the cap, so it is tied to the constant: moving one reds this."""
+    from messagefoundry.config.settings import _RATE_WINDOW_MAX_SECONDS
+
+    guide = (Path(__file__).parents[1] / "docs" / "SECURITY-LOOSENING.md").read_text("utf-8")
+    assert f"A window above `{_RATE_WINDOW_MAX_SECONDS:g}` s (one day)" in guide
+    assert _RATE_WINDOW_MAX_SECONDS == 24 * 60 * 60
+
+
 def test_an_unpruned_window_refuses_every_attempt_once_full(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Why the load refuses NaN and +inf, shown on the limiter those settings build: the count fills
     and never drains, however much time passes. A finite window drains."""
+    from types import SimpleNamespace
+
     from messagefoundry.auth import ratelimit
 
+    # The limiter's own clock only, as its other tests replace it; never the process-wide one.
     clock = [0.0]
-    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ratelimit, "time", SimpleNamespace(monotonic=lambda: clock[0]))
 
     def after_a_long_wait(window: float) -> bool:
         clock[0] = 0.0
@@ -2440,6 +2452,18 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
             "security_loosenings(). Add each to the registry, or add it to this test's exemption "
             "set with the reason — silence is not an option."
         )
+        # The two controls the [api] floor has, against THESE exemption sets. An exemption must
+        # still name a bool field, or it exempts nothing and reads as a decision. And the floor
+        # must still fire with the real set in place, or a set that swallowed every field passes.
+        bools = {f for f, info in model.model_fields.items() if isinstance(info.default, bool)}
+        assert exempt <= bools, f"[{section}] exemptions name no bool field: {exempt - bools}"
+
+        class _WithANewSwitch(model):  # type: ignore[misc,valid-type]
+            made_up_allow_anonymous_stats: bool = False
+
+        assert _unreported_bools(_WithANewSwitch, exempt, section) == [
+            "made_up_allow_anonymous_stats"
+        ]
 
 
 def _unreported_bools(model: type[Any], exempt: Collection[str], section: str) -> list[str]:
@@ -2540,6 +2564,16 @@ async def test_posture_route_reports_docs_an_embedder_turned_on(engine: Engine) 
     assert "expose_docs" not in await switches()
 
 
+async def test_posture_route_reads_the_docs_switch_off_the_app_in_both_directions(
+    engine: Engine,
+) -> None:
+    """What the app serves wins over a stashed ``[api]`` value it was not built with. Settings that
+    say the docs are on, beside an app built with them off, report nothing: nothing is served."""
+    stashed = ServiceSettings(api=ApiSettings(expose_docs=True))
+    body = await _posture_body(engine, static_credential_settings=stashed)
+    assert "expose_docs" not in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+
+
 def test_the_backup_cleartext_flag_is_documented_as_not_yet_reported() -> None:
     """``[backup].allow_unencrypted`` lets a keyless instance write a cleartext archive, and the
     registry cannot see ``[backup]`` (vault BACKLOG #2302). The guide says so in two places.
@@ -2551,7 +2585,12 @@ def test_the_backup_cleartext_flag_is_documented_as_not_yet_reported() -> None:
     from messagefoundry.config.settings import BackupSettings
 
     assert BackupSettings.model_fields["allow_unencrypted"].default is False
-    assert "backup" not in inspect.signature(security_loosenings).parameters
+    # Whatever the argument ends up being called: no parameter mentions backup, none is typed as
+    # the section, and the registry's source never names the switch.
+    params = inspect.signature(security_loosenings).parameters
+    assert not [name for name in params if "backup" in name.lower()]
+    assert not [p for p in params.values() if "BackupSettings" in str(p.annotation)]
+    assert '"allow_unencrypted"' not in inspect.getsource(security_loosenings)
     guide = (Path(__file__).parents[1] / "docs" / "SECURITY-LOOSENING.md").read_text("utf-8")
     row = next(line for line in guide.splitlines() if line.startswith("| | `[backup].allow_un"))
     assert "**Not reported yet**" in row
