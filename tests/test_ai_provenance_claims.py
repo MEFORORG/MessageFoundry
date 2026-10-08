@@ -129,8 +129,9 @@ def test_the_trailer_is_not_listed_as_a_built_guardrail() -> None:
         f"the {_TRAILER} trailer is listed as a BUILT guardrail:\n  "
         + "\n  ".join(offending)
         + "\n"
-        "It is neither prescribed nor enforced, and its appearances are unexplained (§6.7). Move it "
-        "to the designed-but-deferred list, or actually adopt and enforce it."
+        "It is not prescribed, a local commit-msg rule refuses its Claude form, and its past "
+        "appearances are unexplained (§6.7). Move it to the designed-but-deferred list, or actually "
+        "adopt it and enforce it."
     )
 
 
@@ -186,9 +187,10 @@ def test_section_6_7_states_the_status_and_dates_its_measurement() -> None:
     assert any(
         marker in low for marker in ("not in use", "not currently used", "not prescribed")
     ), (
-        "§6.7 does not state that the Co-Authored-By trailer is NOT in use. It is neither prescribed "
-        "nor enforced, so presenting the trailer block as the commit convention makes this section "
-        "fiction — and it is the section a contributor actually follows."
+        "§6.7 does not state that the Co-Authored-By trailer is NOT in use. It is not prescribed, "
+        "and a local commit-msg rule refuses its Claude form, so presenting the trailer block as the "
+        "commit convention makes this section fiction. It is the section a contributor actually "
+        "follows."
     )
     assert re.search(r"re-?measured\s+20\d\d-\d\d-\d\d", low), (
         "§6.7 carries no DATED re-measurement. Trailer adoption here has already changed once without "
