@@ -56,6 +56,12 @@ this line.**
   `caller_is_requester` and `gated`. The console also imports `ResolveOutcome` from
   `messagefoundry.api.models`, so on an older engine it fails at import, before the seam check.
 
+### Changed
+
+- **Seam only: the engine's posture model grew.** `SecurityPosture` gains
+  `transit_bound_attestation`, a `TransitBoundAttestationView` (`BACKLOG #2337`). The console
+  renders nothing new, but the field is on the seam it pins, so the supported digest moved.
+
 ### Fixed
 
 - **A throttled `/ui` write now says how long to wait.** The admin-write `429` carried a literal
@@ -69,6 +75,12 @@ this line.**
 
 ### Security
 
+- **The user page's self-target refusals are audited, with your address.** Reset-password,
+  reset-mfa, link, unlink, disable and delete now pass the request to the engine's handler. The
+  engine refuses your own account by its stored id too, and writes `auth.self_target_refused`.
+  The seam digest did not move, because it records handler names and not their parameters. A
+  console without this change would get a TypeError from those six against this engine. (vault
+  BACKLOG #3259, #3260)
 - **Resend, edit-resend, upload resend, queue purge and config reload each take a proof bound to
   that action.** A fresh session window no longer reaches them. Each needs a re-authentication made
   for it, which it spends. The re-auth page mints that proof when it continues to the action's

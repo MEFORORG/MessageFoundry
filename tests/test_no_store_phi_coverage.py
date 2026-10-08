@@ -174,6 +174,9 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     # built from parsed parts, with an unparseable address withheld rather than echoed.
     ("StaticCredentialHopView", "detail"): None,
     ("AiPolicy", "reason"): None,  # why the AI policy clamped, derived from config
+    # BACKLOG #2337: the operator's own attestation reason, typed at `store attest-transit-bound`
+    # and read from transit_bound_attestation, a non-PHI table no PHI.md row classifies.
+    ("TransitBoundAttestationView", "reason"): None,
     ("ConnectionMetadata", "metadata"): None,  # the operator's own connections.toml label table
     # --- live fields rated with a stored twin (BACKLOG #1185, Manager decision 2026-09-24) ----------
     # Live engine state, so no section 2 ROW names them. Section 2's prose rates each FIELD with its

@@ -1,6 +1,7 @@
 # 0208 -- A Theia desktop app gives interface analysts a simpler Steps-only editor
 
-- **Status:** Proposed (2026-10-07). Design only; no code exists. Accepting it needs the owner.
+- **Status:** Proposed (2026-10-07). Design only; no editor code exists. The lens changes it depends
+  on landed in PR 2155 (D6). Accepting it needs the owner.
 - **Date:** 2026-10-07
 - **Related:** [ADR 0076](0076-typed-action-vocabulary-action-list-lens.md) (the Steps view and its
   grammar; Amendments A, C, D, E and F apply, B was declined; this ADR proposes Amendment G) -
@@ -45,7 +46,7 @@ landed.
 4. Developers keep the full IDE layout in the Theia build, with a Steps / Split / Code switch. They
    may also stay on VS Code and `ide/`.
 5. **Typed-only mode.** `paste_block` and a one-line raw `test` stay available by default. A flag on
-   `lens rewrite` (working name `--typed-only`) refuses both with the generic `refused` code. The
+   `lens rewrite`, `--typed-only` (PR 2155 shipped it under that name), refuses both with the generic `refused` code. The
    analyst build always sets it.
 6. **The repository check's reading.** A Steps-only change passes. Any other change passes only with
    approval from a `code:edit` reviewer.
@@ -80,9 +81,9 @@ landed.
 
 - **The Steps view is built and edits**, in `ide/` (ADR 0076 phase 3; ADRs 0103, 0106 and 0108).
   Every edit is a row-scoped splice computed by `lens rewrite`.
-- **`lens rewrite` does not yet limit an edit to typed rows** (finding R1). The answer is the R1 fix
-  plus typed-only mode (D6). Both are being built separately, on their own branch. Neither has
-  landed, and this ADR does not claim either is done.
+- **`lens rewrite` did not limit an edit to typed rows** (finding R1). The answer is the R1 fix
+  plus typed-only mode (D6). Both landed in PR 2155, merged 2026-10-08 as `8280c3f42b`. ADR 0076
+  Amendment G, G.7, records where the code still differs from the rules.
 - **The roles half-exist.** `Role.CODING` holds `code:edit`, which no endpoint enforces. No permission
   describes the Steps level.
 - **Promote ships no files.** For a remote engine, the reload reads the engine's own `--config`
@@ -144,13 +145,13 @@ it, only when the site meets spec section 5.4.**
   analyst changing
   Python through the analyst build. It does
   not stop a change made with another tool. The developer build needs no engine session (D-A).
-- **D6 -- R1 is a precondition, answered by changes landing separately.** The R1 fix and typed-only
-  mode (ruling 5) are stated once, in ADR 0076 Amendment G: G.6 for typed-only mode, G.7 for the
-  R1 fix and its *inert* rule, and G.5 for the R1 payloads. They are being built separately and
-  have not landed.
+- **D6 -- R1 is a precondition, answered by changes that landed in PR 2155.** The R1 fix and
+  typed-only mode (ruling 5) are stated once, in ADR 0076 Amendment G: G.6 for typed-only mode, G.7
+  for the R1 fix and its *inert* rule, and G.5 for the R1 payloads. They landed in PR 2155 on
+  2026-10-08; G.7 records what still differs.
   Typed-only mode is off by default, so the developer build and `ide/` keep both hatches. The analyst
   build passes it on every `lens rewrite` call and offers no way to turn it off. The analyst build
-  does not ship until both land with the R1 payloads as refusal tests.
+  does not ship until the lens meets AC-3, with the R1 payloads as refusal tests.
 - **D7 -- The repository check is optional, and the project ships it.** It decides whether a change is
   Steps-only, comparing every `code` row, every control header and each typed row's full statement
   against base by content, allowing only the lens's sanctioned generated shapes, and treating any change outside the def bodies or to
@@ -201,7 +202,7 @@ promote stays `POST /config/reload` with step-up and the site's dual control unc
   -> editor test *level selection* (path open)
 - **AC-3** -- THE lens SHALL meet ADR 0076 Amendment G's AC-G6 and AC-G9, which state the typed-only
   refusals, the R1 fix's refusals and the R1 payloads.
-  -> the lens refusal tests the R1 fix adds (being built separately; path set when it lands)
+  -> `tests/test_lens_no_code_injection.py` and `tests/test_lens_typed_only_repair.py` (PR 2155)
 - **AC-3a** -- THE ANALYST BUILD SHALL pass typed-only mode on every `lens rewrite` call.
   -> editor test *typed-only argv* (path open)
 - **AC-4** -- THE ANALYST BUILD SHALL offer no route that opens a `.py` file in a text editor, and
@@ -322,15 +323,16 @@ step with `ide/` (spec section 11). Without the repository check, the Steps limi
 analysts who use the analyst build as intended; with it, it holds only as far as spec section 5.4 is
 set up. A Steps-only change can still redirect a send, run a literal lookup, raise or filter (spec
 5.2), so the site's ordinary review stays the safeguard for those. The `code:edit` reviewer group is
-kept in step with engine roles by hand. Until the R1 fix and typed-only mode land, the analyst build
-cannot ship.
+kept in step with engine roles by hand. The R1 fix and typed-only mode landed in PR 2155; the
+analyst build cannot ship until the lens meets AC-3.
 
 **Out of scope** -- Listed once, in spec section 14.
 
 ## To resolve on acceptance
 
-- [ ] The R1 fix and typed-only mode land in `messagefoundry/lens.py`, with the four payloads as
-      refusal tests (D6).
+- [ ] The R1 fix and typed-only mode meet AC-3 in `messagefoundry/lens.py`, with the four payloads
+      as refusal tests (D6). The code landed in PR 2155 on 2026-10-08; ADR 0076 Amendment G, G.7,
+      records what still differs.
 - [ ] Spikes S-1 to S-4 in the specification, section 17, all pass. Spec section 16 is the test
       strategy.
 - [ ] ADR 0076 Amendment G accepted by the owner.

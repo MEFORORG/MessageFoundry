@@ -328,8 +328,12 @@ def test_the_loop_guard_fires_on_each_spelling_it_claims(source: str) -> None:
 def test_no_engine_module_starts_a_loop_without_run_guarded() -> None:
     """Every loop the engine starts must come from ``last_resort.run_guarded`` (BACKLOG #1789),
     except the one uvicorn owns under ``serve``. A loop started directly gets the stdlib default
-    handler, which prints a task's raw exception text. ``run_guarded`` itself is the one allowed
-    site.
+    handler, which prints a task's raw exception text. ``run_guarded`` itself is an allowed site.
+
+    The protocol floor's startup self-test (BACKLOG #1120) is the other. ``run_guarded`` calls
+    ``asyncio.run``, whose loop opens a socket pair, and that self-test must open none. So it runs
+    one private loop and installs its own handler, which logs the context message and no exception
+    text. Both halves are pinned below: one loop start, and that handler installed.
 
     Controls keep a zero from being a dead instrument. The scanner must find ``run_guarded``'s own
     two calls in the REAL tree, and it must fire on each spelling in the test above."""
@@ -337,15 +341,29 @@ def test_no_engine_module_starts_a_loop_without_run_guarded() -> None:
 
     root = Path(messagefoundry.__file__).resolve().parent
     allowed = root / "last_resort.py"
+    selftest = root / "api" / "protocol_floor_selftest.py"
     files = sorted(root.rglob("*.py"))
     hits: list[str] = []
     allowed_hits: list[str] = []
+    selftest_hits: list[str] = []
     for path in files:
         found = _direct_loop_starts(path.read_text(encoding="utf-8"), str(path))
-        (allowed_hits if path == allowed else hits).extend(found)
+        if path == allowed:
+            allowed_hits.extend(found)
+        elif path == selftest:
+            selftest_hits.extend(found)
+        else:
+            hits.extend(found)
 
     assert len(files) > 100, f"scanned only {len(files)} files under {root}"
     assert len(allowed_hits) == 2, f"run_guarded's own calls were not found: {allowed_hits}"
+    assert len(selftest_hits) == 1, f"the self-test must start exactly one loop: {selftest_hits}"
+    selftest_source = selftest.read_text(encoding="utf-8")
+    assert "self.set_exception_handler(_note_loop_error)" in selftest_source
+    assert (
+        '_log.debug("protocol floor self-test: discarded loop reported: %s", context.get("message"))'
+        in (selftest_source)
+    ), "the self-test loop's handler must log the context message only"
     assert hits == [], (
         "a loop is started without the last-resort handler; use "
         f"messagefoundry.last_resort.run_guarded instead: {hits}"

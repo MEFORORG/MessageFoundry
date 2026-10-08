@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import logging
 import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
@@ -53,6 +54,7 @@ from typing import TYPE_CHECKING, Any
 from messagefoundry.store.crypto import (
     _V3_PREFIX,
     MARKER_PREFIX,
+    AuditKeyVersionRefusedError,
     AuditMacFn,
     CipherError,
     _UnmarkedPolicy,
@@ -64,12 +66,15 @@ from messagefoundry.store.keyprovider_vault import (
     TRANSIT_KEY_TYPES_DATA,
     TRANSIT_MOUNT,
     _build_client,
+    is_vault_bad_request,
     require_transit_key_type,
     vault_failure_text,
 )
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
+
+log = logging.getLogger(__name__)
 
 #: The `[store].cipher_provider` value that selects this cipher.
 PROVIDER_NAME = "vault_transit"
@@ -93,6 +98,9 @@ _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: deterministic MAC round-trips. NEVER change on an existing keyed-in-Transit store (it re-breaks the
 #: suffix), same discipline as rotating the in-heap key.
 _AUDIT_HASH_ALGO = "sha2-256"
+#: The fixed input of the probe that tells a refused key version from an outage (BACKLOG #2337).
+#: Base64, as Transit takes it. It carries no row data, so no row can decide the probe's answer.
+_VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
 
 
 class TransitCipher(_UnmarkedPolicy):
@@ -115,6 +123,12 @@ class TransitCipher(_UnmarkedPolicy):
         # The Transit key the audit-chain HMAC runs under. Defaults to the data key (Transit HMAC works
         # on any key type) so the chain is keyed-in-Transit by default; a dedicated key domain-separates.
         self._audit_key = audit_key or key_name
+
+    @property
+    def transit_key_name(self) -> str:
+        """The Transit data key's NAME, never key material. ``serve`` checks that a recorded
+        attestation names it (BACKLOG #2337), because the engine counts no AES-GCM invocations here."""
+        return self._key
 
     def _associated_data(self, aad: bytes | None) -> str | None:
         # Transit's associated_data is base64; None → omit it (symmetric with a None-aad encrypt).
@@ -186,7 +200,7 @@ class TransitCipher(_UnmarkedPolicy):
         """No in-heap audit keys. Transit versions its own audit key, so the engine sees one range."""
         return {}
 
-    def audit_hmac(self, data: bytes) -> str:
+    def audit_hmac(self, data: bytes, *, key_version: int | None = None) -> str:
         """Compute the audit-chain row MAC INSIDE Transit (``generate_hmac``) — no key ever enters heap.
 
         Returns Transit's own ``vault:v1:…`` HMAC string (deterministic for a given input+key+version, so
@@ -194,20 +208,63 @@ class TransitCipher(_UnmarkedPolicy):
         different input yields a different MAC → tamper/forgery is detected). ADR 0138 §To-resolve: this
         moves the audit chain from keyless SHA-256 to forgery-**resistant** without an in-heap key,
         closing the ASVS 16.4.2 residual for ``vault_transit`` mode. Fail-closed: any Transit error raises
-        :class:`CipherError` (type-only — the canonical row bytes are PHI-derived and never surfaced)."""
+        :class:`CipherError` (type-only — the canonical row bytes are PHI-derived and never surfaced).
+
+        ``key_version`` pins the Transit key version; ``None`` means Transit's latest. A check of a
+        stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
+        an older row read as forged. A pinned call Transit refuses for its version alone raises
+        :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`)."""
         inp = base64.b64encode(data).decode("ascii")
+        kwargs: dict[str, Any] = {
+            "name": self._audit_key,
+            "hash_input": inp,
+            "algorithm": _AUDIT_HASH_ALGO,
+        }
+        if key_version is not None:
+            kwargs["key_version"] = key_version
         try:
-            response: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key, hash_input=inp, algorithm=_AUDIT_HASH_ALGO
-            )
+            response: Any = self._client.secrets.transit.generate_hmac(**kwargs)
             mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
+            if key_version is not None and self._refuses_only_version(exc, key_version):
+                raise AuditKeyVersionRefusedError(key_version) from exc
             raise CipherError(
                 f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
             ) from exc
         if not isinstance(mac, str) or not mac:
             raise CipherError(f"Transit returned an empty audit HMAC (key={self._audit_key!r})")
         return mac
+
+    def _refuses_only_version(self, exc: Exception, key_version: int) -> bool:
+        """Whether ``exc``, raised by a call pinned to ``key_version``, is Transit refusing that
+        version rather than an outage (BACKLOG #2337).
+
+        Transit answers a version above the latest, or below the policy minimum, with HTTP 400,
+        which hvac raises as ``InvalidRequest``. A dropped connection, a rate limit or a sealed node
+        raises another class, so none of those reads as a refused version. A 400 can also mean the
+        key itself is missing, so a probe under the latest version, over FIXED input, must succeed
+        too. Fixed input keeps a row's own content from deciding the answer. The probe must also
+        name a different version, or the refusal was not about the version.
+
+        This infers the cause from the reply; it does not read the key's version range. So a node
+        whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
+        if not is_vault_bad_request(exc):
+            return False
+        try:
+            probe: Any = self._client.secrets.transit.generate_hmac(
+                name=self._audit_key, hash_input=_VERSION_PROBE_INPUT, algorithm=_AUDIT_HASH_ALGO
+            )
+            answered = probe["data"]["hmac"]
+        except Exception as probe_exc:  # the latest version fails too: not a version refusal
+            log.warning(
+                "Transit refused audit key version %d, and the probe under the latest version failed "
+                "too (key=%r): %s",
+                key_version,
+                self._audit_key,
+                vault_failure_text(probe_exc),
+            )
+            return False
+        return isinstance(answered, str) and not answered.startswith(f"vault:v{key_version}:")
 
     def audit_mac_fn(self) -> AuditMacFn:
         """The audit-chain MAC provider: route each row's MAC through Transit (:meth:`audit_hmac`). The

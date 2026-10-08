@@ -198,6 +198,7 @@ from messagefoundry.api.models import (
     StatsResponse,
     StorePrivilegeView,
     SystemStatus,
+    TransitBoundAttestationView,
     UpdateInfo,
     UploadDeleteResult,
     UploadedFileInfo,
@@ -435,6 +436,10 @@ from messagefoundry.store.store import (
     OperatorAudit,
     ReingressOutcome,
     ResendOutcome,
+)
+from messagefoundry.store.transit_attestation import (
+    read_transit_bound_attestation,
+    transit_bound_gap,
 )
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
@@ -1221,6 +1226,12 @@ def _posture_loosenings(
     # resolved settings serve stashed, the #1989 object; an app built without them (the
     # embedding/test path) reports the shipped [api] defaults, which acknowledge nothing.
     api_settings = cred_settings.api if cred_settings is not None else ApiSettings()
+    # Vault BACKLOG #2385: the docs routes are built from create_app's own argument, not from
+    # [api]. So what THIS app serves is read off the app, as allow_no_auth is below, and it wins
+    # in both directions over a stashed [api] value the app was not built with.
+    serves_docs = getattr(state, "expose_docs", None)
+    if serves_docs is not None and serves_docs != api_settings.expose_docs:
+        api_settings = api_settings.model_copy(update={"expose_docs": serves_docs})
     # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
     # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
     # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
@@ -2688,7 +2699,7 @@ def create_app(
             "create_app: allow_no_auth=True was passed beside an auth service; pass the opt-in "
             "only with no service, since a service always requires sign-in"
         )
-    # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
+    # The interactive docs (at least /docs and /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
     #
@@ -2795,6 +2806,8 @@ def create_app(
     app.state.client_address_monoculture = False
     # Fail-closed when no auth is attached unless explicitly opted out (embedding/dev) — SYS-1.
     app.state.allow_no_auth = allow_no_auth
+    # Whether THIS app serves its API documentation routes, for the posture read-out (#2385).
+    app.state.expose_docs = expose_docs
     # ASVS 16.3.2 (#244): audit every authorization grant, not just the sensitive set. ON by default
     # since BACKLOG #1277; `serve` passes the resolved [diagnostics].audit_all_authz over the top.
     app.state.audit_all_authz = audit_all_authz
@@ -3176,6 +3189,32 @@ def create_app(
         )
         return AiChatResponse(reply=reply, model=ai.model, data_scope=enforced_scope)
 
+    async def _transit_bound_view(
+        store: object, key_name: str | None
+    ) -> TransitBoundAttestationView | None:
+        """The vault_transit bound attestation as the start gate reads it (BACKLOG #2337), through
+        the same reader and the same verdict. ``None`` off vault_transit.
+
+        A Transit failure during the audit-row MAC check comes back from the store as a gap, so it
+        reads as not attested rather than failing the whole posture. A row its audit row does not
+        back reports no ``attested_*`` fields: they are whatever a writer with DML put there, and
+        showing a named actor beside ``attested: false`` would still read as that person's
+        attestation."""
+        if key_name is None:
+            return None
+        recorded = await read_transit_bound_attestation(store)
+        gap = transit_bound_gap(key_name, recorded)
+        backed = recorded if recorded is not None and recorded.audit_gap is None else None
+        return TransitBoundAttestationView(
+            key_name=key_name,
+            attested=gap is None,
+            gap=gap,
+            attested_key_name=backed.key_name if backed else None,
+            attested_by=backed.actor if backed else None,
+            attested_at=backed.attested_at if backed else None,
+            reason=backed.reason if backed else None,
+        )
+
     @app.get("/security/posture", response_model=SecurityPosture)
     async def security_posture(
         request: Request,
@@ -3350,6 +3389,9 @@ def create_app(
             client_denied_last=getattr(request.app.state, "client_denied_last", None),
             client_address_monoculture=bool(
                 getattr(request.app.state, "client_address_monoculture", False)
+            ),
+            transit_bound_attestation=await _transit_bound_view(
+                engine.store, info.transit_key_name
             ),
         )
 
@@ -9368,7 +9410,8 @@ def create_managed_app(
     startup AND on every reload — ``serve --shard X`` passes ``filter_registry_for_shard(.., X)`` so
     this process owns only shard X's inbounds; ``None`` = the whole graph (unchanged default).
     ``registry_guard`` refuses a graph by raising ``WiringError``; it runs on the first load and on
-    every reload (the opt-in static-credential gate, BACKLOG #1182). ``static_credential_settings`` is
+    every reload (``serve`` chains its guards into one; at least the opt-in static-credential gate,
+    BACKLOG #1182, is among them). ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it.
     """

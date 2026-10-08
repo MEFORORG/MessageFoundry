@@ -161,6 +161,7 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
     AdminRemoval,
     AlertInstance,
@@ -210,6 +211,7 @@ from messagefoundry.store.store import (
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     _session_cap_groups,
+    _transit_attestation_row,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -227,14 +229,19 @@ from messagefoundry.store.store import (
     operator_audits,
     owned_lane_scope,
     password_claim_set,
+    read_transit_bound_attestation_rows,
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
+    settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
     totp_enable_term,
+    transit_attested_audit,
+    transit_withdrawn_audit,
     verify_audit_rows,
 )
+from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
 
 log = logging.getLogger(__name__)
@@ -644,6 +651,18 @@ _SCHEMA: list[str] = [
         id          INTEGER PRIMARY KEY CHECK (id = 1),
         salt        TEXT NOT NULL,
         created_at  DOUBLE PRECISION NOT NULL
+    )""",
+    # The vault_transit AES-GCM bound attestation (BACKLOG #2337) -- see the SQLite `_SCHEMA`. One row
+    # at most, written only by `store attest-transit-bound` with its audit row in the same
+    # transaction, and naming that row by `audit_seq`/`audit_hash`. Non-secret.
+    """CREATE TABLE IF NOT EXISTS transit_bound_attestation (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        key_name    TEXT NOT NULL,
+        reason      TEXT NOT NULL,
+        actor       TEXT NOT NULL,
+        attested_at DOUBLE PRECISION NOT NULL,
+        audit_seq   BIGINT NOT NULL,
+        audit_hash  TEXT NOT NULL
     )""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
     # for the in-flight-only rationale. This is the backend a real sharded deployment runs:
@@ -7648,6 +7667,85 @@ class PostgresStore:
         if row is None:  # the insert above ran, so only a concurrent delete reaches here
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
+
+    # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
+
+    async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
+        """See the SQLite twin. The shared reader's ``?`` placeholders become ``$n`` here, and
+        its reads share one borrow and one read-only REPEATABLE READ snapshot, as the SQLite twin's
+        share one ``_read()``. Without the snapshot, an attest committed between the row read and
+        the supersession read would make a valid attestation read as superseded."""
+        async with (
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+
+            async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+                parts = sql.split("?")
+                numbered = parts[0] + "".join(f"${i}{part}" for i, part in enumerate(parts[1:], 1))
+                row: Mapping[str, Any] | None = await conn.fetchrow(numbered, *params)
+                return row
+
+            read = await read_transit_bound_attestation_rows(
+                fetch, mac_keys=self._audit_mac_keys, mac_fn=self._audit_mac_fn
+            )
+        # The Transit MAC runs after the snapshot and the borrow are released.
+        return await settle_transit_bound_attestation(read)
+
+    async def record_transit_bound_attestation(
+        self, *, key_name: str, reason: str, actor: str, now: float | None = None
+    ) -> TransitBoundAttestation:
+        """See the SQLite twin. The audit row and the upsert naming it share one transaction."""
+        now = time.time() if now is None else now
+        audit = transit_attested_audit(key_name=key_name, reason=reason, actor=actor)
+        # `record=False` as `create_user` passes: a CLI write is not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            [appended] = await self._append_audits(conn, (audit,), now=now)
+            await conn.execute(
+                "INSERT INTO transit_bound_attestation (id, key_name, reason, actor, attested_at,"
+                " audit_seq, audit_hash) VALUES (1, $1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO"
+                " UPDATE SET key_name = EXCLUDED.key_name, reason = EXCLUDED.reason,"
+                " actor = EXCLUDED.actor, attested_at = EXCLUDED.attested_at,"
+                " audit_seq = EXCLUDED.audit_seq, audit_hash = EXCLUDED.audit_hash",
+                key_name,
+                reason,
+                actor,
+                now,
+                appended.seq,
+                appended.row_hash,
+            )
+        tee_audits((audit,), (appended,), ts=now)
+        return TransitBoundAttestation(
+            key_name=key_name,
+            reason=reason,
+            actor=actor,
+            attested_at=now,
+            audit_seq=appended.seq,
+            audit_hash=appended.row_hash,
+        )
+
+    async def withdraw_transit_bound_attestation(
+        self, *, actor: str, reason: str | None = None, now: float | None = None
+    ) -> TransitBoundAttestation | None:
+        """See the SQLite twin. ``DELETE ... RETURNING`` reads and removes the row in one statement,
+        and the audit row commits in the same transaction."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            # The audit lock FIRST, the order `record_transit_bound_attestation` takes them in (its
+            # append, then the row), so a concurrent attest and withdraw cannot deadlock. The
+            # append below re-takes it, which a transaction-scoped advisory lock allows.
+            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+            row = await conn.fetchrow(
+                "DELETE FROM transit_bound_attestation WHERE id = 1"
+                f" RETURNING {TRANSIT_ATTESTATION_COLUMNS}"
+            )
+            if row is None:
+                return None
+            withdrawn = _transit_attestation_row(row)
+            audits = (transit_withdrawn_audit(withdrawn, actor=actor, reason=reason),)
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
+        return withdrawn
 
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a

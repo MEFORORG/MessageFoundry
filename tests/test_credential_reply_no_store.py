@@ -42,6 +42,7 @@ import httpx
 import pytest
 from _totp_clock import fresh_totp
 from fastapi import Depends
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 
@@ -197,6 +198,41 @@ def test_the_route_class_adds_the_step_with_nothing_declared() -> None:
     )(public_route("test")(_explicit))
     (twice,) = [r for r in app.routes if isinstance(r, APIRoute) and r.path == "/planted/twice"]
     assert sum(d.call is no_store_reply for d in twice.dependant.dependencies) == 1
+
+
+class _Page[T](BaseModel):
+    """A pydantic generic, the shape the route class's docstring once said escapes the mark."""
+
+    items: list[T]
+
+
+def test_a_pydantic_generic_of_a_credential_model_carries_it() -> None:
+    """A parametrized pydantic generic carries its argument in its fields, so the walk finds it."""
+    assert carries_credential(_Page[LoginResponse])
+    assert not carries_credential(_Page[CurrentUser]), "control: a plain argument is not marked"
+
+
+async def test_a_raw_response_from_a_marked_route_is_still_no_store(engine: Engine) -> None:
+    """The escape the vault re-read of ASVS 14.2.2 measured: FastAPI serves a ``Response`` the
+    endpoint built itself as is, so the header ``no_store_reply`` set on FastAPI's own reply never
+    reached it. The route class stamps the returned ``Response`` too. A raw reply from an unmarked
+    route stays unstamped, so the stamp is not simply on every response."""
+    service = await _service(engine, AuthSettings())
+    app = create_app(engine, auth=service)
+
+    async def _raw() -> Any:
+        return JSONResponse({"token": "planted"}, headers={"Cache-Control": "max-age=600"})
+
+    app.post("/planted/raw", response_model=LoginResponse)(public_route("test")(_raw))
+    app.post("/planted/raw-plain", response_model=CurrentUser)(public_route("test")(_raw))
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        marked = await c.post("/planted/raw")
+        plain = await c.post("/planted/raw-plain")
+    assert marked.status_code == 200, marked.text
+    assert marked.headers.get("cache-control") == "no-store"
+    assert plain.status_code == 200, plain.text
+    assert plain.headers.get("cache-control") == "max-age=600"
 
 
 @pytest.fixture

@@ -12,6 +12,7 @@ and the network calls a forwarder would make raise.
 
 from __future__ import annotations
 
+import logging
 import socket
 from pathlib import Path
 from typing import Any
@@ -201,6 +202,77 @@ def test_the_supervisor_is_refused_by_each_gate_exactly_as_serve_is(
     assert _errors(capsys.readouterr().err) == serve_errors
     assert recorder.spawned == 0, "the supervisor spawned shards past a refused gate"
     assert recorder.forwards == [], "the supervisor installed a forwarder past a refused gate"
+
+
+# --- the own-host refusal and its fail-open notes (vault BACKLOG #2375) --------------------------
+#
+# Both came to `serve` after the gates moved into the shared helper. These two tests fail if the
+# helper loses either, which is the only way the supervisor could come to differ from `serve`.
+
+
+def test_a_collector_that_is_this_host_is_refused_for_the_supervisor_exactly_as_for_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verified TLS to a collector named as this host: no separate system, so no start. The OS
+    name is stubbed and every resolver call raises, so the answer rests on no runner state."""
+    monkeypatch.setattr(socket, "gethostname", lambda: VERIFIED_LOG_FORWARDING_HOST.upper() + ".")
+
+    rc, _ = _run("serve", tmp_path, monkeypatch, verified_forwarding=True)
+    serve_errors = _errors(capsys.readouterr().err)
+    assert rc == 2 and len(serve_errors) == 1, serve_errors
+    assert "own name or one of its own addresses" in serve_errors[0], serve_errors
+
+    rc, recorder = _run("supervise", tmp_path, monkeypatch, verified_forwarding=True)
+    assert rc == 2
+    assert _errors(capsys.readouterr().err) == serve_errors
+    assert recorder.spawned == 0, "the supervisor spawned shards past the own-host refusal"
+    assert recorder.forwards == [], "the supervisor installed a forwarder to its own host"
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_a_fail_open_note_is_printed_before_logging_and_logged_after_the_forwarder_exists(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The own-host check fails open when the OS gives no name, and its note is the record of
+    that pass. It goes to stderr at the gate, then to the log once the forwarder is installed."""
+
+    def no_name() -> str:
+        raise OSError("no host name")
+
+    monkeypatch.setattr(socket, "gethostname", no_name)
+    installed_when_logged: list[int] = []
+
+    class _Watch(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "the OS gave no host name" in record.getMessage():
+                installed_when_logged.append(len(recorder_box[0].forwards))
+
+    recorder_box: list[_Recorder] = []
+    real_init = _Recorder.__init__
+
+    def tracking_init(self: _Recorder) -> None:
+        real_init(self)
+        recorder_box.append(self)
+
+    monkeypatch.setattr(_Recorder, "__init__", tracking_init)
+    watch = _Watch(level=logging.WARNING)
+    main_log = logging.getLogger("messagefoundry.__main__")
+    main_log.addHandler(watch)
+    try:
+        with caplog.at_level("WARNING"):
+            rc, recorder = _run(command, tmp_path, monkeypatch, verified_forwarding=True)
+    finally:
+        main_log.removeHandler(watch)
+    assert rc == 0 and len(recorder.forwards) == 1
+    assert "warning: the OS gave no host name" in capsys.readouterr().err
+    # Logged once, by the start code and not by the gate itself, and only with a forwarder up.
+    notes = [r for r in caplog.records if "the OS gave no host name" in r.getMessage()]
+    assert [r.name for r in notes] == ["messagefoundry.__main__"], notes
+    assert installed_when_logged == [1]
 
 
 # --- forwarding not configured ------------------------------------------------------------------

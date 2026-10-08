@@ -849,6 +849,23 @@ def carries_credential(annotation: object, _seen: frozenset[int] = frozenset()) 
     return any(carries_credential(arg, seen) for arg in get_args(annotation))
 
 
+def _stamp_no_store(
+    handler: Callable[[Request], Coroutine[Any, Any, Response]],
+) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+    """Serve whatever ``Response`` the route returns ``no-store``, including one the endpoint built
+    itself, which skips the header :func:`no_store_reply` set on FastAPI's own reply."""
+
+    async def stamped(request: Request) -> Response:
+        response = await handler(request)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    # Set by hand rather than by ``functools.wraps``, which would also copy the name: a reader of
+    # the handler sees the stamp, and ``inspect.unwrap`` finds the handler behind it.
+    stamped.__wrapped__ = handler  # type: ignore[attr-defined]
+    return stamped
+
+
 class AuthenticatedBeforeBodyRoute(APIRoute):
     """Refuse a caller the gate would refuse for having no identity BEFORE the body is read.
 
@@ -883,11 +900,14 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
     IT ALSO SERVES EVERY CREDENTIAL REPLY ``no-store`` (BACKLOG #2372). A route whose response
     model is a :class:`~messagefoundry.api.auth_models.CredentialReply` gets
     :func:`no_store_reply` as a route dependency, so no route has to remember to declare it.
-    It reads the response model, so at least these escape it: a route added through
-    ``include_router``; a route with ``response_model=None`` or a ``Response`` return that hands
-    back a credential model anyway; and a pydantic generic model such as ``Page[X]``, whose type
-    arguments ``get_args`` does not report. ``tests/test_credential_reply_no_store.py`` checks
-    every route on the built app, including each endpoint's return annotation."""
+    A dependency sets the header on FastAPI's own reply only: FastAPI serves a ``Response`` the
+    endpoint built itself as is. So the handler also stamps ``no-store`` on whatever ``Response``
+    a route carrying the step returns. It reads the response model, so at least these escape it:
+    a route added through ``include_router``, and a route with ``response_model=None`` whose
+    endpoint hands back a credential anyway. A pydantic generic such as ``Page[X]`` does not
+    escape: its parametrized class carries ``X`` in its fields, which :func:`carries_credential`
+    walks. ``tests/test_credential_reply_no_store.py`` checks every route on the built app,
+    including each endpoint's return annotation."""
 
     def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
         super().__init__(path, endpoint, **kwargs)
@@ -904,6 +924,8 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         handler = super().get_route_handler()
+        if any(d.call is no_store_reply for d in self.dependant.dependencies):
+            handler = _stamp_no_store(handler)
         # ``body_field`` is the very condition FastAPI reads a body on before it solves
         # dependencies, so it is FastAPI's test and not a second opinion kept here.
         steps = steps_before_body(self.dependant) if self.body_field is not None else ()
