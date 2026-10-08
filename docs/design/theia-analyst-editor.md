@@ -365,10 +365,10 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
 - **FR-19.** `code` rows and control headers stay read-only.
 - **FR-20.** IF a delete or move would break the structure rule of ADR 0076 Amendment G, G.6, THEN
   THE ANALYST BUILD SHALL refuse it (AC-G5). The lens refuses the same under typed-only mode since
-  PR 2155. Since PR 2201 it also refuses any edit that leaves a row unable to run (G.6 rule 8); G.7,
-  "What still differs at `main`", records the limits. Today `ide/` deletes or moves a whole block
-  from its header row, nested `code` rows included (`isRowDeletable` and `isRowMovable` in
-  `ide/src/stepsModel.ts`).
+  PR 2155. Since PR 2201 it also refuses an edit that leaves a row unable to run (G.6 rule 8), in
+  at least the cases G.7, "What still differs at `main`", lists, and with the limits it records.
+  Today `ide/` deletes or moves a whole block from its header row, nested `code` rows included
+  (`isRowDeletable` and `isRowMovable` in `ide/src/stepsModel.ts`).
 - **FR-21. Drag a field.** The drag source SHALL be the sample panel or the schema tree. A drop onto
   a path parameter SHALL issue the same `set_params` edit, byte for byte, as typing that path. A drop
   anywhere else SHALL write nothing. The field picker SHALL be the keyboard path to the same edit.

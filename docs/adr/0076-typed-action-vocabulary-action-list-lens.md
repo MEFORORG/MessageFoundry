@@ -1387,12 +1387,15 @@ invariant rather than a property of the moved row):
    `return sends`, though it may move past `sends = []` (Manager decision 2026-10-07, after review).
    Every typed-only edit keeps each row able to run, whichever verb places it: a move, an
    `insert_row`, or a raise, filter or send `template` (Manager decision 2026-10-08, after review).
-   A row never runs below a statement that never falls through. That is a `return`, `raise`,
-   `break` or `continue`, a `while True:` with no `break`, or a block whose every path ends in one.
-   An `if` with an `else` whose every arm returns or raises is such a block (same decision). Each
-   statement is matched by its occurrence, not by its text alone (same decision). A row already
-   dead before the edit does not count, so a row may move out of a dead block. A dead `pass` seed
-   does not count either. The default mode applies none of this rule (same decision; AC-G7).
+   A row never runs below a statement that never falls through. One predicate,
+   `_is_terminal` in `messagefoundry/lens.py`, decides that for every edit (Manager decision
+   2026-10-08, after review). Its docstring lists at least the shapes it counts; a shape it cannot
+   decide falls through, which keeps the rule permissive. The rule refuses an edit only when it
+   makes reachability worse: a row that ran before and never runs after, or a row the edit placed
+   that never runs (same decision). Each row is compared with itself, by aligning the statements
+   before and after in source order. So an edit to a row already dead, or to a live row with a dead
+   twin of the same text, is accepted, and a row may move out of a dead block. A dead `pass` seed
+   does not count. The default mode applies none of this rule (Manager decision 2026-10-08; AC-G7).
 
 A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
 block whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager
@@ -1522,14 +1525,22 @@ is closed for the cases its tests pin:
   the rule. `tests/test_lens_typed_only_repair.py` pins at least these cases:
   - the moves above, and a `return` moved up past a row;
   - a row moved below an `if` and `else` whose arms both end;
-  - an insert after the last `return`, and a filter, raise or send template above a row;
-  - `break`, `continue` and `while True:` as statements that never fall through.
+  - an insert after the last `return`, after a `with` that returns, and a filter, raise or send
+    template above a row;
+  - `test_rule_8_never_falls_through`, which pins at least one case of each shape `_is_terminal`
+    decides, and a falls-through case for most;
+  - an edit to a dead row, and an edit, delete or move of a live row with a dead twin, accepted.
 
-  So a typed `return` or `raise` never moves up its own suite in typed-only mode. Two limits
-  remain. First, `_bound_after` judges a `with`, a loop, a `match`, and a `try` that only its
-  `else` ends, as falling through. A row placed after one of those that never falls through is not
-  caught. Second, a live row inserted above a dead row with the same text is refused, because the
-  two are matched by occurrence. That refusal is the safe direction.
+  So in typed-only mode a typed `return` or `raise` cannot move up past a row that would then never
+  run. At least these limits remain:
+  - a shape `_is_terminal` does not decide is judged to fall through, so a row placed after it is
+    not caught. Examples are a `with` whose body ends in `raise`, which a context manager may
+    swallow, a `match` that is exhaustive but has no irrefutable last case, and a call that never
+    returns;
+  - rows are aligned by their text in source order, so where rows with the same text sit together,
+    the alignment chooses which one counts as moved;
+  - a send cannot be added in typed-only mode to a handler that ends in `raise`, because the
+    fan-out's `return sends` would land below it and never run.
 
 The recorded limits, which are not reconciled:
 
@@ -1603,8 +1614,8 @@ change landed in PR 2155.
   nothing. R1 payloads 1 and 2 (G.5) are refusal tests, and so is a row using `occurrence=i`
   moved out of its For Each loop (G.6 rule 6). The R1 fix's tests landed in PR 2155, in
   `tests/test_lens_no_code_injection.py` and `tests/test_lens_typed_only_repair.py`. The same holds
-  for any edit that leaves a row unable to run (G.6 rule 8). G.7, "What still differs at `main`",
-  records that case and its limits.
+  for an edit that leaves a row unable to run (G.6 rule 8), in at least the cases G.7, "What still
+  differs at `main`", lists, and with the limits it records.
 - [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL NOT refuse a
   `paste_block` or a raw `test` for being one; each still passes the checks the lens applies in every
   mode. Among those, a raw `test` SHALL be one condition on one line, with no `yield` and no `await`
