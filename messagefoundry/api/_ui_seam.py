@@ -368,6 +368,14 @@ from typing import Any
 #: BACKLOG #2337 merged with vault BACKLOG #2144: the value below was re-derived on the tree
 #: merged with main's change, so it covers both.
 #:
+#: Vault BACKLOG #3259 / #3260: six ``AdminHandlers`` now take ``request``. They are ``update_user``,
+#: ``delete_user``, ``reset_user_password``, ``reset_user_mfa``, ``bind_user_federated_identity`` and
+#: ``unbind_user_federated_identity``. The address goes on their ``auth.self_target_refused`` row,
+#: and the console passes it on each call. Same blind spot as #2346, so the digest did not move. A
+#: skew in either direction raises TypeError on those six calls, which the handshake does not catch:
+#: an older console omits ``request``, and a newer console passes it to an engine that lacks it.
+#: Re-derived on the tree merged with BACKLOG #2337; this item leaves the value below unchanged.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
