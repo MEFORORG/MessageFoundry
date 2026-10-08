@@ -113,10 +113,14 @@ port = 8765
 # EVERY instance carries patient data (ADR 0186) - there is no data-class switch to set here, and the
 # retired one is REFUSED at load. To relax a specific PHI gate, name that gate's own switch.
 # block_unlisted_outbound = false     # the audited opt-out: an empty [egress] list allows any destination
-# Transform state has no retention window by default, and `serve` and `messagefoundry check` refuse
-# a tier with neither a window nor its acknowledgement. This is the acknowledgement: a window here
-# deletes state by the time it was last WRITTEN, so it can remove an entry a Handler still reads.
-# It is an audited loosening; `serve` writes an AUDIT line for it at each start.
+# Transform state has no retention window by default. Under the default `enforcement = "enforce"`,
+# `serve` refuses to start, and `messagefoundry check` fails, on a tier with neither a window nor
+# its acknowledgement; under "warn" both only warn. This is the acknowledgement. The window is
+# `[retention].state_max_age_days`, and it deletes state by the time it was last WRITTEN, so it can
+# remove an entry a Handler still reads.
+# It is an audited loosening; `serve` writes an AUDIT line for it at each start. REVIEW THIS SWITCH
+# before you copy this file to a production instance: a Handler that keys state on an identifier
+# such as an MRN stores that key in plaintext. See the engine's docs/PHI.md, section 2.
 allow_keeping_transform_state_indefinitely = true
 
 [retention]
