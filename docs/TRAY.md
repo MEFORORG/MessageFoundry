@@ -129,6 +129,12 @@ one needs write access to the log's own folder.
 service's* install directory (its NSSM `AppDirectory`). To open your own config/conversion estate
 instead, set `repo_path` in `tray.toml` (edit it via the menu) and restart the tray.
 
+**Which folders "Open Repo in VS Code" refuses.** The `code` command is a batch file, and Windows
+runs a batch file through `cmd.exe`, which reads some characters in the folder path as commands.
+So the tray refuses a `repo_path` holding any of `& | < > ^ % ! ( )`, a double quote, or a control
+character. It shows "Repo not opened" and starts nothing. Rename the folder, or open it from VS
+Code itself.
+
 ## Why the icon is named "MessageFoundry Tray"
 
 Windows names a notification-area icon in **Settings → Taskbar → Other system tray icons** after its

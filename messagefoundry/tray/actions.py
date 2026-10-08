@@ -105,7 +105,33 @@ def open_console(engine_url: str, *, opener: Callable[[str], object] | None = No
 
 def _run_detached(args: list[str]) -> None:
     creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    subprocess.Popen(args, shell=False, creationflags=creationflags)  # nosec B603 - fixed argv (resolved code CLI + repo path), shell=False, no shell interpolation
+    # No shell is asked for, but Windows still runs a batch file such as `code.cmd` under cmd.exe,
+    # which re-reads the argument text. open_repo() refuses a path cmd.exe would re-read first.
+    subprocess.Popen(args, shell=False, creationflags=creationflags)  # nosec B603 - argv is the resolved code CLI plus a repo path open_repo() screened (BACKLOG #2327)
+
+
+#: Characters ``cmd.exe`` reads as syntax in a batch file's arguments. Quoting does not make them
+#: all safe: ``%`` expands inside double quotes, and so does ``!`` under delayed expansion.
+_CMD_REREAD_CHARS = frozenset('&|<>^%!()"')
+
+
+class RepoPathRefused(ValueError):
+    """Open Repo refused ``repo_path``: it has a character ``cmd.exe`` would re-read.
+
+    The message is fixed text. The path comes from ``tray.toml`` or the service's registry hint, so
+    no part of it is echoed, which matches :class:`ConsoleUrlRefused`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "repo_path has a character the Windows command shell would re-read "
+            "(one of & | < > ^ % ! ( ) or a double quote, or a control character)"
+        )
+
+
+def _cmd_would_reread(text: str) -> bool:
+    """True when ``text`` has a ``cmd.exe`` metacharacter or a control character (CR, LF, ...)."""
+    return any(ch in _CMD_REREAD_CHARS or ch < " " or ch == "\x7f" for ch in text)
 
 
 def open_repo(
@@ -114,7 +140,15 @@ def open_repo(
     *,
     runner: Callable[[list[str]], object] = _run_detached,
 ) -> None:
-    """Open ``repo_path`` as a folder in VS Code via the resolved ``code`` CLI (list argv, no shell)."""
+    """Open ``repo_path`` as a folder in VS Code, or raise :class:`RepoPathRefused`.
+
+    The argv is a list and no shell is asked for. That is not enough on Windows: the ``code`` CLI
+    is a batch file, ``code.cmd``, and Windows runs a batch file under ``cmd.exe``, which re-reads
+    the argument text. Python's argv quoting does not escape ``&``, ``|`` or ``%``. So a path with
+    any such character is refused before the launch, and nothing is escaped (BACKLOG #2327).
+    """
+    if _cmd_would_reread(repo_path):
+        raise RepoPathRefused
     runner([code_cmd, repo_path])
 
 

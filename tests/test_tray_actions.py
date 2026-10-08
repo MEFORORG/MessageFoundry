@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
+import types
 import webbrowser
 from collections.abc import Callable
 from pathlib import Path
@@ -16,6 +18,7 @@ import pytest
 from messagefoundry.tray.actions import (
     ConsoleUrlRefused,
     LogPathRefused,
+    RepoPathRefused,
     console_url,
     log_available,
     open_console,
@@ -24,6 +27,8 @@ from messagefoundry.tray.actions import (
     repo_open_available,
     resolve_vscode,
 )
+from messagefoundry.tray.config import TrayConfig
+from messagefoundry.tray.logscrub import TrayLogScrubFilter
 
 
 def test_console_url_appends_ui_and_strips_slash() -> None:
@@ -177,6 +182,75 @@ def test_open_repo_runs_code_with_list_argv() -> None:
     calls: list[list[str]] = []
     open_repo("C:\\repo", "code.cmd", runner=calls.append)
     assert calls == [["code.cmd", "C:\\repo"]]
+
+
+# BACKLOG #2327: the `code` CLI is a batch file, so Windows runs it under cmd.exe, which re-reads
+# the argument text. Python's argv quoting escapes none of these, and `%` expands even in quotes.
+# The markers are harmless: nothing here is a command.
+@pytest.mark.parametrize(
+    "repo_path",
+    [
+        "C:\\a&b",
+        "C:\\a|b",
+        "C:\\a<b",
+        "C:\\a>b",
+        "C:\\a^b",
+        "C:\\a%PATH%b",
+        "C:\\a!b",
+        "C:\\a(b",
+        "C:\\a)b",
+        'C:\\a"b',
+        "C:\\a\rb",
+        "C:\\a\nb",
+        "C:\\a\x00b",
+        "C:\\a\x1ab",
+        "C:\\with space\\a&b",  # quoting the argument does not make it safe to hand over
+    ],
+)
+def test_open_repo_refuses_a_path_cmd_would_reread(repo_path: str) -> None:
+    calls: list[list[str]] = []
+    with pytest.raises(RepoPathRefused) as excinfo:
+        open_repo(repo_path, "code.cmd", runner=calls.append)
+    assert calls == []
+    # Fixed text: the path is operator data, so no part of it is echoed.
+    assert "a&b" not in str(excinfo.value)
+    assert "C:\\" not in str(excinfo.value)
+    assert str(excinfo.value) == str(RepoPathRefused())
+
+
+@pytest.mark.parametrize(
+    "repo_path",
+    ["C:\\Users\\me\\Code\\My Estate", "C:\\repo-1_x.y", "D:\\caf\u00e9\\repo", "C:\\a,b;c=d~e+f"],
+)
+def test_open_repo_still_opens_an_ordinary_folder(repo_path: str) -> None:
+    calls: list[list[str]] = []
+    open_repo(repo_path, "code.cmd", runner=calls.append)
+    assert calls == [["code.cmd", repo_path]]
+
+
+def test_the_tray_app_reports_a_refused_repo_path_and_starts_nothing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from messagefoundry.tray.app import TrayApp
+
+    started: list[object] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: started.append(a))
+    notes: list[str] = []
+    app = TrayApp.__new__(TrayApp)
+    app._config = TrayConfig(repo_path="C:\\a&b")
+    app._vscode = "code.cmd"
+    app._shell = types.SimpleNamespace(request_notify=lambda t, b: notes.append(b))  # type: ignore[assignment]
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.tray.app"):
+        app._open_repo()
+    assert started == []
+    line = f"Repo not opened: {RepoPathRefused()}"
+    assert notes == [line]
+    assert [r.getMessage() for r in caplog.records] == [line]
+    assert "a&b" not in line
+    # tray.log runs the engine's redactor, which must not eat the operator's line (BACKLOG #2092).
+    record = logging.LogRecord("messagefoundry.tray", logging.WARNING, __file__, 1, line, (), None)
+    TrayLogScrubFilter().filter(record)
+    assert record.getMessage() == line
 
 
 def _identity(path: str) -> str:

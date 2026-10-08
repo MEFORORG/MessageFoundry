@@ -267,7 +267,8 @@ What each form means:
 - **shell string** -- one string that a shell parses and runs.
 
 **What holds the argument-list starts.** Python hands the program and its arguments to the OS
-without a shell, and `tray/actions.py` sets `shell=False` explicitly. Where the program is a Windows
+without a shell, and `tray/actions.py` sets `shell=False` explicitly. That setting does not keep
+`cmd.exe` out of the tray's start; the second item below says why. Where the program is a Windows
 system tool, the code pins its absolute path under the system directory, so a same-named program
 planted in the working directory cannot run instead. The security lint marks the reviewed sites with
 a `nosec` note naming the rule it answers.
@@ -280,7 +281,10 @@ Two argument-list starts are not pinned that way:
   is a batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`. So a shell does read
   that start's arguments, one of which is `repo_path` from `tray.toml`. The command is found with
   `shutil.which`, whose Windows search can include the working directory, so a planted `code.cmd`
-  may win there too. What holds it: `repo_path` must name an existing folder, and the tray runs as
+  may win there too. What holds the argument: `open_repo` refuses a `repo_path` holding a character
+  `cmd.exe` would re-read, at least `& | < > ^ % ! ( )`, a double quote, or a control character. It
+  refuses before the start and escapes nothing (BACKLOG #2327). `repo_path` must also name an
+  existing folder. Nothing pins which `code` command runs; what holds that is that the tray runs as
   the signed-in user, who owns `tray.toml`.
 
 **What each child is handed.** A process started with no environment of its own gets a copy of the
