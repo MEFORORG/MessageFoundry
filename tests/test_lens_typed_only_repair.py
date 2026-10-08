@@ -1479,6 +1479,7 @@ def stash(msg):  # type: ignore[no-untyped-def]
 
 @handler("H")
 def h(msg):
+    global i
     for i in range(1, 3):
         pass
     return Send("OB", msg)
@@ -1500,5 +1501,39 @@ def h(msg):
 
 @pytest.mark.parametrize("src", [_GLOBAL_I, _GLOBAL_RANGE], ids=["global-index", "global-range"])
 def test_r13_a_loop_index_that_may_carry_text_is_not_a_destination(src: str) -> None:
+    line = len(src.splitlines())
+    _refused(src, _edit("set_params", line, params={"to": {"expr": "i"}}), match=REFUSED)
+
+
+# --- review of 2558f17928..784abde3d4 -----------------------------------------------------------
+
+
+def test_r14_finding_2_another_function_s_global_does_not_touch_the_handler_s_index() -> None:
+    src = _GLOBAL_I.replace("    global i\n    for i", "    for i")
+    edit = _edit(
+        "insert_row",
+        12,
+        position="before",
+        action="set_field",
+        params={"path": "OBX-3", "value": "x", "occurrence": {"expr": "i"}},
+    )
+    assert "occurrence=i" in rewrite_source(src, edit)
+
+
+@pytest.mark.parametrize(
+    "rebind",
+    [
+        "import builtins\n\n\ndef rebind(msg):  # type: ignore[no-untyped-def]\n"
+        '    builtins.range = lambda *a: [msg.field("PID-5")]\n',
+        "def rebind(msg):  # type: ignore[no-untyped-def]\n"
+        '    globals()["range"] = lambda *a: [msg.field("PID-5")]\n',
+    ],
+    ids=["builtins-attr", "globals-dict"],
+)
+def test_r14_finding_1_a_globals_route_voids_the_loop_index(rebind: str) -> None:
+    src = (
+        f'{rebind}\n\n@handler("H")\ndef h(msg):\n'
+        '    for i in range(1, 3):\n        pass\n    return Send("OB", msg)\n'
+    )
     line = len(src.splitlines())
     _refused(src, _edit("set_params", line, params={"to": {"expr": "i"}}), match=REFUSED)

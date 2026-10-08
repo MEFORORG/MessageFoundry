@@ -4666,13 +4666,22 @@ def _message_scope(
     }
     module_names, star = _module_bound_names(tree)
     globals_ = {name for n in ast.walk(tree) if isinstance(n, ast.Global) for name in n.names}
-    # A ``global range`` in any function can rebind the builtin from inside that function, which
-    # :func:`_module_bound_names` does not see (Lander review of 2558f17928, finding B).
-    if star or "range" in bound or "range" in module_names or "range" in globals_:
+    # ``range`` may not be the builtin when a ``global range`` in any function can rebind it, which
+    # :func:`_module_bound_names` does not see (Lander review of 2558f17928, finding B), or when the
+    # module reaches its globals by a route :func:`_reaches_globals` knows (``builtins.range = ...``,
+    # ``globals()["range"] = ...``; review of 784abde3d4, finding 1).
+    if (
+        star
+        or "range" in bound
+        or "range" in module_names
+        or "range" in globals_
+        or _module_reaches_globals(tree)
+    ):
         loop_indexes = set()
-    # A ``global``-declared index is module state, so it may carry one message's text into the next
-    # (Lander review of 2558f17928, finding A).
-    loop_indexes -= globals_
+    # An index the HANDLER declares ``global`` is module state: a loop that runs zero times leaves
+    # whatever another function stored there (Lander review of 2558f17928, finding A). A ``global``
+    # in another function does not touch the handler's own local index (review of 784abde3d4).
+    loop_indexes -= {n for x in ast.walk(func) if isinstance(x, ast.Global) for n in x.names}
     locals_ = frozenset((set(bound) - loop_indexes) | globals_ | {"msg"})
     literals = _inert_module_literals(tree)
     if extra_inert is not None:
@@ -4855,6 +4864,12 @@ def _reaches_globals(n: ast.AST, safe_getattr: set[int]) -> bool:
 _GLOBALS_ROUTE_NAMES = _GLOBALS_ATTRS | _GLOBALS_WRITERS | _BUILTINS_ROUTES
 
 
+def _module_reaches_globals(tree: ast.Module) -> bool:
+    """Whether anything in the module is a route :func:`_reaches_globals` knows."""
+    safe_getattr = _safe_getattr_names(tree)
+    return any(_reaches_globals(n, safe_getattr) for n in ast.walk(tree))
+
+
 def _safe_getattr_names(tree: ast.Module) -> set[int]:
     """The ``id`` of each ``getattr`` name that is called directly with a string literal attribute
     name that is not a dunder and not in :data:`_GLOBALS_ROUTE_NAMES`, so
@@ -4924,10 +4939,9 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
             binds[name] = binds.get(name, 0) + 1
         pending.extend(ast.iter_child_nodes(node))
     mutated: set[str] = set()
-    safe_getattr = _safe_getattr_names(tree)
+    if _module_reaches_globals(tree):
+        return {}
     for n in ast.walk(tree):
-        if _reaches_globals(n, safe_getattr):
-            return {}
         if isinstance(n, ast.ImportFrom) and any(al.name == "*" for al in n.names):
             return {}
         root: str | None = None
