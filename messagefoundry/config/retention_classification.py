@@ -335,16 +335,20 @@ def make_retention_override_guard(
 ) -> Callable[[Registry], None]:
     """The engine registry guard for a connection's own keep-forever retention override.
 
-    The graph half of the body-window gate in ``serve``, with the same refuse-or-warn split. It
-    differs in one way: the body-window gate writes its AUDIT line only under ``enforce``, and this
-    guard writes one on either dial. Without the
-    acknowledgement (``acknowledged``, the loaded ``[security].allow_keeping_phi_indefinitely``) an
-    enforcing instance refuses the graph by raising ``WiringError``: a first load fails the start,
-    and a ``/config/reload`` is refused with the running graph kept. It runs only where the engine
-    calls its registry guard. At least these do not: ``Engine.add_registry`` called by an embedder,
-    the DR re-apply path, and ``messagefoundry check``. Under ``enforcement = warn`` it
-    warns. With the acknowledgement the guard passes the graph and a WARNING-level ``AUDIT:`` line
-    names each connection, on either dial.
+    The graph half of the body-window gate in ``serve``, with the same refuse-or-warn split.
+    Without the acknowledgement (``acknowledged``, the loaded
+    ``[security].allow_keeping_phi_indefinitely``) an enforcing instance refuses the graph by
+    raising ``WiringError``: a first load fails the start, and a ``/config/reload`` is refused with
+    the running graph kept. Without it under ``enforcement = warn``, the guard warns. With the
+    acknowledgement the guard passes the graph and a WARNING-level ``AUDIT:`` line names each
+    connection, on either dial.
+
+    It is not a copy of the body-window gate. At least this differs: that gate writes its AUDIT
+    line only under ``enforce``, and this guard writes one on either dial.
+
+    It runs only where the engine calls its registry guard. At least these do not:
+    ``Engine.add_registry`` called by an embedder, the DR re-apply path, and
+    ``messagefoundry check``.
 
     The AUDIT line is written each time the guard passes such a graph. That includes a dry-run
     reload, and a reload a later check then refuses, so the line says the gate passed the graph and

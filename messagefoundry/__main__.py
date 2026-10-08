@@ -3580,9 +3580,9 @@ def _serve(args: argparse.Namespace) -> int:
 
     # Vault BACKLOG #2368: a connection may override either body window, and its own 0 keeps that
     # connection's bodies forever. Those overrides are in the graph, which this function does not
-    # load, so the gate above cannot see them. A registry guard judges them at least at the first load and on a reload,
-    # with the posture of the gate above: refuse under enforce, warn under warn, and an AUDIT line
-    # naming each connection once [security].allow_keeping_phi_indefinitely acknowledges it.
+    # load, so the gate above cannot see them. A registry guard judges them, at least at the first
+    # load and on every reload. What it refuses, warns and audits, and how that differs from the
+    # gate above, is stated once, on make_retention_override_guard.
     from messagefoundry.config.retention_classification import make_retention_override_guard
 
     retention_override_guard = make_retention_override_guard(

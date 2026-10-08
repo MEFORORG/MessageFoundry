@@ -22,6 +22,7 @@ import pytest
 
 from messagefoundry.__main__ import _chain_registry_guards, main
 from messagefoundry.config.retention_classification import (
+    auto_bounded_windows,
     keep_forever_overrides,
     make_retention_override_guard,
 )
@@ -106,6 +107,10 @@ def test_warn_enforcement_warns_instead_of_refusing(
     assert "IB_FEED" in text and "OB_FEED" in text and not text.startswith("AUDIT:")
     # The remedy names the switch and says how far it reaches.
     assert f"{_ACK}=true" in text and "covers the whole instance" in text
+    # Only the auto-bounded windows lose a default, and the remedy names each of them.
+    named = [w.setting for w in auto_bounded_windows()]
+    assert named and all(setting in text for setting in named)
+    assert "[retention].state_max_age_days" not in text
     # On stderr too, which no [logging].level can filter.
     assert f"warning: {text}" in capsys.readouterr().err
 
@@ -241,10 +246,10 @@ def test_serve_keeps_the_static_credential_guard_in_the_chain(
 
 
 def _clear_posture_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Drop any ``MEFOR_SECURITY_*`` / ``MEFOR_RETENTION_*`` override the host or an earlier
-    fixture set, so the edit is judged against the settings file the test wrote and nothing else."""
+    """Drop every ``MEFOR_*`` variable the host or an earlier fixture set, so no environment
+    override changes how the edit is judged. Any case: the loader lower-cases the name itself."""
     for name in list(os.environ):
-        if name.startswith(("MEFOR_SECURITY_", "MEFOR_RETENTION_")):
+        if name.upper().startswith("MEFOR_"):
             monkeypatch.delenv(name)
 
 

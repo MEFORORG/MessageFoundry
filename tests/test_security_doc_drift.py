@@ -3256,7 +3256,7 @@ def _retention_doc_findings(section: str, days: int, auto_bounded: tuple[str, ..
         "rows at **every stage**",
         "Unset or `0`, this global window meets the startup posture gate described above this table",
         "`0` = keep only where that gate allows it",
-        # Vault BACKLOG #2368: a per-outbound override of 0 is gated at graph load. The row used to
+        # Vault BACKLOG #2368: a per-outbound override of 0 is gated when `serve` loads the graph. The row used to
         # say the gate does not read the override, which was true and was the defect.
         "An override of `0` meets its own gate, described there",
     ):
