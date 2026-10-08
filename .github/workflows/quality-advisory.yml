@@ -438,10 +438,24 @@ jobs:
     #     opposite of what 21m35s implied.
     #   "ESTIMATED 18 to 20 minutes for the narrowed serial run" -- superseded by the 14m33s above.
     #
-    # NEXT LEVER IF IT DRIFTS AGAIN: pytest-xdist. ci.yml's engine leg runs `-n 4 --dist loadfile`
-    # and this job does not. Adding it here needs `[tool.coverage.run] parallel = true` plus a
-    # combine before --cov-report=xml, so it is a separate change with its own verification --
-    # deliberately NOT bundled here, or a shifted coverage number would have two possible causes.
+    # IT DRIFTED AGAIN, AND THE LEVER NAMED HERE WAS PULLED: the step now runs under pytest-xdist.
+    # The serial pytest step, sampled three jobs a day: 20.4 to 22.0 minutes on 2026-09-23, 27.7
+    # to 28.0 on 2026-09-26, the first cap kill on 2026-09-27, and from 2026-10-03 on every sampled
+    # job that ran to the cap was cancelled there (the shorter cancels are this file's concurrency
+    # group, not the cap). The cause is suite growth, not one slow test and not the runner: `11510
+    # passed` in 13m43s on 2026-09-01, `15926 passed` in 20m02s on 2026-09-23 (job 107432259490),
+    # `22043 passed` in 27m45s on 2026-09-28 (job 109189388475), and in that last job no test in
+    # the slowest 40 took more than 19.05s. The "re-derive at 20 minutes" trigger above had already fired by
+    # 2026-09-23 and nobody read it, so a trigger written into a comment is not a watch.
+    #
+    # THIS PARAGRAPH USED TO SAY xdist "needs `[tool.coverage.run] parallel = true` plus a combine".
+    # It does not: pytest-cov collects each worker's data and combines it in the controller.
+    # Measured 2026-10-07 on 12 test files, serial against `-n 4 --dist loadfile`: both coverage.xml
+    # files report 326 measured files and 15568 covered lines. That subset, run on Windows, shows the
+    # combine works; it does not show the full-suite number is unchanged, which only the first
+    # ubuntu run of this step can. Why `--dist loadfile` and
+    # `--max-worker-restart=0` and not xdist's defaults is in ci.yml's engine step; the reasons
+    # are the same here and are not restated.
     timeout-minutes: 30
     permissions:
       contents: read
@@ -571,7 +585,10 @@ jobs:
         # so a reader who asks the tree for 16 test files does not find them. The web console leg
         # measures 130-140s on ubuntu across the last 10 green ci.yml runs on main, and 114 is below
         # every sample taken. The conclusion "a cheap price" survives at 140s.
-        run: pytest -q -m 'not tooling' --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered --durations=40 || true
+        #
+        # `-n 4` MATCHES THE HOSTED RUNNER'S 4 vCPUs, the same count ci.yml's ubuntu engine leg uses.
+        # The header above `timeout-minutes` has the measurements behind it.
+        run: pytest -q -n 4 --dist loadfile --max-worker-restart=0 -m 'not tooling' --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered --durations=40 || true
       - name: Diff-coverage vs the PR base (advisory - never fails)
         continue-on-error: true
         env:

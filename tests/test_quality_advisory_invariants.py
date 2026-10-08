@@ -71,7 +71,10 @@ _ANALYSIS_MARKERS = (
     "mutmut run",
     "mutmut results",
     "c901_delta.py",
-    "pytest -q --cov",
+    # Was "pytest -q --cov", which stopped matching once `-m 'not tooling'` went between the two, so
+    # the coverage step fell out of this guard with nothing reporting it. Keyed on the flag alone now,
+    # so adding or reordering pytest options cannot drop it again. test_coverage_step_is_guarded pins it.
+    "--cov=messagefoundry",
 )
 
 # An analysis command must be incapable of failing its step.
@@ -202,6 +205,21 @@ def test_every_analysis_step_cannot_fail_its_job(workflow: dict) -> None:
         assert any(idiom in body for idiom in _NON_FAILING_IDIOMS), (
             f"{job}/{name!r} has no non-failing idiom ({_NON_FAILING_IDIOMS})"
         )
+
+
+def test_every_analysis_marker_matches_a_step(workflow: dict) -> None:
+    """A marker that matches nothing drops its step out of the guard above, and the `>= 6` floor
+    there cannot see one going missing. That is how the coverage step left it unnoticed."""
+    runs = [step.get("run") or "" for _, step in _steps(workflow)]
+    dead = [marker for marker in _ANALYSIS_MARKERS if not any(marker in run for run in runs)]
+    assert not dead, f"analysis marker(s) match no step in the workflow: {dead}"
+
+
+def test_coverage_step_is_guarded(workflow: dict) -> None:
+    names = [step.get("name", "") for job, step in _analysis_steps(workflow) if job == "coverage"]
+    assert any(name.startswith("Tests under coverage") for name in names), (
+        f"the coverage job's pytest step is outside the advisory guard; guarded steps: {names}"
+    )
 
 
 # --------------------------------------------------------------------------------------------
