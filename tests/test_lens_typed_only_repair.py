@@ -1738,18 +1738,7 @@ def _handler(body: str) -> Any:
     return ast.parse(f"def h(msg):\n{body}").body[0]
 
 
-def test_rule_8_a_dead_copy_cannot_stand_in_for_a_live_row() -> None:
-    # Finding 3: the same text is dead once before and once after, but the live row is now dead.
-    before = _handler(
-        '    if msg.field("A"):\n        msg.set("X", "1")\n    return Send("OB", msg)\n'
-        '    msg.set("X", "1")\n'
-    )
-    after = _handler(
-        '    if msg.field("A"):\n        return Send("OB", msg)\n        msg.set("X", "1")\n'
-        '    msg.set("X", "1")\n'
-    )
-    with pytest.raises(LensRewriteError, match="stranded"):
-        lens._refuse_rows_that_never_run(before, after, LensRewriteError("stranded"))
+_F = ast.dump(ast.parse("f()").body[0])
 
 
 @pytest.mark.parametrize(
@@ -1761,9 +1750,35 @@ def test_rule_8_a_dead_copy_cannot_stand_in_for_a_live_row() -> None:
         ("    while True:\n        if g():\n            break\n    f()\n", False),
         ("    while True:\n        for x in y:\n            break\n    f()\n", True),
         ("    for x in y:\n        return 1\n    f()\n", False),  # the loop may not run
-        ("    with c:\n        return 1\n    f()\n", False),  # a context manager may swallow
+        ("    for x in y:\n        g()\n    else:\n        return 1\n    f()\n", True),
+        ("    for x in y:\n        break\n    else:\n        return 1\n    f()\n", False),
+        ("    while g():\n        h()\n    else:\n        raise E\n    f()\n", True),
+        ("    with c:\n        return 1\n    f()\n", True),  # a context manager cannot swallow it
+        ("    with c:\n        raise E\n    f()\n", False),  # but it may swallow an exception
         ("    try:\n        return 1\n    except E:\n        raise\n    f()\n", True),
+        ("    try:\n        return 1\n    except E:\n        g()\n    f()\n", False),
+        (
+            "    try:\n        g()\n    except E:\n        return 2\n    else:\n        return 1\n    f()\n",
+            True,
+        ),
+        ("    try:\n        g()\n    finally:\n        return 1\n    f()\n", True),
+        (
+            "    match x:\n        case 1:\n            return 1\n        case _:\n            return 2\n    f()\n",
+            True,
+        ),
+        (
+            "    match x:\n        case 1:\n            return 1\n        case 2:\n            return 2\n    f()\n",
+            False,
+        ),
+        (
+            "    match x:\n        case 1:\n            return 1\n        case y:\n            g()\n    f()\n",
+            False,
+        ),
         ("    if a:\n        return 1\n    f()\n", False),  # no else
+        (
+            "    if a:\n        return 1\n    elif b:\n        raise E\n    else:\n        return 2\n    f()\n",
+            True,
+        ),
     ],
     ids=[
         "continue",
@@ -1772,12 +1787,76 @@ def test_rule_8_a_dead_copy_cannot_stand_in_for_a_live_row() -> None:
         "while-true-break",
         "inner-break",
         "for",
-        "with",
+        "for-else",
+        "for-else-break",
+        "while-else",
+        "with-return",
+        "with-raise",
         "try",
+        "try-handler-falls",
+        "try-else",
+        "try-finally",
+        "match-wildcard",
+        "match-refutable",
+        "match-arm-falls",
         "if-no-else",
+        "if-elif-else",
     ],
 )
 def test_rule_8_never_falls_through(body: str, dead: bool) -> None:
-    # Finding 5 and decision D3: the call ``f()`` is dead exactly when control cannot reach it.
-    flags = lens._dead_statements(_handler(body))
-    assert flags[(ast.dump(ast.parse("f()").body[0]), 0)] is dead
+    # Findings 1 and 5, decisions D3 and D7: ``f()`` is dead exactly when control cannot reach it.
+    assert (_F, dead) in lens._reachability(_handler(body))
+
+
+_LIVE_TWIN = """\
+@handler("H")
+def h(msg):
+    msg.set("A", "1")
+    msg.set("B", "2")
+    return Send("OB", msg)
+    msg.set("A", "1")
+"""
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        # Decision D8: an edit to a dead row strands nothing, so it is accepted.
+        _edit("set_params", 6, params={"value": "9"}),
+        # An edit, delete or move of a live row with a dead twin of the same text.
+        _edit("set_params", 3, params={"value": "9"}),
+        _edit("delete_row", 3),
+        _edit("move_row", 3, direction="down"),
+    ],
+    ids=["set-dead-row", "set-live-twin", "delete-live-twin", "move-live-twin"],
+)
+def test_rule_8_an_edit_that_strands_nothing_new_is_accepted(edit: dict[str, Any]) -> None:
+    assert rewrite_source(_LIVE_TWIN, edit, typed_only=True) != _LIVE_TWIN
+
+
+def test_rule_8_a_row_moved_into_the_dead_twin_s_place_is_refused() -> None:
+    # The live twin dropped after the return lands dead, even though the same text was dead before.
+    edit = _edit("move_row", 3, to_line_start=6, to_position="after")
+    _refused(_LIVE_TWIN, edit, match=NEVER_RUNS, typed_only=True)
+
+
+_WITH = """@handler("H")
+def h(msg):
+    with lock:
+        return Send("OB", msg)
+    msg.set("C", "3")
+"""
+
+
+@pytest.mark.parametrize(
+    "body", ['return Send("OB", msg)', "pass"], ids=["returns", "falls-through"]
+)
+def test_rule_8_an_insert_after_a_with_follows_its_body(body: str) -> None:
+    # D7: a ``with`` whose body returns never falls through, so a row inserted after it never
+    # runs; one whose body falls through is the control.
+    src = _WITH.replace('return Send("OB", msg)', body)
+    edit = _edit("insert_row", 5, position="before", **_SET_PID8)
+    if body == "pass":
+        assert '    msg.set("PID-8", "M")\n' in rewrite_source(src, edit, typed_only=True)
+    else:
+        _refused(src, edit, match=NEVER_RUNS, typed_only=True)

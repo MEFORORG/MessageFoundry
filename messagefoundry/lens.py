@@ -49,6 +49,7 @@ from __future__ import annotations
 import ast
 import builtins
 import copy
+import difflib
 import json
 import keyword
 import math
@@ -2988,30 +2989,73 @@ def _refuse_new_unbound_reads(
         )
 
 
-_NEVER = "<never falls through>"  # a marker no identifier can equal, for :func:`_bound_after`
 _PASS_KEY = ast.dump(ast.Pass())
 
 
-def _is_terminal(stmt: ast.stmt) -> bool:
+def _ends(stmts: list[ast.stmt], *, raise_ends: bool = True) -> bool:
+    """Whether control never reaches the end of suite ``stmts``: some statement in it is terminal
+    (:func:`_is_terminal`)."""
+    return any(_is_terminal(stmt, raise_ends=raise_ends) for stmt in stmts)
+
+
+def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True) -> bool:
     """Whether control never falls through ``stmt`` to the next statement of its suite.
 
-    A ``return``, ``raise``, ``break`` or ``continue`` never does, nor does a ``while True:`` with no
-    ``break`` of its own. A block never does when every path through it ends in one: the marker
-    :data:`_NEVER` stands for "bound" in :func:`_bound_after`, which already decides which suites a
-    block surely runs to the end of (Manager decision 2026-10-08, after review). So an ``if`` with an
-    ``else`` whose every arm returns or raises is terminal, and a loop or ``with`` never is."""
-    if isinstance(stmt, ast.Return | ast.Raise | ast.Break | ast.Continue):
+    At least these are terminal (Manager decisions 2026-10-08, after review):
+
+    * a ``return``, ``raise``, ``break`` or ``continue``;
+    * an ``if`` with an ``else`` whose every arm ends;
+    * a ``with`` whose body ends without a ``raise`` (``raise_ends=False``), since a context
+      manager may swallow a raised exception. One raised by an earlier statement could be swallowed
+      too, so this counts more ``with`` blocks as ending than strictly do: a refusal, the safe way;
+    * a ``try`` whose ``finally`` ends, or whose body or ``else`` ends and whose every handler ends;
+    * a loop with no ``break`` of its own whose ``else`` ends, and a ``while True:`` with no
+      ``break``;
+    * a ``match`` whose last case is irrefutable and whose every case ends.
+
+    Anything this cannot decide is judged to fall through, which keeps rule 8 permissive."""
+    if isinstance(stmt, ast.Return | ast.Break | ast.Continue):
         return True
-    if isinstance(stmt, ast.While):
-        test = stmt.test
-        return isinstance(test, ast.Constant) and bool(test.value) and not _breaks(stmt.body)
-    if not isinstance(stmt, _COMPOUND_STMT_TYPES):
-        return False
-    ends = {
-        label: {_NEVER} if any(_is_terminal(s) for s in suite) else set()
-        for label, suite, _ in _suites(stmt)
-    }
-    return _NEVER in _bound_after(stmt, set(), ends)
+    if isinstance(stmt, ast.Raise):
+        return raise_ends
+    if isinstance(stmt, ast.If):
+        return _ends(stmt.body, raise_ends=raise_ends) and _ends(stmt.orelse, raise_ends=raise_ends)
+    if isinstance(stmt, ast.With | ast.AsyncWith):
+        return _ends(stmt.body, raise_ends=False)
+    if isinstance(stmt, ast.Try | ast.TryStar):
+        if _ends(stmt.finalbody, raise_ends=raise_ends):
+            return True
+        body = _ends(stmt.body, raise_ends=raise_ends) or _ends(stmt.orelse, raise_ends=raise_ends)
+        return body and all(_ends(h.body, raise_ends=raise_ends) for h in stmt.handlers)
+    if isinstance(stmt, ast.For | ast.AsyncFor | ast.While):
+        if _breaks(stmt.body):
+            return False
+        forever = isinstance(stmt, ast.While) and _is_always_true(stmt.test)
+        return forever or _ends(stmt.orelse, raise_ends=raise_ends)
+    if isinstance(stmt, ast.Match):
+        last = stmt.cases[-1] if stmt.cases else None
+        return (
+            last is not None
+            and last.guard is None
+            and _is_irrefutable(last.pattern)
+            and all(_ends(case.body, raise_ends=raise_ends) for case in stmt.cases)
+        )
+    return False
+
+
+def _is_always_true(test: ast.expr) -> bool:
+    """Whether a loop test is a literal that is always true, such as ``True`` or ``1``."""
+    return isinstance(test, ast.Constant) and bool(test.value)
+
+
+def _is_irrefutable(pattern: ast.pattern) -> bool:
+    """Whether a ``case`` pattern matches every subject: ``_``, a bare capture, or an ``|`` of
+    patterns one of which is irrefutable."""
+    if isinstance(pattern, ast.MatchAs):
+        return pattern.pattern is None or _is_irrefutable(pattern.pattern)
+    if isinstance(pattern, ast.MatchOr):
+        return any(_is_irrefutable(p) for p in pattern.patterns)
+    return False
 
 
 def _breaks(stmts: list[ast.stmt]) -> bool:
@@ -3031,21 +3075,15 @@ def _breaks(stmts: list[ast.stmt]) -> bool:
     return False
 
 
-def _dead_statements(func: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[tuple[str, int], bool]:
-    """Each statement of ``func``, keyed as :func:`_refuse_shifted_code` matches one (its
-    :func:`_stmt_key` and which occurrence of that key it is), mapped to whether it never runs:
-    a statement after a terminal one in its suite (:func:`_is_terminal`), or inside one that never
-    runs. Keyed by occurrence, not by text alone, so a row moved out of a dead block counts as
-    revived and a dead copy cannot stand in for a live row of the same text (Manager decision
-    2026-10-08, after review)."""
-    seen: Counter[str] = Counter()
-    out: dict[tuple[str, int], bool] = {}
+def _reachability(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, bool]]:
+    """Each statement of ``func`` in source order, as its :func:`_stmt_key` and whether it never
+    runs: it follows a terminal statement in its suite (:func:`_is_terminal`), or sits inside a
+    statement that never runs."""
+    out: list[tuple[str, bool]] = []
 
     def visit(stmts: list[ast.stmt], dead: bool) -> None:
         for stmt in stmts:
-            key = _stmt_key(stmt)
-            out[(key, seen[key])] = dead
-            seen[key] += 1
+            out.append((_stmt_key(stmt), dead))
             for _, suite, _ in _suites(stmt):
                 visit(suite, dead)
             dead = dead or _is_terminal(stmt)
@@ -3059,16 +3097,31 @@ def _refuse_rows_that_never_run(
     after_func: ast.FunctionDef | ast.AsyncFunctionDef,
     refusal: LensRewriteError,
 ) -> None:
-    """Refuse a typed-only result in which a statement that ran before the edit, or one the edit
-    added, never runs: it sits below a ``return``, ``raise``, ``break`` or ``continue``, or below a
-    block that never falls through (ADR 0076 Amendment G, G.6 rule 8). It judges where a row lands,
-    whatever verb put it there, so it covers a move, an insert and a template (Manager decision
-    2026-10-08, after review). That covers a move past the fan-out ``return sends``. A ``pass``
-    does not count: the generator seeds one, and a filter inserted above it strands nothing."""
-    before = _dead_statements(before_func)
-    for (key, n), dead in _dead_statements(after_func).items():
-        if dead and not before.get((key, n), False) and key != _PASS_KEY:
-            raise refusal
+    """Refuse a typed-only result that makes reachability worse (ADR 0076 Amendment G, G.6 rule 8).
+
+    The statements before and after the edit are aligned in source order by their
+    :func:`_stmt_key`, so each row is compared with itself, by position (Manager decision
+    2026-10-08, after review). A row that ran before and never runs after is refused, and so is a
+    row the edit placed or rewrote that never runs, unless it was already dead in that place. A
+    row is dead when it sits below a statement that never falls through (:func:`_is_terminal`).
+    That covers a move past the fan-out ``return sends``. Whatever verb placed the row, a move, an
+    insert or a template, the rule is the same. A ``pass`` does not count: the generator seeds
+    one, and a filter inserted above it strands nothing."""
+    before = _reachability(before_func)
+    after = _reachability(after_func)
+    matcher = difflib.SequenceMatcher(
+        None, [key for key, _ in before], [key for key, _ in after], autojunk=False
+    )
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        for offset, (key, dead) in enumerate(after[j1:j2]):
+            if not dead or key == _PASS_KEY:
+                continue
+            if tag == "equal" or (tag == "replace" and i2 - i1 == j2 - j1):
+                # The same row, or a row rewritten in place: refused only if it ran before.
+                if not before[i1 + offset][1]:
+                    raise refusal
+            else:
+                raise refusal
 
 
 def _handler_locals(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
