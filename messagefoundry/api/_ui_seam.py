@@ -345,17 +345,27 @@ from typing import Any
 #: action-bound step-up surface each moved the digest on its own branch. The value below was
 #: re-derived on the merged tree, so it covers both.
 #:
+#: BACKLOG #2454: the console imports ``authorization_header`` from ``api.security``. ``GET /ui/sso``
+#: reads ``Authorization`` through it, so a repeated header is refused 400 by the same rule the
+#: engine's own reads use. The digest moved because the imported surface grew. It moved again
+#: when the console's session-cookie read joined the rule: the console now imports
+#: ``RepeatedCredentialError`` and ``record_repeated_credential``, so a repeated cookie is logged
+#: and audited by the same handler as a repeated header.
+#:
 #: BACKLOG #2337: ``SecurityPosture`` gains ``transit_bound_attestation``, a
 #: ``TransitBoundAttestationView``, the vault_transit AES-GCM bound attestation. The console renders
 #: no new field, but the DTO is on the discovered surface, so the digest moved because it grew.
 #: Re-derived on the tree merged with BACKLOG #2438 / #2446 above, so the value below covers #2337 too.
+#:
+#: BACKLOG #2337 merged with BACKLOG #2454: each branch moved the digest on its own (#2454 to
+#: c44474a7b5777455 on main). The value below was re-derived on the merged tree, so it covers both.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "e1657c7766ab48f2"
+ENGINE_UI_SEAM: str = "a117984e0b06f1cc"
 
 
 @dataclass(frozen=True, slots=True)

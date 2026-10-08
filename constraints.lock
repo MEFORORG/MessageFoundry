@@ -187,6 +187,8 @@ pydicom==3.0.2
     #   pynetdicom
 pygments==2.20.0
     # via pytest
+pyjwt==2.15.0
+    # via messagefoundry
 pynacl==1.6.2
     # via paramiko
 pynetdicom==3.0.4

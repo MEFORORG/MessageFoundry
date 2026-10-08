@@ -584,6 +584,11 @@ _NOT_UI_EMITTERS = {
         "the HL7-over-HTTP ingress listener. Its responses go to a sending SYSTEM on a partner "
         "connection, never to the console origin, so its headers are not part of the /ui contract."
     ),
+    "security.py": (
+        "the engine's api/security.py. Its one write is no_store_reply's Cache-Control: no-store, "
+        "which the route class adds only to a JSON route returning a CredentialReply model "
+        "(BACKLOG #2372). No /ui route returns one, and /ui is already no-store by the header floor."
+    ),
 }
 
 #: The shapes a browser-security header is WRITTEN in across both trees: subscript assignment, a

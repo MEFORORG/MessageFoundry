@@ -35,6 +35,17 @@ _GROUP_MAX = 512
 _TOKEN_MAX = 256
 
 
+class CredentialReply(BaseModel):
+    """A response model whose body carries a live credential: a session token, a staged TOTP seed,
+    recovery codes or a temporary password (ASVS 7.2.4 delivery, 14.2.2; BACKLOG #2372).
+
+    Subclassing this is what serves the reply ``Cache-Control: no-store``. The engine's route class
+    adds the no-store step to every route whose response model is one of these
+    (``security.AuthenticatedBeforeBodyRoute``), so a new route returning one cannot forget it.
+    ``tests/test_credential_reply_no_store.py`` fails when a response model carries a credential
+    field name and does not subclass this."""
+
+
 class LoginRequest(RequestModel):
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
@@ -58,7 +69,7 @@ class CurrentUser(BaseModel):
     permissions: list[str]
 
 
-class LoginResponse(BaseModel):
+class LoginResponse(CredentialReply):
     token: str
     token_type: str = "bearer"
     must_change_password: bool = False
@@ -321,7 +332,7 @@ class ReauthRequest(RequestModel):
     purpose: str | None = Field(default=None, max_length=64)
 
 
-class UserCreatedResponse(UserSummary):
+class UserCreatedResponse(UserSummary, CredentialReply):
     """``POST /users``: the new account, plus its engine-generated credential, returned **once** for
     the administrator to convey out-of-band (ADR 0197 Amendment A, AC-A2). The holder must enrol an
     authenticator app, then replace it, at first sign-in. Wrong passwords arm no sign-in lock while
@@ -331,7 +342,7 @@ class UserCreatedResponse(UserSummary):
     must_change_password: bool = True
 
 
-class MfaResetResponse(BaseModel):
+class MfaResetResponse(CredentialReply):
     """``POST /users/{id}/reset-mfa``: the factor reset, and on a LOCAL account the generated
     credential it issued in the same call (ADR 0197 Amendment A, N-B2 part 5, AC-A4), returned
     **once**. ``None`` on a directory account, which has no engine password. ``expires_at`` is the
@@ -342,7 +353,7 @@ class MfaResetResponse(BaseModel):
     expires_at: float | None = None
 
 
-class PasswordResetResponse(BaseModel):
+class PasswordResetResponse(CredentialReply):
     """The result of an admin password reset (ASVS 6.4.6): a one-time credential returned **once** for
     the administrator to convey out-of-band. The user must change it on first login."""
 
@@ -366,7 +377,7 @@ class MfaVerifyRequest(RequestModel):
     code: str = Field(max_length=64)
 
 
-class MfaEnrollResponse(BaseModel):
+class MfaEnrollResponse(CredentialReply):
     """A staged (not-yet-active) TOTP enrollment: the base32 secret + the ``otpauth://`` URI the
     console renders as a QR. Returned once; the secret is not active until confirmed."""
 
@@ -380,7 +391,7 @@ class MfaConfirmRequest(RequestModel):
     code: str = Field(max_length=16)
 
 
-class MfaConfirmResponse(BaseModel):
+class MfaConfirmResponse(CredentialReply):
     """The one-time single-use recovery codes minted on enrollment — shown **once** for the user to
     save (lost-authenticator escape hatch), plus the rotated session token.
 
@@ -392,7 +403,7 @@ class MfaConfirmResponse(BaseModel):
     token: str
 
 
-class ElevatedResponse(BaseModel):
+class ElevatedResponse(CredentialReply):
     """A ceremony that RAISED the session's authentication state, and the token it was re-keyed to.
 
     ``token`` is the caller's NEW bearer token (ASVS 7.2.4). The one the request carried no longer
