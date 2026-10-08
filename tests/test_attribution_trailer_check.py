@@ -47,6 +47,19 @@ def _run(tmp_path: Path, message: str) -> subprocess.CompletedProcess[str]:
         "co-authored-by:Claude",
         "Co-Authored-By" + " : Claude <noreply@anthropic.com>",
         "Claude-Session" + " : x",
+        # Claude named after another word in the name part.
+        "Co-authored-by" + ": Anthropic Claude <noreply@anthropic.com>",
+        "Co-Authored-By" + ": The Claude Bot",
+        "Co-Authored-By" + ": claude[bot] <x@example.invalid>",
+        # The byline the harness appends, bare, linked, and after its U+1F916 lead (with and
+        # without U+FE0F). Built with escapes so this file never carries the glyph itself.
+        "Generated with" + " [Claude Code](https://claude.com/claude-code)",
+        "Generated with" + " Claude Code",
+        "generated WITH" + " claude code",
+        "\U0001f916 Generated with" + " [Claude Code](https://claude.com/claude-code)",
+        "\U0001f916\N{VARIATION SELECTOR-16} Generated with"
+        + " [Claude Code](https://claude.com/claude-code)",
+        "\U0001f916Generated with" + " Claude Code",
     ],
 )
 def test_the_trailer_is_refused_and_the_line_is_named(tmp_path: Path, trailer: str) -> None:
@@ -67,17 +80,59 @@ def test_a_clean_message_passes(tmp_path: Path) -> None:
     assert proc.stderr == ""
 
 
-@pytest.mark.parametrize("quoted", [f"    {_COAUTHOR}", f"`{_COAUTHOR}`", f"> {_SESSION}"])
+_BYLINE = "\U0001f916 Generated with" + " [Claude Code](https://claude.com/claude-code)"
+_ANTHROPIC = "Co-authored-by" + ": Anthropic Claude <noreply@anthropic.com>"
+
+
+@pytest.mark.parametrize(
+    "quoted",
+    [
+        f"    {_COAUTHOR}",
+        f"`{_COAUTHOR}`",
+        f"> {_SESSION}",
+        f"    {_ANTHROPIC}",
+        f"`{_ANTHROPIC}`",
+        f"> {_ANTHROPIC}",
+        f"  {_BYLINE}",
+        f"`{_BYLINE}`",
+        f"> {_BYLINE}",
+        "\t" + "Generated with" + " Claude Code",
+    ],
+)
 def test_a_quoted_trailer_in_the_body_passes(tmp_path: Path, quoted: str) -> None:
     proc = _run(tmp_path, f"docs: a plain subject\n\nThe hook refuses this:\n{quoted}\n")
     assert proc.returncode == 0, proc.stderr
+    # Control: the same line unquoted, at column 0, fires.
+    bare = quoted.strip().strip("`").removeprefix("> ")
+    assert _run(tmp_path, f"docs: a plain subject\n\n{bare}\n").returncode == 1
 
 
-def test_a_human_whose_name_starts_with_claude_is_not_refused(tmp_path: Path) -> None:
-    human = "Co-Authored-By" + ": Claudette Smith <c@example.invalid>"
-    assert _run(tmp_path, f"docs: subject\n\n{human}\n").returncode == 0
+@pytest.mark.parametrize(
+    "human",
+    [
+        "Co-Authored-By" + ": Claudette Smith <c@example.invalid>",
+        "Co-Authored-By" + ": Jean-Claude Smith <jc@example.invalid>",
+        # The email is not read: a human whose address mentions the name passes.
+        "Co-Authored-By" + ": A Person <claude.fan@example.invalid>",
+        "Co-Authored-By" + ": A Person <a@anthropic.com>",
+        "Generated with" + " a script, not Claude Code",
+        "Generated with" + " Claudette Code",
+    ],
+)
+def test_a_human_or_lookalike_is_not_refused(tmp_path: Path, human: str) -> None:
+    proc = _run(tmp_path, f"docs: subject\n\n{human}\n")
+    assert proc.returncode == 0, proc.stderr
     # Control: the name followed by a word boundary fires.
     assert _run(tmp_path, f"docs: subject\n\n{_COAUTHOR}\n").returncode == 1
+
+
+def test_the_byline_is_named_in_ascii(tmp_path: Path) -> None:
+    """The refusal escapes the U+1F916 lead, so a cp1252 stderr cannot raise on it."""
+    proc = _run(tmp_path, f"docs: subject\n\nbody\n\n{_BYLINE}\n")
+    assert proc.returncode == 1, proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert "line 5: \\U0001f916 Generated with" in proc.stderr
+    assert proc.stderr.isascii()
 
 
 def test_a_diff_line_from_commit_verbose_is_not_a_trailer(tmp_path: Path) -> None:

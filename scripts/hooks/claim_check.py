@@ -25,10 +25,12 @@ subject never blocks the work itself.
 
 A third rule rides the same hook because only commit-msg sees the message (CLAUDE.md section 5):
 
-    No line may START with `Co-Authored-By: Claude` (any case) or `Claude-Session:`.
+    No line may START with a `Co-Authored-By:` trailer naming Claude, a `Claude-Session:` trailer,
+    or the `Generated with Claude Code` byline. Any case.
 
-It reads the whole message, fires on every commit, and runs before any git read. Indented or
-backticked, a body may still quote either trailer. It is inert on a box until
+The exact shapes are stated once, in docs/Secure_AI_Development_Standards.md section 6.7.
+It reads the whole message, fires on every commit, and runs before any git read. Indented,
+backticked or blockquoted, a body may still quote any of them. It is inert on a box until
 ``scripts/coord/install-git-hooks.ps1`` re-copies this file into the shared ``.git/hooks``.
 
 Three scoping decisions for the claim rule, each load-bearing:
@@ -110,13 +112,24 @@ _SQUASH_SUFFIX = re.compile(r"\s*\(#\d{1,6}\)\"?\s*\Z")
 # git will drop, which costs a reword -- the other reading would pass the `-m` case silently.
 _COMMENT_LINE = re.compile(r"#(?!\d)")
 
-# THE ATTRIBUTION TRAILERS CLAUDE.md SECTION 5 SAYS TO OMIT. `.claude/settings.json` turns them off at
+# THE ATTRIBUTION LINES CLAUDE.md SECTION 5 SAYS TO OMIT. `.claude/settings.json` turns them off at
 # source, but a session reading a stale or user-scope setting still writes them, and until this rule a
 # Lander caught them by reading commit bodies by hand. Anchored at the start of a line, so a body may
-# still QUOTE either trailer when it is indented or set in backticks.
+# still QUOTE any of them when it is indented, blockquoted or set in backticks.
+#
+# Three arms. A `Co-Authored-By:` line refuses when its NAME part, before any `<`, holds `Claude` as a
+# word: that catches `Claude Opus` and `Anthropic Claude`, and leaves `Claudette` and `Jean-Claude`
+# alone. The email is not read, so a human at any address passes. A `Claude-Session:` line refuses
+# whatever follows. The byline is the one the harness appends to a body, with or without its leading
+# U+1F916 (and an optional U+FE0F); the codepoints are escaped so this file stays cp1252-clean.
 # Whitespace is allowed before the colon because git's trailer parser accepts it there.
 _ATTRIBUTION_TRAILER = re.compile(
-    r"^(?:Co-Authored-By\s*:\s*Claude\b|Claude-Session\s*:)", re.IGNORECASE
+    r"^(?:"
+    r"Co-Authored-By\s*:[^<\n]*?(?<![\w-])Claude\b"
+    r"|Claude-Session\s*:"
+    r"|(?:\U0001F916\N{VARIATION SELECTOR-16}?\s*)?Generated\s+with\s+\[?Claude\s+Code\b"
+    r")",
+    re.IGNORECASE,
 )
 
 # A commit touching ONLY these is documentation/ledger work: it may cite an item without implementing it.
@@ -414,17 +427,23 @@ def _attribution_trailers(message: str) -> list[tuple[int, str]]:
 
 
 def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
-    rows = "\n".join(f"      line {n}: {_safe_for_message(line, 120)}" for n, line in hits)
+    # ASCII-escaped: the byline can carry U+1F916, and a cp1252 stderr would raise on it mid-report.
+    rows = "\n".join(
+        f"      line {n}: "
+        + _safe_for_message(line, 120).encode("ascii", "backslashreplace").decode("ascii")
+        for n, line in hits
+    )
     sys.stderr.write(
         f"\nMessageFoundry attribution-trailer check\n\n"
-        f"  The message carries a trailer CLAUDE.md section 5 says to omit (standing owner\n"
-        f"  preference). It refuses a line starting 'Co-Authored-By: Claude' or 'Claude-Session:'.\n"
+        f"  The message carries a line CLAUDE.md section 5 says to omit (standing owner\n"
+        f"  preference). It refuses a 'Co-Authored-By:' line naming Claude, a 'Claude-Session:'\n"
+        f"  line, and the 'Generated with Claude Code' byline.\n"
         f"{rows}\n\n"
         f"  Delete those lines from the message file, then commit again:\n"
         f"      git commit -F <file>\n"
         f"  .claude/settings.json turns both off at source with `attribution`. If your session\n"
         f"  added one anyway, it is reading a stale or user-scope setting.\n"
-        f"  To QUOTE a trailer in a body, indent it or put it in backticks.\n"
+        f"  To QUOTE one in a body, indent it, put it in backticks, or start the line with '> '.\n"
         f"  This check reads the whole message and fires whatever the commit touches.\n\n"
     )
     return 1
