@@ -129,7 +129,7 @@ def test_the_status_page_row() -> None:
     assert "Off-box log forwarding" not in _page(None)  # not configured: no row
     healthy = _page(HEALTHY)
     assert "Off-box log forwarding" in healthy and "status-failed" not in healthy
-    assert "healthy" in healthy
+    assert "healthy" in _row(healthy)
     # UDP: a row in plain words, never "healthy", and no warning that could never clear.
     udp = _page(UDP)
     assert "running; delivery is not confirmed over UDP" in udp

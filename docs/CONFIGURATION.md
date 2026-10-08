@@ -874,14 +874,15 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 
 #### When the forwarder is absent or losing records
 
-A configured forwarder that does not start never stops the engine. The engine tells you two ways
-(BACKLOG #2612).
+A configured forwarder whose collector cannot be reached or verified at start does not stop the
+engine. A hop the start gate refuses still does; see `forward_spool_max_bytes` above. The engine tells you
+about a missing or failing forwarder two ways (BACKLOG #2612).
 
 - **The `log_forward_failed` alert.** It is keyed on `forwarder:<kind>`. The engine checks every 30
   seconds, and `kind` is a fixed word, at least one of these.
   - `not_installed`: the forwarder is not attached, so this process sends nothing off the host.
-    It fires when the engine first finds it absent, then again every five minutes while it stays
-    absent. The reason is `permanent` or `transient` for a failed start, or `stopped`.
+    It fires when the engine first finds it absent, then again about every five minutes while it
+    stays absent. The reason is `permanent` or `transient` for a failed start, or `stopped`.
   - `dropping`: a loss count rose. The reason names which, and the count is every record lost
     since the process started.
   - `spool_unreadable`: the on-disk spool could not be read, so its records are held and not sent.
@@ -901,9 +902,10 @@ A configured forwarder that does not start never stops the engine. The engine te
 process started. A loss keeps the state `degraded` until a restart, because the records are still
 missing at the collector.
 
-**Over UDP the engine cannot see a lost record.** UDP is the default protocol, and a UDP send
-reports no failure, so a collector that is down looks the same as one that is up. The alert and
-the status row then report queue and spool losses only. `delivery_confirmed` is `false`, a
+**Over UDP the engine cannot see a lost record.** UDP is the default protocol. A UDP send to a
+collector that is down reports no failure, and the engine does not count a UDP send error its own
+host reports either. So a collector that is down looks the same as one that is up, and the alert
+and the status row report queue and spool losses only. `delivery_confirmed` is `false`, a
 forwarder with no fault seen reads `unconfirmed` and never `healthy`, and the console row says
 that delivery is not confirmed. The health indicator does not warn for it. Use `tcp` or `tls`
 where a silent loss must page.

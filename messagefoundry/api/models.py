@@ -1022,7 +1022,7 @@ class LogForwarderInfo(BaseModel):
     process started. Under engine shards each process has its own forwarder, and this is the one
     that answered.
 
-    **A UDP forwarder is never ``healthy``.** UDP reports no failed send, so the engine cannot see
+    **A UDP forwarder is never ``healthy``.** No failed send is counted over UDP, so the engine cannot see
     a record lost on the wire. ``delivery_confirmed`` is then ``False``, a forwarder with no fault
     seen reads ``unconfirmed``, and ``lost`` counts queue and spool losses only.
 

@@ -91,6 +91,9 @@ __all__ = [
     "CredentialQueryScrubFilter",
     "CredentialScrubFilter",
     "SyslogForward",
+    "ForwarderStatus",
+    "FORWARD_LOSS_COUNTERS",
+    "forwarder_status",
     "query_sntp_offset",
     "LOG_LEVELS",
 ]
@@ -1448,7 +1451,8 @@ class ForwarderStatus:
     #: and there is no spool to wait behind), or ``""``.
     start_failure: str = ""
     #: Whether a send that does not reach the collector is visible here at all. ``False`` over
-    #: UDP, which reports no failed send: ``send_failing``, ``unsent`` and so ``lost`` then stay
+    #: UDP, where no failed send is counted (a datagram to a dead collector raises nothing, and
+    #: the UDP handler's own send errors are not read either): ``send_failing``, ``unsent`` and so ``lost`` then stay
     #: at zero while every record is lost on the wire, and only queue and spool losses count.
     delivery_confirmed: bool = True
     #: Whether the last send hit a network error. With a spool the records are kept meanwhile.

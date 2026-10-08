@@ -157,7 +157,7 @@ def _window_note(shown: int, limit: int, noun: str, *, total: int) -> Markup:
     return el("p", f"{count} shown{bound}.", class_="muted")
 
 
-#: What the console says of a UDP forwarder. UDP reports no failed send, so the engine cannot see
+#: What the console says of a UDP forwarder. No failed send is counted over UDP, so the engine cannot see
 #: a record lost on the wire, and the console must not call such a forwarder healthy.
 _UDP_UNCONFIRMED = "delivery is not confirmed over UDP"
 
