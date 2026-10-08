@@ -450,31 +450,110 @@ async def test_each_bound_is_its_own_alert_subject(
     assert sink.kinds(DISK) == ["paused"]
 
 
-async def test_a_start_inside_the_band_does_not_resolve_another_nodes_pause(
+async def test_a_start_inside_the_band_resolves_its_own_stale_pause(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The subject is shared by every node on the store. A node that starts while the backlog sits
-    between the resume line and the bound must not report a clear: another node may still hold its
-    pause there. It reports the clear once the backlog passes the resume line."""
+    """#2272 defect 5. The subject names one process, so no other node's pause rides on it. A
+    process that starts with its gate open, while the reading sits between the resume line and the
+    bound, reports the clear at once: a pause its own last run left open does not stay open."""
     store, sink = _FakeStore(depth=10), _RecordingSink()
     monitor, gate = _monitor(store, sink, max_staged_depth=10)
     await monitor.check_once()
-    assert gate.is_open and sink.kinds(DEPTH) == []
-    store.depth = 9
-    await monitor.check_once()
-    assert sink.kinds(DEPTH) == ["resumed"]
+    assert gate.is_open and sink.kinds(DEPTH) == ["resumed"]
 
     disk = _Disk(free_mib=1100)  # over the 1024 MiB floor, under the 1126 MiB resume line
     monkeypatch.setattr(shutil, "disk_usage", disk)
     sink2 = _RecordingSink()
-    monitor2, _gate2 = _monitor(
+    monitor2, gate2 = _monitor(
         _FakeStore(path=str(tmp_path / "s.db")), sink2, min_free_disk_mb=1024
     )
     await monitor2.check_once()
-    assert sink2.kinds(DISK) == []
-    disk.free_mib = 2048
-    await monitor2.check_once()
-    assert sink2.kinds(DISK) == ["resumed"]
+    assert gate2.is_open and sink2.kinds(DISK) == ["resumed"]
+
+
+# --- one subject per process (#2272 defects 4 to 6) ---------------------------------------------
+
+
+async def test_two_nodes_on_one_store_pause_and_clear_independently() -> None:
+    """Each process raises and clears only its own alert. Node A pauses over the bound; node B
+    starts while the backlog sits in the band, so its gate is open and it clears only its own
+    subject (defects 5 and 6). Each node that paused pages under its own subject (defect 4)."""
+    store, sink = _FakeStore(depth=50), _RecordingSink()
+    a, gate_a = _monitor(store, sink, max_staged_depth=10, node="shard:a")
+    a_depth = intake_alert_subject(DEPTH_REASON, "shard:a")
+    b_depth = intake_alert_subject(DEPTH_REASON, "shard:b")
+    await a.check_once()
+    assert not gate_a.is_open
+    store.depth = 10  # inside A's band: A stays paused
+    b, gate_b = _monitor(store, sink, max_staged_depth=10, node="shard:b")
+    await b.check_once()
+    await a.check_once()
+    assert gate_b.is_open and not gate_a.is_open
+    assert sink.kinds(a_depth) == ["paused"], "B's clear must not reach A's alert"
+    assert sink.kinds(b_depth) == ["resumed"]
+    assert sink.kinds(DEPTH) == [], "no process reports under the shared, node-less subject"
+
+    store.depth = 50  # both over: each pages under its own subject
+    await b.check_once()
+    assert sink.kinds(b_depth) == ["resumed", "paused"]
+    store.depth = 0
+    await a.check_once()
+    assert sink.kinds(a_depth) == ["paused", "resumed"]
+    assert sink.kinds(b_depth) == ["resumed", "paused"], "A's clear must not reach B's alert"
+    await b.check_once()
+    assert sink.kinds(b_depth) == ["resumed", "paused", "resumed"]
+
+
+def test_the_node_subject_names_the_reason_and_the_process() -> None:
+    assert intake_alert_subject(DEPTH_REASON) == "intake:staged_depth"
+    assert intake_alert_subject(DEPTH_REASON, "shard:a") == "intake:staged_depth@shard:a"
+    assert intake_alert_subject(DISK_REASON, "node:h1:42:ab12cd34") == (
+        "intake:disk_floor@node:h1:42:ab12cd34"
+    )
+    assert intake_alert_subject(DEPTH_REASON, "shard:a") != intake_alert_subject(
+        DISK_REASON, "shard:a"
+    )
+
+
+def test_a_long_node_label_is_capped_and_stays_distinct() -> None:
+    """``[cluster].node_id`` has no length limit. A label too long to fit keeps a prefix and a
+    checksum of the whole label, so two long labels that share the prefix still differ."""
+    one = "node:" + "x" * 400 + "1"
+    two = "node:" + "x" * 400 + "2"
+    s1 = intake_alert_subject(DEPTH_REASON, one)
+    s2 = intake_alert_subject(DEPTH_REASON, two)
+    assert len(s1) == len(s2) == intake_bound.INTAKE_SUBJECT_MAX_LENGTH
+    assert s1 != s2
+    assert s1 == intake_alert_subject(DEPTH_REASON, one), "the same label gives the same subject"
+    exact = "node:" + "y" * (
+        intake_bound.INTAKE_SUBJECT_MAX_LENGTH - len("intake:staged_depth@") - 5
+    )
+    assert intake_alert_subject(DEPTH_REASON, exact) == f"intake:staged_depth@{exact}"
+
+
+async def test_stop_clears_its_pause_only_when_its_subject_will_not_return() -> None:
+    """An unpinned cluster node gets a new id on every start, so nothing could clear its alert
+    after it stops. It clears its own open pause at stop. A process whose subject returns does not:
+    its next start reports under the same subject."""
+    store, sink = _FakeStore(depth=50), _RecordingSink()
+    keep, _g = _monitor(store, sink, max_staged_depth=10, node="node:pinned")
+    await keep.check_once()
+    await keep.stop()
+    assert sink.kinds(intake_alert_subject(DEPTH_REASON, "node:pinned")) == ["paused"]
+
+    gone, gate = _monitor(
+        store, sink, max_staged_depth=10, node="node:h:1:aa", resolve_on_stop=True
+    )
+    await gone.check_once()
+    await gone.stop()
+    assert gate.is_open
+    gone_depth = intake_alert_subject(DEPTH_REASON, "node:h:1:aa")
+    assert sink.of(gone_depth) == [
+        ("paused", {"reason": DEPTH_REASON, "value": 11, "limit": 10, "kind": "sqlite"}),
+        ("resumed", {"reason": DEPTH_REASON, "value": 11, "limit": 10, "kind": "sqlite"}),
+    ]
+    # Its disk bound never paused, so the stop has nothing to clear there.
+    assert sink.kinds(intake_alert_subject(DISK_REASON, "node:h:1:aa")) == ["resumed"]
 
 
 async def test_a_report_the_sink_refused_is_retried(caplog: pytest.LogCaptureFixture) -> None:
@@ -556,6 +635,30 @@ async def test_the_engine_hands_its_sink_to_the_monitor_and_clears_off_bounds(
         await engine.stop()
 
 
+async def test_an_engine_shard_names_itself_in_its_intake_subjects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine hands its instance identity to the monitor, so an engine shard's alerts are its
+    own. A shard id survives a restart, so the shard does not clear its alerts at stop."""
+    from messagefoundry.pipeline.engine import Engine
+
+    monkeypatch.setattr(Engine, "instance_identity", property(lambda _self: "shard:a"))
+    sink = _RecordingSink()
+    engine = await Engine.create(
+        tmp_path / "engine3.db",
+        alert_sink=cast(AlertSink, sink),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    await engine.start()
+    try:
+        assert sink.kinds(intake_alert_subject(DEPTH_REASON, "shard:a")) == ["resumed"]
+        assert sink.kinds(DEPTH) == []
+        monitor = engine._intake_monitor
+        assert monitor is not None and not monitor._resolve_on_stop
+    finally:
+        await engine.stop()
+
+
 async def test_an_engine_with_both_bounds_off_still_clears_both(tmp_path: Path) -> None:
     from messagefoundry.pipeline.engine import Engine
 
@@ -594,10 +697,14 @@ async def test_a_sink_that_raises_does_not_stop_the_release(
 
 
 def test_the_subject_is_outside_the_connection_name_grammar() -> None:
+    """control_action's default target is the subject; it must never read as a connection."""
     from messagefoundry.connection_names import is_connection_name
 
     assert not is_connection_name(DEPTH)
     assert not is_connection_name(DISK)
+    for node in ("shard:a", "node:h1:42:ab12cd34", "node:" + "x" * 400):
+        assert not is_connection_name(intake_alert_subject(DEPTH_REASON, node))
+        assert not is_connection_name(intake_alert_subject(DISK_REASON, node))
 
 
 # --- the sinks -----------------------------------------------------------------------------------

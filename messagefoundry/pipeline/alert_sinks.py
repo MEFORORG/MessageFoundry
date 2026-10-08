@@ -914,8 +914,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def intake_paused(
         self, name: str, *, reason: str, value: int, limit: int, store_kind: str
     ) -> None:
-        # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>` stands in for "connection",
-        # so each bound is its own instance and throttle key. `detail` is what the instance's reason
+        # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>[@<process>]` stands in for
+        # "connection", so each bound on each engine process is its own instance and throttle key. `detail` is what the instance's reason
         # column shows, built by the same helper the logging sink uses. The monitor re-raises this
         # while a pause holds, and _emit's (type, connection) throttle collapses the repeats, as
         # for queue_buildup. Counts and sizes only: no message content, no PHI.

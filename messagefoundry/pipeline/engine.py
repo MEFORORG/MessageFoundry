@@ -1222,7 +1222,8 @@ class Engine:
 
         A cluster node's id is the same after a restart only when ``[cluster].node_id`` is pinned.
         The shard id is known once the engine holds its graph (:meth:`start` or ``add_registry``).
-        Read by the approval gate to mark the releases it claims (BACKLOG #1562)."""
+        Read by the approval gate to mark the releases it claims (BACKLOG #1562), and by the intake
+        monitor to name this process in its alert subjects (BACKLOG #2272)."""
         if self._coordinator.is_clustered():
             return f"node:{self._coordinator.node_id}"
         runner = self._registry_runner
@@ -1507,6 +1508,13 @@ class Engine:
                 # Slice 3: intake_paused / intake_resumed. None (no notifier) raises nothing: the
                 # monitor's own log lines already record each pause.
                 alert_sink=self._alert_sink,
+                # BACKLOG #2272 defects 4 to 6: each process names itself in its alert subjects, so
+                # it raises and clears only its own pause. An unpinned cluster node gets a new id on
+                # every start, so it clears its own alerts at stop; nothing could clear them later.
+                node=self.instance_identity,
+                resolve_on_stop=(
+                    self._coordinator.is_clustered() and self._cluster_settings.node_id is None
+                ),
             )
             # Always measured once, even with both bounds off: a bound that is off reports itself
             # clear, which resolves a pause alert an earlier run left open (slice 3).

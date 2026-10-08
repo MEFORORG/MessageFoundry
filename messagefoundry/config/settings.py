@@ -4466,7 +4466,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "ad_reconcile_held",
         # BACKLOG #290 (ASVS 15.2.2): the engine paused intake, because the staged backlog went over
         # [inbound].max_staged_depth or the SQLite volume fell below [retention].min_free_disk_mb.
-        # Keyed `intake:<reason>`, which no connection can be named.
+        # Keyed `intake:<reason>`, or `intake:<reason>@<process>` when several engine processes share
+        # the store (BACKLOG #2272), which no connection can be named.
         "intake_paused",
         # vault BACKLOG #2597: a start loaded a config whose fingerprint differs from the store's last
         # recorded one. Keyed `config:<12 hex>`, which no connection can be named, so it is not in
