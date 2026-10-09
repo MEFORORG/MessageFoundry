@@ -161,9 +161,7 @@ At least these do not count:
 - a docstring;
 - a code comment;
 - a bare option name;
-- an error message, because a reader reaches it only by breaking the rule;
-- text the product shows only after an operator turns on something that ships off. Rule 5 covers
-  what ships off.
+- an error message, because a reader reaches it only by breaking the rule.
 
 **Which lines are the owner's own words.** The owner ruled on the docstring and the code comment in
 these words: *"No, neither counts"*. The help-text line is a reading that adversarial review reached,
@@ -184,9 +182,6 @@ draw it. The line is narrower than the passage, which also accepts a decision ke
   evidence that a control exists: code and tests remain evidence (§3).
 - It names which text may be counted. Rules 1 to 6 still grade the cell, and the ruling does not say
   which verdict follows when no text counts.
-- Some text exists but ships off, so it does not count. Rule 3 asks whether the thing exists in any
-  configuration, and rule 5 grades what ships off. The ruling does not say which of them such a
-  cell lands on. Two assessors who disagree on it follow rule 6.
 - Some text is two things at once, such as a docstring that a command prints as its help. The
   ruling does not address that case. Two assessors who disagree on it follow rule 6.
 - Whether a page that counts is accurate is still the assessor's to check against the code.
