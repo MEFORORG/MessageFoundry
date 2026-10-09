@@ -3070,7 +3070,7 @@ def create_app(
         # Rejections are logged (ASVS 16.3.3) — these are control-bypass attempts (a pre-auth memory
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         length = request.headers.get("content-length")
         transfer_encoding = request.headers.get("transfer-encoding", "").lower()
         # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
@@ -3133,9 +3133,10 @@ def create_app(
         # default deployment's /health payload is byte-identical. This route is EXEMPT from the network
         # gate (api/client_networks.py), which is what lets a locked-out operator curl it and discover
         # which address the engine is matching — the difference between a diagnosable 403 and a
-        # console that looks dead.
+        # console that looks dead. It reads through client_ip, as the gate itself does, so the echo
+        # names the address the gate would match on any other path (BACKLOG #2289).
         networks = getattr(request.app.state, "client_networks", ())
-        observed = (request.client.host if request.client else None) if networks else None
+        observed = client_ip(request) if networks else None
         return Health(
             version=__version__ if identity is not None else None, observed_client=observed
         )

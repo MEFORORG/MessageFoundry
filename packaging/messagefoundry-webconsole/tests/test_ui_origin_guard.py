@@ -556,7 +556,7 @@ class _Handshake:
         self.app = app
         self.url = SimpleNamespace(scheme="ws", path="/ws/stats")
         self.cookies = {"mf_session": cookie}
-        self.client = SimpleNamespace(host="127.0.0.1", port=123)
+        self.scope = {"client": ("127.0.0.1", 123)}  # what client_ip reads (BACKLOG #2289)
 
 
 async def test_the_socket_origin_check_does_not_trust_a_proxied_host(engine: Engine) -> None:

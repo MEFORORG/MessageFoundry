@@ -427,10 +427,11 @@ async def test_a_stale_step_up_proof_is_not_recorded_as_an_mfa_denial(engine: En
 # --- one extractor for every console client read (BACKLOG #2088) ------------------------------------
 #
 # ``client_ip`` is the extractor the engine designates for "the client address", and its docstring
-# forbids a second one, so the audit trail and the new-IP risk signal cannot disagree. Second copies
-# still exist outside _auth.py: at least ``routes/_common._client``, ``api/auth_routes._client`` and
-# inline reads in the console's routes, which write the login and reauth anchors. This block covers
-# _auth.py only, which is BACKLOG #2088's scope. Today ``client_ip`` reads the
+# forbids a second one, so the audit trail and the new-IP risk signal cannot disagree. This block
+# covers _auth.py, which is BACKLOG #2088's scope. The reads outside it, including the ones that
+# write the login and reauth anchors, went through ``client_ip`` under BACKLOG #2289, and
+# ``tests/test_client_ip_single_extractor.py`` in the engine suite fails on a new raw read, for the
+# shapes its docstring lists and the packages its ``_SCANNED`` names. Today ``client_ip`` reads the
 # same ``scope["client"]`` an inline ``request.client.host`` reads, because uvicorn's
 # ProxyHeadersMiddleware is the single X-Forwarded-For trust point. So an inline read records the
 # right address TODAY, and a test that checks only the address cannot tell it from ``client_ip``. The
@@ -596,7 +597,8 @@ async def test_a_denial_behind_a_trusted_proxy_records_the_forwarded_client(
 
 # The static half covers the client reads in _auth.py, including the new-IP signal's, which no request
 # test can separate from client_ip. It sees the literal ``<x>.client.host`` chain and the listed calls
-# only; an aliased read, or a route outside _auth.py, is out of its reach. It reads the SOURCE tree,
+# only; an aliased read, or a route outside _auth.py, is out of its reach here and is the engine
+# suite's ``test_client_ip_single_extractor`` to catch (BACKLOG #2289). It reads the SOURCE tree,
 # never the imported module: a venv can hold a frozen copy of the console package, and the guard must
 # judge the file under review. The spy test above patches the imported module, so run the suite with
 # the checkout first on the path.

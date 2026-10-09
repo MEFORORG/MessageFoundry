@@ -1487,9 +1487,10 @@ class _FakeWS:
             {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
         )
         self.app = app
-        # ``.client`` is what ``client_ip`` reads for the denial rows (ADR 0150, BACKLOG #1644). A
-        # real address by default, never None, so a client assertion cannot pass as None == None.
-        self.client = SimpleNamespace(host=peer[0], port=peer[1])
+        # ``scope["client"]`` is what ``client_ip`` reads for the denial rows (ADR 0150, BACKLOG
+        # #1644, #2289). A real address by default, never None, so a client assertion cannot pass
+        # as None == None.
+        self.scope = {"client": peer}
         # A real Starlette WebSocket carries ``.url``; the #192 cookie-name resolver
         # (session_cookie_name → effective_https) reads ``.url.scheme`` to key the cookie name off the
         # effective scheme. Model the handshake scheme from the page origin — a cleartext http page

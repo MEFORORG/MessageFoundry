@@ -7,7 +7,8 @@ network, in ASGI middleware: OUTSIDE every route, dependency, body cap and auth 
 the ``/ws/stats`` WebSocket and the ``/ui/static`` mount as well as the JSON routes.
 
 **Which address is evaluated, and why it is the right one.** This reads ``scope["client"][0]`` — the
-address the SERVER reports — and parses **no forwarding header, ever**. uvicorn's
+address the SERVER reports, read through ``api.security.client_ip`` like every other client-address
+read (BACKLOG #2289) — and parses **no forwarding header, ever**. uvicorn's
 ``ProxyHeadersMiddleware`` is the single X-Forwarded-For trust point in the process: it rewrites
 ``scope["client"]`` from XFF when, and only when, the socket peer matches ``forwarded_allow_ips``,
 which ``__main__`` feeds verbatim from ``[api].trusted_proxies``. So:
@@ -44,6 +45,9 @@ import logging
 import time
 from typing import Any
 
+# Aliased: tests/test_reply_framing.py::test_no_engine_module_builds_a_stock_opener finds calls by
+# NAME, and a bare ``HTTPConnection(...)`` call here reads to it as ``http.client``'s class.
+from starlette.requests import HTTPConnection as StarletteConnection
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -52,6 +56,7 @@ from messagefoundry.api.header_floor import (
     FRAME_ANCESTORS_CSP,
     websocket_denial_supported,
 )
+from messagefoundry.api.security import client_ip
 from messagefoundry.netaddr import client_network_allowed
 
 _log = logging.getLogger(__name__)
@@ -180,8 +185,9 @@ class ClientNetworkMiddleware:
             await self.app(scope, receive, send)
             return
 
-        client = scope.get("client")
-        host = client[0] if client else None
+        # Through client_ip, the one client-address extractor (BACKLOG #2289; its docstring lists
+        # who else reads it). starlette's HTTPConnection is the base of Request and WebSocket.
+        host = client_ip(StarletteConnection(scope))
         _record_observation(state, host)
         if client_network_allowed(host, networks):
             await self.app(scope, receive, send)

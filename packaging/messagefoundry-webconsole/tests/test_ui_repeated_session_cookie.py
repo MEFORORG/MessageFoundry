@@ -79,7 +79,7 @@ def _handshake(app: object, cookie_lines: list[str]) -> SimpleNamespace:
         app=app,
         url=SimpleNamespace(scheme="ws", path="/ws/stats"),
         cookies={_NAME: token},
-        client=SimpleNamespace(host="127.0.0.1", port=123),
+        scope={"client": ("127.0.0.1", 123)},  # what client_ip reads (BACKLOG #2289)
     )
 
 

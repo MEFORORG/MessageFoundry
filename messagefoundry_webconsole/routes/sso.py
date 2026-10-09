@@ -15,6 +15,7 @@ from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.security import (
     alert_directory_administrator_granted,
     authorization_header,
+    client_ip,
     get_auth,
     public_route,
 )
@@ -59,7 +60,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # token requests can't amplify into unbounded audit_log growth. The rate-limit
         # reject itself is a _log.warning (NOT an audit) — parity with the JSON
         # _rate_limited path's anti-flood posture — so exhaustion writes zero DB rows.
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not auth.allow_login_attempt(client):
             _log.warning("SSO rate limit exceeded for %s", client or "<unknown>")
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)

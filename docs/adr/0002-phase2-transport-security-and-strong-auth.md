@@ -78,7 +78,8 @@ API — or any inbound MLLP listener — binds off-loopback**:
 - **Authentication is single-factor** (local argon2id or AD bind/Kerberos): defensible on a trusted
   host, but single-factor remote PHI access is a HIPAA NPRM gap (6.3.3; [PHI.md](../PHI.md) P2-2).
 - **No reverse-proxy trust:** the audit/rate-limit source IP is the direct TCP peer
-  (`request.client.host`, [api/auth_routes.py](../../messagefoundry/api/auth_routes.py) `_client`); behind
+  (`request.client.host`, [api/auth_routes.py](../../messagefoundry/api/auth_routes.py) `_client`, now
+  [api/security.py](../../messagefoundry/api/security.py) `client_ip`, BACKLOG #2289); behind
   a proxy that becomes the proxy's IP unless forwarded headers are trusted from the proxy *only*
   (4.1.3, 4.2.1, 15.3.4).
 
@@ -217,7 +218,8 @@ enterprise healthcare — the engine stays `http` on a restricted interface **be
 
 - Run uvicorn with `proxy_headers=True` + `forwarded_allow_ips=<proxy>` so `X-Forwarded-For` /
   `X-Forwarded-Proto` are trusted **only** from the proxy; the audit/rate-limit source IP
-  ([api/auth_routes.py](../../messagefoundry/api/auth_routes.py) `_client`) then reads the real client IP
+  ([api/auth_routes.py](../../messagefoundry/api/auth_routes.py) `_client`, now
+  [api/security.py](../../messagefoundry/api/security.py) `client_ip`) then reads the real client IP
   from the trusted XFF (4.1.3, 15.3.4).
 - New `[api].trusted_proxies: list[str]` (empty = trust nothing, today's behavior) and
   `[api].tls_terminated_upstream: bool` — the latter satisfies the §0 exposed-gate **without** in-process
