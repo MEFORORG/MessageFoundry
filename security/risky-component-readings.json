@@ -1,7 +1,7 @@
 {
   "subject": "Public-metadata readings of each runtime component on ASVS 5.0.0 V15.1's risky-component examples (BACKLOG #1189, ASVS 15.1.4)",
-  "snapshot_date": "2026-10-04",
-  "reread_by": "2027-01-02",
+  "snapshot_date": "2026-10-08",
+  "reread_by": "2027-01-06",
   "population": {
     "core": "security/runtime-closure-core.txt",
     "extras": {
@@ -288,31 +288,19 @@
       "project_status": "active",
       "pinned_yanked": false,
       "requires_python_latest": ">=3.10",
-      "advisories": [
-        {
-          "id": "PYSEC-2026-2132",
-          "severity": "HIGH",
-          "rated_by": "cvss3",
-          "published": "2026-04-30"
-        }
-      ],
+      "advisories": [],
       "advisories_dropped": [],
-      "advisories_unresolved": [
-        {
-          "id": "PYSEC-2026-2132",
-          "twin": "GHSA-47fr-3ffg-hgmw"
-        }
-      ],
+      "advisories_unresolved": [],
       "advisories_affecting_pin": [],
       "risky": {
         "maintenance": false,
         "support": false,
-        "advisory_history": true
+        "advisory_history": false
       }
     },
     {
       "name": "cryptography",
-      "pinned": "50.0.1",
+      "pinned": "50.0.2",
       "added_by": [],
       "latest_version": "50.0.2",
       "newest_upload": "2026-09-30",
@@ -480,11 +468,11 @@
     },
     {
       "name": "fastapi",
-      "pinned": "0.141.1",
+      "pinned": "0.142.2",
       "added_by": [],
-      "latest_version": "0.142.2",
-      "newest_upload": "2026-09-30",
-      "releases_in_maintenance_window": 111,
+      "latest_version": "0.142.4",
+      "newest_upload": "2026-10-07",
+      "releases_in_maintenance_window": 113,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
@@ -689,6 +677,29 @@
       "project_status": "active",
       "pinned_yanked": false,
       "requires_python_latest": "",
+      "advisories": [],
+      "advisories_dropped": [],
+      "advisories_unresolved": [],
+      "advisories_affecting_pin": [],
+      "risky": {
+        "maintenance": false,
+        "support": false,
+        "advisory_history": false
+      }
+    },
+    {
+      "name": "opentelemetry-api",
+      "pinned": "1.45.0",
+      "added_by": [],
+      "latest_version": "1.45.1",
+      "newest_upload": "2026-10-06",
+      "releases_in_maintenance_window": 28,
+      "development_status": [
+        "Development Status :: 5 - Production/Stable"
+      ],
+      "project_status": "active",
+      "pinned_yanked": false,
+      "requires_python_latest": ">=3.10",
       "advisories": [],
       "advisories_dropped": [],
       "advisories_unresolved": [],
@@ -967,11 +978,11 @@
     },
     {
       "name": "pyspnego",
-      "pinned": "0.12.2",
+      "pinned": "0.12.3",
       "added_by": [],
-      "latest_version": "0.12.3",
-      "newest_upload": "2026-09-29",
-      "releases_in_maintenance_window": 5,
+      "latest_version": "0.12.4",
+      "newest_upload": "2026-10-06",
+      "releases_in_maintenance_window": 6,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
@@ -1271,7 +1282,7 @@
     },
     {
       "name": "uvloop",
-      "pinned": "0.22.1",
+      "pinned": "0.23.0",
       "added_by": [],
       "latest_version": "0.23.0",
       "newest_upload": "2026-10-01",

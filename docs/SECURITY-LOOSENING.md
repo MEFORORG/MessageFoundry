@@ -72,7 +72,10 @@ section reference.
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
+| | `[auth].ad_connect_timeout`, `ad_receive_timeout` | `10` s / `10` s (*conditional* — a loosening only once `ad_enabled`; a timeout above `10` s is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
 | | `[auth].admin_new_ip_step_up` | `true` |
+| | `[auth].require_action_step_up` | `true` (`false` lets the action-bound step-up routes accept the session-wide step-up window) |
+| | `[auth].password_check_breached`, `password_check_context`, `password_check_username` | `true` (each `false` turns off one screen of a local password) |
 | | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
 | | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
 | | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (`false`, a count of `0` or above `120`, or a window below `60` s) |
@@ -84,7 +87,11 @@ section reference.
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
+| | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
+| | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
+| | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
+| | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive; named as `backup.allow_unencrypted`) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
@@ -92,26 +99,28 @@ section reference.
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
-| | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening) |
+| | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
-`[auth].ad_allow_insecure_ldap`, `[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
+`[auth].ad_allow_insecure_ldap`, `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
+`[auth].admin_new_ip_step_up`, `[auth].require_action_step_up`, the three
+`[auth].password_check_*` keys, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
 keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
-`[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies` and
-`[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
-settings at all. They are listed here anyway, and all but `update_url_form` are reported, because the rule is *one shipped
+`[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
+`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
+`[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs` and `[backup].allow_unencrypted` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
+settings at all. They are listed here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
-`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[api]` sections; the per-connection
+`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]`/`[backup]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
-exactly which surfaces see them, and which cannot). At least one per-connection row is not passed in
-yet: `update_url_form`, whose entry names the two records it does have.
+exactly which surfaces see them, and which cannot).
 
 **One row is not a setting at all.** `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is an environment variable.
 `security_loosenings()` reads it from the environment of the process that renders the report, and
@@ -124,7 +133,7 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one), the connection
 > factories' TLS-shaped parameters (a second floor in the same file censuses the factory signatures,
 > because a per-connection deviation is outside `model_fields`' reach by construction) and the
-> enumerated deviations above, except `update_url_form` (its entry says which records it has). It is
+> enumerated deviations above. It is
 > **not yet** an exhaustive register of every security-relevant
 > switch in every section: `[store].encrypt` / `trust_server_certificate` and
 > `[auth].ad_tls_verify` are gated by their own serve-time refusals and are **not** reported here.
@@ -136,6 +145,8 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > `require_mfa` itself is reported: see its entry below.
 > That gap is enumerated in the floor test's exemption set, so it is a written decision rather than an
 > accident, and a *new* switch in either section cannot join it silently. Closing it is owed work.
+> The `[api]` bools have a floor of their own in the same file (vault BACKLOG #2385): each one is
+> named here or sits on that floor's exemption list with its reason.
 
 `enforcement` (ADR 0148 GIVEN 2) is the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 escape-clamp key, defaulting to `enforce` (byte-identical to the former production-tier refusal). It is
@@ -286,6 +297,11 @@ false premise.
   before the outage ([SECURITY.md](SECURITY.md#keep-a-local-administrator)).
 - **For embedders and tests only:** the app factories still take `allow_no_auth=True`. `serve` never
   passes it.
+- **Where the open mode is reported:** `GET /security/posture` on such an app names it as
+  `allow_no_auth`, with no auth service attached. It is an app opt-in, not a setting, so it is not
+  in the registry (`security_loosenings()`) and has no row in the tables on this page. So
+  `messagefoundry security show` would never name it: that command reads settings, and no
+  setting holds it.
 
 ### `require_mfa = false` — single-factor sign-in
 - **What you lose:** every account with no second factor enrolled, Administrators included,
@@ -566,6 +582,48 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart. Nothing
   about the key or the store changes either way; only whether the engine agrees to start.
 
+### `[cert_monitor].warn_days` or `[secret_rotation].warn_days` at `0`, or below its default — a credential reminder is off or late
+Named as `cert_monitor.warn_days` and `secret_rotation.warn_days` (ASVS 6.4.5, BACKLOG #2227). A
+value below the shipped default (`30` and `14` days) is named too, as the sign-in limits are when looser
+than theirs: a reminder one day ahead leaves no time to renew.
+- **What you lose:** the renewal reminder, or the time it gives. At `0`, the cert monitor raises no
+  `cert_expiry` alert for any certificate or CRL file it watches, and a service caller's client
+  certificate is never flagged as near expiry. At `0`, the periodic rotation reminder is off:
+  nothing reminds anyone ahead of a due date, or later while a secret runs overdue. Before this
+  entry, each showed only as a debug line from its runner.
+- **What you keep:** at least the start-time expiry checks, whatever `warn_days` is, and only where
+  they can run. Under `enforcement = enforce`, on a store that tracks its key, a store key past
+  `store_key_max_age_days + enforce_grace_days`, or of an age that cannot be determined, raises a
+  `secret_rotation` alert and refuses to start under `enforce_store_key_expiry`. An expired class
+  listed in `enforce_secret_expiry_classes` does the same. On a keyless or `vault_transit` store
+  these checks find nothing, so with `warn_days = 0` no `secret_rotation` alert of any kind fires
+  there. The `[alerts]` recipient gate counts each reminder separately, so turning one off does not
+  hide the others. A longer `check_interval_seconds` also delays a reminder, and it is not named.
+- **When acceptable:** an instance where something outside the engine tracks the same certificates or
+  secrets and reminds a person in time.
+- **Compensating controls:** that outside tracker, and a calendar entry per credential.
+- **Reversible:** yes. Set the default or more, or delete the line, and restart.
+
+### `[[alerts.rules]]` that send a credential reminder to no transport — the reminder is recorded but nobody is told
+Named as `alerts.rules`, with each rule's position, its `id`, and the reminder events it can match
+(ASVS 6.4.5, BACKLOG #2008).
+- **What you lose:** the notice. A rule whose `event_type` is `any`, `initial_credential_expiring`,
+  `cert_expiry` or `secret_rotation`, and which sets `mute = true` or `transports = []`, or has an
+  `escalate` tier with `transports = []`, sends a matching reminder to no transport. The `[alerts]`
+  recipient gate has already passed by then, so nothing else says so. The engine still records the
+  alert instance; it notifies nobody.
+- **What the check cannot see:** it reads each rule alone. A rule whose `connection` glob or `schedule`
+  never matches a reminder, or one an earlier rule always matches first, is still named. It errs toward
+  naming a rule that silences nothing.
+- **When acceptable:** a reminder already reaches people some other way, and the rule exists to stop a
+  duplicate.
+- **Compensating controls:** route the reminder events to a transport somebody reads, ahead of the
+  silencing rule, since the first matching rule wins. The entry stays listed even so, because the check
+  reads each rule alone.
+- **Reversible:** yes. Remove the rule or narrow its `event_type`, and restart. Giving it a transport
+  is not enough on its own: `mute = true` sends nothing whatever `transports` holds, and an
+  `escalate` tier with `transports = []` overrides the base rule once it is reached.
+
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating
 > **Conditional**, like `allowed_client_networks`. With no directory to reconcile against, `0` is not a
 > weaker choice — it is the only meaningful one — so it is reported as a deviation **only** when
@@ -604,6 +662,58 @@ This section is kept rather than deleted, because the claim it used to make is t
   authenticator, and `serve` and `GET /security/posture` name the switch on every boot. No audit row
   is written, as for the other settings-scoped loosenings.
 - **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
+
+### `[auth].ad_connect_timeout` or `ad_receive_timeout` above `10` s **with `ad_enabled`** — a stalled directory call holds a thread longer
+> **Conditional** on `[auth].ad_enabled`, since nothing reads the timeouts with no directory (vault
+> BACKLOG #2567, ASVS 13.1.3). Each is named on its own once it is above `10` s. A shorter timeout
+> fails a stalled call sooner, which is stricter, and is not named. Neither has an off value: the
+> row in the table above gives what the load refuses.
+- **What you lose:** each directory call runs in a worker thread until the domain controller answers
+  or a timeout ends. That covers at least a sign-in, a step-up and a session recheck. One call can
+  wait on several connects and reads, each bounded on its own. With a longer timeout, a controller
+  that has stopped answering holds each thread longer, so stalled calls tie up the thread pool that
+  sign-in shares for longer.
+- **When acceptable:** a directory reached over a slow link, where `10` s is measured to be too short
+  for a healthy round trip.
+- **Compensating controls:** none bounds how many calls stall at once. The sign-in rate limit paces
+  how many start per window, not how many are held, and a session recheck does not pass it. So
+  raise the timeout only as far as the measured round trip needs.
+- **Reversible:** yes, immediately — restore `10` (or delete the line) and restart.
+
+### `[auth].require_action_step_up = false` — the action-bound step-up falls back to the session window
+> Reported whenever it is `false` (vault BACKLOG #2600). The default is `true`
+> ([ADR 0077](adr/0077-action-bound-step-up.md)).
+- **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
+  once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
+  With the switch off, those routes accept the session-wide step-up window instead. A sign-in can
+  open that window, so a session taken over inside it can bind an authenticator, inject a message
+  or export bodies in bulk with no fresh proof.
+- **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
+  while a client that cannot send the bound proof is updated.
+- **Compensating controls:** keep `[auth].step_up_max_age_seconds` short, keep
+  `[auth].admin_new_ip_step_up` on, and restrict the operator surface with
+  `[security].allowed_client_networks`.
+- **Where it is reported:** `security_loosenings()` names it, so the serve-time warning,
+  `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses it.
+- **Reversible:** yes, immediately. Set it back to `true`, or delete the line, and restart.
+
+### `[auth].password_check_breached`, `password_check_context` or `password_check_username` `= false` — a local-password screen is off
+> Each is reported whenever it is `false` (vault BACKLOG #2600), under its own name. All three
+> default to `true`. They screen local passwords.
+- **What you lose:** with `password_check_breached` off, a password is not checked against a
+  common and breached password list when it is set: neither the bundled list nor a site list in
+  `[auth].password_breach_corpus_file`. With `password_check_context` off, it
+  is not checked for context words, neither the shipped terms nor
+  `[auth].password_extra_context_words`. With `password_check_username` off, it may contain the
+  account's own username.
+- **When acceptable:** `password_check_breached = false` is the documented way to start when the
+  bundled list cannot be read and the wheel cannot be reinstalled yet.
+- **Compensating controls:** keep `[auth].password_min_length` at its default or longer, and keep
+  `[security].require_mfa` on.
+- **Where it is reported:** `security_loosenings()` names each, so the serve-time warning,
+  `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses one.
+- **Reversible:** yes. Set it back to `true` and restart. Passwords set while a screen was off are
+  not re-screened.
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
 > Reported whenever it is `false`. No sign-in condition applies, since no setting turns sign-in off
@@ -644,8 +754,12 @@ This section is kept rather than deleted, because the claim it used to make is t
 > it paces is `0`, since it then paces nothing; each zeroed count is named instead. **The cutoff is the shipped default, not a
 > judged threshold.** Any value looser than the default is named, so a huge count or a tiny window is
 > reported like an off value, with text that says *looser than the default of* rather than *off*. A
-> value at or stricter than the default is not reported. That includes a **negative** count, and a
-> window that is not a number or is `+inf`, each of which refuses *more* attempts, not fewer.
+> value at or stricter than the default is not reported. That includes a **negative** count, which
+> refuses *more* attempts, not fewer. A window that is not a number, or is infinite, does not load
+> (vault BACKLOG #2466): a `NaN` or `+inf` window never ages an attempt out, so once the count filled
+> the limiter would refuse every sign-in until a restart. A window above `86400` s (one day) does
+> not load either, since a huge finite one does the same in practice. Both rules hold for
+> `phi_read_rate_limit_window_seconds` and `admin_write_rate_limit_window_seconds` too.
 - **What you lose:** a password spray across many usernames never trips one account's lockout, and these
   limits are what slow it. With the per-address limit off, one client may try as fast as the all-clients
   limit allows. With the all-clients limit off, a spray spread across many addresses grows with the number
@@ -847,6 +961,39 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes. Supply `[api].tls_cert_file` and restart; the acknowledgement then does nothing
   and may stay. To drop the terminator instead, remove `tls_terminated_upstream`, the acknowledgement
   and `trusted_proxies` together, or the load refuses.
+
+### `[api].expose_docs = true` — the API schema is served with no sign-in
+> **Not conditional** (vault BACKLOG #2385). The documentation routes exist only while the switch is
+> on, and none of them asks for sign-in, on a loopback bind or off it.
+- **What you lose:** the engine serves at least `/docs`, `/redoc` and `/openapi.json` to anyone who
+  can reach the API socket. They show every route, parameter and response shape. They hold the schema, not
+  message data.
+- **When acceptable:** a development engine on a loopback bind, while you write a client against it.
+- **Compensating controls:** keep the bind loopback, or list only trusted networks in
+  `[security].allowed_client_networks`. Neither hides the schema from a client that is allowed in.
+- **Reversible:** yes, immediately. Delete the line, or set it to `false`, and restart.
+
+### `[backup].allow_unencrypted = true` — a keyless instance writes its backup archive in cleartext
+> **Not conditional on the data** (vault BACKLOG #2302). The flag reads no synthetic or non-PHI
+> condition, and every instance carries patient data
+> ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)).
+> It does not ask `[security].enforcement` either, so `enforce` does not refuse it.
+- **What you lose:** with no store key, the backup runner writes a `.mfbak.plain` archive instead of
+  refusing. On a SQLite store that archive holds a full snapshot, message bodies included, and the
+  config bundle, with nothing encrypting it. With a store key the engine still writes a sealed
+  `.mfbak`, so the flag then changes nothing a backup writes.
+- **When acceptable:** the backup destination is itself encrypted and access-controlled, and the site
+  has accepted that the archive is cleartext. Prefer configuring a store key.
+- **Compensating controls:** encrypt the destination volume, and restrict who can read it. Treat
+  every `.mfbak.plain` file as PHI.
+- **Where it is reported:** `security_loosenings()` names it as `backup.allow_unencrypted`
+  whenever the flag is `true`, with or without a store key. So the serve-time loosening warning,
+  `messagefoundry security show` and `GET /security/posture` name it. With a store key the flag
+  still relaxes one refusal: the restore-verify accepts a plaintext archive it would otherwise
+  refuse as a possible downgrade. The `dr_backup` audit row of each backup also carries
+  `encrypted: false`. Nothing refuses the flag, and `messagefoundry check` has no line for it.
+- **Reversible:** yes. Configure a store key, set the flag back to `false` (or delete the line) and
+  restart. Archives already written in cleartext stay cleartext; delete them once a sealed one exists.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**
@@ -1098,14 +1245,19 @@ This section is kept rather than deleted, because the claim it used to make is t
   sources. Set it on the one connection that needs it.
 - **Compensating controls:** treat the server's access logs as PHI-bearing, with the access control and
   retention that implies, and confirm who can read any proxy log on the path.
-- **It is never silent:** a WARNING at every construction naming the connection, never an id, and a
-  `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it.
+- **It is never silent:** a WARNING at every construction naming the connection, never an id, a
+  `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it, and
+  an `update_url_form` entry in `security_loosenings()`, which `GET /security/posture` shows with
+  the same connection names (vault BACKLOG #2571). The last two read one list. That list holds a
+  connection whose `update_url_form` is written as the literal `"path"`. A value supplied
+  through `env()` is not resolved when the list is built, so such a connection is not named by
+  either.
 - **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
   `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
-  and `[security].enforcement = enforce` does not refuse it. It is **not yet** in
-  `security_loosenings()`, so `GET /security/posture` and the serve-time loosening warning do not name
-  it. The construction WARNING and the `check` line are its only records today; adding it to the
-  registry is owed work.
+  and `[security].enforcement = enforce` does not refuse it. It is not in the
+  serve-time loosening warning, which fires before the graph is loaded, exactly as for
+  `cleartext_accepted`. `messagefoundry security show` and a graphless `GET /security/posture`
+  cannot see it either, and say so in `loosenings_scope`.
 
 ### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
@@ -1322,8 +1474,9 @@ This section is kept rather than deleted, because the claim it used to make is t
   the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
   only if another audit hook refused the engine's.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
-  the engine's own process. `supervise` logs one WARNING at start for the supervisor process, and
-  no API reports that process afterwards. The engine's Python children start with the interface
+  the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
+  It logs the line a second time once its off-box log forwarder is installed, so the collector's
+  copy has it. No API reports that process afterwards. The engine's Python children start with the interface
   off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
   line says so. Other commands, such as `rotate-key`, `backup` and `restore`, install the hook
@@ -1427,7 +1580,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
   for the engine's own process. The posture's `interpreter` block carries the whole reading: the
   flags, each file found with its verdict, and the directories. `supervise` logs one WARNING for
-  each entry at start for the supervisor process. `messagefoundry security show` is a separate
+  each entry at start for the supervisor process, and logs each a second time once its off-box
+  log forwarder is installed. `messagefoundry security show` is a separate
   process, so it reports none of them, and its scope line says so.
 - **The reading is taken once, at start.** Start-up code runs when the interpreter starts, so a
   file added later has not run in this process. Restart the engine to read again.
@@ -1473,14 +1627,17 @@ chapter was not part of the verification above.
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].ad_allow_insecure_ldap` (plain `ldap://` AD bind) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(d) Person or Entity Authentication |
+| `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout` (bound on one directory call) | V13 Configuration (13.1.3) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
 | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` (config-source check downgraded to a warning) | V13 Configuration | **CM-5** Access Restrictions for Change · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold`, `[auth].lockout_max_minutes` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].phi_read_rate_limit_*`, `[auth].admin_write_*`, `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`, `[auth].oidc_callback_floor_exempt_amr` (PHI-read and admin-write pacing, second-step time floors and the federated floor's exemption) | V2 Validation and Business Logic (anti-automation, 2.4.1 / 2.4.2) | **SC-5** Denial-of-Service Protection | §164.312(a)(1) Access Control |
 | `[auth].max_sessions_per_user` (concurrent-session cap) | V7 Session Management (7.1.2) | **AC-10** Concurrent Session Control | §164.312(a)(1) Access Control |
 | `[auth].oidc_flow_cache_max` (pending federated sign-in bound) | V2 Validation and Business Logic (anti-automation) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
+| `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, `[[alerts.rules]]` (credential reminders off, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
 | `[api].trusted_proxies` (trust-every-peer forwarded header) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
+| `[api].expose_docs` (API schema and interactive docs served with no sign-in) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `url_query_credential` (per-connection credential in an endpoint URL's query) | V14 Data Protection (14.2.1) | **SC-8** Transmission Confidentiality and Integrity · **IA-5(7)** No Embedded Unencrypted Static Authenticators | §164.312(d) Person or Entity Authentication · §164.312(e)(1) Transmission Security |

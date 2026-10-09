@@ -4,6 +4,8 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 
+import { SCRIPT_BANNER_ID, STARTUP_BANNERS } from "../../webviewMessaging";
+
 import {
   ADD_MENU_CATALOG,
   addMenuGroups,
@@ -496,6 +498,7 @@ function pageShell(bodyHtml: string): string {
     .join("");
   return (
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>steps</title></head><body>` +
+    STARTUP_BANNERS +
     `<div class="bar">` +
     `<input id="stepsFilter" type="search" />` +
     `<select id="insertAction">${insertOptions}</select>` +
@@ -1222,6 +1225,8 @@ suite("Steps mirror — the webview script under jsdom (STEPS-06)", () => {
       [],
       "the script threw while loading under jsdom",
     );
+    // The shell's script-not-started banner is visible until this script hides it (BACKLOG #1116).
+    assert.strictEqual(h.window.document.getElementById(SCRIPT_BANNER_ID).hidden, true);
     const pings = plain(h.posted.filter((m) => m.command === "stepsDiag" && m.level === "ping"));
     assert.deepStrictEqual(
       pings,

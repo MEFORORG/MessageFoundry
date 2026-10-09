@@ -121,6 +121,8 @@ Three ownership tiers — keeping them separate is the whole design:
   (Artifactory, Azure Artifacts, a private PyPI) serves the same role.
 - Administrator/elevation on the host if you will install the engine as a Windows service (see
   [SERVICE.md](SERVICE.md)).
+- A **synchronized clock** on each engine host. See
+  [SYSTEM-REQUIREMENTS.md, *Host clock*](SYSTEM-REQUIREMENTS.md#host-clock).
 
 ---
 

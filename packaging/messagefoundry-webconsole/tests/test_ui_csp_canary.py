@@ -584,6 +584,12 @@ _NOT_UI_EMITTERS = {
         "the HL7-over-HTTP ingress listener. Its responses go to a sending SYSTEM on a partner "
         "connection, never to the console origin, so its headers are not part of the /ui contract."
     ),
+    "security.py": (
+        "the engine's api/security.py. Its only writes are Cache-Control: no-store, from "
+        "no_store_reply and from the stamp on the route's returned Response, which the route class "
+        "adds only to a JSON route returning a CredentialReply model "
+        "(BACKLOG #2372). No /ui route returns one, and /ui is already no-store by the header floor."
+    ),
 }
 
 #: The shapes a browser-security header is WRITTEN in across both trees: subscript assignment, a
@@ -788,8 +794,12 @@ def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
     assert "Unresolved" in text
     # and the wording stays compatible with the unpublished-distribution scan (see the docstring)
     assert "not published" not in text
-    # the console never blocks: the OTHER half of the 3.1.1 verb (warn the user OR block access)
-    assert "warns, it never blocks" in text or "No browser is blocked" in text
+    # Both halves of the 3.1.1 verb (warn the user OR block access), plus the named control. This
+    # pinned "warns, it never blocks" until BACKLOG #1116/#1124 made that false: a state-changing
+    # request with neither provenance header is refused now, and the page must not claim otherwise.
+    for answer in ("**Warns.**", "**Fails closed.**", "**Named control.**"):
+        assert answer in text, answer
+    assert "it never blocks" not in text
 
 
 def _runbook_contract_table() -> str:

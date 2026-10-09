@@ -24,7 +24,9 @@ site does not bypass the floor, or what covers it instead.
 | ``protocol-override`` | A def of, or assignment to, a server response writer (see below). |
 
 The server response writers are ``send_400_response``, ``send_500_response`` and
-``write_http_response``. "Assignment" covers ``x.name = ...``, a class-level ``name = ...``, an
+``write_http_response``. ``send_response``, the sans-I/O WebSocket conn's writer, counts only when
+it is ASSIGNED on an object (``x.send_response = ...``): the name is too common for a def of it to
+mean a server writer. "Assignment" covers ``x.name = ...``, a class-level ``name = ...``, an
 annotated assignment, and ``setattr(x, "name", ...)`` with a literal name.
 
 **Its bound, stated so it is not read as more.** This pins the FIRST-PARTY emitter population, and
@@ -57,6 +59,8 @@ _ASGI_RESPONSE_STARTS = frozenset(
 )
 _STATUS_LINE = re.compile(r"HTTP/\d\.\d \S")
 _PROTOCOL_METHODS = frozenset({"send_400_response", "send_500_response", "write_http_response"})
+#: Counted only as an attribute assignment; see the module docstring.
+_ASSIGNED_WRITERS = frozenset({"send_response"})
 _SERVER_CALLS = frozenset({"run", "Server", "Config"})
 _WS_NAMES = frozenset({"ws", "websocket"})
 _MESSAGE_KINDS = {
@@ -101,7 +105,9 @@ class _Collector(ast.NodeVisitor):
                 self._assigned(element)
             return
         name = getattr(target, "attr", None) or getattr(target, "id", None)
-        if name in _PROTOCOL_METHODS:
+        if name in _PROTOCOL_METHODS or (
+            isinstance(target, ast.Attribute) and target.attr in _ASSIGNED_WRITERS
+        ):
             self._add("protocol-override")
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -121,7 +127,7 @@ class _Collector(ast.NodeVisitor):
             name == "setattr"
             and len(node.args) >= 2
             and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value in _PROTOCOL_METHODS
+            and node.args[1].value in _PROTOCOL_METHODS | _ASSIGNED_WRITERS
         ):
             self._add("protocol-override")
         if name in ("FastAPI", "Starlette"):
@@ -211,6 +217,12 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         "run_kwargs passes the floored http and ws protocols (api/protocol_headers.py); "
         "tests/test_api_tls.py pins both arms of the client-cert shim.",
     ),
+    Site("messagefoundry/api/protocol_floor_selftest.py", "_drive_all", "asgi-server"): (
+        1,
+        "A uvicorn.Config and no Server: the startup self-test hands it to the floored classes' own "
+        "constructors and reads their answers from an in-memory transport. Nothing is served from "
+        "it; tests/test_protocol_floor_selftest.py shows it opens no socket.",
+    ),
     Site(_APP, "create_app._unhandled_exception", "error-handler"): (
         1,
         "Runs in ServerErrorMiddleware, outside every user middleware, so it sets "
@@ -251,10 +263,21 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         1,
         "Adds the headers to uvicorn's own HTTP 400; tests/test_header_floor_wire.py.",
     ),
-    Site(_PROTOCOL, "_build_floored_ws._FlooredWebSocketProtocol", "protocol-override"): (
+    Site(_PROTOCOL, "_build_floored_legacy_ws._FlooredWebSocketProtocol", "protocol-override"): (
         2,
         "Adds the headers to uvicorn's own WebSocket 500 and, where absent, to every handshake "
         "answer the legacy websockets server writes; tests/test_header_floor_wire.py.",
+    ),
+    Site(_PROTOCOL, "_floor_the_conn_responses", "protocol-override"): (
+        1,
+        "Adds the headers, where absent, to every handshake answer the sans-I/O WebSocket protocol "
+        "hands its conn; tests/test_header_floor_wire.py.",
+    ),
+    Site("messagefoundry/api/protocol_floor_selftest.py", "_failing_app", "ws-close"): (
+        1,
+        "The startup self-test's stand-in app closes before accepting ON PURPOSE, so the server "
+        "writes its own 403 and the test can read the floor's headers off it. It answers an "
+        "in-memory transport and is never served.",
     ),
     Site("messagefoundry/transports/http_listener.py", "_status_line", "status-line"): (
         1,

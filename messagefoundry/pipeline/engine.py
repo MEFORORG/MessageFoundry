@@ -69,6 +69,7 @@ from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
 from messagefoundry.pipeline.intake_bound import IntakeBoundMonitor
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
+from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.retention import RetentionRunner
@@ -90,28 +91,37 @@ from messagefoundry.pipeline.wiring_runner import (
     TeardownReason,
     check_pt_backend_supported,
     check_reference_backend_supported,
+    refuse_reference_hop_flags,
 )
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import rotation_fingerprint_keys
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
+    REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
     ConnectionMetrics,
     DestinationMetrics,
     InboundMetrics,
+    MessageOrigin,
     OperatorAudit,
     OwnedLanes,
     ReingressOutcome,
+    ResendKeyRecord,
     ResendOutcome,
     parse_audit_anchor,
     read_audit_anchor_file,
 )
+from messagefoundry.store.transit_attestation import enforce_transit_bound_attestation
 from messagefoundry.transports.base import IntakeGate
 
 __all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
 
 log = logging.getLogger(__name__)
+
+#: How long stop waits for alert-instance writes already scheduled before it closes the store
+#: (BACKLOG #2272). Short: a write that has not landed by then is logged and lost, as before.
+_ALERT_STATE_DRAIN_SECONDS = 5.0
 
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
 #: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
@@ -410,6 +420,7 @@ class Engine:
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
         self._crl_reload_runner: CrlReloadRunner | None = None
+        self._log_forward_watch: LogForwardWatch | None = None
         self._gcm_invocation_runner: GcmInvocationRunner | None = None
         # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
         # #1169); None until start() arms it, and again after stop() disarms it.
@@ -501,6 +512,8 @@ class Engine:
         # AND dr.activate): then the runner binds only connections whose resolved tier rank >=
         # dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the runner
         # → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
+        # A DR box that is not activated passes dr_standby instead, and binds no inbound listener
+        # until it is (vault BACKLOG #3140).
         self._priority_default = priority_default
         self._dr_settings = dr_settings or DrSettings()
         # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
@@ -727,6 +740,17 @@ class Engine:
         threshold is consistently applied across reloads."""
         return self._dr_settings.priority_threshold if self._dr_active else None
 
+    def _dr_standby_threshold(self) -> Priority | None:
+        """``[dr].priority_threshold`` on a DR standby that is not activated, else ``None``. The
+        runner binds no inbound listener while it is set (vault BACKLOG #3140), because ADR 0048's
+        load balancer moves the VIP to the node that answers. It judges the listeners an
+        activation would bind, so a reload here refuses what that activation would refuse."""
+        # Without store settings there is no coordinator (dr_coordinator), so nothing could
+        # activate the box; parking its intake for good would leave it dead, not passive.
+        if self._dr_settings.enabled and not self._dr_active and self._store_settings is not None:
+            return self._dr_settings.priority_threshold
+        return None
+
     @property
     def dr_active(self) -> bool:
         """Whether the engine is running under the DR run-profile this boot (#61, ADR 0048)."""
@@ -779,24 +803,30 @@ class Engine:
         The runner takes its threshold at construction and reads it on every start and reload, so
         a flip of the latch alone parked nothing on a running box (vault BACKLOG #3067). Every
         runtime flip goes through here, so the two cannot disagree. It binds and unbinds nothing:
-        the next reload does."""
+        the next reload does. A release hands the runner the passive standby's threshold, so that
+        reload binds no listener (vault BACKLOG #3140)."""
         self._dr_active = active
         if self._registry_runner is not None:
-            self._registry_runner.set_dr_threshold(self._dr_run_threshold())
+            self._registry_runner.set_dr_threshold(
+                self._dr_run_threshold(), standby=self._dr_standby_threshold()
+            )
 
     async def _dr_activate_profile(self) -> None:
         """Engine callback the DR coordinator runs to BEGIN serving under the DR run-profile (#61, ADR
         0048 step 4): latch the run-profile ON, hand the runner the threshold, and re-apply the
         running graph so the runner binds only connections at/above ``[dr].priority_threshold`` (the
-        rest report ``status:"filtered"``). A reload (not a cold start) so a box already serving its
-        full graph drops to the critical set in place, with in-flight rows preserved (the reload is
-        quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
+        rest report ``status:"filtered"``). A reload (not a cold start) so a passive box, which binds
+        no listener (vault BACKLOG #3140), binds the critical set in place, with in-flight rows
+        preserved (the reload is quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
         from :meth:`_dr_config_drift`.
 
         It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
         (vault BACKLOG #2184, engine PR 2070). The preflight reads anchor files, which can change
-        after the graph loaded. The guard ``serve`` wires, the static-credential guard, judges only
-        the graph and the startup settings, and neither has changed. It already judged this graph
+        after the graph loaded. Skipping the guard is safe only while every guard in the
+        chain reads just the graph and the startup settings, because neither input has changed.
+        The two ``serve`` chains today do: the static-credential guard and, since vault BACKLOG
+        #2368, the per-connection keep-forever retention guard. A guard that reads anything else
+        would need to run here. The chain already judged this graph
         when it loaded, through :meth:`reload_detail` or the managed app's first load, over the
         whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
         filtered graph, so a guard here would judge less than that load did. A graph an embedder
@@ -903,8 +933,9 @@ class Engine:
     async def _dr_release_drain(self) -> dict[str, object]:
         """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
         listeners (stop accepting new intake), drain the staged queue (every drainable NOT-DONE row
-        delivered or dead-lettered), then latch the run-profile OFF and clear the runner's threshold,
-        so a later operator reload stops parking feeds (vault BACKLOG #3067). Within the DR store
+        delivered or dead-lettered), then latch the run-profile OFF and clear the runner's threshold
+        (vault BACKLOG #3067). The box is then passive, so the runner parks every outbound at once
+        and a later reload starts none (vault BACKLOG #3262). Within the DR store
         at-least-once + idempotency make the drain safe; cross-store reconciliation is
         operator-verified per the runbook. Returns only once intake is unbound and the drain has
         ended (no dual-accept window).
@@ -912,18 +943,39 @@ class Engine:
         Returns the fields for the ``dr.release`` row: ``depth_left``, the staged-queue depth left
         when the drain ended (vault BACKLOG #2752, finding D-V1); ``held_on_parked_outbounds``, the
         part of it held on outbounds the engine parks; and ``drained``, whether every OTHER row
-        drained (vault BACKLOG #3067). The coordinator records them rather than claiming a drain."""
+        drained (vault BACKLOG #3067). The coordinator records them rather than claiming a drain.
+
+        If any step fails, the coordinator keeps the box active, so the runner's DR thresholds
+        come back and its inbound markers are written again under them (vault BACKLOG #3140).
+        That parks at least each feed below the threshold that the release stopped and left
+        down, even one an operator had started. The listeners at or above the threshold that the park unbound stay
+        down until a reload, their schedule window or an alert rule's restart binds them again;
+        a reload skips an ``auto_start = false`` one."""
         rr = self._registry_runner
         if rr is None:
             # No graph, so nothing to unbind, no worker to drain with and no parked outbound.
             depth = await self.store.in_pipeline_depth()
             self._set_dr_active(False)
             return {"depth_left": depth, "drained": depth == 0, "held_on_parked_outbounds": 0}
-        for name in list(rr.registry.inbound):
-            await rr.stop_inbound(name)  # unbind every listener — no new intake during fail-back
-        rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
-        depth, held = await self._drain_pipeline()
+        # Unbind every listener, as a passive standby, so neither the scheduler nor an alert rule
+        # can bind one while the drain runs (vault BACKLOG #3140). The threshold stays, so the
+        # outbounds the profile parks hold their rows through the drain.
+        standby = self._dr_settings.priority_threshold
+        before = rr.dr_intake_state()
+        try:
+            await rr.park_intake(standby)
+            rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
+            depth, held = await self._drain_pipeline()
+            # Again, for a listener an operator started during the drain: none is bound on return.
+            await rr.park_intake(standby)
+        except BaseException:
+            # The coordinator keeps the box active, so the runner leaves the standby with it. The
+            # profile's markers are written again from the graph as it is now, so the feeds below
+            # the threshold stay parked, and the next reload binds the auto-start ones at or above it.
+            rr.restore_dr_intake(before)
+            raise
         self._set_dr_active(False)
+        await rr.close_passive_connectors()  # a passive box holds no partner session open
         return {"depth_left": depth, "drained": depth <= held, "held_on_parked_outbounds": held}
 
     async def _drain_pipeline(
@@ -1012,6 +1064,7 @@ class Engine:
             intake_gate=self._intake_gate,
             priority_default=self._priority_default,
             dr_threshold=self._dr_run_threshold(),
+            dr_standby=self._dr_standby_threshold(),
             alert_sink=self._alert_sink,
             egress=self._egress_settings,
             hop_posture=self._hop_posture,
@@ -1098,10 +1151,16 @@ class Engine:
         if self.store.secret_rotation_fingerprint_key() is None:
             # Keyless, or `vault_transit`, where the DEK never enters the heap: no secret is
             # fingerprinted, so no class can carry an age and the opt-in cannot fire. Say so rather
-            # than let an operator believe the listed classes refuse.
+            # than let an operator believe the listed classes refuse. BACKLOG #2320: this line used
+            # to say those classes "only alert", but reconcile_rotation_meta stamps a non-DEK class
+            # only under a fingerprint key, so here no class has a stamp and the reminder runner
+            # never sees one. They do not alert either, and the line must say so.
             log.warning(
                 "[secret_rotation].enforce_secret_expiry_classes is set but this store does not "
-                "fingerprint secrets (keyless or vault_transit), so those classes only alert"
+                "fingerprint secrets (keyless, or vault_transit, which keeps the store key out of "
+                "this process). The engine tracks no rotation age for the non-DEK secret classes "
+                "here, so those classes neither refuse nor alert: no secret_rotation alert fires "
+                "for them on this store"
             )
             return frozenset()
         return frozenset(held_env_secret_values()) | frozenset(self._connector_secret_env_values())
@@ -1175,7 +1234,9 @@ class Engine:
 
         A cluster node's id is the same after a restart only when ``[cluster].node_id`` is pinned.
         The shard id is known once the engine holds its graph (:meth:`start` or ``add_registry``).
-        Read by the approval gate to mark the releases it claims (BACKLOG #1562)."""
+        Read by the approval gate to mark the releases it claims (BACKLOG #1562), and by the intake
+        monitor (BACKLOG #2272) and the log forwarder watch (BACKLOG #2612) to name this process in
+        their alert subjects."""
         if self._coordinator.is_clustered():
             return f"node:{self._coordinator.node_id}"
         runner = self._registry_runner
@@ -1378,6 +1439,16 @@ class Engine:
         self.started_at = time.time()
         # Before anything reads the store, so a refusal during recovery alerts too (BACKLOG #1169).
         self._arm_cipher_refusal_alert()
+        # BACKLOG #2337 (owner rulings 2026-10-07): on `vault_transit` the engine counts no AES-GCM
+        # invocations, so a recorded, audited operator attestation must name the configured Transit
+        # data key. It refuses under enforce and warns otherwise. First, before recovery or any
+        # listener, so a refused start has touched nothing; outside any handler, so it propagates
+        # out of start() and aborts the lifespan.
+        await enforce_transit_bound_attestation(
+            self.store,
+            self.store.cipher_info().transit_key_name,
+            enforcement=self._security_enforcement,
+        )
         # All-stages recovery: returns any row a crash left `inflight` — ingress rows mid-route and
         # outbound rows mid-delivery alike — to `pending` so the staged workers re-claim them
         # (staged pipeline, ADR 0001). The handoff/delivery transactions make the re-run idempotent.
@@ -1460,6 +1531,15 @@ class Engine:
                 # Slice 3: intake_paused / intake_resumed. None (no notifier) raises nothing: the
                 # monitor's own log lines already record each pause.
                 alert_sink=self._alert_sink,
+                # BACKLOG #2272 defects 4 to 6: each process names itself in its alert subjects, so
+                # it raises and clears only its own pause. An unpinned cluster node gets a new id on
+                # every start, so it clears its own alerts at stop; nothing could clear them later.
+                # Read once: serve hands the engine its graph before start, so a shard id is known
+                # here, and a reload re-applies the same shard filter, so the identity does not move.
+                node=self.instance_identity,
+                resolve_on_stop=(
+                    self._coordinator.is_clustered() and not self._cluster_settings.node_id
+                ),
             )
             # Always measured once, even with both bounds off: a bound that is off reports itself
             # clear, which resolves a pause alert an earlier run left open (slice 3).
@@ -1493,6 +1573,9 @@ class Engine:
             # supports_ingest_stage check it fires on EVERY node (leader or standby) — which also covers
             # the clustered branch, where the reference runner starts on every node before leadership.
             self._check_reference_backend_supported()
+            # Vault BACKLOG #3139: serve runs no build check, so a reference set's raw hop flag is
+            # refused here, before any sync, rather than surfacing later as a failed sync.
+            refuse_reference_hop_flags(self._registry_runner.registry)
             if not self._coordinator.is_clustered():
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
                 # before — byte-identical. The config-drift sweeps + reference materialize + listener
@@ -1563,6 +1646,17 @@ class Engine:
                 watch_unlisted_held_crls=True,
             )
             self._cert_expiry_runner.start()
+        # BACKLOG #2612: page when the off-box log forwarder is absent, losing records or not
+        # sending. NOT leader-gated, for the certificate monitor's reason: the forwarder is this
+        # process's own, so a standby and every engine shard watches its own.
+        if self._log_forward_watch is None:
+            # The process names itself in the alert key, as the intake monitor does (BACKLOG
+            # #2272): otherwise every process on the store shares one alert row per kind, and the
+            # row cannot say which process lost its forwarder. Read once, for that monitor's reason.
+            self._log_forward_watch = LogForwardWatch(
+                alert_sink=self._alert_sink, node=self.instance_identity
+            )
+            self._log_forward_watch.start()
         # BACKLOG #299: apply a replaced CRL file to the running hops that hold the old copy. Not
         # gated on [cert_monitor]: turning the expiry alert off must not also stop a revocation
         # reaching a running hop. Not leader-gated: each process holds its own TLS contexts. Its cap
@@ -2457,6 +2551,7 @@ class Engine:
                 stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
                 priority_default=self._priority_default,
                 dr_threshold=self._dr_run_threshold(),
+                dr_standby=self._dr_standby_threshold(),
                 alert_sink=self._alert_sink,
                 egress=self._egress_settings,
                 hop_posture=self._hop_posture,
@@ -2584,6 +2679,24 @@ class Engine:
             self._registry_runner.notify_work()
         return requeued
 
+    async def prior_resend(
+        self, idempotency_key: str, *, message_id: str, to: str | None
+    ) -> ResendKeyRecord | None:
+        """The record of an already-run request this key repeats, or ``None``.
+
+        A repeat is the SAME request under the same key: a resend of ``message_id`` to the outbound
+        ``to``, or, with ``to=None``, an edit-and-resubmit re-ingress of ``message_id``. An unused key
+        and a key used for a different request (the store's 409 conflict) both answer ``None``, so
+        a caller treats them as a new request. Read-only, and it queues nothing: the web console
+        asks it before it demands a step-up proof, so a double-submit answers "already resent"
+        instead of sending the operator to re-authenticate (vault BACKLOG #2625)."""
+        record = await self.store.get_resend_record(idempotency_key)
+        if record is None or record.message_id != message_id:
+            return None
+        if to is None:
+            return record if record.to_destination.startswith(REINGRESS_TARGET_PREFIX) else None
+        return record if record.to_destination == to else None
+
     async def resend(
         self,
         message_id: str,
@@ -2615,14 +2728,20 @@ class Engine:
         raw: str,
         idempotency_key: str,
         audit: OperatorAudit[ReingressOutcome],
+        actor: str,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-ingress an EDITED body as a fresh
         correlated ``RECEIVED`` message on the ORIGIN's channel, then wake the workers so the router
         drains the new ingress row promptly. The store (:meth:`QueueStore.reingress`) does the idempotent,
         original-immutable, correlated insert; RBAC + step-up are the API's job, and so are the origin
-        inbound's ingress guards (BACKLOG #1911). The original message row is never written."""
+        inbound's ingress guards (BACKLOG #1911). The original message row is never written. ``actor``
+        is the operator, recorded as the child's ``origin_actor`` (vault BACKLOG #2615)."""
         outcome = await self.store.reingress(
-            origin_message_id=message_id, raw=raw, idempotency_key=idempotency_key, audit=audit
+            origin_message_id=message_id,
+            raw=raw,
+            idempotency_key=idempotency_key,
+            audit=audit,
+            actor=actor,
         )
         if (
             outcome.status == "resubmitted"
@@ -2640,6 +2759,7 @@ class Engine:
         source_type: str = "upload",
         metadata: str | None = None,
         audit: OperatorAudit[str],
+        actor: str,
     ) -> str:
         """Inject a fresh ``RECEIVED`` message onto ``channel_id``'s **ingress** stage — the DISTINCT
         inject path for the offline uploaded-logs resend (BACKLOG #125, ADR 0134). It reuses the exact
@@ -2651,9 +2771,16 @@ class Engine:
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
         validation (registered/running), RBAC and the target inbound's ingress guards (BACKLOG
         #1911) are the API's job. The API also builds the ``audit`` row that commits with the message
-        (BACKLOG #2624). Returns the new message id."""
+        (BACKLOG #2624). Returns the new message id. The message's origin is ``operator_upload`` with
+        ``actor`` as its acting user (vault BACKLOG #2615)."""
         mid = await self.store.enqueue_ingress(
-            channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata, audit=audit
+            channel_id=channel_id,
+            raw=raw,
+            source_type=source_type,
+            metadata=metadata,
+            audit=audit,
+            origin=MessageOrigin.OPERATOR_UPLOAD,
+            origin_actor=actor,
         )
         if self._registry_runner is not None and self._registry_runner.running:
             self._registry_runner.notify_work()
@@ -2667,6 +2794,7 @@ class Engine:
         raw: str,
         idempotency_key: str,
         audit: OperatorAudit[ResendOutcome],
+        actor: str,
     ) -> ResendOutcome:
         """Edit-and-resubmit DIRECT power-path (ADR 0090 §9, BACKLOG #153): deliver an EDITED body
         straight to a chosen alternate outbound ``to`` (reusing #123's :meth:`QueueStore.resend_to` with
@@ -2679,6 +2807,7 @@ class Engine:
             idempotency_key=idempotency_key,
             body_override=raw,
             audit=audit,
+            actor=actor,
         )
         if (
             outcome.status == "resent"
@@ -2810,6 +2939,9 @@ class Engine:
         if self._crl_reload_runner is not None:
             await self._crl_reload_runner.stop()
             self._crl_reload_runner = None
+        if self._log_forward_watch is not None:
+            await self._log_forward_watch.stop()
+            self._log_forward_watch = None
         if self._secret_rotation_runner is not None:
             await self._secret_rotation_runner.stop()
         if self._update_check_runner is not None:
@@ -2859,4 +2991,10 @@ class Engine:
             self._warm_pool_task.cancel()
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
+        # Clears raised on the way out are background writes: an unpinned cluster node's intake
+        # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
+        # to land before the store closes. Last, so it covers every stop step above.
+        drain = getattr(self._alert_sink, "drain_state", None)
+        if drain is not None:
+            await drain(_ALERT_STATE_DRAIN_SECONDS)
         await self.store.close()

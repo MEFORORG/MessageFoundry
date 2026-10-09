@@ -11,6 +11,7 @@ a JSON-API credential and SameSite is never the sole CSRF defense for the JSON A
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -23,10 +24,12 @@ from fastapi import HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import RedirectResponse
 
 from messagefoundry.api.security import (
+    RepeatedCredentialError,
     client_ip,
     enforce_phi_read_hop,
     get_auth,
     mark_route_gate,
+    record_repeated_credential,
 )
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
@@ -78,6 +81,11 @@ __all__ = [
     "session_token",
     "set_oidc_flow_cookie",
     "set_session_cookie",
+    "spend_ui_action_step_up",
+    "ActionSpend",
+    "RepeatRefused",
+    "proof_spent_for",
+    "settle_ui_action_step_up",
 ]
 
 COOKIE_NAME = "mf_session"
@@ -188,8 +196,43 @@ def session_cookie_name(conn: Request | WebSocket) -> str:
     return HOST_COOKIE_NAME if browser_hardening_enabled() else SECURE_COOKIE_NAME
 
 
+#: The 400 detail for a request carrying more than one copy of the session cookie (BACKLOG #2454).
+#: A fixed string: it names the rule, never a value.
+REPEATED_SESSION_COOKIE_DETAIL = "more than one session cookie"
+
+
+def session_cookie_copies(conn: Request | WebSocket) -> int:
+    """How many copies of this connection's session cookie the request carries, over every
+    ``Cookie`` header line (BACKLOG #2454, the cookie half).
+
+    Starlette's ``conn.cookies`` keeps only the LAST copy of a name, so it cannot see a repeat; this
+    reads the raw lines instead. A chunk is counted exactly when Starlette's own ``cookie_parser``
+    would file it under the name: it holds an ``=``, and the text before the first one, stripped,
+    is the name.
+
+    A browser holding this engine's cookie sends one copy: the engine sets it with ``Path=/`` and no
+    ``Domain``. Two copies mean another writer set a second one, such as a sibling host writing the
+    ``__Secure-`` or plain name for a parent domain, or a crafted client. RFC 6265 section 5.4 says
+    a server should not rely on the order of such copies, so neither is chosen. The cost is that a
+    browser holding a planted copy is refused until it drops it. The ``__Host-`` name, the shipped
+    default, cannot be planted from another host."""
+    name = session_cookie_name(conn)
+    return sum(
+        1
+        for line in conn.headers.getlist("cookie")
+        for chunk in line.split(";")
+        if "=" in chunk and chunk.split("=", 1)[0].strip() == name
+    )
+
+
 def session_token(conn: Request | WebSocket) -> str | None:
-    """Read the session token from whichever cookie name applies to this connection's scheme."""
+    """Read the session token from whichever cookie name applies to this connection's scheme.
+
+    Raises 400 when the request carries the cookie more than once (BACKLOG #2454), as the engine's
+    ``RepeatedCredentialError``, whose handler logs and audits it. A WebSocket caller checks
+    :func:`session_cookie_copies` first, because a raise there is not an answer."""
+    if session_cookie_copies(conn) > 1:
+        raise RepeatedCredentialError("session_cookie", REPEATED_SESSION_COOKIE_DETAIL)
     return conn.cookies.get(session_cookie_name(conn))
 
 
@@ -206,6 +249,9 @@ UI_CSP = (
 # state-changing /ui POSTs (M2). "same-site" (a sibling subdomain) is rejected too: /ui is strictly
 # same-origin. "same-origin" and "none" (a user-initiated navigation) are allowed.
 _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
+#: The ``Sec-Fetch-Site`` values a /ui WRITE is accepted with (:func:`assert_same_origin`): the
+#: browser calls the request same-origin, or user-initiated (``none``). A GET is not held to this.
+_SAME_ORIGIN_FETCH = frozenset({"same-origin", "none"})
 
 
 #: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
@@ -546,12 +592,13 @@ def require_ui(
         if not write:
             return identity
         # Its own `if`, not `write and ...`: tests/test_security_doc_rate_limits.py reads this exact
-        # test line to plant its mutations.
+        # test line to plant its mutations. It reads the Retry-After line below the same way.
         if not auth.allow_admin_write(identity.user_id):
+            # BACKLOG #2144: the actor's own wait, the same value the JSON floor sends.
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "too many requests; please slow down",
-                headers={"Retry-After": "10"},
+                headers={"Retry-After": str(auth.admin_write_retry_after(identity.user_id))},
             )
         return identity
 
@@ -628,7 +675,8 @@ def assert_same_origin(request: Request) -> None:
 
     The **primary** CSRF defense is the SameSite=Strict session cookie: a cross-site POST carries no
     ``mf_session`` cookie, so ``require_ui`` already fails it (303 to login) before any action runs.
-    This adds an explicit origin check on top: modern browsers send ``Sec-Fetch-Site`` on every request
+    This adds an explicit origin check on top, whose exact rule is the table below. In outline:
+    modern browsers send ``Sec-Fetch-Site`` on every request
     (reject ``cross-site``/``same-site``); for older clients that omit it, fall back to comparing the
     ``Origin`` to our own origin (``[api].public_origin`` when set, else the request ``Host``, except
     behind a proxy in front of a loopback bind, where nothing matches). A same-origin form POST (the
@@ -639,16 +687,83 @@ def assert_same_origin(request: Request) -> None:
     state-changing POSTs (ASVS 3.5.1): ``POST /ui/login``, where SameSite=Strict supplies nothing
     because no session cookie exists yet, and ``POST /ui/logout``, which has no ``Depends`` gate at all
     (by design — a must-change-confined session must be able to revoke itself, ASVS 7.4.4) and so has
-    no other request-provenance control. The header-less fallthrough is safe by construction: a browser
-    attaches ``Sec-Fetch-Site`` or ``Origin`` to every cross-site POST, so only a non-browser client —
-    which cannot be CSRF-ridden — passes header-less.
+    no other request-provenance control.
+
+    **THE RULE, stated once.** This table is the one statement of what the check does with the
+    method and ONE line of each header. Other documents say the one fact they need and point here.
+    ``test_ui_origin_guard.py`` reads the table out of this docstring and drives the function over
+    every row, on the Host-fallback posture; a change to the table or to these branches that
+    leaves the other behind fails there.
+
+    What the table does not state, so it is not read as covering it:
+
+    * "matches" means :func:`_origin_matches` accepts the ``Origin``. What that function compares
+      is its own subject (a configured public origin, the ``Host`` fallback, the proxied-loopback
+      refusal) and is not restated or re-tested by the table.
+    * A repeated ``Sec-Fetch-Site`` line: this function reads the first, and
+      :class:`._security.UiFetchMetadataMiddleware` keeps the last.
+    * Values are compared as this function receives them. "any other value" is any non-empty value
+      outside the four named, so another letter case or padding is another value HERE; an HTTP
+      server may trim padding before the request arrives.
+
+    A refusal is a 403. "write" is any method but GET, to match ``require_ui``.
+
+    ======  =======================  ===============  =======
+    Method  Sec-Fetch-Site           Origin           Verdict
+    ======  =======================  ===============  =======
+    write   absent                   absent or empty  refuse
+    write   absent                   matches          accept
+    write   absent                   does not match   refuse
+    write   empty                    absent or empty  refuse
+    write   empty                    matches          accept
+    write   empty                    does not match   refuse
+    write   cross-site or same-site  any              refuse
+    write   same-origin or none      any              accept
+    write   any other value          any              refuse
+    GET     absent                   absent or empty  accept
+    GET     absent                   matches          accept
+    GET     absent                   does not match   refuse
+    GET     empty                    any              accept
+    GET     cross-site or same-site  any              refuse
+    GET     same-origin or none      any              accept
+    GET     any other value          any              accept
+    ======  =======================  ===============  =======
+
+    The write rows fail closed where the request names no provenance this code recognises
+    (BACKLOG #1116, #1124). Before that change a write was refused only for ``cross-site``,
+    ``same-site`` or a non-matching ``Origin`` with no ``Sec-Fetch-Site`` line; every other write
+    row passed, on the reasoning that a browser attaches one of the two headers to every cross-site
+    POST. That is an assumption about the browser, and nothing told the operator when it did not
+    hold. No shipped first-party client posts to ``/ui`` without a browser.
+
+    **The GET rows are the rule a GET had before that change, and must stay.** At least one GET
+    reaches this check: ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in
+    navigation. Owner rulings R4 and R4b of 2026-09-28 hold that a sign-in GET is never blocked for
+    missing fetch metadata.
     """
-    sec_fetch_site = request.headers.get("sec-fetch-site")
-    if sec_fetch_site is not None:
+    # "GET" and nothing wider, to match require_ui's own definition of a write.
+    write = request.method != "GET"
+    site = request.headers.get("sec-fetch-site")
+    # On a write an EMPTY Sec-Fetch-Site names no provenance, so it is absence, as an empty Origin
+    # is below. On a GET any present line settles it, which is the pre-#1116 rule unchanged.
+    if site if write else site is not None:
         assert_not_cross_site(request)
+        # An ALLOW set on a write, not only the two refused values above. The Fetch Metadata
+        # values are four exact lowercase tokens; anything else (an unknown token, another case,
+        # padding) is not a browser naming this request same-origin, so it fails closed.
+        if write and site not in _SAME_ORIGIN_FETCH:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "unrecognised Sec-Fetch-Site value rejected"
+            )
         return
     origin = request.headers.get("origin")
-    if origin and not _origin_matches(request.app.state, origin, request.headers.get("host")):
+    if not origin:
+        if write:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "request carries neither Sec-Fetch-Site nor Origin"
+            )
+        return
+    if not _origin_matches(request.app.state, origin, request.headers.get("host")):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-origin request rejected")
 
 
@@ -1174,10 +1289,13 @@ def require_ui_reauth_only(
     return mark_route_gate(dependency)
 
 
-async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: str) -> bool:
+async def _ui_action_step_up_ok(
+    auth: AuthService, token: str | None, action: str, *, spend: bool = True
+) -> bool:
     """The /ui step-up decision for a per-action lane (ADR 0077), mirroring
     ``api.security._action_step_up_ok``: when action-binding is enforced (default) a fresh single-use
-    grant BOUND to ``action`` (consumed here); when the org opted out
+    grant BOUND to ``action`` (consumed here, or only checked with ``spend=False``, vault BACKLOG
+    #2625); when the org opted out
     (``[auth].require_action_step_up = false``) the legacy session-window recency. Uses only PUBLIC
     ``AuthService`` members, so no cross-package private import is needed.
 
@@ -1187,25 +1305,53 @@ async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: st
     if await auth.factor_binding_is_blocked(token, action):
         return False
     if auth.action_step_up_required:
-        return await auth.has_action_step_up(token, action)
+        if spend:
+            return await auth.has_action_step_up(token, action)
+        return await auth.holds_action_step_up(token, action)
     return await auth.has_recent_step_up(token)
 
 
 def require_ui_step_up_action(
     action: str,
     *permissions: Permission,
+    phi: bool = False,
     reauth_next: Callable[[Request], str] | None = None,
+    spend: bool = True,
+    repeat: Callable[[Request], Awaitable[bool]] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_ui_step_up`, but the step-up must be a fresh proof **bound to** ``action``
     (single-use, ADR 0077 / ASVS 7.5.1), not the shared session window. Keeps the MFA gate — used for
-    the durable-takeover browser factor ops (**disable-MFA**, **webauthn-delete**). Falls back to the
-    session window under ``[auth].require_action_step_up = false``. ``new_ip`` is checked FIRST so a
-    forced new-IP step-up short-circuits and leaves the single-use grant UNCONSUMED (mirrors
-    ``api.security.require_step_up_action``)."""
+    the durable-takeover browser factor ops (**disable-MFA**, **webauthn-delete**) and, since vault
+    BACKLOG #2625, the injection and bulk lanes (resend, edit-resend, upload resend, purge, reload).
+    Falls back to the session window under ``[auth].require_action_step_up = false``. ``new_ip`` is
+    checked FIRST so a forced new-IP step-up short-circuits and leaves the single-use grant
+    UNCONSUMED (mirrors ``api.security.require_step_up_action``).
+
+    ``phi`` forwards to :func:`require_ui` exactly as :func:`require_ui_step_up`'s does.
+
+    ``spend=False`` asks only that the grant is HELD, and leaves it for a later request to spend.
+    It is for a page that opens an action without performing it, so the operator proves who they
+    are before doing work a re-auth would throw away. The route that performs the action must
+    still spend it, either through its own gate or through :func:`spend_ui_action_step_up`.
+
+    ``repeat`` answers whether the request repeats one this session spent its proof on, still
+    running or kept, or one the store already holds (vault BACKLOG #2625). It does not wait. A
+    repeat passes the gate without a proof, and the route's :func:`spend_ui_action_step_up` then
+    waits for the first request and decides: ride on it, answer with its refusal, or spend a proof.
+    Only with ``spend=False``, so nothing acts here; and only while action binding is on, with the
+    factor-binding refusal still applied first. Under the org opt-out the session window is checked
+    as on any other request. Without it, a double-click spent the proof on the first submit and
+    sent the second to re-authenticate, onto a confirm page with a fresh key. :class:`_SpentForKey`
+    says which repeats ride, and why one proof still lets at most one request commit."""
+    if repeat is not None and spend:
+        raise ValueError("repeat needs spend=False: the route must spend the proof itself")
     # mfa_refusal, NOT allow_mfa_pending: the base's gate refuses and audits a pending session, and
     # the hook only points it at /ui/reauth with the continuation. See require_ui_step_up for why.
     base = require_ui(
-        *permissions, mfa_refusal=_reauth_refusal(reauth_next), new_address_check=False
+        *permissions,
+        phi=phi,
+        mfa_refusal=_reauth_refusal(reauth_next),
+        new_address_check=False,
     )
 
     async def dependency(request: Request) -> Identity:
@@ -1219,11 +1365,226 @@ def require_ui_step_up_action(
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-        if new_ip or not await _ui_action_step_up_ok(auth, token, action):
+        if new_ip:
             raise _reauth_redirect(request, nxt)
-        return identity
+        if await _ui_action_step_up_ok(auth, token, action, spend=spend):
+            return identity
+        # Asked only once the proof is missing, and after it rather than before: a second POST in
+        # flight can find the proof gone because the first just spent it, and the first's spend is
+        # what marks this one as its repeat. The route decides what the repeat does (see above).
+        # The factor-binding refusal still applies first.
+        if (
+            repeat is not None
+            and auth.action_step_up_required
+            and not await auth.factor_binding_is_blocked(token, action)
+            and await repeat(request)
+        ):
+            return identity
+        raise _reauth_redirect(request, nxt)
 
     return mark_route_gate(dependency)
+
+
+#: How long a kept spend record outlives the request that made it. Not a security window: a
+#: record is kept only for a request the handler did not refuse, and the proof it spent still lets
+#: at most one request commit (see :class:`_SpentForKey`). It just lets a quick repeat skip the
+#: prompt.
+_SPENT_FOR_KEY_TTL_SECONDS = 300.0
+#: Bound on the spend records held at once. Fail-safe: a dropped record makes its repeat ask again.
+_SPENT_FOR_KEY_MAX = 4096
+#: How long a repeat waits for the request it repeats, the engine's default request timeout. The
+#: console's own bound, because it may be mounted where no request timeout runs. Fail-safe: a
+#: repeat that gives up is sent to re-auth, and never takes over the running request's record.
+_SPENT_FOR_KEY_WAIT_SECONDS = 120.0
+
+
+class RepeatRefused(Exception):
+    """Raised by :func:`spend_ui_action_step_up` for a repeat that waited on the request it repeats,
+    when the handler refused that request. The route answers with ``refusal``, the first request's
+    own refusal, so the repeat queues nothing and shows what the first one would have shown."""
+
+    def __init__(self, refusal: HTTPException) -> None:
+        super().__init__(refusal.status_code)
+        self.refusal = refusal
+
+
+@dataclass(eq=False)
+class ActionSpend:
+    """One request's spend of an action-bound proof. Opaque to callers:
+    :func:`spend_ui_action_step_up` returns it, and :func:`settle_ui_action_step_up` closes it."""
+
+    entry: tuple[str, str, str]
+    #: No expiry while the request runs; set when it settles without a refusal.
+    deadline: float = float("inf")
+    settled: asyncio.Event = field(default_factory=asyncio.Event)
+    #: ``None`` while the request runs; ``True`` once it settled without a refusal.
+    kept: bool | None = None
+    #: The handler's refusal, for a repeat that was waiting on this request.
+    refusal: HTTPException | None = None
+
+
+class _SpentForKey:
+    """Which requests a session spent an action-bound proof on (vault BACKLOG #2625). The caller
+    names each request from everything it carries: the idempotency key, what the key acts on, and
+    the rest of the request (the source, or the edited body), so only an identical request, a
+    double-click, is a repeat. In memory, so a second POST in flight beside the first finds the
+    spend before the first one's write commits.
+
+    A record is made just before the proof is spent, and a repeat that finds one still running
+    WAITS for it to settle. If the handler refused it, the repeat is answered with that same
+    refusal and the record is dropped, so the next submit asks for a proof again; a refusal of any
+    request riding on a record drops it too. A request that ends any other way keeps its record:
+    an error, or a cancel by a timeout or a disconnect, may come after the store committed, and a
+    repeat must then reach the store's duplicate check rather than a re-auth. If the store had not
+    committed, each repeat in the record's lifetime runs the handler on the proof that request
+    spent, and the idempotency key lets at most one of them commit. Keyed by the session's token
+    hash; bounded and TTL'd."""
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[tuple[str, str, str], ActionSpend] = OrderedDict()
+
+    def live(self, token: str, action: str, name: str) -> ActionSpend | None:
+        """The record for ``name``, still running or kept and unexpired, or ``None``."""
+        spend = self._entries.get((hash_token(token), action, name))
+        if spend is None or (spend.kept is not None and spend.deadline <= time.monotonic()):
+            return None
+        return spend
+
+    def claim(self, token: str, action: str, name: str) -> ActionSpend:
+        """A new running record for ``name``. Called only when :meth:`live` found none."""
+        now = time.monotonic()
+        spend = ActionSpend((hash_token(token), action, name))
+        self._entries.pop(spend.entry, None)
+        self._entries[spend.entry] = spend
+        # Kept records sit in settle order with one TTL, so the expired ones are at the front. A
+        # running record has no expiry and stops the sweep; the size bound still applies.
+        while self._entries and next(iter(self._entries.values())).deadline <= now:
+            self._entries.popitem(last=False)
+        while len(self._entries) > _SPENT_FOR_KEY_MAX:
+            # The oldest settled record first, so a request still running keeps its record.
+            victim = next((k for k, v in self._entries.items() if v.kept is not None), None)
+            del self._entries[victim if victim is not None else next(iter(self._entries))]
+        return spend
+
+    def settle(
+        self, spend: ActionSpend, *, refused: bool, refusal: HTTPException | None = None
+    ) -> None:
+        if refused and self._entries.get(spend.entry) is spend:
+            del self._entries[spend.entry]
+        if spend.kept is not None:  # settled already; only a refusal's drop above still applies
+            return
+        spend.kept = not refused
+        if refused and refusal is not None:
+            # A copy without the traceback, which would hold the route's frame (an edited body
+            # among its locals) for as long as the record lives.
+            spend.refusal = HTTPException(refusal.status_code, refusal.detail, refusal.headers)
+        else:
+            spend.deadline = time.monotonic() + _SPENT_FOR_KEY_TTL_SECONDS
+            if self._entries.get(spend.entry) is spend:
+                self._entries.move_to_end(spend.entry)
+        spend.settled.set()
+
+    async def await_settled(self, spend: ActionSpend) -> bool:
+        """Wait for a running request to settle; ``False`` if it did not within the bound."""
+        try:
+            await asyncio.wait_for(spend.settled.wait(), _SPENT_FOR_KEY_WAIT_SECONDS)
+        except TimeoutError:
+            return False
+        return True
+
+
+_SPENT_FOR_KEY = _SpentForKey()
+
+
+def proof_spent_for(request: Request, action: str, name: str) -> bool:
+    """Whether this session spent its ``action`` proof on the request named ``name``, and that
+    request is still running or settled without a refusal. Does not wait: a gate uses it to let a
+    repeat reach its route, where :func:`spend_ui_action_step_up` waits and decides."""
+    token = session_token(request)
+    if not token:
+        return False
+    return _SPENT_FOR_KEY.live(token, action, name) is not None
+
+
+def settle_ui_action_step_up(
+    spend: ActionSpend | None, *, refused: bool, refusal: HTTPException | None = None
+) -> None:
+    """Close out what :func:`spend_ui_action_step_up` returned. ``refused=True``, with the
+    handler's ``refusal``, drops the record, so the next submit asks for a proof again, and answers
+    any repeat waiting on it with that refusal. ``refused=False`` keeps it, so a quick repeat rides
+    on it. A route settles a refusal in its ``except`` and settles again in ``finally``; only the
+    first verdict counts. No-op for ``None``."""
+    if spend is not None:
+        _SPENT_FOR_KEY.settle(spend, refused=refused, refusal=refusal)
+
+
+async def _rider_still_allowed(
+    auth: AuthService, token: str, action: str, identity: Identity | None
+) -> bool:
+    """Re-check, after a wait, what the gate checked before it: the session is live, it resolves
+    to the same identity (roles, permissions and channel scope unchanged), its second factor is
+    satisfied, and no factor-binding block has been raised since."""
+    fresh = await auth.identity_for_token(token, activity=False)
+    return (
+        fresh is not None
+        and (identity is None or fresh == identity)
+        and await auth.mfa_satisfied(token)
+        and not await auth.factor_binding_is_blocked(token, action)
+    )
+
+
+async def spend_ui_action_step_up(
+    request: Request,
+    action: str,
+    *,
+    reauth_next: Callable[[Request], str],
+    key: str | None = None,
+    identity: Identity | None = None,
+) -> ActionSpend | None:
+    """Spend the grant a ``spend=False`` gate let through, just before the action runs (vault
+    BACKLOG #2625). A route takes this split when it checks its own input first: a refusal of that
+    input then costs the operator no proof. Sends the browser to ``/ui/reauth`` when the grant is
+    gone, for instance spent by a second tab. ``reauth_next`` is the gate's own, so both refusals
+    land on one page. No-op with no auth service, as the gate is, and under the org opt-out,
+    where there is no grant and the gate has already checked the window on this request.
+
+    With ``key``, the name of the request (see :class:`_SpentForKey`), a repeat of a request
+    already running waits for it. It rides on one that settled without a refusal, and raises
+    :class:`RepeatRefused` for one the handler refused. Returns what the caller must settle with
+    :func:`settle_ui_action_step_up`, in a ``finally`` so every way out settles it: this request's
+    own spend, or the record it rides on. ``None`` with no ``key`` and under the opt-out. A caller
+    passing ``key`` must catch :class:`RepeatRefused`. ``identity`` is the one the gate resolved; a
+    repeat that waited goes to re-auth unless its session still resolves to it."""
+    auth = get_auth(request)
+    if auth is None or not auth.action_step_up_required:
+        return None
+    token = session_token(request)
+    if key is None or not token:
+        if not await _ui_action_step_up_ok(auth, token, action):
+            raise _reauth_redirect(request, reauth_next(request))
+        return None
+    while (current := _SPENT_FOR_KEY.live(token, action, key)) is not None:
+        if current.kept is None:
+            settled = await _SPENT_FOR_KEY.await_settled(current)
+            if not settled or not await _rider_still_allowed(auth, token, action, identity):
+                raise _reauth_redirect(request, reauth_next(request))
+            if not current.kept:
+                if current.refusal is not None:
+                    raise RepeatRefused(current.refusal)
+                continue  # its own spend failed; look again, and spend a proof if none is left
+        return current  # rides on a request the handler did not refuse
+    # Claimed BEFORE the spend, with no await between the look above and here, so a second POST
+    # arriving while this one spends waits for it rather than racing it for the one proof.
+    spend = _SPENT_FOR_KEY.claim(token, action, key)
+    try:
+        ok = await _ui_action_step_up_ok(auth, token, action)
+    except BaseException:
+        _SPENT_FOR_KEY.settle(spend, refused=True)
+        raise
+    if not ok:
+        _SPENT_FOR_KEY.settle(spend, refused=True)
+        raise _reauth_redirect(request, reauth_next(request))
+    return spend
 
 
 def require_ui_reauth_only_action(
@@ -1304,6 +1665,12 @@ async def authorize_ui_ws(
         return None, None  # native client (no Origin) — the header path handles it
     if not _origin_matches(websocket.app.state, origin, websocket.headers.get("host")):
         return None, None  # cross-origin browser handshake (CSWSH) — reject
+    if session_cookie_copies(websocket) > 1:
+        # BACKLOG #2454: a repeated session cookie authenticates nothing, and the refusal is logged
+        # and audited here, since a handshake has no exception handler. The caller falls back to
+        # the header path, whose Origin check refuses a browser handshake.
+        await record_repeated_credential(websocket, "session_cookie")
+        return None, None
     token = session_token(websocket)
     if not token:
         return None, None

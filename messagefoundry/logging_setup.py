@@ -65,7 +65,12 @@ from messagefoundry.logging_guard import (
     LogWriteGuard,
     set_active_guard,
 )
-from messagefoundry.redaction import redact_untrusted
+from messagefoundry.redaction import (
+    ExcInfo,
+    prepare_log_record,
+    redact_untrusted,
+    safe_traceback,
+)
 
 # THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
 # one place so the write-time filters here and the read-time support-bundle redactor cannot disagree
@@ -91,6 +96,9 @@ __all__ = [
     "CredentialQueryScrubFilter",
     "CredentialScrubFilter",
     "SyslogForward",
+    "ForwarderStatus",
+    "FORWARD_LOSS_COUNTERS",
+    "forwarder_status",
     "query_sntp_offset",
     "LOG_LEVELS",
 ]
@@ -192,9 +200,13 @@ class ControlCharScrubFilter(logging.Filter):
         return True
 
 
-# A throwaway formatter used only to render a record's exception into text for redaction.
-# ``formatException`` is independent of any format string, so one shared instance is safe.
-_EXC_RENDERER = logging.Formatter()
+class _SafeExcFormatter(logging.Formatter):
+    """A formatter whose traceback prints a ``UnicodeError`` the way ``safe_exc`` does (vault BACKLOG
+    #3185). On the configured handlers :class:`RedactionFilter` renders the traceback first, so this
+    matters to a handler that carries no filter chain."""
+
+    def formatException(self, ei: ExcInfo) -> str:  # noqa: N802 - the stdlib's name
+        return safe_traceback(ei)
 
 
 class RedactionFilter(logging.Filter):
@@ -265,10 +277,20 @@ class RedactionFilter(logging.Filter):
         # `_rewrite_record`'s body, which is the shape BACKLOG #1478 records as a defect: four filters
         # with four copies, and the one field missing from one of them was invisible to a reviewer
         # comparing four `filter` methods. #1576 would have added a second thing to remember per field.
-        if not record.exc_text and record.exc_info:
-            record.exc_text = _EXC_RENDERER.formatException(record.exc_info)
-        record.exc_info = None
-        _rewrite_record(record, redact_untrusted)
+        #
+        # A UnicodeError prints from its attributes in the traceback and as a message or argument
+        # (vault BACKLOG #3185): its str() names the character or byte the codec failed on, which no
+        # pattern can tell from prose. The tray's chain shares the step, through the same function.
+        prepare_log_record(record)
+        try:
+            _rewrite_record(record, redact_untrusted)
+        except Exception as exc:  # noqa: BLE001 -- a log call must never raise, as in the tray's filter
+            # getMessage() runs the caller's % format and its arguments' own __str__/__repr__, and
+            # Handler.handle does not guard a filter. Fail closed: a fixed line, never the raw record.
+            record.msg = f"[log record dropped: {type(exc).__name__} while redacting it]"
+            record.args = ()
+            record.exc_text = None
+            record.stack_info = None
         return True
 
 
@@ -344,7 +366,7 @@ class CredentialScrubFilter(logging.Filter):
         return True
 
 
-class JsonFormatter(logging.Formatter):
+class JsonFormatter(_SafeExcFormatter):
     """Render each record as a single line of JSON — one object per line — for a log shipper / SIEM
     (sec-offbox-log).
 
@@ -760,7 +782,7 @@ def _make_formatter(fmt: str) -> logging.Formatter:
     """A JSON formatter for ``fmt == "json"``, else the human-readable text formatter (the default)."""
     if fmt == "json":
         return JsonFormatter()
-    formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
+    formatter = _SafeExcFormatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
     formatter.converter = time.gmtime  # emit UTC timestamps (16.2.2)
     return formatter
 
@@ -877,6 +899,21 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         self._last_undeliverable_report: float | None = None
         self._spool_drops_reported = 0
         self._last_spool_drop_report: float | None = None
+        #: ``spool.read_errors`` as of the last read-fault report (BACKLOG #2278).
+        self._spool_read_errors_reported = 0
+        self._last_spool_read_report: float | None = None
+        #: Monotonic time before which :meth:`_reclaim_spool` does not try again. 0.0 = try now.
+        self._reclaim_at = 0.0
+        self._reclaim_delay = _SPOOL_RETRY_MIN
+        self._reclaimed_at_stop = False
+        #: Records a network error cost with no spool to keep them (BACKLOG #2612). They are gone.
+        self.unsent = 0
+        #: Whether the last send hit a network error. :func:`forwarder_status` reads it. A deferred
+        #: connect (BACKLOG #1966) starts out failing; the first good send clears it.
+        self.send_failing = getattr(target, "startup_error", None) is not None
+        #: Sends that hit a network error, spooled or not. It tells a collector that is still
+        #: failing from one whose last failure is simply the last thing that happened.
+        self.send_failures = 0
 
     def handle(self, record: logging.LogRecord) -> None:
         deadline = self._drain_deadline
@@ -886,20 +923,32 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             if past_deadline:
                 self.undrained += 1
                 return
-            super().handle(record)
+            if not self._send(record):
+                # No spool, so nothing keeps it. Counted, because the collector being down is
+                # otherwise silent here until the queue fills (BACKLOG #2612).
+                self.unsent += 1
             return
         if past_deadline:
             # Shutdown: no more network, but the record is kept for the next start.
+            if not self._reclaimed_at_stop:
+                # One last try whatever the backoff says: close() frees this space a moment
+                # later anyway, and by then a record dropped for want of it is gone.
+                self._reclaimed_at_stop = True
+                self._reclaim_spool(force=True)
             if self._spool_record(record):
                 self.spooled_at_stop += 1
             else:
                 self.undrained += 1
             return
+        self._reclaim_spool()
         if spool.pending or time.monotonic() < self._retry_at:
             # Something older is still waiting, or the collector is backing off: queue behind it.
             self._spool_record(record)
             self._replay()
             return
+        # `pending` is False for an unreadable spool as well as a drained one. On a busy engine the
+        # idle poll never runs, so this is the only place that fault would be noticed.
+        self._report_spool_read_fault()
         if not self._send(record):
             self._spool_record(record)
             self._collector_failed()
@@ -915,6 +964,7 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
                     record = self._records.get(block, _SPOOL_POLL)
                     break
                 except queue.Empty:
+                    self._reclaim_spool()
                     self._replay()
         if record is self._sentinel:
             self._sentinel_queued = False
@@ -949,7 +999,10 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
                     self.undeliverable,
                 )
             return True
-        return not getattr(target, "send_failed", False)
+        self.send_failing = bool(getattr(target, "send_failed", False))
+        if self.send_failing:
+            self.send_failures += 1
+        return not self.send_failing
 
     def _spool_record(self, record: logging.LogRecord) -> bool:
         assert self.spool is not None
@@ -959,6 +1012,27 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         if not ok:
             self._report_spool_drop()
         return ok
+
+    def _reclaim_spool(self, *, force: bool = False) -> None:
+        """Try again to delete sent segments whose delete failed (BACKLOG #2279). They hold
+        delivered text and count against the cap.
+
+        Each try is one ``unlink`` per leftover on this thread, so it is not paid per record: the
+        wait doubles from :data:`_SPOOL_RETRY_MIN` to :data:`_SPOOL_RETRY_MAX` while the delete
+        keeps failing, and starts over once nothing is left. A short hold on a file (a scanner, a
+        backup agent) is then retried within seconds, and a lasting one about once a minute."""
+        spool = self.spool
+        if spool is None or not spool.undeleted_segments:
+            return
+        now = time.monotonic()
+        if not force and now < self._reclaim_at:
+            return
+        spool.reclaim()
+        if spool.undeleted_segments:
+            self._reclaim_at = now + self._reclaim_delay
+            self._reclaim_delay = min(self._reclaim_delay * 2, _SPOOL_RETRY_MAX)
+        else:
+            self._reclaim_at, self._reclaim_delay = 0.0, _SPOOL_RETRY_MIN
 
     def _collector_failed(self) -> None:
         self._retry_at = time.monotonic() + self._retry_delay
@@ -975,6 +1049,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
                 return  # shutdown began mid-batch: stop sending, keep the rest on disk
             entry = spool.peek()
             if entry is None:
+                # Drained, or unreadable just now. Only the second is a fault, and peek() counts it.
+                self._report_spool_read_fault()
                 return
             level = logging.getLevelName(entry.level)
             replayed = logging.makeLogRecord(
@@ -1001,13 +1077,59 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         self._last_spool_drop_report = now
         total = self.spool.dropped
         batch, self._spool_drops_reported = total - self._spool_drops_reported, total
+        # Two faults fill a spool without the collector being down, and "the spool is full" alone
+        # would blame neither (BACKLOG #2278, #2279). A segment that cannot be read is never sent,
+        # so never deleted. A sent segment that would not delete still counts against the cap.
+        cause = ""
+        if self.spool.read_faulted:
+            cause += (
+                " The spool cannot be read just now, and a segment that cannot be read is never "
+                "freed, so a read fault may be what filled it."
+            )
+        undeleted = self.spool.undeleted_segments
+        if undeleted:
+            cause += (
+                f" {undeleted} segment(s) already sent could not be deleted and still count "
+                "against the cap."
+            )
         _log.warning(
             "off-box log forwarding dropped %d record(s): the on-disk spool at %s is full (%d bytes "
-            "cap) or refused the write; %d dropped since this process started. Evidence for this "
-            "window does not reach the collector.",
+            "cap) or refused the write; %d dropped since this process started.%s Evidence for "
+            "this window does not reach the collector.",
             batch,
             self.spool.directory,
             self.spool.max_bytes,
+            total,
+            cause,
+        )
+
+    def _report_spool_read_fault(self) -> None:
+        """Report new spool read faults at most once per :data:`_FORWARD_DROP_REPORT_INTERVAL`
+        (BACKLOG #2278).
+
+        :meth:`LogSpool.peek` keeps every file when a read fails for a reason other than a missing
+        file, and returns ``None``, which is also what a drained spool returns. Without this report
+        the only sign was the "spool is full" drop warning, long after and naming the wrong cause.
+        The line carries a count and a directory, never a record. It is rate limited for the same
+        reason as :meth:`_report_spool_drop`: it comes back through this listener, and every pass
+        over an unreadable segment counts one more fault."""
+        assert self.spool is not None
+        total = self.spool.read_errors
+        if total == self._spool_read_errors_reported:
+            return
+        now = time.monotonic()
+        last = self._last_spool_read_report
+        if last is not None and now - last < _FORWARD_DROP_REPORT_INTERVAL:
+            return
+        self._last_spool_read_report = now
+        batch, self._spool_read_errors_reported = total - self._spool_read_errors_reported, total
+        _log.warning(
+            "off-box log forwarding could not read its on-disk spool at %s: %d read(s) failed (%d "
+            "since this process started), for a reason other than a missing file. The segments are "
+            "kept, and what they hold is not sent until a read succeeds. Newer records are sent "
+            "ahead of them meanwhile.",
+            self.spool.directory,
+            batch,
             total,
         )
 
@@ -1127,6 +1249,10 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         limited to one per :data:`_FORWARD_DROP_REPORT_INTERVAL` and carries the batch count, because
         the report is itself a log record arriving at this same full queue."""
         if not self._accepting:
+            if getattr(self._reporting, "active", False):
+                # close()'s own report, arriving at the handler it is closing. It was never going
+                # to the collector, and counting it would log a false "queue is full" drop.
+                return
             self._count_drop()
             return
         try:
@@ -1185,14 +1311,39 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
             # thread still appending would race. A thread that outlived its join keeps the lock
             # until the process exits, which is when the OS releases it anyway.
             spool.close()
-        if not drained or undelivered:
-            _log.warning(
-                "off-box log forwarding shut down with at least %d record(s) undelivered after "
-                "%.1fs (listener stopped cleanly: %s); they did not reach the collector.",
-                undelivered,
-                _FORWARD_DRAIN_TIMEOUT,
-                drained,
-            )
+        kept = self._listener.spooled_at_stop
+        undeleted = spool.undeleted_segments if spool is not None and drained else 0
+        # These two lines are logged while this handler may still be on a logger, so they come
+        # straight back to enqueue(); the flag tells it they are not dropped records.
+        self._reporting.active = True
+        try:
+            if spool is not None and drained and kept:
+                # Only once the thread has ended, so the count is final. Not a loss, so INFO.
+                _log.info(
+                    "off-box log forwarding moved %d record(s) still queued at the drain deadline "
+                    "to the on-disk spool at %s; they are sent after the next start.",
+                    kept,
+                    spool.directory,
+                )
+            if spool is not None and undeleted:
+                # close() made the last try. Say so, or duplicates at the collector after the
+                # next start have nothing in the log to explain them.
+                _log.warning(
+                    "off-box log forwarding left %d spool segment(s) at %s that were already "
+                    "sent and could not be deleted; the next start sends them again.",
+                    undeleted,
+                    spool.directory,
+                )
+            if not drained or undelivered:
+                _log.warning(
+                    "off-box log forwarding shut down with at least %d record(s) undelivered "
+                    "after %.1fs (listener stopped cleanly: %s); they did not reach the collector.",
+                    undelivered,
+                    _FORWARD_DRAIN_TIMEOUT,
+                    drained,
+                )
+        finally:
+            self._reporting.active = False
         super().close()
 
 
@@ -1215,19 +1366,54 @@ def _build_queued_forwarder(
     return handler
 
 
+def _warn_leftover_segments(spool_dir: str, why: str) -> None:
+    """Log one WARNING if ``spool_dir`` holds segments this start will not send (BACKLOG #2279).
+
+    Warn, never delete: they are records that were not delivered, and a delete cannot be undone."""
+    from messagefoundry.log_spool import count_segments
+
+    try:
+        leftover = count_segments(spool_dir)
+    except OSError as exc:
+        _log.warning(
+            "%s, and %s could not be checked for spool segments an earlier run left: %s",
+            why,
+            spool_dir,
+            exc,
+        )
+        return
+    if leftover:
+        _log.warning(
+            "%s, but %s still holds %d spool segment(s) from an earlier run. They are not sent "
+            "and not deleted. Once the spool runs again it sends them; or remove them by hand "
+            "when they are no longer needed.",
+            why,
+            spool_dir,
+            leftover,
+        )
+
+
 def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     """The opened on-disk spool for ``forward``, or ``None`` when it has none or cannot use it.
 
     A spool that cannot be opened (an unwritable directory, or one another process holds) warns and
     leaves the forwarder spool-less rather than refusing to start: the spool adds durability to a
     best-effort stream, and losing it must not cost the message path its start (BACKLOG #1966)."""
-    if not forward.spool_dir or forward.spool_max_bytes <= 0:
+    if not forward.spool_dir:
+        return None
+    if forward.spool_max_bytes <= 0:
+        _warn_leftover_segments(
+            forward.spool_dir,
+            "the on-disk log spool is turned off ([logging].forward_spool_max_bytes = 0)",
+        )
         return None
     spool = LogSpool(forward.spool_dir, max_bytes=forward.spool_max_bytes)
     try:
         spool.open()
     except SpoolUnavailable as exc:
         _log.warning("%s; off-box log forwarding runs without an on-disk spool", exc)
+        if not exc.in_use:  # the process that holds it sends what it holds
+            _warn_leftover_segments(forward.spool_dir, "the on-disk log spool could not be opened")
         return None
     return spool
 
@@ -1244,6 +1430,137 @@ def _forward_targets(logger: logging.Logger) -> list[logging.Handler]:
         if isinstance(handler, _ForwardQueueHandler):
             targets.extend(handler.targets)
     return targets
+
+
+# --- forwarder health, for the alert and GET /status (BACKLOG #2612) ------------------------------
+
+#: What the last :func:`configure_logging` call was asked for, and how a failed start ended.
+#: Module state because the forwarder is process-wide, like the root logger it hangs on.
+_forward_configured = False
+_forward_start_failure = ""
+#: False for a UDP forwarder. See :attr:`ForwarderStatus.delivery_confirmed`.
+_forward_delivery_confirmed = True
+
+#: The :class:`ForwarderStatus` counts that are LOSSES, each with the fixed word an alert names it
+#: by. The one list: :attr:`ForwarderStatus.lost` adds these up, and the watch names the ones that
+#: rose (``pipeline/log_forward_watch.py``).
+FORWARD_LOSS_COUNTERS = (
+    ("queue_dropped", "queue_full"),
+    ("unsent", "collector_unreachable"),
+    ("undeliverable", "send_error"),
+    ("spool_dropped", "spool_refused"),
+    ("spool_skipped", "spool_damaged"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ForwarderStatus:
+    """A point-in-time reading of the off-box log forwarder. Counts and fixed words only: never a
+    record, a host name or an exception text. Every count but ``queued`` is since this process
+    started. Every count reads zero while :attr:`installed` is false, whatever was counted before:
+    that covers a listener thread that ended with the handler still queuing.
+
+    One reading per process. Under engine shards each ``serve --shard`` process has its own
+    forwarder, so each reports its own."""
+
+    #: Whether ``[logging].forward_host`` asked for a forwarder at all.
+    configured: bool = False
+    #: Whether a forwarder is attached and accepting records.
+    installed: bool = False
+    #: Why a configured forwarder is not installed: ``"permanent"`` (a certificate that fails
+    #: verification or a name that does not resolve), ``"transient"`` (the collector did not answer
+    #: and there is no spool to wait behind), or ``""``.
+    start_failure: str = ""
+    #: Whether a send that does not reach the collector is visible here at all. ``False`` over
+    #: UDP, where no failed send is counted (a datagram to a dead collector raises nothing, and
+    #: the UDP handler's own send errors are not read either): ``send_failing``, ``unsent`` and so ``lost`` then stay
+    #: at zero while every record is lost on the wire, and only queue and spool losses count.
+    delivery_confirmed: bool = True
+    #: Whether the last send hit a network error. Also true from a deferred start, where the
+    #: connect failed, until the first good send. A spool keeps the records while it has room.
+    send_failing: bool = False
+    #: Sends that hit a network error, whether or not a spool kept the record.
+    send_failures: int = 0
+    #: Records on the in-memory hand-off queue right now. A level, not a loss. Records waiting in
+    #: the on-disk spool are not in it, and no field here counts them.
+    queued: int = 0
+    #: Records dropped because the hand-off queue was full.
+    queue_dropped: int = 0
+    #: Records a network error cost, with no spool to keep them.
+    unsent: int = 0
+    #: Records dropped for a send error that was not a network error.
+    undeliverable: int = 0
+    #: Records the on-disk spool refused: full, or the write failed.
+    spool_dropped: int = 0
+    #: Spooled records skipped as torn or malformed, and segments found gone before they were sent.
+    spool_skipped: int = 0
+    #: Spool reads that failed for a reason other than a missing file. Held, not lost.
+    spool_read_errors: int = 0
+    #: Whether the last spool read failed that way.
+    spool_read_faulted: bool = False
+
+    @property
+    def lost(self) -> int:
+        """Records that will not reach the collector, as a floor: the five counted causes only."""
+        return sum(getattr(self, field) for field, _ in FORWARD_LOSS_COUNTERS)
+
+    @property
+    def state(self) -> str:
+        """``"off"``, ``"not_installed"``, ``"degraded"``, ``"unconfirmed"`` or ``"healthy"``.
+
+        ``degraded`` means :attr:`send_failing` is set, the spool cannot be read, or a record was
+        lost since this process started. The last one does not clear while this forwarder runs: the
+        records are still missing at the collector. ``unconfirmed`` is a forwarder with no fault
+        seen whose protocol cannot show one (:attr:`delivery_confirmed`), so it is never called
+        healthy."""
+        if not self.configured:
+            return "off"
+        if not self.installed:
+            return "not_installed"
+        if self.send_failing or self.spool_read_faulted or self.lost:
+            return "degraded"
+        return "healthy" if self.delivery_confirmed else "unconfirmed"
+
+
+def forwarder_status() -> ForwarderStatus:
+    """Read the forwarder's health from memory. It touches no socket and no disk, so it is safe on
+    the event loop and still answers when the collector does not.
+
+    The counters belong to other threads and are read without their locks. Each is one integer
+    that only goes up, so a reading is at worst one record behind."""
+    configured, start_failure = _forward_configured, _forward_start_failure
+    confirmed = _forward_delivery_confirmed
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, _ForwardQueueHandler) and handler._accepting:
+            break
+    else:
+        return ForwarderStatus(
+            configured=configured, start_failure=start_failure, delivery_confirmed=confirmed
+        )
+    listener = handler._listener
+    thread = listener._thread
+    if thread is not None and not thread.is_alive():
+        # The listener thread ended without being stopped. The handler still queues, and
+        # nothing takes a record off the queue, so this forwarder sends nothing.
+        return ForwarderStatus(
+            configured=True, start_failure=start_failure, delivery_confirmed=confirmed
+        )
+    spool = listener.spool
+    return ForwarderStatus(
+        configured=True,
+        installed=True,
+        delivery_confirmed=confirmed,
+        send_failing=listener.send_failing,
+        send_failures=listener.send_failures,
+        queued=handler._records.qsize(),
+        queue_dropped=handler.dropped,
+        unsent=listener.unsent,
+        undeliverable=listener.undeliverable,
+        spool_dropped=spool.dropped if spool is not None else 0,
+        spool_skipped=spool.unreadable if spool is not None else 0,
+        spool_read_errors=spool.read_errors if spool is not None else 0,
+        spool_read_faulted=spool.read_faulted if spool is not None else False,
+    )
 
 
 def _resolve_level(level: str) -> int:
@@ -1354,16 +1671,31 @@ def configure_logging(
     set_active_guard(guard)
 
     forwarder_installed = False
+    global _forward_configured, _forward_start_failure, _forward_delivery_confirmed
+    _forward_configured, _forward_start_failure = forward is not None, ""
+    # UDP is fire-and-forget (RFC 5426): a send that reaches nobody raises nothing here.
+    _forward_delivery_confirmed = forward is None or forward.protocol != "udp"
     if forward is not None:
         spool = _open_forward_spool(forward)
         try:
             fwd_handler = _build_syslog_handler(forward, defer_connect=spool is not None)
         except BaseException as exc:
             if spool is not None:
-                spool.close()  # on ANY failure, or the lock outlives it (InsecureHopRefused too)
+                # On ANY failure, or the lock outlives it (InsecureHopRefused too). The spool was
+                # opened first because whether to defer the connect depends on having one; with no
+                # forwarder to put behind it, take back the directory and lock file this call
+                # created. Segments an earlier run left are kept (BACKLOG #2279).
+                spool.discard_unused()
+                if isinstance(exc, OSError) and forward.spool_dir:
+                    _warn_leftover_segments(
+                        forward.spool_dir, "off-box log forwarding did not start"
+                    )
             if not isinstance(exc, OSError):
                 raise
-            if is_permanent_connect_error(exc):
+            permanent = is_permanent_connect_error(exc)
+            # A fixed word, read by forwarder_status(): this is what the alert and /status carry.
+            _forward_start_failure = "permanent" if permanent else "transient"
+            if permanent:
                 # Never deferred, even with a spool: waiting cannot fix a bad certificate or name.
                 _log.error(
                     "off-box log forwarding to %s:%d (%s) failed permanently: %s; fix the collector "

@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from typing import Any, NoReturn
 from uuid import uuid4
 
+from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.settings import ApprovalsSettings
@@ -103,6 +104,11 @@ DRAIN_TIMEOUT_SECONDS = 3.0
 #: Fixed, so a plain ``serve`` recognises its own claims after a restart. Two such engines over one
 #: store would share it; that layout is unsupported for other reasons too (``__main__`` says why).
 DEFAULT_CLAIM_OWNER = "engine"
+
+#: How many open requests :meth:`ApprovalGate.rejoin` reads, newest first. A repeat whose request
+#: sits further back is not found there and falls through to the proof and :meth:`ApprovalGate.guard`,
+#: whose own repeat rule still joins it; only the proof-free path is lost.
+REJOIN_SCAN_LIMIT = 1000
 
 
 @dataclass(frozen=True)
@@ -433,9 +439,16 @@ class ApprovalGate:
         **A repeat files nothing (vault BACKLOG #2445).** When the same requester already has an
         OPEN request for this operation with identical captured params, that request's id is
         returned, so the endpoint answers the same 202. An ``approval.request_repeated`` row names
-        the requester and the request they were pointed at. This covers a retried IDE promote, a
-        double click in the web console, an API client that retries, and two such calls racing:
-        the store makes the check and the insert one serialized step.
+        the requester and the request they were pointed at. Two such calls racing land on one
+        request: the store makes the check and the insert one serialized step.
+
+        **A repeat that reaches here has already paid its step-up.** The JSON purge and reload
+        routes take a single-use proof bound to their action (vault BACKLOG #2625). They can call
+        :meth:`rejoin` BEFORE the proof is demanded, so a repeat that rejoins there needs no proof
+        and never gets this far. A repeat still arrives here with a spent proof in at least these
+        cases. The routes skip the rejoin when the session window has lapsed, and for a purge that
+        would now be refused. The console's purge and reload demand a proof on every request. A
+        repeat can also race the first request's commit.
 
         **A different requester gets their own request.** The requester of record is the person
         whose authority :meth:`approve` re-checks (ASVS 8.3.2), and the executors attribute their
@@ -522,6 +535,73 @@ class ApprovalGate:
                 operation,
                 scrub_log_argument(requester),
             )
+        return held
+
+    async def rejoin(
+        self,
+        operation: str,
+        params: Mapping[str, Any],
+        *,
+        requester: str,
+        requester_user_id: str,
+        client: str | None = None,
+    ) -> str | None:
+        """Point a repeat at the requester's OPEN request, filing nothing (vault BACKLOG #2625).
+
+        Returns the id :meth:`guard` would join this request to, after writing the same
+        ``approval.request_repeated`` row, or ``None`` when there is no such request, or dual
+        control does not gate ``operation``. ``None`` means the caller goes on to its step-up proof
+        and then :meth:`guard`. The match is :meth:`guard`'s: same operation, same captured params,
+        same ``requester_user_id``, pending and unexpired, oldest first.
+
+        It exists so a route can answer a repeat BEFORE it demands an action-bound proof. Returning
+        an id here never runs anything and never holds anything new, so a caller who already has an
+        open request needs no new proof to be told its id again. Its permissions, pacing, MFA and
+        the rest of its gate still apply. A first request still needs the proof, because this finds
+        nothing for it.
+
+        **The read and the audit row are two steps, not one.** A request approved, rejected or
+        expired between them is still named in the 202. Nothing new runs or is held because of it.
+        The read also covers only the newest :data:`REJOIN_SCAN_LIMIT` open requests; past that, the
+        repeat needs a proof, and :meth:`guard` then joins it."""
+        if not self._gated(operation) or not requester_user_id:
+            return None
+        wanted = json.dumps(dict(params), sort_keys=True)
+        rows = await self._store.list_pending_approvals(now=self._clock(), limit=REJOIN_SCAN_LIMIT)
+        matches = [
+            r
+            for r in rows
+            if str(r["operation"]) == operation
+            and str(r["params"]) == wanted
+            and str(r["requester_user_id"] or "") == requester_user_id
+        ]
+        if not matches:
+            return None
+        held = str(min(matches, key=lambda r: float(r["requested_at"]))["id"])
+        try:
+            await self._store.record_audit(
+                "approval.request_repeated",
+                actor=requester,
+                detail=json.dumps({"approval_id": held, "operation": operation}),
+                client=client,  # ADR 0150: the requester's own address
+            )
+        except Exception:
+            log.exception(
+                "approval %s: the approval.request_repeated row for a repeat %s request failed. "
+                "The request is still held under this id. Lost detail: actor=%s",
+                held,
+                operation,
+                scrub_log_argument(requester),  # CodeQL py/log-injection; see scrub_log_argument
+            )
+            self._alert_lost_audit(held, "approval.request_repeated")
+            raise
+        log.info(
+            "approval %s: a repeat %s request by %s rejoined it before its step-up; nothing new is "
+            "held",
+            held,
+            operation,
+            scrub_log_argument(requester),
+        )
         return held
 
     async def list_pending(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
@@ -1103,19 +1183,18 @@ class ApprovalGate:
         For a row whose answer stands whether or not it lands: a refusal, which runs nothing and
         leaves the request pending, or an outcome the gate has already settled. Before vault
         BACKLOG #2255 a failed write at the refusals turned a documented 409 into a raw 500. The
-        loss is logged at ERROR with ``context`` and the detail, and paged."""
-        try:
-            await self._store.record_audit(action, actor=actor, detail=detail, client=client)
-        except Exception:  # noqa: BLE001 - every store backend raises its own type
-            log.exception(
-                "approval %s: %s, but its %s audit row failed. Lost detail: %s",
-                approval_id,
-                context,
-                action,
-                # The detail names the requester. It is JSON, so the scrub leaves it byte-identical;
-                # it is here for CodeQL py/log-injection, which cannot see that.
-                scrub_log_argument(detail),
-            )
+        loss is logged at ERROR with ``context`` and the detail, and paged. ``defects=()``: some
+        callers run after the operation executed, and a defect raised there would skip the page
+        and report an executed release as a 500 (vault BACKLOG #2260)."""
+        if not await write_audit_soft(
+            lambda: self._store.record_audit(action, actor=actor, detail=detail, client=client),
+            log=log,
+            message="approval %s: %s, but its %s audit row failed. Lost detail: %s",
+            # The detail names the requester. It is JSON, so the scrub leaves it byte-identical;
+            # it is here for CodeQL py/log-injection, which cannot see that.
+            args=lambda: (approval_id, context, action, scrub_log_argument(detail)),
+            defects=(),
+        ):
             self._alert_lost_audit(approval_id, action)
 
     async def _requester_standing(

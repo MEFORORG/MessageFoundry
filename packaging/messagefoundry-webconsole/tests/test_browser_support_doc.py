@@ -15,7 +15,11 @@ literal in this file:
 * each row's verdict on ABSENCE is found by running the code without that header;
 * the opt-out cookie names come from the resolvers themselves;
 * the HSTS conditions come from calling ``hsts_notable``;
-* the IDE webview list comes from the files that set a webview's HTML.
+* the IDE webview list comes from the files that set a webview's HTML;
+* the two IDE banner quotes come from ``ide/src/webviewMessaging.ts``, and "every panel that runs a
+  script" from which of those files embed the banners;
+* the denial page's status, header, two shapes and policy come from running the middleware;
+* which API page has a no-JavaScript message comes from FastAPI's own page builders.
 
 Each carries a positive control, so a green run cannot be an extraction that found nothing.
 """
@@ -32,8 +36,11 @@ from typing import Any, cast
 
 import pytest
 from fastapi import HTTPException
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
+import messagefoundry.api.client_networks as client_networks
 import messagefoundry.api.header_floor as header_floor
 import messagefoundry.api.security as engine_security
 import messagefoundry_webconsole
@@ -218,7 +225,8 @@ async def test_each_fetch_metadata_rows_absence_verdict_matches_the_middleware()
 
 def _fake_request(headers: dict[str, str]) -> Any:
     state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
-    return SimpleNamespace(headers=headers, app=SimpleNamespace(state=state))
+    # A POST: the row is the form-POST row, and the check keeps its earlier rule on a GET.
+    return SimpleNamespace(method="POST", headers=headers, app=SimpleNamespace(state=state))
 
 
 def test_the_form_post_origin_rows_absence_verdict_matches_assert_same_origin() -> None:
@@ -255,7 +263,7 @@ def _fake_websocket(headers: dict[str, str]) -> Any:
         auth=None,
     )
     return SimpleNamespace(
-        headers=headers,
+        headers=Headers(headers),  # has getlist (BACKLOG #2454)
         app=SimpleNamespace(state=state),
         url=SimpleNamespace(scheme="wss", path="/ws/stats"),
         cookies=_RecordingCookies(),
@@ -430,4 +438,165 @@ def test_the_ide_section_names_every_webview_and_its_startup_check() -> None:
     claimed = {name for name, row in by_source.items() if re.search(r"within \d", row[-1])}
     assert claimed == checked, (claimed, checked)
     lead = " ".join(_section(_IDE_HEADING).split())
-    assert ("Only one webview checks that its script started" in lead) == (len(checked) == 1)
+    assert ("Only one webview also has a host-side startup check" in lead) == (len(checked) == 1)
+
+
+# --- the IDE startup banners (BACKLOG #1116, #1124) -------------------------------------------------
+
+_IDE_BANNERS_SOURCE = "webviewMessaging.ts"
+_BANNERS_EMBED = "${STARTUP_BANNERS}"
+#: A banner as the helper writes it: ``<div id="${NAME}" role="alert" ...>text</div>``.
+_BANNER_RE = re.compile(r'<div id="\$\{(\w+)\}" role="alert"[^>]*>([^<]+)</div>')
+#: The one panel file whose script-running documents are all built by another file's builder.
+_DELEGATING_PANELS = {"configEditors.ts": ("connectionFormHtml", "codeSetFormHtml")}
+
+
+def _quoted_blocks(section: str) -> list[str]:
+    """Each Markdown block quote in ``section``, joined to one line."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in [*section.splitlines(), ""]:
+        if line.startswith(">"):
+            current.append(line.lstrip("> ").strip())
+        elif current:
+            blocks.append(" ".join(current))
+            current = []
+    return blocks
+
+
+def test_the_ide_section_quotes_both_banners_as_the_code_writes_them() -> None:
+    """The page tells a reader what each warning SAYS. Both quotes are compared with the text in
+    ``webviewMessaging.ts``, so a reworded banner cannot leave the page describing the old one."""
+    panels = {path.name: path for path in _ide_panel_sources()}
+    helper = next(iter(panels.values())).parent / _IDE_BANNERS_SOURCE
+    banners = dict(_BANNER_RE.findall(helper.read_text(encoding="utf-8")))
+    # positive control: the extraction finds the two banners that ship today
+    assert set(banners) == {"SCRIPT_BANNER_ID", "CSP_BANNER_ID"}, banners
+    quotes = _quoted_blocks(_section(_IDE_HEADING))
+    for name, text in banners.items():
+        assert text in quotes, (
+            f"docs/BROWSER-SUPPORT.md does not quote the {name} banner as "
+            f"{_IDE_BANNERS_SOURCE} writes it: {text!r}"
+        )
+
+
+def test_every_ide_panel_that_runs_a_script_carries_the_banners() -> None:
+    """The section says EVERY panel that runs a script warns. Each file that sets a webview's HTML
+    must embed the banners itself, or be a named delegator whose builders live in files that do.
+    ``ide/src/test/suite/startup-banners.test.ts`` checks the same wiring one assignment at a time."""
+    panels = {path.name: path.read_text(encoding="utf-8") for path in _ide_panel_sources()}
+    carriers = {name for name, source in panels.items() if _BANNERS_EMBED in source}
+    # positive control: the scan sees real carriers, so an empty set is a broken search
+    assert {"home.ts", "stepsView.ts", "testBench.ts"} <= carriers, sorted(carriers)
+    for name in sorted(set(panels) - carriers):
+        builders = _DELEGATING_PANELS.get(name)
+        assert builders, (
+            f"{name} sets a webview's HTML and does not embed the startup banners, so the page's "
+            f"claim that every panel with a script warns is no longer true"
+        )
+        for builder in builders:
+            homes = [n for n in carriers if f"function {builder}(" in panels[n]]
+            assert len(homes) == 1 and builder in panels[name], (name, builder, homes)
+    lead = " ".join(_section(_IDE_HEADING).split())
+    assert "Every panel that runs a script warns you when that script has not started" in lead
+
+
+# --- the client-network denial page -----------------------------------------------------------------
+
+_DENIAL_HEADING = "## The client-network denial page needs no browser feature"
+
+
+async def _denial(path: str, accept: str | None) -> tuple[int, dict[str, str], str]:
+    """What ``ClientNetworkMiddleware`` answers a refused address on ``path``."""
+
+    async def inner(scope: Scope, receive: Receive, send: Send) -> None:
+        raise AssertionError("a refused address reached the app")
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    state = SimpleNamespace(client_networks=("192.0.2.0/24",))
+    scope: Scope = {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "headers": [(b"accept", accept.encode("latin-1"))] if accept else [],
+        "client": ("198.51.100.7", 4000),
+        "app": SimpleNamespace(state=state),
+    }
+    await client_networks.ClientNetworkMiddleware(inner)(scope, receive, send)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in start["headers"]}
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return int(start["status"]), headers, body.decode("utf-8")
+
+
+async def test_the_denial_page_section_states_what_the_middleware_answers() -> None:
+    section = " ".join(_section(_DENIAL_HEADING).split())
+    marker = f"`{client_networks.DENIAL_HEADER}: {client_networks.DENIAL_MARKER}`"
+    assert marker in section, marker
+    shapes = {
+        "ui": await _denial("/ui/messages", None),
+        "html": await _denial("/status", "text/html,application/xhtml+xml"),
+        "json": await _denial("/status", "application/json"),
+        "bare": await _denial("/status", None),
+    }
+    for name, (status_code, headers, _body) in shapes.items():
+        assert status_code == 403, (name, status_code)
+        assert headers[client_networks.DENIAL_HEADER.lower()] == client_networks.DENIAL_MARKER, name
+    assert "`403`" in section
+    # the two shapes, and which request gets which
+    assert {n for n, s in shapes.items() if s[1]["content-type"].startswith("text/html")} == {
+        "ui",
+        "html",
+    }
+    assert {
+        n for n, s in shapes.items() if s[1]["content-type"].startswith("application/json")
+    } == {
+        "json",
+        "bare",
+    }
+    assert "`/ui`" in section and "`text/html`" in section and "JSON" in section
+    page = shapes["ui"][2]
+    heading = re.search(r"<h1>([^<]+)</h1>", page)
+    assert heading and heading.group(1) in section, heading
+    assert "198.51.100.7" in page and "198.51.100.7" in shapes["json"][2]
+    # "runs no script": true of the page and of its policy, and the section says so only then
+    policy = shapes["ui"][1]["content-security-policy"]
+    scriptless = "<script" not in page.lower() and "script-src" not in policy
+    assert ("It runs no script" in section) == scriptless
+    for directive in ("default-src 'none'", "frame-ancestors 'none'", "base-uri 'none'"):
+        assert directive in policy, (directive, policy)
+        assert f"`{directive}`" in section, directive
+    # control: an allowed address is not denied, so the 403s above are the rule and not a default
+    assert client_networks.client_network_allowed("192.0.2.9", ("192.0.2.0/24",))
+    for exempt in sorted(client_networks._EXEMPT_PATHS):
+        assert f"`{exempt}`" in section, exempt
+
+
+# --- the API pages' no-JavaScript message -----------------------------------------------------------
+
+_API_PAGES_HEADING = "## The engine's API pages load third-party scripts"
+
+
+def test_the_api_pages_section_states_which_page_has_a_no_javascript_message() -> None:
+    """``/redoc`` carries FastAPI's ``<noscript>`` line and ``/docs`` carries none. The section says
+    which page warns and which is blank, so a FastAPI upgrade that changes either moves this test."""
+    redoc = bytes(get_redoc_html(openapi_url="/openapi.json", title="t").body).decode("utf-8")
+    swagger = bytes(get_swagger_ui_html(openapi_url="/openapi.json", title="t").body).decode(
+        "utf-8"
+    )
+    section = " ".join(_section(_API_PAGES_HEADING).split())
+    warned = re.search(r"<noscript>\s*(.*?)\s*</noscript>", redoc, re.DOTALL)
+    assert ("`/redoc` with JavaScript off shows FastAPI's own line" in section) == bool(warned)
+    if warned:
+        first_sentence = warned.group(1).split(". ")[0] + "."
+        assert first_sentence in section, first_sentence
+    assert ("`/docs` with JavaScript off is a blank page" in section) == (
+        "<noscript" not in swagger
+    )

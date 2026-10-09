@@ -60,7 +60,7 @@ from messagefoundry.api.models import (
     ClusterStatus,
     ClusterStepdownResult,
     ConfigProvenance,
-    ConnectionEventInfo,
+    ConnectionEventList,
     ConnectionRow,
     DeadLetterList,
     DeadLetterReplayResult,
@@ -1097,16 +1097,20 @@ class EngineClient:
         console's sensitive actions run on the Qt main thread, so a modal dialog is safe)."""
         self._step_up_handler = handler
 
-    def reauth(self, password: str) -> None:
+    def reauth(self, password: str, *, purpose: str | None = None) -> None:
         """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
         session's step-up window. Raises :class:`ApiError` (status 403) on a wrong password. Does not
         itself trigger the step-up handler (``/me/reauth`` is not a step-up-gated route).
 
         When the 403 that triggered this reauth named a per-action step-up (``X-Step-Up-Action``, ADR
         0077), the stashed action rides along as ``purpose`` so the engine mints a grant BOUND to it;
-        a plain session-window step-up posts ``{"password": …}`` unchanged."""
+        a plain session-window step-up posts ``{"password": …}`` unchanged.
+
+        ``purpose`` names the action up front instead, for a caller that proves BEFORE the call it
+        is about to make, so the refusal and the retry never happen (vault BACKLOG #2625: a timed
+        reload must not carry a step-up inside its timer). It wins over a stashed action."""
         self._refuse_credential_on_cleartext("a password")
-        action = self._pending_step_up_action
+        action = purpose if purpose is not None else self._pending_step_up_action
         self._pending_step_up_action = None  # single-use: one reauth per named action
         body: dict[str, str] = {"password": password}
         if action is not None:
@@ -1351,17 +1355,27 @@ class EngineClient:
         connection: str | None = None,
         kind: str | None = None,
         limit: int = 200,
+        offset: int = 0,
+        before_id: int | None = None,
         reveal: int | None = None,
-    ) -> list[ConnectionEventInfo]:
+    ) -> ConnectionEventList:
         """The Corepoint-style connection/transport event log (#46), newest first. It needs only
         ``monitoring:read``, but it is not PHI-free: ``reason`` is scrubbed free text that
         ``docs/PHI.md`` section 2 gives a protection level. So ``reason`` is null without
         ``messages:view_summary`` and a fixed mask with it, and ``reveal`` names ONE event whose
-        reason comes back whole, an audited PHI read (BACKLOG #2443)."""
+        reason comes back whole, an audited PHI read (BACKLOG #2443). ``offset`` pages it against
+        the result's ``total``; pass the result's ``before_id`` back with the next offset so the
+        pages read one snapshot (BACKLOG #2438)."""
         response = self._get(
-            "/events", connection=connection, kind=kind, limit=limit, reveal=reveal
+            "/events",
+            connection=connection,
+            kind=kind,
+            limit=limit,
+            offset=offset,
+            before_id=before_id,
+            reveal=reveal,
         )
-        return [ConnectionEventInfo.model_validate(e) for e in response.json()]
+        return ConnectionEventList.model_validate(response.json())
 
     def replay_dead_letters(
         self, *, channel_id: str | None = None, destination_name: str | None = None
@@ -1821,8 +1835,10 @@ class EngineClient:
     def delete_user(self, user_id: str) -> None:
         self._request("DELETE", f"/users/{_seg(user_id)}")
 
-    def audit(self, *, limit: int = 100) -> AuditList:
-        return _decode(self._get("/audit", limit=limit), AuditList)
+    def audit(self, *, limit: int = 100, offset: int = 0, as_of: float | None = None) -> AuditList:
+        """One page of the audit trail; ``total`` on the result places it, and its ``as_of``
+        passed back with the next offset keeps the pages on one snapshot (BACKLOG #2438)."""
+        return _decode(self._get("/audit", limit=limit, offset=offset, as_of=as_of), AuditList)
 
     def ad_group_map(self) -> AdGroupMap:
         return _decode(self._get("/ad-group-map"), AdGroupMap)

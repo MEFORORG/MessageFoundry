@@ -78,6 +78,7 @@ jobs:
           # CA+CRL is minted in the run block. The two `warn` legs below only warn, so they need none.
           MEFOR_LOGGING_FORWARD_HOST: siem.invalid
           MEFOR_LOGGING_FORWARD_PROTOCOL: tls
+          MEFOR_EGRESS_ALLOWED_SYSLOG: siem.invalid  # BACKLOG #2356: the collector is an egress destination
         run: |
           set -o pipefail
           syslogCa="$(python scripts/ci/make_syslog_ca_crl.py "$RUNNER_TEMP/syslog-ca")"
@@ -144,7 +145,7 @@ jobs:
           [ -n "$ready" ] && [ "$rig_rc" -ne 4 ]
       - name: Upload baseline report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: baseline-sqlite
           path: out/load/
@@ -320,7 +321,7 @@ jobs:
           set -e
       - name: Upload baseline report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: baseline-postgres
           path: out/load/
@@ -517,7 +518,7 @@ jobs:
           set -e
       - name: Upload baseline report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: baseline-sqlserver
           path: out/load/

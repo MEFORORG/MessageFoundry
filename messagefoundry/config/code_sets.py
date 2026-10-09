@@ -53,6 +53,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from messagefoundry.redaction import codec_safe_str
+
 __all__ = [
     "CODESETS_DIR_NAME",
     "POLICY_SIDECAR_SUFFIX",
@@ -462,7 +464,9 @@ def load_policy(codeset_path: str | Path) -> UnmappedPolicy:
         with sidecar.open("rb") as fh:
             raw = tomllib.load(fh)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as exc:
-        invalid: str | None = f"policy sidecar {sidecar.name!r}: invalid TOML — {exc}"
+        invalid: str | None = (
+            f"policy sidecar {sidecar.name!r}: invalid TOML — {codec_safe_str(exc)}"
+        )
     else:
         invalid = None
     if invalid is not None:
@@ -506,7 +510,29 @@ def load_code_sets(codesets_dir: str | Path) -> dict[str, CodeSet]:
 
 
 def _load_csv(path: Path) -> dict[str, Any]:
-    """CSV with a header row: first column = key; one other column → scalar, several → ``{header: cell}``."""
+    """CSV with a header row: first column = key; one other column → scalar, several → ``{header: cell}``.
+
+    A file that is not UTF-8, that the ``csv`` module refuses, or that cannot be opened, is a
+    :class:`CodeSetError` naming the file, as a malformed TOML one is. Each used to escape raw, past
+    every caller's
+    ``CodeSetError`` arm, and the decode error's text names the byte it failed on (vault BACKLOG
+    #3295). The reader decodes as it iterates, so the whole read is inside the arms.
+
+    No position is given for a decode error: the reader decodes a block at a time, so the error's
+    offset is into that block, not into the file."""
+    try:
+        return _read_csv(path)
+    except UnicodeDecodeError:
+        invalid = f"code set {path.name!r}: invalid CSV — the file is not valid UTF-8"
+    except csv.Error as exc:  # its text is one of the module's fixed phrases
+        invalid = f"code set {path.name!r}: invalid CSV — {exc}"
+    except OSError as exc:  # as _load_toml maps it: an unreadable file is refused by name
+        invalid = f"code set {path.name!r}: invalid CSV — {exc}"
+    # Raised after the handler: the decode error's .object is a block of the file.
+    raise CodeSetError(invalid)
+
+
+def _read_csv(path: Path) -> dict[str, Any]:
     data: dict[str, Any] = {}
     with path.open(newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
@@ -547,7 +573,7 @@ def _load_toml(path: Path) -> dict[str, Any]:
         with path.open("rb") as fh:
             raw = tomllib.load(fh)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as exc:
-        invalid = f"code set {path.name!r}: invalid TOML — {exc}"
+        invalid = f"code set {path.name!r}: invalid TOML — {codec_safe_str(exc)}"
     else:
         # tomllib already rejects duplicate keys (TOMLDecodeError), so no extra dup check is needed.
         return dict(raw)

@@ -300,6 +300,25 @@ from typing import Any
 #: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
 #: signatures changed.
 #:
+#: BACKLOG #2438: the audit, security-event and event-log pages page by ``offset`` against a
+#: total. ``AuditList`` and ``SecurityEventsList`` gained the required ``total``, ``limit`` and
+#: ``offset``; ``CoreHandlers`` gained the required ``connection_event_page``, which returns the new
+#: ``ConnectionEventList``; ``list_audit`` and ``my_security_events`` take the keyword ``offset``.
+#: ``list_connection_events`` is now an unpaged wrapper with the same parameters, so the
+#: connection detail page is unchanged. The digest moved because the DTO surface and
+#: ``CoreHandlers`` grew; a skewed pair fails the handshake.
+#:
+#: BACKLOG #2446: ``AuditList`` gained the required ``withheld``, which the audit page states, and
+#: ``AdminHandlers`` gained the required ``export_audit``, which the new ``/ui/audit/export``
+#: streams from the console session. The digest moved because both grew.
+#:
+#: BACKLOG #2438, the review's repair: each list model gained the snapshot a page was read under.
+#: ``AuditList`` and ``SecurityEventsList`` carry ``as_of``, a timestamp, which ``list_audit`` and
+#: ``my_security_events`` take as a keyword. ``ConnectionEventList`` carries ``before_id``, which
+#: ``connection_event_page`` takes. Without a pin, the grant row each audit read writes made every
+#: page repeat a row. The audit pins are timestamps because an audit row id would count the lock
+#: rows a reader may not see. The digest moved because the DTO surface grew.
+#:
 #: Vault BACKLOG #2460 / #2458: ``CoreHandlers`` gains a required ``resolve_action`` for the
 #: console's resolve of an interrupted release, with ``ApprovalResolveRequest`` and its ``outcome``
 #: values. ``PendingApprovalInfo`` gains ``params``, ``caller_is_requester`` and ``gated``. The
@@ -309,12 +328,71 @@ from typing import Any
 #: that failed to import (BACKLOG #1907), before any digest check runs. The digest records the
 #: alias's values, not its name, so renaming it alone would not move the digest.
 #:
+#: Vault BACKLOG #2625: ``AuthService`` gained ``holds_action_step_up``, which the console's
+#: message editor calls to ask for an action-bound proof without spending it, and the console imports
+#: five new step-up action constants, for the resend, edit-resend, upload-resend, purge and reload
+#: lanes (message export has no console route). A method the console calls, so a skew would be an
+#: AttributeError at request time; it forces a bump. Unnumbered, as above. Re-derived on the tree
+#: merged with vault BACKLOG #3062 (``AuthService.enabled`` removed), which moved the digest on its
+#: own; the value below covers both changes. ``CoreHandlers`` then gained the REQUIRED
+#: ``prior_resend``, the read-only repeat lookup the resend and edit-resend routes ask before they
+#: demand a proof. The engine builds ``CoreHandlers``, so a console that calls it against an engine
+#: without it would raise AttributeError at request time; the pinned digest refuses the pair at
+#: mount first. Re-derived again on the tree merged with the #2460 / #2458 change above, so the value
+#: below covers #3062, #2460 / #2458 and #2625 together.
+#:
+#: BACKLOG #2438 / #2446 merged with vault BACKLOG #2625: the audit paging and export surface above and the
+#: action-bound step-up surface each moved the digest on its own branch. The value below was
+#: re-derived on the merged tree, so it covers both.
+#:
+#: BACKLOG #2454: the console imports ``authorization_header`` from ``api.security``. ``GET /ui/sso``
+#: reads ``Authorization`` through it, so a repeated header is refused 400 by the same rule the
+#: engine's own reads use. The digest moved because the imported surface grew. It moved again
+#: when the console's session-cookie read joined the rule: the console now imports
+#: ``RepeatedCredentialError`` and ``record_repeated_credential``, so a repeated cookie is logged
+#: and audited by the same handler as a repeated header.
+#:
+#: BACKLOG #2337: ``SecurityPosture`` gains ``transit_bound_attestation``, a
+#: ``TransitBoundAttestationView``, the vault_transit AES-GCM bound attestation. The console renders
+#: no new field, but the DTO is on the discovered surface, so the digest moved because it grew.
+#: Re-derived on the tree merged with BACKLOG #2438 / #2446 above, so the value below covers #2337 too.
+#:
+#: BACKLOG #2337 merged with BACKLOG #2454: each branch moved the digest on its own (#2454 to
+#: c44474a7b5777455 on main). The value below was re-derived on the merged tree, so it covers both.
+#:
+#: Vault BACKLOG #2144: ``AuthService`` gained ``admin_write_retry_after``, which ``require_ui``
+#: calls to fill the ``Retry-After`` of a throttled ``/ui`` write. A method the console calls, so a
+#: skew would be an AttributeError where the 429 belongs; it forces a bump. Re-derived on the
+#: tree merged with BACKLOG #2454, so the value below covers both.
+#:
+#: BACKLOG #2337 merged with vault BACKLOG #2144: the value below was re-derived on the tree
+#: merged with main's change, so it covers both.
+#:
+#: Vault BACKLOG #3259 / #3260: six ``AdminHandlers`` now take ``request``. They are ``update_user``,
+#: ``delete_user``, ``reset_user_password``, ``reset_user_mfa``, ``bind_user_federated_identity`` and
+#: ``unbind_user_federated_identity``. The address goes on their ``auth.self_target_refused`` row,
+#: and the console passes it on each call. Same blind spot as #2346, so the digest did not move. A
+#: skew in either direction raises TypeError on those six calls, which the handshake does not catch:
+#: an older console omits ``request``, and a newer console passes it to an engine that lacks it.
+#: Re-derived on the tree merged with BACKLOG #2337; this item leaves the value below unchanged.
+#:
+#: BACKLOG #2612: ``SystemStatus`` gained ``log_forwarder``, a ``LogForwarderInfo`` the console's
+#: status page and health indicator render. A DTO the console reads by attribute, so it forces a
+#: bump. Re-derived on the tree merged with BACKLOG #2337, and again on the tree merged with vault
+#: BACKLOG #3259 / #3260, which did not move it. The value below covers all three.
+#:
+#: BACKLOG #2289: ``api.security.client_ip`` takes starlette's ``HTTPConnection``, where it took
+#: ``Request | WebSocket``, so the raw-ASGI network gate can build one from its scope. The
+#: console imports ``client_ip`` and calls it with a ``Request`` or a ``WebSocket``, which both
+#: still fit, so no console call changed. The digest moved because a signature on the discovered
+#: surface did. Re-derived on the tree merged with BACKLOG #2612, so the value below covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "6eb39134a27c89ad"
+ENGINE_UI_SEAM: str = "05d283512c738b8b"
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,12 +429,18 @@ class CoreHandlers:
     restart_connection: Callable[..., Awaitable[Any]]
     replay_message: Callable[..., Awaitable[Any]]
     # Resend a stored body to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500). Its JSON
-    # gate is require_step_up(MESSAGES_RESEND) and NOTHING more: the handler returns ids only and
-    # never a body, so the /ui route in front of it asserts that one permission and passes no
-    # ``phi=``. Copying the edit verbs' MESSAGES_VIEW_RAW + phi=True here would charge the PHI
-    # budget for a route that emits none, and would lock out a role narrowed to resend alone.
+    # gate is require_step_up_action(message_resend, MESSAGES_RESEND) and NOTHING more: the handler
+    # returns ids only and never a body, so the /ui route in front of it asserts that one permission
+    # with the same bound proof and passes no ``phi=``. Copying the edit verbs' MESSAGES_VIEW_RAW +
+    # phi=True here would charge the PHI budget for a route that emits none, and would lock out a
+    # role narrowed to resend alone. Vault BACKLOG #2625 bound the proof on this handler and on
+    # ``edit_resend_message``, ``resend_uploaded_message``, ``purge_connection`` and
+    # ``reload_config``; each /ui route in front of one re-asserts the same action.
     resend_message: Callable[..., Awaitable[Any]]
     edit_resend_message: Callable[..., Awaitable[Any]]  # edit-and-resubmit (ADR 0090 §9, seam v2)
+    # Vault BACKLOG #2625: whether a resend or edit-and-resubmit key repeats a request that
+    # already ran. Read-only. The console asks it before it demands a step-up proof.
+    prior_resend: Callable[..., Awaitable[Any]]
     replay_dead_letters: Callable[..., Awaitable[Any]]
     list_active_alerts: Callable[..., Awaitable[Any]]
     alerts_rules: Callable[..., Awaitable[Any]]
@@ -410,6 +494,10 @@ class CoreHandlers:
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]
+    # The paged event log (BACKLOG #2438): one page and its total, as a ConnectionEventList, under
+    # GET /events' gates. ``list_connection_events`` above stays the unpaged bare-list read the
+    # connection detail page uses.
+    connection_event_page: Callable[..., Awaitable[Any]]
     resolve_action: Callable[..., Awaitable[Any]]
 
 
@@ -450,6 +538,10 @@ class AdminHandlers:
     enroll_mfa: Callable[..., Awaitable[Any]]
     disable_my_mfa: Callable[..., Awaitable[Any]]
     list_audit: Callable[..., Awaitable[Any]]
+    # GET /audit/export (BACKLOG #2446): the console's /ui/audit/export streams it from the cookie
+    # session, so an auditor who signs in only through OIDC, and so holds no bearer, can export.
+    # Its JSON gate is require(AUDIT_EXPORT), and the /ui route asserts the same permission.
+    export_audit: Callable[..., Awaitable[Any]]
     my_security_events: Callable[..., Awaitable[Any]]
     # Sync DTO projections (kept engine-side so the console never imports store.UserRecord — the
     # ``user`` arg stays opaque/Any across the seam).

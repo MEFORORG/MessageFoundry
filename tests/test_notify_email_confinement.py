@@ -23,7 +23,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from _totp_clock import pin_totp_clock
-from starlette.datastructures import Address
+from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.api.security import NOTIFY_EMAIL_REQUIRED_DETAIL, authorize_ws
@@ -801,9 +801,9 @@ class _FakeURL:
 class _FakeWS:
     def __init__(self, auth: object, token: str) -> None:
         self.app = _FakeApp(auth)
-        self.headers = {"Authorization": f"Bearer {token}"}
+        self.headers = Headers({"Authorization": f"Bearer {token}"})  # has getlist (BACKLOG #2454)
         self.url = _FakeURL()
-        self.client = Address("192.0.2.77", 51234)
+        self.scope = {"client": ("192.0.2.77", 51234)}  # what client_ip reads (BACKLOG #2289)
 
 
 async def test_the_websocket_refuses_a_confined_session(engine: Engine) -> None:

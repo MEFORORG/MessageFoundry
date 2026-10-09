@@ -152,8 +152,19 @@ class TrayApp:
         self._shell.request_notify("MessageFoundry", body)
 
     def _open_repo(self) -> None:
-        if self._config.repo_path and self._vscode:
+        if not (self._config.repo_path and self._vscode):
+            return
+        try:
             actions.open_repo(self._config.repo_path, self._vscode)
+        except actions.RepoPathRefused as exc:
+            # Fixed text, like the console refusal above: the path is operator data (BACKLOG #2327).
+            log.warning("Repo not opened: %s", exc)
+            self._shell.request_notify("MessageFoundry", f"Repo not opened: {exc}")
+        except OSError as exc:
+            # The launcher resolved at startup and has since gone, or will not start. The error
+            # message quotes its path, so only the error class is kept.
+            log.warning("Repo not opened: the launch failed (%s)", type(exc).__name__)
+            self._shell.request_notify("MessageFoundry", "Repo not opened: the launch failed")
 
     def _view_log(self) -> None:
         if not self._config.log_path:

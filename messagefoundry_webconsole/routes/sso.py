@@ -14,6 +14,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.security import (
     alert_directory_administrator_granted,
+    authorization_header,
+    client_ip,
     get_auth,
     public_route,
 )
@@ -42,7 +44,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # exact anti-flood invariant the JSON rate-limit path preserves. The attempt is
             # a no-op (SSO is off); its visibility is the operator-facing serve-time state.
             return RedirectResponse("/ui/login?e=sso_unavailable", status_code=303)
-        header = request.headers.get("Authorization", "")
+        header = authorization_header(request)  # 400 on a repeated header (BACKLOG #2454)
         if not header.startswith("Negotiate "):
             # The RFC 4559 challenge leg — deliberately NOT rate-limited: every
             # unauthenticated SSO navigation produces one 401 before the browser attaches
@@ -58,7 +60,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # token requests can't amplify into unbounded audit_log growth. The rate-limit
         # reject itself is a _log.warning (NOT an audit) — parity with the JSON
         # _rate_limited path's anti-flood posture — so exhaustion writes zero DB rows.
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not auth.allow_login_attempt(client):
             _log.warning("SSO rate limit exceeded for %s", client or "<unknown>")
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)

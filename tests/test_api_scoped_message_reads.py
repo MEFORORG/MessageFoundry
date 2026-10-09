@@ -135,6 +135,7 @@ _SCOPED_STORE_READS = frozenset(
         "count_dead",
         "list_replay_targets",
         "list_connection_events",
+        "connection_event_extent",
         "list_active_alert_instances",
         "summarize_active_alert_instances",
         "get_alert_instance",

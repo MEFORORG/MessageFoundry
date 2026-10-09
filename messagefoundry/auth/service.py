@@ -20,13 +20,11 @@ import logging
 import math
 import os
 import secrets
-import sqlite3
 import time
 import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import (
-    AsyncIterator,
     Awaitable,
     Callable,
     Coroutine,
@@ -34,15 +32,16 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cache
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
 
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
 from messagefoundry.auth.audit_visibility import (
     ACCOUNT_LOCKED_ACTION,
@@ -124,6 +123,8 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
+from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
+from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.store.base import AdminStore, store_driver_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
@@ -170,17 +171,6 @@ def _audit_write_errors() -> tuple[type[Exception], ...]:
     runs the reconciler builds it at construction, so that import never runs on the event loop in
     the middle of a store incident."""
     return (RuntimeError, OSError, CipherError, *store_driver_errors())
-
-
-#: The classes inside :func:`_audit_write_errors` that a reconciler audit write raises rather than
-#: passes over (BACKLOG #2137). ``RuntimeError`` has to stay in that catch,
-#: because the store raises it for its own refusals; ``NotImplementedError`` and ``RecursionError``
-#: are its subclasses that never mean one. ``sqlite3.ProgrammingError`` is a bad statement or bind:
-#: the SQLite store reaches sqlite3 through aiosqlite, which refuses a closed connection with its
-#: own ``ValueError`` first. pyodbc's ``ProgrammingError`` stays caught, because pyodbc raises it
-#: for a closed connection too, and raising that would cost the pass's alerts, the harm BACKLOG
-#: #2137 removed.
-_AUDIT_WRITE_DEFECTS: Final = (NotImplementedError, RecursionError, sqlite3.ProgrammingError)
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -565,6 +555,17 @@ STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — s
 # attribute that affects authentication (ASVS 7.5.1). Bound to its own action and single-use, and
 # MFA-gated, for the same reason `admin_reset_password` is.
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY = "admin_federated_identity"
+# Vault BACKLOG #2625. The routes that inject a message, send a stored body to another partner,
+# export bodies in bulk, cancel queued deliveries or swap the live graph. Each takes a proof bound to
+# its own action, so one live session inside the step-up window is not enough to do any of them.
+# Only these: the rest of the step-up surface keeps the shared window, because a proof per action is
+# a typed password, and an operator replaying dead letters during an incident would type it per message.
+STEP_UP_ACTION_MESSAGE_RESEND = "message_resend"
+STEP_UP_ACTION_MESSAGE_EDIT_RESEND = "message_edit_resend"
+STEP_UP_ACTION_UPLOAD_RESEND = "upload_resend"
+STEP_UP_ACTION_MESSAGE_EXPORT = "message_export"
+STEP_UP_ACTION_CONNECTION_PURGE = "connection_purge"
+STEP_UP_ACTION_CONFIG_RELOAD = "config_reload"
 
 #: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
 #: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
@@ -1659,36 +1660,6 @@ def _directory_answer_mismatch(principal: AdPrincipal, object_id: str) -> str | 
     return None
 
 
-@dataclass
-class _KeyedLock:
-    """One entry of a per-account lock table, with a count of the tasks holding or awaiting it so the
-    entry can be dropped when the last one leaves. The re-proof table, the credential table and the
-    lock-notice table (BACKLOG #2216) each use it (:func:`_hold_keyed_lock`)."""
-
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    users: int = 0
-
-
-@asynccontextmanager
-async def _hold_keyed_lock(table: dict[str, _KeyedLock], key: str) -> AsyncIterator[None]:
-    """Hold ``table``'s lock for ``key``, creating the entry on first use and dropping it once no
-    task holds or awaits it, so the table never outgrows the attempts in flight.
-
-    ``asyncio.Lock`` wakes its waiters in arrival order, so the attempts queued on one key run in the
-    order they arrived."""
-    entry = table.get(key)
-    if entry is None:
-        entry = table[key] = _KeyedLock()
-    entry.users += 1
-    try:
-        async with entry.lock:
-            yield
-    finally:
-        entry.users -= 1
-        if entry.users == 0:
-            del table[key]
-
-
 #: How much of a typed username :func:`_credential_lock_key` reads (BACKLOG #1943). Four times the
 #: 256-character column the store keeps, so no real name is cut.
 _CREDENTIAL_KEY_INPUT_MAX = 1024
@@ -2013,6 +1984,17 @@ _ISSUE_ROW_PAGE: Final = 200
 #: recipient as the actor, so the reminder shows in that account's ``/me/security-events`` feed.
 _REMINDER_HOLDER_ACTION: Final = "auth.temporary_credential_expiring"
 _REMINDER_ISSUER_ACTION: Final = "auth.temporary_credential_expiring_issuer"
+#: BACKLOG #2303: how many of an account's newest holder-reminder rows
+#: :meth:`initial_credential_reminded` reads. Each credential writes about one such row, and the
+#: current credential's is the newest, so a page this size is ample.
+_REMINDER_MARK_PAGE: Final = 50
+
+#: Vault BACKLOG #3260: the row an admin route writes when it refuses the caller's own account.
+#: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
+SELF_TARGET_REFUSED_ACTION: Final = "auth.self_target_refused"
+SelfTargetOp = Literal[
+    "password_reset", "mfa_reset", "federated_bind", "federated_unbind", "disable", "delete"
+]
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -2372,6 +2354,22 @@ class AuthService:
             if settings.login_rate_limit_enabled
             else None
         )
+        # BACKLOG #2454: the budget for ``auth.repeated_credential`` audit rows. A repeated
+        # Authorization header or session cookie is refused before any credential is read, so the
+        # row is written for an unauthenticated caller and needs a bound. It is its OWN budget, on
+        # the login knobs like _reauth_limiter, and never draws on _login_limiter: a proxy that
+        # duplicates a header, or a tab holding a planted cookie, would otherwise spend the sign-in
+        # budget of everyone behind the same address. Keyed on the client address, with a global
+        # ceiling of its own so a flood from many addresses still cannot grow audit_log unbounded.
+        self._repeated_credential_limiter: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=settings.login_rate_limit_per_ip,
+                glob=settings.login_rate_limit_global,
+                window_seconds=settings.login_rate_limit_window_seconds,
+            )
+            if settings.login_rate_limit_enabled
+            else None
+        )
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # host keys already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
@@ -2539,6 +2537,15 @@ class AuthService:
             return True
         return self._login_limiter.allow(client or "unknown")
 
+    def allow_repeated_credential_audit(self, client: str | None) -> bool:
+        """Whether a repeated-credential refusal may write its ``auth.repeated_credential`` row
+        (BACKLOG #2454). Its own budget, never the sign-in one, so a flood of such refusals cannot
+        refuse a sign-in from the same address. True = write; always True when the limiter is
+        disabled."""
+        if self._repeated_credential_limiter is None:
+            return True
+        return self._repeated_credential_limiter.allow(client or "unknown")
+
     def allow_reauth_attempt(self, actor: str) -> bool:
         """Rate-limit gate for the POST-session credential ceremonies, keyed on the acting user.
 
@@ -2569,6 +2576,20 @@ class AuthService:
         if self._admin_write_limiter is None:
             return True
         return self._admin_write_limiter.allow(actor)
+
+    def admin_write_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value, in whole seconds, for an admin write just refused for ``actor``.
+
+        The wait until this actor's next write would be admitted: the rest of the window when the
+        count fired, or the rest of the gap when the minimum interval did. Rounded UP and never
+        below 1, so a client that waits this long is admitted by THIS process's limiter, provided
+        the account makes no other write meanwhile. The limiter is in-process, so another engine
+        shard keeps its own count. It reflects this actor's own
+        writes only; the limiter has no cross-actor dimension (BACKLOG #2144). The JSON API and the
+        ``/ui`` console both send this value, so the same refusal reads the same on either."""
+        if self._admin_write_limiter is None:
+            return 1
+        return max(1, math.ceil(self._admin_write_limiter.retry_after(actor)))
 
     def attach_security_notifier(self, notifier: SecurityNotifier | None) -> None:
         """Wire the out-of-band notice channel after construction (BACKLOG #2081).
@@ -2662,6 +2683,21 @@ class AuthService:
     def mark_kerberos_unavailable(self, reason: str) -> None:
         """Record a failed boot-time SPNEGO acceptor preflight (app lifespan, ADR 0068 §9)."""
         self._kerberos_unavailable_reason = reason
+
+    async def audit_repeated_credential(
+        self, credential: str, path: str, *, client: str | None
+    ) -> None:
+        """Audit a request refused for carrying a credential more than once (BACKLOG #2454): the
+        ``Authorization`` header or the console's session cookie. ``credential`` is a fixed label,
+        never the value, and there is no actor, because neither copy was compared. The API plane's
+        twin of the intake listener's ``intake.auth_failed`` row (BACKLOG #2051). The caller charges
+        :meth:`allow_repeated_credential_audit` first, never the sign-in limiter
+        (``api.security.record_repeated_credential``)."""
+        await self._audit(
+            "auth.repeated_credential",
+            detail=_json({"credential": credential, "path": path}),
+            client=client,
+        )
 
     async def audit_kerberos_reject(self, reason: str, *, client: str | None) -> None:
         """AUTH-K-AUDIT for route-level SSO rejects that never reach ``authenticate_kerberos``, such
@@ -6951,20 +6987,17 @@ class AuthService:
         on. The log line is then the only record of that row. A per-revocation audit write is not routed through here: that one
         still raises.
 
-        A defect is raised, not passed over (:data:`_AUDIT_WRITE_DEFECTS`).
+        A defect is raised, not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`).
         """
-        try:
-            await self._audit(action, actor="<reconciler>", detail=detail)
-        except _AUDIT_WRITE_DEFECTS:
-            raise
-        except _audit_write_errors():
-            _log.exception(
-                "directory reconcile: the %s audit row could not be written; the pass goes on, "
-                "so its alerts still fire",
-                action,
-            )
-            return False
-        return True
+        return await write_audit_soft(
+            lambda: self._audit(action, actor="<reconciler>", detail=detail),
+            log=_log,
+            message="directory reconcile: the %s audit row could not be written; the pass goes on, "
+            "so its alerts still fire",
+            args=(action,),
+            errors=_audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
 
     async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> bool:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
@@ -8478,6 +8511,19 @@ class AuthService:
         if action in _REFUNDABLE_ACTIONS:
             _SPENT_REFUNDABLE_GRANT.set((id(self), key, deadline))
         return True
+
+    async def holds_action_step_up(self, token: str | None, action: str) -> bool:
+        """Whether the caller holds a live grant bound to ``action``, WITHOUT spending it.
+
+        For a web console page that opens an action rather than performing it (vault BACKLOG
+        #2625): the message editor asks for the proof before the operator types an edit, because a
+        re-auth demanded at submit time re-opens the editor and drops the edit. Only
+        :meth:`has_action_step_up` spends a grant, so this never authorizes the action itself, and
+        it leaves the refund record alone."""
+        if not token:
+            return False
+        deadline = self._action_step_up_grants.get((hash_token(token), action))
+        return deadline is not None and deadline > time.monotonic()
 
     def refund_action_step_up(self, action: str) -> bool:
         """Give back the step-up grant THIS REQUEST spent on ``action``, when the route it opened
@@ -10442,14 +10488,24 @@ class AuthService:
         """Read access to the backing store for admin list/read endpoints (users + audit)."""
         return self._store
 
-    async def security_events_for(self, username: str, *, limit: int = 100) -> list[dict[str, Any]]:
+    async def security_events_for(
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
+    ) -> list[dict[str, Any]]:
         """The caller's own security-event history (audited ``auth.*`` actions, most-recent-first) for
         ``GET /me/security-events`` — normalized to plain dicts so the API doesn't see backend Row
-        types. PHI-free (the audit ``detail`` carries metadata only)."""
-        rows = await self._store.security_events_for_user(username, limit=limit)
+        types. PHI-free (the audit ``detail`` carries metadata only). ``offset`` pages it,
+        ``until`` keeps rows at or before that ``ts`` so a pager reads one snapshot, and
+        :meth:`count_security_events_for` is its total (BACKLOG #2438)."""
+        rows = await self._store.security_events_for_user(
+            username, limit=limit, offset=offset, until=until
+        )
         return [
             {"ts": float(r["ts"]), "action": str(r["action"]), "detail": r["detail"]} for r in rows
         ]
+
+    async def count_security_events_for(self, username: str, *, until: float | None = None) -> int:
+        """How many rows :meth:`security_events_for` pages through (BACKLOG #2438)."""
+        return await self._store.count_security_events_for_user(username, until=until)
 
     async def _generate_issued_credential(
         self,
@@ -10483,22 +10539,22 @@ class AuthService:
                 detail["user_id"] = user_id
             if roles is not None:
                 detail["roles"] = list(roles)
-            try:
-                await self._audit(
+            # The refusal below is the answer either way, and the traceback says why the row is
+            # missing. ``defects=()``: a defect raised here would replace the refusal, so the route
+            # would answer 500 and keep the spent step-up grant (vault BACKLOG #2260).
+            await write_audit_soft(
+                lambda: self._audit(
                     CREDENTIAL_ISSUE_REFUSED_ACTION,
                     actor=actor,
                     detail=_json(detail),
                     client=client,
-                )
-            except _audit_write_errors():
-                # A store refusal only: a bug in the call above still raises. The refusal below is
-                # the answer either way, and the traceback says why the row is missing.
-                _log.exception(
-                    "could not write the %s audit row for a refused %s by %s",
-                    CREDENTIAL_ISSUE_REFUSED_ACTION,
-                    op,
-                    actor,
-                )
+                ),
+                log=_log,
+                message="could not write the %s audit row for a refused %s by %s",
+                args=(CREDENTIAL_ISSUE_REFUSED_ACTION, op, actor),
+                errors=_audit_write_errors(),
+                defects=(),
+            )
             raise
 
     async def create_local_user(
@@ -10930,11 +10986,12 @@ class AuthService:
         that it stops working at ``deadline`` (ASVS 6.4.5, BACKLOG #2007).
 
         The API lifespan's reminder pass calls this once per credential, beside its ``[alerts]``
-        operator reminder, and its ``warned`` map is what keeps each notice to one per credential per
-        engine process. A restart inside the warn window therefore reminds again, as the operator
-        alert does; a mark that outlived the process would be a second once-only mechanism. This
-        method keeps no state of its own and makes one attempt: a failed read is logged and not
-        retried, because a retry would repeat the notices that did go out. It never has the
+        operator reminder. The holder's audit row below is the once-only mark for all three
+        reminders, and it outlives the process (BACKLOG #2303): the pass asks
+        :meth:`initial_credential_reminded` before it sends, so a restart inside the warn window
+        reminds nobody again. That row is written before any notice, so a crash after it loses a
+        reminder rather than repeating one. This method makes one attempt: a failed read is logged
+        and not retried, because a retry would repeat the notices that did go out. It never has the
         password, so no notice can carry it.
 
         The holder's notice goes to the account's own ``notify_email``. The issuer's goes to the
@@ -10990,6 +11047,35 @@ class AuthService:
             email=issuer.notify_email,
             detail={"expires_at": deadline, "holder": user.username},
         )
+
+    async def initial_credential_reminded(self, user: UserRecord, *, deadline: float) -> bool:
+        """Whether the reminders for ``user``'s credential expiring at ``deadline`` already went out,
+        from this engine process or an earlier one (BACKLOG #2303).
+
+        The mark is the holder's ``auth.temporary_credential_expiring`` row, which
+        :meth:`remind_expiring_initial_credential` writes before any notice. A row counts only when
+        its detail names this account's id and this exact deadline, so a new credential on the same
+        account is reminded about again. No time bound is applied: the id and the deadline already
+        pin the credential, and a bound would compare two processes' clocks. A failed read raises;
+        the caller then reminds, so a store fault costs a duplicate rather than a missed reminder.
+
+        The rows are found by the holder's current username, newest first. An account renamed after
+        its reminder is not matched, and is reminded once more."""
+        rows = await self._store.list_audit(
+            action=_REMINDER_HOLDER_ACTION, actor=user.username, limit=_REMINDER_MARK_PAGE
+        )
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(detail, dict)
+                and detail.get("user_id") == user.id
+                and detail.get("expires_at") == deadline
+            ):
+                return True
+        return False
 
     async def _temporary_credential_issuer(self, user: UserRecord) -> tuple[UserRecord | None, str]:
         """The account that issued ``user``'s current temporary password and can still act on a
@@ -11533,9 +11619,9 @@ class AuthService:
         """Write the :data:`CHANNEL_SCOPE_CHANGE_REFUSED_ACTION` row for a refused
         :meth:`set_channel_scope` (BACKLOG #2271). A store that refuses the row is logged at ERROR and
         the refusal still stands, so the caller gets its 409 rather than a 500. A defect is raised,
-        not passed over (:data:`_AUDIT_WRITE_DEFECTS`)."""
-        try:
-            await self._audit(
+        not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`)."""
+        await write_audit_soft(
+            lambda: self._audit(
                 CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
                 actor=actor,
                 detail=_json(
@@ -11548,15 +11634,13 @@ class AuthService:
                         "owner": _effective_scope_source(user),
                     }
                 ),
-            )
-        except _AUDIT_WRITE_DEFECTS:
-            raise
-        except _audit_write_errors():
-            _log.exception(
-                "could not write the %s audit row for a refused save by %s",
-                CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
-                actor,
-            )
+            ),
+            log=_log,
+            message="could not write the %s audit row for a refused save by %s",
+            args=(CHANNEL_SCOPE_CHANGE_REFUSED_ACTION, actor),
+            errors=_audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
 
     async def is_last_enabled_admin(self, user_id: str) -> bool:
         """True iff ``user_id`` is an enabled administrator and the only one remaining.
@@ -11718,6 +11802,27 @@ class AuthService:
             "auth.mfa_denied",
             actor=identity.username,
             detail=_json({"path": path}),
+            client=client,
+        )
+
+    async def audit_self_target_refused(
+        self, identity: Identity, *, op: SelfTargetOp, client: str | None
+    ) -> None:
+        """Audit an administrator route refused because it targets the caller's own account (vault
+        BACKLOG #3260, ASVS 16.3.2). ``op`` names the route.
+
+        The refusal is an authorization decision of its own. Before this row, the JSON plane kept
+        only the step-up gate's ``auth.permission_granted`` for the attempt, and the console plane
+        kept nothing. The API handlers write it, so a console call through the seam writes it too.
+
+        ``user_id`` is the caller's stored id, never the path's spelling, which on the console is
+        an unbounded caller string (``api.auth_routes._refuse_if_self`` says why the two differ).
+        ``client`` is required, not defaulted: both planes reach this from a request, and
+        :meth:`audit_permission_denied` says what a row that omits a known address costs."""
+        await self._audit(
+            SELF_TARGET_REFUSED_ACTION,
+            actor=identity.username,
+            detail=_json({"op": op, "user_id": identity.user_id}),
             client=client,
         )
 

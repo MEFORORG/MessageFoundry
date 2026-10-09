@@ -172,8 +172,13 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _deployer(engine: Engine, deadline: float) -> tuple[httpx.AsyncClient, Any]:
+    # This file's subject is the reload deadline, so it keeps the session window.
+    # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
     service = AuthService(
-        engine.store, AuthSettings(require_mfa=False, admin_write_min_interval_seconds=0)
+        engine.store,
+        AuthSettings(
+            require_mfa=False, admin_write_min_interval_seconds=0, require_action_step_up=False
+        ),
     )
     await service.initialize()
     user_id = await create_local_user_chosen(

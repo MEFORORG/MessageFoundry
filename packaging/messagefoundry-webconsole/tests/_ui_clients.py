@@ -35,6 +35,11 @@ from messagefoundry.pipeline import Engine
 #: >=15 characters, no app or vendor terms -- satisfies the ASVS password policy (WP-3).
 PW = "a-strong-test-passphrase"
 
+#: Set ``extensions={HEADERLESS_UI_REQUEST: True}`` on one request to send it as a program would,
+#: with no fetch metadata at all. ``conftest.py`` otherwise gives a state-changing /ui request the
+#: ``Sec-Fetch-Site`` a browser sends; the refusal tests need the request left alone.
+HEADERLESS_UI_REQUEST = "mf_headerless_ui_request"
+
 #: A synthetic ADT^A01, the one message these suites seed. Never real PHI (CLAUDE.md section 9).
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
@@ -55,9 +60,12 @@ async def auth_service(engine: Engine) -> AuthService:
     return service
 
 
-def ui_client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    """An ASGI client over the engine app with the console mounted -- the real ``mount_ui`` path."""
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
+def ui_client(engine: Engine, service: AuthService, **app_kwargs: Any) -> httpx.AsyncClient:
+    """An ASGI client over the engine app with the console mounted -- the real ``mount_ui`` path.
+    ``app_kwargs`` reach ``create_app``, for a test that needs, say, an uploads store."""
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, serve_ui=True, **app_kwargs)
+    )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -161,6 +169,18 @@ def issue_continuation(client: httpx.AsyncClient, next_path: str) -> None:
     token = client.cookies.get("mf_session")
     assert token, "issue_continuation needs a signed-in client"
     _ISSUED_CONTINUATIONS.issue(token, next_path)
+
+
+async def mint_bound_proof(client: httpx.AsyncClient, next_path: str) -> None:
+    """Re-authenticate toward ``next_path`` so ``/ui/reauth`` mints the action-bound grant that
+    continuation's registration names (vault BACKLOG #2625). The continuation is issued first, as
+    the step-up gate's refusal would issue it, so an auto-retry target takes the grant as well as an
+    unlock page does. For a test whose subject is what the action does, not the proof it takes."""
+    issue_continuation(client, next_path)
+    r = await client.post(
+        "/ui/reauth", data={"next": next_path, "password": PW}, headers=SAME_ORIGIN
+    )
+    assert r.status_code in (200, 303), f"re-auth toward {next_path!r} returned {r.status_code}"
 
 
 @contextmanager

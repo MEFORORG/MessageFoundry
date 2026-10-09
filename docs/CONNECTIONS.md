@@ -1501,6 +1501,11 @@ An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-r
   MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
   and name it in `odbc_driver`; see [*Generic ODBC*](#generic-odbc-postgresql--mysql) below.
 
+**Host precondition for the SQL Server ODBC hops** (at least this connector, `DatabasePoll(...)`,
+`db_lookup`, `DatabaseRef(...)` and the SQL Server store): the engine cannot set TLS cipher suites on
+an ODBC hop, so the operator sets the host cipher policy. The step is stated once, in
+[`DEPLOY-SERVER-DB.md` section 5.4](DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition).
+
 (The SQL Server *store* backend is a **separate** layer, also production; the connector doesn't depend on
 it.) The **inbound** direction is the DB poll source below (`DatabasePoll(...)`).
 
@@ -3037,7 +3042,11 @@ does declaring it together with `cleartext_accepted`, which is the opposite clai
 construction. An attested hop is recorded as secure, so a false attestation hides a plaintext hop.
 
 **It is reported.** `messagefoundry check` prints a `tls-hop-attested` line listing every attested hop
-with its reason, and `GET /security/posture` names them in a `tls_hop_attested` loosening. At least
+with its reason, and `GET /security/posture` names them in a `tls_hop_attested` loosening. The `check`
+line shows each reason in quotes, with every quote, control and non-ASCII character escaped. It adds
+`REFUSED` at the end of the entry when the build check rejects the declaration. One case is an
+`env()` flag written into a lookup's settings after its factory ran. The engine never uses that hop.
+The mark comes from the engine, not from the reason, so a reason cannot add it. At least
 the inbound bind gates and the raw-TCP/MLLP hop guard also log a WARNING with the reason when they
 suppress a refusal. Not every cell does: the database weakened-TLS audit line omits the reason, and a
 `DatabaseRef` source writes that same line. So those two reports are the complete record. The risk entry is in
@@ -3149,7 +3158,9 @@ two ways as `retry`/`buildup` — **code-first** on `inbound(...)`/`outbound(...
 ### Retention overrides ([ADR 0027](adr/0027-per-connection-retention.md))
 
 Override the global `[retention]` body-null windows per connection. `None` (omitted) = inherit the global
-window; `0` = keep this connection's bodies **forever**; `>0` = days.
+window; `0` = keep this connection's bodies **forever**; `>0` = days. A `0` meets a retention
+gate when `serve` loads the graph: see *Per-connection overrides* in
+[CONFIGURATION.md](CONFIGURATION.md#retention).
 
 | Key | Dir | Type | Default | Meaning |
 |-----|-----|------|---------|---------|

@@ -112,6 +112,7 @@ def test_graph_of_sample(capsys: pytest.CaptureFixture[str]) -> None:
         "fhir_router",
         "sr_router",
         "demo_oru_router",  # per-feed "Hybrid" layout demo (IB_DEMO_ORU_router.py)
+        "steps_oru_router",  # typed-Steps example (IB_STEPS_ORU_router.py)
         "stream_mdm_router",  # #149 streaming: MDM-with-embedded-PDF pass-through (IB_STREAM_MDM.py)
         "pdf_mdm_router",  # #149 streaming: PDF-file → base64 → MDM build (IB_PDF_TO_MDM.py)
     }
@@ -126,6 +127,7 @@ def test_graph_of_sample(capsys: pytest.CaptureFixture[str]) -> None:
         "fhir_handler",
         "sr_to_oru",
         "demo_oru_relay",  # per-feed "Hybrid" layout demo (IB_DEMO_ORU_handler.py)
+        "steps_oru_handler",  # typed-Steps example (IB_STEPS_ORU_handler.py)
         "stream_mdm_handler",  # #149 streaming (IB_STREAM_MDM.py)
         "pdf_mdm_handler",  # #149 streaming (IB_PDF_TO_MDM.py)
     }
@@ -2937,18 +2939,24 @@ def test_serve_starts_with_a_reminder_recipient_in_prod(
     assert "no [alerts] recipient" not in capsys.readouterr().err
 
 
+_CERT_REMINDER_OFF = "[cert_monitor]\nwarn_days = 0\n"
+_ROTATION_REMINDER_OFF = "[secret_rotation]\nwarn_days = 0\n"
+_PASSWORD_REMINDER_OFF = "[auth]\ninitial_password_expiry_hours = 0\n"
+
+
 def test_serve_reminder_recipient_gate_is_quiet_when_no_reminder_can_fire(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Both reminders off: no temporary-password deadline and no cert monitor, so nothing needs a
-    # recipient and the gate does not fire.
+    # All three reminders off: no temporary-password deadline, no cert monitor and no secret-rotation
+    # reminder, so nothing needs a recipient and the gate does not fire.
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
         "security.block_unlisted_outbound = true\n"
         + _SECURE_RETENTION
-        + "[cert_monitor]\nwarn_days = 0\n"
-        + "[auth]\ninitial_password_expiry_hours = 0\n"
+        + _CERT_REMINDER_OFF
+        + _ROTATION_REMINDER_OFF
+        + _PASSWORD_REMINDER_OFF
         + _SECURE_ALERTS_NO_RECIPIENT,
     )
     assert "no [alerts] recipient" not in capsys.readouterr().err
@@ -2958,8 +2966,15 @@ def test_serve_reminder_recipient_gate_is_quiet_when_no_reminder_can_fire(
 @pytest.mark.parametrize(
     "reminder_on",
     [
-        pytest.param("[cert_monitor]\nwarn_days = 0\n", id="temporary-password-reminder-only"),
-        pytest.param("[auth]\ninitial_password_expiry_hours = 0\n", id="cert-reminder-only"),
+        pytest.param(
+            _CERT_REMINDER_OFF + _ROTATION_REMINDER_OFF, id="temporary-password-reminder-only"
+        ),
+        pytest.param(_PASSWORD_REMINDER_OFF + _ROTATION_REMINDER_OFF, id="cert-reminder-only"),
+        # BACKLOG #2227: the gate ignored this reminder, so with the other two off it passed silently
+        # while the secret-rotation reminder, still on, reached only the log.
+        pytest.param(
+            _PASSWORD_REMINDER_OFF + _CERT_REMINDER_OFF, id="secret-rotation-reminder-only"
+        ),
     ],
 )
 def test_serve_either_reminder_alone_needs_a_recipient(
@@ -2980,6 +2995,28 @@ def test_serve_either_reminder_alone_needs_a_recipient(
     )
     assert rc == 2
     assert "no [alerts] recipient is configured" in capsys.readouterr().err
+
+
+def test_serve_warns_when_a_credential_reminder_is_silenced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #2227 and #2008 step 4 (ASVS 6.4.5): each way to silence a reminder past the
+    # recipient gate is named in the serve-time loosening WARNING, which goes to stdout.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _CERT_REMINDER_OFF
+        + _ROTATION_REMINDER_OFF
+        + _SECURE_ALERTS
+        + '[[alerts.rules]]\nevent_type = "initial_credential_expiring"\nmute = true\n',
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "posture loosened from the secure defaults" in out
+    for switch in ("cert_monitor.warn_days", "secret_rotation.warn_days", "alerts.rules"):
+        assert switch in out, switch
 
 
 def test_serve_reminder_recipient_gate_honours_the_audited_waiver(

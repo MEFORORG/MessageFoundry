@@ -21,7 +21,7 @@ from messagefoundry.api.models import (
     AlertsConfig,
     ClusterNodeList,
     ClusterStatus,
-    ConnectionEventInfo,
+    ConnectionEventList,
     DrStatus,
     GraphResponse,
     IntegrityResult,
@@ -33,7 +33,14 @@ from messagefoundry.api.models import (
 )
 
 from .._html import Markup, el, page, register_nav, rows_table
-from ._common import _failed_inbound_reason, _reveal_cell, _window_note
+from ._common import (
+    _failed_inbound_reason,
+    _log_forwarder_reason,
+    _log_forwarder_text,
+    _pager,
+    _reveal_cell,
+    _window_note,
+)
 
 __all__ = [
     "alerts",
@@ -348,6 +355,9 @@ _EVENT_KINDS = (
     # BACKLOG #1619 -- the MLLP listener's inbound handler faulted on a frame it read cleanly (a
     # store outage at the ingress commit is the reachable case). Not a framing fault, so not that kind.
     "handler_error",
+    # vault BACKLOG #2613 -- a TLS handshake on an MLLP listener failed. Throttled to one per minute
+    # per listener; the reason carries the count since the last one.
+    "tls_handshake_failed",
     # BACKLOG #1662 — the DATABASE poll source, on a row it cannot turn into a body. The first
     # non-listener kind: a poll source has no peer, so its rows carry a NULL peer_host.
     "row_undecodable",
@@ -385,29 +395,38 @@ def _event_filter(connection: str, kind: str = "") -> Markup:
 
 
 def events(
-    rows: list[ConnectionEventInfo],
+    data: ConnectionEventList,
     *,
     connection: str = "",
     kind: str = "",
     error: str = "",
     revealed: int | None = None,
 ) -> Markup:
-    """The connection/transport event log (Corepoint-style, #46), newest first. The Reason column is
-    scrubbed free text that ``docs/PHI.md`` section 2 gives a protection level, so the page is not
-    PHI-free. It arrives masked, and ``revealed`` is the one event whose reason this request asked
-    for whole (BACKLOG #2443). Each other masked reason links to its own reveal, carrying the two
-    filters so the operator lands back on this list. The kind and the rest of each row stay visible
-    to every ``monitoring:read`` holder.
+    """The connection/transport event log (Corepoint-style, #46), newest first, paged by ``offset``
+    against ``data.total`` (BACKLOG #2438). The Reason column is scrubbed free text that
+    ``docs/PHI.md`` section 2 gives a protection level, so the page is not PHI-free. It arrives
+    masked, and ``revealed`` is the one event whose reason this request asked for whole (BACKLOG
+    #2443). Each other masked reason links to its own reveal, carrying the two filters and the page
+    position so the operator lands back on this page of this list. The kind and the rest of each row
+    stay visible to every ``monitoring:read`` holder.
 
     ``error`` renders a refusal banner above the table, the shape ``pages.messages`` uses: the filter
     form comes back carrying what the operator typed and the route answers 400 rather than querying
     under a filter the JSON twin would refuse (BACKLOG #1740). It also suppresses the "No events."
-    line, which would otherwise read as the result of a filter that was never applied.
+    line and the pager, which would otherwise read as the result of a filter that was never applied.
     """
     headers = ["When", "Connection", "Transport", "Dir", "Kind", "Peer", "Reason"]
+    rows = data.events
+    filters = {"connection": connection, "kind": kind}
+    if data.before_id is not None:
+        filters["before_id"] = str(data.before_id)
     # The filters ride the reveal link as query values, never as path segments, so urlencode
-    # escapes them; a blank one is left off, as the filter form's own GET would send it.
-    back = urlencode({k: v for k, v in (("connection", connection), ("kind", kind)) if v})
+    # escapes them; a blank one is left off, as the filter form's own GET would send it. The page
+    # position and its snapshot pin ride it too, always: a reveal that dropped either would read
+    # a different window, miss its event, and still charge and audit the read (BACKLOG #2438).
+    query: dict[str, object] = {k: v for k, v in filters.items() if v}
+    query.update(limit=data.limit, offset=data.offset)
+    back = urlencode(query)
     suffix = f"?{back}" if back else ""
     body = [
         [
@@ -430,6 +449,15 @@ def events(
         else [
             el("p", "No events.", class_="muted") if not rows else Markup(""),
             rows_table(headers, body),
+            _pager(
+                path="/ui/events",
+                total=data.total,
+                limit=data.limit,
+                offset=data.offset,
+                shown=len(rows),
+                noun="event(s)",
+                filters=filters,
+            ),
         ]
     )
     return page(
@@ -477,6 +505,21 @@ def status(
         if e.channels_failed
         else []
     )
+    # BACKLOG #2612: no row when no forwarder is configured. This process's forwarder only: under
+    # engine shards each process has its own.
+    forwarder_reason = _log_forwarder_reason(sys.log_forwarder)
+    forwarder_rows: list[list[object]] = (
+        []
+        if sys.log_forwarder is None
+        else [
+            [
+                "Off-box log forwarding",
+                _log_forwarder_text(sys.log_forwarder)
+                if forwarder_reason is None
+                else el("span", forwarder_reason, class_="status status-failed"),
+            ]
+        ]
+    )
     engine_tbl = rows_table(
         ["Field", "Value"],
         [
@@ -485,6 +528,7 @@ def status(
             ["PID", e.pid],
             ["Inbound", inbound],
             *failed_rows,
+            *forwarder_rows,
             # #93 engine-wide KPI headline: combined inbound+outbound endpoint count + engine-wide
             # msg/s (reusing the recent_done rate window) — the single-glance roll-up no per-connection
             # row gives. Metadata only (counts + a rate), no PHI.
@@ -627,6 +671,26 @@ def status(
             ["Block unlisted outbound", _sec("block_unlisted_outbound")],
             ["Delete message bodies after (days)", _sec("delete_message_bodies_after_days")],
             ["Allow keeping PHI indefinitely", _sec("allow_keeping_phi_indefinitely")],
+            # The per-tier retention acknowledgements (BACKLOG #1967, #2280). The switch above covers
+            # the auto-bounded tiers only, so each of these is its own row. A literal list because a
+            # client may not import the engine's classification; test_webui.py pins it to that
+            # classification instead, so a tier given a switch there reds until it has a row here.
+            [
+                "Allow keeping transform state indefinitely",
+                _sec("allow_keeping_transform_state_indefinitely"),
+            ],
+            [
+                "Allow keeping search presets indefinitely",
+                _sec("allow_keeping_search_presets_indefinitely"),
+            ],
+            [
+                "Allow keeping app logs indefinitely",
+                _sec("allow_keeping_app_logs_indefinitely"),
+            ],
+            [
+                "Allow keeping backup archives indefinitely",
+                _sec("allow_keeping_backup_archives_indefinitely"),
+            ],
             ["Audit all authz decisions", _sec("audit_all_authorization_decisions")],
             ["Production instance", _sec("production_instance", "(derived from environment)")],
         ],

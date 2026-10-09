@@ -422,9 +422,14 @@ Two limits, stated so nobody reads more into a green than it carries:
 - **A SQL-Server test leg can die with a native segfault** (exit 139, in the DB driver). It hits `main`
   too — it is not a regression in your PR. Clear it with `gh run rerun <run-id> --failed`.
 - **`prod` is a fail-closed PHI environment.** `serve --env prod` refuses to start without a store
-  encryption key, without an egress allow-list, and without bounded retention windows
-  (`[retention].messages_days` **and** `dead_letter_days` must be `> 0`). Any prod-like CI job must
-  supply all three or the service crash-loops and never serves `/health`.
+  encryption key and without an egress allow-list. It no longer refuses over an **unset** PHI body
+  retention window: each one is defaulted to 30 days at startup, and only a window set explicitly
+  to `0` refuses. It does refuse a retention tier that ships with no window and has no
+  acknowledgement, at least `[retention].state_max_age_days` and `[retention].search_preset_days`.
+  [CONFIGURATION.md](CONFIGURATION.md#retention) states the retention gate once, and
+  `messagefoundry check` reports its refusals before a start. These are not the only start gates,
+  and `prod` is not the only environment they apply to. Any prod-like CI job must satisfy each
+  gate it meets, or the service crash-loops and never serves `/health`.
 - **Git-Bash mangles `git show <ref>:<path>`** (the colon). Use
   `MSYS_NO_PATHCONV=1 git show "origin/main:.github/workflows/ci.yml"`.
 - **An instrument that does not record WHICH TREE answered can be self-consistently wrong.** Two

@@ -7,6 +7,9 @@
     // whole toolbar (Add/Copy/Cut/Paste never enable, rows don't select). Cache it on window so a re-run
     // reuses the same instance instead of re-acquiring. (This is the standard retain-context webview fix.)
     const vscode = window.__mfStepsVscode || (window.__mfStepsVscode = acquireVsCodeApi());
+    // Hide the page's script-not-started banner (webviewMessaging.ts, SCRIPT_STARTED_MARK). This file is
+    // static, so the id is spelled out here; startup-banners.test.ts pins it to SCRIPT_BANNER_ID.
+    { const mfBanner = document.getElementById('mf-script-not-started'); if (mfBanner) { mfBanner.hidden = true; } }
     // Provider-side handshake: tell the provider the script actually STARTED. If the provider never hears
     // this, it knows the script failed to initialize (blocked / threw at load) and surfaces that itself.
     try { vscode.postMessage({ command: 'stepsDiag', level: 'ping', text: 'alive' }); } catch (_) {}

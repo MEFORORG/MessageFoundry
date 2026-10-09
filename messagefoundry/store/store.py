@@ -38,8 +38,10 @@ import asyncio
 import functools
 import hashlib
 import hmac
+import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -60,7 +62,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -101,6 +103,7 @@ from messagefoundry.store.content_search import SearchSpec, newest_first, row_ma
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
+    AuditKeyVersionRefusedError,
     AuditMacFn,
     Cipher,
     CipherError,
@@ -141,6 +144,11 @@ from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
     sealed_reference_set,
+)
+from messagefoundry.store.transit_attestation import (
+    TRANSIT_BOUND_ATTESTED_ACTION,
+    TRANSIT_BOUND_WITHDRAWN_ACTION,
+    TransitBoundAttestation,
 )
 from messagefoundry.store.typed_fields import encode_typed_fields
 
@@ -811,6 +819,23 @@ class ResendOutcome:
     to_destination: str
     from_destination: str
     outbox_id: str | None
+    #: The child message an edit-and-resend DIRECT call created (vault BACKLOG #2615); ``None`` for a
+    #: plain resend, which adds a delivery to the same message, and for a duplicate.
+    new_message_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ResendKeyRecord:
+    """What a ``resend_log`` row records for one idempotency key (ADR 0090 §4), as read back by
+    :meth:`QueueStore.get_resend_record`. ``to_destination`` is the outbound name, or
+    :data:`REINGRESS_TARGET_PREFIX` plus the channel for an edit-and-resubmit re-ingress;
+    ``outbox_id`` is the row (or, for a re-ingress, the child message) the first call created.
+    Ids and names only, never a body."""
+
+    message_id: str
+    to_destination: str
+    from_destination: str
+    outbox_id: str | None
 
 
 class ReingressOriginMissing(ResendError):
@@ -826,6 +851,26 @@ class ReingressOriginMissing(ResendError):
 #: disjoint from a resend-to-alternate's ``(message_id, <outbound>)`` so the two can never be confused
 #: when a duplicate/conflict is reported, while sharing the one ``resend_log`` UNIQUE gate.
 REINGRESS_TARGET_PREFIX = "@reingress:"
+
+
+class MessageOrigin(StrEnum):
+    """How a ``messages`` row came to exist: the plain ``messages.origin`` column (vault BACKLOG #2615).
+
+    Written once, at insert, and never updated; retention blanks the body columns and leaves it, so a
+    site can still tell an operator-made message from a partner's after the body is gone. The acting
+    user of an operator origin sits beside it in ``messages.origin_actor``. ``NULL`` on a row written
+    before the column existed means "not recorded", never "partner"."""
+
+    #: Taken in by an inbound connection, refused ones included. Usually a partner's message; a timer
+    #: inbound's configured body arrives this way too, so ``partner`` means "through a connection".
+    PARTNER = "partner"
+    #: An operator's edited body, by edit-and-resend (either mode).
+    OPERATOR_EDIT = "operator_edit"
+    #: An operator's injection of one message from an uploaded log file.
+    OPERATOR_UPLOAD = "operator_upload"
+    #: The engine's own hop: a loopback re-ingress or a pass-through child of an earlier message.
+    REINGRESS = "reingress"
+
 
 #: How long an uploader's quota row may go with no activity before the next reserve reclaims its
 #: slots (seconds) — ASVS 2.3.4, BACKLOG #1112. Activity is an applied reserve, a release, or a live
@@ -2428,7 +2473,13 @@ def _audit_row_mac(
     row: Mapping[str, Any], prev: Any, key: bytes | None, mac: AuditMacFn | None
 ) -> str | None:
     """The hash ``row`` should carry, chained from ``prev``, or ``None`` when a chained column holds a
-    value of a type no engine build writes -- which the walk reports as a break rather than raising."""
+    value of a type no engine build writes -- which the walk reports as a break rather than raising.
+
+    A MAC provider is pinned to the Transit key version ``row``'s stored hash names
+    (:func:`_version_pinned_mac`), so a row sealed before a key rotation still verifies after it.
+    It may raise :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError`."""
+    if mac is not None:
+        mac = _version_pinned_mac(mac, row["row_hash"])
     try:
         return audit_row_hash(
             prev,
@@ -2738,16 +2789,19 @@ def verify_audit_rows(
         # Not held: the stored hash is compared with itself. The only check left is that it is a
         # non-empty text value; an empty or non-text one is never a MAC (#2725). Any other text
         # passes, whether or not it is a real MAC: that needs the key.
-        expected = (
-            _audit_row_mac(r, prev, key, mac)
-            if held
-            else (stored if isinstance(stored, str) and stored else None)
-        )
+        refused: str | None = None
+        if held:
+            try:
+                expected = _audit_row_mac(r, prev, key, mac)
+            except AuditKeyVersionRefusedError as exc:  # a break at this row; the walk goes on
+                expected, refused = None, str(exc)
+        else:
+            expected = stored if isinstance(stored, str) and stored else None
         # Bind the compare first so it is ALWAYS evaluated: folding it behind a known-break test
         # would short-circuit the comparator once a break is known.
         mac_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))
         if seq_ok and not (mac_ok and expected is not None):
-            breaks.append((pos, rid, None))
+            breaks.append((pos, rid, refused))
         if ranged:
             range_digest.update(_audit_digest_line(r))
         # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
@@ -3013,12 +3067,18 @@ async def settle_audit_ranges(
     problem: str | None = None
     first_secret = _audit_secret_for(genesis_key, keys, host._audit_mac_fn)
     if first_secret is not None:
-        expected = _audit_row_mac(genesis, "", first_secret[0], first_secret[1])
+        refused = ""
+        try:
+            expected = _audit_row_mac(genesis, "", first_secret[0], first_secret[1])
+        except AuditKeyVersionRefusedError as exc:  # the genesis row fails, as the walk reports it
+            expected, refused = None, f" ({exc})"
         mac_ok = hmac.compare_digest(
             audit_mac_bytes(genesis["row_hash"]), audit_mac_bytes(expected)
         )
         if not mac_ok or expected is None or _strict_int(genesis["seq"]) != 1:
-            problem = "the audit chain's genesis row does not verify under the key it names"
+            problem = (
+                f"the audit chain's genesis row does not verify under the key it names{refused}"
+            )
     genesis_ok = problem is None
     current, current_from = genesis_key, 1
     seen: list[str] = [genesis_key]
@@ -4201,6 +4261,256 @@ row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock
 not read chain state."""
 
 
+#: The columns every backend reads a ``transit_bound_attestation`` row by (BACKLOG #2337).
+TRANSIT_ATTESTATION_COLUMNS: Final = "key_name, reason, actor, attested_at, audit_seq, audit_hash"
+
+
+def _transit_attestation_row(row: Any) -> TransitBoundAttestation:
+    """A ``transit_bound_attestation`` row as the dataclass, on any backend's row mapping. The
+    audit columns are attacker-writable, so they are typed here rather than trusted.
+
+    An ``attested_at`` that is not a finite number reads as ``nan`` with ``audit_gap`` set, never as
+    an exception: SQLite's REAL affinity stores text, and a raise here would stop a ``warn`` start,
+    fail the posture and block the withdraw that removes the row."""
+    audit_hash = row["audit_hash"]
+    raw_at = row["attested_at"]
+    finite = (
+        isinstance(raw_at, (int, float)) and not isinstance(raw_at, bool) and math.isfinite(raw_at)
+    )
+    return TransitBoundAttestation(
+        key_name=str(row["key_name"]),
+        reason=str(row["reason"]),
+        actor=str(row["actor"]),
+        attested_at=float(raw_at) if finite else float("nan"),
+        audit_seq=_strict_int(row["audit_seq"]),
+        audit_hash=audit_hash if isinstance(audit_hash, str) else None,
+        audit_gap=None if finite else "its attested_at is not a finite number",
+    )
+
+
+def transit_attested_audit(*, key_name: str, reason: str, actor: str) -> AuditAppend:
+    """The audit row ``record_transit_bound_attestation`` appends, on every backend (BACKLOG #2337).
+    The store builds it, never the caller, so the read-side check knows what the detail must say."""
+    return AuditAppend(
+        TRANSIT_BOUND_ATTESTED_ACTION,
+        actor=actor,
+        detail=json.dumps({"key_name": key_name, "reason": reason}),
+    )
+
+
+def transit_withdrawn_audit(
+    withdrawn: TransitBoundAttestation, *, actor: str, reason: str | None
+) -> AuditAppend:
+    """The audit row ``withdraw_transit_bound_attestation`` appends, on every backend (BACKLOG
+    #2337). The store builds it, as it does the attest row, so no caller can delete the attestation
+    with no ``store.transit_bound_withdrawn`` row, which is what makes a later DML replay of the old
+    row read as superseded."""
+    detail: dict[str, object] = {
+        "key_name": withdrawn.key_name,
+        "attested_by": withdrawn.actor,
+        # A non-finite time (a corrupt row) is recorded as null: json.dumps would write NaN, which is
+        # not JSON.
+        "attested_at": withdrawn.attested_at if math.isfinite(withdrawn.attested_at) else None,
+    }
+    if reason:
+        detail["reason"] = reason
+    return AuditAppend(TRANSIT_BOUND_WITHDRAWN_ACTION, actor=actor, detail=json.dumps(detail))
+
+
+#: Transit's HMAC string names the key version that made it: ``vault:v<N>:<base64>``.
+_TRANSIT_MAC_VERSION: Final = re.compile(r"vault:v([1-9][0-9]{0,9}):")
+
+
+def _version_pinned_mac(mac: AuditMacFn, stored: object) -> AuditMacFn:
+    """``mac`` pinned to the Transit key version ``stored`` was made under, or ``mac`` unchanged
+    when ``stored`` names no version.
+
+    Transit's ``generate_hmac`` uses the key's LATEST version unless told otherwise. So after the
+    operator rotates the key, as the attestation says they will, an unpinned recompute yields
+    ``vault:v2:...`` against a stored ``vault:v1:...`` and the attestation reads as forged. Pinning
+    keeps the check exact: the recompute still runs inside Transit under the stored version's key,
+    so a writer without Transit access still cannot forge a match. A provider whose signature takes
+    no ``key_version`` (a plain ``Callable[[bytes], str]``) is returned unpinned, as before."""
+    match = _TRANSIT_MAC_VERSION.match(stored) if isinstance(stored, str) else None
+    if match is None:
+        return mac
+    try:
+        pinnable = "key_version" in inspect.signature(mac).parameters
+    except (TypeError, ValueError):  # a builtin or C callable with no introspectable signature
+        pinnable = False
+    if not pinnable:
+        return mac
+    version = int(match.group(1))
+    versioned = cast("Callable[..., str]", mac)
+
+    def pinned(data: bytes) -> str:
+        return versioned(data, key_version=version)
+
+    return pinned
+
+
+#: One read for :func:`load_transit_bound_attestation`: ``(sql, params) -> row or None``. ``sql``
+#: carries ``?`` placeholders; the Postgres store rewrites them to ``$n`` before it runs.
+type TransitAttestationFetch = Callable[
+    [str, tuple[object, ...]], Awaitable[Mapping[str, Any] | None]
+]
+
+
+@dataclass(frozen=True, slots=True)
+class TransitAttestationRead:
+    """What :func:`read_transit_bound_attestation_rows` gathered inside one read: the attestation,
+    and the one MAC still to check, which :func:`settle_transit_bound_attestation` computes after
+    the read is released (BACKLOG #2337).
+
+    ``mac_check`` is ``(audit row, previous row hash, key, MAC provider)``, or ``None`` when the
+    verdict is already settled (no row, or a gap found without a MAC)."""
+
+    attestation: TransitBoundAttestation | None
+    mac_check: tuple[Mapping[str, Any], object, bytes | None, AuditMacFn | None] | None = None
+
+
+async def read_transit_bound_attestation_rows(
+    fetch: TransitAttestationFetch,
+    *,
+    mac_keys: Mapping[str, bytes],
+    mac_fn: AuditMacFn | None,
+) -> TransitAttestationRead:
+    """The recorded attestation and the audit rows that must back it -- the read all three
+    backends' ``get_transit_bound_attestation`` run inside one snapshot (BACKLOG #2337).
+
+    Every query is portable across SQLite, Postgres and SQL Server, and every value is a bound
+    parameter. It makes no MAC call: a Transit MAC is a Vault round trip, and holding a read
+    snapshot or a pooled connection across it would pin the WAL or the pool while Vault is slow.
+    Pass the result to :func:`settle_transit_bound_attestation` once the read is released."""
+    row = await fetch(
+        f"SELECT {TRANSIT_ATTESTATION_COLUMNS} FROM transit_bound_attestation WHERE id = ?", (1,)
+    )
+    if row is None:
+        return TransitAttestationRead(None)
+    attestation = _transit_attestation_row(row)
+    if attestation.audit_gap is not None:  # the row itself is malformed
+        return TransitAttestationRead(attestation)
+    found = await _transit_attestation_audit_gap(
+        attestation, fetch, mac_keys=mac_keys, mac_fn=mac_fn
+    )
+    if isinstance(found, str):
+        return TransitAttestationRead(replace(attestation, audit_gap=found))
+    return TransitAttestationRead(attestation, found)
+
+
+async def settle_transit_bound_attestation(
+    read: TransitAttestationRead,
+) -> TransitBoundAttestation | None:
+    """``read``'s attestation, with ``audit_gap`` set when its audit row's MAC does not verify.
+
+    ``None`` when no row is recorded. The check reuses the chain's own pieces: the row MAC
+    (:func:`_audit_row_mac`, under the key of the row's range and the Transit key version its hash
+    names) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC provider
+    runs off the event loop, because it is a blocking Vault call. A Transit refusal of that call,
+    such as a key version a forged hash names that does not exist, reads as a gap, not an error, so
+    a row anyone with DML wrote cannot stop a ``warn`` start."""
+    attestation = read.attestation
+    if attestation is None or read.mac_check is None:
+        return attestation
+    audit, prev, key, mac = read.mac_check
+    seq = audit["seq"]
+    if mac is None:
+        expected = _audit_row_mac(audit, prev, key, None)
+    else:
+        try:
+            expected = await asyncio.to_thread(_audit_row_mac, audit, prev, key, mac)
+        except CipherError as exc:
+            return replace(
+                attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
+            )
+    if expected is None or not hmac.compare_digest(
+        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(expected)
+    ):
+        return replace(
+            attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"
+        )
+    return attestation
+
+
+async def _transit_attestation_audit_gap(
+    attestation: TransitBoundAttestation,
+    fetch: TransitAttestationFetch,
+    *,
+    mac_keys: Mapping[str, bytes],
+    mac_fn: AuditMacFn | None,
+) -> str | tuple[Mapping[str, Any], object, bytes | None, AuditMacFn | None]:
+    """Why ``attestation``'s audit row does not back it, or, when every check but the MAC passes,
+    the inputs of that MAC check: ``(audit row, previous row hash, key, MAC provider)``."""
+    seq = attestation.audit_seq
+    if seq is None or seq < 1 or attestation.audit_hash is None:
+        return "it names no audit row"
+    audit = await fetch(
+        "SELECT seq, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
+        " WHERE seq = ?",
+        (seq,),
+    )
+    if audit is None:
+        return f"its audit row, sequence number {seq}, is not in the audit log"
+    if audit["action"] != TRANSIT_BOUND_ATTESTED_ACTION:
+        return f"audit row {seq} is not an attestation"
+    # The newest attest-or-withdraw row must be this one, so a row replayed after a withdraw, or
+    # after a later attestation, does not count.
+    newest = await fetch(
+        "SELECT MAX(seq) AS newest FROM audit_log WHERE action IN (?, ?)",
+        (TRANSIT_BOUND_ATTESTED_ACTION, TRANSIT_BOUND_WITHDRAWN_ACTION),
+    )
+    if newest is None or _strict_int(newest["newest"]) != seq:
+        return f"a later attest or withdraw audit row supersedes audit row {seq}"
+    try:
+        detail = json.loads(audit["detail"] or "")
+    except (ValueError, TypeError, RecursionError):
+        detail = None
+    ts = audit["ts"]
+    if not (
+        isinstance(detail, dict)
+        and detail.get("key_name") == attestation.key_name
+        and detail.get("reason") == attestation.reason
+        and audit["actor"] == attestation.actor
+        and isinstance(ts, (int, float))
+        and float(ts) == attestation.attested_at
+    ):
+        return f"audit row {seq} names a different key, reason, actor or time"
+    if not hmac.compare_digest(
+        audit_mac_bytes(audit["row_hash"]), audit_mac_bytes(attestation.audit_hash)
+    ):
+        return f"audit row {seq} carries a different hash than the attestation recorded"
+    prev: object = ""
+    if seq > 1:
+        before = await fetch("SELECT row_hash FROM audit_log WHERE seq = ?", (seq - 1,))
+        if before is None:
+            return f"audit row {seq - 1}, which audit row {seq} chains from, is missing"
+        prev = before["row_hash"]
+    # The key of the row's own range: the newest genesis or range row at or below it.
+    opening = await fetch(
+        "SELECT seq, action, detail FROM audit_log WHERE seq ="
+        " (SELECT MAX(seq) FROM audit_log WHERE action = ? AND seq <= ?)",
+        (AUDIT_KEY_EPOCH_ACTION, seq),
+    )
+    key_id: str | None = None
+    if opening is not None and _strict_int(opening["seq"]) == 1:
+        key_id = _audit_genesis_key(opening)
+    elif opening is not None and opening["action"] == AUDIT_KEY_EPOCH_ACTION:
+        parsed = parse_audit_epoch(opening["detail"])
+        key_id = parsed[0] if parsed is not None else None
+    secret: tuple[bytes | None, AuditMacFn | None] | None
+    if key_id is None:
+        # A keyless chain walks as plain SHA-256, and only a process holding no key walks it so,
+        # the rule verify_audit_rows applies. A keyed process reads a keyless row as a break.
+        secret = (None, None) if not mac_keys and mac_fn is None else None
+    else:
+        secret = _audit_secret_for(key_id, mac_keys, mac_fn)
+    if secret is None:
+        return f"this process does not hold the audit key audit row {seq} is sealed under"
+    # A plain dict, so the row outlives the cursor and the read that produced it.
+    columns = ("seq", *_AUDIT_CHAINED_COLUMNS, "row_hash")
+    return ({c: audit[c] for c in columns}, prev, secret[0], secret[1])
+
+
 def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
     """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624)."""
     if audit is None:
@@ -4550,6 +4860,52 @@ def _append_channel_scope(
         clauses.append("1=0")  # scoped to no channels
 
 
+def _connection_event_where(
+    connection: str | None,
+    kinds: Sequence[str] | None,
+    since: float | None,
+    before_id: int | None,
+    allowed_channels: Sequence[str] | None,
+) -> tuple[str, list[Any]]:
+    """The ``?`` ``WHERE`` text and its bound values for a connection-event page and its extent, so
+    the two read the same set (BACKLOG #2438). SQLite and SQL Server both bind ``?`` and both call
+    this module-level builder, so the per-channel scope is written once for the two of them."""
+    where: list[str] = []
+    params: list[Any] = []
+    if connection is not None:
+        where.append("connection=?")
+        params.append(connection)
+    if kinds:
+        placeholders = ",".join("?" for _ in kinds)
+        where.append(f"kind IN ({placeholders})")
+        params.extend(kinds)
+    if since is not None:
+        where.append("ts>=?")
+        params.append(since)
+    if before_id is not None:
+        where.append("id<?")
+        params.append(before_id)
+    # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
+    # outbound row (which spans channels) — mirrors the connection_metadata/purge boundary that
+    # hides shared-outbound topology. None leaves the read unrestricted.
+    if allowed_channels is not None:
+        where.append("direction='inbound'")
+        _append_channel_scope(where, params, "connection", allowed_channels)
+    return (" WHERE " + " AND ".join(where)) if where else "", params
+
+
+def _security_events_where(username: str, until: float | None) -> tuple[str, list[Any]]:
+    """The ``?`` ``WHERE`` text and values for one user's security-event page and its total (BACKLOG
+    #2438): the ``auth.*`` actions recorded under their own name, at or before ``until`` when a
+    pager pins one. SQLite and SQL Server share it, so the page and its total count one set."""
+    params: list[Any] = [username]
+    clause = " WHERE actor = ? AND action LIKE 'auth.%'"
+    if until is not None:
+        clause += " AND ts <= ?"
+        params.append(until)
+    return clause, params
+
+
 def _dead_target_pairs(rows: Iterable[tuple[Any, Any]]) -> list[tuple[str, str]]:
     """Shape every backend's raw ``list_replay_targets`` rows into one sorted list. Sorting here,
     not in SQL, gives the three backends one order whatever their collation. A pair with a NULL or
@@ -4571,7 +4927,9 @@ CREATE TABLE IF NOT EXISTS messages (
     error        TEXT,
     summary      TEXT,             -- ingest-derived (MRN/name/order) — PHI, cipher-encrypted at rest (EF-3)
     metadata     TEXT,             -- code/operator-attached values — PHI, cipher-encrypted at rest (EF-3)
-    documents_pruned REAL          -- #47/ADR 0042: epoch ts an embedded doc was stripped in place (NULL=never)
+    documents_pruned REAL,         -- #47/ADR 0042: epoch ts an embedded doc was stripped in place (NULL=never)
+    origin       TEXT,             -- vault BACKLOG #2615: MessageOrigin, plain, set at insert, never updated
+    origin_actor TEXT              -- vault BACKLOG #2615: the operator behind an operator origin, else NULL
 );
 CREATE INDEX IF NOT EXISTS ix_messages_channel  ON messages(channel_id, received_at);
 CREATE INDEX IF NOT EXISTS ix_messages_control  ON messages(channel_id, control_id);
@@ -4930,6 +5288,22 @@ CREATE TABLE IF NOT EXISTS store_salt (
     created_at  REAL NOT NULL
 );
 
+-- The vault_transit AES-GCM bound attestation (BACKLOG #2337, owner rulings 2026-10-07). One row at
+-- most: the Transit data-key NAME an operator attested, their reason, who (a `cli:<osuser>` actor) and
+-- when. Only `messagefoundry store attest-transit-bound` writes it, and its audit row commits in the
+-- same transaction; `store withdraw-transit-bound` deletes it the same way. `audit_seq` and
+-- `audit_hash` name that audit row, and every read checks it, so a row written by DML alone counts as
+-- none. `serve` on vault_transit refuses under enforce unless it names the configured key. Non-secret.
+CREATE TABLE IF NOT EXISTS transit_bound_attestation (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    key_name    TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    attested_at REAL NOT NULL,
+    audit_seq   INTEGER NOT NULL,
+    audit_hash  TEXT NOT NULL
+);
+
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per uploader holding
 -- only the IN-FLIGHT total: uploads reserved but not yet landed in `uploads_dir`, and therefore
 -- invisible to the sidecar scan that counts everything already on disk. The scan is uncached and so
@@ -5144,7 +5518,14 @@ _LAST_EVENT_COLUMN = (
 # `documents_pruned` (#47, ADR 0042): a nullable epoch timestamp set when retention strips an embedded
 # document in place (NULL = never pruned / no document was ever present). Orthogonal to `status` — it
 # alters no disposition/count; it is the message-level "evicted vs never present" signal a raw-view reads.
-_MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
+_MESSAGE_MIGRATIONS = {
+    "summary": "TEXT",
+    "metadata": "TEXT",
+    "documents_pruned": "REAL",
+    # vault BACKLOG #2615. NULL on an existing row means the origin was not recorded.
+    "origin": "TEXT",
+    "origin_actor": "TEXT",
+}
 
 # BACKLOG #1909: the account a 0.3.2 preset row belongs to. See MessageStore._migrate_preset_owner.
 _PRESET_OWNER_MATCH = (
@@ -6887,6 +7268,7 @@ class MessageStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             await self._insert_outbound_deliveries(mid, channel_id, deliveries, now)
             # #63 verbosity gate — a routine 'received' row is thinnable; suppressing it does NOT
@@ -7374,6 +7756,8 @@ class MessageStore:
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
         audit: OperatorAudit[str] | None = None,
+        origin: MessageOrigin = MessageOrigin.PARTNER,
+        origin_actor: str | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001 Step A).
@@ -7411,6 +7795,8 @@ class MessageStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=origin,
+                origin_actor=origin_actor,
             )
             # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059).
             ingress_created_at = now
@@ -7874,12 +8260,14 @@ class MessageStore:
         metadata: str | None,
         error: str | None,
         now: float,
+        origin: MessageOrigin,
+        origin_actor: str | None = None,
     ) -> None:
         await self._db.execute(
             "INSERT INTO messages"
             " (id, channel_id, received_at, source_type, control_id,"
-            "  message_type, raw, status, error, summary, metadata)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "  message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 mid,
                 channel_id,
@@ -7893,6 +8281,9 @@ class MessageStore:
                 # EF-3: MRN/name is PHI — ciphered at rest like the body
                 self._enc(summary, aad=cell_aad("messages", "summary", mid)),
                 self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
+                origin.value,
+                origin_actor,
             ),
         )
         self.body_copies += (
@@ -7935,6 +8326,7 @@ class MessageStore:
                 metadata=metadata,
                 error=error,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             # #63 verbosity gate. `event` is 'error' (a compliance-floor event → always kept) or
             # 'filtered' (routine → thinnable). The messages row above records the disposition
@@ -8816,6 +9208,7 @@ class MessageStore:
                 metadata=child_meta,
                 error=None,
                 now=now,
+                origin=MessageOrigin.REINGRESS,
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
             ingress_created = now
@@ -9070,6 +9463,7 @@ class MessageStore:
                         (peek_error or "re-ingress body failed HL7 peek") if peek_failed else None
                     ),
                     now=now,
+                    origin=MessageOrigin.REINGRESS,
                 )
                 # 6. The ingress queue row — UNLESS peek_failed (an ERROR message owes no work).
                 if not peek_failed:
@@ -9868,6 +10262,28 @@ class MessageStore:
             await self._commit()
         return count
 
+    async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None:
+        """The ``resend_log`` row an idempotency key claimed, or ``None`` when the key is unused.
+
+        Read-only. For a caller that answers a repeat of an already-run resend before it asks for
+        anything a first resend needs (vault BACKLOG #2625: the console's step-up proof). Ids and
+        names only, never a body."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
+                " WHERE resend_key=?",
+                (resend_key,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return ResendKeyRecord(
+            message_id=row["message_id"],
+            to_destination=row["to_destination"],
+            from_destination=row["from_destination"] or "",
+            outbox_id=row["outbox_id"],
+        )
+
     async def resend_to(
         self,
         *,
@@ -9878,6 +10294,7 @@ class MessageStore:
         body_override: str | None = None,
         now: float | None = None,
         audit: OperatorAudit[ResendOutcome] | None = None,
+        actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's **stored transformed body** to an ALTERNATE outbound ``to`` (ADR 0090,
         BACKLOG #123). Ships exactly what we sent — the retained ``done``/``cancelled`` outbound
@@ -9909,7 +10326,9 @@ class MessageStore:
         message/target — review #123-4).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
-        commits with the resend (BACKLOG #2624, :data:`OperatorAudit`)."""
+        commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
+        origin ``operator_edit`` with ``actor`` as its ``origin_actor``, and the outcome names it in
+        ``new_message_id`` (vault BACKLOG #2615)."""
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
@@ -9949,6 +10368,7 @@ class MessageStore:
                 await self._append_operator_audit(written, audit, outcome)
                 await self._commit()
                 return outcome
+            child_mid: str | None = None
             if body_override is not None:
                 # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                 # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN
@@ -10016,6 +10436,8 @@ class MessageStore:
                     metadata=child_meta,
                     error=None,
                     now=now,
+                    origin=MessageOrigin.OPERATOR_EDIT,
+                    origin_actor=actor,
                 )
                 await self._event(
                     child_mid, "received", None, f"edit-resend from {message_id}", now
@@ -10099,6 +10521,7 @@ class MessageStore:
                 to_destination=to,
                 from_destination=src_dest,
                 outbox_id=outbox_id,
+                new_message_id=child_mid,
             )
             await self._append_operator_audit(written, audit, outcome)
             await self._commit()
@@ -10112,6 +10535,7 @@ class MessageStore:
         idempotency_key: str,
         now: float | None = None,
         audit: OperatorAudit[ReingressOutcome] | None = None,
+        actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-enter an EDITED body onto the
         ORIGIN message's channel as a **fresh, correlated ``RECEIVED`` child message** at the ingress
@@ -10132,7 +10556,8 @@ class MessageStore:
         on a raise (the whole txn rolls back).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
-        commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`)."""
+        commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
+        ``operator_edit`` with ``actor`` as its ``origin_actor`` (vault BACKLOG #2615)."""
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
@@ -10214,6 +10639,8 @@ class MessageStore:
                     metadata=child_meta,
                     error=None,
                     now=now,
+                    origin=MessageOrigin.OPERATOR_EDIT,
+                    origin_actor=actor,
                 )
                 # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
                 # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
@@ -10821,35 +11248,21 @@ class MessageStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
+        offset: int = 0,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(
             1, min(limit, 1000)
         )  # server-side clamp (a flooded log can't drive an unbounded read)
-        where: list[str] = []
-        params: list[Any] = []
-        if connection is not None:
-            where.append("connection=?")
-            params.append(connection)
-        if kinds:
-            placeholders = ",".join("?" for _ in kinds)
-            where.append(f"kind IN ({placeholders})")
-            params.extend(kinds)
-        if since is not None:
-            where.append("ts>=?")
-            params.append(since)
-        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
-        # outbound row (which spans channels) — mirrors the connection_metadata/purge boundary that
-        # hides shared-outbound topology. None leaves the read unrestricted.
-        if allowed_channels is not None:
-            where.append("direction='inbound'")
-            _append_channel_scope(where, params, "connection", allowed_channels)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
-        params.append(limit)
+        clause, params = _connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        params += [limit, max(offset, 0)]
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
-                f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ?",
+                f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
                 params,
             )
             return [
@@ -10871,6 +11284,28 @@ class MessageStore:
                 )
                 for r in await cur.fetchall()
             ]
+
+    async def connection_event_extent(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        before_id: int | None = None,
+        allowed_channels: Sequence[str] | None,
+    ) -> tuple[int, int]:
+        """The total :meth:`list_connection_events` pages through, and the newest ``id`` in it, or
+        0 when it is empty (BACKLOG #2438). A pager passes that ``id`` plus one back as
+        ``before_id``, so its later pages read the set this one counted while new events arrive."""
+        clause, params = _connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT COUNT(*), MAX(id) FROM connection_event{clause}", params
+            )
+            row = await cur.fetchone()
+        return (int(row[0]), int(row[1] or 0)) if row is not None else (0, 0)
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
     # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
@@ -11343,10 +11778,12 @@ class MessageStore:
         until: float | None = None,
         exclude: AuditExclusion | None = None,
         before_id: int | None = None,
+        offset: int = 0,
     ) -> list[aiosqlite.Row]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
-        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
-        Every value is a bound parameter; see :meth:`_audit_where`."""
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776),
+        or past ``offset`` rows of the filtered set (BACKLOG #2438). Every value is a bound
+        parameter; see :meth:`_audit_where`."""
         where, params = self._audit_where(
             actor=actor,
             action=action,
@@ -11355,17 +11792,17 @@ class MessageStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
+        params += [limit, max(offset, 0)]
         async with self._read() as db:
             cur = await db.execute(
-                f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?", params
+                f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?", params
             )
             return list(await cur.fetchall())
 
     async def count_audit(
         self,
         *,
-        limit: int,
+        limit: int | None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
@@ -11383,12 +11820,18 @@ class MessageStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
+        # Each branch writes its SQL inline rather than in a local variable. The transaction guard
+        # test cannot read a local, and it pins how many SQL arguments it cannot read.
         async with self._read() as db:
-            cur = await db.execute(
-                f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where} ORDER BY id DESC LIMIT ?)",
-                params,
-            )
+            if limit is None:
+                cur = await db.execute(f"SELECT COUNT(*) FROM audit_log{where}", params)
+            else:
+                params.append(limit)
+                cur = await db.execute(
+                    f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where}"
+                    " ORDER BY id DESC LIMIT ?)",
+                    params,
+                )
             row = await cur.fetchone()
             return int(row[0]) if row is not None else 0
 
@@ -11420,18 +11863,30 @@ class MessageStore:
         return [dict(r) for r in rows]
 
     async def security_events_for_user(
-        self, username: str, *, limit: int = 100
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
     ) -> list[aiosqlite.Row]:
         """A user's own security events (the audited ``auth.*`` actions), most-recent-first — the
         source for ``GET /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes (whose audit
-        ``actor`` is the admin) are delivered out-of-band by email, not shown in this self view."""
+        ``actor`` is the admin) are delivered out-of-band by email, not shown in this self view.
+        ``offset`` pages it, and ``until`` pins the pages to one snapshot (BACKLOG #2438)."""
+        where, params = _security_events_where(username, until)
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT ts, action, detail FROM audit_log "
-                "WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC LIMIT ?",
-                (username, limit),
+                f"SELECT ts, action, detail FROM audit_log{where} ORDER BY id DESC"
+                " LIMIT ? OFFSET ?",
+                (*params, limit, max(offset, 0)),
             )
             return list(await cur.fetchall())
+
+    async def count_security_events_for_user(
+        self, username: str, *, until: float | None = None
+    ) -> int:
+        """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
+        where, params = _security_events_where(username, until)
+        async with self._read() as db:
+            cur = await db.execute(f"SELECT COUNT(*) FROM audit_log{where}", params)
+            row = await cur.fetchone()
+        return int(row[0]) if row is not None else 0
 
     # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
 
@@ -11658,6 +12113,79 @@ class MessageStore:
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
 
+    # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
+    # Non-secret. See messagefoundry.store.transit_attestation for the rulings it implements.
+
+    async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
+        """The recorded attestation, checked against its audit row, or ``None``. The rows are read
+        in one ``_read()`` snapshot (:func:`read_transit_bound_attestation_rows`); the MAC runs after
+        it is released (:func:`settle_transit_bound_attestation`)."""
+        async with self._read() as db:
+
+            async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+                cur = await db.execute(sql, params)
+                # sqlite3.Row reads by column name, the one Mapping operation the reader uses.
+                return cast("Mapping[str, Any] | None", await cur.fetchone())
+
+            read = await read_transit_bound_attestation_rows(
+                fetch, mac_keys=self._audit_mac_keys, mac_fn=self._audit_mac_fn
+            )
+        return await settle_transit_bound_attestation(read)
+
+    async def record_transit_bound_attestation(
+        self, *, key_name: str, reason: str, actor: str, now: float | None = None
+    ) -> TransitBoundAttestation:
+        """Append the attestation's audit row, then replace the attestation with ``key_name`` and that
+        row's sequence number and hash, in ONE transaction, so the row never exists without the record
+        of who wrote it (the #2624 pattern) and names it."""
+        now = time.time() if now is None else now
+        audit = transit_attested_audit(key_name=key_name, reason=reason, actor=actor)
+        async with _writer_txn(self._db, self._lock):
+            [appended] = await self._append_audits((audit,), now=now)
+            recorded = TransitBoundAttestation(
+                key_name=key_name,
+                reason=reason,
+                actor=actor,
+                attested_at=now,
+                audit_seq=appended.seq,
+                audit_hash=appended.row_hash,
+            )
+            await self._db.execute(
+                "INSERT INTO transit_bound_attestation (id, key_name, reason, actor, attested_at,"
+                " audit_seq, audit_hash) VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET"
+                " key_name=excluded.key_name, reason=excluded.reason, actor=excluded.actor,"
+                " attested_at=excluded.attested_at, audit_seq=excluded.audit_seq,"
+                " audit_hash=excluded.audit_hash",
+                (key_name, reason, actor, now, appended.seq, appended.row_hash),
+            )
+            await self._commit()
+        tee_audits((audit,), (appended,), ts=now)
+        return recorded
+
+    async def withdraw_transit_bound_attestation(
+        self, *, actor: str, reason: str | None = None, now: float | None = None
+    ) -> TransitBoundAttestation | None:
+        """Delete the attestation and append its ``store.transit_bound_withdrawn`` row
+        (:func:`transit_withdrawn_audit`), in ONE transaction. ``None``, with nothing appended, when
+        none was recorded."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                f"SELECT {TRANSIT_ATTESTATION_COLUMNS} FROM transit_bound_attestation WHERE id = 1"
+            )
+            row = await cur.fetchone()
+            if row is None:
+                # Nothing written, so nothing to commit: _writer_txn leaves the unwind to us.
+                await self._db.rollback()
+                return None
+            withdrawn = _transit_attestation_row(row)
+            await self._db.execute("DELETE FROM transit_bound_attestation WHERE id = 1")
+            audits = (transit_withdrawn_audit(withdrawn, actor=actor, reason=reason),)
+            appended = await self._append_audits(audits, now=now)
+            await self._commit()
+        tee_audits(audits, appended, ts=now)
+        return withdrawn
+
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
         async with self._read() as db:
@@ -11811,7 +12339,8 @@ class MessageStore:
         the intentional disclosure. (Under ``vault_transit`` each row MAC is a Transit round trip, so a
         broken chain now pays the same N round trips a healthy one already pays — accepted: the
         healthy-verify cost is the bound, and a tamper alarm must not be cheaper to provoke than a
-        clean pass.)"""
+        clean pass. A row whose key version Transit refuses costs one more, the probe that tells the
+        refusal from an outage, BACKLOG #2337.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(

@@ -5,7 +5,7 @@
 // without `vscode`. securityEditor.ts builds the page and embeds this; the unit suite evaluates the
 // SAME source in a jsdom page (webview-receivers.test.ts), so what the tests exercise is what
 // ships.
-import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, embedJson, guardScript } from "./webviewMessaging";
+import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
 
 // The switches live here rather than in securityEditor.ts so the unit suite renders the real list.
 export type FieldType = "bool" | "int" | "string" | "tristate";
@@ -69,6 +69,22 @@ export const FIELDS: Field[] = [
   { key: "allow_keeping_phi_indefinitely", label: "Allow keeping PHI indefinitely", type: "bool", group: "Data handling",
     desc: "Audited escape: unbounded PHI retention.",
     insecure: true, risk: "unbounded PHI retention is permitted" },
+  // The per-tier retention acknowledgements (BACKLOG #1967, #2280). 'Allow keeping PHI indefinitely'
+  // above covers the auto-bounded tiers only and does NOT satisfy these. Each `risk` mirrors
+  // security_loosenings(); tests/test_security_config.py reds when a risk drifts, when a tier's
+  // switch is missing here, or when one is not a bool whose `true` is the loosening.
+  { key: "allow_keeping_transform_state_indefinitely", label: "Allow keeping transform state indefinitely", type: "bool", group: "Data handling",
+    desc: "Audited acknowledgement: [retention].state_max_age_days may stay unset. Under strict enforcement the engine refuses to start without this or a window. Read [retention] in docs/CONFIGURATION.md before choosing a window on this tier.",
+    insecure: true, risk: "the PL-2 tier [retention].state_max_age_days may start with no retention window and accumulate without bound" },
+  { key: "allow_keeping_search_presets_indefinitely", label: "Allow keeping search presets indefinitely", type: "bool", group: "Data handling",
+    desc: "Audited acknowledgement: [retention].search_preset_days may stay unset. Under strict enforcement the engine refuses to start without this or a window.",
+    insecure: true, risk: "the PL-2 tier [retention].search_preset_days may start with no retention window and accumulate without bound" },
+  { key: "allow_keeping_app_logs_indefinitely", label: "Allow keeping app logs indefinitely", type: "bool", group: "Data handling",
+    desc: "Audited acknowledgement: [retention].app_log_days may stay unset while [logging].log_dir is set. Under strict enforcement the engine refuses to start without this or a window.",
+    insecure: true, risk: "the PL-1 tier [retention].app_log_days may start with no retention window and accumulate without bound" },
+  { key: "allow_keeping_backup_archives_indefinitely", label: "Allow keeping backup archives indefinitely", type: "bool", group: "Data handling",
+    desc: "Audited acknowledgement: [backup].retention_keep may be 0 while [backup].destination is set. Under strict enforcement the engine refuses to start without this or a keep count.",
+    insecure: true, risk: "the PL-1 tier [backup].retention_keep may start with no retention window and accumulate without bound" },
   { key: "audit_all_authorization_decisions", label: "Audit all authorization decisions", type: "bool", group: "Data handling",
     desc: "PHI access is ALWAYS audited; this records the grant for every authorization decision on top. On by default (BACKLOG #1277).",
     insecure: false, risk: "every authenticated READ is authorized but NOT recorded — what an account reached cannot be reconstructed afterwards" },
@@ -84,11 +100,13 @@ export const FIELDS: Field[] = [
  *  channel token, minted by the caller with the nonce (webviewMessaging.ts). */
 export function securityEditorScript(token: string, fields: unknown): string {
   return `
-    const vscode = acquireVsCodeApi();${guardScript(token)}${SHAPE_HELPERS}
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}${guardScript(token)}${SHAPE_HELPERS}
     const FIELDS = ${embedJson(fields)};
     const $ = (id) => document.getElementById(id);
     const errorEl = $('error');
     let defaults = {};
+    // The refusal now showing, or '' while the form is up. See refuse().
+    let refusal = '';
 
     // Build the grouped form once; values are filled in on 'state'.
     function buildForm() {
@@ -151,8 +169,21 @@ export function securityEditorScript(token: string, fields: unknown): string {
     function render(state) {
       defaults = state.defaults || {};
       for (const f of FIELDS) { setValue(f, state.values ? state.values[f.key] : undefined); }
+      refusal = '';
       errorEl.style.display = 'none';
+      $('form').style.display = '';
       $('save').disabled = false;
+    }
+
+    // A state this form cannot read. The form is hidden and Save goes off, so nothing can be written
+    // from placeholders or from the values of an earlier state. textContent (through show): the
+    // problem names a switch, and no part of a message is ever parsed as markup here.
+    function refuse(problem) {
+      $('save').disabled = true;
+      $('form').style.display = 'none';
+      refusal = 'These settings cannot be shown. The state sent to this form is malformed: ' + problem +
+        '. Save is off until a well-formed state arrives.';
+      show(refusal);
     }
 
     function collectUpdates() {
@@ -168,27 +199,80 @@ export function securityEditorScript(token: string, fields: unknown): string {
       return updates;
     }
 
-    function show(msg) { errorEl.textContent = msg; errorEl.style.display = ''; }
+    // 'block', not '': the page's stylesheet hides .error, and clearing the inline value would hand
+    // the element back to that rule, so the text would be set and never seen.
+    function show(msg) { errorEl.textContent = msg; errorEl.style.display = 'block'; }
 
     $('save').addEventListener('click', () => vscode.postMessage({ command: 'save', updates: collectUpdates() }));
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
-    // One entry per message the host posts (at least securityEditor.ts). The state is ShowResult,
-    // the JSON "security show" prints. That comes from the INSTALLED engine, which can be older or
-    // newer than this extension, so the two fields the form renders from are required and the two
-    // it does not read are typed only when present.
+    // The JS type each FIELDS type arrives as, and how the refusal names it. Types only: a negative
+    // int is a value range, which is a different requirement (webviewMessaging.ts, SHAPE_HELPERS).
+    // mfInt is Number.isSafeInteger, so a fraction and a number past 2^53 are refused as not an int.
+    // null is a value only for a tristate: elsewhere it would render as "No" or as an empty number.
+    const TYPE_OK = {
+      bool: { ok: mfBool, want: 'true or false' },
+      int: { ok: mfInt, want: 'a whole number' },
+      string: { ok: mfStr, want: 'text' },
+      tristate: { ok: (x) => x === null || mfBool(x), want: 'true, false or null' },
+    };
+
+    // What is wrong with the first switch in o (state.values or state.defaults) that is missing or
+    // has the wrong type, or null when every FIELDS switch is there with its type.
+    // EVERY switch is required in BOTH objects. "security show" prints the whole settings model
+    // twice (the file's values, then the defaults), so a missing switch is a malformed state. It is
+    // refused for the reason a null is: setValue() would show an absent Yes/No as "No" and an absent
+    // number as empty, and Save would write that as false or 0. A tristate that is unset arrives as
+    // null, which is present. Keys with no FIELDS entry are never read, so never checked.
+    function switchProblem(o, where) {
+      for (const f of FIELDS) {
+        const name = where + '.' + f.key;
+        const v = o[f.key];
+        if (v === undefined) { return name + ' is missing'; }
+        // Own-property lookup, so a FIELDS type with no entry here fails closed and does not throw.
+        const t = Object.prototype.hasOwnProperty.call(TYPE_OK, f.type) ? TYPE_OK[f.type] : null;
+        if (!t) { return name + ' has a type this form does not know'; }
+        if (t.ok(v) !== true) { return name + ' must be ' + t.want + ', got ' + mfKind(v); }
+      }
+      return null;
+    }
+
+    // What is wrong with a 'state' message, or null. The state is ShowResult, the JSON "security
+    // show" prints. All four of its fields are required: the two objects the form renders from, with
+    // every switch, and the two it does not read (set, loosenings), which the command always prints.
+    function stateProblem(d) {
+      const s = d.state;
+      if (!mfObj(s)) { return 'state is missing or is not an object'; }
+      for (const where of ['values', 'defaults']) {
+        if (!mfObj(s[where])) { return where + ' is missing or is not an object'; }
+        const problem = switchProblem(s[where], where);
+        if (problem !== null) { return problem; }
+      }
+      if (!mfArrOf(s.set, mfStr)) { return 'set is missing or is not a list of text'; }
+      if (!mfArrOf(s.loosenings, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk))) {
+        return 'loosenings is missing or is not a list of switch and risk entries';
+      }
+      return null;
+    }
+
+    // One entry per message the host posts (at least securityEditor.ts).
     const SHAPES = {
-      state: (d) => mfObj(d.state) && mfObj(d.state.values) && mfObj(d.state.defaults) &&
-        mfOpt(d.state.set, (s) => mfArrOf(s, mfStr)) &&
-        mfOpt(d.state.loosenings, (ls) => mfArrOf(ls, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk))),
+      state: (d) => stateProblem(d) === null,
       error: (d) => mfStr(d.message),
     };
     ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
       const d = mfTrusted(e);
-      if (!d || !mfShapeOk(d, 'command', SHAPES, 'Security Settings')) { return; }
+      if (!d) { return; }
+      if (!mfShapeOk(d, 'command', SHAPES, 'Security Settings')) {
+        // A discarded state is shown as well as warned: an empty form with no reason reads as broken.
+        // The fallback text covers a discard stateProblem() does not explain, so "null" is never shown.
+        if (d.command === 'state') { refuse(stateProblem(d) || 'it is malformed'); }
+        return;
+      }
       if (d.command === 'state') { render(d.state); }
-      else if (d.command === 'error') { show(d.message); }
+      // After a refusal the form is still hidden, so the reason stays up beside the new error.
+      else if (d.command === 'error') { show(refusal ? refusal + ' The engine also reported: ' + d.message : d.message); }
     });
 
     // Save stays off until a state has rendered. Until then the form holds placeholders, not the file's

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import httpx
 from _ui_clients import PW, SAME_ORIGIN, cookie_login, provision
+from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Permission, Role
@@ -346,12 +347,12 @@ class _FakeWS:
     """A same-origin browser handshake carrying the session cookie, for ``authorize_ui_ws``."""
 
     def __init__(self, app: object, cookie: str) -> None:
-        self.headers = {"origin": "http://t", "host": "t"}
+        self.headers = Headers({"origin": "http://t", "host": "t"})  # has getlist (BACKLOG #2454)
         self.app = app
         self.url = SimpleNamespace(scheme="ws", path="/ws/stats")
         self.cookies = {"mf_session": cookie}
         # Read by client_ip for the denial row (ADR 0150, BACKLOG #1644), as on a real WebSocket.
-        self.client = SimpleNamespace(host="127.0.0.1", port=123)
+        self.scope = {"client": ("127.0.0.1", 123)}
 
 
 async def test_the_console_socket_refuses_a_confined_session_below_the_factor_check(

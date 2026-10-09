@@ -298,7 +298,11 @@ async def test_dry_run_reload_audits_config_reload_check_under_the_acting_user(
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        service = AuthService(eng.store, AuthSettings(require_mfa=False))
+        # This test's subject is the dry run's audit row, so it keeps the session window.
+        # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
+        service = AuthService(
+            eng.store, AuthSettings(require_mfa=False, require_action_step_up=False)
+        )
         await service.initialize()
         uid = await create_local_user_chosen(
             service,

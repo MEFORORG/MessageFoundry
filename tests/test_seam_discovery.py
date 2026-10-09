@@ -160,9 +160,13 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
     with the initial-credential deadline surfaces (BACKLOG #1141, ASVS 6.4.5). ``mark_route_gate`` and
     ``public_route`` joined with the engine's deny-by-default route check (vault BACKLOG #2604).
     ``alert_directory_administrator_granted`` joined with the directory sign-in grant alert (vault
-    BACKLOG #2610)."""
+    BACKLOG #2610). ``authorization_header`` joined with the repeated-header refusal on
+    ``GET /ui/sso`` (BACKLOG #2454). ``RepeatedCredentialError`` and ``record_repeated_credential``
+    joined when the session-cookie read took the same rule (BACKLOG #2454)."""
     assert surface.security_symbols == (
+        "RepeatedCredentialError",
         "alert_directory_administrator_granted",
+        "authorization_header",
         "client_ip",
         "enforce_phi_read_hop",
         "enforce_phi_read_pacing",
@@ -172,6 +176,7 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
         "pending_credential_deadline",
         "pending_credential_deadline_for",
         "public_route",
+        "record_repeated_credential",
     )
 
 
@@ -184,7 +189,10 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     imports change, and never widen it to a membership check.
 
     Recorded 2026-09-29. The filing named three ``admin.py`` constants; the tree had five names
-    there by then, and ``OidcStepUp`` in ``routes/oidc.py`` was new since the filing too."""
+    there by then, and ``OidcStepUp`` in ``routes/oidc.py`` was new since the filing too.
+
+    Vault BACKLOG #2625 added the five constants of the injection and bulk lanes the console has a
+    route for (resend, edit-resend, upload resend, purge, reload)."""
     assert surface.auth_service_symbols == (
         "AuthService",
         "Elevation",
@@ -196,10 +204,15 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
         "STEP_UP_ACTION_ADMIN_RESET_MFA",
         "STEP_UP_ACTION_ADMIN_RESET_PASSWORD",
         "STEP_UP_ACTION_ADMIN_USER_UPDATE",
+        "STEP_UP_ACTION_CONFIG_RELOAD",
+        "STEP_UP_ACTION_CONNECTION_PURGE",
+        "STEP_UP_ACTION_MESSAGE_EDIT_RESEND",
+        "STEP_UP_ACTION_MESSAGE_RESEND",
         "STEP_UP_ACTION_MFA_CONFIRM",
         "STEP_UP_ACTION_MFA_DISABLE",
         "STEP_UP_ACTION_MFA_ENROLL",
         "STEP_UP_ACTION_SESSION_TERMINATE",
+        "STEP_UP_ACTION_UPLOAD_RESEND",
         "STEP_UP_ACTION_WEBAUTHN_DELETE",
         "STEP_UP_ACTION_WEBAUTHN_ENROLL",
     )

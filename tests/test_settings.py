@@ -493,33 +493,29 @@ def test_an_engine_written_config_still_loads(tmp_path: Path) -> None:
     assert s.retention.messages_days == 30
 
 
-def test_the_refusal_is_scoped_to_the_file_not_env_or_cli(tmp_path: Path) -> None:
-    """Pins the SCOPE of the refusal, so the gap reads as the decision it is rather than an oversight.
+def test_the_refusal_covers_the_file_and_env_but_not_cli(tmp_path: Path) -> None:
+    """Pins the SCOPE of the refusal, so the gap that is left reads as a decision.
 
-    Refusing an unrecognized env key would refuse the documented out-of-band ``MEFOR_*`` variables
-    exercised by ``test_an_engine_written_config_still_loads``; CLI keys are engine-written, never
-    operator-spelled. Whatever the docs say about this refusal has to carry that scope — a reader who
-    believes env is checked stops proof-reading the surface where secrets and posture switches live.
-    """
+    The file refuses an unknown key under a modelled section. The environment has a narrower
+    refusal since vault BACKLOG #2600; ``tests/test_settings_env_keys.py`` holds its tests.
+    CLI keys are engine-written, never operator-spelled, and nothing checks them."""
     cfg = _write(tmp_path / "messagefoundry.toml", '[store]\nbackend = "sqlite"\n')
 
-    # Positive control: the SAME typo in the FILE is refused, so a silent pass below is a real scope
-    # boundary and not a checker that stopped running.
     bad = _write(tmp_path / "bad.toml", '[store]\nbackend = "sqlite"\npathh = "typo.db"\n')
     with pytest.raises(ValueError, match=r"\[store\]\.pathh"):
         load_settings(config_path=bad, environ={})
 
-    from_env = load_settings(config_path=cfg, environ={"MEFOR_STORE_PATHH": "typo.db"})
-    assert from_env.store.path == "messagefoundry.db"  # dropped, and nothing said
+    with pytest.raises(ValueError, match="MEFOR_STORE_PATHH"):
+        load_settings(config_path=cfg, environ={"MEFOR_STORE_PATHH": "typo.db"})
 
     from_cli = load_settings(config_path=cfg, environ={}, cli={"store": {"pathh": "typo.db"}})
-    assert from_cli.store.path == "messagefoundry.db"
+    assert from_cli.store.path == "messagefoundry.db"  # dropped, and nothing said
 
 
 def test_an_unknown_security_key_from_env_is_still_refused(tmp_path: Path) -> None:
-    # The one exception to the file-only scope: every shipped MEFOR_SECURITY_* name maps to a real
-    # field, so there is no out-of-band variable to collide with, and a posture switch the operator
-    # believes is on is the worst case of the class.
+    # [security] has its own refusal, older than the environment-wide one and worded by section
+    # and key: every shipped MEFOR_SECURITY_* name maps to a real field, so there is no
+    # out-of-band variable to collide with.
     cfg = _write(tmp_path / "messagefoundry.toml", '[store]\nbackend = "sqlite"\n')
     with pytest.raises(ValueError, match=r"\[security\]\.block_unlisted_outboud"):
         load_settings(config_path=cfg, environ={"MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUD": "true"})

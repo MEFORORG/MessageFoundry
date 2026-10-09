@@ -1086,7 +1086,7 @@ jobs:
       # run (docs-only PRs, a deselecting -k), and a missing diagnostic must never redden a leg.
       - name: Upload connscale readings
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: connscale-readings-${{ matrix.os }}-py${{ matrix.python-version }}
           path: out/connscale/
@@ -2161,7 +2161,7 @@ jobs:
       # count -- under `--dist loadfile` no shard finishes faster than its single largest file.
       - name: Upload the tier's junit
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tooling-junit-${{ matrix.os }}
           path: tooling-junit.xml
@@ -2653,7 +2653,9 @@ jobs:
           # the same holds for it, and for tests/_replay_settle_contract.py (vault BACKLOG #2723).
           # api/approvals.py and tests/_pending_approval_store_contract.py carry the approval gate
           # and the body both server legs run (BACKLOG #1562).
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app|approvals)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|\.github/workflows/ci\.yml)'; then
+          # tests/test_transit_bound_attestation_server_backends.py holds the attestation round trip
+          # both server legs run (BACKLOG #2337).
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app|approvals)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|tests/test_transit_bound_attestation_server_backends\.py|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -3532,6 +3534,7 @@ jobs:
           # engine reports it at ERROR and starts. The CA+CRL is minted in the run block below.
           MEFOR_LOGGING_FORWARD_HOST: siem.invalid
           MEFOR_LOGGING_FORWARD_PROTOCOL: tls
+          MEFOR_EGRESS_ALLOWED_SYSLOG: siem.invalid  # BACKLOG #2356: the collector is an egress destination
         run: |
           set -o pipefail
           mkdir -p out/load
@@ -3613,7 +3616,7 @@ jobs:
 
       - name: Upload load report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: load-report
           path: out/load/
@@ -3840,7 +3843,7 @@ jobs:
 
       - name: Upload load report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: load-report-sqlserver
           path: out/load/
@@ -4087,6 +4090,7 @@ jobs:
             "MEFOR_RETENTION_SEARCH_PRESET_DAYS=30" `
             "MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true" `
             "MEFOR_LOGGING_FORWARD_HOST=siem.invalid" `
+            "MEFOR_EGRESS_ALLOWED_SYSLOG=siem.invalid" `
             "MEFOR_LOGGING_FORWARD_PROTOCOL=tls" `
             "MEFOR_LOGGING_FORWARD_TLS_CA_FILE=$syslogCa" `
             "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=$syslogCa" `
@@ -4687,7 +4691,7 @@ jobs:
 
       - name: Upload store-access logs (ADR 0183 Wave 0)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: store-access-logs-${{ matrix.os }}-py${{ matrix.python-version }}
           path: |
@@ -4698,7 +4702,7 @@ jobs:
 
       - name: Upload service logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}
           path: C:\ProgramData\MessageFoundry\logs\
@@ -4790,6 +4794,7 @@ jobs:
             -e MEFOR_RETENTION_SEARCH_PRESET_DAYS=30 \
             -e MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true \
             -e MEFOR_LOGGING_FORWARD_HOST=siem.invalid \
+            -e MEFOR_EGRESS_ALLOWED_SYSLOG=siem.invalid \
             -e MEFOR_LOGGING_FORWARD_PROTOCOL=tls \
             -e MEFOR_LOGGING_FORWARD_TLS_CA_FILE=/syslog-ca/syslog_ca_and_crl.pem \
             -e MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=/syslog-ca/syslog_ca_and_crl.pem \

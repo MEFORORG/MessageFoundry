@@ -20,6 +20,8 @@ This module is the one place that names the hidden rows. Every API read of the t
 * ``auth.account_locked`` -- a lock landed. In a combined campaign under a live sign-in lock, only
   a right candidate can make one.
 * ``auth.lock_notice`` -- the throttle row of a lock mail, and its detail names the counter.
+* ``auth.lock_notice_undelivered`` -- a lock mail the relay's queue dropped or the send lost
+  (BACKLOG #2383). It is written only when a lock landed.
 * ``auth.login_locked`` -- a sign-in refused by a live lock. A live second-step lock refuses a
   later sign-in that a wrong candidate would have been refused for as a plain wrong password.
 * ``auth.admin_unlocked`` -- the whole row, not only its lock fields. Its detail records both lock
@@ -71,25 +73,37 @@ from messagefoundry.store.audit_exclusion import AuditExclusion
 __all__ = [
     "ACCOUNT_LOCKED_ACTION",
     "ADMIN_UNLOCKED_ACTION",
+    "AUDIT_WITHHELD_HEADER",
     "DIRECTORY_LOCKED_REFUSAL_DETAIL",
     "HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE",
     "LOCKED_REFUSAL_DETAIL",
     "LOCK_EVENT_ACTIONS",
     "LOCK_NOTICE_ACTION",
+    "LOCK_NOTICE_UNDELIVERED_ACTION",
     "LOGIN_LOCKED_ACTION",
     "audit_exclusion_for",
     "is_audit_copy_line",
     "reads_audit_copies_in_the_log",
+    "withholds_rows_from",
 ]
 
 ACCOUNT_LOCKED_ACTION: Final = "auth.account_locked"
 LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
+#: A lock notice that never left this engine (BACKLOG #2383). Its own name, not
+#: ``auth.security_notice_undelivered``, so the whole row can be hidden like the lock rows.
+LOCK_NOTICE_UNDELIVERED_ACTION: Final = "auth.lock_notice_undelivered"
 LOGIN_LOCKED_ACTION: Final = "auth.login_locked"
 ADMIN_UNLOCKED_ACTION: Final = "auth.admin_unlocked"
 
 #: The whole-row hides.
 LOCK_EVENT_ACTIONS: Final[frozenset[str]] = frozenset(
-    {ACCOUNT_LOCKED_ACTION, LOCK_NOTICE_ACTION, LOGIN_LOCKED_ACTION, ADMIN_UNLOCKED_ACTION}
+    {
+        ACCOUNT_LOCKED_ACTION,
+        LOCK_NOTICE_ACTION,
+        LOCK_NOTICE_UNDELIVERED_ACTION,
+        LOGIN_LOCKED_ACTION,
+        ADMIN_UNLOCKED_ACTION,
+    }
 )
 
 #: The exact detail of a lock refusal on the TOTP/recovery and passkey legs. The writers use this
@@ -134,6 +148,22 @@ _AUDIT_COPY_LINE: Final = re.compile(
 def is_audit_copy_line(line: str) -> bool:
     """Whether ``line`` of the general log is the tee's copy of an audit row."""
     return _AUDIT_COPY_LINE.search(line) is not None
+
+
+#: The ``GET /audit/export`` response header that says whether the caller's permissions withheld
+#: rows from the CSV (BACKLOG #2446): ``true`` or ``false``. A CSV body has nowhere to say it
+#: without breaking the parsers that read it, so the header and the ``audit.export`` row carry it.
+AUDIT_WITHHELD_HEADER: Final = "X-Audit-Withheld"
+
+
+def withholds_rows_from(identity: Identity) -> bool:
+    """Whether ``identity`` reads the trail with rows withheld (BACKLOG #2446).
+
+    A reader is told this so a filtered trail does not read as the whole one. It is decided by the
+    permission alone, never by whether a hidden row exists in the range read: an answer that
+    depended on the rows would itself say whether a lock happened, which is the oracle the
+    exclusion closes."""
+    return audit_exclusion_for(identity) is not None
 
 
 def reads_audit_copies_in_the_log(identity: Identity) -> bool:

@@ -5,7 +5,8 @@
 // loaded without `vscode`. connectionEditor.ts builds the page and embeds this; the unit suite
 // evaluates the SAME source in a jsdom page (webview-receivers.test.ts), so what the tests exercise
 // is what ships.
-import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, embedJson, guardScript } from "./webviewMessaging";
+import { FIELD_CONTROLS, PARAM_TYPES } from "./connectionForm";
+import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
 
 /** What the connection editor's script is seeded with, each embedded as JSON. */
 export interface ConnectionEditorScriptInputs {
@@ -21,7 +22,7 @@ export interface ConnectionEditorScriptInputs {
  *  channel token, minted by the caller with the nonce (webviewMessaging.ts). */
 export function connectionEditorScript(token: string, p: ConnectionEditorScriptInputs): string {
   return `
-    const vscode = acquireVsCodeApi();${guardScript(token)}${SHAPE_HELPERS}
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}${guardScript(token)}${SHAPE_HELPERS}
     const INITIAL = ${embedJson(p.initial)};
     const ROUTERS = ${embedJson(p.routers)};
     // The installed engine's transport list when it could be fetched, else the legacy constant.
@@ -296,11 +297,16 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // this page. Both post "error"; only connectionEditor.ts answers with "fields". A field is a
     // FieldDescriptor from connectionForm.ts: its declared fields with their types. The two
     // unknown-typed values (value, defaultValue) and the carried-through envDefault and
-    // preserveValue are not typed there either.
+    // preserveValue are not typed there either. choices is required and may be null; envKey, cast
+    // and a group's description may be absent and are never null.
+    // control and type are closed sets: the lists FieldControl and ParamType are derived from.
+    const FIELD_CONTROLS = ${embedJson(FIELD_CONTROLS)};
+    const PARAM_TYPES = ${embedJson(PARAM_TYPES)};
     function mfFieldDescriptor(f) {
-      return mfObj(f) && mfStr(f.key) && mfStr(f.label) && mfStr(f.control) && mfStr(f.type) &&
+      return mfObj(f) && mfStr(f.key) && mfStr(f.label) && mfOneOf(f.control, FIELD_CONTROLS) &&
+        mfOneOf(f.type, PARAM_TYPES) &&
         mfStr(f.help) && mfBool(f.required) && mfBool(f.conditionallyRequired) && mfBool(f.secret) &&
-        mfBool(f.envAllowed) && mfBool(f.secretOnlyEnv) && (f.choices === null || Array.isArray(f.choices)) &&
+        mfBool(f.envAllowed) && mfBool(f.secretOnlyEnv) && mfNullable(f.choices, Array.isArray) &&
         mfStr(f.placeholder) && mfBool(f.isEnvRef) && mfStr(f.group) && mfBool(f.known) &&
         mfBool(f.offDirection) && mfOpt(f.envKey, mfStr) && mfOpt(f.cast, mfStr);
     }

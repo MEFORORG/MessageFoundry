@@ -26,12 +26,17 @@
 // already ordered those parameters for humans.
 
 /** The coarse type tag `connection schema --json` reports for a setting. */
-export type ParamType = "str" | "int" | "float" | "bool" | "table" | "unknown";
+// The members live in a const so a webview page can be handed the same list its host is typed by
+// (ASVS 3.5.5, BACKLOG #1123). The type is derived from it, so the two cannot drift.
+// These are the tags "connection schema --json" prints (_type_name, config/connection_schema.py).
+export const PARAM_TYPES = ["str", "int", "float", "bool", "table", "unknown"] as const;
+export type ParamType = (typeof PARAM_TYPES)[number];
 
 export type Direction = "inbound" | "outbound";
 
 /** The control the webview should render for a field. */
-export type FieldControl = "text" | "number" | "checkbox" | "select" | "table";
+export const FIELD_CONTROLS = ["text", "number", "checkbox", "select", "table"] as const;
+export type FieldControl = (typeof FIELD_CONTROLS)[number];
 
 /**
  * One setting as the engine describes it (schemaVersion 1). Every property is optional here even

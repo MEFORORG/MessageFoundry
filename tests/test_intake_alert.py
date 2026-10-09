@@ -258,6 +258,161 @@ async def test_a_failed_read_reports_nothing() -> None:
     assert sink.kinds(DEPTH) == [], "an unmeasured backlog is neither paused nor clear"
 
 
+# --- BACKLOG #2272: the follow-ups engine PR 1713 shipped open ----------------------------------
+
+
+async def test_a_held_depth_pause_keeps_reminding_while_its_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2272 defect 1. The gate stays held while the read fails, so intake stays paused. Silence
+    would read as a pause that ended, so the reminder still fires, with the last reading."""
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    store, sink = _FakeStore(depth=50), _RecordingSink()
+    monitor, gate = _monitor(store, sink, max_staged_depth=10)
+    await monitor.check_once()
+    store.fail = True
+    clock[0] += intake_bound.REALERT_SECONDS - 1
+    await monitor.check_once()
+    assert sink.kinds(DEPTH) == ["paused"], "no reminder before the window closes"
+    clock[0] += 1
+    await monitor.check_once()
+    assert not gate.is_open
+    assert sink.of(DEPTH)[-1] == (
+        "paused",
+        {"reason": DEPTH_REASON, "value": 11, "limit": 10, "kind": "sqlite"},
+    )
+    assert sink.kinds(DEPTH) == ["paused", "paused"]
+
+
+async def test_a_held_disk_pause_keeps_reminding_while_its_probe_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    disk = _Disk(free_mib=512)
+    monkeypatch.setattr(shutil, "disk_usage", disk)
+    sink = _RecordingSink()
+    monitor, gate = _monitor(_FakeStore(path=str(tmp_path / "s.db")), sink, min_free_disk_mb=1024)
+    await monitor.check_once()
+
+    def _broken(path: object) -> object:
+        raise OSError("volume gone")
+
+    monkeypatch.setattr(shutil, "disk_usage", _broken)
+    clock[0] += intake_bound.REALERT_SECONDS
+    await monitor.check_once()
+    assert not gate.is_open
+    assert sink.of(DISK) == [
+        ("paused", {"reason": DISK_REASON, "value": 512, "limit": 1024, "kind": "sqlite"}),
+        ("paused", {"reason": DISK_REASON, "value": 512, "limit": 1024, "kind": "sqlite"}),
+    ]
+
+
+async def test_a_failing_read_with_no_pause_held_still_reports_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    store, sink = _FakeStore(depth=0), _RecordingSink()
+    monitor, gate = _monitor(store, sink, max_staged_depth=10)
+    await monitor.check_once()
+    store.fail = True
+    clock[0] += intake_bound.REALERT_SECONDS
+    await monitor.check_once()
+    assert gate.is_open
+    assert sink.kinds(DEPTH) == ["resumed"], "only the clean first reading's report"
+
+
+def test_the_intake_and_buildup_reminders_share_one_interval() -> None:
+    """#2272 defect 2: one constant, so the two reminder cadences cannot drift apart."""
+    from messagefoundry.pipeline import wiring_runner
+    from messagefoundry.pipeline.alerts import REMINDER_SECONDS
+
+    assert intake_bound.REALERT_SECONDS == REMINDER_SECONDS
+    assert wiring_runner._BUILDUP_REALERT_SECONDS == REMINDER_SECONDS
+
+
+async def test_the_reminder_window_starts_after_the_sink_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2272 defect 3. A notifier stamps its cooldown inside the call. A window measured from before
+    the call could close a moment early, so the next reminder would land inside that cooldown and be
+    throttled for a whole interval. The model here: the sink's stamp comes after time has passed."""
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+
+    class _SlowStamp(_RecordingSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stamps: list[float] = []
+            self.delay = 0.5
+
+        def intake_paused(self, name: str, **kw: Any) -> None:
+            clock[0] += self.delay
+            self.stamps.append(clock[0])
+            super().intake_paused(name, **kw)
+
+    store, sink = _FakeStore(depth=50), _SlowStamp()
+    monitor, _gate = _monitor(store, sink, max_staged_depth=10)
+    await monitor.check_once()
+    sink.delay = 0.0
+    clock[0] = 1000.0 + intake_bound.REALERT_SECONDS  # past the call's start, short of its stamp
+    await monitor.check_once()
+    assert len(sink.stamps) == 1, "a reminder here would land inside the notifier's cooldown"
+    clock[0] = sink.stamps[0] + intake_bound.REALERT_SECONDS
+    await monitor.check_once()
+    assert len(sink.stamps) == 2
+    assert sink.stamps[1] - sink.stamps[0] >= intake_bound.REALERT_SECONDS
+
+
+async def test_the_real_notifier_pages_every_reminder_when_its_stamp_lands_late(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2272 defect 3, against the real ``NotifierAlertSink`` throttle. Its monotonic clock and the
+    monitor's are one fake clock, and its first call stamps half a second late. Every reminder the
+    monitor raises must page: none may land inside the notifier's own cooldown."""
+    import time as real_time
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline import alert_sinks
+
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        alert_sinks, "time", SimpleNamespace(monotonic=lambda: clock[0], time=real_time.time)
+    )
+
+    class _LateFirstStamp(NotifierAlertSink):
+        delay = 0.5
+
+        def intake_paused(self, name: str, **kw: Any) -> None:
+            clock[0] += self.delay
+            self.delay = 0.0
+            super().intake_paused(name, **kw)
+
+    transport = _RecordingTransport("webhook")
+    sink = _LateFirstStamp([transport], realert_seconds=intake_bound.REALERT_SECONDS)
+    monitor, _gate = _monitor(_FakeStore(depth=50), sink, max_staged_depth=10)
+    await monitor.check_once()
+    for _ in range(3):
+        clock[0] += 0.25
+        await monitor.check_once()
+    clock[0] = 1000.0 + intake_bound.REALERT_SECONDS
+    for _ in range(4):
+        await monitor.check_once()
+        clock[0] += 0.25
+    await _drain_transports(sink)
+    assert [e["type"] for e in transport.events] == ["intake_paused", "intake_paused"]
+
+
+def test_an_intake_pause_rule_cannot_carry_a_control_action() -> None:
+    """#2272 defect 7, closed by #1898. A pause raised before the control callback is wired cannot
+    miss an action, because no rule on ``intake_paused`` may carry one."""
+    with pytest.raises(ValidationError, match="connection-scoped event_type"):
+        AlertRule(event_type="intake_paused", control_action="restart_inbound")
+
+
 async def test_a_disk_pause_reports_mib_against_the_floor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -295,31 +450,110 @@ async def test_each_bound_is_its_own_alert_subject(
     assert sink.kinds(DISK) == ["paused"]
 
 
-async def test_a_start_inside_the_band_does_not_resolve_another_nodes_pause(
+async def test_a_start_inside_the_band_resolves_its_own_stale_pause(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The subject is shared by every node on the store. A node that starts while the backlog sits
-    between the resume line and the bound must not report a clear: another node may still hold its
-    pause there. It reports the clear once the backlog passes the resume line."""
+    """#2272 defect 5. The subject names one process, so no other node's pause rides on it. A
+    process that starts with its gate open, while the reading sits between the resume line and the
+    bound, reports the clear at once: a pause its own last run left open does not stay open."""
     store, sink = _FakeStore(depth=10), _RecordingSink()
     monitor, gate = _monitor(store, sink, max_staged_depth=10)
     await monitor.check_once()
-    assert gate.is_open and sink.kinds(DEPTH) == []
-    store.depth = 9
-    await monitor.check_once()
-    assert sink.kinds(DEPTH) == ["resumed"]
+    assert gate.is_open and sink.kinds(DEPTH) == ["resumed"]
 
     disk = _Disk(free_mib=1100)  # over the 1024 MiB floor, under the 1126 MiB resume line
     monkeypatch.setattr(shutil, "disk_usage", disk)
     sink2 = _RecordingSink()
-    monitor2, _gate2 = _monitor(
+    monitor2, gate2 = _monitor(
         _FakeStore(path=str(tmp_path / "s.db")), sink2, min_free_disk_mb=1024
     )
     await monitor2.check_once()
-    assert sink2.kinds(DISK) == []
-    disk.free_mib = 2048
-    await monitor2.check_once()
-    assert sink2.kinds(DISK) == ["resumed"]
+    assert gate2.is_open and sink2.kinds(DISK) == ["resumed"]
+
+
+# --- one subject per process (#2272 defects 4 to 6) ---------------------------------------------
+
+
+async def test_two_nodes_on_one_store_pause_and_clear_independently() -> None:
+    """Each process raises and clears only its own alert. Node A pauses over the bound; node B
+    starts while the backlog sits in the band, so its gate is open and it clears only its own
+    subject (defects 5 and 6). Each node that paused pages under its own subject (defect 4)."""
+    store, sink = _FakeStore(depth=50), _RecordingSink()
+    a, gate_a = _monitor(store, sink, max_staged_depth=10, node="shard:a")
+    a_depth = intake_alert_subject(DEPTH_REASON, "shard:a")
+    b_depth = intake_alert_subject(DEPTH_REASON, "shard:b")
+    await a.check_once()
+    assert not gate_a.is_open
+    store.depth = 10  # inside A's band: A stays paused
+    b, gate_b = _monitor(store, sink, max_staged_depth=10, node="shard:b")
+    await b.check_once()
+    await a.check_once()
+    assert gate_b.is_open and not gate_a.is_open
+    assert sink.kinds(a_depth) == ["paused"], "B's clear must not reach A's alert"
+    assert sink.kinds(b_depth) == ["resumed"]
+    assert sink.kinds(DEPTH) == [], "no process reports under the shared, node-less subject"
+
+    store.depth = 50  # both over: each pages under its own subject
+    await b.check_once()
+    assert sink.kinds(b_depth) == ["resumed", "paused"]
+    store.depth = 0
+    await a.check_once()
+    assert sink.kinds(a_depth) == ["paused", "resumed"]
+    assert sink.kinds(b_depth) == ["resumed", "paused"], "A's clear must not reach B's alert"
+    await b.check_once()
+    assert sink.kinds(b_depth) == ["resumed", "paused", "resumed"]
+
+
+def test_the_node_subject_names_the_reason_and_the_process() -> None:
+    assert intake_alert_subject(DEPTH_REASON) == "intake:staged_depth"
+    assert intake_alert_subject(DEPTH_REASON, "shard:a") == "intake:staged_depth@shard:a"
+    assert intake_alert_subject(DISK_REASON, "node:h1:42:ab12cd34") == (
+        "intake:disk_floor@node:h1:42:ab12cd34"
+    )
+    assert intake_alert_subject(DEPTH_REASON, "shard:a") != intake_alert_subject(
+        DISK_REASON, "shard:a"
+    )
+
+
+def test_a_long_node_label_is_capped_and_stays_distinct() -> None:
+    """``[cluster].node_id`` has no length limit. A label too long to fit keeps a prefix and a
+    checksum of the whole label, so two long labels that share the prefix still differ."""
+    one = "node:" + "x" * 400 + "1"
+    two = "node:" + "x" * 400 + "2"
+    s1 = intake_alert_subject(DEPTH_REASON, one)
+    s2 = intake_alert_subject(DEPTH_REASON, two)
+    assert len(s1) == len(s2) == intake_bound.INTAKE_SUBJECT_MAX_LENGTH
+    assert s1 != s2
+    assert s1 == intake_alert_subject(DEPTH_REASON, one), "the same label gives the same subject"
+    exact = "node:" + "y" * (
+        intake_bound.INTAKE_SUBJECT_MAX_LENGTH - len("intake:staged_depth@") - 5
+    )
+    assert intake_alert_subject(DEPTH_REASON, exact) == f"intake:staged_depth@{exact}"
+
+
+async def test_stop_clears_its_pause_only_when_its_subject_will_not_return() -> None:
+    """An unpinned cluster node gets a new id on every start, so nothing could clear its alert
+    after it stops. It clears its own open pause at stop. A process whose subject returns does not:
+    its next start reports under the same subject."""
+    store, sink = _FakeStore(depth=50), _RecordingSink()
+    keep, _g = _monitor(store, sink, max_staged_depth=10, node="node:pinned")
+    await keep.check_once()
+    await keep.stop()
+    assert sink.kinds(intake_alert_subject(DEPTH_REASON, "node:pinned")) == ["paused"]
+
+    gone, gate = _monitor(
+        store, sink, max_staged_depth=10, node="node:h:1:aa", resolve_on_stop=True
+    )
+    await gone.check_once()
+    await gone.stop()
+    assert gate.is_open
+    gone_depth = intake_alert_subject(DEPTH_REASON, "node:h:1:aa")
+    assert sink.of(gone_depth) == [
+        ("paused", {"reason": DEPTH_REASON, "value": 11, "limit": 10, "kind": "sqlite"}),
+        ("resumed", {"reason": DEPTH_REASON, "value": 11, "limit": 10, "kind": "sqlite"}),
+    ]
+    # Its disk bound never paused, so the stop has nothing to clear there.
+    assert sink.kinds(intake_alert_subject(DISK_REASON, "node:h:1:aa")) == ["resumed"]
 
 
 async def test_a_report_the_sink_refused_is_retried(caplog: pytest.LogCaptureFixture) -> None:
@@ -401,6 +635,79 @@ async def test_the_engine_hands_its_sink_to_the_monitor_and_clears_off_bounds(
         await engine.stop()
 
 
+async def test_an_engine_shard_names_itself_in_its_intake_subjects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine hands its instance identity to the monitor, so an engine shard's alerts are its
+    own. A shard id survives a restart, so the shard does not clear its alerts at stop."""
+    from messagefoundry.pipeline.engine import Engine
+
+    monkeypatch.setattr(Engine, "instance_identity", property(lambda _self: "shard:a"))
+    sink = _RecordingSink()
+    engine = await Engine.create(
+        tmp_path / "engine3.db",
+        alert_sink=cast(AlertSink, sink),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    await engine.start()
+    try:
+        assert sink.kinds(intake_alert_subject(DEPTH_REASON, "shard:a")) == ["resumed"]
+        assert sink.kinds(DEPTH) == []
+        monitor = engine._intake_monitor
+        assert monitor is not None and not monitor._resolve_on_stop
+    finally:
+        await engine.stop()
+
+
+async def test_drain_state_lands_a_clear_raised_on_the_way_out() -> None:
+    """Engine.stop drains the sink's scheduled state writes before it closes the store, so an
+    unpinned node's stop-time clear is written rather than lost to the close."""
+    import asyncio
+
+    class _SlowStore(_RecordingStore):
+        async def resolve_alert_instances_for(
+            self, *, event_type: str, connection: str, now: float | None = None
+        ) -> int:
+            await asyncio.sleep(0.05)
+            return await super().resolve_alert_instances_for(
+                event_type=event_type, connection=connection, now=now
+            )
+
+    store = _SlowStore()
+    sink = NotifierAlertSink([], store=store)
+    subject = intake_alert_subject(DEPTH_REASON, "node:h:1:aa")
+    sink.intake_resumed(subject, reason=DEPTH_REASON, value=0, limit=10, store_kind="postgres")
+    assert store.resolves == []
+    await sink.drain_state(5.0)
+    assert [r["connection"] for r in store.resolves] == [subject]
+    await sink.drain_state(5.0)  # nothing pending: returns at once
+
+
+async def test_a_cluster_node_with_an_empty_node_id_clears_at_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty ``[cluster].node_id`` pins nothing: the coordinator falls back to a fresh id, so
+    the engine treats the node as unpinned and clears its intake alerts at stop."""
+    from messagefoundry.config.settings import ClusterSettings
+    from messagefoundry.pipeline import cluster as cluster_mod
+    from messagefoundry.pipeline.engine import Engine
+
+    monkeypatch.setattr(cluster_mod.NullCoordinator, "is_clustered", lambda _self: True)
+    sink = _RecordingSink()
+    engine = await Engine.create(
+        tmp_path / "engine4.db",
+        alert_sink=cast(AlertSink, sink),
+        egress_settings=EgressSettings(deny_by_default=False),
+        cluster_settings=ClusterSettings(node_id=""),
+    )
+    await engine.start()
+    try:
+        monitor = engine._intake_monitor
+        assert monitor is not None and monitor._resolve_on_stop
+    finally:
+        await engine.stop()
+
+
 async def test_an_engine_with_both_bounds_off_still_clears_both(tmp_path: Path) -> None:
     from messagefoundry.pipeline.engine import Engine
 
@@ -439,10 +746,14 @@ async def test_a_sink_that_raises_does_not_stop_the_release(
 
 
 def test_the_subject_is_outside_the_connection_name_grammar() -> None:
+    """control_action's default target is the subject; it must never read as a connection."""
     from messagefoundry.connection_names import is_connection_name
 
     assert not is_connection_name(DEPTH)
     assert not is_connection_name(DISK)
+    for node in ("shard:a", "node:h1:42:ab12cd34", "node:" + "x" * 400):
+        assert not is_connection_name(intake_alert_subject(DEPTH_REASON, node))
+        assert not is_connection_name(intake_alert_subject(DISK_REASON, node))
 
 
 # --- the sinks -----------------------------------------------------------------------------------
@@ -466,7 +777,7 @@ def test_the_logging_sink_warns_on_a_pause_and_logs_the_resume_at_debug(
 def test_the_disk_detail_gives_the_free_mib() -> None:
     assert (
         intake_pause_detail(reason=DISK_REASON, value=512, limit=1024, store_kind="sqlite")
-        == "intake paused: free space fell below the 1024 MiB floor; 512 MiB free now (sqlite store)"
+        == "intake paused: free space fell below the 1024 MiB floor; 512 MiB free at the last reading (sqlite store)"
     )
 
 
@@ -515,7 +826,7 @@ async def test_the_notifier_pages_the_pause_and_resolves_it_on_resume() -> None:
     assert event["detail"] == intake_pause_detail(
         reason=DISK_REASON, value=512, limit=1024, store_kind="sqlite"
     )
-    assert "512 MiB free now" in event["detail"]
+    assert "512 MiB free at the last reading" in event["detail"]
     assert store.upserts[0]["event_type"] == "intake_paused"
     assert store.upserts[0]["reason"] == event["detail"]
     assert store.resolves == [{"event_type": "intake_paused", "connection": DISK}]
@@ -588,3 +899,27 @@ def test_the_rung_is_silent_when_the_dial_is_not_enforcing(
     assert _serve() == 0
     captured = capsys.readouterr()
     assert _rung_lines(captured.out + captured.err) == []
+
+
+# --- BACKLOG #2324: the pause WARNINGs say what a dimse inbound actually does --------------------
+
+
+async def test_both_pause_warnings_say_an_open_dicom_association_keeps_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dimse inbound refuses only a NEW association while paused; one already open runs until it
+    ends (``transports/dicom.py``, ``docs/CONFIGURATION.md``). Neither WARNING may say it stops."""
+    monkeypatch.setattr(shutil, "disk_usage", _Disk(free_mib=1))
+    store = _FakeStore(depth=50, path=str(tmp_path / "s.db"))
+    monitor = IntakeBoundMonitor(
+        cast(Store, store), IntakeGate(), max_staged_depth=10, min_free_disk_mb=1024
+    )
+    with caplog.at_level(logging.WARNING, logger=intake_bound.__name__):
+        await monitor.check_once()
+    paused = [r.getMessage() for r in caplog.records if "intake PAUSED" in r.getMessage()]
+    assert len(paused) == 2, "one WARNING per bound: depth and disk"
+    for message in paused:
+        assert intake_bound.PAUSE_EFFECT in message
+        assert "dimse inbounds refuse new associations" in message
+        assert "an association already open keeps running until it ends" in message
+        assert "dimse and timer inbounds stop reading" not in message

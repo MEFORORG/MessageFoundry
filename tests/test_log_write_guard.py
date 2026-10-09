@@ -486,8 +486,8 @@ def test_the_legacy_rotation_key_is_refused_from_env_where_the_file_gate_does_no
     # WHICH LAYER REFUSES DEPENDS ON WHERE THE KEY CAME FROM, and the model validator above is not
     # the one a file reaches. `_reject_unknown_file_keys` refuses an unrecognized key in the TOML
     # before any model is built, so a FILE carrying either spelling stops there. The env layer is
-    # different: `docs/CONFIGURATION.md` states plainly that the refusal "covers the FILE" and that
-    # env does not refuse, so a misspelled `MEFOR_*` is normally dropped in SILENCE.
+    # different: its own unknown-key refusal (vault BACKLOG #2600) spares these two spellings by
+    # name, so the model validator is still the layer that refuses them from env.
     #
     # These two spellings are the exception, and that is the whole point of keeping the model
     # validator once the loader gained a generic refusal. Without this test the docstring's claim

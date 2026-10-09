@@ -77,7 +77,7 @@ came up, stopped unexpectedly, went unreachable), rate-limited so a crash-loop c
 
 - **Open Monitor Console** — opens `<engine_url>/ui` in your browser (disabled, with a hint, when the
   console isn't enabled — set `[security].serve_web_console = true` in the service settings).
-- **Open Repo in VS Code** — opens the engine repo folder via the `code` CLI.
+- **Open Repo in VS Code** — opens the engine repo folder in VS Code, found through the `code` CLI.
 - **Start / Stop / Restart Service** — drives the NSSM service; **Stop** and **Restart** ask for
   confirmation first (they halt message flow), then raise a single Windows **UAC prompt**. Cancelling
   the prompt is handled cleanly ("Action cancelled"). No standing admin rights are granted.
@@ -121,13 +121,40 @@ nothing.
 4. The file exists, and the path it resolves to passes the same tests. A shortcut (`.lnk`) is never
    followed; a symbolic link is judged by what it points at.
 
-To read a log that lives on a share, copy it to a local drive first. One gap is left: resolving a
-local symbolic link that points at a share contacts that share before the tray refuses it. Planting
-one needs write access to the log's own folder.
+The menu applies tests 1 and 2 as well, each time it is built. A `log_path` that fails either one
+greys out "View Service Log", and the tray does not check whether that file exists.
+
+To read a log that lives on a share, copy it to a local drive first. One gap is left: checking for
+or resolving a local symbolic link that points at a share contacts that share before the tray
+refuses it. Planting one needs write access to the log's own folder.
 
 **"Open Repo in VS Code" opens the wrong folder?** By default `repo_path` falls back to the *engine
 service's* install directory (its NSSM `AppDirectory`). To open your own config/conversion estate
 instead, set `repo_path` in `tray.toml` (edit it via the menu) and restart the tray.
+
+**How "Open Repo in VS Code" starts the editor.** The tray finds the `code` command, then starts
+the editor program itself: `Code.exe`, one folder above the `bin` folder that holds `code.cmd`. It
+hands that program the folder as a single argument, with no command shell. So a folder under
+`C:\Program Files (x86)`, or one with `&` or `%` in its name, opens like any other.
+
+**The one case where a folder is refused.** Some setups have a `code.cmd` with no `Code.exe` in
+that place, for example a shim from a package manager. `code.cmd` is a batch file, and Windows
+runs a batch file through `cmd.exe`, which reads some characters in the command line as commands.
+Only then, the tray opens a `repo_path` made of nothing but letters, digits, spaces and
+`\ / : . _ - ~ + @ #`. For any other character, such as `&`, `%`, a comma or a bracket, it shows
+"Repo not opened" and starts nothing. This is wider than `cmd.exe` strictly needs. Rename the
+folder, or open it from VS Code itself. If that `code.cmd`'s own path fails the same test, the
+tray does not use it at all.
+
+If Windows cannot start the editor program, the tray shows "Repo not opened: the launch failed"
+and writes the error type to `tray.log`. A failure after the program has started is not reported.
+
+The menu item is greyed out and marked "(unavailable)" in at least these cases: no usable `code`
+command was found, the folder does not exist, `repo_path` does not start with a local drive letter, or
+that drive is a mapped network drive. The tray judges the last two from the text of the path and
+the local drive list, and only then checks that the folder exists. So the menu does not contact a
+`repo_path` that names a share. A local link that points at a share is not caught: the menu's
+check follows it, and VS Code then opens the share.
 
 ## Why the icon is named "MessageFoundry Tray"
 
@@ -211,10 +238,32 @@ any runtime change (the app only *loads* the files).
 
 ## Logs
 
-The tray logs to `%LOCALAPPDATA%\MessageFoundry\tray.log` (rotating, INFO). It records at least
-startup, the resolved config, state **transitions** (never per-tick), user actions, elevation
-outcomes, and the status-check failures below — and never a message body, a token, or PHI (it has
-none by construction).
+The tray logs to `%LOCALAPPDATA%\MessageFoundry\tray.log` (rotating, INFO). The tray never
+signs in, so it holds no session token, message body or PHI to write. The file holds at least
+these:
+
+- Two lines at startup. The first gives the tray module's own version number, which is not the
+  installed package version. The second gives the engine URL, the service name and `monitor_only`
+  as the tray resolved them. The URL is written much as it was set, so keep credentials out of
+  `engine_url`. Some service names of two or more capitalized words are written as `[redacted]`.
+- From a second tray that finds one already running: the version line, then a line saying so.
+  It then exits.
+- Some menu actions that were refused or failed: `Console not opened` and `Service log not opened`,
+  each with the reason, and `autostart not turned on` when the login command is too long.
+- A traceback when a menu action or a double-click raises.
+- A warning at startup when the pinned engine certificate cannot be loaded. Later, a line when the
+  tray reads a certificate file that differs from the one it holds, saying whether it loads.
+- The status-check failures and their recovery, described below. A check or icon update that raises
+  while the tray is stopping gets one INFO line with no traceback.
+- `tray crashed`, with a traceback, when the tray stops on an unhandled error.
+
+`tray.log` does **not** hold state transitions, menu actions that worked, or the result of a
+service Start, Stop or Restart. That includes whether the UAC prompt was accepted. It also holds
+no line for a status check that completes and finds the engine down, a failed certificate
+verification included. Where the tray reports one of these, it uses the icon, the tooltip or a
+balloon, and it keeps no record: see [What the icon shows](#what-the-icon-shows) and
+[Menu](#menu). Exit has no line of its own. The branded-launcher step writes nothing here either,
+because it runs before the tray opens the file.
 
 Every record also passes the engine's PHI redaction, credential scrub and control-character scrub
 before it is written, tracebacks included. So a traceback that quotes engine reply text or a
@@ -223,6 +272,9 @@ credential is redacted in `tray.log` rather than written as it came.
 One engine filter is left out: the one that masks OIDC `code` and `state` values in a request URL.
 The tray holds no OIDC credential. It also holds the `httpx` and `httpcore` loggers at WARNING,
 so their per-request URL lines never reach `tray.log`.
+
+Each line starts with the time in UTC, in the engine log's form: `2026-01-02T03:04:05Z`. It is not
+the PC's local time, so allow for the offset when you look for an event you saw on screen.
 
 When a status check fails, or the icon update that follows it fails, the tray logs the error with a
 traceback and keeps running. **Those tracebacks are deliberately not written on every attempt.** A

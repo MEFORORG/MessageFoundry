@@ -58,6 +58,12 @@ token or JWKS leg that checks no certificate revocation under an enforcing postu
 ``serve`` applies (ADR 0173 AC-4). It reads the decision ``verify``'s ``fed.idp_revocation`` row
 reads.
 
+``retention`` is required too (vault BACKLOG #2280): it FAILS settings the retention start gate
+refuses, an explicit 0 on an auto-bounded PHI window or a warn-only tier with neither a window nor
+its acknowledgement. It calls the function ``serve`` calls, so the refusal reads the same.
+``retention-overrides`` (vault BACKLOG #2368) is its graph half: it FAILS a connection's own
+``messages_days = 0`` or ``dead_letter_days = 0`` that ``serve``'s registry guard refuses.
+
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
 config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable — at
@@ -95,6 +101,7 @@ from __future__ import annotations
 import ast
 import functools
 import importlib.metadata
+import json
 import os
 import re
 import shutil
@@ -297,6 +304,26 @@ def run_checks(
         # revocation under an enforcing posture. Required, so the gate refuses what serve refuses.
         _with_source(
             _check_oidc_revocation(
+                config_dir,
+                service_config=service_config,
+                suppress_search=suppress_service_toml_search,
+            ),
+            env_only,
+        ),
+        # Vault BACKLOG #2280: serve refuses an unbounded PHI retention tier nobody acknowledged.
+        # Required, so the gate refuses what serve refuses, in serve's words.
+        _with_source(
+            _check_retention(
+                config_dir,
+                service_config=service_config,
+                suppress_search=suppress_service_toml_search,
+            ),
+            env_only,
+        ),
+        # Vault BACKLOG #2368: serve's registry guard refuses a connection's own keep-forever
+        # retention override nobody acknowledged. Required, for the same reason.
+        _with_source(
+            _check_retention_overrides(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
@@ -2366,6 +2393,36 @@ def _check_alert_smtp_tls(
     )
 
 
+#: A declaration name shown bare on a check line. Anything else is quoted (vault BACKLOG #3139).
+_BARE_DECLARATION_NAME = re.compile(r"[A-Za-z0-9_.:-]+")
+
+
+def _quoted_text(text: str) -> str:
+    """``text`` as one double-quoted token that its own content cannot close or extend.
+
+    JSON string quoting escapes every quote, backslash and C0 control, so a reason cannot end its
+    token and write a separator, a second entry or a mark after it. ``ensure_ascii`` also writes
+    every non-ASCII character as ``\\uXXXX``, so a lookalike quote such as U+02BA or U+FF02, or a
+    right-to-left letter, cannot fake that end for a human reader. The log escape then covers DEL,
+    the one ASCII control JSON leaves raw (vault BACKLOG #3139)."""
+    from messagefoundry.controlchars import scrub_control_chars
+
+    return scrub_control_chars(json.dumps(text))
+
+
+def _declared_entry(name: str, reason: str | None, *, refused: bool = False) -> str:
+    """One entry of a declaration list on an advisory check line: ``name ("reason")``.
+
+    The reason is always quoted. A name is shown bare only when it holds nothing but letters,
+    digits and ``_.:-``; a reference set's or a lookup's name is not held to the connection-name
+    pattern, so any other name is quoted too. Every character an author controls is therefore
+    inside quotes, and ``REFUSED`` after the entry can only come from the caller (vault BACKLOG
+    #3139)."""
+    shown = name if _BARE_DECLARATION_NAME.fullmatch(name) else _quoted_text(name)
+    why = "none recorded" if reason is None else _quoted_text(reason)
+    return f"{shown} ({why}){' REFUSED' if refused else ''}"
+
+
 def _check_cleartext_accepted(
     config_dir: str | Path,
 ) -> CheckResult:
@@ -2403,7 +2460,7 @@ def _check_cleartext_accepted(
             required=False,
             detail="no connection declares cleartext_accepted",
         )
-    listed = "; ".join(f"{name} ({reason})" for name, reason in accepted)
+    listed = "; ".join(_declared_entry(name, reason) for name, reason in accepted)
     return CheckResult(
         "cleartext-accepted",
         ok=True,
@@ -2417,12 +2474,14 @@ def _check_hop_attested(config_dir: str | Path) -> CheckResult:
 
     The sibling of :func:`_check_cleartext_accepted`, with the opposite claim: an attested hop is
     ALLOWed rather than warned, so this line is where a reviewer sees what the engine is taking on
-    trust. Owner ruling 2026-09-24. Advisory (``required=False``): an attestation with a written reason
-    is a legitimate choice, not a config error. It reads through ``attested_secure_hops``, the same
-    reader as ``security_loosenings()`` and ``GET /security/posture``.
+    trust. A declaration the build check refuses is listed and marked REFUSED, because it is never
+    crossed (vault BACKLOG #3139). Owner ruling 2026-09-24. Advisory (``required=False``): an
+    attestation with a written reason is a legitimate choice, not a config error. It reads through
+    ``attested_secure_hop_records``, the walk behind ``attested_secure_hops``, which
+    ``security_loosenings()`` and ``GET /security/posture`` read, so all three list one set.
 
     SKIPs when the graph will not load, same convention as its siblings."""
-    from messagefoundry.config.wiring import WiringError, attested_secure_hops, load_config
+    from messagefoundry.config.wiring import WiringError, attested_secure_hop_records, load_config
 
     try:
         registry = load_config(config_dir)
@@ -2434,19 +2493,23 @@ def _check_hop_attested(config_dir: str | Path) -> CheckResult:
             skipped=True,
             detail=f"config did not load: {exc}",
         )
-    attested = attested_secure_hops(registry)
+    attested = attested_secure_hop_records(registry)
     if not attested:
         return CheckResult(
             "tls-hop-attested", ok=True, required=False, detail="no hop is attested secure"
         )
-    listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    listed = "; ".join(
+        _declared_entry(hop.name, hop.reason, refused=hop.refused) for hop in attested
+    )
+    # The sentence must not say every listed hop is allowed; see AttestedHop (vault BACKLOG #3139).
     return CheckResult(
         "tls-hop-attested",
         ok=True,
         required=False,
         detail=(
-            f"{len(attested)} hop(s) are attested secure by means the engine cannot see, and are "
-            f"ALLOWed where an enforcing gate would refuse them — {listed}"
+            f"{len(attested)} hop(s) declare they are secure by means the engine cannot see. An "
+            "enforcing gate allows each one it would otherwise refuse, unless the entry is marked "
+            f"REFUSED — {listed}"
         ),
     )
 
@@ -2725,7 +2788,7 @@ def _check_revocation_attested(config_dir: str | Path) -> CheckResult:
             required=False,
             detail="no connection declares tls_revocation_attested",
         )
-    listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    listed = "; ".join(_declared_entry(name, reason) for name, reason in attested)
     return CheckResult(
         "tls-revocation-attested",
         ok=True,
@@ -3389,6 +3452,241 @@ def _check_oidc_revocation(
         ok=row.status not in FAILING,
         required=True,
         detail=f"{row.status.value}: {row.detail}",
+    )
+
+
+#: The name the two retention legs print where ``serve`` would print the environment, when the
+#: settings they read name none. ``serve`` can take its own from ``--env``, which ``check`` does
+#: not have, or from a ``MEFOR_AI_ENVIRONMENT`` this command's environment does not hold.
+_UNNAMED_ENVIRONMENT = "not named in the settings check read"
+
+
+def _as_reported(text: str) -> str:
+    """Gate text for a check line. A record that starts ``AUDIT:`` is relabelled ``audit
+    record:``, so a search of CI logs for the record's own prefix does not match a ``check`` run,
+    where nothing started and nothing was audited."""
+    return f"audit record: {text.removeprefix('AUDIT: ')}" if text.startswith("AUDIT: ") else text
+
+
+#: The SKIP text both retention legs give an unresolved production tier.
+_TIER_UNRESOLVED = "the production tier is unresolved; the posture check reports it"
+
+
+def _retention_posture(settings: ServiceSettings) -> tuple[str, bool, str] | None:
+    """``(env_name, production, note)`` for the two retention legs, or ``None`` to SKIP.
+
+    Neither leg's verdict depends on the environment name or the production tier. Both only word
+    the text. So with no active environment in the settings the legs still judge, because a site
+    that names its environment only on ``serve --env`` would otherwise get no parity from them.
+    They print :data:`_UNNAMED_ENVIRONMENT` for the name. The tier is the explicit
+    ``[security].production_instance`` when the settings carry one; with none the word
+    "production" is left out. ``note`` says which on the line, since ``serve`` would print the
+    real name and tier. A leg appends it only to a line that prints the name.
+
+    ``None`` when the environment is named but its production tier is unresolved, a custom name
+    with no ``[security].production_instance``. ``serve`` stops on that before either retention
+    gate, and the ``posture`` leg fails on it."""
+    env_name = settings.ai.environment
+    # With a name: the explicit tier, else the built-in name's. With none: the explicit tier only.
+    production = settings.ai.derived_posture()
+    if env_name is None:
+        placeholder = (
+            " [the settings check read name no environment, so the name above is a placeholder"
+        )
+        if production is None:
+            return (
+                _UNNAMED_ENVIRONMENT,
+                False,
+                f"{placeholder} and the production tier is not known]",
+            )
+        return _UNNAMED_ENVIRONMENT, production, f"{placeholder}]"
+    if production is None:
+        return None
+    return env_name, production, ""
+
+
+def _check_retention(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Report the retention start gate ``serve`` applies, at commit/CI time (vault BACKLOG #2280).
+
+    Without it the gate passed settings that ``serve`` then refuses with exit 2: an explicit 0 on
+    an auto-bounded PHI window, or a warn-only tier with neither a window nor its acknowledgement.
+    The decision is
+    :func:`~messagefoundry.config.retention_classification.evaluate_retention_gate`, the function
+    ``serve`` calls, so on the same settings the two agree and the refusal reads the same.
+
+    A refusal FAILS this leg. Under ``enforcement = warn`` that function refuses only a
+    classification shorter than its floor, a build defect, so otherwise the leg passes and its
+    line carries what the gate would write, the warnings included. A pass is about this gate
+    alone: ``serve`` has other start gates this leg does not read.
+
+    The function sets each unset auto-bounded window on the settings it is given. Those are this
+    leg's own load, and nothing else reads them.
+
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`.
+    :func:`_retention_posture` says what it does with no active environment and with an
+    unresolved production tier. The settings are the ones this leg loads, so a ``serve`` whose
+    own environment sets a window, or which reads another settings file, can still decide
+    differently."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.retention_classification import evaluate_retention_gate
+    from messagefoundry.config.settings import SecurityEnforcement
+
+    name = "retention"
+    toml, env_only = _settings_source(
+        config_dir, service_config=service_config, suppress_search=suppress_search
+    )
+    if toml is None and not env_only:
+        return CheckResult(
+            name,
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
+        )
+    try:
+        settings = _load_check_settings(toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            name,
+            ok=False,
+            required=True,
+            detail=f"settings did not load: {_settings_error(exc)}",
+        )
+    posture = _retention_posture(settings)
+    if posture is None:
+        return CheckResult(name, ok=True, required=True, skipped=True, detail=_TIER_UNRESOLVED)
+    env_name, production, note = posture
+    outcome = evaluate_retention_gate(
+        settings,
+        enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+        production=production,
+        env_name=env_name,
+    )
+    if outcome.refusal is not None:
+        return CheckResult(
+            name,
+            ok=False,
+            required=True,
+            detail=f"serve would refuse to start (exit 2): {outcome.refusal}{note}",
+        )
+    if not outcome.lines:
+        return CheckResult(
+            name,
+            ok=True,
+            required=True,
+            # No note: this line prints no environment name for it to qualify.
+            detail="the retention start gate would refuse nothing and write nothing",
+        )
+    return CheckResult(
+        name,
+        ok=True,
+        required=True,
+        detail=(
+            "the retention start gate would refuse nothing, and write: "
+            + " | ".join(_as_reported(line.text) for line in outcome.lines)
+            + note
+        ),
+    )
+
+
+def _check_retention_overrides(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Report the refusal ``serve`` applies to a connection's own keep-forever retention override,
+    at commit/CI time (vault BACKLOG #2368).
+
+    An inbound ``messages_days = 0`` or an outbound ``dead_letter_days = 0`` keeps that
+    connection's PHI bodies forever. ``serve`` hands the engine a registry guard that refuses such
+    a graph under ``enforce`` unless ``[security].allow_keeping_phi_indefinitely`` is set, and this
+    gate passed it. The decision is
+    :func:`~messagefoundry.config.retention_classification.judge_keep_forever_overrides`, the
+    function that guard calls, so for the same graph and switches the two agree and the refusal
+    reads the same.
+
+    A refusal FAILS this leg. Where the guard would report and pass the graph, the acknowledged
+    case and ``enforcement = warn``, the leg passes and its line carries what the guard would
+    write. It writes no AUDIT line itself.
+
+    Required, with the fail-safe SKIPs of :func:`_check_build`: no ``messagefoundry.toml`` and no
+    ``MEFOR_AI_ENVIRONMENT`` → SKIP; a graph that won't load → SKIP (``validate`` reports it);
+    settings that won't load → FAIL (BACKLOG #1318). :func:`_retention_posture` says what it does
+    with no active environment and with an unresolved production tier."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.retention_classification import judge_keep_forever_overrides
+    from messagefoundry.config.settings import SecurityEnforcement
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    name = "retention-overrides"
+    toml, env_only = _settings_source(
+        config_dir, service_config=service_config, suppress_search=suppress_search
+    )
+    if toml is None and not env_only:
+        return CheckResult(
+            name,
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
+        )
+    try:
+        settings = _load_check_settings(toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            name,
+            ok=False,
+            required=True,
+            detail=f"settings did not load: {_settings_error(exc)}",
+        )
+    posture = _retention_posture(settings)
+    if posture is None:
+        return CheckResult(name, ok=True, required=True, skipped=True, detail=_TIER_UNRESOLVED)
+    env_name, _production, note = posture
+    try:
+        # allow_empty: same reason as build-check (BACKLOG #1648). With zero connections there is
+        # no override to judge and the leg passes, which is the honest answer.
+        registry = load_config(config_dir, allow_empty=True)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=True, skipped=True, detail=f"config did not load: {exc}"
+        )
+    verdict = judge_keep_forever_overrides(
+        registry,
+        acknowledged=settings.retention.allow_unbounded_phi,
+        enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+        env_name=env_name,
+    )
+    if verdict.refusal is not None:
+        return CheckResult(
+            name,
+            ok=False,
+            required=True,
+            detail=f"serve would refuse this graph: {verdict.refusal}{note}",
+        )
+    if verdict.report is not None:
+        return CheckResult(
+            name,
+            ok=True,
+            required=True,
+            detail=(
+                "the retention override guard would pass this graph and report: "
+                f"{_as_reported(verdict.report)}{note}"
+            ),
+        )
+    return CheckResult(
+        name,
+        ok=True,
+        required=True,
+        detail="no connection's own retention override keeps its PHI bodies indefinitely",
     )
 
 

@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from PySide6.QtCore import QMetaObject, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -204,6 +205,8 @@ class MonitorPanel(QWidget):
         super().__init__()
         self._allow_insecure = allow_insecure
         self._client: EngineClient | None = None
+        # The handler-less reader the message panels use off the GUI thread (see _build_inner).
+        self._poll_client: EngineClient | None = None
         self._thread: QThread | None = None
         self._poller: MonitorPoller | None = None
 
@@ -283,7 +286,24 @@ class MonitorPanel(QWidget):
             client.close()
             return
 
+        # Built before the panel adopts the client: it reloads the pinned certificate and can fail,
+        # and a failure must leave the panel disconnected, not half-connected.
+        try:
+            poll_client = client.for_polling()
+        except ApiError as exc:
+            # End the session the sign-in just made before dropping the client, as the must-change
+            # refusal above does, or it stays live until it expires (BACKLOG #2091).
+            if client.token is not None:
+                with contextlib.suppress(ApiError):
+                    client.logout()
+            client.close()
+            self._set_status(str(exc), error=True)
+            return
         self._client = client
+        self._poll_client = poll_client
+        # Vault BACKLOG #2625: reload and purge take a step-up proof bound to their action, which
+        # a sign-in does not mint, so answer the engine's step-up refusal with a re-proof.
+        client.set_step_up_handler(self._step_up)
         inner = self._build_inner()
         self._body.addWidget(inner)
         self._body.setCurrentWidget(inner)
@@ -322,8 +342,43 @@ class MonitorPanel(QWidget):
             return False
         return client.token is not None
 
+    def _step_up(self) -> bool:
+        """Answer a step-up refusal (403 + ``X-Step-Up-Required``): ask for the password, masked,
+        and re-prove it. ``EngineClient.reauth`` sends the action the refusal named as ``purpose``
+        and adopts the re-keyed session, and the client then retries the call once.
+
+        The re-proof rotates the session, so the poller's copy of the old token is dead: it is
+        restarted on the new one. The password is passed straight to ``reauth`` and kept nowhere."""
+        client = self._client
+        # A dialog belongs on the GUI thread. Every worker read goes through the polling client,
+        # which has no handler, so this is a second guard: refuse rather than build Qt off-thread.
+        if client is None or QThread.currentThread() is not self.thread():
+            return False
+        password, ok = QInputDialog.getText(
+            self,
+            "Confirm it's you",
+            "This action needs your password again:",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not password:
+            return False
+        # A refused re-proof raises out of the action that asked for it, so the action's own error
+        # report names the real cause ("re-verification failed") rather than the original 403.
+        client.reauth(password)
+        self._stop_poller()
+        self._start_poller()
+        return True
+
     def _disconnect(self) -> None:
         self._stop_poller()
+        # Stop the panels' background readers first, so none is mid-call on a closed client and no
+        # late result reaches a widget that is about to go.
+        for panel in (self._messages, self._detail):
+            if panel is not None:
+                panel.stop()
+        if self._poll_client is not None:
+            self._poll_client.close()
+            self._poll_client = None
         if self._client is not None:
             with contextlib.suppress(ApiError):
                 self._client.logout()
@@ -421,8 +476,11 @@ class MonitorPanel(QWidget):
         tabs.addTab(live, "Live")
 
         # Messages: reuse the console's filter list + detail pane (user-initiated, GUI thread).
-        self._messages = MessagesPanel(self._client)
-        self._detail = MessageDetailPanel(self._client)
+        # Their reads run on worker threads, so they get a polling client: it shares the token but
+        # carries no step-up handler, so a refusal there can never open a Qt dialog off the GUI
+        # thread (vault BACKLOG #2625 gave the main client one).
+        self._messages = MessagesPanel(self._client, poll_client=self._poll_client)
+        self._detail = MessageDetailPanel(self._client, poll_client=self._poll_client)
         self._messages.message_selected.connect(self._detail.load)
         self._messages.error.connect(lambda m: self._set_status(m, error=True))
         self._detail.error.connect(lambda m: self._set_status(m, error=True))

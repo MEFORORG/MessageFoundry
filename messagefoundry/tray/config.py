@@ -577,6 +577,8 @@ TRAY_TOML_TEMPLATE = """\
 # The folder that "Open Repo in VS Code" opens. When unset it defaults to the engine service's own
 # install directory (read from its NSSM registry entry). Set this to the repo/estate you actually
 # work in — e.g. your config or conversion estate — so the menu opens THAT, not the engine checkout.
+# It must be a folder on a local drive letter; a share or a mapped network drive greys the menu
+# item out. Any folder name opens otherwise; docs/TRAY.md names the one launch that is narrower.
 # repo_path = 'C:\\Path\\To\\Your\\Estate'
 
 # The file that "View Service Log" opens. When unset it defaults to the service's NSSM AppStdout.

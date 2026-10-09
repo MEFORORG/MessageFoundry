@@ -20,6 +20,8 @@ from messagefoundry.config.settings import (
     ApiSettings,
     ApprovalsSettings,
     AuthSettings,
+    BackupSettings,
+    CertMonitorSettings,
     EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -304,7 +306,7 @@ def test_the_check_line_lists_every_attested_hop(tmp_path: Path) -> None:
     )
     result = _check_hop_attested(tmp_path)
     assert result.ok and not result.required
-    assert f"OB ({REASON})" in result.detail
+    assert f'OB ("{REASON}")' in result.detail
 
     (tmp_path / "ob.py").write_text(
         'from messagefoundry import Tcp, outbound\noutbound("OB", Tcp(host="10.0.0.5", port=5000))\n',
@@ -387,8 +389,11 @@ def _loosening_names(attested_hops: tuple[str, ...]) -> list[str]:
             unverified_db_hops=(),
             attested_hops=attested_hops,
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

@@ -16,8 +16,11 @@ Lives in ``pipeline/`` (next to the operator alert plumbing it reuses) and impor
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from typing import Final
 
+from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
 from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
@@ -55,9 +58,19 @@ from messagefoundry.pipeline.alert_sinks import (
     _BackgroundDispatcher,
     send_plain_email,
 )
+from messagefoundry.store.base import AuditStore
 from messagefoundry.transports.email import checked_sender
 
 log = logging.getLogger(__name__)
+
+#: BACKLOG #2383: the row :meth:`SecurityEventNotifier._record_undelivered` writes; its docstring
+#: states the row. Defined here, not in ``auth/notifications.py``, where every upper-case string is a
+#: notice kind.
+SECURITY_NOTICE_UNDELIVERED_ACTION: Final = "auth.security_notice_undelivered"
+#: How many queue-full records may be in flight at once. Past it a drop goes unrecorded, so the
+#: overload that filled the queue cannot also grow tasks and store writers without bound.
+_MAX_RECORDING: Final = 64
+
 
 _SUBJECTS = {
     ACCOUNT_LOCKED: "Your MessageFoundry account was locked",
@@ -496,6 +509,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         tls_verify: bool = True,
         tls_ca_file: str | None = None,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
+        audit: AuditStore | None = None,
     ) -> None:
         super().__init__()
         self._host = host
@@ -511,6 +525,12 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._tls_verify = tls_verify
         self._tls_ca_file = tls_ca_file
         self._trust_anchor_policy = trust_anchor_policy
+        # BACKLOG #2383: where a dropped or failed notice is recorded. None writes no row, which is
+        # how an offline command builds it; the API lifespan passes the store.
+        self._audit = audit
+        # The queue-full records still being written, held so the loop keeps them alive and so
+        # aclose() can wait for them.
+        self._recording: set[asyncio.Task[None]] = set()
         # Logged now, once, rather than at the first send (BACKLOG #1131): the first send may be a
         # lock notice, and a line appearing then would show a logs:view reader that a lock landed.
         if use_tls and not tls_verify:
@@ -558,12 +578,27 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                     event.username,
                 )
             return
+        # Read before the enqueue, with no await between, so it is the queue the enqueue meets.
+        full = self._queue.full()
         self._enqueue(
             event,
             dropped=None
             if event.event_type in LOG_SILENT_EVENT_TYPES
             else f"{event.event_type} for {event.username}",
         )
+        if full and self._audit is not None and len(self._recording) < _MAX_RECORDING:
+            # Off the caller's path: a notice must never block a sign-in or an admin action, and
+            # this write would wait on the store under exactly the overload that filled the queue.
+            task = asyncio.create_task(self._record_undelivered(event, {"reason": "queue_full"}))
+            self._recording.add(task)
+            task.add_done_callback(self._recording.discard)
+
+    async def aclose(self) -> None:
+        try:
+            await super().aclose()
+        finally:
+            # Each one swallows its own failure, so this only waits.
+            await asyncio.gather(*self._recording, return_exceptions=True)
 
     async def _handle(self, event: SecurityEvent) -> None:
         try:
@@ -573,14 +608,47 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # A lock notice fails silently here (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): a line per
             # failed lock mail would show a logs:view reader when a lock landed. A relay that is down
             # still shows, on every other kind of notice.
-            if event.event_type in LOG_SILENT_EVENT_TYPES:
-                return
-            log.warning(
-                "security-event email failed for %s (%s)",
-                event.username,
-                event.event_type,
-                exc_info=True,
+            if event.event_type not in LOG_SILENT_EVENT_TYPES:
+                log.warning(
+                    "security-event email failed for %s (%s)",
+                    event.username,
+                    event.event_type,
+                    exc_info=True,
+                )
+            # The reason only. The exception's text can quote the relay's reply or the address, and
+            # even its class would tell the recipient, in their own feed, that the relay is broken.
+            await self._record_undelivered(event, {"reason": "send_failed"})
+
+    async def _record_undelivered(self, event: SecurityEvent, why: dict[str, str]) -> None:
+        """Write the audit row that says this notice never left the engine (BACKLOG #2383).
+
+        Before this, a full queue or a failed send left only a WARNING line, so the trail could not
+        say which account was never told. The actor is the notice's recipient, so the row also
+        reaches that account's ``/me/security-events`` feed. The detail is the notice kind and
+        ``why``, plus the holder's username on an issuer's reminder, which says whose credential it
+        was. Never the rest of ``event.detail`` or the address: an EMAIL_CHANGED carries an address
+        in its detail. A lock notice writes the hidden ``auth.lock_notice_undelivered`` action (BACKLOG
+        #1131). A failed write is swallowed, like the send it reports on. It is logged by class, and
+        not at all for a lock notice: that kind writes no other line, so a lone line would say a
+        lock landed."""
+        if self._audit is None:
+            return
+        silent = event.event_type in LOG_SILENT_EVENT_TYPES
+        action = LOCK_NOTICE_UNDELIVERED_ACTION if silent else SECURITY_NOTICE_UNDELIVERED_ACTION
+        detail = {"notice": notice_kind_log_label(event.event_type), **why}
+        holder = event.detail.get("holder")
+        if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER and isinstance(holder, str):
+            detail["holder"] = holder
+        try:
+            await self._audit.record_audit(
+                action, actor=event.username, detail=json.dumps(detail, sort_keys=True)
             )
+        except Exception as exc:  # noqa: BLE001 - best-effort, like the notice itself
+            if not silent:
+                log.warning(
+                    "an undelivered security notice could not be recorded in the audit log (%s)",
+                    type(exc).__name__,
+                )
 
     def _send(self, event: SecurityEvent) -> None:
         if not event.email:  # narrowed for mypy; notify() already filtered these out
@@ -608,6 +676,7 @@ def security_notifier_from_settings(
     *,
     secret_provider: SecretProvider | None = None,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    audit: AuditStore | None = None,
 ) -> SecurityEventNotifier | None:
     """Build the per-user security notifier from ``[alerts]`` SMTP settings, or ``None`` when no SMTP
     server/sender is configured (then nothing is emailed; ``auth/notifications.py`` states which events
@@ -615,7 +684,8 @@ def security_notifier_from_settings(
 
     ``secret_provider`` (ADR 0019 §5) resolves the SMTP password from a ``[secrets].provider`` when
     ``email_password_secret`` is set (fail-closed); ``None``/no reference → the env-sourced
-    ``email_password``, byte-identical to before."""
+    ``email_password``, byte-identical to before. ``audit`` is where a dropped or failed notice is
+    recorded (BACKLOG #2383); ``None`` records nothing."""
     if not (alerts.email_smtp_host and alerts.email_from):
         return None
     # The sender is MAIL FROM on every notice, and send_plain_email refuses one that fails the address
@@ -640,4 +710,5 @@ def security_notifier_from_settings(
         tls_verify=alerts.email_tls_verify,
         tls_ca_file=alerts.email_tls_ca_file,
         trust_anchor_policy=trust_anchor_policy,
+        audit=audit,
     )

@@ -1328,6 +1328,8 @@ _CLI_OPENERS = {
     "_audit_verify.run",
     "_audit_anchor.run",
     "_backup.run",
+    # BACKLOG #2337: record or withdraw the vault_transit bound attestation, with its audit row
+    "_store_transit_bound.run",
 }
 _CLI_DEFAULT = {"_rotate_key.run"}
 
@@ -1561,6 +1563,17 @@ def _run_supervise(
 
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
     monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: None)
+    # The supervisor passes serve's forwarding gates after the at-rest gate (BACKLOG #2356), so a
+    # fleet that gets past this module's subject needs a collector configured to start.
+    from tests._phi_gate_provisions import (
+        make_syslog_ca_and_crl,
+        setenv_declared_egress,
+        setenv_verified_log_forwarding,
+    )
+
+    setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(shell))
+    # And the open-egress gate, which it runs before it installs that forwarder.
+    setenv_declared_egress(monkeypatch)
     rc = cli._supervise(_supervise_args(shell / "mefor.db", shell))
     return rc, capsys.readouterr().err, spawned
 

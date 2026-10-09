@@ -191,6 +191,17 @@ def vault_failure_text(exc: BaseException) -> str:
     return text(exc)
 
 
+def is_vault_bad_request(exc: BaseException) -> bool:
+    """Whether ``exc`` is Vault's HTTP 400, which hvac raises as ``InvalidRequest``. Shared with
+    ``crypto_transit.py`` so ``hvac`` stays imported here only (BACKLOG #2337). ``False`` without the
+    ``[vault]`` extra, since then no hvac client raised it."""
+    try:
+        from hvac.exceptions import InvalidRequest  # type: ignore[import-untyped]  # noqa: PLC0415
+    except ImportError:
+        return False
+    return isinstance(exc, InvalidRequest)
+
+
 # --- Transit key-TYPE validation (BACKLOG #1166, owner ruling 2026-08-22, ASVS 11.2.3) -------------
 #
 # Every Vault Transit key this product uses is OPERATOR-CHOSEN by name, and the product read its type

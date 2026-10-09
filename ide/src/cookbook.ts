@@ -13,6 +13,7 @@
 import * as vscode from "vscode";
 import { RECIPES, searchBlob } from "./cookbookRecipes";
 import { nonce } from "./cspNonce";
+import { SCRIPT_STARTED_MARK, STARTUP_BANNERS } from "./webviewMessaging";
 
 function esc(s: string): string {
   // Escape quotes too, not just &<>: these values land inside double-quoted HTML attributes
@@ -114,6 +115,7 @@ export class CookbookPanel {
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <h1>Cookbook</h1>
   <p class="lede">Solved HL7 routing/transform problems, as real Python. Search, then insert into the active editor and edit it there.</p>
   <input id="search" type="text" placeholder="Search recipes (e.g. “code set”, “split”, “fan-out”)…" />
@@ -123,7 +125,7 @@ export class CookbookPanel {
   </div>
   <div id="empty">No recipes match.</div>
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}
     const cards = Array.from(document.querySelectorAll('.card'));
     const countEl = document.getElementById('count');
     const emptyEl = document.getElementById('empty');
