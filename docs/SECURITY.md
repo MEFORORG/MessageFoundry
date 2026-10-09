@@ -716,7 +716,8 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
   BACKLOG #1182). `[security].require_nonstatic_credentials` ships **off** (owner decision
   2026-09-23). Turned on, `serve` refuses to start while any hop that presents an unchanging
   credential or none lacks an entry in `[security].static_credential_accepted`, which takes a reason
-  per hop. Each honoured opt-out is logged at start by hop name, never by secret, and is named by
+  per hop. `supervise` checks the service-settings hops too, before it starts any engine shard
+  (BACKLOG #2356); the connection graph's hops stay with each engine shard. Each honoured opt-out is logged at start by hop name, never by secret, and is named by
   `security_loosenings()`. The refuse/warn split is `[security].enforcement`. What it counts as a
   hop, and what it leaves out (listeners, plugin connector types, and a generic-ODBC credential
   hidden in a driver keyword), is stated in `messagefoundry/config/static_credentials.py`.
