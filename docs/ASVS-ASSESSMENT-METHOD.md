@@ -167,9 +167,10 @@ At least these do not count:
 **Which lines are the owner's own words.** The owner ruled on the docstring and the code comment in
 these words: *"No, neither counts"*. The first test, reach without opening the source code, is in
 the option the owner chose. The second test, words a reviewer can compare with the code, is this
-method's reading and not the owner's words. The help-text line is a reading that adversarial review
-reached, and the owner then built on it. The other lines are the reading of the Manager seat that
-took the ruling, and not the owner's words.
+method's reading and not the owner's words. The help-text line is the reading of the Manager seat
+that took the ruling, reached after adversarial review. The owner was told of it when ruling on
+docstrings and code comments, and did not rule on it. The other lines are the reading of the
+Manager seat that took the ruling, and not the owner's words.
 
 **Why documentation is read more widely than prose pages.** ASVS 5.0 allows it. Its front matter
 says a security decision may be written in a document that developers refer to. It also allows one
