@@ -11,11 +11,13 @@ base-uri 'none'`` (the floor's :data:`~messagefoundry.api.header_floor.FLOOR_CSP
 * the ``500`` when the app raised, or returned, without starting a response
   (``send_500_response`` on uvicorn's per-request cycle object, not on the protocol);
 * the ``500`` when a WebSocket app fails before the handshake is answered;
-* on the sans-I/O WebSocket protocol that ``ws="auto"`` resolves to from uvicorn 0.50, every
-  handshake answer, because that protocol hands each one to ``send_response`` on its ``conn``, a
-  websockets ``ServerProtocol``: the library's own rejection of a malformed handshake (for example
-  a ``400`` for a missing ``Sec-WebSocket-Key``), uvicorn's ``500``, its ``403`` for an app that
-  closes before accepting, the app's own denial, and the ``101``; and
+* on the sans-I/O WebSocket protocol that ``ws="auto"`` resolves to from uvicorn 0.50, each
+  handshake answer handed to ``send_response`` on its ``conn``, a websockets ``ServerProtocol``.
+  At uvicorn 0.54.0 that is every one this module's author found, and at least these: the
+  library's own rejection of a malformed handshake (a ``400`` for a missing
+  ``Sec-WebSocket-Key``, a ``405`` for a method other than GET), uvicorn's ``500``, its ``403``
+  for an app that closes before accepting, the app's own denial, the ``101``, and the ``414`` or
+  ``431`` the library's parser queues for an over-long request line or header block; and
 * on the legacy websockets server, which ``ws="auto"`` resolved to before uvicorn 0.50 and
   ``ws="websockets"`` still names, the pre-handshake ``500`` (``send_500_response``) and every
   handshake answer that library writes through ``write_http_response``: its own rejection of a
@@ -29,6 +31,15 @@ dependency. uvicorn
 0.54 also ships a ``zttp`` HTTP protocol. ``http="auto"`` does not resolve to it and ``serve`` never
 names it; handed to the class build, it is checked for the HTTP hooks like any other base.
 uvicorn's interim ``100 Continue`` carries no header either.
+
+**One answer this module WRITES, where everything else only adds headers.** uvicorn 0.54.0's
+sans-I/O protocol never writes the ``414`` or ``431`` the websockets parser queues. The peer gets no
+answer and the connection stays open; at server stop, uvicorn's own ``500`` for that connection
+then fails an assertion inside websockets, and ``Server.shutdown`` raises before the lifespan
+shutdown runs. The legacy server answered the same request and closed. So the floored sans-I/O
+class writes what the parser queued and closes, the way uvicorn's own ``handle_connect`` does for a
+rejection it does see. ``tests/test_header_floor_wire.py`` pins the upstream behaviour on the bare
+class, so a uvicorn that fixes it turns that test red and this step can go.
 
 **Never HSTS here.** Whether HSTS belongs on a response depends on the request's host and the served
 chain (:func:`~messagefoundry.api.header_floor.hsts_notable`). On the default posture, a self-signed
@@ -51,8 +62,8 @@ built, against the server class it is handed: the HTTP protocol's ``send_400_res
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response`` and ``default_headers``, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
-protocol they are ``send_500_response``, the ``conn`` attribute, and a synchronous
-``send_response`` on the ``ServerProtocol`` its module imports. The methods the floor wraps synchronously must still be
+protocol they are the ``conn`` attribute, and a synchronous ``send_response`` and
+``data_to_send`` on the ``ServerProtocol`` its module imports. The methods the floor wraps synchronously must still be
 synchronous. An attribute counts as present when a method of the server's own class for the hook
 using it, or of a subclass, assigns it. A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
 installed uvicorn and websockets versions, and ``serve`` refuses to start on it. There is no
@@ -286,20 +297,26 @@ def _answers_through_conn(base: type[Any]) -> bool:
     ``ServerProtocol`` its module lacks."""
     if callable(getattr(base, "write_http_response", None)):
         return False
-    owner = _root_definer(base, "send_500_response")
+    # Up to the class that first defines data_received, which is asyncio.Protocol: the whole of the
+    # server's own class chain. Keyed on nothing the sans-I/O floor does not itself use.
+    owner = _root_definer(base, "data_received")
     return owner is not None and _assigns(base, "conn", upto=owner)
 
 
 def _require_ws_hooks(base: type[Any], *, through_conn: bool) -> None:
     """Refuse, at class build, a base lacking any hook its floored class relies on.
     ``through_conn`` is :func:`_answers_through_conn`'s reading of ``base``, which picks the set."""
-    _require_sync_method(base, "send_500_response")
     if through_conn:
+        # Not send_500_response: on this protocol it goes through the conn, and the floor never
+        # touches it, so its absence is no reason to refuse.
+        _require_sync_method(base, "data_received")
         conn_cls = _module_class(base, _CONN_CLASS)
         if conn_cls is None:
             raise _refusal(base, f"{_CONN_CLASS} in its module")
         _require_sync_method(conn_cls, "send_response")
+        _require_sync_method(conn_cls, "data_to_send")
     else:
+        _require_sync_method(base, "send_500_response")
         _require_assigned(base, "transport", hook="send_500_response")
         _require_sync_method(base, "write_http_response")
 
@@ -441,11 +458,36 @@ def _floor_the_conn_responses(conn: Any) -> None:
     Per instance, and holding a WEAK reference, for the reasons :func:`_floor_the_cycle_500` gives.
     websockets' own parser calls ``self.send_response`` for the answers it queues before uvicorn
     sees a request (an over-long request line, too many headers), so those get the headers too.
-    uvicorn 0.54 does not write what the parser queued there, and no test drives that family."""
+    :func:`_answer_a_parser_rejection` is what gets them written."""
     try:
         conn.send_response = partial(_send_floored_handshake_response, weakref.ref(conn))
     except Exception as exc:
         _degraded("ws-sansio", "hook", exc)
+
+
+def _answer_a_parser_rejection(protocol: Any) -> None:
+    """Write the answer the websockets parser queued for a request it rejected, and close.
+
+    See the module docstring: uvicorn 0.54.0 leaves that answer unwritten and the connection open.
+    The parser sets ``handshake_exc`` and yields no request, so uvicorn's ``handle_connect`` never
+    runs and ``handshake_initiated`` stays false. That pair is the whole test. The three flags are
+    set the way ``handle_connect`` sets them for a rejection, so uvicorn's ``shutdown`` reads the
+    connection as already answered."""
+    try:
+        conn = protocol.conn
+        if getattr(protocol, "handshake_initiated", True):
+            return
+        if getattr(conn, "handshake_exc", None) is None:
+            return
+        queued = b"".join(conn.data_to_send())
+        protocol.handshake_initiated = True
+        protocol.handshake_complete = True
+        protocol.close_sent = True
+        if queued:
+            protocol.transport.write(queued)
+        protocol.transport.close()
+    except Exception as exc:
+        _degraded("ws-sansio", "parser rejection answer", exc)
 
 
 def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol]:
@@ -512,12 +554,11 @@ def floored_ws_protocol_class(base: type[Any] | None = None) -> type[asyncio.Pro
 
 def _build_floored_sansio_ws(base: type[Any]) -> type[asyncio.Protocol]:
     class _FlooredWebSocketProtocol(base):  # type: ignore[misc]
-        # The sans-I/O protocol writes every handshake answer by handing a response to
-        # `self.conn.send_response` and then writing what the conn serialized: the library's
-        # rejection of a bad handshake, the 500, the 403, the app's denial and the 101. So the conn
-        # is the one place to add the headers, and a property sees it whenever it is assigned.
-        # send_500_response is NOT wrapped here: it goes through the conn like the rest, and a
-        # second wrapper would stamp it twice.
+        # The sans-I/O protocol writes a handshake answer by handing a response to
+        # `self.conn.send_response` and then writing what the conn serialized; the module docstring
+        # lists the answers found. So the conn is the one place to add the headers, and a property
+        # sees it whenever it is assigned. send_500_response is NOT wrapped here: it goes through
+        # the conn like the rest, and a second wrapper would stamp it twice.
         @property
         def conn(self) -> Any:
             return self._mf_conn
@@ -527,6 +568,10 @@ def _build_floored_sansio_ws(base: type[Any]) -> type[asyncio.Protocol]:
             self._mf_conn = value  # first, so no failure below can lose the conn
             if value is not None:
                 _floor_the_conn_responses(value)
+
+        def data_received(self, *args: Any, **kwargs: Any) -> None:
+            super().data_received(*args, **kwargs)
+            _answer_a_parser_rejection(self)
 
     return _FlooredWebSocketProtocol
 

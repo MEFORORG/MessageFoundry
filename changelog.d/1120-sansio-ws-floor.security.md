@@ -8,4 +8,7 @@
   websockets server stays covered as before. wsproto is still refused. The lock moves uvicorn to
   0.54.0. `websockets` gains an upper bound, `<18`, because the floor wraps two of its internals;
   the lock stays at 17.1. The startup self-test drives whichever WebSocket class is served, and
-  gains a fifth drive: an app that closes before accepting. (`BACKLOG #1120`)
+  gains two drives: an app that closes before accepting, and an upgrade the websockets parser
+  rejects. For that last one the floor also writes the answer. uvicorn 0.54.0 leaves it unwritten
+  and the connection open, and then raises at server stop, before the engine's own shutdown runs.
+  The floored class writes the queued `414` or `431` and closes. (`BACKLOG #1120`)

@@ -23,8 +23,10 @@ site does not bypass the floor, or what covers it instead.
 | ``status-line`` | A literal that starts an HTTP status line: a raw writer below any ASGI stack. |
 | ``protocol-override`` | A def of, or assignment to, a server response writer (see below). |
 
-The server response writers are ``send_400_response``, ``send_500_response``,
-``write_http_response`` and ``send_response`` (the sans-I/O WebSocket conn's). "Assignment" covers ``x.name = ...``, a class-level ``name = ...``, an
+The server response writers are ``send_400_response``, ``send_500_response`` and
+``write_http_response``. ``send_response``, the sans-I/O WebSocket conn's writer, counts only when
+it is ASSIGNED on an object (``x.send_response = ...``): the name is too common for a def of it to
+mean a server writer. "Assignment" covers ``x.name = ...``, a class-level ``name = ...``, an
 annotated assignment, and ``setattr(x, "name", ...)`` with a literal name.
 
 **Its bound, stated so it is not read as more.** This pins the FIRST-PARTY emitter population, and
@@ -56,9 +58,9 @@ _ASGI_RESPONSE_STARTS = frozenset(
     {"http.response.start", "websocket.http.response.start", "websocket.accept"}
 )
 _STATUS_LINE = re.compile(r"HTTP/\d\.\d \S")
-_PROTOCOL_METHODS = frozenset(
-    {"send_400_response", "send_500_response", "write_http_response", "send_response"}
-)
+_PROTOCOL_METHODS = frozenset({"send_400_response", "send_500_response", "write_http_response"})
+#: Counted only as an attribute assignment; see the module docstring.
+_ASSIGNED_WRITERS = frozenset({"send_response"})
 _SERVER_CALLS = frozenset({"run", "Server", "Config"})
 _WS_NAMES = frozenset({"ws", "websocket"})
 _MESSAGE_KINDS = {
@@ -103,7 +105,9 @@ class _Collector(ast.NodeVisitor):
                 self._assigned(element)
             return
         name = getattr(target, "attr", None) or getattr(target, "id", None)
-        if name in _PROTOCOL_METHODS:
+        if name in _PROTOCOL_METHODS or (
+            isinstance(target, ast.Attribute) and target.attr in _ASSIGNED_WRITERS
+        ):
             self._add("protocol-override")
 
     def visit_Assign(self, node: ast.Assign) -> None:

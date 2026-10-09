@@ -16,11 +16,13 @@ protocol, the way uvicorn itself would receive it:
 * a well-formed request to an app that raises, for the server's own ``500``;
 * a WebSocket upgrade with no ``Sec-WebSocket-Key``, for the handshake rejection the WebSocket
   library writes;
-* a complete WebSocket upgrade to an app that raises, for the pre-handshake ``500``; and
+* a complete WebSocket upgrade to an app that raises, for the pre-handshake ``500``;
 * a complete WebSocket upgrade to an app that closes before it accepts, for the ``403`` the server
-  writes for it.
+  writes for it; and
+* a WebSocket upgrade whose request line is longer than the WebSocket library reads, for the
+  answer its parser queues before the server sees a request.
 
-The last three are skipped when there is no WebSocket protocol, which uvicorn reads as WebSockets
+The last four are skipped when there is no WebSocket protocol, which uvicorn reads as WebSockets
 off. They run against whichever WebSocket class is handed in: the sans-I/O protocol uvicorn 0.50 and
 later resolve ``ws="auto"`` to, or the legacy server before it. Each must be answered by that class.
 
@@ -39,7 +41,7 @@ It never quotes the bytes written, and it names an exception by type only.
 
 **What it does not prove.** At least these are outside it:
 
-* A response family other than the five above. One a new server version adds is outside it, as it is
+* A response family other than the six above. One a new server version adds is outside it, as it is
   outside the floor.
 * The settings ``serve`` runs with. The drives use a plain ``uvicorn.Config``: no TLS, no server-wide
   default headers, one worker, and nothing read from the environment. A header merge that depended
@@ -73,8 +75,8 @@ __all__ = ["selftest_protocol_floor"]
 _log = logging.getLogger(__name__)
 
 #: Loop turns one drive may take before its response counts as missing. Each turn is a zero-timeout
-#: pass, so this bounds work, never time. Measured at uvicorn 0.54.0 and websockets 17.1: the five
-#: drives take 3 turns between them on the sans-I/O protocol and 8 on the legacy server.
+#: pass, so this bounds work, never time. Measured at uvicorn 0.54.0 and websockets 17.1: the six
+#: drives take 3 turns between them on the sans-I/O protocol and 9 on the legacy server.
 _MAX_TURNS = 200
 
 #: Turns given to the driven connections to close, and again to their cancelled tasks, before the
@@ -122,6 +124,11 @@ _DRIVES = (
     _Drive("WebSocket handshake rejection", _upgrade(key=False), range(400, 500), True),
     _Drive("WebSocket pre-handshake 500", _upgrade(), (500,), True),
     _Drive("WebSocket refusal 403", _upgrade(_REFUSED_PATH), (403,), True),
+    # Longer than the 8192 bytes websockets reads for one line, and well inside what the HTTP
+    # protocols accept, so it is the WebSocket library's parser that rejects it.
+    _Drive(
+        "WebSocket parser rejection", _upgrade("/selftest/" + "a" * 9000), range(400, 500), True
+    ),
 )
 
 

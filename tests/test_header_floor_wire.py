@@ -351,6 +351,52 @@ async def test_an_accepted_handshake_is_still_a_101_with_each_header_once(base: 
         assert names.count(name.lower()) == 1, names
 
 
+#: A request line longer than the 8192 bytes the websockets parser reads, and a header block with
+#: more lines than it accepts. Both pass uvicorn's HTTP protocol and reach the WebSocket one.
+_PARSER_REJECTED = [
+    pytest.param(_HANDSHAKE.format(path="/" + "a" * 9000).encode(), 414, id="long-request-line"),
+    pytest.param(
+        _HANDSHAKE.format(path="/ws/stats")
+        .replace("\r\n\r\n", "\r\n" + "".join(f"X-{n}: 1\r\n" for n in range(200)) + "\r\n")
+        .encode(),
+        431,
+        id="too-many-headers",
+    ),
+]
+
+
+@pytest.mark.parametrize(("request_bytes", "status"), _PARSER_REJECTED)
+async def test_a_parser_rejected_upgrade_is_answered_floored_and_closed(
+    request_bytes: bytes, status: int
+) -> None:
+    """The one answer the floor writes itself. Leaving the block also stops the server, which
+    must not raise: the control below shows it does on the bare class."""
+    floored = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
+    async with _served(_raises, ws=floored) as port:
+        shipped = await _exchange(port, request_bytes)
+    assert shipped[0] == status, shipped
+    assert _protocol_floored(shipped[1]), shipped[1]
+
+
+async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() -> None:
+    """The control, and a pin on uvicorn's own behaviour at the measured version: no answer, the
+    connection left open, and a server stop that raises from inside websockets. If this fails,
+    uvicorn has changed that path: re-read it, and remove the floor's ``data_received`` step if it
+    is no longer needed."""
+    request_bytes = _PARSER_REJECTED[0].values[0]
+    with pytest.raises(AssertionError):
+        async with _served(_raises, ws=WebSocketsSansIOProtocol) as port:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            try:
+                writer.write(request_bytes)
+                await writer.drain()
+                # Raised here, a TimeoutError would be the wrong exception for the block.
+                answer = await asyncio.wait({asyncio.ensure_future(reader.read())}, timeout=1.0)
+                assert not answer[0], "the bare protocol answered; uvicorn changed this path"
+            finally:
+                writer.close()
+
+
 def test_the_sans_io_websocket_protocol_is_floored() -> None:
     """It was refused until BACKLOG #1120 floored it: uvicorn 0.50 and later resolve
     ``ws="auto"`` to it, so on the measured uvicorn every start goes through this class."""
@@ -727,14 +773,17 @@ def _fake_sansio_ws(drop: str | None, monkeypatch: pytest.MonkeyPatch | None = N
     conn_members: dict[str, Any] = {"__module__": _FAKE_SANSIO_MODULE}
     if drop != "send_response":
         conn_members["send_response"] = _async_hook if drop == "sync send_response" else _writes
+    if drop != "data_to_send":
+        conn_members["data_to_send"] = _writes
     if monkeypatch is not None:
         module = ModuleType(_FAKE_SANSIO_MODULE)
         if drop != "ServerProtocol":
             module.ServerProtocol = type("ServerProtocol", (), conn_members)  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, _FAKE_SANSIO_MODULE, module)
+    # No send_500_response: the sans-I/O floor does not use it, so it must not be required.
     members: dict[str, Any] = {"__module__": _FAKE_SANSIO_MODULE, "__init__": _sets_conn}
-    if drop != "send_500_response":
-        members["send_500_response"] = _writes
+    if drop == "sync data_received":
+        members["data_received"] = _async_hook
     return type("FakeSansIOProtocol", (asyncio.Protocol,), members)
 
 
@@ -749,10 +798,11 @@ def test_the_complete_fakes_build(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     ("drop", "named"),
     [
-        ("send_500_response", "synchronous send_500_response method"),
+        ("sync data_received", "synchronous data_received method"),
         ("ServerProtocol", "ServerProtocol in its module"),
         ("send_response", "synchronous send_response method"),
         ("sync send_response", "synchronous send_response method"),
+        ("data_to_send", "synchronous data_to_send method"),
     ],
 )
 def test_a_sans_io_base_missing_a_hook_is_refused(

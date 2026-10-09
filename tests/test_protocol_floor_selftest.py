@@ -100,7 +100,7 @@ def test_no_websocket_protocol_drives_the_http_families_alone() -> None:
 def test_the_unfloored_classes_are_refused_for_every_response(ws_base: type[Any]) -> None:
     """The vacuity control for the whole check: uvicorn's own classes, with no floor, fail every
     drive."""
-    assert len(_ALL_RESPONSES) == 5 and len(_WS_RESPONSES) == 3
+    assert len(_ALL_RESPONSES) == 6 and len(_WS_RESPONSES) == 4
     _names_only(_refusal(HttpToolsProtocol, ws_base), *_ALL_RESPONSES)
 
 
@@ -132,7 +132,11 @@ def test_a_bare_500_is_refused(http_base: type[Any], monkeypatch: pytest.MonkeyP
         pytest.param(
             WebSocketProtocol,
             "write_http_response",
-            ["WebSocket handshake rejection", "WebSocket refusal 403"],
+            [
+                "WebSocket handshake rejection",
+                "WebSocket refusal 403",
+                "WebSocket parser rejection",
+            ],
             id="legacy-write_http_response",
         ),
         pytest.param(
@@ -159,6 +163,18 @@ def test_a_conn_whose_hook_does_nothing_is_refused(monkeypatch: pytest.MonkeyPat
     selftest_protocol_floor(http, ws)
     monkeypatch.setattr(protocol_headers, "_floor_the_conn_responses", lambda conn: None)
     _names_only(_refusal(http, ws), *sorted(_WS_RESPONSES))
+
+
+def test_a_parser_rejection_uvicorn_leaves_unwritten_is_refused() -> None:
+    """The floor's one written answer, knocked out: with the class's data_received removed, the
+    answer the websockets parser queued is never written, as on the bare class, and the self-test
+    says so for that drive alone."""
+    http, ws = _floored()
+    selftest_protocol_floor(http, ws)
+    del ws.data_received
+    message = _refusal(http, ws)
+    assert "the WebSocket parser rejection was never written" in message, message
+    assert "lacked" not in message, message
 
 
 def test_one_missing_header_is_named_alone(monkeypatch: pytest.MonkeyPatch) -> None:
