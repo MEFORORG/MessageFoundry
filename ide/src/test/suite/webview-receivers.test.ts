@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
 
 import { alertEditorScript } from "../../alertEditorWebview";
 import { codeSetEditorScript } from "../../codeSetEditorWebview";
@@ -20,6 +22,9 @@ import { wiringMapScript } from "../../wiringMapWebview";
 // that is correctly stamped and carries a known discriminator, but whose payload is missing a
 // required field or has one of the wrong JS type, is DISCARDED. Nothing on the page changes and
 // nothing throws. Value ranges are a different requirement and are not tested here.
+//
+// One receiver SHOWS the discard: Security Settings, for a `state` (see its `shownDiscard`). An
+// empty settings form with no reason given reads as a broken panel.
 //
 // Each panel's REAL script is evaluated in a jsdom page, so what runs here is what ships. Each
 // well-formed fixture is built by the host's own pure function where there is one (buildForm,
@@ -65,6 +70,8 @@ interface Page {
   readonly errors: unknown[];
   /** Every console.warn the page wrote. A discard names itself there. */
   readonly warnings: string[];
+  /** Every message the page posted to the host. */
+  readonly posted: Payload[];
   deliver(data: Payload): void;
   /** Markup plus every form control's live value, which markup does not show. */
   snapshot(): string;
@@ -81,6 +88,7 @@ function closeWindows(): void {
 function page(script: string, body: string): Page {
   const errors: unknown[] = [];
   const warnings: string[] = [];
+  const posted: Payload[] = [];
   const virtualConsole = new VirtualConsole();
   virtualConsole.on("jsdomError", (e: unknown) => errors.push(e));
   virtualConsole.on("warn", (...args: unknown[]) => warnings.push(args.map(String).join(" ")));
@@ -94,7 +102,7 @@ function page(script: string, body: string): Page {
   window.acquireVsCodeApi = () => ({
     getState: () => null,
     setState: () => undefined,
-    postMessage: () => undefined,
+    postMessage: (m: Payload) => void posted.push(m),
   });
   const el = window.document.createElement("script");
   el.textContent = script;
@@ -104,6 +112,7 @@ function page(script: string, body: string): Page {
     window,
     errors,
     warnings,
+    posted,
     deliver(data): void {
       window.dispatchEvent(
         new window.MessageEvent("message", {
@@ -143,6 +152,9 @@ interface Receiver {
   readonly wellFormed: Record<string, Payload[]>;
   /** Per message type: malformed payloads with the discriminator intact. */
   readonly malformed: Record<string, [string, Payload][]>;
+  /** Per message type, for a receiver that SHOWS a discard, so the page does change. Called before
+   *  the message is delivered; the check it returns runs after, in place of "the page is unchanged". */
+  readonly shownDiscard?: Record<string, (p: Page) => () => void>;
 }
 
 // --- Alert Rules --------------------------------------------------------------------------------
@@ -449,16 +461,60 @@ const SECURITY_SHOW: Payload = {
 
 const STATE_OK = { command: "state", state: SECURITY_SHOW };
 
+/** One switch of each FIELDS type. The absent-switch cases remove each from values and from defaults. */
+const ONE_PER_TYPE: [string, string][] = [
+  ["bool", "serve_web_console"],
+  ["int", "max_session_hours"],
+  ["string", "listen_address"],
+  ["tristate", "production_instance"],
+];
+
+/** The live value of every control in the form, which is what Save would send. */
+function formValues(p: Page): string {
+  const controls = [...p.window.document.querySelectorAll("#form input, #form select")];
+  return JSON.stringify(controls.map((c: DomNode) => [c.id, c.value]));
+}
+
+/** The text the panel is SHOWING in its error element, or "" while that element is hidden. Read
+ *  through the computed style, because the page's own stylesheet hides `.error` (securityEditor.ts). */
+function refusalShown(p: Page): string {
+  const el = p.window.document.getElementById("error");
+  const computed = (p.window.getComputedStyle as (e: DomNode) => { display: string })(el);
+  return computed.display === "none" ? "" : String(el.textContent);
+}
+
+/** The rule securityEditor.ts formHtml() ships for the error element, and the element as it ships.
+ *  That file imports `vscode`, so it cannot be loaded here; a test below reads its text instead and
+ *  fails if this rule or that element is no longer in it. */
+const SECURITY_ERROR_RULE = ".error { display: none;";
+const SECURITY_ERROR_ELEMENT = '<div id="error" class="error">';
+const SECURITY_ERROR_CSS = `<style>${SECURITY_ERROR_RULE} }</style>`;
+function securityBody(seed: string): string {
+  return `${SECURITY_ERROR_CSS}<div id="form"></div>${SECURITY_ERROR_ELEMENT}${seed}</div>
+       <button id="save"></button><button id="close"></button>`;
+}
+const REFUSAL = "These settings cannot be shown.";
+
 const security: Receiver = {
   panel: "Security Settings",
   key: "command",
   load: () =>
-    page(
-      securityEditorScript(TOKEN, FIELDS),
-      `<div id="form"></div><div id="error">${SENTINEL}</div>
-       <button id="save"></button><button id="close"></button>`,
-    ),
+    page(securityEditorScript(TOKEN, FIELDS), securityBody(SENTINEL)),
   wellFormed: { state: [STATE_OK], error: [ERROR_OK] },
+  shownDiscard: {
+    // A discarded state is SHOWN (BACKLOG #1123), so the page changes. What must hold instead: no
+    // control took a value from the message, the form is hidden, the refusal is up, Save is off.
+    state: (p) => {
+      const before = formValues(p);
+      return () => {
+        const doc = p.window.document;
+        assert.strictEqual(formValues(p), before, "a control took a value from a discarded state");
+        assert.strictEqual(doc.getElementById("form").style.display, "none", "the form stayed up");
+        assert.ok(refusalShown(p).startsWith(REFUSAL), `no refusal on the page: "${refusalShown(p)}"`);
+        assert.strictEqual(doc.getElementById("save").disabled, true, "Save is on after a discard");
+      };
+    },
+  },
   malformed: {
     state: [
       ["no state", variant(STATE_OK, (c) => delete c.state)],
@@ -482,6 +538,12 @@ const security: Receiver = {
       ["an int default is a string", variant(STATE_OK, (c) => (c.state.defaults.delete_message_bodies_after_days = "30"))],
       ["a string default is an array", variant(STATE_OK, (c) => (c.state.defaults.listen_address = ["127.0.0.1"]))],
       ["a tristate default is a number", variant(STATE_OK, (c) => (c.state.defaults.production_instance = 0))],
+      // An ABSENT switch, one per FIELDS type, in each object (BACKLOG #1123). "security show" dumps
+      // the whole settings model twice, so no switch is ever legitimately missing from either.
+      ...ONE_PER_TYPE.flatMap(([type, key]): [string, Payload][] => [
+        [`values has no ${type} switch`, variant(STATE_OK, (c) => delete c.state.values[key])],
+        [`defaults has no ${type} switch`, variant(STATE_OK, (c) => delete c.state.defaults[key])],
+      ]),
     ],
     error: badMessages(ERROR_OK),
   },
@@ -616,29 +678,136 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.ok(SECURITY_SHOW.loosenings.length > 0);
   });
 
-  test("Security Settings: Save stays off until a state renders, and a discarded state leaves it off", () => {
+  test("Security Settings: Save stays off until a state renders, and a discarded state turns it off again", () => {
     // Before a state renders, the form holds placeholders, and saving them would write them as
     // explicit values. A discard must not leave the form looking loaded AND saveable.
     const p = security.load();
-    const save = p.window.document.getElementById("save");
+    const doc = p.window.document;
+    const save = doc.getElementById("save");
     assert.strictEqual(save.disabled, true, "Save was on before any state arrived");
     p.deliver(variant(STATE_OK, (c) => delete c.state.defaults));
     assert.strictEqual(save.disabled, true, "a discarded state turned Save on");
     p.deliver(STATE_OK);
     assert.strictEqual(save.disabled, false, "a well-formed state did not turn Save on");
+    // A state discarded AFTER one rendered: the form now holds values nobody can vouch for.
+    p.deliver(variant(STATE_OK, (c) => delete c.state.values.require_mfa));
+    assert.strictEqual(save.disabled, true, "Save stayed on over a stale form");
+    assert.strictEqual(doc.getElementById("form").style.display, "none", "the stale form stayed up");
+    // And the next well-formed state brings all of it back.
+    p.deliver(STATE_OK);
+    assert.strictEqual(save.disabled, false);
+    assert.strictEqual(doc.getElementById("form").style.display, "");
+    assert.strictEqual(refusalShown(p), "", "the refusal outlived the state that replaced it");
   });
 
-  test("Security Settings: a switch the engine does not report, and a key this form has no switch for, still render", () => {
-    // BACKLOG #2447. The per-key type check must not turn version skew into a blank panel: the
-    // INSTALLED engine can be older than this extension (a switch is absent) or newer (a key has no
-    // FIELDS entry). Both rendered before the check and both must render after it. This is also the
-    // control for the wrongly typed cases above, which change a key's TYPE rather than remove it.
+  test("Security Settings: a discarded state names the switch and what was wrong with it", () => {
+    // BACKLOG #1123. The operator sees why the panel is empty, not only the webview console.
+    // Every case that can carry text sends this marker as the bad value. None may echo it.
+    const SENT = "SENT_IN_THE_MESSAGE";
+    const cases: [string, (c: Payload) => void, string][] = [
+      ...ONE_PER_TYPE.flatMap(([, key]): [string, (c: Payload) => void, string][] => [
+        [`values.${key} absent`, (c) => delete c.state.values[key], `values.${key} is missing`],
+        [`defaults.${key} absent`, (c) => delete c.state.defaults[key], `defaults.${key} is missing`],
+      ]),
+      ["a bool that is a string", (c) => (c.state.values.require_mfa = SENT), "values.require_mfa must be true or false, got string"],
+      ["an int that is a string", (c) => (c.state.values.max_session_hours = SENT), "values.max_session_hours must be a whole number, got string"],
+      ["an int that is a fraction", (c) => (c.state.defaults.max_session_hours = 12.5), "defaults.max_session_hours must be a whole number, got a fraction"],
+      ["an int past 2^53", (c) => (c.state.defaults.max_session_hours = 2 ** 60), "defaults.max_session_hours must be a whole number, got a number too large"],
+      ["an int that is null", (c) => (c.state.defaults.max_session_hours = null), "defaults.max_session_hours must be a whole number, got null"],
+      ["a string that is a list", (c) => (c.state.values.listen_address = [SENT]), "values.listen_address must be text, got list"],
+      ["a string that is an object", (c) => (c.state.defaults.listen_address = { [SENT]: SENT }), "defaults.listen_address must be text, got object"],
+      ["a tristate that is a string", (c) => (c.state.values.production_instance = SENT), "values.production_instance must be true, false or null, got string"],
+      ["a tristate that is a number", (c) => (c.state.values.production_instance = 0), "values.production_instance must be true, false or null, got number"],
+      ["no values object", (c) => delete c.state.values, "values is missing or is not an object"],
+      ["no state", (c) => delete c.state, "state is missing or is not an object"],
+    ];
+    for (const [why, change, problem] of cases) {
+      const p = security.load();
+      p.deliver(variant(STATE_OK, change));
+      assert.deepStrictEqual(p.errors.map(String), [], `${why}: the page threw`);
+      const shown = refusalShown(p);
+      assert.ok(shown.startsWith(REFUSAL), `${why}: no refusal, got "${shown}"`);
+      assert.ok(shown.includes(problem), `${why}: the refusal does not say "${problem}": "${shown}"`);
+      assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "state"')), `${why}: console.warn was dropped`);
+      // The message's own values are never echoed: the refusal names a kind, not what was sent.
+      assert.ok(!shown.includes(SENT), `${why}: the refusal echoed a value from the message`);
+    }
+  });
+
+  test("Security Settings: the test page hides its error element by the rule the panel ships", () => {
+    // refusalShown() reads a computed style under a COPY of the panel's rule. This ties the copy to
+    // the source: if formHtml() changes how it hides the element, this fails and the copy is redone.
+    const host = fs.readFileSync(path.resolve(__dirname, "../../../src/securityEditor.ts"), "utf8");
+    assert.ok(host.includes(SECURITY_ERROR_RULE), "securityEditor.ts no longer hides .error this way");
+    assert.ok(host.includes(SECURITY_ERROR_ELEMENT), "securityEditor.ts no longer ships this error element");
+  });
+
+  test("Security Settings: an error that follows a refusal keeps the reason on the page", () => {
+    const p = security.load();
+    p.deliver(variant(STATE_OK, (c) => delete c.state.values.require_mfa));
+    p.deliver(ERROR_OK);
+    const shown = refusalShown(p);
+    assert.ok(shown.startsWith(REFUSAL) && shown.includes("values.require_mfa is missing"), shown);
+    assert.ok(shown.includes(CLI_ERROR), "the new error was dropped");
+    // The control: once a state renders, an error shows alone.
+    p.deliver(STATE_OK);
+    p.deliver(ERROR_OK);
+    assert.strictEqual(refusalShown(p), CLI_ERROR);
+  });
+
+  test("Security Settings: a switch name with markup in it reaches the refusal as text", () => {
+    // The refusal is built with textContent. A name that would be an element if it were parsed as
+    // HTML must arrive as characters, and must add no element to the page.
+    const key = '<img src=x onerror="window.pwned=1"><b id="planted">';
+    const p = page(
+      securityEditorScript(TOKEN, [{ key, label: "A switch", desc: "", type: "bool", group: "G" }]),
+      securityBody(""),
+    );
+    const doc = p.window.document;
+    // The control: with the switch present this form renders, so the refusal below is about its absence.
+    p.deliver({ command: "state", state: { values: { [key]: true }, defaults: { [key]: true } } });
+    assert.strictEqual(doc.getElementById("save").disabled, false, "the control state did not render");
+    assert.strictEqual(refusalShown(p), "", "the error element is showing before any refusal");
+    p.deliver({ command: "state", state: { values: {}, defaults: { [key]: true } } });
+    const error = doc.getElementById("error");
+    assert.ok(refusalShown(p).includes(`values.${key} is missing`), `shown: "${refusalShown(p)}"`);
+    assert.strictEqual(error.children.length, 0, "the switch name was parsed as markup");
+    assert.strictEqual(doc.getElementById("planted"), null);
+    assert.strictEqual(p.window.pwned, undefined);
+    assert.deepStrictEqual(p.errors.map(String), []);
+  });
+
+  test("Security Settings: Save posts nothing after a discard, and posts the form after a complete state", () => {
+    const p = security.load();
+    const doc = p.window.document;
+    const save = doc.getElementById("save");
+    p.deliver(variant(STATE_OK, (c) => delete c.state.values.serve_web_console));
+    save.click();
+    assert.strictEqual(p.posted.length, 0, "Save posted from a form no state had rendered");
+    // THE CONTROL: the complete recording renders, and Save sends one entry per switch. Only the
+    // switch that differs from its default (require_mfa) is an explicit set; the rest are removals.
+    p.deliver(STATE_OK);
+    assert.strictEqual(refusalShown(p), "");
+    save.click();
+    assert.strictEqual(p.posted.length, 1, "Save did not post after a complete state");
+    assert.strictEqual(p.posted[0].command, "save");
+    assert.deepStrictEqual(Object.keys(p.posted[0].updates).sort(), FIELDS.map((f) => f.key).sort());
+    const sets = Object.entries(p.posted[0].updates).filter(([, v]) => v !== null);
+    assert.deepStrictEqual(sets, [["require_mfa", false]]);
+    // A discard after that: Save is off again, and a click sends nothing more.
+    p.deliver(variant(STATE_OK, (c) => delete c.state.defaults.max_session_hours));
+    save.click();
+    assert.strictEqual(p.posted.length, 1, "Save posted from a stale form");
+  });
+
+  test("Security Settings: a key this form has no switch for, and a tristate that is set, still render", () => {
+    // Extra keys are never read, so they are never checked: the recording itself carries a dozen
+    // (enforcement, organization_domains, ...). This is also the control for the absent-switch
+    // cases: what they refuse is a MISSING switch, not any state that differs from the recording.
     for (const [why, change] of [
-      ["an absent int switch", (c: Payload) => { delete c.state.values.max_session_hours; delete c.state.defaults.max_session_hours; }],
-      ["an absent Yes/No switch", (c: Payload) => { delete c.state.values.serve_web_console; delete c.state.defaults.serve_web_console; }],
-      ["a switch with a value and no default", (c: Payload) => { delete c.state.defaults.listen_address; }],
       ["an unknown key of another type", (c: Payload) => { c.state.values.a_future_switch = { nested: [1] }; c.state.defaults.a_future_switch = 7; }],
       ["a tristate that is set", (c: Payload) => { c.state.values.production_instance = true; }],
+      ["no set and no loosenings, which the form does not read", (c: Payload) => { delete c.state.set; delete c.state.loosenings; }],
     ] as [string, (c: Payload) => void][]) {
       const p = security.load();
       p.deliver(variant(STATE_OK, change));
@@ -693,13 +862,18 @@ suite("webview receivers discard a malformed payload and render a well-formed on
         test(`${r.panel}: DISCARDS "${type}" when ${why}`, () => {
           assert.strictEqual(payload[r.key], type, `${why}: the discriminator must stay intact`);
           const p = r.load();
+          const shown = r.shownDiscard?.[type]?.(p);
           const before = p.snapshot();
           p.deliver(payload);
           // No-throw is half the discard: a receiver that crashed partway would also leave the page
           // alone, and would read here as a discard it is not. These two come BEFORE the console
           // check, so a switched-off discard fails on what the page did, not on a missing warning.
           assert.deepStrictEqual(p.errors.map(String), [], `${r.panel} "${type}", ${why}: the page threw`);
-          assert.strictEqual(p.snapshot(), before, `${r.panel} "${type}", ${why}: the page changed`);
+          if (shown) {
+            shown();
+          } else {
+            assert.strictEqual(p.snapshot(), before, `${r.panel} "${type}", ${why}: the page changed`);
+          }
           assert.ok(
             p.warnings.some((w) => w.includes(`MessageFoundry ${r.panel}: discarded a malformed "${type}"`)),
             `${r.panel} "${type}", ${why}: the discard was not named in the console`,
