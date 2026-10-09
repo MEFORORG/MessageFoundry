@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,7 +31,7 @@ from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.framing import MLLP_CODEC, STX_ETX_CODEC, FrameCodec
 from messagefoundry.parsing.x12.interchange import X12FrameReader
 from messagefoundry.transports import admission
-from messagefoundry.transports.admission import ListenerAdmission, RefusalLog
+from messagefoundry.transports.admission import FrameClock, ListenerAdmission, RefusalLog
 from messagefoundry.transports.base import SourceConnector
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import (
@@ -325,12 +326,13 @@ async def test_a_pipelined_sender_is_not_cut_off_by_the_frame_deadline(kind: str
     one complete frame at a time, is never dropped.
 
     The sender and the listener share one event loop, and the deadline is many gaps long, so only
-    a loop stall longer than ``deadline - gap`` can cut the feed. Sleeps only run long, so the
-    whole feed always outlasts the deadline, and a clock that never restarted would cut it.
+    a loop stall longer than ``deadline - gap`` can cut the feed. These are the margins of the
+    MLLP twin in tests/test_connection_event_emit.py. Sleeps only run long, so the whole feed
+    always outlasts the deadline, and a clock that never restarted would cut it.
     """
     events = _Events()
     received: list[bytes] = []
-    deadline, gap, writes = 2.0, 0.1, 23
+    deadline, gap, writes = 1.0, 0.03, 60
     assert writes * gap > deadline  # the feed must outlast the deadline in total
 
     async def handler(raw: bytes) -> str | None:
@@ -345,18 +347,40 @@ async def test_a_pipelined_sender_is_not_cut_off_by_the_frame_deadline(kind: str
         _reader, writer = await asyncio.open_connection("127.0.0.1", port)
         # Each write ends half way through the next frame, so a frame is always open between reads.
         half = len(frame) // 2
-        writer.write(frame[:half])
-        for _ in range(writes):
-            writer.write(frame[half:] + frame[:half])
+        # A drop surfaces as a short count below, which names the defect, not as a reset here.
+        with contextlib.suppress(OSError):
+            writer.write(frame[:half])
+            for _ in range(writes):
+                writer.write(frame[half:] + frame[:half])
+                await writer.drain()
+                await asyncio.sleep(gap)
+            writer.write(frame[half:])
             await writer.drain()
-            await asyncio.sleep(gap)
-        writer.write(frame[half:])
-        await writer.drain()
-        assert await _until(lambda: len(received) == writes + 1)
+        assert await _until(lambda: len(received) == writes + 1), (
+            f"{len(received)} of {writes + 1} frames arrived: the frame clock ran across frames"
+        )
         await _close(writer)
 
     await _run(source, body, handler)
     assert "frame_deadline" not in events.reasons("closed")
+
+
+def test_the_frame_clock_restarts_on_each_completed_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-frame restart on a fake clock, so no runner's speed can move it. It holds for every
+    listener that uses FrameClock; the socket test above shows the listeners do."""
+    now = 100.0
+    monkeypatch.setattr(admission, "time", SimpleNamespace(monotonic=lambda: now))
+    clock = FrameClock(transport="TCP", max_frame_seconds=1.0, receive_timeout=None)
+    clock.after_read(in_frame=True, decoded=0, trailer_only=False)
+    assert clock.opened_at == 100.0  # the first frame's first bytes start the clock
+    now = 100.8
+    clock.after_read(in_frame=True, decoded=1, trailer_only=False)
+    assert clock.opened_at == 100.8  # a frame completed and the next one opened: a fresh budget
+    now = 101.5
+    clock.after_read(in_frame=True, decoded=0, trailer_only=False)
+    assert clock.opened_at == 100.8  # still the same frame: its clock keeps running
+    clock.after_read(in_frame=False, decoded=1, trailer_only=False)
+    assert clock.opened_at is None  # the frame completed and none is open: no clock
 
 
 @pytest.mark.parametrize("kind", ["mllp", "tcp", "x12"])

@@ -278,10 +278,13 @@ def test_an_ack_over_the_frame_cap_is_refused_not_buffered(
     assert "MSH" not in captured.err
 
 
-#: How long the peer below trickles before it hangs up: ten times the sender's --timeout. So the
-#: test reads behavior, not speed. One overall deadline times out while bytes still arrive; a wait
-#: reset per read is still waiting at the hang-up, and sees a close instead of a TimeoutError.
-_TRICKLE_SECONDS = 10.0
+#: The --timeout the test passes, and how long its peer trickles before it hangs up. A wait reset
+#: per read is still waiting at the hang-up, so it sees a close instead of a TimeoutError.
+_TIMEOUT = 1.0
+_TRICKLE_SECONDS = 16 * _TIMEOUT
+#: The sender must give up well inside the trickle. Half of it is 8 s for a 1 s --timeout: a hosted
+#: Windows runner took 4.44 s in all, against an older bound of 4 s.
+_GAVE_UP_WITHIN = _TRICKLE_SECONDS / 2
 
 
 def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_path: Path) -> None:
@@ -312,9 +315,12 @@ def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_p
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
+    started = time.monotonic()
     try:
         with pytest.raises(TimeoutError):
-            _load().main([str(path), "--port", _port(listener), "--timeout", "1"])
+            _load().main([str(path), "--port", _port(listener), "--timeout", str(_TIMEOUT)])
     finally:
         done.set()
+    # The deadline follows --timeout: one that ignored it would outlast this bound.
+    assert time.monotonic() - started < _GAVE_UP_WITHIN
     thread.join(5)
