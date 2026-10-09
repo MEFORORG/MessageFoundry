@@ -8,7 +8,7 @@
   is `null` when the report is complete. A mistyped `MEFOR_<SECTION>_<KEY>` variable in the
   shell is one cause, and the reason names it and not its value. (`vault BACKLOG #2600`)
 - **`[backup].destination`, `[dr].seed_archive`, `[dr].seed_dir` and `[dr].restore_token` refuse
-  at least a `<scheme>://` URL, whatever the scheme, and the refusal quotes the scheme and no longer
+  a `<scheme>://` URL whose scheme has two or more characters, and the refusal quotes the scheme and no longer
   the URL.** A fixed list of
   seven cloud schemes let `sftp://` or `s3a://` load as a local path. A URL can carry a
   credential, and a load failure is printed to stderr, to a service log and now to

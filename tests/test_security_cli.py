@@ -311,7 +311,7 @@ def test_a_cloud_url_refusal_in_the_partial_reason_quotes_the_scheme_only(
     table: str, key: str, scheme: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A URL can carry a credential, and the reason prints each validator's message. The cloud-URL
-    refusals take any scheme, quote it, and never quote the URL (vault BACKLOG #2600)."""
+    refusals take any scheme of two or more characters, quote it, and never quote the URL (vault BACKLOG #2600)."""
     planted = "canary-canary-canary"
     toml = tmp_path / "mf.toml"
     toml.write_text(

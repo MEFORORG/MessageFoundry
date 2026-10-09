@@ -359,9 +359,8 @@ def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> 
     Each error keeps its location, type and message, and a known type keeps its ``ctx`` (a
     validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT ONLY. The message
     and ``ctx`` are written by the validator, and a validator that quotes the value it refused
-    still shows it there: at least the ``[api].trusted_proxies`` entry refusals do (the ``[backup]``
-    and ``[dr]`` URL refusals quote only the scheme since vault BACKLOG #2600, and
-    :func:`settings_error_detail` keeps the current list). None is meant to hold a secret, but a URL
+    still shows it there. :func:`settings_error_detail` keeps the list of those that do. None is
+    meant to hold a secret, but a URL
     can carry one, so a validator message must name the setting, never quote a secret value.
     """
     try:
@@ -6033,8 +6032,8 @@ _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 _URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]+://")
 
 
-def _cloud_scheme(value: str) -> str | None:
-    """The ``<scheme>://`` that ``value`` starts with, or ``None``. Any scheme: these settings take
+def _url_scheme(value: str) -> str | None:
+    """The ``<scheme>://`` that ``value`` starts with, or ``None``. Any scheme of two or more characters: these settings take
     a LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or ``s3a://`` load as
     a bogus local path (vault BACKLOG #2600).
 
@@ -6062,7 +6061,7 @@ class BackupSettings(_Section):
     # Opt-in master switch; a deployment with no [backup] is unaffected (no-op default).
     enabled: bool = False
     # Operator-set LOCAL or UNC destination path, e.g. "D:/mefor-backups" or r"\\nas\mefor\backups".
-    # REQUIRED (non-empty) when enabled. A cloud URL (s3://, https://, ...) is REJECTED — no cloud target.
+    # REQUIRED (non-empty) when enabled. A <scheme>:// URL (s3://, https://, sftp://, ...) is REJECTED.
     destination: str = ""
     # Daily local "HH:MM" at which the scheduled backup runs (reusing the RetentionSettings clock parser).
     # "" = on-demand only (the `messagefoundry backup` CLI), no scheduled pass.
@@ -6126,9 +6125,9 @@ class BackupSettings(_Section):
     @field_validator("destination")
     @classmethod
     def _no_cloud_destination(cls, value: str) -> str:
-        # No cloud target / no new egress surface (ADR 0049, owner-locked). Reject a cloud-URL destination
+        # No cloud target / no new egress surface (ADR 0049, owner-locked). Reject a URL destination
         # at config load rather than silently treating it as a (bogus) local path at 02:00.
-        scheme = _cloud_scheme(value)
+        scheme = _url_scheme(value)
         if scheme is not None:
             raise ValueError(
                 f"[backup].destination must be a LOCAL or UNC path, not a URL ({scheme}...); "
@@ -6210,12 +6209,12 @@ class DrSettings(_Section):
     takeover_timeout_seconds: float = 30.0
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
     # supplies the archive path in the POST /dr/activate request body instead (the runbook path),
-    # which needs seed_dir below. A cloud URL is rejected (the seed is local/UNC only, like the
+    # which needs seed_dir below. A URL is rejected (the seed is local/UNC only, like the
     # backup destination — no new egress).
     seed_archive: str = ""
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
-    # which is operator configuration and is not confined. Must be absolute. A cloud URL is
+    # which is operator configuration and is not confined. Must be absolute. A URL is
     # rejected, like seed_archive.
     seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
@@ -6225,7 +6224,7 @@ class DrSettings(_Section):
     # the #102 server-DB seed gate cross-checks it against the restored DB's OWN latest successful dr_backup
     # archive — a VINTAGE FLOOR a bare boolean attestation cannot give (a stale/wrong native restore's
     # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
-    # byte-unchanged and SQLite is a no-op. A cloud URL is rejected (local/UNC only, like seed_archive).
+    # byte-unchanged and SQLite is a no-op. A URL is rejected (local/UNC only, like seed_archive).
     restore_token: str = ""
 
     @field_validator("takeover_hook", "release_hook")
@@ -6249,7 +6248,7 @@ class DrSettings(_Section):
     @field_validator("seed_archive", "seed_dir")
     @classmethod
     def _no_cloud_seed(cls, value: str, info: ValidationInfo) -> str:
-        scheme = _cloud_scheme(value)
+        scheme = _url_scheme(value)
         if scheme is not None:
             raise ValueError(
                 f"[dr].{info.field_name} must be a LOCAL or UNC path, not a URL ({scheme}...); "
@@ -6266,7 +6265,7 @@ class DrSettings(_Section):
         # that will resolve it: a rooted path with no drive is relative on Windows.
         value = value.strip()
         if value and not os.path.isabs(value):
-            # The value is not quoted: a URL whose scheme _cloud_scheme missed could carry a
+            # The value is not quoted: a URL whose scheme _url_scheme missed could carry a
             # credential (vault BACKLOG #2600).
             raise ValueError("[dr].seed_dir must be an absolute path, or omitted")
         return value
@@ -6275,8 +6274,8 @@ class DrSettings(_Section):
     @classmethod
     def _no_cloud_restore_token(cls, value: str) -> str:
         # The restore-token is a DBA-placed local artifact on the DR box (BACKLOG #223, ADR 0102); like
-        # seed_archive it is LOCAL/UNC only — a cloud URL would imply new egress, which DR forbids.
-        scheme = _cloud_scheme(value)
+        # seed_archive it is LOCAL/UNC only — a URL would imply new egress, which DR forbids.
+        scheme = _url_scheme(value)
         if scheme is not None:
             raise ValueError(
                 f"[dr].restore_token must be a LOCAL or UNC path, not a URL ({scheme}...); "
@@ -7134,7 +7133,9 @@ def _env_secret_reference_names(data: Mapping[str, Any]) -> set[str]:
 
 
 def _near_env_name(section: str, key: str, model: type[BaseModel]) -> str | None:
-    """The variable an operator probably meant by ``MEFOR_<section>_<key>``, or ``None``.
+    """What an operator probably meant by ``MEFOR_<section>_<key>``, as the text after "did you
+    mean", or ``None``. Usually a variable name. For a key one string cannot fill
+    (:func:`_env_can_hold`), the ``[section].key`` to set in the file instead.
 
     Matched on the KEY part alone, as :func:`_near_field` matches a file key, so the shared
     ``MEFOR_<SECTION>_`` prefix cannot make two unrelated names look close.
@@ -7157,7 +7158,11 @@ def _near_env_name(section: str, key: str, model: type[BaseModel]) -> str | None
     near = difflib.get_close_matches(key, sorted({*fields, *gone, *spared}), n=1)
     if not near or near[0] in gone or near[0] in tables:
         return None
-    return f"{prefix}{near[0].upper()}"
+    if near[0] in fields and not _env_can_hold(model, near[0]):
+        # A list or dict with no one-string form (vault BACKLOG #2600): its variable would fail
+        # the load on its shape, so the hint names the file, as the unread-variable note does.
+        return f"[{section}].{near[0]}? It has no environment form; set it in the file"
+    return f"{prefix}{near[0].upper()}?"
 
 
 def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]) -> None:
@@ -7220,7 +7225,7 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
         if section == "logging" and key in _RENAMED_LOGGING_KEYS:
             continue
         near = _near_env_name(section, key, model)
-        offenders.append(_printable(name) + (f" (did you mean {near}?)" if near else ""))
+        offenders.append(_printable(name) + (f" (did you mean {near})" if near else ""))
     if offenders:
         raise ValueError(
             f"unrecognized environment variable(s): {', '.join(offenders)}. Each names a config "
@@ -9243,7 +9248,7 @@ def settings_error_detail(exc: Exception) -> str:
     refusals do, and several path and enum refusals. A URL can carry a credential, so a validator
     message must name the setting and never quote a secret value. The OIDC URL refusals quote no
     part of the URL for that reason, and since vault BACKLOG #2600 the ``[backup]`` and ``[dr]``
-    cloud-URL refusals quote only the scheme (:func:`_cloud_scheme`).
+    URL refusals quote only the scheme (:func:`_url_scheme`).
 
     THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
     is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is

@@ -99,6 +99,29 @@ def test_no_hint_is_given_when_the_nearest_key_is_one_the_environment_cannot_set
     assert "did you mean" not in message
 
 
+@pytest.mark.parametrize(
+    ("name", "meant"),
+    [
+        ("MEFOR_APPROVALS_OPERATION", "[approvals].operations"),  # a list with no splitter
+        ("MEFOR_ALERTS_RULE", "[alerts].rules"),  # a list of tables
+        ("MEFOR_AI_ALLOWED_ENDPOINT", "[ai].allowed_endpoints"),
+        ("MEFOR_API_TLS_CLIENT_CERT_IDENTITIE", "[api].tls_client_cert_identities"),  # a dict
+    ],
+)
+def test_the_refusal_points_a_key_one_string_cannot_fill_at_the_file(name: str, meant: str) -> None:
+    """The variable for such a key would fail the load on its shape, so the hint names the file
+    setting, as the unread-variable note does."""
+    message = _refusal({name: "x"})
+    assert f"did you mean {meant}? It has no environment form; set it in the file" in message
+    section, key = meant[1:].split("].")
+    assert f"MEFOR_{section.upper()}_{key.upper()}" not in message  # no variable is offered
+
+
+def test_the_refusal_still_offers_a_list_that_one_string_can_fill() -> None:
+    """The control: ``[alerts].email_to`` splits one comma-separated string."""
+    assert "did you mean MEFOR_ALERTS_EMAIL_TO?" in _refusal({"MEFOR_ALERTS_EMAIL_T": "a@b"})
+
+
 def test_every_offender_is_named_in_one_refusal() -> None:
     message = _refusal(
         {"MEFOR_STORE_PATHH": "a", "MEFOR_API_PORTT": "1", "MEFOR_STORE_PATH": "ok.db"}
@@ -280,10 +303,14 @@ def test_serve_logs_the_warnings_again_after_configure_logging() -> None:
     from messagefoundry import __main__ as cli
 
     source = inspect.getsource(cli._serve)
-    configured = source.index("configure_logging(")
+    # _start_logging runs configure_logging (passed to it as `configure`) and returns once the
+    # handlers are installed; the replay must follow the check of its result, not just its text.
+    started = source.index("_start_logging(")
+    assert "configure_logging(" in source[started:]
+    checked = source.index("if _logging_refused is not None:")
     replayed = source.index("unread_env_warnings(settings)")
-    assert configured < replayed
-    assert source.index("_load_service_settings(") < configured  # the control: the load is first
+    assert started < checked < replayed
+    assert source.index("_load_service_settings(") < started  # the control: the load is first
 
 
 def test_a_refusal_does_not_hide_the_warning(caplog: pytest.LogCaptureFixture) -> None:
