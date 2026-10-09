@@ -5055,8 +5055,8 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   that resolves to this host, and the fully qualified name on a host whose OS name is short. One
   form is refused although the collector is separate: a virtual address the routing table treats
   as local, such as a Kubernetes Service address under IPVS read from the node's own network
-  namespace. ADR 0200, Amendment A, records the reasoning and what to do; it is proposed, and not
-  yet ruled on by the owner.
+  namespace. ADR 0200, Amendment A, records the reasoning and what to do; the owner accepted it
+  as built on 2026-10-08.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
 committed audit row ships as metadata, with only best-effort PHI redaction
