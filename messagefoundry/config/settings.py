@@ -25,8 +25,9 @@ section has an env layer and whose key that section does not define. It is narro
 documented ``MEFOR_*`` variables are read straight from ``os.environ`` by their consuming module
 and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED``
 and siblings); those are spared by name. A variable whose SECTION part matches no section with
-an env layer is refused when it names a modelled section and is dropped silently when it names
-none. The ``cli`` mapping is not checked: its keys are engine-written
+an env layer is refused when it names a modelled section. When it names none it is not applied:
+:func:`_unread_env_notes` logs a WARNING for at least some such names, and the rest are dropped
+with no message. The ``cli`` mapping is not checked: its keys are engine-written
 from parsed arguments, never operator-spelled, and an operator's unknown flag never reaches them,
 because argparse refuses it first with exit 2. ``[security]`` has its own refusal from env (the
 arm inside :func:`_desugar_security`). Anything stated to an operator about these refusals must
@@ -49,8 +50,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from types import UnionType
-from typing import Any, Literal, Union, get_args, get_origin
+from typing import Any, Literal, get_args, get_origin
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -6015,8 +6015,8 @@ class ApprovalsSettings(_Section):
 #: what the copy still costs is stated once, on ``MessageStore.snapshot_to``.
 _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 
-#: Cloud-URL schemes the destination must NEVER be (ADR 0049 — local/UNC only, no new egress surface).
-#: ``<scheme>://`` at the start of a value. Two characters at least, so a drive letter
+#: ``<scheme>://`` at the start of a value: a URL, which the backup and DR path settings never take
+#: (ADR 0049, local/UNC only, no new egress surface). Two characters at least, so a drive letter
 #: (``C://backups``) is still a path.
 _URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]+://")
 
@@ -6119,7 +6119,7 @@ class BackupSettings(_Section):
         scheme = _cloud_scheme(value)
         if scheme is not None:
             raise ValueError(
-                f"[backup].destination must be a LOCAL or UNC path, not a cloud URL ({scheme}...); "
+                f"[backup].destination must be a LOCAL or UNC path, not a URL ({scheme}...); "
                 "MessageFoundry DR backups have no cloud target (ADR 0049 — no new egress)"
             )
         return value
@@ -6240,7 +6240,7 @@ class DrSettings(_Section):
         scheme = _cloud_scheme(value)
         if scheme is not None:
             raise ValueError(
-                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a cloud URL ({scheme}...); "
+                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a URL ({scheme}...); "
                 "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
             )
         return value
@@ -6267,7 +6267,7 @@ class DrSettings(_Section):
         scheme = _cloud_scheme(value)
         if scheme is not None:
             raise ValueError(
-                f"[dr].restore_token must be a LOCAL or UNC path, not a cloud URL ({scheme}...); "
+                f"[dr].restore_token must be a LOCAL or UNC path, not a URL ({scheme}...); "
                 "the DR restore-token is a local artifact on the DR box (ADR 0102 — no new egress)"
             )
         return value
@@ -7234,21 +7234,21 @@ def _unspared_env_names(
             yield name, name[len(_ENV_PREFIX) :].lower()
 
 
-#: Container types the env layer cannot fill: it hands every field one string.
-_NOT_FROM_ONE_STRING = (list, dict, tuple, set, frozenset)
+def _holds_model(annotation: Any) -> bool:
+    """Whether ``annotation`` is a settings model or has one inside it (``list[AlertRule]``,
+    ``SubTable | None``)."""
+    base = get_origin(annotation) or annotation
+    if isinstance(base, type) and issubclass(base, BaseModel):
+        return True
+    return any(_holds_model(arg) for arg in get_args(annotation))
 
 
 def _env_can_hold(field: Any) -> bool:
-    """Whether the one string the env layer gives ``field`` can validate: not a sub-table
-    (``[cluster].vip``) and not a container (``[alerts].rules``), alone or in a union with
-    ``None``. A hint naming such a field would point at a variable that fails the load."""
-    annotation = field.annotation
-    members = [a for a in get_args(annotation) if a is not type(None)]
-    for member in members if get_origin(annotation) in (Union, UnionType) else [annotation]:
-        base = get_origin(member) or member
-        if base in _NOT_FROM_ONE_STRING or (isinstance(base, type) and issubclass(base, BaseModel)):
-            return False
-    return True
+    """Whether the one string the env layer gives ``field`` can validate. Not when the field is or
+    holds a model: a sub-table (``[cluster].vip``) or a list of tables (``[alerts].rules``). A hint
+    naming such a field would point at a variable that fails the load. A list of strings stays
+    a hint: several are filled from one comma-separated string (``[alerts].email_to``)."""
+    return not _holds_model(field.annotation)
 
 
 def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:

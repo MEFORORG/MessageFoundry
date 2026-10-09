@@ -159,6 +159,9 @@ def test_a_name_that_names_no_modelled_section_is_not_refused(name: str) -> None
         ("MEFOR_SECURTY_REQUIRE_MFA", "did you mean MEFOR_SECURITY_REQUIRE_MFA?"),
         ("MEFOR_SECRET_PROVIDER", "did you mean MEFOR_SECRETS_PROVIDER?"),
         ("MEFOR_STOER_VAULT_ADDR", "did you mean MEFOR_STORE_VAULT_ADDR?"),  # a spared name
+        # A list of strings, filled from one comma-separated string: still a hint.
+        ("MEFOR_ALERT_EMAIL_TO", "did you mean MEFOR_ALERTS_EMAIL_TO?"),
+        ("MEFOR_SECURTY_ALLOWED_CLIENT_NETWORKS", "MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS?"),
         ("MEFOR_CERT_MONITR_WARN_DAYS", "[cert_monitor].warn_days"),  # a file-only section
         (
             "MEFOR_STORE",
@@ -192,7 +195,7 @@ def test_a_name_that_looks_like_an_unread_setting_is_warned_about(name: str, hin
         # Near [cluster], and vip is a sub-table there. MEFOR_CLUSTER_VIP would fail validation,
         # so it is not offered.
         "MEFOR_CLUSTR_VIP",
-        # Near [alerts], and rules is a list: one string cannot fill it.
+        # Near [alerts], and rules is a list of tables: one string cannot fill it.
         "MEFOR_ALERT_RULES",
         # Near [auth] and [api], and each key moved to [security]: that spelling is refused.
         "MEFOR_AUHT_REQUIRE_MFA",

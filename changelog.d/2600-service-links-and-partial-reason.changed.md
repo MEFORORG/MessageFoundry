@@ -15,7 +15,8 @@
   either. A drive letter (`C://`) and a UNC path are still paths. (`vault BACKLOG #2600`)
 - **`serve` logs the unread-`MEFOR_*`-variable warnings again once logging is configured,** so
   they reach the log file and the off-box forwarder, not only stderr. Every command now logs them
-  before any settings refusal, so one refused key does not hide a mistyped variable.
+  before the key and value refusals, so one refused key does not hide a mistyped variable. A
+  missing, unreadable or malformed settings file still stops the load before they are logged.
   (`vault BACKLOG #2600`)
 - **On Windows, a secret reference written in another letter case still spares its variable.**
   Under `[secrets].provider = "env"` the unknown-variable refusal compares the two names as the

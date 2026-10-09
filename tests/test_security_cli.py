@@ -321,7 +321,7 @@ def test_a_cloud_url_refusal_in_the_partial_reason_quotes_the_scheme_only(
     data = _show(toml, capsys)
     assert data["loosenings_partial"] is True
     reason = data["loosenings_partial_reason"]
-    assert f"{table}.{key}" in reason and f"not a cloud URL ({scheme}://...)" in reason
+    assert f"{table}.{key}" in reason and f"not a URL ({scheme}://...)" in reason
     assert planted not in json.dumps(data) and "SYNTHTOKEN" not in json.dumps(data)
 
 
