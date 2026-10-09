@@ -381,8 +381,8 @@ from typing import Any
 #: bump. Re-derived on the tree merged with BACKLOG #2337, and again on the tree merged with vault
 #: BACKLOG #3259 / #3260, which did not move it. The value below covers all three.
 #:
-#: Vault BACKLOG #2289: ``api.security.client_ip`` takes starlette's ``HTTPConnection``, where it
-#: took ``Request | WebSocket``, so the raw-ASGI network gate can pass ``HTTPConnection(scope)``. The
+#: BACKLOG #2289: ``api.security.client_ip`` takes starlette's ``HTTPConnection``, where it took
+#: ``Request | WebSocket``, so the raw-ASGI network gate can build one from its scope. The
 #: console imports ``client_ip`` and calls it with a ``Request`` or a ``WebSocket``, which both
 #: still fit, so no console call changed. The digest moved because a signature on the discovered
 #: surface did. Re-derived on the tree merged with BACKLOG #2612, so the value below covers both.

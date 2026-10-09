@@ -509,8 +509,8 @@ def client_ip(conn: HTTPConnection) -> str | None:
     ``scope["client"]`` on both planes, so this is the same read on both planes rather than two
     reads that agree today. The parameter is ``conn`` rather than
     ``request`` for the same reason, matching ``_auth.session_cookie_name``. It is typed as that base
-    class so the raw-ASGI network gate, which holds a scope and no Request, can pass
-    ``HTTPConnection(scope)`` rather than read the scope a second way (BACKLOG #2289).
+    class so the raw-ASGI network gate, which holds a scope and no Request, can build
+    one from that scope rather than read the scope a second way (BACKLOG #2289).
 
     Behind a declared trusted proxy this already resolves to the real client:
     uvicorn runs with ``forwarded_allow_ips = settings.api.trusted_proxies`` (``__main__.py``;
