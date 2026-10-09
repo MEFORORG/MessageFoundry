@@ -294,14 +294,17 @@ in-flight rows stranded.
 > **The rule.** A box with `[dr].enabled = true` that is not activated parks every deployed outbound, of
 > any tier, at start and after `POST /dr/release`. Each reads `status: "filtered"`. It is parked the way
 > the run-profile parks a lane below the threshold: no connector is built, and its rows are held PENDING,
-> never claimed, charged an attempt or dead-lettered for being parked. Delivery from a DR box therefore
-> always follows an operator's `POST /dr/activate`. The activation's reload builds the lanes at or above
-> the threshold, and each held row is delivered once, in the order it was queued. A reload on a passive box
+> never claimed, charged an attempt or dead-lettered for being parked. A box that starts passive therefore
+> delivers only after an operator's `POST /dr/activate`. A box started with `[dr].activate = true` is
+> active from its start, and delivers as the run-profile allows. The activation's reload builds the lanes
+> at or above the threshold, and the held rows are delivered in the order they were queued. Delivery is
+> at-least-once, as everywhere in the engine, so a retry can repeat a row. A reload on a passive box
 > reads the CA file of the outbounds an activation would build, as it judges the listeners one would bind.
 >
 > **The release.** The drain runs as before, with the lanes at or above the threshold delivering. When it
-> ends, the release parks every outbound, without waiting for a reload. The park is cooperative, so a row
-> already in flight still completes. This supersedes two sentences above: Decision 3's *"A lane the engine
+> ends, the release parks every outbound, without waiting for a reload, and closes their connectors. The
+> park is cooperative, so a row already in flight is not cut off by it; a send the close interrupts is
+> retried after the next activation. A lane an operator-required STOP holds is left as it is. This supersedes two sentences above: Decision 3's *"A lane the engine
 > parked then comes up"* on the first reload after a release, and the #3140 amendment's restatement of
 > it. A released box cannot tell a row it accepted while active from a row the seed carried, and the
 > primary is back by then, so that reload was the same defect by another route. Rows left on a released

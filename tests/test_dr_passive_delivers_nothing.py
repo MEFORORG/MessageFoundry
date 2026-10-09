@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.settings import DrSettings
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import DrParkedError
 from messagefoundry.store import MessageStore, Store
@@ -154,8 +155,12 @@ async def _all_at_outbound(engine: Engine, crit: int, norm: int) -> None:
     await _until(there)
 
 
+async def _refuse_the_reload(*_args: object) -> list[tuple[str, str]]:
+    raise WiringError("a trust anchor this graph names is not readable")
+
+
 async def test_a_passive_standby_delivers_nothing_until_it_is_activated(
-    tmp_path: Path, sent: Sent, claim_mode: str
+    tmp_path: Path, sent: Sent, claim_mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Red before #3262: the passive box delivered every restored row as soon as it started."""
     cfg = await _seeded(tmp_path, sent)
@@ -176,6 +181,17 @@ async def test_a_passive_standby_delivers_nothing_until_it_is_activated(
         # A reload's CA gate reads the outbounds an activation would build, and no other.
         gated = rr._reload_anchor_lanes(rr.registry, rr.registry, [])
         assert [name for _kind, name, _settings in gated] == [_OB_CRIT]
+        # The door holds without the marker the scheduler reads first.
+        marker = rr._filtered.pop(("outbound", _OB_CRIT))
+        with pytest.raises(DrParkedError, match="POST /dr/activate"):
+            await rr.start_outbound(_OB_CRIT)
+        rr._filtered[("outbound", _OB_CRIT)] = marker
+        # A reload refused before it reconciles the outbounds leaves every lane marked.
+        with monkeypatch.context() as patched:
+            patched.setattr(rr, "_check_reload_lane_anchors", _refuse_the_reload)
+            with pytest.raises(WiringError):
+                await rr.reload()
+        assert set(rr.filtered_outbound()) == {_OB_CRIT, _OB_NORM}
         # A reload while passive keeps every lane parked.
         await engine.reload_detail(cfg)
         await asyncio.sleep(_SETTLE_SECONDS)
@@ -208,6 +224,7 @@ async def test_a_release_stops_delivery_again_until_the_next_activation(
         # Parked at once, before any reload: the release returns with nothing delivering.
         assert set(rr.filtered_outbound()) == {_OB_CRIT, _OB_NORM}
         assert not rr.outbound_running(_OB_CRIT)
+        assert _OB_CRIT not in rr._destinations  # and no session is held open to the partner
         del sent[:]
 
         await _enqueue(engine.store, "S5")

@@ -500,6 +500,8 @@ async def test_an_operator_pause_survives_a_release_and_the_next_activation(
         channel_id=_CRIT, raw=ADT, deliveries=[("OB_CRIT_ADT", ADT)], now=time.time()
     )
     await engine.reload_detail(box.tiered)
+    # An alert rule's restart is refused like any door, and must not make the pause the engine's.
+    await _alert_control_action(engine, "restart_outbound", "OB_CRIT_ADT", default_target=False)
     assert rr.outbound_filtered("OB_CRIT_ADT") is not None  # passive: parked with the rest
     assert "OB_CRIT_ADT" not in rr._gate_parked  # and still not the engine's to lift
 

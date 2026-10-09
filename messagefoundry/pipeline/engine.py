@@ -973,6 +973,7 @@ class Engine:
             rr.restore_dr_intake(before)
             raise
         self._set_dr_active(False)
+        await rr.close_passive_connectors()  # a passive box holds no partner session open
         return {"depth_left": depth, "drained": depth <= held, "held_on_parked_outbounds": held}
 
     async def _drain_pipeline(

@@ -2662,13 +2662,30 @@ class RegistryRunner:
 
         It is synchronous, so every flip to passive parks, including the rollback of a failed
         activation, which runs in an ``except`` block. A parked lane's connector is therefore
-        left open here, and the next reload closes it."""
+        left open here. A release closes them next (:meth:`close_passive_connectors`), and so
+        does any reload.
+
+        A reload on a passive box calls it too, straight after it clears the markers. So a
+        reload that is refused or cancelled before it reconciles the outbounds leaves each one
+        marked, and the scheduler and the doors still read the park."""
         for name in {*self.registry.outbound, *self._destinations}:
             oc = self.registry.outbound.get(name)
             if oc is not None and not oc.deployed:
                 continue
             if self._dr_filters_out(name, oc.priority if oc else None, kind="outbound"):
                 self._dr_park_outbound(name, live=self._outbound_lane_live(name))
+
+    async def close_passive_connectors(self) -> None:
+        """Close the connector of every outbound a passive standby parks (vault BACKLOG #3262).
+        The engine calls it when a release has made the box passive, so the released box holds
+        no session open to a partner the primary must reach. A lane the next activation starts
+        builds a new one. A row still in flight on a lane fails that send and is retried, as
+        when a reload replaces a connector."""
+        async with self._reload_lock:
+            if not self._dr_passive:
+                return
+            for name in [n for n in self._destinations if self._dr_parked(n)]:
+                await self._aclose_quietly(self._destinations.pop(name), name)
 
     def _rewrite_inbound_parks(self, held: frozenset[str] = frozenset()) -> None:
         """Write every inbound DR marker again under the current thresholds (vault BACKLOG #3140).
@@ -3150,6 +3167,8 @@ class RegistryRunner:
         """Raise :class:`DrParkedError` if the DR run-profile parks outbound ``name``. Asked by every
         door that would change a parked lane's run state; the error's docstring says why."""
         reason = self._filtered.get(("outbound", name))
+        if reason is None and self._dr_passive and self._deployed(name, "outbound"):
+            reason = _DR_PASSIVE_REASON  # the door holds on a passive box without its marker
         if reason is not None:
             # Read from the marker, not the box's state now: an activation's reload has not yet
             # re-judged a lane that still holds the passive park (vault BACKLOG #3262).
@@ -3180,8 +3199,12 @@ class RegistryRunner:
         A ``live`` lane may have a row in flight, so it is paused the cooperative way
         (:meth:`_stop_outbound_unsafe`), which reads quiesced only once that row resolves, and then
         marked as an engine park. A lane never started has nothing in flight and takes
-        :meth:`_park_outbound_lane`, which reads quiesced at once."""
-        if name in self._outbound_paused:
+        :meth:`_park_outbound_lane`, which reads quiesced at once.
+
+        A lane an operator-required STOP holds is left alone too (vault BACKLOG #3262). It
+        delivers nothing as it is, and an engine park would have the next reload that lifts the
+        park re-arm it, which only an operator may do (:meth:`_schedule_holds`)."""
+        if name in self._outbound_paused or ("outbound", name) in self._stop_held:
             return
         if live:
             self._stop_outbound_unsafe(name)
@@ -6274,8 +6297,12 @@ class RegistryRunner:
                 # With the profile off the threshold parks no outbound. The loops below drop a
                 # marker only for a connection that passes the earlier gates, so one left down by
                 # auto_start or deployed would otherwise read "filtered" for good (vault BACKLOG
-                # #3067). A passive standby's markers, inbound and outbound, are written again below.
+                # #3067). A passive standby's inbound markers are written again below. Its
+                # outbound markers are written again here, with no await since the clear, so a
+                # reload that stops before the reconcile leaves them in place (vault BACKLOG #3262).
                 self._filtered.clear()
+                if self._dr_passive and self._running:
+                    self._park_outbounds_while_passive()
             if not self._running:
                 self.registry = new_registry
                 return
