@@ -55,7 +55,7 @@ from pathlib import Path
 
 from messagefoundry.childenv import engine_environment, python_child_argv
 from messagefoundry.config.settings import StoreBackend
-from messagefoundry.config.wiring import load_config
+from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _config_preflight
 from messagefoundry.pipeline.sharding import require_unified_store, shard_ids
@@ -166,12 +166,18 @@ def discover_shard_specs(
     project_root: str | None = None,
     extra_serve_args: Sequence[str] = (),
     python_executable: str | None = None,
+    registry_guard: Callable[[Registry], None] | None = None,
 ) -> list[ShardSpec]:
     """Load the config, discover its shard ids, and build a :class:`ShardSpec` per shard.
 
     Raises ``WiringError``/``FileNotFoundError`` from :func:`load_config` if the config is invalid,
     and ``ValueError`` if the graph declares no inbound connections (nothing to supervise), or if a
     ``>1``-shard config is on SQLite (the no-split-store guard — see :func:`require_unified_store`).
+
+    ``registry_guard`` is called with the whole graph after those checks, and refuses it by raising
+    ``WiringError``. It is for a refusal each engine shard would make of that same graph, so the
+    fleet refuses once instead of restarting engine shards that cannot start (vault BACKLOG
+    #2368).
     """
     registry = load_config(config)
     ids = shard_ids(registry)
@@ -182,6 +188,8 @@ def discover_shard_specs(
     # No-split-store guard (ADR 0063): >1 shard on SQLite would fan the message store into one file per
     # shard. Refuse it here — a sharded deployment must share ONE unified server-DB store.
     require_unified_store(store_backend, ids)
+    if registry_guard is not None:
+        registry_guard(registry)
     return build_shard_specs(
         ids,
         config=config,
@@ -516,12 +524,14 @@ async def supervise(
     project_root: str | None = None,
     extra_serve_args: Sequence[str] = (),
     install_signal_handlers: bool = True,
+    registry_guard: Callable[[Registry], None] | None = None,
 ) -> int:
     """Discover shards from ``config`` and run a :class:`Supervisor` until interrupted.
 
     Installs SIGINT/SIGTERM handlers (when ``install_signal_handlers``) that trigger a clean drain.
     Runs while any engine shard is alive. Returns 0 on a clean shutdown, 1 when every engine shard
-    tripped the crash-loop breaker, and 2 on a config/discovery error.
+    tripped the crash-loop breaker, and 2 on a config/discovery error, which includes a graph
+    ``registry_guard`` refuses (:func:`discover_shard_specs`).
     """
     from messagefoundry.config.wiring import WiringError
 
@@ -535,6 +545,7 @@ async def supervise(
             service_config=service_config,
             project_root=project_root,
             extra_serve_args=extra_serve_args,
+            registry_guard=registry_guard,
         )
     except (WiringError, FileNotFoundError, ValueError) as exc:
         logger.error("supervise: %s", exc)

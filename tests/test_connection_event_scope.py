@@ -219,7 +219,7 @@ async def test_scoped_operator_topology_and_events_are_filtered(engine: Engine) 
         }
 
         # /events: only IB_A's inbound events (no IB_B, no outbound OB_X)
-        events = (await c.get("/events", headers=h)).json()
+        events = (await c.get("/events", headers=h)).json()["events"]
         assert {e["connection"] for e in events} == {"IB_A"}
         assert all(e["direction"] == "inbound" for e in events)
 
@@ -250,7 +250,7 @@ async def test_event_info_carries_no_phi_field(engine: Engine) -> None:
     )
     async with _client(engine, service) as c:
         h = await _login(c, "op")
-        events = (await c.get("/events", headers=h)).json()
+        events = (await c.get("/events", headers=h)).json()["events"]
         assert events, "expected at least the IB_A inbound events"
         # The metadata-only shape: no body/summary/raw field can leak via this surface.
         assert set(events[0]) == {
@@ -268,7 +268,9 @@ async def test_event_info_carries_no_phi_field(engine: Engine) -> None:
         # BACKLOG #2443: a bare load masks the reason whole for a view_summary holder; the
         # per-event reveal returns the stored, safe_text-scrubbed value, never a message body.
         assert closed["reason"] == "****"
-        revealed = (await c.get("/events", params={"reveal": closed["id"]}, headers=h)).json()
+        revealed = (await c.get("/events", params={"reveal": closed["id"]}, headers=h)).json()[
+            "events"
+        ]
         assert next(e for e in revealed if e["id"] == closed["id"])["reason"] == "eof"
 
 
@@ -282,7 +284,7 @@ async def test_all_channels_operator_sees_full_estate(engine: Engine) -> None:
         h = await _login(c, "op")
         chans = (await c.get("/channels", headers=h)).json()
         assert {ch["id"] for ch in chans} == {"IB_A", "IB_B"}
-        events = (await c.get("/events", headers=h)).json()
+        events = (await c.get("/events", headers=h)).json()["events"]
         assert {e["connection"] for e in events} == {"IB_A", "IB_B", "OB_X"}
         # out-of-scope routes are unrestricted for an unscoped caller
         assert (await c.get("/events", params={"connection": "IB_B"}, headers=h)).status_code == 200

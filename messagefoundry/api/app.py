@@ -63,6 +63,7 @@ from fastapi import (
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.telemetry import TelemetryConfig
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -131,6 +132,7 @@ from messagefoundry.api.models import (
     ClusterStepdownResult,
     ConfigProvenance,
     ConnectionEventInfo,
+    ConnectionEventList,
     ConnectionFlagRequest,
     ConnectionMetadata,
     ConnectionRow,
@@ -155,6 +157,7 @@ from messagefoundry.api.models import (
     Health,
     IntegrityResult,
     InterpreterView,
+    LogForwarderInfo,
     LogInfo,
     LogLevelInfo,
     LogLevelUpdate,
@@ -197,6 +200,7 @@ from messagefoundry.api.models import (
     StatsResponse,
     StorePrivilegeView,
     SystemStatus,
+    TransitBoundAttestationView,
     UpdateInfo,
     UploadDeleteResult,
     UploadedFileInfo,
@@ -213,10 +217,10 @@ from messagefoundry.api.multipart import (
     parse_single_file_upload,
 )
 from messagefoundry.api.outlive import OutlivingOperations
+from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
-    _allow_no_auth,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -226,6 +230,7 @@ from messagefoundry.api.security import (
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
     get_auth,
+    open_mode,
     optional_identity,
     pending_credential_deadline,
     public_route,
@@ -246,6 +251,7 @@ from messagefoundry.api.tls import GeneratedPairReplaced, record_generated_pair_
 from messagefoundry.api.validation import (
     MAX_EVENT_KINDS,
     MAX_EXPORT_IDS,
+    PAGE_BIND_MAX,
     ConnectionName,
     ControlIdFilter,
     DigestId,
@@ -357,6 +363,7 @@ from messagefoundry.config.wiring import (
     expiry_relaxed_hops,
     hostname_unchecked_hops,
     load_config,
+    path_form_fhir_updates,
     query_credential_hops,
     redacted_settings,
     revocation_attested_hops,
@@ -370,6 +377,7 @@ from messagefoundry.logging_setup import (
     LOG_LEVELS,
     LogLevelRefused,
     current_log_level,
+    forwarder_status,
     level_refused_on_production,
     set_runtime_level,
 )
@@ -394,6 +402,10 @@ from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
+from messagefoundry.pipeline.security_signals import (
+    SecuritySignalThresholds,
+    install_security_signals,
+)
 from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
@@ -418,14 +430,20 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
+from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
+    MessageOrigin,
     OperatorAudit,
     ReingressOutcome,
     ResendOutcome,
+)
+from messagefoundry.store.transit_attestation import (
+    read_transit_bound_attestation,
+    transit_bound_gap,
 )
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
@@ -683,6 +701,30 @@ def _log_sink_health() -> list[LogSinkInfo]:
     ]
 
 
+def _log_forwarder_health() -> LogForwarderInfo | None:
+    """The off-box log forwarder's health for ``GET /status`` (BACKLOG #2612), or ``None`` when no
+    forwarder is configured. In-memory only, like :func:`_log_sink_health`."""
+    status = forwarder_status()
+    if not status.configured:
+        return None
+    return LogForwarderInfo(
+        state=status.state,
+        installed=status.installed,
+        delivery_confirmed=status.delivery_confirmed,
+        start_failure=status.start_failure or None,
+        send_failing=status.send_failing,
+        lost=status.lost,
+        queued=status.queued,
+        queue_dropped=status.queue_dropped,
+        unsent=status.unsent,
+        undeliverable=status.undeliverable,
+        spool_dropped=status.spool_dropped,
+        spool_skipped=status.spool_skipped,
+        spool_read_errors=status.spool_read_errors,
+        spool_read_faulted=status.spool_read_faulted,
+    )
+
+
 def _read_log_tail(
     log_dir: str | None, *, limit: int, offset: int, audit_copies: bool = True
 ) -> tuple[list[str], int, bool]:
@@ -777,16 +819,53 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
     return identity.can_access_channel(channel_id)
 
 
-async def _alert_control_action(engine: Engine, action: str, target: str) -> None:
+#: Which namespace each alert control action restarts (BACKLOG #2528).
+_CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
+
+
+async def _alert_control_action(
+    engine: Engine, action: str, target: str, *, default_target: bool
+) -> None:
     """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
 
     Re-reads ``engine.registry_runner`` on each call, so it stays right across a reload that swaps
     the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067); that
     is the rule working as designed, not a failure, so it is logged once here at INFO and nothing
-    else happens. Any other error reaches the notifier, which logs it and never raises."""
+    else happens. Any other error reaches the notifier, which logs it and never raises.
+
+    ``default_target`` means the rule set no ``control_target``, so ``target`` is the event's own
+    bare name, and the event does not say whether that name is an inbound or an outbound. The two
+    are separate namespaces (BACKLOG #2528). So the restart runs only when the name is declared on
+    the action's side and not on the other: then the event can only have come from that side. A
+    name declared on both sides, or only on the other, is skipped with a WARNING that says to set
+    ``control_target``. A config-load refusal cannot do this, because a rule does not know the
+    graph and a reload can change it."""
     rr = engine.registry_runner
     if rr is None:
         return
+    if default_target:
+        wanted = _CONTROL_ACTION_SIDE.get(action)
+        if wanted is None:
+            _log.warning("alert control_action %s for %r skipped: unknown action", action, target)
+            return
+        sides = {
+            side
+            for side, declared in (
+                ("inbound", target in rr.registry.inbound),
+                # A reload-dropped outbound still draining is an outbound too (#2528 review).
+                ("outbound", rr.knows_outbound(target)),
+            )
+            if declared
+        }
+        if sides != {wanted}:
+            _log.warning(
+                "alert control_action %s for %r skipped: the rule sets no control_target and the "
+                "name is not declared as an %s connection only; set control_target",
+                action,
+                target,
+                wanted,
+            )
+            return
     if action == "restart_inbound":
         if rr.inbound_filtered(target) is not None:
             # An operator start of a parked inbound overrides the profile; a rule is the engine,
@@ -1175,6 +1254,12 @@ def _posture_loosenings(
     # resolved settings serve stashed, the #1989 object; an app built without them (the
     # embedding/test path) reports the shipped [api] defaults, which acknowledge nothing.
     api_settings = cred_settings.api if cred_settings is not None else ApiSettings()
+    # Vault BACKLOG #2385: the docs routes are built from create_app's own argument, not from
+    # [api]. So what THIS app serves is read off the app, as allow_no_auth is below, and it wins
+    # in both directions over a stashed [api] value the app was not built with.
+    serves_docs = getattr(state, "expose_docs", None)
+    if serves_docs is not None and serves_docs != api_settings.expose_docs:
+        api_settings = api_settings.model_copy(update={"expose_docs": serves_docs})
     # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
     # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
     # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
@@ -1192,10 +1277,13 @@ def _posture_loosenings(
         db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
         attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
         revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
+        # Vault BACKLOG #2571. This reader returns plain names already.
+        path_form_hops = path_form_fhir_updates(runner.registry)
     else:
         cleartext_hops, expired_hops, hostname_hops, db_hops = [], [], [], []
         query_hops = []
         attested_hops, revocation_hops = [], []
+        path_form_hops = []
     loosenings_scope = (
         None
         if runner is not None
@@ -1203,7 +1291,8 @@ def _posture_loosenings(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-            "tls_revocation_attested declarations are NOT included (see `messagefoundry check`)"
+            "tls_revocation_attested / FHIR update_url_form declarations are NOT included "
+            "(see `messagefoundry check`)"
         )
     )
     pairs = list(
@@ -1220,9 +1309,19 @@ def _posture_loosenings(
             unverified_db_hops=db_hops,
             attested_hops=attested_hops,
             revocation_attested_hops=revocation_hops,
+            path_form_fhir_hops=path_form_hops,
             api=api_settings,
             # BACKLOG #2489: the dual-control dwell and expiry, read off the gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),
+            # BACKLOG #2227: a short or zero warn_days is named. The managed lifespan stashes the
+            # live section. An app built without it (an embedding, or a test) is read at the
+            # shipped default, the stash-or-default rule [secret_rotation] follows above. KNOWN
+            # GAP: such an engine may run no cert monitor at all, and this then reads it as on.
+            cert_monitor=getattr(state, "cert_monitor_settings", None) or CertMonitorSettings(),
+            # Vault BACKLOG #2302: the cleartext-archive escape, off the [backup] section the
+            # managed lifespan stashed. The same stash-or-default rule: an app built without it
+            # is read at the shipped default, which names nothing.
+            backup=getattr(state, "backup_settings", None) or BackupSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -1231,9 +1330,9 @@ def _posture_loosenings(
         )
     )
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
-    # cannot see it. The same two reads the request-time gates make decide it: no service, and
-    # the flag. A service beside the flag still requires sign-in, so it reports nothing.
-    if getattr(state, "auth", None) is None and _allow_no_auth(state):
+    # cannot see it. The check the request-time gates make decides it: no service, and the flag.
+    # A service beside the flag still requires sign-in, so no entry is added for it.
+    if open_mode(state):
         pairs.append(
             (
                 "allow_no_auth",
@@ -2591,6 +2690,26 @@ class _SummaryAuditCoalescer:
         )
 
 
+# fastapi 0.142 ships OpenTelemetry telemetry that is on by default. Left on, it would read
+# OTEL_EXPORTER_OTLP_* before lifespan startup and install its own OTLP exporters whenever the
+# SDK is importable (the [otel] extra installs it). Its logs carry unhandled-exception messages and
+# stack traces, and it hands any log processor the request's validation errors with their original
+# input values; here either can be PHI. That would send data off the host with no reviewed
+# [api] setting behind it (CLAUDE.md section 9). Every switch is off, not only auto_configure: with
+# auto_configure alone, any provider another component configures globally would still receive
+# fastapi's spans, request metrics and validation logs, and fastapi would still parse inbound trace
+# headers through the global propagators. The engine's own optional OTLP metrics export
+# (api/metrics.py, BACKLOG #21) builds its own provider and does not depend on any of this.
+# tests/test_api_fastapi_telemetry_off.py pins it.
+_FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
+    "tracing": False,
+    "metrics": False,
+    "logs": False,
+    "operation_spans": False,
+    "auto_configure": False,
+}
+
+
 def create_app(
     engine: Engine | None = None,
     *,
@@ -2637,7 +2756,7 @@ def create_app(
             "create_app: allow_no_auth=True was passed beside an auth service; pass the opt-in "
             "only with no service, since a service always requires sign-in"
         )
-    # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
+    # The interactive docs (at least /docs and /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
     #
@@ -2663,6 +2782,7 @@ def create_app(
         # unless it carries a gate or a public declaration; security.refuse_undeclared_route says
         # what that covers and what it does not.
         dependencies=[Depends(refuse_undeclared_route)],
+        telemetry=_FASTAPI_TELEMETRY_OFF,
     )
     # Vault BACKLOG #2739: every route registered on this app from here on is built by this class,
     # which refuses a caller with no identity BEFORE FastAPI reads the request body. Set before the
@@ -2744,6 +2864,8 @@ def create_app(
     app.state.client_address_monoculture = False
     # Fail-closed when no auth is attached unless explicitly opted out (embedding/dev) — SYS-1.
     app.state.allow_no_auth = allow_no_auth
+    # Whether THIS app serves its API documentation routes, for the posture read-out (#2385).
+    app.state.expose_docs = expose_docs
     # ASVS 16.3.2 (#244): audit every authorization grant, not just the sensitive set. ON by default
     # since BACKLOG #1277; `serve` passes the resolved [diagnostics].audit_all_authz over the top.
     app.state.audit_all_authz = audit_all_authz
@@ -3126,6 +3248,32 @@ def create_app(
         )
         return AiChatResponse(reply=reply, model=ai.model, data_scope=enforced_scope)
 
+    async def _transit_bound_view(
+        store: object, key_name: str | None
+    ) -> TransitBoundAttestationView | None:
+        """The vault_transit bound attestation as the start gate reads it (BACKLOG #2337), through
+        the same reader and the same verdict. ``None`` off vault_transit.
+
+        A Transit failure during the audit-row MAC check comes back from the store as a gap, so it
+        reads as not attested rather than failing the whole posture. A row its audit row does not
+        back reports no ``attested_*`` fields: they are whatever a writer with DML put there, and
+        showing a named actor beside ``attested: false`` would still read as that person's
+        attestation."""
+        if key_name is None:
+            return None
+        recorded = await read_transit_bound_attestation(store)
+        gap = transit_bound_gap(key_name, recorded)
+        backed = recorded if recorded is not None and recorded.audit_gap is None else None
+        return TransitBoundAttestationView(
+            key_name=key_name,
+            attested=gap is None,
+            gap=gap,
+            attested_key_name=backed.key_name if backed else None,
+            attested_by=backed.actor if backed else None,
+            attested_at=backed.attested_at if backed else None,
+            reason=backed.reason if backed else None,
+        )
+
     @app.get("/security/posture", response_model=SecurityPosture)
     async def security_posture(
         request: Request,
@@ -3300,6 +3448,9 @@ def create_app(
             client_denied_last=getattr(request.app.state, "client_denied_last", None),
             client_address_monoculture=bool(
                 getattr(request.app.state, "client_address_monoculture", False)
+            ),
+            transit_bound_attestation=await _transit_bound_view(
+                engine.store, info.transit_key_name
             ),
         )
 
@@ -4339,7 +4490,97 @@ def create_app(
             )
         return out
 
-    @app.get("/events", response_model=list[ConnectionEventInfo])
+    async def _admit_event_read(
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        connection: str | None,
+        reveal: int | None,
+    ) -> Sequence[str] | None:
+        """The gates every event-log read passes, and the channel scope it then reads under."""
+        await _admit_reveal(request, identity, reveal)
+        # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
+        # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
+        if connection is not None and not identity.can_access_channel(connection):
+            await _audit_channel_denied(engine, identity, connection, client_ip(request))
+            raise HTTPException(403, "connection is outside your channel scope")
+        return _scope(identity)
+
+    async def _event_infos(
+        rows: Sequence[Any],
+        *,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        reveal: int | None,
+    ) -> list[ConnectionEventInfo]:
+        return await _redact_reasons(
+            [_conn_event_info(r) for r in rows],
+            engine=engine,
+            identity=identity,
+            request=request,
+            reveal=reveal,
+            audit_action="connection_event_reveal",
+        )
+
+    async def _connection_event_page(
+        *,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        connection: str | None,
+        kind: Sequence[str] | None,
+        since: float | None,
+        limit: int,
+        offset: int = 0,
+        before_id: int | None = None,
+        reveal: int | None = None,
+    ) -> ConnectionEventList:
+        """One page of the event log and the total it sits in (BACKLOG #2438): the one body of
+        ``GET /events`` and of the console's ``/ui/events`` page, so both read the same rows under
+        the same gates. The total is counted under the same filters and channel scope as the page,
+        so a scoped caller is told how many events IT can page through and no more.
+
+        Every page is pinned below ``before_id``. A caller that names none gets the newest event's
+        ``id`` plus one, read in the same query as the total, and passes it back with the next
+        offset. Without the pin, events arriving between clicks would shift every row down, and a
+        reveal would re-read a window its event had already left. The pin is an id because each
+        event row already carries its id; ``list_connection_events`` in ``store/base.py`` states
+        where, with more than one writer, it is close rather than exact.
+
+        Called in-process by the console, so every argument is a plain value. ``reveal`` and the
+        redaction of ``reason`` behave as :func:`list_connection_events` states."""
+        scope = await _admit_event_read(request, engine, identity, connection, reveal)
+        where: dict[str, Any] = {
+            "connection": connection,
+            "kinds": kind,
+            "since": since,
+            "allowed_channels": scope,
+        }
+        counted: int | None = None
+        if before_id is None:
+            counted, newest = await engine.store.connection_event_extent(**where)
+            before_id = newest + 1 if newest else None
+        rows = await engine.store.list_connection_events(
+            limit=limit, offset=offset, before_id=before_id, **where
+        )
+        pin = before_id
+
+        async def _count() -> int:
+            if counted is not None:
+                return counted
+            total, _newest = await engine.store.connection_event_extent(before_id=pin, **where)
+            return total
+
+        total = await page_total(len(rows), limit=limit, offset=offset, count=_count)
+        events = await _event_infos(
+            rows, request=request, engine=engine, identity=identity, reveal=reveal
+        )
+        return ConnectionEventList(
+            total=total, limit=limit, offset=offset, before_id=before_id, events=events
+        )
+
+    @app.get("/events", response_model=ConnectionEventList)
     async def list_connection_events(
         request: Request,
         engine: Engine = Depends(_get_engine),
@@ -4348,12 +4589,20 @@ def create_app(
         kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
-        # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
-        # calls this handler in-process, and a call that leaves it out must get None.
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        before_id: int | None = Query(
+            None,
+            ge=1,
+            le=PAGE_BIND_MAX,
+            description="the snapshot pin a previous page returned; omit it on the first page",
+        ),
         reveal: Annotated[int | None, Query(ge=1)] = None,
-    ) -> list[ConnectionEventInfo]:
+    ) -> ConnectionEventList:
         """The Corepoint-style connection/transport event log (#46), newest first. Optionally filtered
         by ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp.
+
+        Paged by ``offset`` against ``total``, under the ``before_id`` snapshot pin (BACKLOG
+        #2438); :func:`_connection_event_page` states why the pin exists.
 
         Not PHI-free: ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives it a
         protection level. The route is gated by ``monitoring:read``, so ``reason`` is gated
@@ -4362,26 +4611,40 @@ def create_app(
         ``messages:view_summary``, charges the PHI-read budget, and is audited as
         ``connection_event_reveal``. The response is served ``no-store``
         (``_NO_STORE_ROUTE_PATHS``)."""
-        await _admit_reveal(request, identity, reveal)
-        # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
-        # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
-        if connection is not None and not identity.can_access_channel(connection):
-            await _audit_channel_denied(engine, identity, connection, client_ip(request))
-            raise HTTPException(403, "connection is outside your channel scope")
-        rows = await engine.store.list_connection_events(
-            connection=connection,
-            kinds=kind,
-            since=since,
-            limit=limit,
-            allowed_channels=_scope(identity),
-        )
-        return await _redact_reasons(
-            [_conn_event_info(r) for r in rows],
+        return await _connection_event_page(
+            request=request,
             engine=engine,
             identity=identity,
-            request=request,
+            connection=connection,
+            kind=kind,
+            since=since,
+            limit=limit,
+            offset=offset,
+            before_id=before_id,
             reveal=reveal,
-            audit_action="connection_event_reveal",
+        )
+
+    async def _ui_connection_events(
+        *,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+        connection: str | None,
+        kind: Sequence[str] | None,
+        since: float | None,
+        limit: int,
+        reveal: int | None = None,
+    ) -> list[ConnectionEventInfo]:
+        """The console's unpaged event read, for a connection's detail page: the newest ``limit``
+        events as a bare list, under the gates ``GET /events`` applies, with no total and no pin.
+        The paged ``/ui/events`` page calls :func:`_connection_event_page` instead (BACKLOG
+        #2438)."""
+        scope = await _admit_event_read(request, engine, identity, connection, reveal)
+        rows = await engine.store.list_connection_events(
+            connection=connection, kinds=kind, since=since, limit=limit, allowed_channels=scope
+        )
+        return await _event_infos(
+            rows, request=request, engine=engine, identity=identity, reveal=reveal
         )
 
     @app.get("/connections/{name}/events", response_model=list[ConnectionEventInfo])
@@ -6065,6 +6328,29 @@ def create_app(
         (``to=None``) this key repeats, or ``None``. Read-only; it queues nothing."""
         return await engine.prior_resend(idempotency_key, message_id=message_id, to=to)
 
+    async def _edit_resend_provenance(
+        engine: Engine, row: Mapping[str, Any], edited: str
+    ) -> dict[str, object]:
+        """What an edit-resend audit row adds so the resend can be proved later (vault BACKLOG #2615).
+
+        ``origin`` repeats the new message's plain ``messages.origin``. ``body_digest`` holds keyed
+        HMAC-SHA256 digests of the ORIGIN message's stored body and of the edited body the operator
+        submitted, under a key derived from the audit key (:func:`audit_body_digests`). In reroute
+        mode the edited body is what re-enters the origin channel; a handler then transforms it, and
+        what a partner receives is that handler's output, which this digest does not cover. Keyed,
+        never a plain hash: a short PHI body is guessable, and this row is kept for good. It is
+        ``None`` when the store has no in-heap key (keyless, or Vault Transit), and ``original`` is
+        ``None`` when retention has already blanked the origin's body. The bodies never enter the row.
+        Off the event loop, since each body may run to the 16 MiB ceiling."""
+        original = row.get("raw")
+        digests = await asyncio.to_thread(
+            audit_body_digests,
+            engine.store.cipher(),
+            original=original if isinstance(original, str) else "",
+            edited=edited,
+        )
+        return {"origin": MessageOrigin.OPERATOR_EDIT.value, "body_digest": digests}
+
     @app.post("/messages/{message_id}/edit-resend", response_model=EditResendResult)
     async def edit_resend_message(
         message_id: ResourceId,
@@ -6083,7 +6369,12 @@ def create_app(
         seam). The ORIGINAL message stays byte-identical (count-and-log) — the resubmit is a new,
         correlated message. Requires ``MESSAGES_EDIT`` step-up (implies ``MESSAGES_VIEW_RAW``); the direct
         path additionally requires access to the alternate outbound's channel. Audited
-        (``message.edit_resend``, actor + original→new correlation) — NEVER the edited body."""
+        (``message.edit_resend``, actor + original→new correlation) — NEVER the edited body.
+
+        The audit row also carries keyed digests of the original and the edited body, and the new
+        message records its origin as ``operator_edit`` with the acting user, so the edited body can
+        be proved after retention has blanked both bodies (vault BACKLOG #2615,
+        :func:`_edit_resend_provenance`)."""
         # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
         row = await get_scoped_message(engine, identity, message_id, request)
 
@@ -6128,6 +6419,8 @@ def create_app(
             )
             client = client_ip(request)
 
+            direct_provenance = await _edit_resend_provenance(engine, row, admitted)
+
             def _direct_audit(direct: ResendOutcome) -> AuditAppend | None:
                 # Committed with the delivery row (BACKLOG #2624); a duplicate records nothing.
                 if direct.status != "resent":
@@ -6142,6 +6435,8 @@ def create_app(
                             "mode": "direct",
                             "to": direct.to_destination,
                             "outbox_id": direct.outbox_id,
+                            "new_message_id": direct.new_message_id,
+                            **direct_provenance,
                         }
                     ),
                     client=client,
@@ -6154,6 +6449,7 @@ def create_app(
                     raw=admitted,
                     idempotency_key=body.idempotency_key,
                     audit=_direct_audit,
+                    actor=identity.username,
                 )
             except ResendError as exc:
                 # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
@@ -6197,6 +6493,7 @@ def create_app(
             detail={"message_id": message_id, "mode": "reroute"},
         )
         client = client_ip(request)
+        reroute_provenance = await _edit_resend_provenance(engine, row, admitted)
 
         def _reroute_audit(outcome: ReingressOutcome) -> AuditAppend | None:
             # Committed with the re-ingress (BACKLOG #2624); a duplicate records nothing.
@@ -6212,6 +6509,7 @@ def create_app(
                         "mode": "reroute",
                         "new_message_id": outcome.new_message_id,
                         "channel_id": outcome.channel_id,
+                        **reroute_provenance,
                     }
                 ),
                 client=client,
@@ -6219,7 +6517,11 @@ def create_app(
 
         try:
             outcome = await engine.edit_resend_reroute(
-                message_id, raw=admitted, idempotency_key=body.idempotency_key, audit=_reroute_audit
+                message_id,
+                raw=admitted,
+                idempotency_key=body.idempotency_key,
+                audit=_reroute_audit,
+                actor=identity.username,
             )
         except ResendError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -6786,6 +7088,11 @@ def create_app(
             detail={"file_id": file_id, "index": body.index, "to": body.to},
         )
         client = client_ip(request)
+        # Vault BACKLOG #2615: the same keyed digest an edit-resend row holds, of the injected body, so
+        # the inject can be proved once retention and the upload's own deletion have taken the bytes.
+        injected_digest = await asyncio.to_thread(
+            audit_body_digests, engine.store.cipher(), injected=admitted
+        )
         # The row commits with the injected message (BACKLOG #2624).
         mid = await engine.inject_message(
             channel_id=body.to,
@@ -6797,10 +7104,18 @@ def create_app(
                 actor=identity.username,
                 channel_id=body.to,
                 detail=json.dumps(
-                    {"file_id": file_id, "index": body.index, "to": body.to, "message_id": new_mid}
+                    {
+                        "file_id": file_id,
+                        "index": body.index,
+                        "to": body.to,
+                        "message_id": new_mid,
+                        "origin": MessageOrigin.OPERATOR_UPLOAD.value,
+                        "body_digest": injected_digest,
+                    }
                 ),
                 client=client,
             ),
+            actor=identity.username,
         )
         return UploadResendResult(
             file_id=file_id, index=body.index, to=body.to, message_id=mid, status="injected"
@@ -7486,6 +7801,7 @@ def create_app(
             ),
             logs=logs,
             log_sinks=_log_sink_health(),
+            log_forwarder=_log_forwarder_health(),
             update=update,
             pool=pool,
             claim_proc=claim_proc,
@@ -8379,7 +8695,7 @@ def create_app(
                 replay_dead_letters=replay_dead_letters,
                 list_active_alerts=list_active_alerts,
                 alerts_rules=alerts_rules,
-                list_connection_events=list_connection_events,
+                list_connection_events=_ui_connection_events,
                 system_status=system_status,
                 security_posture=security_posture,
                 cluster_status=cluster_status,
@@ -8418,6 +8734,7 @@ def create_app(
                 list_approvals=list_approvals,
                 approve_action=approve_action,
                 reject_action=reject_action,
+                connection_event_page=_connection_event_page,
                 resolve_action=resolve_action,
             ),
             admin=admin,
@@ -8965,7 +9282,12 @@ async def _remind_expiring_initial_credentials(
     ``warned`` maps a user id to the deadline already reminded about. A new credential on the same
     account has a new deadline, so it is reminded about again. An entry is dropped once its account
     leaves every window (claimed, lapsed, disabled or deleted), so the map stays as small as the set
-    of live reminders."""
+    of live reminders.
+
+    The map is only a cache. The once-only mark is the holder's reminder audit row (BACKLOG #2303),
+    so an account missing from the map is checked against the store before anything is sent. A
+    restart inside the window therefore sends nothing again. A failed read sends the reminders, so
+    a store fault costs a duplicate rather than a credential that lapses with nobody told."""
     now = time.time() if now is None else now
     live: set[str] = set()
     for user in await auth.store.list_users():
@@ -8977,24 +9299,42 @@ async def _remind_expiring_initial_credentials(
         live.add(user.id)
         if warned.get(user.id) == deadline:
             continue
+        try:
+            reminded = await auth.initial_credential_reminded(user, deadline=deadline)
+        except Exception as exc:  # noqa: BLE001 - a failed read must not cost the reminder
+            # Read as not reminded: a duplicate reminder is the cheap failure, a missing one before
+            # the credential lapses the costly. The class only, since a driver message can quote
+            # bound values.
+            _log.warning(
+                "initial credential reminder: could not read whether %s was reminded (%s), so it "
+                "is reminded now",
+                scrub_log_argument(user.username),
+                type(exc).__name__,
+            )
+            reminded = False
+        if reminded:
+            warned[user.id] = deadline
+            continue
         expires = deadline_utc(deadline)
         if expires is None:
             continue
-        sink.initial_credential_expiring(
-            f"user:{user.username}",
-            expires_at=expires,
-            hours_remaining=max(0, int((deadline - now) // 3600)),
-        )
         warned[user.id] = deadline
-        # BACKLOG #2007: the holder and the issuing administrator, under the same once-per-credential
-        # mark as the operator reminder above. A failure here is logged per account, so it neither
-        # repeats the operator reminder nor stops the pass for the accounts after this one.
+        # BACKLOG #2007: the holder and the issuing administrator. This writes the once-only mark
+        # (BACKLOG #2303) before any notice, so it runs before the operator reminder below: a crash
+        # between the two then loses that reminder rather than repeating all three. A failure here
+        # is logged per account, so it neither stops the operator reminder nor the pass for the
+        # accounts after this one.
         try:
             await auth.remind_expiring_initial_credential(user, deadline=deadline)
         except Exception:
             _log.exception(
                 "initial credential reminder: the security notices for %s failed", user.username
             )
+        sink.initial_credential_expiring(
+            f"user:{user.username}",
+            expires_at=expires,
+            hours_remaining=max(0, int((deadline - now) // 3600)),
+        )
     for user_id in warned.keys() - live:
         del warned[user_id]
 
@@ -9130,7 +9470,8 @@ def create_managed_app(
     startup AND on every reload — ``serve --shard X`` passes ``filter_registry_for_shard(.., X)`` so
     this process owns only shard X's inbounds; ``None`` = the whole graph (unchanged default).
     ``registry_guard`` refuses a graph by raising ``WiringError``; it runs on the first load and on
-    every reload (the opt-in static-credential gate, BACKLOG #1182). ``static_credential_settings`` is
+    every reload (``serve`` chains its guards into one; at least the opt-in static-credential gate,
+    BACKLOG #1182, is among them). ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it.
     """
@@ -9551,6 +9892,19 @@ def create_managed_app(
         # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
         credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
+        # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
+        # adds no commit to the request path. Here, just above the span whose finally removes it,
+        # so no startup failure can leave it registered. Before the start's config_loaded row.
+        signal_settings = alerts_settings or AlertsSettings()
+        remove_security_signals = (
+            install_security_signals(
+                notifier or LoggingAlertSink(),
+                SecuritySignalThresholds.from_settings(signal_settings),
+                asyncio.get_running_loop(),
+            )
+            if signal_settings.security_signals
+            else None
+        )
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
@@ -9578,6 +9932,7 @@ def create_managed_app(
                         alerts_settings,
                         secret_provider=secret_provider,
                         trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                        audit=store,
                     )
                 auth = AuthService(
                     store,
@@ -9618,8 +9973,10 @@ def create_managed_app(
             # runner. The sink dispatches this off-worker + never-raise, so exceptions here are logged, not fatal.
             if notifier is not None:
 
-                async def _alert_control(action: str, target: str) -> None:
-                    await _alert_control_action(engine, action, target)
+                async def _alert_control(action: str, target: str, *, default_target: bool) -> None:
+                    await _alert_control_action(
+                        engine, action, target, default_target=default_target
+                    )
 
                 notifier.set_control_callback(_alert_control)
             app.state.engine = engine
@@ -9635,6 +9992,10 @@ def create_managed_app(
             # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
             # for a monitoring signal, and byte-identical to before.
             app.state.cert_monitor_settings = cert_monitor_settings
+            # Vault BACKLOG #2302: back GET /security/posture's backup.allow_unencrypted entry.
+            # None (direct create_app / embedding) leaves the route on the shipped [backup]
+            # defaults, which report nothing.
+            app.state.backup_settings = backup_settings
             # BACKLOG #1004: back GET /security/posture's enforce_store_key_expiry loosening entry.
             # None (direct create_app / embedding) leaves the route on shipped defaults, which report
             # nothing — correct, because an app built without [secret_rotation] has not opted out.
@@ -9866,6 +10227,8 @@ def create_managed_app(
                         "window's audit row is lost; continuing the teardown"
                     )
             finally:
+                if remove_security_signals is not None:
+                    remove_security_signals()
                 await engine.stop()
                 # B11: shut down the harness-only instrumented executor (None in production / other tests).
                 # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.

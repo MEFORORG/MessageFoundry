@@ -228,6 +228,18 @@ ControlIdFilter = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTER
 ActorFilter = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTERN, max_length=256)]
 ActionFilter = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTERN, max_length=128)]
 
+#: ``GET /audit/export``'s default and largest ``limit``. Named once so the console's
+#: ``/ui/audit/export``, which declares the same bounds and quotes the default, cannot drift from it
+#: (BACKLOG #2446).
+AUDIT_EXPORT_DEFAULT_LIMIT = 10_000
+AUDIT_EXPORT_MAX_LIMIT = 1_000_000
+
+#: The largest ``offset`` or ``before_id`` a paged list route accepts (BACKLOG #2438). Pydantic
+#: accepts any int, so without a bound a huge offset reached the driver and came back as a 500.
+#: It is 2**62, not the signed 64-bit maximum: SQL Server's ``OFFSET ... FETCH`` adds the offset
+#: and the row count, and that sum must still fit a signed 64-bit integer.
+PAGE_BIND_MAX = 2**62
+
 #: An operator-chosen display label, such as a saved preset's name. Printable, bounded as it ships.
 DisplayLabel = Annotated[str, StringConstraints(pattern=PRINTABLE_TEXT_PATTERN, max_length=128)]
 

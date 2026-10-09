@@ -161,6 +161,7 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
     AdminRemoval,
     AlertInstance,
@@ -183,6 +184,7 @@ from messagefoundry.store.store import (
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
+    MessageOrigin,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -209,6 +211,7 @@ from messagefoundry.store.store import (
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     _session_cap_groups,
+    _transit_attestation_row,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -226,14 +229,19 @@ from messagefoundry.store.store import (
     operator_audits,
     owned_lane_scope,
     password_claim_set,
+    read_transit_bound_attestation_rows,
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
+    settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
     totp_enable_term,
+    transit_attested_audit,
+    transit_withdrawn_audit,
     verify_audit_rows,
 )
+from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
 
 log = logging.getLogger(__name__)
@@ -387,7 +395,9 @@ _SCHEMA: list[str] = [
         error        TEXT,
         summary      TEXT,
         metadata     TEXT,
-        documents_pruned DOUBLE PRECISION
+        documents_pruned DOUBLE PRECISION,
+        origin       TEXT,
+        origin_actor TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS ix_messages_channel ON messages(channel_id, received_at)",
     "CREATE INDEX IF NOT EXISTS ix_messages_control ON messages(channel_id, control_id)",
@@ -641,6 +651,18 @@ _SCHEMA: list[str] = [
         id          INTEGER PRIMARY KEY CHECK (id = 1),
         salt        TEXT NOT NULL,
         created_at  DOUBLE PRECISION NOT NULL
+    )""",
+    # The vault_transit AES-GCM bound attestation (BACKLOG #2337) -- see the SQLite `_SCHEMA`. One row
+    # at most, written only by `store attest-transit-bound` with its audit row in the same
+    # transaction, and naming that row by `audit_seq`/`audit_hash`. Non-secret.
+    """CREATE TABLE IF NOT EXISTS transit_bound_attestation (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        key_name    TEXT NOT NULL,
+        reason      TEXT NOT NULL,
+        actor       TEXT NOT NULL,
+        attested_at DOUBLE PRECISION NOT NULL,
+        audit_seq   BIGINT NOT NULL,
+        audit_hash  TEXT NOT NULL
     )""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
     # for the in-flight-only rationale. This is the backend a real sharded deployment runs:
@@ -939,6 +961,12 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
 # the IdP step-up refuses as step_up_idp_auth_time_missing.
 _SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"))
+# Vault BACKLOG #2615: the plain origin pair for a pre-existing messages table. Gated, because a bare
+# ADD COLUMN IF NOT EXISTS would hold ACCESS EXCLUSIVE on the hottest table through the batch even when
+# the column is there. In _SCHEMA, so adding it moves _schema_hash() and needs no _MIGRATION_REV bump.
+# NULL on an existing row means the origin was not recorded.
+_SCHEMA.append(_gated_add_column("messages", "origin", "TEXT"))
+_SCHEMA.append(_gated_add_column("messages", "origin_actor", "TEXT"))
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
@@ -2997,12 +3025,14 @@ class PostgresStore:
         metadata: str | None,
         error: str | None,
         now: float,
+        origin: MessageOrigin,
+        origin_actor: str | None = None,
     ) -> None:
         await conn.execute(
             "INSERT INTO messages"
             " (id, channel_id, received_at, source_type, control_id,"
-            "  message_type, raw, status, error, summary, metadata)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "  message_type, raw, status, error, summary, metadata, origin, origin_actor)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
             mid,
             channel_id,
             now,
@@ -3015,6 +3045,9 @@ class PostgresStore:
             # EF-3: MRN/name is PHI — ciphered at rest like the body
             self._enc(summary, aad=cell_aad("messages", "summary", mid)),
             self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+            # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
+            origin.value,
+            origin_actor,
         )
 
     async def _insert_outbound_row(
@@ -3146,6 +3179,7 @@ class PostgresStore:
                 metadata=child_meta,
                 error=None,
                 now=now,
+                origin=MessageOrigin.REINGRESS,
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created = now
@@ -3267,6 +3301,7 @@ class PostgresStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             for dest_name, payload in deliveries:
                 await self._insert_outbound_row(conn, mid, channel_id, dest_name, payload, now)
@@ -3307,6 +3342,7 @@ class PostgresStore:
                 metadata=metadata,
                 error=error,
                 now=now,
+                origin=MessageOrigin.PARTNER,
             )
             await self._event(conn, mid, event, None, error, now)
         return mid
@@ -3324,6 +3360,8 @@ class PostgresStore:
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
         audit: OperatorAudit[str] | None = None,
+        origin: MessageOrigin = MessageOrigin.PARTNER,
+        origin_actor: str | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001). In one transaction: insert the message
@@ -3355,6 +3393,8 @@ class PostgresStore:
                 metadata=metadata,
                 error=None,
                 now=now,
+                origin=origin,
+                origin_actor=origin_actor,
             )
             # ingest-time (ADR 0009) + metrics only; FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created_at = now
@@ -4738,6 +4778,7 @@ class PostgresStore:
                                 else None
                             ),
                             now=now,
+                            origin=MessageOrigin.REINGRESS,
                         )
                         if not peek_failed:
                             # ingest-time (ADR 0009) + metrics only; FIFO orders by seq — ADR 0059.
@@ -5147,31 +5188,19 @@ class PostgresStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
+        offset: int = 0,
+        before_id: int | None = None,
         allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
-        where: list[str] = []
-        params: list[Any] = []
-        if connection is not None:
-            params.append(connection)
-            where.append(f"connection=${len(params)}")
-        if kinds:
-            placeholders = ",".join(f"${len(params) + i + 1}" for i in range(len(kinds)))
-            params.extend(kinds)
-            where.append(f"kind IN ({placeholders})")
-        if since is not None:
-            params.append(since)
-            where.append(f"ts>=${len(params)}")
-        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
-        # outbound row (which spans channels), matching the SQLite path and the metadata/purge boundary.
-        if allowed_channels is not None:
-            where.append("direction='inbound'")
-            _append_channel_scope_pg(where, params, "connection", allowed_channels)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
-        params.append(limit)
+        clause, params = self._connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        params += [limit, max(offset, 0)]
         rows = await self._pool.fetch(
             "SELECT id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
-            f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ${len(params)}",
+            f" FROM connection_event{clause} ORDER BY ts DESC, id DESC"
+            f" LIMIT ${len(params) - 1} OFFSET ${len(params)}",
             *params,
         )
         return [
@@ -5191,6 +5220,57 @@ class PostgresStore:
             )
             for r in rows
         ]
+
+    async def connection_event_extent(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        before_id: int | None = None,
+        allowed_channels: Sequence[str] | None,
+    ) -> tuple[int, int]:
+        """The total :meth:`list_connection_events` pages through, and its newest ``id`` or 0
+        (BACKLOG #2438)."""
+        clause, params = self._connection_event_where(
+            connection, kinds, since, before_id, allowed_channels
+        )
+        row = await self._fetchone(
+            f"SELECT COUNT(*) AS n, MAX(id) AS newest FROM connection_event{clause}", *params
+        )
+        return (int(row["n"]), int(row["newest"] or 0)) if row is not None else (0, 0)
+
+    @staticmethod
+    def _connection_event_where(
+        connection: str | None,
+        kinds: Sequence[str] | None,
+        since: float | None,
+        before_id: int | None,
+        allowed_channels: Sequence[str] | None,
+    ) -> tuple[str, list[Any]]:
+        """The ``WHERE`` text and its bound ``$N`` values shared by :meth:`list_connection_events`
+        and :meth:`connection_event_extent`, so a page and its total read the same set."""
+        where: list[str] = []
+        params: list[Any] = []
+        if connection is not None:
+            params.append(connection)
+            where.append(f"connection=${len(params)}")
+        if kinds:
+            placeholders = ",".join(f"${len(params) + i + 1}" for i in range(len(kinds)))
+            params.extend(kinds)
+            where.append(f"kind IN ({placeholders})")
+        if since is not None:
+            params.append(since)
+            where.append(f"ts>=${len(params)}")
+        if before_id is not None:
+            params.append(before_id)
+            where.append(f"id<${len(params)}")
+        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
+        # outbound row (which spans channels), matching the SQLite path and the metadata/purge boundary.
+        if allowed_channels is not None:
+            where.append("direction='inbound'")
+            _append_channel_scope_pg(where, params, "connection", allowed_channels)
+        return (" WHERE " + " AND ".join(where)) if where else "", params
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
     # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
@@ -6287,6 +6367,7 @@ class PostgresStore:
         body_override: str | None = None,
         now: float | None = None,
         audit: OperatorAudit[ResendOutcome] | None = None,
+        actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
         Mirrors :meth:`MessageStore.resend_to`. Strict-FIFO writer-funnel: takes the per-lane advisory
@@ -6337,6 +6418,7 @@ class PostgresStore:
                     )
                     await self._append_operator_audit(conn, written, audit, outcome)
                     return outcome
+                child_mid: str | None = None
                 if body_override is not None:
                     # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                     # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN row
@@ -6397,6 +6479,8 @@ class PostgresStore:
                         metadata=child_meta,
                         error=None,
                         now=now,
+                        origin=MessageOrigin.OPERATOR_EDIT,
+                        origin_actor=actor,
                     )
                     await self._event(
                         conn, child_mid, "received", None, f"edit-resend from {message_id}", now
@@ -6475,6 +6559,7 @@ class PostgresStore:
                     to_destination=to,
                     from_destination=src_dest,
                     outbox_id=outbox_id,
+                    new_message_id=child_mid,
                 )
                 await self._append_operator_audit(conn, written, audit, outcome)
                 return outcome
@@ -6487,6 +6572,7 @@ class PostgresStore:
         idempotency_key: str,
         now: float | None = None,
         audit: OperatorAudit[ReingressOutcome] | None = None,
+        actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
         fresh, correlated ``RECEIVED`` child message at the origin channel's ingress stage; the origin
@@ -6577,6 +6663,8 @@ class PostgresStore:
                         metadata=child_meta,
                         error=None,
                         now=now,
+                        origin=MessageOrigin.OPERATOR_EDIT,
+                        origin_actor=actor,
                     )
                     # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
                     resubmit_row_id = uuid4().hex
@@ -7299,10 +7387,12 @@ class PostgresStore:
         until: float | None = None,
         exclude: AuditExclusion | None = None,
         before_id: int | None = None,
+        offset: int = 0,
     ) -> Sequence[Row]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
-        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
-        Every value is a bound parameter; see :meth:`_audit_where`."""
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776),
+        or past ``offset`` rows of the filtered set (BACKLOG #2438). Every value is a bound
+        parameter; see :meth:`_audit_where`."""
         where, params = self._audit_where(
             actor=actor,
             action=action,
@@ -7311,14 +7401,17 @@ class PostgresStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
-        sql = f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ${len(params)}"
+        params += [limit, max(offset, 0)]
+        sql = (
+            f"SELECT * FROM audit_log{where} ORDER BY id DESC"
+            f" LIMIT ${len(params) - 1} OFFSET ${len(params)}"
+        )
         return await self._fetchall(sql, *params)
 
     async def count_audit(
         self,
         *,
-        limit: int,
+        limit: int | None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
@@ -7336,11 +7429,14 @@ class PostgresStore:
             exclude=exclude,
             before_id=before_id,
         )
-        params.append(limit)
-        sql = (
-            f"SELECT COUNT(*) AS n FROM (SELECT id FROM audit_log{where}"
-            f" ORDER BY id DESC LIMIT ${len(params)}) t"
-        )
+        if limit is None:
+            sql = f"SELECT COUNT(*) AS n FROM audit_log{where}"
+        else:
+            params.append(limit)
+            sql = (
+                f"SELECT COUNT(*) AS n FROM (SELECT id FROM audit_log{where}"
+                f" ORDER BY id DESC LIMIT ${len(params)}) t"
+            )
         row = await self._fetchone(sql, *params)
         return int(row["n"]) if row is not None else 0
 
@@ -7365,16 +7461,30 @@ class PostgresStore:
         )
         return [dict(r) for r in rows]
 
-    async def security_events_for_user(self, username: str, *, limit: int = 100) -> Sequence[Row]:
+    async def security_events_for_user(
+        self, username: str, *, limit: int = 100, offset: int = 0, until: float | None = None
+    ) -> Sequence[Row]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
         /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
-        user only by email, when one can be sent. ``auth/notifications.py`` states the rule."""
+        user only by email, when one can be sent. ``auth/notifications.py`` states the rule.
+        ``offset`` pages it, and ``until`` pins the pages to one snapshot (BACKLOG #2438)."""
+        where, params = _security_events_where_pg(username, until)
+        n = len(params)
         return await self._fetchall(
-            "SELECT ts, action, detail FROM audit_log "
-            "WHERE actor = $1 AND action LIKE 'auth.%' ORDER BY id DESC LIMIT $2",
-            username,
+            f"SELECT ts, action, detail FROM audit_log{where} ORDER BY id DESC"
+            f" LIMIT ${n + 1} OFFSET ${n + 2}",
+            *params,
             limit,
+            max(offset, 0),
         )
+
+    async def count_security_events_for_user(
+        self, username: str, *, until: float | None = None
+    ) -> int:
+        """The total :meth:`security_events_for_user` pages through (BACKLOG #2438)."""
+        where, params = _security_events_where_pg(username, until)
+        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM audit_log{where}", *params)
+        return int(row["n"]) if row is not None else 0
 
     # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
 
@@ -7557,6 +7667,85 @@ class PostgresStore:
         if row is None:  # the insert above ran, so only a concurrent delete reaches here
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
+
+    # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
+
+    async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
+        """See the SQLite twin. The shared reader's ``?`` placeholders become ``$n`` here, and
+        its reads share one borrow and one read-only REPEATABLE READ snapshot, as the SQLite twin's
+        share one ``_read()``. Without the snapshot, an attest committed between the row read and
+        the supersession read would make a valid attestation read as superseded."""
+        async with (
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+
+            async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+                parts = sql.split("?")
+                numbered = parts[0] + "".join(f"${i}{part}" for i, part in enumerate(parts[1:], 1))
+                row: Mapping[str, Any] | None = await conn.fetchrow(numbered, *params)
+                return row
+
+            read = await read_transit_bound_attestation_rows(
+                fetch, mac_keys=self._audit_mac_keys, mac_fn=self._audit_mac_fn
+            )
+        # The Transit MAC runs after the snapshot and the borrow are released.
+        return await settle_transit_bound_attestation(read)
+
+    async def record_transit_bound_attestation(
+        self, *, key_name: str, reason: str, actor: str, now: float | None = None
+    ) -> TransitBoundAttestation:
+        """See the SQLite twin. The audit row and the upsert naming it share one transaction."""
+        now = time.time() if now is None else now
+        audit = transit_attested_audit(key_name=key_name, reason=reason, actor=actor)
+        # `record=False` as `create_user` passes: a CLI write is not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            [appended] = await self._append_audits(conn, (audit,), now=now)
+            await conn.execute(
+                "INSERT INTO transit_bound_attestation (id, key_name, reason, actor, attested_at,"
+                " audit_seq, audit_hash) VALUES (1, $1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO"
+                " UPDATE SET key_name = EXCLUDED.key_name, reason = EXCLUDED.reason,"
+                " actor = EXCLUDED.actor, attested_at = EXCLUDED.attested_at,"
+                " audit_seq = EXCLUDED.audit_seq, audit_hash = EXCLUDED.audit_hash",
+                key_name,
+                reason,
+                actor,
+                now,
+                appended.seq,
+                appended.row_hash,
+            )
+        tee_audits((audit,), (appended,), ts=now)
+        return TransitBoundAttestation(
+            key_name=key_name,
+            reason=reason,
+            actor=actor,
+            attested_at=now,
+            audit_seq=appended.seq,
+            audit_hash=appended.row_hash,
+        )
+
+    async def withdraw_transit_bound_attestation(
+        self, *, actor: str, reason: str | None = None, now: float | None = None
+    ) -> TransitBoundAttestation | None:
+        """See the SQLite twin. ``DELETE ... RETURNING`` reads and removes the row in one statement,
+        and the audit row commits in the same transaction."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            # The audit lock FIRST, the order `record_transit_bound_attestation` takes them in (its
+            # append, then the row), so a concurrent attest and withdraw cannot deadlock. The
+            # append below re-takes it, which a transaction-scoped advisory lock allows.
+            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+            row = await conn.fetchrow(
+                "DELETE FROM transit_bound_attestation WHERE id = 1"
+                f" RETURNING {TRANSIT_ATTESTATION_COLUMNS}"
+            )
+            if row is None:
+                return None
+            withdrawn = _transit_attestation_row(row)
+            audits = (transit_withdrawn_audit(withdrawn, actor=actor, reason=reason),)
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
+        return withdrawn
 
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a
@@ -9378,6 +9567,17 @@ def _pg_cutoff_case(
     )  # ELSE — connections with no override use the global window
     sql = f"(CASE {column} {' '.join(whens)} ELSE ${idx}::double precision END)"
     return sql, params, idx + 1
+
+
+def _security_events_where_pg(username: str, until: float | None) -> tuple[str, list[Any]]:
+    """The ``$N`` ``WHERE`` text and values for one user's security-event page and its total
+    (BACKLOG #2438), shared so the two count one set. The SQLite builder states the rule."""
+    params: list[Any] = [username]
+    clause = " WHERE actor = $1 AND action LIKE 'auth.%'"
+    if until is not None:
+        params.append(until)
+        clause += " AND ts <= $2"
+    return clause, params
 
 
 def _append_channel_scope_pg(

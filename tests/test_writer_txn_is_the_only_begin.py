@@ -382,11 +382,13 @@ def test_only_writer_txn_and_the_read_snapshot_open_a_transaction() -> None:
         f"executescript arm is not resolving `_SCHEMA`, so the one multi-statement call is unread"
     )
     # PINNED, not floored: an unreadable argument is the exact shape an evasion takes, so a NEW one
-    # has to be looked at. The three today are `cancel_queued`, `revoke_user_sessions` and
-    # `delivery_latency_histogram`, each building a SELECT in a local variable. If you added a
-    # fourth, confirm it carries no transaction verb and then move this number.
-    assert scan.unreadable == 3, (
-        f"{scan.unreadable} SQL arguments could not be read as text, expected 3. A new one is a new "
+    # has to be looked at. The four today are `cancel_queued`, `revoke_user_sessions` and
+    # `delivery_latency_histogram`, each building a SELECT in a local variable, and
+    # `get_transit_bound_attestation`'s read-only `fetch`, which runs only the SELECTs
+    # `load_transit_bound_attestation` passes it, on a `_read()` connection (BACKLOG #2337). If you
+    # added a fifth, confirm it carries no transaction verb and then move this number.
+    assert scan.unreadable == 4, (
+        f"{scan.unreadable} SQL arguments could not be read as text, expected 4. A new one is a new "
         f"blind spot in this guard: check it carries no transaction verb before moving the number."
     )
 

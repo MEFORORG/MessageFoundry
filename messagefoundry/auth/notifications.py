@@ -120,9 +120,10 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 #: Only ``ACCOUNT_LOCKED`` carries that bit. Every other kind is sent on an authenticated action, a
 #: completed sign-in, or a clock, so it keeps its per-event line (BACKLOG #1139). A lock notice with
 #: no relay or no address is still recorded where only an administrator reads it, as ``mailed: false``
-#: on the ``auth.lock_notice`` row. A full queue or a failed send is not: that row is written at the
-#: hand-off, as ``mailed: true``. An instance with no relay at all is reported at startup by the serve
-#: gate, unless enforcement is ``warn`` and the operator waived notices in writing.
+#: on the ``auth.lock_notice`` row. A full queue or a failed send is recorded on its own
+#: ``auth.lock_notice_undelivered`` row (BACKLOG #2383), since the ``auth.lock_notice`` row is written
+#: at the hand-off, as ``mailed: true``. An instance with no relay at all is reported at startup by
+#: the serve gate, unless enforcement is ``warn`` and the operator waived notices in writing.
 LOG_SILENT_EVENT_TYPES: frozenset[str] = frozenset({ACCOUNT_LOCKED})
 
 #: What a general-log line calls each notice kind. A log call names the kind through

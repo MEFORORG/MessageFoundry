@@ -18,6 +18,7 @@ __lazy_modules__ = ["messagefoundry.tray.instance"]
 import logging
 import logging.handlers
 import sys
+import time
 from pathlib import Path
 
 from messagefoundry.tray import __version__
@@ -27,13 +28,23 @@ from messagefoundry.tray.logscrub import TrayLogScrubFilter
 
 log = logging.getLogger("messagefoundry.tray")
 
+# Must match messagefoundry.logging_setup._DATE_FORMAT. The literal Z is true only with gmtime.
+_DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
 
 def _setup_logging(config_dir: Path) -> None:
     config_dir.mkdir(parents=True, exist_ok=True)
     handler = logging.handlers.RotatingFileHandler(
         config_dir / "tray.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8"
     )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    # UTC with a trailing Z, so a tray.log line sorts against the engine's log on the same clock
+    # reading (BACKLOG #2349). The tray cannot import logging_setup (ADR 0113), so the format is
+    # spelled here; tests/test_tray_logscrub.py fails if it stops matching the engine's.
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt=_DATE_FORMAT
+    )
+    formatter.converter = time.gmtime
+    handler.setFormatter(formatter)
     # A handler filter, so it covers every record that reaches tray.log, tracebacks included
     # (BACKLOG #2092). See messagefoundry.tray.logscrub for why it is not the engine's chain.
     handler.addFilter(TrayLogScrubFilter())

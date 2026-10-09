@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import httpx
 from _ui_clients import PW, SAME_ORIGIN, cookie_login, provision
+from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Permission, Role
@@ -346,7 +347,7 @@ class _FakeWS:
     """A same-origin browser handshake carrying the session cookie, for ``authorize_ui_ws``."""
 
     def __init__(self, app: object, cookie: str) -> None:
-        self.headers = {"origin": "http://t", "host": "t"}
+        self.headers = Headers({"origin": "http://t", "host": "t"})  # has getlist (BACKLOG #2454)
         self.app = app
         self.url = SimpleNamespace(scheme="ws", path="/ws/stats")
         self.cookies = {"mf_session": cookie}

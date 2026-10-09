@@ -24,20 +24,48 @@
 > engine that does not model it. The refusal never repeats the offending value, because this file can
 > carry secrets.
 >
-> **The refusal covers the FILE, and the CLI refuses an unknown flag too. Env mostly does not — check
-> `MEFOR_*` spellings yourself.** An unknown `serve` flag stops the command: argparse prints
-> `unrecognized arguments` and exits 2. Its default prefix matching still applies, so an unambiguous
-> prefix of a real flag (`--service-conf`) is read as that flag. A misspelled `MEFOR_*` variable is
-> dropped with no warning, whether the typo is in its section part or its key part. Some env input is
-> refused anyway: at least an unrecognized `[security]` key and the renamed `[logging]` keys, both
-> described below. The env layer is where
-> secrets belong, and it already drops a var aimed at one of the four sections that have no env layer
-> ([Mechanism](#mechanism)). The loader also cannot tell such a typo from one of the documented
-> `MEFOR_*` variables its consuming module reads straight from the environment rather than declaring as
-> a field (`MEFOR_STORE_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and siblings). **One exception:**
-> an unrecognized `[security]` posture switch is refused from **env as well as the file**, because every
-> shipped `MEFOR_SECURITY_*` name maps to a real field, so there is no out-of-band variable to collide
-> with — and believing a posture control is on when it is not is the worst case of the class.
+> **The refusal covers the FILE, and the CLI refuses an unknown flag too. Env is covered in part —
+> check the SECTION part of a `MEFOR_*` spelling yourself.** An unknown `serve` flag stops the
+> command: argparse prints `unrecognized arguments` and exits 2. Its default prefix matching still
+> applies, so an unambiguous prefix of a real flag (`--service-conf`) is read as that flag.
+>
+> **A `MEFOR_<SECTION>_<KEY>` variable that names a real section and no setting in it is REFUSED at
+> load** (vault BACKLOG #2600). `MEFOR_STORE_REQUIRE_ENCRYPTON=true` used to be dropped with no
+> warning, so the instance started without the hardening its environment asked for. The refusal
+> names the variable and, when one fits, the nearest real one. It never repeats the value, because
+> the environment is where secrets belong. Unset the variable or fix its spelling.
+>
+> **A variable aimed at a section with no env layer is refused too**, even when its key is real.
+> `MEFOR_SECRET_ROTATION_WARN_DAYS=0` used to change nothing and say nothing. The four sections
+> are listed under [Mechanism](#mechanism). Set them in the file.
+>
+> **What env still drops in silence:** a variable that names no section at all. A typo in the
+> SECTION part (`MEFOR_STOER_PATH`) is not refused. The loader cannot tell it from the `MEFOR_*`
+> variables that belong to no section, such as `MEFOR_ALLOW_INSECURE_TLS`.
+>
+> **A secret reference names a variable of your choosing, and that variable is spared.** Under
+> `[secrets].provider = "env"`, spelled exactly so, the value of a reference setting is the name
+> of an environment variable: at least `[auth].ad_bind_password_secret`,
+> `[auth].oidc_client_secret_ref`, `[auth].oidc_client_private_key_ref` and
+> `[alerts].email_password_secret`. The variable such a setting names loads, whatever it is
+> called. Under any other provider nothing is spared this way.
+>
+> **The check reads the whole process environment.** A platform that injects variables can trip
+> it. Kubernetes service links are the known case: a Service named `mefor-auth` in the engine's
+> namespace gives the pod `MEFOR_AUTH_SERVICE_HOST`, and the load is refused. The Services in the
+> shipped manifests have names that start `mefor-engine`, and `engine` is not a section, so those
+> do not trip it. Name your own Services clear of the section names, or set
+> `enableServiceLinks: false` on the pod.
+>
+> **Variables that are not settings are spared by name.** Their consuming module reads them straight
+> from the environment and they are not fields here: at least `MEFOR_STORE_VAULT_ADDR`,
+> `MEFOR_STORE_VAULT_TOKEN`, `MEFOR_SECRETS_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and the two
+> phase-timing variables. The list is `_OUT_OF_BAND_ENV` in `messagefoundry/config/settings.py`. A
+> name on it is spared only as spelled there, in upper case.
+>
+> An unrecognized `[security]` posture switch is refused from **env as well as the file**, with a
+> message that names the section and key. So are the renamed `[logging]` keys described below, by a
+> message that names the replacement.
 >
 > A handful of keys are **declared but not yet read** — they load, they just do nothing yet:
 > `[retention].audit_days` (**reserved/keep-forever by design**), `[reference].max_staleness_seconds`,
@@ -47,8 +75,8 @@
 > #122 / ADR 0162 made it a real, engine-owned field, and the two legacy spellings beside it refuse.
 > **They refuse on BOTH layers, and only one of those is the general rule.** In the file they hit the
 > unknown-key refusal above (`max_bytes` is even suggested onward as `file_max_bytes`; `backups` is
-> refused naming nothing). From **env** — where a misspelled `MEFOR_*` is otherwise dropped in
-> silence — they hit a dedicated `[logging]` validator that names the replacement for both.
+> refused naming nothing). From **env** they hit a dedicated `[logging]` validator that names the
+> replacement for both; the env unknown-key refusal above leaves these two to it.
 
 ## Principle — two kinds of configuration
 
@@ -83,7 +111,7 @@ CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
   in the file — env wins over the file so a deployment can inject them.
 - Env naming: `MEFOR_<SECTION>_<KEY>` (e.g. `MEFOR_STORE_PASSWORD`, `MEFOR_API_PORT`). The parser splits
   the name at the **first** `_` after the prefix and matches that against a known-section list, so four
-  built sections have **no env layer** and a `MEFOR_*` var aimed at one is dropped without a warning:
+  built sections have **no env layer** and a `MEFOR_*` var aimed at one is refused at load:
   `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`. The reasons
   differ. `[service]` would work if the known-section list named it, but it just isn't listed. The other
   three fail a different way: that same first-underscore split turns `MEFOR_CERT_MONITOR_ENABLED` into
@@ -116,7 +144,7 @@ backend-limited.
 | `aad_bind` | bool | `true` | **not a secret** (`MEFOR_STORE_AAD_BIND`); cell binding (ASVS 11.3.3, [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md)). New at-rest AES-256-GCM writes use the cell-bound writer, `mfenc:v4` (`mfenc:v2` before [ADR 0196](adr/0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md), which seals each store under its own HKDF data sub-key) — each value is bound to its `(table, column, row)` cell via GCM Associated Data, so a ciphertext cut-and-pasted into another cell **fails the auth tag** (dead-lettered `CipherError`) instead of silently decrypting. **On by default** (ADR 0148 GIVEN 1: the shipped configuration runs the hardened path). Setting it `false` selects the frozen `mfenc:v1` writer (byte-identical at rest) and is a **loosening** — `security_loosenings()` names it, so the opt-out is never silent. No effect without an `encryption_key` (the identity cipher has nothing to bind). Legacy `v1` rows still decrypt (dual-read); `messagefoundry rotate-key` upgrades them `v1` to `v4`, so the default is safe and reversible on an existing store. |
 | `allow_unmarked_ciphertext` | bool | `false` | **not a secret** (`MEFOR_STORE_ALLOW_UNMARKED_CIPHERTEXT`); refuse unmarked values (ASVS 11.3.3, BACKLOG #1169). On a keyed store, a non-blank value with no `mfenc:` marker in an encrypted column is **refused** (`CipherError`, plus an `integrity_drift` alert with subject `store-cipher` naming only the table and column) instead of being read back as plaintext: it is a stripped marker or a planted row. A purged `''` is never refused. The keyed open seals legacy plaintext only on a `(table, column)` that holds no ciphertext yet, one transaction per column. Setting it `true` restores the old behaviour (plaintext passthrough, and the open seals every unmarked value) and is a **loosening** — `security_loosenings()` names it. No effect without an `encryption_key`. **It covers the uploaded-file store too** (owner ruling 2026-09-23): on a keyed store a plaintext upload under `uploads_dir` is refused on read until `messagefoundry rotate-key` seals it, alerting under its own subject `upload-cipher`, and `serve` logs the count of such uploads at startup. Setting this `true` restores the upload passthrough as well. Under `cipher_provider = "vault_transit"` uploads keep the passthrough either way; [PHI.md](PHI.md) §3 says why. |
 | `key_provider` | enum | `auto` | selects **how** the active/retired DEK bytes are *sourced* — never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged; ADR 0019, ASVS 13.3.3). `auto` (default) is the env-then-DPAPI ladder, **byte-identical** to the pre-seam behavior; `env` pins `MEFOR_STORE_ENCRYPTION_KEY` and `dpapi` pins `encryption_key_file`, and each ignores the other source. A key set only in the source the pinned provider ignores is **refused, not used as keyless** (BACKLOG #2077): `serve`, `supervise` and `provision-admin` refuse before opening, whatever the audited opt-out says, and `open_store` refuses for every other command. Set `auto` or the source the provider reads. Under `cipher_provider = "vault_transit"` the gate still counts any local key, because the store never resolves `key_provider` there; DR backups and `rotate-key` do, and refuse the ignored key. `vault` **is built** ([store/keyprovider_vault.py](../messagefoundry/store/keyprovider_vault.py)): it envelope-decrypts a wrapped DEK through HashiCorp Vault **Transit** and needs the optional `[vault]` extra. Its wiring comes from the environment. `MEFOR_STORE_VAULT_TRANSIT_KEY` (the KEK name; not the next row's `MEFOR_STORE_TRANSIT_KEY`) and `MEFOR_STORE_VAULT_WRAPPED_DEK` are required. `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_VAULT_CA_FILE` are optional, and an unset address or token is **not refused**: hvac falls back to its own `VAULT_ADDR`/`VAULT_TOKEN` handling and built-in defaults, so set both. The unwrap runs wherever the key is resolved, at least at every store open and every DR backup pass. It reads the KEK's metadata to check its type before decrypting, so the token needs both. A missing required variable or extra, a KEK of an unsuitable type, or a failed unwrap **fails closed**: the store does not open, or that backup pass fails. Only the **active** key comes from Vault; retired keys still come from `encryption_keys_retired`, in plaintext. The unwrapped DEK feeds the in-process cipher, so unlike `cipher_provider = "vault_transit"` it does enter engine heap. **The keyless-PHI gate counts it as a key** (BACKLOG #1998). `_store_key_configured` in [`__main__.py`](../messagefoundry/__main__.py) treats every external provider as a configured key without resolving it, because the gate runs before the store opens and must not need the network. So a PHI instance set to `vault` with no local key passes the gate, and a provider that cannot resolve fails closed when the store opens. Under `cipher_provider = "vault_transit"` the store never resolves `key_provider`; DR backups and `rotate-key` still do, and fail closed there. `aws_kms`·`azure_kv`·`gcp_kms`·`pkcs11` are **not built yet**; selecting one **fails closed** the same way, never a silent downgrade. Names a *provider*, not key material, so it is **not** a secret. |
-| `cipher_provider` | enum | `aesgcm` | selects the at-rest **cipher itself** — distinct from `key_provider`, which only *sources* DEK bytes for the in-process cipher ([ADR 0138](adr/0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md), ASVS 13.3.3). `aesgcm` (the default) is that in-process AES-256-GCM cipher, byte-identical to today. `vault_transit` performs the bulk encrypt/decrypt **inside** Vault/OpenBao Transit, so the plaintext DEK never enters engine heap; at-rest values then carry the `mfenc:v3:` marker, the local `encryption_key`/`key_provider` go unused (Transit holds the key), and the audit chain is keyed by Transit's `generate_hmac` — computed inside the vault, so no HMAC key enters heap either. Threaded through **all three** backends. Vault address / token / data-key name come from `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_TRANSIT_KEY` (optionally `MEFOR_STORE_TRANSIT_AUDIT_KEY`). Names a *provider*, not key material, so it is **not** a secret. Any other value **fails closed** at `open_store` — never a silent downgrade to plaintext. **Needs the optional `[vault]` extra** (`pip install 'messagefoundry[vault]'` — hvac); lazy-imported, so a base install pulls no Vault SDK and an absent extra fails closed at `open_store` rather than degrading. **Two preconditions before you plan a deployment on this — read both.** (1) *The keyless-PHI serve gate does not treat this setting as a key.* [`__main__.py`](../messagefoundry/__main__.py)'s gate tests `encryption_key` / `encryption_key_file` and an external `key_provider` (previous row). It consults `cipher_provider` only to count a local key that a pinned `key_provider` ignores (BACKLOG #2077). All three built-in environment names derive PHI, so a PHI instance configured for `vault_transit` **with no local key and no external `key_provider` still refuses to start (exit 2)** and points you at `messagefoundry gen-key`. Forcing past it with `[security].allow_unencrypted_phi` (+ `…_under_strict_enforcement`) makes `security_loosenings()` and `GET /security/posture` publish the instance as *PHI stored UNENCRYPTED at rest* while it is in fact encrypted inside Transit — a false read-out, not a real posture. Until the gate learns `cipher_provider`, **also configure a local `encryption_key`**, with a `key_provider` that reads it (`auto` or `env`): the Transit cipher never reads it, but it satisfies the gate, and it remains the key `.mfbak` DR archives actually use (`resolve_active_key` never consults `cipher_provider`, so Transit does **not** cover backups). (2) *Greenfield stores only.* The Transit cipher **fails closed** (`CipherError`) on any pre-existing `mfenc:v1`/`v2` value, and `rotate-key` both refuses to run without an active *local* key and would itself have to decrypt those values through the Transit cipher — so there is **no in-place migration** off an already-encrypted store today. Flipping this on a populated store makes its historical PHI unreadable. |
+| `cipher_provider` | enum | `aesgcm` | selects the at-rest **cipher itself** — distinct from `key_provider`, which only *sources* DEK bytes for the in-process cipher ([ADR 0138](adr/0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md), ASVS 13.3.3). `aesgcm` (the default) is that in-process AES-256-GCM cipher, byte-identical to today. `vault_transit` performs the bulk encrypt/decrypt **inside** Vault/OpenBao Transit, so the plaintext DEK never enters engine heap; at-rest values then carry the `mfenc:v3:` marker, the local `encryption_key`/`key_provider` go unused (Transit holds the key), and the audit chain is keyed by Transit's `generate_hmac` — computed inside the vault, so no HMAC key enters heap either. Threaded through **all three** backends. Vault address / token / data-key name come from `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_TRANSIT_KEY` (optionally `MEFOR_STORE_TRANSIT_AUDIT_KEY`). Names a *provider*, not key material, so it is **not** a secret. Any other value **fails closed** at `open_store` — never a silent downgrade to plaintext. **Needs the optional `[vault]` extra** (`pip install 'messagefoundry[vault]'` — hvac); lazy-imported, so a base install pulls no Vault SDK and an absent extra fails closed at `open_store` rather than degrading. **Three preconditions before you plan a deployment on this — read all three.** (1) *The keyless-PHI serve gate does not treat this setting as a key.* [`__main__.py`](../messagefoundry/__main__.py)'s gate tests `encryption_key` / `encryption_key_file` and an external `key_provider` (previous row). It consults `cipher_provider` only to count a local key that a pinned `key_provider` ignores (BACKLOG #2077). All three built-in environment names derive PHI, so a PHI instance configured for `vault_transit` **with no local key and no external `key_provider` still refuses to start (exit 2)** and points you at `messagefoundry gen-key`. Forcing past it with `[security].allow_unencrypted_phi` (+ `…_under_strict_enforcement`) makes `security_loosenings()` and `GET /security/posture` publish the instance as *PHI stored UNENCRYPTED at rest* while it is in fact encrypted inside Transit — a false read-out, not a real posture. Until the gate learns `cipher_provider`, **also configure a local `encryption_key`**, with a `key_provider` that reads it (`auto` or `env`): the Transit cipher never reads it, but it satisfies the gate, and it remains the key `.mfbak` DR archives actually use (`resolve_active_key` never consults `cipher_provider`, so Transit does **not** cover backups). (2) *Greenfield stores only.* The Transit cipher **fails closed** (`CipherError`) on any pre-existing `mfenc:v1`/`v2` value, and `rotate-key` both refuses to run without an active *local* key and would itself have to decrypt those values through the Transit cipher — so there is **no in-place migration** off an already-encrypted store today. Flipping this on a populated store makes its historical PHI unreadable. (3) *The AES-GCM bound is yours, and `serve` needs your recorded attestation of it* (BACKLOG #2337). The engine counts no encryptions on this cipher, so rotate the Transit data key (`MEFOR_STORE_TRANSIT_KEY`) before any one key version seals 2^32 values; plan to rotate by 2^31, sized from the peak encrypt rate (Vault's `auto_rotate_period`, or a manual schedule). Then run `messagefoundry store attest-transit-bound --reason "<your rotation policy>"` once, on the host, or `serve` **refuses to start** under `[security].enforcement = enforce`. What the record holds, what keeps or voids it, and what it does not check are in [SECURITY.md](SECURITY.md), *On vault_transit, a recorded attestation stands in for the AES-GCM count*. |
 | `require_encryption` | bool | `false` | when `true`, `serve` **refuses to start** without an encryption key in **any** environment, even a synthetic one. Off by default. |
 | `allow_unencrypted_phi` | | | **→ moved to `[security].allow_unencrypted_phi`** (ADR 0118) — set it there; no longer accepted in `[store]`. |
 | `server`, `port` | str/int | — / 1433 | server DBs (required for `sqlserver`) |
@@ -650,7 +678,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `lockout_threshold` | int | 5 | failed logins before lock (per account). One exception: while the credential in force is engine-generated (an administrator's account creation and both resets set it), wrong passwords are counted and audited but arm no sign-in lock (ADR 0197 Amendment A). The second-step lock arms as usual |
 | `lockout_minutes` | int | 15 | lockout duration |
 | `lockout_max_minutes` | int | 1440 | the **ceiling** an escalating lock doubles up to (ADR 0197, BACKLOG #1131). A lock doubles per cycle, `lockout_minutes` x 2^(cycle - 1), only where the owner has a way past it: the second-step lock on a local account, and the sign-in lock on a local account with TOTP enrolled, whose owner can sign in with the password and the authenticator code together. Every other lock keeps `lockout_minutes`. Must be at least `lockout_minutes`; set it equal to turn the escalation off. See [SECURITY.md](SECURITY.md), control 1 of the 6.1.1 protection set |
-| `initial_password_expiry_hours` | int | 72 | **(ASVS 6.4.1):** an admin-issued initial/reset credential (a `must_change_password` temp password) that is never claimed **expires** this many hours after it was set. Without it an unused reset password grants an authenticated session indefinitely — and what it permits includes *setting the password*, i.e. account takeover. Keyed on `password_changed_at`; a user who set their own password has `must_change_password = false` and is unaffected. Past the deadline a session opened before it ends the first time it is presented, so it can neither set a new password with the credential ([BACKLOG #2009](BACKLOG.md)) nor finish the second factor ([BACKLOG #2298](BACKLOG.md)). `POST /me/password` and `POST /auth/mfa-verify` ask the deadline again during the request, and no sign-in ceremony re-keys a session once it has passed; a rotation that has passed its last check still completes. Every local account holding such a temporary password is in scope; the engine creates no default account. `0` = no expiry (not recommended on a PHI instance). **Reminder (ASVS 6.4.5, [BACKLOG #1141](BACKLOG.md)):** while such a credential is still unclaimed, an **`initial_credential_expiring`** [`[alerts]`](#alerts) event names the holder (as `user:<username>`) and the deadline once per engine process, in the last third of the window capped at 24 hours (24 hours at the default). At the same moment the holder, and the administrator who issued the credential, each get a security notice at their own notification address ([BACKLOG #2007](BACKLOG.md); see [`docs/SECURITY.md`](SECURITY.md)). The issuer is not told when the audit trail cannot say reliably who that was. None of the reminders has a setting of its own; at `0` nothing expires and none runs. The two notices travel as security notices, so they need `[auth].notify_security_events` and the `[alerts]` SMTP host and sender, not an `email_to`. The operator reminder needs an `[alerts]` **recipient** (`webhook_url`, or `email_to` beside the SMTP host and sender); without one it reaches only the log, so `serve` refuses under `enforce` and warns under `warn` ([BACKLOG #2008](BACKLOG.md); see `security_notifications_required` under [`[alerts]`](#alerts)). |
+| `initial_password_expiry_hours` | int | 72 | **(ASVS 6.4.1):** an admin-issued initial/reset credential (a `must_change_password` temp password) that is never claimed **expires** this many hours after it was set. Without it an unused reset password grants an authenticated session indefinitely — and what it permits includes *setting the password*, i.e. account takeover. Keyed on `password_changed_at`; a user who set their own password has `must_change_password = false` and is unaffected. Past the deadline a session opened before it ends the first time it is presented, so it can neither set a new password with the credential ([BACKLOG #2009](BACKLOG.md)) nor finish the second factor ([BACKLOG #2298](BACKLOG.md)). `POST /me/password` and `POST /auth/mfa-verify` ask the deadline again during the request, and no sign-in ceremony re-keys a session once it has passed; a rotation that has passed its last check still completes. Every local account holding such a temporary password is in scope; the engine creates no default account. `0` = no expiry (not recommended on a PHI instance). **Reminder (ASVS 6.4.5, [BACKLOG #1141](BACKLOG.md)):** while such a credential is still unclaimed, an **`initial_credential_expiring`** [`[alerts]`](#alerts) event names the holder (as `user:<username>`) and the deadline once per credential, in the last third of the window capped at 24 hours (24 hours at the default). A restart inside that window does not send it again ([BACKLOG #2303](BACKLOG.md)). At the same moment the holder, and the administrator who issued the credential, each get a security notice at their own notification address ([BACKLOG #2007](BACKLOG.md); see [`docs/SECURITY.md`](SECURITY.md)). The issuer is not told when the audit trail cannot say reliably who that was. None of the reminders has a setting of its own; at `0` nothing expires and none runs. The two notices travel as security notices, so they need `[auth].notify_security_events` and the `[alerts]` SMTP host and sender, not an `email_to`. The operator reminder needs an `[alerts]` **recipient** (`webhook_url`, or `email_to` beside the SMTP host and sender); without one it reaches only the log, so `serve` refuses under `enforce` and warns under `warn` ([BACKLOG #2008](BACKLOG.md); see `security_notifications_required` under [`[alerts]`](#alerts)). |
 | `login_rate_limit_enabled` | bool | `true` | in-process sliding-window limiter on the **sign-in surface** — `/auth/login`, `/auth/negotiate`, `/auth/mfa-verify` plus the four console entry routes (`POST /ui/login`, `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`) — in front of the per-account lockout. `GET /ui/oidc/start` charges it only when its "you are leaving this site" page is skipped (see `[security].external_link_interstitial`). On shipped defaults that page is shown, and the GET charges nothing. The **same flag** also constructs the per-actor **credential-ceremony** limiter covering `/me/password`, `/me/reauth`, `/me/mfa/confirm` (+ the console re-auth routes); turning it off removes **both** (see [SECURITY.md](SECURITY.md) "Route → limiter map"). |
 | `login_rate_limit_per_ip` | int | 10 | max attempts per client IP per window (`0` disables). **One number, two limiters:** it is also the per-**actor** budget of the credential-**ceremony** limiter (`/me/password`, `/me/reauth`, `/me/mfa/confirm` + the console re-auth routes) — the `_per_ip` name is historical, and retuning it retunes both |
 | `login_rate_limit_global` | int | 60 | max attempts across all clients per window (`0` disables). Sign-in window only — the ceremony limiter has **no** global dimension (`glob=0`) |
@@ -661,7 +689,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `phi_read_rate_limit_window_seconds` | float | 60 | sliding-window length |
 | `admin_write_rate_limit_enabled` | bool | `true` | per-actor anti-automation pacing on the **state-changing admin surface** (ASVS 2.4.2) — **NON-GET only**, charged from one per-actor bucket by `require_step_up`, `require_step_up_action` and `require_paced`. Charged on the `/ui` surface too, by `require_ui` -- the console reaches the handlers in-process, so it re-applies the floor rather than inheriting it ([BACKLOG #287](BACKLOG.md)) |
 | `admin_write_rate_limit_per_actor` | int | 12 | max state-changing admin writes per actor per window (`0` disables this dimension); there is deliberately **no global arm** — one operator's bulk work must never throttle another's |
-| `admin_write_rate_limit_window_seconds` | float | 15.0 | sliding-window length, above 0. The default is a **provisional** human-timing floor ([BACKLOG #287](BACKLOG.md)). A script making more than 12 admin writes in 15 s is refused. Over budget → `429` + `Retry-After: 1` on the JSON API and `Retry-After: 10` on the `/ui` console, refused before any further work |
+| `admin_write_rate_limit_window_seconds` | float | 15.0 | sliding-window length, above 0. The default is a **provisional** human-timing floor ([BACKLOG #287](BACKLOG.md)). A script making more than 12 admin writes in 15 s is refused. Over budget → `429` + a `Retry-After` naming the caller's own wait, the same on the JSON API and the `/ui` console ([SECURITY.md](SECURITY.md), *The write floor's `Retry-After` is the actor's real wait*), refused before any further work |
 | `admin_write_min_interval_seconds` | float | 0.15 | the least time between two admin writes by one actor ([BACKLOG #2301](BACKLOG.md), ASVS 2.4.2). A write that lands sooner after the same actor's last admitted write is refused like an over-budget one, with the same `429`. The count above admits its budget back to back; this gap makes a burst wait. The default is a **provisional** human-timing floor from the keystroke-level model, derived in the comment on the setting. `0` turns the gap off. While `admin_write_rate_limit_enabled` is on, it must be shorter than `admin_write_rate_limit_window_seconds`, or the settings are refused at load |
 | `notify_security_events` | bool | `true` | email the affected user on lockout / first-success-after-failures / password-email-role-disable changes (ASVS 6.3.5/6.3.7). Reuses the `[alerts]` SMTP transport, sent to the user's own address; no SMTP configured → email skipped. The `GET /me/security-events` feed (over the audit log) is always available regardless of this toggle. On a **PHI production** instance this push must be *effective* — see `[alerts].security_notifications_required` (BACKLOG #188). |
 | `require_mfa` | | | **→ moved to `[security].require_mfa`** (ADR 0118) — set it there; no longer accepted in `[auth]`. |
@@ -834,7 +862,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `forward_hop_attested` | bool | `false` | **acknowledged opt-out** for a plaintext / unverified-TLS collector hop (#200, ADR 0092 — the `[logging]` sibling of a connection's `tls_hop_attested`). A hop that is not verified TLS is now decided by the shared posture gradient: **refused** on an enforcing instance, warned on a non-enforcing one, allowed for a loopback collector. The synthetic arm is gone with the declaration that fed it ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)). Set this (with a reason) to affirm the hop is secure by other means — e.g. a dedicated out-of-band management VLAN |
 | `forward_hop_attested_reason` | str | — | why the hop is secure, recorded for the audit trail. **Mandatory when `forward_hop_attested = true`** (ADR 0153 retro-fitted the flag-implies-reason rule: an attestation that suppresses a refusal must record WHY, or it is worthless when audited) — the flag alone now fails at load. Rejected without the flag, and must be non-empty |
 | `forward_spool_dir` | str | `log-spool/<engine or shard id>` beside `[store].path` | the on-disk spool behind the forwarder (BACKLOG #1966, ADR 0200). Records the collector has not taken (down, backing off, or still queued at shutdown) are kept here in order and sent when it answers. Best effort, not at least once: after a collector reset the first send on the dead connection can be lost, a restart can resend up to one segment (12.5 MB at the default cap), and over UDP no failed send is detected (ADR 0200). It holds only text the PHI, credential and control-character filters already processed; PL-1 like the app log ([PHI.md](PHI.md) section 2). Each engine shard gets its own subdirectory, because the spool locks its directory. With a spool, a TCP or TLS collector down at start is retried instead of dropped for the process life |
-| `forward_spool_max_bytes` | int | `100000000` | cap on the spool's size on disk. When full, the newest record is dropped and the drop reported, which keeps the oldest evidence. `0` turns the spool off, and with it the deferred start. It does NOT turn off the forwarding start gate: under `[security].enforcement = "enforce"` a PHI instance refuses to start unless forwarding is verified TLS (`forward_protocol = "tls"`, verification on) to a `forward_host` that is not loopback, whatever the spool (BACKLOG #1966, owner ruling R4 (a)). The gate reads configuration only; a host name that resolves to loopback passes it, a residual #1199 owns |
+| `forward_spool_max_bytes` | int | `100000000` | cap on the spool's size on disk. When full, the newest record is dropped and the drop reported, which keeps the oldest evidence. `0` turns the spool off, and with it the deferred start. It does NOT turn off the forwarding start gate: under `[security].enforcement = "enforce"` a PHI instance refuses to start unless forwarding is verified TLS (`forward_protocol = "tls"`, verification on) to a `forward_host` that is not loopback and is not this host's own OS name or one of its own addresses, whatever the spool (BACKLOG #1966, owner ruling R4 (a); ADR 0200 Amendment A, vault BACKLOG #2375). The gate reads configuration and local host state: the OS host name and, for an IP literal, the routing table's source address. It sends no packet and resolves no name. If that local read fails, the gate passes and logs a WARNING. At least a host name that resolves to loopback, and an alias that resolves to this host, still pass it, a residual #1199 owns |
 | `require_time_sync` | bool | `false` | **opt-in** startup clock-sync gate (ASVS 16.2.2, ADR 0080): before listeners start, probe `ntp_peer` and warn on skew. Requires `ntp_peer`. Default = no-op |
 | `ntp_peer` | str | — | NTP/SNTP host to compare the local clock against (**required** when `require_time_sync`) |
 | `time_sync_max_skew_seconds` | float | `2.0` | \|local − peer\| above this is "skewed" (must be > 0) |
@@ -872,6 +900,84 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 > longer a synthetic arm to fall into. To keep a plaintext off-box hop, either move to `forward_protocol = "tls"` or set
 > `forward_hop_attested` with a reason — an acknowledged escape, not a silent default.
 
+#### When the forwarder is absent or losing records
+
+A configured forwarder whose collector cannot be reached or verified at start does not stop the
+engine. A hop the start gate refuses still does; see `forward_spool_max_bytes` above. The engine tells you
+about a missing or failing forwarder two ways (BACKLOG #2612).
+
+- **The `log_forward_failed` alert.** Its `connection` names the kind and the engine process:
+  `forwarder:<kind>@<process>`, where `<process>` is `node:<node_id>` on a cluster node or
+  `shard:<id>` on an engine shard. A lone engine that owns its store drops the suffix:
+  `forwarder:<kind>`. So each process sharing a store has its own alert, and the alert says which
+  process lost its forwarder. The suffix is built the way the `intake_paused` suffix is, with the
+  same 200-character cap. An `[[alerts.rules]]` rule matches its `connection` glob against the
+  whole key, so where a suffix applies write `forwarder:not_installed*`; a rule on the bare
+  `forwarder:not_installed` matches a lone engine only. On a cluster node with no pinned
+  `[cluster].node_id` the suffix holds this engine's own host name and process id. They go
+  wherever the key goes: at least the log line, the alert list, the email subject and the webhook.
+
+  Every alert event carries a reason in fixed words, as `detail`, and a `count`. The count is a
+  number of lost records on `dropping` only. The other kinds always send `0`, and that `0` says
+  nothing about losses. The alert-list row keeps the reason and not this count. A custom
+  `email_body_template` has no placeholder for either. The engine checks at start and then every
+  30 seconds. `kind` is a fixed word, at least one of these.
+  - `not_installed`: no forwarder is attached, or its sending thread has ended, so the forwarder
+    sends nothing. It fires on the first check that finds the forwarder absent, then again about
+    every five minutes. The reason is `permanent` or `transient` for a failed start, or
+    `stopped`. Whatever the reason word, nothing attaches a forwarder to a running engine: fix
+    the cause, then restart the engine.
+  - `dropping`: a loss count rose. The reason names which. `count` is `lost` from the status
+    field below: the records the engine has counted as lost since the process started. It is a
+    floor, because some losses are not counted.
+  - `spool_unreadable`: a read of the on-disk spool failed. The spool keeps its records, and
+    they are not sent until a read succeeds.
+  - `not_sending`: every check for five minutes found `send_failing` true, and a send has
+    failed since the last alert. A spool keeps the records on disk while it has room. It is
+    not raised when the same check raises `dropping` for an unreachable collector. Without a
+    spool that is the usual case, so page on both kinds.
+
+  The kinds share one window of about five minutes. One check can raise more than one kind.
+  After a check raises any, no check raises one again until the window ends. The one exception
+  is the first check that finds the forwarder absent.
+  With an `[alerts]` notifier the alert has a row in the alert list. Nothing closes that row;
+  resolve it by hand. A cluster node keeps
+  its name across a restart only when `[cluster].node_id` is pinned. An unpinned node gets a new
+  id on every start, so a fault that outlasts a restart opens a new alert beside the old one.
+- **`log_forwarder` on `GET /status`.** It is `null` when no forwarder is configured. Otherwise
+  `state` is `healthy`, `unconfirmed`, `degraded` or `not_installed`. Beside it are `installed`,
+  `start_failure`, `delivery_confirmed`, `send_failing`, `spool_read_faulted` and the counts:
+  `lost`, `queued`, `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped`, `spool_skipped`
+  and `spool_read_errors`. The web console's status page has a row for the forwarder. Its health
+  indicator turns to warn when the state is `not_installed` or `degraded`.
+
+`degraded` means `send_failing` is true, the last spool read failed, or `lost` is above zero.
+`send_failing` is true after a send that failed. It is also true from a start that could not
+connect until the first send that works.
+`lost` never goes down while the forwarder runs, so a loss keeps the state `degraded` for that
+long. If the forwarder then stops, the state reads `not_installed`.
+
+**Over UDP the engine cannot see a lost record.** UDP is the default protocol. A UDP send to a
+collector that is down reports no failure, and the engine does not count a UDP send error its own
+host reports either. So a collector that is down looks the same as one that is up. The only
+losses the engine counts are queue and spool losses. `delivery_confirmed` is `false`, a
+forwarder with no fault seen reads `unconfirmed` and never `healthy`. In the `unconfirmed` and
+`degraded` states the console row says that delivery is not confirmed. The health indicator does not warn for that alone. Use `tcp` or
+`tls` where a silent loss must page.
+
+Neither the alert nor `log_forwarder` on `GET /status` carries a record, the collector's address
+or an error text. The status field holds counts, true-or-false flags and fixed words. The alert
+holds its key, its reason words and its `count`. The key carries the process suffix where one
+applies, and the alert item above says what the suffix holds. The count in the alert list is a
+different number: how many times the engine has raised that alert.
+
+`queued` is how many records sit on the in-memory hand-off queue right now. It does not count
+records waiting in the on-disk spool, and no field does. Every other count runs from the start of
+the process. While the state is `not_installed`, every count reads zero, whatever was counted
+before. Each engine process has
+its own forwarder and watches its own: every engine shard, and a cluster standby too.
+`GET /status` reports the process that answered.
+
 ### `[retention]`
 Enforced by the engine's retention/purge task ([pipeline/retention.py](../messagefoundry/pipeline/retention.py)).
 A purge **NULLs the PHI *body*** past its window while **keeping the message row** (counts,
@@ -885,9 +991,10 @@ opt-in on a PHI instance**: each *unset* window that carries an auto-bound —
 `[security].enforcement` dials, and the defaulted settings are named on stderr. A window set
 **explicitly to `0`** is not defaulted: that **refuses to start (exit 2)** under `enforce`, and warns
 under `warn`. This paragraph used to state the opposite split — refusal under `enforce`, auto-bound
-only on a non-enforcing instance — which the shipped gate in
-[`__main__.py`](../messagefoundry/__main__.py) refutes; an *unset* window has not refused since the
-auto-bound moved to both dials. All three built-in environment names (`dev`, `staging`, `prod`)
+only on a non-enforcing instance — which the shipped gate
+(`evaluate_retention_gate` in
+[`retention_classification.py`](../messagefoundry/config/retention_classification.py)) refutes; an
+*unset* window has not refused since the auto-bound moved to both dials. All three built-in environment names (`dev`, `staging`, `prod`)
 derive PHI. The audited opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
 suppresses the auto-bound as well as the refusal. **Thirty days is the engine's floor against an
 accidentally unbounded window, not your retention policy — set each window to the number your site
@@ -899,6 +1006,15 @@ acknowledgement. Under `enforce`, a tier with neither **refuses to start (exit 2
 names the tier and its switch. Under `warn` it warns and starts. A start under an acknowledgement writes
 a WARNING-level `AUDIT:` line naming the tier. `allow_keeping_phi_indefinitely` does not count for
 these tiers, and one tier's switch does not cover another.
+
+`messagefoundry check` runs this gate as a required check, `retention`, through the function
+`serve` calls. So a refusal fails the check in the words `serve` would print. It reads the settings
+file `check` resolves and the environment `check` runs in. `check` has no `--env`, so settings that
+name no environment are still judged, and the line prints a placeholder where `serve` would print
+the name. A pass is about this gate alone; `serve` has other start gates.
+
+`supervise` does not pre-check this gate. On settings it refuses, each engine shard would refuse to
+start, and the supervisor would restart it until its crash-loop breaker trips. Run `check` first.
 
 | Tier | Applies when | Its acknowledgement |
 |---|---|---|
@@ -914,7 +1030,7 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `messages_days` | | | **→ moved to `[security].delete_message_bodies_after_days`** (ADR 0118) — set it there; no longer accepted in `[retention]`. |
-| `dead_letter_days` | int | `0` | past N days, null the bodies of **dead-lettered** rows at **every stage**. A dead `ingress` or `routed` row carries the whole raw body, so the purge reaches it as well as a dead outbound row (BACKLOG #1188). This is their own window, because a dead row stays replayable until purged. Unset or `0`, this global window meets the startup posture gate described above this table; `0` = keep only where that gate allows it. An outbound's own `dead_letter_days` overrides it for that outbound's dead rows only (see *Per-connection overrides* below). The gate does not read that override. A dead row at any other stage always takes this global window. *Corrected 2026-09-28 (BACKLOG #1186):* this row used to scope the purge to outbound rows, which BACKLOG #1188 made false. |
+| `dead_letter_days` | int | `0` | past N days, null the bodies of **dead-lettered** rows at **every stage**. A dead `ingress` or `routed` row carries the whole raw body, so the purge reaches it as well as a dead outbound row (BACKLOG #1188). This is their own window, because a dead row stays replayable until purged. Unset or `0`, this global window meets the startup posture gate described above this table; `0` = keep only where that gate allows it. An outbound's own `dead_letter_days` overrides it for that outbound's dead rows only (see *Per-connection overrides* below). An override of `0` meets its own gate, described there. A dead row at any other stage always takes this global window. *Corrected 2026-09-28 (BACKLOG #1186):* this row used to scope the purge to outbound rows, which BACKLOG #1188 made false. |
 | `allow_unbounded_phi` | | | **→ moved to `[security].allow_keeping_phi_indefinitely`** (ADR 0118) — set it there; no longer accepted in `[retention]`. |
 | `state_max_age_days` | int | `0` | past N days, **delete** transform-state entries (ADR 0005) last written before the cutoff — keeps the in-memory state cache + table bounded. A simple global age purge (by `set_at`); per-namespace policy is a follow-up. `0` = keep |
 | `connection_event_retention_hours` | int | `0` | past N **hours**, **delete** `connection_event` rows (the `[diagnostics]` #46 transport/lifecycle log — high-volume under a connect-per-message sender or a probe storm, so its own short window in **hours**, not days). `0` = inherit the `messages_days` body window (the ADR 0021 §7.5 default). |
@@ -936,6 +1052,29 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > pruning** (`prune_documents_after` + `prune_documents_min_bytes`, [ADR 0042](adr/0042-embedded-document-pruning.md))
 > to strip bulky base64 attachments while keeping the readable message. These live on the connection (code-first
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
+>
+> **An override of `0` needs the same acknowledgement as a global `0`** (BACKLOG #2368). It keeps that
+> connection's PHI bodies forever, whatever the global window says. The overrides live in the graph, so
+> `serve` checks them when it loads the graph, at least at startup and on every config reload:
+>
+> - Without `[security].allow_keeping_phi_indefinitely = true`, under `enforce`, the engine refuses the
+>   graph and names each connection. At startup the engine does not start. On a reload the running
+>   graph stays.
+> - Without it, under `warn`, the engine logs a warning naming each connection and loads the graph.
+> - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection,
+>   each time it passes one. A dry-run reload counts.
+>
+> **That switch is not scoped to one connection.** It also turns off the 30-day default for each
+> unset window that carries one (those named in the posture paragraph above), and it acknowledges
+> every connection's `0`, including one added by a later reload. Before you set it for one feed, set
+> each of those windows to an explicit number of days.
+>
+> The acknowledgement is read once, at startup. `messagefoundry connection upsert` and `remove` refuse
+> an edit an enforcing engine would refuse. `messagefoundry check` reads the same decision as a
+> required check, `retention-overrides`, so a graph an enforcing engine would refuse fails the check
+> in the same words. `supervise` reads it once before it starts an engine shard, and refuses to start
+> the fleet on a graph each engine shard would refuse. Neither writes the warning or the `AUDIT:`
+> line; those belong to the engine that loads the graph.
 
 > **Backend coverage.** The retention/purge pass is **backend-agnostic** and every PHI purge runs on
 > **all three** backends (SQLite, SQL Server, Postgres). `wal_checkpoint_seconds` and `vacuum_at` are
@@ -1282,7 +1421,15 @@ does `queue_buildup`. That spacing is fixed. The notifier's throttle (`realert_s
 count them. So a cooldown under 300 seconds does not page faster. A second pause soon after the first
 raises at once, but the throttle may hold its page; a later reminder in that pause sends it. With no
 `[alerts]` transport the engine raises no event; its own WARNING line records each pause. Its
-`connection` is `intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert.
+`connection` names the bound and the engine process: `intake:staged_depth@<process>` or
+`intake:disk_floor@<process>`, where `<process>` is `node:<node_id>` on a cluster node or
+`shard:<id>` on an engine shard. A lone engine that owns its store drops the suffix:
+`intake:staged_depth` or `intake:disk_floor`. So each bound on each process is its own alert. Every
+process sharing a store pauses its own listeners, and each one raises and clears only its own
+alert, so one node's clear never resolves another node's pause. The pause is not leader-gated, so
+a cluster standby measures too and raises its own alert while the shared backlog is over the bound,
+even with nothing of its own to pause. A subject longer than 200
+characters keeps a prefix of the process label plus a checksum of the whole label.
 A rule cannot attach a `control_action` to `intake_paused`, because it is not a connection-scoped
 event (see `control_action` in the rule table below).
 
@@ -1294,11 +1441,17 @@ gives the free MiB now. `value` is the measurement taken when the event was rais
 payload carries no message content and no PHI.
 
 Its inverse, `intake_resumed`, pages nobody and cannot be a rule's `event_type`. It resolves the open
-`intake_paused` for the same bound. After a start, the engine also raises it once for each bound that
-is turned off, with `value` and `limit` at 0. It raises it once more for a bound first measured clear
-of its resume line. This clears a pause that an earlier run left open when it stopped. A bound first
-measured between its resume line and its limit reports nothing until it leaves that band, because
-another node on the same store may still be paused there.
+`intake_paused` for the same bound on the same process. After a start, the engine also raises it
+once for each bound that is turned off, with `value` and `limit` at 0. It raises it once more for
+each bound it did not pause at its first measurement, even one between its resume line and its
+limit. This clears a pause that an earlier run of the same process left open when it stopped.
+
+That relies on the process keeping its name across a restart. An engine shard does. A cluster node
+does only when `[cluster].node_id` is pinned; otherwise its id is new on every start. An unpinned
+node therefore clears its own open pause alerts when it stops, since its next start reports under a
+new name. The stop waits up to 5 seconds for that write before it closes the store. An unpinned node
+that crashes while paused, or whose clear does not land in time, leaves its alert open; resolve it
+in the alert list, or pin `[cluster].node_id`.
 
 **`config_changed` says a start loaded different config bytes than the store's baseline** (vault
 BACKLOG #2597). At each start the engine compares its config fingerprint (ADR 0041 D1) with the
@@ -1369,9 +1522,25 @@ path, no git commit and no message content.
 | `email_subject_template` | str | _unset_ | optional **operator-editable** alert-email subject (#138, [ADR 0127](adr/0127-operator-editable-alert-email-templates-with-a-non-phi-variable-allowlist.md)). Unset (the default, with its two siblings) = the fixed subject + key/value body, byte-identical to before. When set it is a `{name}` template over a **closed non-PHI variable allow-list**, validated at config load and **fail-closed** — an unknown or message-derived reference raises rather than rendering |
 | `email_body_template` | str | _unset_ | the same, for the **plain-text** body. The plain-text part is **always** sent, even when an HTML alternative is configured |
 | `email_html_template` | str | _unset_ | the same, adding an **HTML alternative** part whose substituted *values* are HTML-escaped. Never HTML-only — it supplements `email_body_template`, it does not replace it |
-| `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start (exit 2)**. **The refuse/warn split is `[security].enforcement`, not the production tier:** the gate reads `enforcing` ([`__main__.py`](../messagefoundry/__main__.py)), which is `enforce` by default on **all three** built-in env names, and all three derive PHI ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — so `serve --env dev` and `--env staging` on shipped defaults with no `[alerts]` SMTP are refused exactly like `prod`, not warned. (Measured: `dev`/`staging`/`prod` all resolve `data_class=phi, enforcing=True, channel_ready=False`.) It downgrades to a warning only under `enforcement = warn`. **This gate is why `[alerts]` is not optional on a stock instance** — configure the SMTP transport, or set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). **The same gate also requires a reminder recipient (BACKLOG #2008, ASVS 6.4.5).** Host and sender are enough for the per-user notices, which are addressed to each account. The credential reminders (`initial_credential_expiring`, `cert_expiry`) go to the `[alerts]` notifier instead, and that is built only from `webhook_url`, or from `email_smtp_host` + `email_from` + at least one `email_to`. So when either reminder can fire (`[auth].initial_password_expiry_hours` or `[cert_monitor].warn_days` above `0`) and neither recipient is set, `serve` refuses under `enforce` and warns under `warn`. Setting this flag `false` waives that check too, with an audit line saying the reminders reach only the log. |
+| `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start (exit 2)**. **The refuse/warn split is `[security].enforcement`, not the production tier:** the gate reads `enforcing` ([`__main__.py`](../messagefoundry/__main__.py)), which is `enforce` by default on **all three** built-in env names, and all three derive PHI ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — so `serve --env dev` and `--env staging` on shipped defaults with no `[alerts]` SMTP are refused exactly like `prod`, not warned. (Measured: `dev`/`staging`/`prod` all resolve `data_class=phi, enforcing=True, channel_ready=False`.) It downgrades to a warning only under `enforcement = warn`. **This gate is why `[alerts]` is not optional on a stock instance** — configure the SMTP transport, or set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). **The same gate also requires a reminder recipient (BACKLOG #2008, ASVS 6.4.5).** Host and sender are enough for the per-user notices, which are addressed to each account. The credential reminders (`initial_credential_expiring`, `cert_expiry`, `secret_rotation`) go to the `[alerts]` notifier instead, and that is built only from `webhook_url`, or from `email_smtp_host` + `email_from` + at least one `email_to`. So when any reminder can fire (`[auth].initial_password_expiry_hours`, `[cert_monitor].warn_days` or `[secret_rotation].warn_days` above `0`; the last since BACKLOG #2227) and neither recipient is set, `serve` refuses under `enforce` and warns under `warn`. Setting this flag `false` waives that check too, with an audit line saying the reminders reach only the log. |
 | `realert_seconds` | num | 300 | suppress re-notifying the same (event, connection) more often than this (anti-spam for a flapping lane). A matching rule's `cooldown_seconds` overrides it. |
 | `rules` | list | `[]` | ordered `[[alerts.rules]]` table array — per-event severity, transport routing, thresholds, suppression, cooldown (see below). Empty = today's behaviour (every event → every transport at `warning`). |
+| `security_signals` | bool | `true` | the security-signal rule layer over the audit stream (vault BACKLOG #2613). `false` switches off all six detectors below, the DEBUG and posture ones included. With no transport configured, the signals reach the log at `WARNING`, as every alert does |
+| `security_window_seconds` | num | 300 | the sliding window the four counting detectors use. Must be finite and above 0 |
+| `security_signin_failures` | int | 20 | raise `signin_failure_burst` when one client address has this many refused sign-ins (`auth.login_failed`) inside the window. A directory sign-in refused by a live lock is not counted: its row is withheld from readers without `users:manage`. Keyed `signin:<address>`, never the typed username. `0` = off |
+| `security_denials` | int | 20 | raise `access_denied_burst` when one account has this many `auth.permission_denied`, `auth.channel_denied` and `auth.mfa_denied` rows inside the window. Keyed `account:<username>`. `0` = off |
+| `security_body_views` | int | 100 | raise `body_view_burst` when one account reads this many stored bodies inside the window: `message_body_view` and `attachment_download` rows, an `outbound.read` that returned a payload, and a `response.read` that returned reply bodies. `0` = off |
+| `security_export_messages` | int | 5000 | raise `bulk_export` when one account's `messages_export` calls select this many messages in total inside the window. `0` = off |
+
+The layer has two more detectors with no threshold. `log_level_debug` fires when `PATCH /logging/level`
+sets DEBUG, and when a production instance refuses that request. `posture_loosened` fires when a start
+records a non-empty loosenings list in its `config_loaded` audit row. A site that loosens on purpose
+pages on every start; suppress it with an `[[alerts.rules]]` row for `posture_loosened`, which keeps
+the instance on the alert list. Neither of these two resolves itself: an operator resolves it.
+Past five subjects alerting from one counting detector inside one window, later ones share a
+`<prefix>:*` subject. An account lock raises no alert: the lock rows are withheld from readers
+without `users:manage`, and the alert list is readable under `monitoring:diagnose`.
+`docs/SECURITY.md` §Audit says how the layer reads the audit stream.
 
 #### `[[alerts.rules]]` — per-event routing (ADR 0014)
 Each rule is a row in an **ordered** `[[alerts.rules]]` array; the **first matching rule wins** (so
@@ -1381,14 +1550,14 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
 | `severity` | str | `warning` | `info` \| `warning` \| `critical` — tagged onto the event (webhook JSON + email subject) for downstream triage |
 | `transports` | list | _all_ | which transports fire: subset of `["webhook", "email"]`; **unset = all configured**; **`[]` = SUPPRESS** (drop silently) |
 | `cooldown_seconds` | num | _global_ | override `realert_seconds` for matching events (e.g. re-page a critical sooner) |
-| `control_action` | str | _unset_ | `restart_inbound` \| `restart_outbound` — restart a connection when the rule fires ([ADR 0128](adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md)). **Allowed only with a connection-scoped `event_type`** (BACKLOG #1898). The source of record is `_ALERT_CONTROL_EVENT_TYPES` in `messagefoundry/config/settings.py`; at the time of writing it holds `connection_stopped`, `connection_error`, `queue_buildup`, `message_stall`, `saturation` and `lane_stuck`. Config load refuses the action with `any` and with every other type. Those other types put a stand-in in `connection`, such as a bare username, `store` or a cert label. A restart aimed at a stand-in could hit an unrelated connection with the same name. With no `control_target`, the action aims at the event's own name, so pair `restart_outbound` with events from outbound connections and `restart_inbound` with events from inbound ones |
+| `control_action` | str | _unset_ | `restart_inbound` \| `restart_outbound` — restart a connection when the rule fires ([ADR 0128](adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md)). **Allowed only with a connection-scoped `event_type`** (BACKLOG #1898). The source of record is `_ALERT_CONTROL_EVENT_TYPES` in `messagefoundry/config/settings.py`; at the time of writing it holds `connection_stopped`, `connection_error`, `queue_buildup`, `message_stall`, `saturation` and `lane_stuck`. Config load refuses the action with `any` and with every other type. Those other types put a stand-in in `connection`, such as a bare username, `store` or a cert label. A restart aimed at a stand-in could hit an unrelated connection with the same name. The notifier also skips the action, logged, for an event whose `connection` key is not a connection name, such as `reference:<name>`, even when `control_target` is set (BACKLOG #2527). With no `control_target`, the action aims at the event's own name. Inbound and outbound names are separate namespaces, and the event does not say which one its name came from. So the restart runs only when that name is declared on the action's side (an inbound for `restart_inbound`, an outbound for `restart_outbound`) and not on the other. Otherwise the engine logs a WARNING and restarts nothing; set `control_target` to act on a name both sides declare (BACKLOG #2528) |
 | `control_target` | str | _the event's connection_ | the connection `control_action` restarts, when it is not the one that fired. Config load refuses a value that is not a connection name, and refuses it on a rule with no `control_action` |
 
 ```toml
@@ -1422,6 +1591,17 @@ transports = ["email"]
 connection = "OB_LOADTEST"
 transports = []   # suppress every event for this connection
 ```
+
+> **A rule that can send a credential reminder to no transport is named at every start** (BACKLOG
+> #2008, ASVS 6.4.5). That is a rule whose `event_type` is `any`, `initial_credential_expiring`,
+> `cert_expiry` or `secret_rotation`, with `mute = true`, `transports = []`, or an `escalate` tier
+> with `transports = []`. The serve-time loosening warning and `GET /security/posture` list it as
+> `alerts.rules`. The check reads each rule alone, so the last example above is named too: its
+> `connection` glob decides whether a reminder ever matches it, and the check does not try to tell.
+> An earlier rule that routes the reminders does not clear the entry either. The only way off the
+> list is a rule that cannot match a reminder event: one rule per non-reminder `event_type` you want
+> suppressed, in place of the one `any` rule. That is more rules, and the warning is the cost of the
+> shorter form.
 
 > A rule routing to a transport that isn't configured (e.g. `transports = ["email"]` with a webhook
 > but no SMTP settings) is rejected at startup, so a typo can't silently black-hole an alert.
@@ -1540,7 +1720,7 @@ window and alerts on every scan.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `warn_days` | int | 30 | alert when a served cert expires within this many days; **`0` disables** the monitor |
+| `warn_days` | int | 30 | alert when a served cert expires within this many days; **`0` disables** the monitor. `0`, or any value below `30`, is named as the security loosening `cert_monitor.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
 | `check_interval_seconds` | num | 43200 | rescan cadence (default 12h); the per-cert re-alert throttle is `[alerts].realert_seconds` |
 | `crl_max_reloads` | int | 10000 | how many replaced copies of one CRL file a running hop takes before it refuses the next and asks for a restart (BACKLOG #299). Must be above 0. The CRL reload reads it even when `warn_days` is `0`. The default outlasts a year of hourly CRLs (8,760). **What each held copy costs**, measured on CPython 3.14 / OpenSSL 3.5.7: about four times the CRL file's size plus about 1.5 KB of memory. Each handshake takes about 2 microseconds longer per copy held for its issuer. So 10,000 copies of a 1 KB CRL hold about 40 MB and add about 20 ms to each handshake. Lower it for a large CRL that is reissued often. |
 
@@ -1642,9 +1822,12 @@ refuses to start the engine, with an `enforced = true` alert. So does a listed c
 a keyed store with no recorded age, which means the rotation-meta reconcile failed. The error names each
 class, its age, the limit and the two ways out. Rotate the secret, and the next start detects the new
 value and resets its clock. Or remove the class from the list, and it goes back to alert-only. The list
-ships empty, so a class you do not list only alerts, as before. Under `enforcement = warn` the list does
+ships empty, so a class you do not list only alerts, as before. "Alert-only" holds while `warn_days` is
+above `0`; with `warn_days = 0` the periodic reminder is off and an unlisted class does not alert at all. Under `enforcement = warn` the list does
 nothing but log a warning. A keyless store, and a `vault_transit` store, fingerprint no secrets, so
-there the list refuses nothing and the engine logs a warning saying so.
+the engine tracks no non-DEK class there at all. On those stores the list refuses nothing, **and no
+non-DEK class raises a rotation alert either**, listed or not; the engine logs a warning saying so
+(BACKLOG #2320).
 
 Valid entries are `MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_ALERTS_EMAIL_PASSWORD`,
 `MEFOR_AUTH_OIDC_CLIENT_SECRET`, `MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY`,
@@ -1662,7 +1845,7 @@ tracked; set `warn_days = 0` to disable the reminder.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `warn_days` | int | 14 | alert when a tracked secret is due within this many days; **`0` disables** the reminder |
+| `warn_days` | int | 14 | alert when a tracked secret is due within this many days; **`0` disables** the reminder. `0`, or any value below `14`, is named as the security loosening `secret_rotation.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
 | `check_interval_seconds` | num | 86400 | rescan cadence (default 24h); the per-secret re-alert throttle is `[alerts].realert_seconds` |
 | `store_key_last_rotated` | str | — | ISO `YYYY-MM-DD` the store DEK was last rotated; **unset ⇒ the DEK is still tracked live-by-default** off a persisted first-seen stamp (this date is an override) |
 | `store_key_max_age_days` | int | 365 | rotate the store DEK within this many days of its effective last-rotated (the operator date if set, else the persisted stamp) |
@@ -1822,7 +2005,7 @@ then. The design, including what it can and cannot promise about split-brain on 
 Leaving the block out, or switching `enabled` off, changes nothing. A switched-off block is never
 refused for the values it holds, but unknown keys in it are still refused, as in every section. The
 block is file-only. There is no `MEFOR_CLUSTER_VIP_*` environment override, and such a variable is
-dropped like any other unrecognized env key.
+refused at load like any other unrecognized key under a known section.
 
 With `enabled = true` the engine **refuses to load** when:
 
@@ -1903,7 +2086,7 @@ a warm DR-site engine is a non-promotable cluster member, not a lease-contending
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | is this deployment a DR standby box at all? `false` = the normal run-profile (every connection starts, subject only to ADR 0031), byte-unchanged |
-| `activate` | bool | `false` | should this box come up **under the DR run-profile** on this boot — the startup activation latch, distinct from the runtime `POST /dr/activate` endpoint. Enabled but `activate = false` is *provisioned-but-passive*: the box binds **no** inbound listener, of any tier (vault BACKLOG #3140). ADR 0048's load balancer moves the VIP to the node that answers, so a passive box must answer on nothing. Each inbound reads `status: "filtered"`, and the start logs one WARNING saying why. Its outbounds are built as usual. A reload or dry run still checks the listeners an activation would bind. So a config the activation would refuse is refused before the disaster. A bind fault that only a bind can find, such as a port in use, shows only when the activation binds. An operator start of an inbound still binds it, until the next reload parks it again or the close of its schedule window stops it. An alert rule's restart and the scheduler bind nothing. `POST /dr/activate` then turns the run-profile on in place: it re-applies the graph the engine is already running, parks every connection below `priority_threshold` (`status: "filtered"`), and keeps it parked across later reloads. While an outbound is parked, an operator start, stop or restart of it answers `409`. An alert rule's restart of a parked connection does nothing. `POST /dr/release` parks every inbound before it unbinds them and drains, then stops parking outbounds. The next reload binds no listener, as on any passive box. A parked outbound then runs again, unless an operator or its schedule had paused it first. An `auto_start = false` outbound stays parked by its own gate. A failed release leaves the box active, with the run-profile's parks in place. It also parks a below-threshold inbound an operator had started, when the release stopped it and it is still down. Only an operator start binds that one again. The listeners at or above `priority_threshold` that it unbound stay down. `POST /config/reload` binds them again, and so can their schedule window or an alert rule's restart. A reload skips an `auto_start = false` one. The activation applies nothing from the config dir: it only digests it, for the audit record. If the running config dir on disk no longer matches the running graph, the `dr.activate` audit row records both digests and the engine logs a WARNING; only `POST /config/reload` applies those bytes. A no-op unless `enabled` |
+| `activate` | bool | `false` | should this box come up **under the DR run-profile** on this boot — the startup activation latch, distinct from the runtime `POST /dr/activate` endpoint. Enabled but `activate = false` is *provisioned-but-passive*: the box binds **no** inbound listener, of any tier (vault BACKLOG #3140). ADR 0048's load balancer moves the VIP to the node that answers, so a passive box must answer on nothing. Each inbound reads `status: "filtered"`, and the start logs one WARNING saying why. The box also delivers nothing (vault BACKLOG #3262). No outbound is started: each reads `status: "filtered"` and holds its rows, and an operator start, stop or restart of one answers `409`. A DR box is seeded from a backup of the primary's store, which can hold rows the primary had not delivered, and the primary may still be alive and delivering them. The router and transform stages still run, so a restored row moves to the outbound stage and waits there. A handler's live lookup therefore still runs on a passive box, and a routing or transform failure still alerts. A reload or dry run still checks the listeners an activation would bind. So a config the activation would refuse is refused before the disaster. A bind fault that only a bind can find, such as a port in use, shows only when the activation binds. An operator start of an inbound still binds it, until the next reload parks it again or the close of its schedule window stops it. An alert rule's restart and the scheduler bind nothing. `POST /dr/activate` then turns the run-profile on in place: it re-applies the graph the engine is already running, parks every connection below `priority_threshold` (`status: "filtered"`), and keeps it parked across later reloads. While an outbound is parked, an operator start, stop or restart of it answers `409`. An alert rule's restart of a parked connection does nothing. `POST /dr/release` parks every inbound before it unbinds them and drains. When the drain ends it parks every outbound, so the released box delivers nothing, as on any passive box, closes their connectors, and the next reload starts none of them. A row the drain left, or one held on an outbound the profile parked, stays queued on this box, and the `dr.release` audit row counts them. The next activation delivers the ones on an outbound at or above `priority_threshold`. An `auto_start = false` outbound an operator had started is parked with the rest and then takes its own gate's answer, so only an operator start brings it up again. The others are for the operator to reconcile against the primary, as ADR 0048's fail-back runbook says. A failed release leaves the box active, with the run-profile's parks in place. It also parks a below-threshold inbound an operator had started, when the release stopped it and it is still down. Only an operator start binds that one again. The listeners at or above `priority_threshold` that it unbound stay down. `POST /config/reload` binds them again, and so can their schedule window or an alert rule's restart. A reload skips an `auto_start = false` one. The activation applies nothing from the config dir: it only digests it, for the audit record. If the running config dir on disk no longer matches the running graph, the `dr.activate` audit row records both digests and the engine logs a WARNING; only `POST /config/reload` applies those bytes. A no-op unless `enabled` |
 | `activation_mode` | enum | `manual` | `manual` is the **only built mode** — the DR box promotes solely on the explicit, RBAC-gated operator action. `auto` (the box detects HA-pair loss and self-promotes) is named so a forward-looking config is explicit, but config load **rejects** it with a "not yet supported" error — never a silent no-op |
 | `priority_threshold` | enum | `critical` | start **only** connections whose resolved priority rank is at or above this tier (`[delivery].priority` + a per-connection `priority=`). `critical` (owner-locked default) starts only the critical feeds; `normal` would also start normal-tier ones. A below-threshold connection reports `status: "filtered"` — distinct from ADR 0031's `"failed"`. An unknown value fails config load |
 | `takeover_hook` | str | `""` | **optional** operator command run before binding the priority listeners: exit 0 = "VIP acquired", any non-zero or timeout = "not acquired" and **activation aborts**. For an ADR 0047 load-balancer topology the passive LB is the fence and this is belt-and-braces only. `""` = no hook; a whitespace-only value is rejected at load (it would run an empty shell and "succeed"). **Both hooks run with the engine's environment minus every `MEFOR_*` variable, `VAULT_TOKEN` and `PGPASSWORD`**, so a hook keeps ordinary variables such as `PATH` or a cloud profile and gets none of the engine's own settings. A secret you keep under any other name, such as a `[secrets].provider = "env"` reference that is not named `MEFOR_*`, still reaches the hook. Pass a hook what it needs on its command line or under another name |
@@ -2112,7 +2295,7 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `max_session_hours` | int | `12` | session absolute lifetime |
 | `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send. Leaving it unset applies `true`, because the internal `[egress]` field defaults to deny too (see [`[egress]`](#egress)). `serve` still reads whether you **wrote** it, because its [`[egress]`](#egress) startup gate treats unset and written `true` differently |
 | `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited). **Leaving it unset does not apply 30 through the desugar** — the internal window stays `0`, and the `[retention]` startup gate then defaults it to 30 days on a PHI instance under **either** enforcement dial. This row used to say the gate refuses under `enforce` and auto-bounds only under `warn`; it does not — only an **explicit** `0` reaches the refusal. See the note under this table |
-| `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention |
+| `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention. It covers the whole instance, and every connection's own keep-forever override too: see *Per-connection overrides* under [`[retention]`](#retention) |
 | `allow_keeping_transform_state_indefinitely` | bool | `false` | the acknowledgement for `[retention].state_max_age_days = 0` (BACKLOG #1967). Without it or a window, an enforcing instance refuses to start. With it, the start writes a WARNING-level `AUDIT:` line naming the tier. A **loosening**. See the tier table under [`[retention]`](#retention) |
 | `allow_keeping_search_presets_indefinitely` | bool | `false` | the same, for `[retention].search_preset_days = 0` |
 | `allow_keeping_app_logs_indefinitely` | bool | `false` | the same, for `[retention].app_log_days = 0` while `[logging].log_dir` is set |

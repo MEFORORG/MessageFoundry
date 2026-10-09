@@ -28,7 +28,13 @@ Two deliberate departures a reviewer will want to check rather than "fix":
   cross-site ``<form method=post>`` is still ``Sec-Fetch-Mode: navigate``, so the navigate check does
   not stop it. The first version of that split shipped without the assertion and its commit message
   claimed otherwise; this is the correction. A bookmarked or typed navigation is unaffected —
-  ``Sec-Fetch-Site: none`` is not cross-site, and a request carrying neither header raises nothing.
+  ``Sec-Fetch-Site: none`` is not cross-site. A POST carrying NEITHER ``Sec-Fetch-Site`` NOR
+  ``Origin`` is refused (BACKLOG #1116, #1124; it used to raise nothing). The GET that runs the
+  POST leg directly when the interstitial is skipped is NOT refused for that: a browser sends no
+  ``Origin`` on a GET navigation, and owner rulings R4 and R4b of 2026-09-28 hold that a sign-in
+  GET is never blocked for missing fetch metadata. ``assert_same_origin`` keeps its earlier rule
+  on a GET, so that navigation still refuses ``cross-site`` and ``same-site``. What it does with
+  ``Origin`` on a GET is stated once, in :func:`.._auth.assert_same_origin`.
 * **The callback returns 200 + a meta refresh, never a 303.** See :func:`pages.oidc_landing`.
 
 Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter.**

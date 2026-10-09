@@ -67,7 +67,10 @@ export interface TraceEntry {
 
 // ---- Coverage model ----------------------------------------------------------------------------
 
-export type LineRole = "def" | "code" | "comment" | "blank";
+// The members live in a const so a webview page can be handed the same list its host is typed by
+// (ASVS 3.5.5, BACKLOG #1123). The type is derived from it, so the two cannot drift.
+export const LINE_ROLES = ["def", "code", "comment", "blank"] as const;
+export type LineRole = (typeof LINE_ROLES)[number];
 
 export interface CoverageLine {
   line: number; // 1-based source line number

@@ -17,6 +17,9 @@ from packaging.version import Version
 from messagefoundry import __version__
 from messagefoundry.__main__ import main
 from messagefoundry.api.tls import _generated_pair
+from messagefoundry.checks import CheckResult, run_checks
+from messagefoundry.config.retention_classification import warn_only_windows
+from messagefoundry.config.settings import load_settings, security_loosenings
 from messagefoundry.scaffold import scaffold
 from scripts.release.tag_spelling import allowed
 
@@ -337,8 +340,6 @@ def test_the_config_init_writes_is_accepted_by_the_loader_that_reads_it(tmp_path
     Asserting a string is absent would pass the day the next key is relocated. Loading the file is
     the only assertion that stays true under a change made somewhere else.
     """
-    from messagefoundry.config.settings import load_settings
-
     repo = tmp_path / "repo"
     scaffold(repo)
     load_settings(config_path=repo / "messagefoundry.toml")
@@ -357,7 +358,6 @@ def test_no_commented_line_in_the_template_is_a_relocated_key(tmp_path: Path) ->
     """
     import re
 
-    from messagefoundry.config.settings import load_settings
     from messagefoundry.scaffold import _SERVICE_TOML
 
     lines = _SERVICE_TOML.splitlines()
@@ -449,3 +449,111 @@ def test_check_still_skips_when_there_is_no_service_config(tmp_path: Path) -> No
         ]
     )
     assert rc == 0, "an ABSENT service config must remain a skip, not a failure"
+
+
+# --- vault BACKLOG #2280: the scaffold answers the retention gate, and only that -------------------
+#
+# `messagefoundry check` runs the retention start gate as a required leg. rc == 0 alone would also
+# pass if that leg skipped, so these read the leg itself.
+
+_STATE_ACK = "allow_keeping_transform_state_indefinitely"
+
+
+def _scaffold_without_mefor_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A scaffolded repo, judged with no ``MEFOR_*`` variable from the host or another fixture."""
+    for name in list(os.environ):
+        if name.upper().startswith("MEFOR_"):
+            monkeypatch.delenv(name)
+    repo = tmp_path / "repo"
+    scaffold(repo)
+    return repo
+
+
+def _retention_leg(repo: Path) -> CheckResult:
+    """The ``retention`` leg, with the settings file found the way the scaffold's own command
+    finds it: ``messagefoundry check --config config`` names no ``--service-config``, so the file
+    is found by the walk up from the config dir."""
+    report = run_checks(repo / "config", run_lint=False)
+    legs = {r.name: r for r in report.results}
+    assert "retention" in legs, f"no retention leg in the report; it has {sorted(legs)}"
+    return legs["retention"]
+
+
+def test_the_scaffold_passes_the_retention_leg_without_skipping_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    leg = _retention_leg(_scaffold_without_mefor_env(tmp_path, monkeypatch))
+    assert leg.required and leg.ok and not leg.skipped, leg.detail
+    # It ran on the scaffold's own settings, and the tier is acknowledged, not merely warned
+    # about: the line carries the gate's audit record for it. A warning names the switch too.
+    assert (
+        "audit record: starting a PHI instance (environment 'dev') with "
+        f"[retention].state_max_age_days (PL-2) unbounded, permitted because [security].{_STATE_ACK}"
+        "=true" in leg.detail
+    )
+    assert "warning:" not in leg.detail
+
+
+@pytest.mark.parametrize(
+    ("line", "tier"),
+    [
+        (f"{_STATE_ACK} = true\n", "[retention].state_max_age_days"),
+        ("search_preset_days = 30\n", "[retention].search_preset_days"),
+    ],
+    ids=["state-ack", "search-presets"],
+)
+def test_removing_either_retention_line_fails_the_leg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: str, tier: str
+) -> None:
+    """THE CONTROL. Each line the scaffold writes for the gate is one the gate needs."""
+    repo = _scaffold_without_mefor_env(tmp_path, monkeypatch)
+    toml = repo / "messagefoundry.toml"
+    text = toml.read_text(encoding="utf-8")
+    assert text.count(line) == 1, "the scaffold no longer writes this line; re-point the control"
+    toml.write_text(text.replace(line, ""), encoding="utf-8")
+    leg = _retention_leg(repo)
+    assert not leg.ok and not leg.skipped
+    assert leg.detail.startswith("serve would refuse to start (exit 2): ") and tier in leg.detail
+
+
+def test_the_scaffold_names_one_loosening_and_it_is_the_state_acknowledgement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The acknowledgement is an audited loosening, so it must be the only one a new repo carries.
+
+    Read from the settings the scaffold writes, with no graph and no process posture. The hop and
+    process entries of the list are out of scope here."""
+    repo = _scaffold_without_mefor_env(tmp_path, monkeypatch)
+    settings = load_settings(config_path=repo / "messagefoundry.toml")
+    names = [
+        name
+        for name, _ in security_loosenings(
+            settings.security,
+            settings.store,
+            settings.auth,
+            settings.alerts,
+            settings.secret_rotation,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            path_form_fhir_hops=(),
+            api=settings.api,
+            approvals=settings.approvals,
+            cert_monitor=settings.cert_monitor,
+            backup=settings.backup,
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+            remote_debug=None,
+            startup=None,
+        )
+    ]
+    # The whole list, so this one line also says no other retention acknowledgement is set.
+    assert names == [_STATE_ACK]
+    # Control: the state switch is a real per-tier acknowledgement, so the list above is the
+    # registry naming it rather than a coincidence of spelling.
+    assert _STATE_ACK in {w.acknowledged_by for w in warn_only_windows()}
+    assert not settings.retention.allow_unbounded_phi

@@ -230,11 +230,11 @@ def test_serve_allows_non_loopback_bind_with_tls(
     assert isinstance(factory(None, None), ssl.SSLContext)
 
 
-def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # ADR 0083 activation: in-process mTLS (client CA) + a cert-identity map → the scope-populating shim
-    # is passed to uvicorn as the `http` protocol so a verified peer cert reaches the resolver.
+def _serve_mtls_with_cert_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str = "serve"
+) -> tuple[int, dict[str, Any]]:
+    """Run ``command`` with in-process mTLS and a cert-identity map. Returns the exit code and what
+    reached ``uvicorn.run``."""
     from messagefoundry.store.crypto import generate_key
 
     cert, key = _self_signed(tmp_path)
@@ -256,12 +256,62 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
         '{ "CN:svc" = "0123456789abcdef0123456789abcdef" } }\n',
         encoding="utf-8",
     )
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    return main([command, "--config", str(SAMPLES_CONFIG), "--env", "dev"]), captured
+
+
+def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADR 0083 activation: in-process mTLS (client CA) + a cert-identity map → the scope-populating shim
+    # is passed to uvicorn as the `http` protocol so a verified peer cert reaches the resolver.
+    rc, captured = _serve_mtls_with_cert_map(tmp_path, monkeypatch)
+    assert rc == 0
     http_cls = captured.get("http")
     assert http_cls is not None
     assert "connection_made" in vars(http_cls)  # the shim's per-connection cert-stashing override
     # BACKLOG #1120: the shim is stacked ON the header-floored protocol, never instead of it.
     assert "send_400_response" in vars(http_cls.__mro__[1])
+
+
+@pytest.mark.parametrize(
+    ("command", "refusing_to"), [("serve", "start."), ("supervise", "start the fleet.")]
+)
+def test_a_shim_that_answers_bare_is_refused_before_any_side_effect(
+    command: str,
+    refusing_to: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #1120: with the shim stacked on, the shim is the class uvicorn serves, so the startup
+    self-test drives it too. A shim that shadowed the floor's 400 writer is refused, by ``serve``
+    and by ``supervise`` before it spawns a shard that would refuse. The test above is the control:
+    the same fixture with the real shim starts, and it creates files."""
+    from messagefoundry.api import tls_client_cert
+
+    def _no_spawn(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("supervise spawned shards")
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", _no_spawn)
+
+    real = tls_client_cert.client_cert_http_protocol_class
+
+    def _shadowing_shim(base: Any) -> Any:
+        shim: Any = real(base=base)
+        shim.send_400_response = base.__mro__[1].send_400_response  # the server's own writer
+        return shim
+
+    monkeypatch.setattr(tls_client_cert, "client_cert_http_protocol_class", _shadowing_shim)
+    rc, captured = _serve_mtls_with_cert_map(tmp_path, monkeypatch, command)
+    assert rc == 2
+    assert captured == {}, "uvicorn.run was reached"
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert left == ["cert.pem", "key.pem", "messagefoundry.toml"], (
+        f"a side effect came first: {left}"
+    )
+    err = capsys.readouterr().err
+    assert "failed its startup self-test: the malformed-request 400 lacked" in err, err
+    assert f"refusing to {refusing_to}" in err, err
 
 
 def test_serve_mtls_without_cert_map_gets_no_shim(
@@ -293,15 +343,19 @@ def test_serve_mtls_without_cert_map_gets_no_shim(
     http_cls = captured["http"]
     assert "connection_made" not in vars(http_cls)  # the shim is never wired without a map
     assert "send_400_response" in vars(http_cls)  # the header-floored protocol (BACKLOG #1120)
-    # The ws class overrides the WebSocket 500, and on the legacy server the handshake writer too.
+    # The ws class is the floored one. On the sans-I/O protocol, which ws="auto" resolves to from
+    # uvicorn 0.50, the floor's one hook is the conn property. On the legacy server it overrides
+    # the WebSocket 500 and the handshake writer.
     from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
 
     ws_base: Any = AutoWebSocketsProtocol
     ws_cls = captured["ws"]
-    assert issubclass(ws_cls, ws_base)
-    assert ws_cls.send_500_response is not ws_base.send_500_response
+    assert issubclass(ws_cls, ws_base) and ws_cls is not ws_base
     if hasattr(ws_base, "write_http_response"):
+        assert ws_cls.send_500_response is not ws_base.send_500_response
         assert ws_cls.write_http_response is not ws_base.write_http_response
+    else:
+        assert isinstance(vars(ws_cls)["conn"], property)
 
 
 def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(
@@ -4510,6 +4564,9 @@ def test_supervise_renews_once_before_it_spawns_any_shard(
         "env",
         "service_config",
         "project_root",
+        # Not handed to the engine shards: the supervisor calls it on the graph it loads (vault
+        # BACKLOG #2368), and build_shard_specs never sees it.
+        "registry_guard",
     }  # nothing new handed to the shards
     _load_pair(cert, tmp_path / "api-generated-key.pem")
 

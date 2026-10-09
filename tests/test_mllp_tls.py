@@ -1066,12 +1066,13 @@ async def test_a_peer_outside_the_allowlist_is_refused_before_its_handshake(
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
-async def test_a_failed_handshake_gives_its_slot_back_and_emits_nothing(
+async def test_a_failed_handshake_gives_its_slot_back_and_emits_only_its_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A socket admitted before its handshake and then aborted at the handshake bound must free both
-    counters, or a handful of silent sockets would lock a peer out for good. It emits no event: it
-    was never a session, and before this change a failed handshake emitted nothing either."""
+    counters, or a handful of silent sockets would lock a peer out for good. It was never a session,
+    so it emits no ``established`` or ``closed``. Since vault BACKLOG #2613 it does emit one
+    ``tls_handshake_failed``, which before then nothing recorded above DEBUG."""
     monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 0.3)
     source, _cert_path = _tls_source(tmp_path)
     events = _Events()
@@ -1085,9 +1086,88 @@ async def test_a_failed_handshake_gives_its_slot_back_and_emits_nothing(
             await _close_raw(writer)
         await _until(lambda: source._admission.active == 0, "the slot was not released")
         assert source._admission.per_host == {}
-        assert events.kinds() == []
+        assert events.kinds() == ["tls_handshake_failed"]
+        (_kind, peer, reason) = events.seen[0]
+        assert peer == "127.0.0.1"
+        assert reason is not None and reason.startswith("1 failed handshake(s)")
+        assert source.tls_handshake_failures == 1
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_plaintext_peer_on_a_tls_listener_is_a_failed_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2613: bytes that are not a ClientHello fail the handshake, and that is
+    recorded. A peer that only hangs up is not (the cap test above is that control)."""
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
+    source, _cert_path = _tls_source(tmp_path)
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            writer.write(b"\x0bMSH|^~\\&|NOT|TLS\r\x1c\r" * 8)
+            await writer.drain()
+            await _until(lambda: "tls_handshake_failed" in events.kinds(), "no failure event")
+        finally:
+            await _close_raw(writer)
+        assert source.tls_handshake_failures == 1
+        (_kind, _peer, reason) = events.seen[0]
+        assert reason is not None and "MSH" not in reason  # a class name, never the peer's bytes
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_failed_handshakes_are_counted_and_their_events_throttled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2613: every failure counts. One listener emits the first at once, holds the
+    rest of the window, and reports them in one trailing event that names no single peer."""
+    monkeypatch.setattr(mllp_module, "_TLS_FAILURE_EVENT_SECONDS", 0.3)
+    source, _cert_path = _tls_source(tmp_path)
+    events = _Events()
+    source.on_connection_event = events
+    await source._note_tls_failure("10.0.0.9", "SSLError")
+    await source._note_tls_failure("10.0.0.8", "SSLError")
+    await source._note_tls_failure("10.0.0.7", "ConnectionAbortedError")
+    # The control: three failures inside one window are one event so far, and the count is exact.
+    assert source.tls_handshake_failures == 3
+    assert events.seen == [
+        (
+            "tls_handshake_failed",
+            "10.0.0.9",
+            "1 failed handshake(s) since the last event; last cause SSLError",
+        )
+    ]
+    # The trailing event reports the two held back, with no peer, once the window ends.
+    await _until(lambda: len(events.seen) == 2, "the held failures were never reported")
+    assert events.seen[1] == (
+        "tls_handshake_failed",
+        None,
+        "2 failed handshake(s) since the last event; last cause ConnectionAbortedError",
+    )
+    await asyncio.sleep(0.4)
+    assert len(events.seen) == 2  # nothing more was held, so nothing more is sent
+
+
+async def test_stop_reports_the_handshake_failures_still_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _cert_path = _tls_source(tmp_path)
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        for _ in range(4):
+            await source._note_tls_failure("10.0.0.9", "SSLError")
+        assert len(events.seen) == 1
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+    held = events.seen[1][2]
+    assert held is not None and held.startswith("3 failed handshake(s)")
+    assert source._tls_flush is None
 
 
 async def test_a_peer_dropping_as_its_handshake_completes_is_closed_quietly(

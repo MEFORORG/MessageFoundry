@@ -1501,6 +1501,11 @@ An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-r
   MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
   and name it in `odbc_driver`; see [*Generic ODBC*](#generic-odbc-postgresql--mysql) below.
 
+**Host precondition for the SQL Server ODBC hops** (at least this connector, `DatabasePoll(...)`,
+`db_lookup`, `DatabaseRef(...)` and the SQL Server store): the engine cannot set TLS cipher suites on
+an ODBC hop, so the operator sets the host cipher policy. The step is stated once, in
+[`DEPLOY-SERVER-DB.md` section 5.4](DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition).
+
 (The SQL Server *store* backend is a **separate** layer, also production; the connector doesn't depend on
 it.) The **inbound** direction is the DB poll source below (`DatabasePoll(...)`).
 
@@ -3153,7 +3158,9 @@ two ways as `retry`/`buildup` — **code-first** on `inbound(...)`/`outbound(...
 ### Retention overrides ([ADR 0027](adr/0027-per-connection-retention.md))
 
 Override the global `[retention]` body-null windows per connection. `None` (omitted) = inherit the global
-window; `0` = keep this connection's bodies **forever**; `>0` = days.
+window; `0` = keep this connection's bodies **forever**; `>0` = days. A `0` meets a retention
+gate when `serve` loads the graph: see *Per-connection overrides* in
+[CONFIGURATION.md](CONFIGURATION.md#retention).
 
 | Key | Dir | Type | Default | Meaning |
 |-----|-----|------|---------|---------|

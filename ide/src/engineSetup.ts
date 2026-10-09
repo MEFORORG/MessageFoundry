@@ -15,6 +15,7 @@
 import * as vscode from "vscode";
 import { SETUP_LEDE, SETUP_SECTIONS, SETUP_TITLE, buttonById } from "./engineSetupContent";
 import { nonce } from "./cspNonce";
+import { SCRIPT_STARTED_MARK, STARTUP_BANNERS } from "./webviewMessaging";
 
 function esc(s: string): string {
   // Escape quotes too, not just &<>: these values land inside double-quoted HTML attributes
@@ -106,11 +107,12 @@ export class EngineSetupPanel {
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <h1>${esc(SETUP_TITLE)}</h1>
   <p class="lede">${esc(SETUP_LEDE)}</p>
   ${sections}
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}
     for (const btn of document.querySelectorAll('button.action')) {
       btn.addEventListener('click', () => vscode.postMessage({ command: 'run', id: btn.dataset.id }));
     }

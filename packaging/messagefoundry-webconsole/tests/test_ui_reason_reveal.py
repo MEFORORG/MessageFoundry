@@ -13,6 +13,7 @@ returning it whole is the control arm that proves the page had something to hide
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -74,8 +75,14 @@ async def test_the_event_page_masks_each_reason_and_reveals_one_per_request(
         bare = await c.get("/ui/events", params={"kind": "handler_error"})
         assert bare.status_code == 200
         assert _LOST not in bare.text and _OTHER not in bare.text and "****" in bare.text
-        # The link carries the page's filter back, escaped as a query value.
-        assert f'href="/ui/events/{lost}/reason?kind=handler_error"' in bare.text
+        # The link carries the page's filter back, escaped as a query value, and the page's
+        # snapshot pin and position, so the reveal reads the window it was clicked on (BACKLOG
+        # #2438).
+        link = re.search(rf'href="/ui/events/{lost}/reason\?([^"]*)"', bare.text)
+        assert link is not None, "no reveal link for the seeded event"
+        assert re.fullmatch(
+            r"kind=handler_error&amp;before_id=\d+&amp;limit=100&amp;offset=0", link.group(1)
+        ), link.group(1)
 
         shown = await c.get(f"/ui/events/{lost}/reason", params={"kind": "handler_error"})
         assert shown.status_code == 200

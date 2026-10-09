@@ -145,7 +145,6 @@ _BASELINE: dict[str, int] = {
     "tests/test_key_lifecycle_coverage.py": 1,
     "tests/test_key_usage_scope_inventory.py": 2,
     "tests/test_ldap_timeouts.py": 2,
-    "tests/test_lens_param_modes.py": 1,
     "tests/test_log_redaction_secret_domain.py": 3,
     "tests/test_logging.py": 1,
     "tests/test_logging_credential_scrub.py": 2,

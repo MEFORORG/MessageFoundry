@@ -19,17 +19,18 @@ silently-dropped key leaves the setting it was meant to apply un-applied, with n
 reporting a problem. An unknown top-level **section**, or a top-level key outside any section, is
 refused the same way and for the same reason: a misspelt ``[integrty]`` drops every key under it.
 
-The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
-oversight: the **env** layer and the ``cli`` mapping still drop an unrecognized key silently. Env
-cannot be checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read
-straight from ``os.environ`` by their consuming module and are not fields on any section
-(``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership
-test would refuse a correctly-configured deployment. ``cli`` keys are engine-written from parsed
-arguments, never operator-spelled; an operator's unknown flag never reaches them, because argparse
-refuses it first with exit 2. The one
-exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
-Anything stated to an operator about this refusal must carry that scope — see
-``docs/CONFIGURATION.md``.
+The **env** layer has a refusal of its own, narrower than the file's
+(:func:`_reject_unknown_env_keys`, vault BACKLOG #2600): a ``MEFOR_<SECTION>_<KEY>`` variable whose
+section has an env layer and whose key that section does not define. It is narrower because some
+documented ``MEFOR_*`` variables are read straight from ``os.environ`` by their consuming module
+and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED``
+and siblings); those are spared by name. A variable whose SECTION part matches no section with
+an env layer is refused when it names a modelled section and is dropped silently when it names
+none. The ``cli`` mapping is not checked: its keys are engine-written
+from parsed arguments, never operator-spelled, and an operator's unknown flag never reaches them,
+because argparse refuses it first with exit 2. ``[security]`` has its own refusal from env (the
+arm inside :func:`_desugar_security`). Anything stated to an operator about these refusals must
+carry that scope — see ``docs/CONFIGURATION.md``.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ import re
 import string
 import tomllib
 from collections.abc import Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
@@ -96,7 +98,7 @@ from messagefoundry.config.tls_policy import (
     validate_tls_ciphers,
 )
 from messagefoundry.connection_names import is_connection_name
-from messagefoundry.controlchars import has_lone_surrogate
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
@@ -190,6 +192,13 @@ _DEFAULT_FILE = "messagefoundry.toml"
 _ERROR_DETAIL_ROWS = 5
 
 _log = logging.getLogger(__name__)
+
+#: The legacy ``[logging]`` rotation keys and the field each became (BACKLOG #122, ADR 0162). The
+#: model refuses each by name, and the env unknown-key refusal leaves them to it.
+_RENAMED_LOGGING_KEYS: dict[str, str] = {
+    "max_bytes": "file_max_bytes",
+    "backups": "file_backup_count",
+}
 
 #: (section, key) secrets that belong in env, never the config file (see _warn_file_secrets).
 _FILE_SECRET_KEYS = (
@@ -389,7 +398,7 @@ class _InputHidingModel(BaseModel):
 
 class _Section(_InputHidingModel):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
-    # (_reject_unknown_file_keys). A model-level extra="forbid" would refuse the engine's OWN writes:
+    # (_reject_unknown_file_keys for the file, _reject_unknown_env_keys for the environment). A model-level extra="forbid" would refuse the engine's OWN writes:
     # _env_overrides scrapes every MEFOR_<section>_<key> into its section dict, and a dozen documented
     # variables are read straight from os.environ by their consuming module rather than being fields here
     # (the Vault KMS/Transit and secret-provider credentials, MEFOR_TLS_REVOCATION_ATTESTED, the two
@@ -411,10 +420,14 @@ class _Section(_InputHidingModel):
         section built in code skips the loader, and ``extra="ignore"`` would drop the key, so
         ``SecuritySettings(require_sign_in=False)`` would quietly keep sign-in on. Unlike a blanket
         ``extra="forbid"``, this names only keys that were removed, and its message carries no value.
-        So ``security show`` on a file still holding one refuses with the fix in its message, and the
-        operator removes the line, by hand or with ``security set`` and a ``null`` value.
+        ``security show`` builds ``[security]`` this way, so on a file still holding one of that
+        section's removed keys it refuses with the fix in its message. The operator removes the
+        line, by hand or with ``security set`` and a ``null`` value. The other sections' removed
+        keys reach this refusal only from code.
 
-        Keys are checked in ``_REMOVED_KEYS`` order, so the key named is the one the loader names."""
+        Keys are checked in ``_REMOVED_KEYS`` order, so the key named is the one the loader names.
+        The removal step differs from the loader's, because a section built here read no
+        environment variable (:func:`_removed_key_message`)."""
         if isinstance(data, Mapping) and (removed := _removed_keys_for(cls)):
             for key, refusal in removed.items():
                 if key in data:
@@ -1233,7 +1246,9 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
-    expose_docs: bool = False  # serve /docs, /redoc, /openapi.json (off by default; widens surface)
+    # Serve the API documentation routes, at least /docs, /redoc and /openapi.json, with no sign-in.
+    # Off by default; on, it widens the surface and security_loosenings() names it (#2385).
+    expose_docs: bool = False
     # Serve the same-origin browser ops console under /ui (ADR 0065, BACKLOG #75). On by default (ADR
     # 0143 — the console is the operator UI, effectively core); disable with [security].serve_web_console=
     # false (a surface-reducing opt-out). When on, the engine mounts /ui + /ui/static and accepts an
@@ -2389,16 +2404,13 @@ class LoggingSettings(_Section):
         replacement — the loader's nearest-name heuristic does not reach ``file_backup_count``.
 
         **The layer this one covers is ENV, which the file refusal deliberately does not.**
-        ``_env_overrides`` scrapes ``MEFOR_LOGGING_*`` straight into the section dict, and a
-        misspelled env var is otherwise dropped in silence (docs/CONFIGURATION.md, "The refusal covers
-        the FILE"). Measured: ``MEFOR_LOGGING_MAX_BYTES`` and ``MEFOR_LOGGING_BACKUPS`` each reach
-        this validator and are refused naming their replacement. So the two spellings are the rare
-        env keys that fail loudly, and that is worth keeping rather than folding into the loader."""
+        ``_env_overrides`` scrapes ``MEFOR_LOGGING_*`` straight into the section dict. Measured:
+        ``MEFOR_LOGGING_MAX_BYTES`` and ``MEFOR_LOGGING_BACKUPS`` each reach this validator and are
+        refused naming their replacement. Since vault BACKLOG #2600 the loader has an unknown-key
+        refusal for the environment too (:func:`_reject_unknown_env_keys`, which states what it
+        spares). It spares these two, so they keep the message that names the replacement."""
         if isinstance(data, dict):
-            for legacy, actual in (
-                ("max_bytes", "file_max_bytes"),
-                ("backups", "file_backup_count"),
-            ):
+            for legacy, actual in _RENAMED_LOGGING_KEYS.items():
                 if legacy in data:
                     raise ValueError(
                         f"[logging].{legacy} is not a setting — the engine-managed application-log "
@@ -2420,6 +2432,23 @@ class LoggingSettings(_Section):
         if not 1 <= value <= 65535:
             raise ValueError("[logging].forward_port must be between 1 and 65535")
         return value
+
+    @field_validator("forward_host")
+    @classmethod
+    def _check_forward_host(cls, value: str | None) -> str | None:
+        # Vault BACKLOG #2375. Before this, such text raised out of the #1966 gate, or passed it
+        # and then raised out of the forwarder's own socket call, so the start died with a
+        # traceback either way.
+        return _checked_host_text(value, "[logging].forward_host")
+
+    @field_validator("ntp_peer")
+    @classmethod
+    def _check_ntp_peer(cls, value: str | None) -> str | None:
+        # The time-sync probe hands this text to the socket layer, and its caller catches OSError
+        # only. A NUL, or non-ASCII text the encoding refuses, raised TypeError there, so a
+        # require_time_sync start died with a traceback (measured). ASCII text with a bad label is
+        # a gaierror, which that caller already warns on or refuses cleanly, so it is left to it.
+        return _checked_host_text(value, "[logging].ntp_peer", ascii_too=False)
 
     @field_validator("forward_tls_crl_file")
     @classmethod
@@ -2547,8 +2576,10 @@ class RetentionSettings(_Section):
     # attached PHI (#150 SetMeta), not disposition, so it can never outlive the body.
     # 0 = keep forever.
     messages_days: int = 0
-    # Past N days, null the bodies of DEAD (dead-lettered) outbound rows — their own window because a
-    # dead row stays replayable until its body is purged. 0 = keep forever.
+    # Past N days, null the bodies of DEAD (dead-lettered) rows at EVERY stage — their own window
+    # because a dead row stays replayable until its body is purged. A dead ingress or routed row
+    # carries the whole raw body, so the purge reaches it as well as a dead outbound row (#1188).
+    # 0 = keep forever.
     dead_letter_days: int = 0
     # Past N days, DELETE transform-state entries (ADR 0005) last written before the cutoff — keeps the
     # in-memory state cache + table bounded. A simple global age purge; per-namespace policy is a
@@ -2775,6 +2806,13 @@ EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 #: real directory round trip and far below the point where a socket timeout overflows.
 _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
+#: Upper bound for the three ``[auth]`` rate-limit windows (vault BACKLOG #2466). A window holds each
+#: counted attempt for its whole length, so one far longer than the process lives acts as a NaN one
+#: does: the count fills once and then refuses every later attempt. One day is a JUDGMENT with no
+#: measured anchor. It is 1440 times the sign-in default, and at the cap a filled count still
+#: refuses for up to a day, so a long window is a choice to make with care at any length.
+_RATE_WINDOW_MAX_SECONDS = 86400.0
+
 #: The widest ``[auth].oidc_issuer`` the engine loads, in UTF-16 units (BACKLOG #2331): the width of
 #: the narrowest issuer column a federated binding is stored in, SQL Server ``NVARCHAR(256)``.
 _OIDC_ISSUER_MAX = 256
@@ -2802,23 +2840,8 @@ class AuthSettings(_Section):
 
     There is no sign-in switch here (vault BACKLOG #2825). Settings that exist build an auth service,
     and a service always requires sign-in. The open mode is the app factories' ``allow_no_auth=True``
-    with no settings at all."""
-
-    @model_validator(mode="before")
-    @classmethod
-    def _refuse_the_removed_sign_in_switch(cls, data: Any) -> Any:
-        """Refuse ``enabled`` loudly rather than drop it (vault BACKLOG #2825).
-
-        ``extra="ignore"`` would drop it, so settings built in code with ``enabled=False`` would
-        silently require sign-in after all. The loader already refuses the key from a file or the
-        environment as REMOVED (``_REMOVED_KEYS``), before any model is built."""
-        if isinstance(data, Mapping) and "enabled" in data:
-            raise ValueError(
-                "AuthSettings has no `enabled` field: sign-in cannot be turned off (vault BACKLOG "
-                "#2825). For an app with no sign-in, pass the app factory allow_no_auth=True and no "
-                "auth settings"
-            )
-        return data
+    with no settings at all. ``enabled`` passed in code is refused by the base class, like every
+    other removed key (``_Section._refuse_removed_keys``)."""
 
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
@@ -3034,7 +3057,8 @@ class AuthSettings(_Section):
     # a block-forever operation — AuthService dispatches each LDAP call through a bare asyncio.to_thread
     # with no wait_for, so one wedged DC pinned a thread-pool worker indefinitely instead of failing the
     # login. 10 s each is well above a healthy on-prem DC round trip and well below any human patience
-    # for a login. Both must be > 0: a 0/negative value would restore the unbounded wait.
+    # for a login. Both must be > 0: a 0/negative value would restore the unbounded wait. A value
+    # above 10 s is a LOOSENING that security_loosenings() names while AD is on (vault BACKLOG #2567).
     ad_connect_timeout: float = 10.0  # seconds — bound the LDAP/LDAPS TCP connect
     ad_receive_timeout: float = 10.0  # seconds — bound each LDAP response read (bind + search)
 
@@ -3234,7 +3258,14 @@ class AuthSettings(_Section):
     login_rate_limit_enabled: bool = True
     login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
     login_rate_limit_global: int = 60  # max attempts across all clients per window
-    login_rate_limit_window_seconds: float = 60.0
+    # No nan/inf (vault BACKLOG #2466): the limiter prunes a hit once it is older than the window,
+    # and no hit is ever older than a NaN or +inf one. The counts then fill once and never drain, so
+    # after login_rate_limit_global attempts every sign-in would be refused until a restart. A huge
+    # finite window does the same in practice, so it is capped (_RATE_WINDOW_MAX_SECONDS). -inf is
+    # refused with them; 0 and a finite negative still load, as the named off value above.
+    login_rate_limit_window_seconds: float = Field(
+        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
 
     # Anti-automation on the authenticated PHI-read endpoints (WP-8, ASVS 2.4.1): a per-actor sliding
     # window over /messages, /messages/{id}, /dead-letters — bounds scripted PHI harvesting on top of
@@ -3243,7 +3274,11 @@ class AuthSettings(_Section):
     phi_read_rate_limit_enabled: bool = True
     phi_read_rate_limit_per_actor: int = 120  # max PHI reads per user per window
     phi_read_rate_limit_global: int = 0  # max PHI reads across all users per window (0 = off)
-    phi_read_rate_limit_window_seconds: float = 60.0
+    # No nan/inf, for the reason login_rate_limit_window_seconds gives: the count would fill once
+    # and then refuse every PHI read until a restart. Capped for the same reason.
+    phi_read_rate_limit_window_seconds: float = Field(
+        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
 
     # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
     # sliding window folded into the step-up gate (require_step_up) for every NON-GET sensitive op —
@@ -3281,7 +3316,9 @@ class AuthSettings(_Section):
     )
     # gt=0 and no nan/inf: a zero window turns the floor off silently, and a nan one never prunes, so
     # every write after the twelfth would be refused for the life of the process.
-    admin_write_rate_limit_window_seconds: float = Field(default=15.0, gt=0, allow_inf_nan=False)
+    admin_write_rate_limit_window_seconds: float = Field(
+        default=15.0, gt=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
     # THE MINIMUM GAP BETWEEN TWO WRITES BY ONE ACTOR, AND IT IS PROVISIONAL TOO (BACKLOG #2301, ASVS
     # 2.4.2; owner ruling R7 of 2026-09-23). The count above admits its twelve writes back to back;
     # this refuses a write that lands sooner than this after the same actor's last admitted one. It
@@ -4109,21 +4146,209 @@ def _names_this_host(host: str) -> bool:
     """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
     :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
     where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
-    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS."""
-    import ipaddress
-    import socket as _socket
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS.
 
-    h = host.strip().rstrip(".").lower()
+    The host's own name and its own non-loopback addresses are :func:`_is_own_name_or_address`."""
+    h = _bare_host(host)
     if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
         return True
+    addr = _host_ip_literal(h)
+    return addr is not None and (addr.is_loopback or addr.is_unspecified)
+
+
+def _checked_host_text(value: str | None, setting: str, *, ascii_too: bool = True) -> str | None:
+    """``value`` unchanged, or a ``ValueError`` naming ``setting`` when it is text that cannot name
+    a host. The message never quotes the value.
+
+    Two refusals. A control character or a lone surrogate can never be part of a host name. And
+    the socket layer encodes a host with the "idna" codec before it resolves or connects, so text
+    that codec refuses raised ``UnicodeEncodeError`` out of the start, which is not an ``OSError``
+    and so was caught nowhere. At least an empty label (``a..b``), an encoded label over 63
+    characters and a C1 control are such text. An IP literal and an ordinary name both pass.
+
+    ``ascii_too=False`` runs the encoding check on non-ASCII text only. That is for a setting whose
+    caller hands ASCII text to the socket layer on a path that reports a bad label as an
+    ``OSError``, which that caller already handles."""
+    if value is None:
+        return value
+    if has_lone_surrogate(value) or has_control_char(value):
+        raise ValueError(f"{setting} must not contain a control character or an undecodable byte")
+    if not ascii_too and value.isascii():
+        return value
+    # Raised OUTSIDE the handler, on purpose. The codec's error keeps the whole host text on
+    # `.object`, and `from None` would hide it from the traceback printer only: the refusal's
+    # `__context__` would still hold it. Raised after the handler ends, the refusal has no chain
+    # (tests/test_from_none_is_not_redaction.py says why this shape is the safe one).
+    encodable = True
     try:
-        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(h.strip("[]"))
+        value.encode("idna")
+    except UnicodeError:
+        encodable = False
+    if not encodable:
+        raise ValueError(
+            f"{setting} is not a host name the network layer can encode (its IDNA encoding "
+            "refuses it). Look for an empty label, a label that is too long once encoded, or an "
+            "invisible or prohibited character. A non-ASCII name may be written in its xn-- form"
+        )
+    return value
+
+
+def _socket_form(host: str) -> str:
+    """``host`` as the socket layer will read it: trimmed, and passed through the "idna" encoding
+    that layer applies before it resolves or connects (review of vault BACKLOG #2375).
+
+    The gate must compare THIS form. Compared raw, ``127.0.0.1`` typed in full-width digits, or
+    ``localhost`` with a soft hyphen inside, read as some other host while the socket layer
+    dialled loopback (measured). ASCII text comes back unchanged, case included, so an IPv6 zone
+    keeps its case. Text the encoding refuses comes back as it was: the load refuses it for
+    ``[logging].forward_host``, and another caller still gets an answer."""
+    text = host.strip()
+    try:
+        # Trimmed again: the encoding drops an invisible character, which can uncover a space.
+        return text.encode("idna").decode("ascii").strip()
+    except UnicodeError:
+        return text
+
+
+def _bare_host(host: str) -> str:
+    """``host`` as the two predicates here compare it: its :func:`_socket_form`, lowercased, with
+    no trailing dot."""
+    return _socket_form(host).rstrip(".").lower()
+
+
+#: Where a fail-open note goes while :func:`forwarding_gate_check` runs: a list it returns to its
+#: caller. Unset, a note is logged at once, which is what a direct caller of the helpers gets.
+_gate_notes: ContextVar[list[str] | None] = ContextVar("_gate_notes", default=None)
+
+
+def _fail_open_note(note: str) -> None:
+    """Record that an own-host check could not be made. Never silent: the same config can pass
+    before an interface is up and refuse at the next start, and this note is the only record of
+    which happened. It carries no configured value; the refusal text names the setting."""
+    held = _gate_notes.get()
+    if held is None:
+        _log.warning("%s", note)
+    else:
+        held.append(note)
+
+
+def _host_ip_literal(h: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """``h`` as an address when it is an IP literal, else None. Reads the IPv4 shorthand a resolver
+    also accepts (``127.1``, ``0``), and a bracketed IPv6 literal. No DNS."""
+    import socket as _socket
+
+    try:
+        return ipaddress.ip_address(h.strip("[]"))
     except ValueError:
         try:
-            addr = ipaddress.IPv4Address(_socket.inet_aton(h))  # 127.1, 0 and friends; no DNS
-        except OSError:
-            return False
-    return addr.is_loopback or addr.is_unspecified
+            return ipaddress.IPv4Address(_socket.inet_aton(h))
+        except (OSError, ValueError):  # ValueError: a NUL, or text the OS cannot encode
+            return None
+
+
+def _own_host_names() -> frozenset[str]:
+    """This host's name as the OS holds it, and that name's first label, both lowercased.
+
+    ``gethostname`` reads local state, so this asks no resolver. It does NOT learn a domain the OS
+    name leaves out: on a host named ``eng1``, ``eng1.example.org`` is not in the set. On Linux that
+    form needs a lookup, which the gate that calls this must not make. On Windows the OS holds the
+    qualified name locally (``GetComputerNameExW``); reading it there is owed work, not built."""
+    import socket as _socket
+
+    try:
+        name = _bare_host(_socket.gethostname())
+    except OSError as exc:
+        _fail_open_note(
+            f"the OS gave no host name ({type(exc).__name__}), so the ASVS 16.4.3 forwarding gate "
+            "cannot compare [logging].forward_host with it; the gate decides without that check"
+        )
+        return frozenset()
+    return frozenset({name, name.partition(".")[0]}) - {""}
+
+
+def _local_source_address(
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address this host would send FROM to reach ``addr``, or None when the OS will not say.
+
+    Connecting a UDP socket sends no packet. It only asks the routing table for a source address,
+    so it waits on nothing and resolves no name (measured well under a millisecond). The answer for
+    one of the host's own addresses is that same address. Asked instead of bound, because a host
+    with ``net.ipv4.ip_nonlocal_bind`` set (common beside a floating VIP) can bind any address."""
+    import socket as _socket
+
+    family = _socket.AF_INET6 if addr.version == 6 else _socket.AF_INET
+    try:
+        with _socket.socket(family, _socket.SOCK_DGRAM) as probe:
+            probe.connect((str(addr), 9))  # discard port; nothing is sent
+            # A link-local answer carries its zone ("fe80::1%eth0"), which ip_address reads.
+            return ipaddress.ip_address(probe.getsockname()[0])
+    except (OSError, ValueError, TypeError) as exc:  # TypeError: a NUL in an IPv6 zone
+        _fail_open_note(
+            f"the OS gave no source address for [logging].forward_host ({type(exc).__name__}), "
+            "so the ASVS 16.4.3 forwarding gate cannot tell whether that address is this host's "
+            "own; the gate decides without that check"
+        )
+        return None
+
+
+def _is_own_name_or_address(host: str) -> bool:
+    """Whether ``host`` is this host's own name or one of its own non-loopback addresses (vault
+    BACKLOG #2375). The #1966 gate refused loopback only, so a collector at the engine's own LAN
+    address passed although it is the same system.
+
+    **It fails OPEN, on purpose.** When the OS gives no name or no source address, this returns
+    False and the gate passes as it did before. Owner ruling R4 (a) keyed that gate on configuration
+    so a fault cannot hold a clinical message path down, and a refusal resting on a failed probe
+    would be such a fault. The cost is that a broken probe hides this one case. It never loosens
+    the loopback, TLS or verification checks, which do not come through here.
+
+    **What it does not catch, at least:** a name that is not the OS host name but resolves to this
+    host (an alias, or the fully qualified form on a host whose OS name is short), and an address
+    held by this host that the routing table does not treat as local. Both need a lookup, and
+    ADR 0200 leaves the collector-separation probe to #1199's remainder.
+
+    **Where it refuses a collector that IS separate:** an address the routing table treats as local
+    although another system answers on it. A virtual address bound on every node is the known
+    case: a Kubernetes Service address under kube-proxy's IPVS mode, read from the node's own
+    network namespace, or a direct-server-return address held on ``lo``. Reasoned, not measured.
+    A DNS name for that collector passes, since a name is compared with the OS name only. The
+    refusal text points at ADR 0200 Amendment A instead of saying so itself: the same step would
+    let a collector that really is this host through, and a refusal must not teach that."""
+    h = _bare_host(host)
+    # The name first, so an all-digit OS name such as "1234" is not read as an address instead.
+    if h in _own_host_names():
+        return True
+    # Not lowercased: an IPv6 zone is an interface name, and those are case-sensitive on Linux.
+    addr = _host_ip_literal(_socket_form(host).rstrip("."))
+    if addr is None:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    source = _local_source_address(addr)
+    # Zones are compared away: "fe80::1" and "fe80::1%eth0" are one address on this host.
+    return source is not None and int(source) == int(addr) and source.version == addr.version
+
+
+def forwarding_gate_check(log: LoggingSettings) -> tuple[str | None, list[str]]:
+    """:func:`forwarding_gate_refusal` for ``log``, plus the fail-open notes it made, as text.
+
+    For a caller that runs the gate BEFORE logging is configured, which ``serve`` does. A note
+    logged there would reach bare stderr only, never the log file or the off-box collector, and
+    ADR 0200 Amendment A calls that note the record of a fail-open pass. So the notes come back to
+    the caller, which writes each where it can be kept, as ``serve`` does with the #1989
+    static-credential lines. If the gate raises, the notes are logged at once before the error
+    leaves, so they are never dropped."""
+    notes: list[str] = []
+    token = _gate_notes.set(notes)
+    try:
+        return forwarding_gate_refusal(log), notes
+    except BaseException:
+        for note in notes:
+            _log.warning("%s", note)
+        raise
+    finally:
+        _gate_notes.reset(token)
 
 
 def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
@@ -4134,14 +4359,19 @@ def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
     configured with verified TLS to a collector that is not on loopback. This is the predicate; the
     caller owns the refuse/warn split.
 
-    **It reads configuration only.** It opens no socket and resolves no name, so a collector that is
-    down, or a DNS server that is slow, can never stop a start through it: the ruling keys the gate
-    on configuration precisely so a network fault cannot hold a clinical message path down.
+    **It reads configuration and local host state only.** It sends no packet and resolves no name,
+    so a collector that is down, or a DNS server that is slow, can never stop a start through it:
+    the ruling keys the gate on configuration precisely so a network fault cannot hold a clinical
+    message path down. The local state is the OS host name and, for an IP-literal collector, the
+    routing table's source address (:func:`_is_own_name_or_address`, vault BACKLOG #2375); a probe
+    that fails there passes the gate rather than refusing.
 
-    Two things do NOT pass it, on purpose. **Loopback**, because 16.4.3 asks for a logically separate
+    Three things do NOT pass it, on purpose. **Loopback**, because 16.4.3 asks for a logically separate
     system, and a local agent on 127.0.0.1 is the same host; :func:`is_loopback_hop_host` never
     resolves DNS, so a NAME that resolves to loopback does pass, and the collector-separation probe
-    that would catch it is #1199's remainder. **``forward_hop_attested``**, because it attests that an
+    that would catch it is #1199's remainder. **This host's own name or own address**, for the same
+    reason: the engine's LAN address is no more a separate system than 127.0.0.1 is.
+    **``forward_hop_attested``**, because it attests that an
     unprotected hop is secure by other means, and this gate asks whether verified TLS is configured
     at all; letting one flag answer the other's question is how a flag silently widens."""
     if not log.forward_enabled or not log.forward_host:
@@ -4154,6 +4384,12 @@ def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
         return (
             f"[logging].forward_host {log.forward_host!r} is loopback or unspecified, which is this "
             "host and not a logically separate collector"
+        )
+    if _is_own_name_or_address(log.forward_host):
+        return (
+            f"[logging].forward_host {log.forward_host!r} is this host's own name or one of its "
+            "own addresses, which is this host and not a logically separate collector (ADR 0200 "
+            "Amendment A covers a virtual address that another system answers on)"
         )
     return None
 
@@ -4442,6 +4678,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
         # events the stop also emits.
         "log_write_failed",
+        # BACKLOG #2612: the off-box log forwarder is absent, losing records or not sending. Keyed
+        # `forwarder:<kind>`, with a process suffix where several engine processes share the
+        # store. No connection can be named that, so it takes no control_action.
+        "log_forward_failed",
         # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
         # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
         "approval_stale_requester",
@@ -4466,12 +4706,22 @@ _ALERT_EVENT_TYPES = frozenset(
         "ad_reconcile_held",
         # BACKLOG #290 (ASVS 15.2.2): the engine paused intake, because the staged backlog went over
         # [inbound].max_staged_depth or the SQLite volume fell below [retention].min_free_disk_mb.
-        # Keyed `intake:<reason>`, which no connection can be named.
+        # Keyed `intake:<reason>`, or `intake:<reason>@<process>` when several engine processes share
+        # the store (BACKLOG #2272), which no connection can be named.
         "intake_paused",
         # vault BACKLOG #2597: a start loaded a config whose fingerprint differs from the store's last
         # recorded one. Keyed `config:<12 hex>`, which no connection can be named, so it is not in
         # _ALERT_CONTROL_EVENT_TYPES below.
         "config_changed",
+        # vault BACKLOG #2613: the security-signal rule layer over the audit stream. Each detector
+        # has its own type; pipeline/security_signals.py SECURITY_SIGNAL_TYPES mirrors this block, and
+        # a test pins that each is here. None is connection-scoped.
+        "signin_failure_burst",
+        "access_denied_burst",
+        "body_view_burst",
+        "bulk_export",
+        "log_level_debug",
+        "posture_loosened",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,
@@ -4492,12 +4742,16 @@ _ALERT_CONTROL_ACTIONS = frozenset({"restart_inbound", "restart_outbound"})
 #: Some stand-ins fit the connection-name grammar, so a restart aimed at one could hit an unrelated
 #: real connection. The notifier checks the same set at dispatch (``NotifierAlertSink._emit``).
 #:
-#: KNOWN GAPS this set does not close, at least these two. First, two emitters raise
-#: ``connection_stopped`` with a stand-in: ``reference:<name>`` (pipeline/reference_sync.py) and
-#: ``transform-state`` (pipeline/state_convergence.py); the second fits the connection-name grammar.
-#: Second, an allowed event can carry an inbound name or an outbound name, and the two are separate
-#: namespaces. With no control_target, restart_outbound on an inbound's event, or restart_inbound on
-#: an outbound's, aims at whatever connection on the other side shares the bare name.
+#: This set checks the event TYPE only, and an allowed type can still carry a stand-in:
+#: ``reference:<name>`` (pipeline/reference_sync.py) and ``cluster:transform-state``
+#: (pipeline/state_convergence.py) both raise ``connection_stopped``. So the notifier also skips the
+#: action for an event whose ``connection`` key is not a connection name, even at an explicit
+#: control_target (BACKLOG #2527). A stand-in raised under one of these types must keep a colon.
+#:
+#: An allowed event can carry an inbound name or an outbound name, and the two are separate
+#: namespaces. With no control_target, the api/app.py control callback restarts the bare name only
+#: when it is declared on the action's side and not the other (BACKLOG #2528), and logs a skip
+#: otherwise. That needs the graph, which a rule does not have, so it is not a load-time check.
 _ALERT_CONTROL_EVENT_TYPES = frozenset(
     {
         "connection_stopped",
@@ -4648,8 +4902,8 @@ class AlertRule(BaseModel):
     # BACKLOG #1898: allowed only with an event_type in _ALERT_CONTROL_EVENT_TYPES; "any" and every
     # other type are refused at load (_check_control_scope below).
     control_action: str | None = None
-    # The connection the control action targets. None = the event's own `connection` key (see the
-    # KNOWN GAP on _ALERT_CONTROL_EVENT_TYPES); set it to act on a DIFFERENT connection than the one
+    # The connection the control action targets. None = the event's own `connection` key, restarted
+    # only on the action's side (see _ALERT_CONTROL_EVENT_TYPES); set it to act on a DIFFERENT connection than the one
     # that fired (e.g. restart an inbound when its paired outbound stalls). BACKLOG #1898: when set it
     # must be a connection name and needs a control_action.
     control_target: str | None = None
@@ -4795,6 +5049,24 @@ class AlertsSettings(_Section):
     # Re-alert throttle: the same (event, connection) won't re-notify more often than this, so a
     # flapping lane can't spam the channel.
     realert_seconds: float = 300.0
+
+    # --- security signals (vault BACKLOG #2613) ------------------------------------------------
+    # A rule layer over the audit stream (pipeline/security_signals.py) raises an alert when a count
+    # below is reached inside security_window_seconds. On by default. A count of 0 switches that one
+    # detector off; security_signals=false switches the whole layer off, the DEBUG and posture
+    # detectors included. The defaults are set high on purpose: a page nobody acts on teaches an
+    # operator to ignore the channel. docs/CONFIGURATION.md [alerts] lists each one.
+    security_signals: bool = True
+    security_window_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    # Refused sign-ins from ONE client address. Keyed on the address, never the typed username.
+    security_signin_failures: int = Field(default=20, ge=0)
+    # auth.permission_denied + auth.channel_denied + auth.mfa_denied for ONE account.
+    security_denials: int = Field(default=20, ge=0)
+    # Stored-body reads by ONE account: message_body_view, outbound.read, response.read and
+    # attachment_download rows.
+    security_body_views: int = Field(default=100, ge=0)
+    # Messages selected by ONE account's messages_export calls, summed over the window.
+    security_export_messages: int = Field(default=5000, ge=0)
 
     # Secure-by-default (#188, ASVS 6.3.5/6.3.7): out-of-band security-event notifications are required
     # by default. `serve` refuses to start under [security].enforcement=enforce (warns under
@@ -5792,7 +6064,10 @@ class BackupSettings(_Section):
     # REFUSES to write an unencrypted archive (fail-closed). With it on, any keyless instance writes
     # one: the check reads no synthetic or non-PHI condition, and every instance carries patient data
     # since BACKLOG #1279 (ADR 0186), so a cleartext archive can hold PHI. Each backup's `dr_backup`
-    # audit row carries `encrypted: false`; security_loosenings() does not name this flag.
+    # audit row carries `encrypted: false`. Setting it is a LOOSENING: security_loosenings() names it
+    # as `backup.allow_unencrypted` (vault BACKLOG #2302), so the serve-time warning,
+    # `messagefoundry security show` and GET /security/posture report it. No instance is refused for
+    # setting it. docs/SECURITY-LOOSENING.md has the entry.
     allow_unencrypted: bool = False
 
     @field_validator("schedule_at")
@@ -6721,12 +6996,13 @@ def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
     while the operator believed it failed closed. Nothing reads a section of this file that the model
     does not define, so there is no legitimate unmodelled section to spare.
 
-    Scoped to the FILE deliberately. The env layer (:func:`_env_overrides`) scrapes any
-    ``MEFOR_<section>_<key>`` into its section dict, including a dozen documented variables that their
-    consuming module reads straight from ``os.environ`` and that are not fields here — refusing there
-    would refuse a variable the shipped docs tell operators to set. It drops a variable naming no
-    modelled section before this point, so it never reaches the section check either. The CLI layer and
-    the ``[security]`` desugar write only real fields, and the file is the surface the ruling names."""
+    Scoped to the FILE. The env layer (:func:`_env_overrides`) scrapes any ``MEFOR_<section>_<key>``
+    into its section dict, including documented variables that their consuming module reads straight
+    from ``os.environ`` and that are not fields here, so this check cannot run over the merged data.
+    The environment has its own refusal, :func:`_reject_unknown_env_keys` (vault BACKLOG #2600),
+    which spares those variables by name. The env layer drops a variable naming no modelled section
+    before this point, so it never reaches the section check here. The CLI layer and the
+    ``[security]`` desugar write only real fields, and nothing checks a CLI key."""
     models = _section_models()
     sections: list[str] = []
     stray = False
@@ -6752,6 +7028,160 @@ def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
             + (" A key above the first [section] header belongs to no section." if stray else "")
             + " Check the spelling against docs/CONFIGURATION.md; a key that MOVED to another section "
             "is reported by name instead."
+        )
+
+
+#: ``MEFOR_<SECTION>_<KEY>`` names under a known section that are NOT settings fields, because the
+#: module that uses each reads it straight from ``os.environ`` (vault BACKLOG #2600). They are spared
+#: by :func:`_reject_unknown_env_keys`, exactly as spelled. ``tests/test_settings_env_keys.py`` reds
+#: when engine code spells a ``MEFOR_<known section>_*`` variable that is neither a field nor listed
+#: here, and when an entry here is spelled by no engine module other than this one.
+_OUT_OF_BAND_ENV: frozenset[str] = frozenset(
+    {
+        # The two phase-timing diagnostics (pipeline/phase_timing.py).
+        "MEFOR_DELIVERY_PHASE_TIMING",
+        "MEFOR_PIPELINE_LANE_EPISODE_TIMING",
+        # The connector SecretProvider's Vault credentials (config/secretprovider_vault.py).
+        "MEFOR_SECRETS_VAULT_ADDR",
+        "MEFOR_SECRETS_VAULT_CA_FILE",
+        "MEFOR_SECRETS_VAULT_KV_MOUNT",
+        "MEFOR_SECRETS_VAULT_TOKEN",
+        # The store's Vault KeyProvider and Transit cipher (store/keyprovider_vault.py,
+        # store/crypto_transit.py).
+        "MEFOR_STORE_TRANSIT_AUDIT_KEY",
+        "MEFOR_STORE_TRANSIT_KEY",
+        "MEFOR_STORE_VAULT_ADDR",
+        "MEFOR_STORE_VAULT_CA_FILE",
+        "MEFOR_STORE_VAULT_TOKEN",
+        "MEFOR_STORE_VAULT_TRANSIT_KEY",
+        "MEFOR_STORE_VAULT_WRAPPED_DEK",
+        # The process-wide revocation attestation (config/tls_policy.py).
+        "MEFOR_TLS_REVOCATION_ATTESTED",
+    }
+)
+
+
+#: ``(section, key)`` settings whose value is a SECRET REFERENCE (ADR 0019 section 5). Under
+#: ``[secrets].provider = "env"`` such a value is the name of an environment variable the operator
+#: chooses, so :func:`_reject_unknown_env_keys` spares the variable it names. At least these four
+#: reach ``resolve_connector_secret``; a reference field added later and not listed here would have
+#: its variable refused at load, by name, which is the visible direction to fail in.
+_SECRET_REFERENCE_KEYS: tuple[tuple[str, str], ...] = (
+    ("auth", "ad_bind_password_secret"),
+    ("auth", "oidc_client_secret_ref"),
+    ("auth", "oidc_client_private_key_ref"),
+    ("alerts", "email_password_secret"),
+)
+
+
+def _env_secret_reference_names(data: Mapping[str, Any]) -> set[str]:
+    """The environment variables the settings in ``data`` name as secret references, or an empty
+    set unless ``[secrets].provider`` is exactly ``"env"``, the only provider that reads one."""
+    secrets = data.get("secrets")
+    if not isinstance(secrets, Mapping) or secrets.get("provider") != "env":
+        return set()
+    names: set[str] = set()
+    for section, key in _SECRET_REFERENCE_KEYS:
+        values = data.get(section)
+        value = values.get(key) if isinstance(values, Mapping) else None
+        if isinstance(value, str):
+            names.add(value)
+    return names
+
+
+def _near_env_name(section: str, key: str, model: type[BaseModel]) -> str | None:
+    """The variable an operator probably meant by ``MEFOR_<section>_<key>``, or ``None``.
+
+    Matched on the KEY part alone, as :func:`_near_field` matches a file key, so the shared
+    ``MEFOR_<SECTION>_`` prefix cannot make two unrelated names look close.
+
+    No hint is given, rather than the next nearest name, when the closest key is one the
+    environment cannot set: a key that MOVED to ``[security]`` or was removed (the loader refuses
+    that spelling too), or a sub-table. Offering the runner-up there would name an unrelated
+    switch. A key that starts with a sub-table's name (``vip_enabled``) gets no hint either."""
+    prefix = f"{_ENV_PREFIX}{section.upper()}_"
+    fields = model.model_fields
+    tables = {
+        name
+        for name, field in fields.items()
+        if isinstance(field.annotation, type) and issubclass(field.annotation, _Section)
+    }
+    if any(key.startswith(f"{table}_") for table in tables):
+        return None
+    gone = {k for s, k in (*_RELOCATED_TO_SECURITY, *_REMOVED_KEYS) if s == section}
+    spared = {name[len(prefix) :].lower() for name in _OUT_OF_BAND_ENV if name.startswith(prefix)}
+    near = difflib.get_close_matches(key, sorted({*fields, *gone, *spared}), n=1)
+    if not near or near[0] in gone or near[0] in tables:
+        return None
+    return f"{prefix}{near[0].upper()}"
+
+
+def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]) -> None:
+    """Raise ``ValueError`` if the environment sets a ``MEFOR_<SECTION>_<KEY>`` variable that names a
+    modelled section and no setting in it (vault BACKLOG #2600).
+
+    The same failure :func:`_reject_unknown_file_keys` refuses in the file: a mistyped
+    ``MEFOR_STORE_REQUIRE_ENCRYPTON`` used to be scraped into ``[store]``, ignored by the model, and
+    reported by nothing, so the instance started without the hardening its environment asked for.
+
+    Names the VARIABLE and **never its value**, which may be a secret. ``data`` is the merged file
+    and environment layers, before the model is built, so a typo that is also the cause of a
+    cross-field validation error is named here first.
+
+    Two cases refuse:
+
+    * the section part is in :data:`_SECTIONS`, the list :func:`_env_overrides` reads, and the key
+      is not a field of that section;
+    * the name starts ``MEFOR_<SECTION>_`` for a modelled section that has NO env layer
+      (``[service]``, ``[cert_monitor]``, ``[secret_rotation]``, ``[update_check]`` today). Nothing
+      reads such a variable, so ``MEFOR_SECRET_ROTATION_WARN_DAYS=0`` changed nothing and said
+      nothing. The refusal says the section is set in the file.
+
+    At least these names are spared:
+
+    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, a harness
+      variable, another tool's). So a typo in the SECTION part of a name is still dropped silently;
+    * one with no key part;
+    * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;
+    * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message, and the
+      renamed ``[logging]`` keys in :data:`_RENAMED_LOGGING_KEYS`, which the model refuses naming
+      the replacement;
+    * under ``[secrets].provider = "env"`` only, a variable that one of the
+      :data:`_SECRET_REFERENCE_KEYS` settings names as its value.
+
+    A relocated or removed key never reaches here: :func:`_reject_relocated_keys` runs first.
+
+    The section and key are matched in lower case, as :func:`_env_overrides` matches them."""
+    models = _section_models()
+    no_env_layer = sorted(set(models) - set(_SECTIONS), key=len, reverse=True)
+    referenced = _env_secret_reference_names(data)
+    offenders: list[str] = []
+    for name in sorted(environ):
+        if not name.startswith(_ENV_PREFIX) or name in _OUT_OF_BAND_ENV or name in referenced:
+            continue
+        rest = name[len(_ENV_PREFIX) :].lower()
+        unread = next((s for s in no_env_layer if rest.startswith(f"{s}_")), None)
+        if unread is not None:
+            offenders.append(
+                f"{_printable(name)} ([{unread}] has no environment layer; set it in the file)"
+            )
+            continue
+        section, _, key = rest.partition("_")
+        model = models.get(section)
+        if section not in _SECTIONS or section == "security" or not key or model is None:
+            continue
+        if key in model.model_fields:
+            continue
+        if section == "logging" and key in _RENAMED_LOGGING_KEYS:
+            continue
+        near = _near_env_name(section, key, model)
+        offenders.append(_printable(name) + (f" (did you mean {near}?)" if near else ""))
+    if offenders:
+        raise ValueError(
+            f"unrecognized environment variable(s): {', '.join(offenders)}. Each names a config "
+            "section and no setting the environment can give it. It is REFUSED, not ignored — a "
+            "dropped one leaves the setting it was meant to apply silently un-applied. Check the "
+            "spelling against docs/CONFIGURATION.md, or unset the variable."
         )
 
 
@@ -6797,53 +7227,79 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "allow_single_factor_admin_when_exposed, allow_unverified_alert_smtp_tls, "
         "[alerts].security_notifications_required, a per-connection cleartext_accepted, "
         "tls_hop_attested or tls_revocation_attested (each with its reason), the process-wide "
-        "MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Relax the one you mean, "
-        "or delete this line"
+        "MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Relax the one you mean"
     ),
     ("ai", "data_class"): (
         "the data class was removed, not relocated: every instance now carries patient data "
         "(BACKLOG #1279). [ai].data_class had already moved to "
-        "[security].handles_real_patient_data under ADR 0118, and that key is retired too — delete "
-        "this line"
+        "[security].handles_real_patient_data under ADR 0118, and that key is retired too"
     ),
     # BACKLOG #2000. It was loader plumbing that an operator could also set, and setting it changed
     # startup while [security] reported no choice. `serve` now reads the same fact from what
     # [security] was given (SecuritySettings.serve_web_console_explicit), so nothing writes this key.
     ("api", "serve_ui_explicit"): (
         "it was an internal marker the loader set, never an operator setting (BACKLOG #2000). "
-        "Remove it from the config file, or unset MEFOR_API_SERVE_UI_EXPLICIT if the environment "
-        "sets it. To request the web console explicitly, set [security].serve_web_console"
+        "To request the web console explicitly, set [security].serve_web_console"
     ),
     # Vault BACKLOG #2719. Named here rather than left to the unknown-key refusal, because that one
     # offers the nearest spelling, and for this key the nearest is `require_mfa`: an operator following
     # the hint would swap one loosening for another.
     ("security", "require_sign_in"): (
         "`serve` always requires sign-in, on every bind, and this switch was removed rather than "
-        "relocated (vault BACKLOG #2719). Remove this line, or unset MEFOR_SECURITY_REQUIRE_SIGN_IN "
-        "if the environment sets it. On a store with no Administrator yet, create the first one "
-        "with `messagefoundry provision-admin`"
+        "relocated (vault BACKLOG #2719). On a store with no Administrator yet, create the first "
+        "one with `messagefoundry provision-admin`"
     ),
     # Vault BACKLOG #2719. It had moved to [security].require_sign_in under ADR 0118, and that key is
     # gone too, so the relocation notice would have named a key that no longer exists.
     ("auth", "enabled"): (
         "`serve` always requires sign-in, and the switch that turned it off was removed (vault "
         "BACKLOG #2719). ADR 0118 had relocated it to [security].require_sign_in, and that key is "
-        "retired too. Remove this line, or unset MEFOR_AUTH_ENABLED if the environment sets it"
+        "retired too"
     ),
     # BACKLOG #2090 (ADR 0066 §12): `false` could only start the mode that deadlocks.
     ("pipeline", "require_rcsi_for_pooled"): (
         "a SQL Server store no longer opens with READ_COMMITTED_SNAPSHOT off. The pooled start "
         "check also always fails closed, so this key has nothing left to relax (BACKLOG #2090, "
-        "ADR 0066 section 12). Remove it from the config file, or unset "
-        "MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED if the environment sets it. To run pooled on SQL "
-        "Server, turn READ_COMMITTED_SNAPSHOT on for the database"
+        "ADR 0066 section 12). To run pooled on SQL Server, turn READ_COMMITTED_SNAPSHOT on for "
+        "the database"
     ),
 }
 
 
-def _removed_key_message(section: str, key: str, reason: str) -> str:
+#: What an embedder who passed a removed key in code most likely wanted, where that differs from
+#: what an operator wanted. Added only to the refusal a section built directly gives: `serve` cannot
+#: reach the open mode, so the loader's message does not offer it.
+_REMOVED_KEY_BUILT_DIRECTLY_HINT: dict[tuple[str, str], str] = {
+    ("auth", "enabled"): (
+        "For an app with no sign-in, pass the app factory allow_no_auth=True and no auth settings"
+    ),
+}
+
+
+def _removed_key_message(
+    section: str, key: str, reason: str, *, built_directly: bool = False
+) -> str:
+    """The refusal for a removed key: the decision (``reason``), then how to remove the key.
+
+    The removal step depends on where the key came from (vault BACKLOG #3216). The loader reads a
+    file and the environment, so it names both. A section built directly reads neither: code
+    passed the key (the loader's own ``cli`` overrides count as code), or ``security show``
+    read it from the file's table. Naming an environment
+    variable there would send the reader to a place the key cannot be."""
+    if built_directly:
+        fix = (
+            f"The key was passed straight to the section, so no environment variable set it. "
+            f"Remove `{key}` from the arguments or the file table the section was built from"
+        )
+        if hint := _REMOVED_KEY_BUILT_DIRECTLY_HINT.get((section, key)):
+            fix = f"{fix}. {hint}"
+    else:
+        fix = (
+            f"Remove `{key}` from the config file, or unset "
+            f"{_ENV_PREFIX}{section.upper()}_{key.upper()} if the environment sets it"
+        )
     return (
-        f"[{section}].{key} was REMOVED and is no longer accepted: {reason} "
+        f"[{section}].{key} was REMOVED and is no longer accepted: {reason}. {fix} "
         "(see docs/CONFIGURATION.md)."
     )
 
@@ -6858,7 +7314,7 @@ def _removed_keys_for(model: type[BaseModel]) -> dict[str, str]:
     then. A section built at module level anywhere above this function would raise ``NameError``."""
     sections = {name for name, m in _section_models().items() if issubclass(model, m)}
     return {
-        key: _removed_key_message(section, key, reason)
+        key: _removed_key_message(section, key, reason, built_directly=True)
         for (section, key), reason in _REMOVED_KEYS.items()
         if section in sections
     }
@@ -7095,10 +7551,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
-      older than the window, so a SHORTER window admits more, and one of 0 or less (``-inf`` included)
-      prunes each hit before it is counted. A negative count refuses more, and a NaN or ``+inf``
-      window never prunes, so none of those is named. A ``min_interval_seconds`` of 0 turns the gap
-      off, and a shorter gap admits a faster burst.
+      older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
+      before it is counted. A negative count refuses more, so it is not named. A NaN or infinite
+      window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
+      ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
+      admits a faster burst.
     * ``next_lockout_state`` ends a lock at now + ``lockout_minutes`` (shorter is looser; 0 or less
       ends it at once) and arms it at ``lockout_threshold`` failures (higher is looser; 0 or less locks
       on the first failure). An escalating lock doubles up to ``lockout_max_minutes`` (ADR 0197), so a
@@ -7120,6 +7577,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       looser and 0 is off. A higher floor is stricter, and is not named.
     * ``oidc_callback_floor_exempt_amr`` (BACKLOG #2388) skips the federated floor for a matching
       ``amr``, so any value listed is looser, named while that floor is on.
+    * ``ad_connect_timeout`` and ``ad_receive_timeout`` (vault BACKLOG #2567) bound how long one
+      directory call may hold a worker thread, so a value above its default is looser, named while
+      AD is on. They are timeouts and not rate limits; they sit here because they are read the same
+      way, against the shipped default.
 
     ``[approvals].min_dwell_seconds``, the dual-control approval floor, is another time floor of the
     same kind. It lives in its own section, so :func:`_approvals_loosenings` names it, read the same
@@ -7477,6 +7938,34 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             ),
             off=None,
         )
+
+    # --- the directory timeouts (vault BACKLOG #2567, ASVS 13.1.3). LdapAuthenticator hands them to
+    # every ldap3 Server and Connection, and each directory call runs in a worker thread until it
+    # answers or times out. A longer timeout holds that thread longer, so only a value above the
+    # default is looser. The load refuses 0, a negative, inf and NaN, so there is no off value.
+    # Named only with AD on, as ad_session_recheck_seconds is: with no directory nothing reads them.
+    if auth.ad_enabled:
+        for field, what in (
+            ("ad_connect_timeout", "the LDAP connect timeout"),
+            # auth/ldap.py hands ldap3 this value rounded UP to a whole second.
+            (
+                "ad_receive_timeout",
+                "the LDAP response-read timeout (applied rounded up to a whole second)",
+            ),
+        ):
+            value, default = getattr(auth, field), _auth_default(field)
+            if value > default:
+                out.append(
+                    (
+                        field,
+                        # repr round-trips, so a value one step past the default never prints as it.
+                        f"{what} is {value!r} s, above the default of {default:g} s, so a "
+                        "directory call (at least a sign-in, a step-up and a session recheck) to "
+                        "a domain controller that has stopped answering holds a worker thread "
+                        "longer before it fails -- stalled calls then tie up the thread pool that "
+                        "sign-in shares for longer",
+                    )
+                )
     return out
 
 
@@ -7567,6 +8056,118 @@ def oidc_second_factor_claim_exception(auth: AuthSettings) -> str:
     return ""
 
 
+#: The alert event types that carry a credential reminder (ASVS 6.4.5): an unclaimed temporary
+#: password near its deadline, a certificate near expiry, a secret due for rotation. Each is a member
+#: of ``_ALERT_EVENT_TYPES``, so a rule can name it.
+CREDENTIAL_REMINDER_EVENT_TYPES: tuple[str, ...] = (
+    "initial_credential_expiring",
+    "cert_expiry",
+    "secret_rotation",
+)
+
+
+def reminder_silencing_rules(alerts: AlertsSettings) -> list[tuple[str, tuple[str, ...]]]:
+    """Each ``[[alerts.rules]]`` entry that can send a credential reminder to no transport, as
+    ``(label, reminder event types it can match)`` (BACKLOG #2008 step 4, ASVS 6.4.5).
+
+    A rule silences a matching event when it sets ``mute = true`` or ``transports = []``, or when an
+    escalate tier sets ``transports = []`` and the occurrence count reaches it
+    (``NotifierAlertSink._apply_escalation``). A rule that sets ``min_depth`` or
+    ``min_oldest_seconds`` never matches a reminder event (``AlertRuleSet._matches``), so it is
+    skipped.
+
+    **It reads each rule alone, and so it can over-report.** A rule whose connection glob or schedule
+    excludes every reminder, or one that an earlier rule always shadows (first match wins), is still
+    listed. That errs toward naming a rule that silences nothing over missing one that silences a
+    reminder. The label is the rule's position, plus its ``id`` quoted with ``repr`` so a control
+    character in it cannot reach the log raw."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for i, rule in enumerate(alerts.rules):
+        if rule.min_depth is not None or rule.min_oldest_seconds is not None:
+            continue
+        types = tuple(t for t in CREDENTIAL_REMINDER_EVENT_TYPES if rule.event_type in ("any", t))
+        if not types:
+            continue
+        if rule.mute or rule.transports == [] or any(t.transports == [] for t in rule.escalate):
+            label = f"rules[{i}]" if rule.id is None else f"rules[{i}] (id {rule.id!r})"
+            out.append((label, types))
+    return out
+
+
+def _reminder_lead(
+    switch: str, value: int, default: int, off: str, late: str
+) -> list[tuple[str, str]]:
+    """One reminder's ``warn_days`` entry: ``off`` at 0, ``late`` (formatted with the value and the
+    default) below the shipped default, nothing at or above it."""
+    if value == 0:
+        return [(switch, off)]
+    if value < default:
+        return [(switch, late.format(value=value, default=default))]
+    return []
+
+
+def _reminder_loosenings(
+    cert_monitor: CertMonitorSettings,
+    secret_rotation: SecretRotationSettings,
+    alerts: AlertsSettings,
+) -> list[tuple[str, str]]:
+    """The credential-reminder weakenings :func:`security_loosenings` names (ASVS 6.4.5).
+
+    BACKLOG #2227: each ``warn_days = 0`` turned its reminder off with only a debug line from the
+    runner. A lead shorter than the shipped default is named too, as BACKLOG #1131 names a limit
+    looser than its default: a reminder one day ahead leaves no time to renew. Each section's
+    ``check_interval_seconds`` also delays a reminder and is NOT named here.
+
+    BACKLOG #2008 step 4: an ``[[alerts.rules]]`` entry that can send a reminder to no transport
+    (:func:`reminder_silencing_rules`)."""
+    out = _reminder_lead(
+        "cert_monitor.warn_days",
+        cert_monitor.warn_days,
+        CertMonitorSettings.model_fields["warn_days"].default,
+        "[cert_monitor].warn_days = 0 turns the certificate-expiry monitor off -- no "
+        "cert_expiry reminder is raised for any certificate or CRL file the monitor watches, so "
+        "one can reach its expiry with no warning ahead of it, and a service caller's client "
+        "certificate is never flagged as near expiry",
+        "[cert_monitor].warn_days = {value}, shorter than the default of {default} -- a "
+        "certificate or CRL file the monitor watches, and a service caller's client certificate, "
+        "is first flagged only {value} day(s) before it expires, which may leave too little time "
+        "to renew it",
+    )
+    # Not "no secret_rotation alert at all". On a store that tracks the key, under enforce, at least
+    # the start-time expiry checks still raise one (reconcile_rotation_meta,
+    # enforce_store_key_expiry, enforce_secret_expiry), whatever warn_days is. On a keyless or vault_transit store
+    # they find nothing to check. What warn_days = 0 removes is the periodic runner.
+    out += _reminder_lead(
+        "secret_rotation.warn_days",
+        secret_rotation.warn_days,
+        SecretRotationSettings.model_fields["warn_days"].default,
+        "[secret_rotation].warn_days = 0 turns the periodic secret-rotation reminder off -- "
+        "nothing reminds anyone ahead of a due date, or later while a secret runs overdue. The "
+        "start-time expiry checks are the only source of a secret_rotation alert left: they run "
+        "only under enforcement = enforce, and find something only on a store that tracks its "
+        "key",
+        "[secret_rotation].warn_days = {value}, shorter than the default of {default} -- a "
+        "secret is first flagged only {value} day(s) before it is due, which may leave too "
+        "little time to rotate it",
+    )
+    silencing = reminder_silencing_rules(alerts)
+    if silencing:
+        # ", " between rules and "/" between types: the serve warning joins whole entries with
+        # "; ", so an entry must not use that separator inside itself.
+        named = ", ".join(f"{label} matches {'/'.join(types)}" for label, types in silencing)
+        out.append(
+            (
+                "alerts.rules",
+                f"{len(silencing)} [[alerts.rules]] entr{'y' if len(silencing) == 1 else 'ies'} "
+                f"can send a credential reminder to no transport ({named}) -- mute = true, "
+                "transports = [], or an escalate tier with transports = [] records the reminder "
+                "but notifies nobody, so a temporary password, certificate or secret can reach "
+                "its deadline with no one told",
+            )
+        )
+    return out
+
+
 def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
@@ -7581,8 +8182,11 @@ def security_loosenings(
     unverified_db_hops: Sequence[str],
     attested_hops: Sequence[str],
     revocation_attested_hops: Sequence[str],
+    path_form_fhir_hops: Sequence[str],
     api: ApiSettings,
     approvals: ApprovalsSettings,
+    cert_monitor: CertMonitorSettings,
+    backup: BackupSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
@@ -7597,26 +8201,34 @@ def security_loosenings(
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
-    bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap and OIDC flow-cache
+    bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288),
+    ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
+    BACKLOG #2600), the ``[auth]``
+    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache
+    and AD timeout
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
     (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
-    ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
+    ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
+    #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
+    ``[backup].allow_unencrypted`` (vault BACKLOG #2302),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
+    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
+    leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
+    ``[[alerts.rules]]`` entry that can silence a reminder (#2227, #2008), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS
     12.3.2), an endpoint ``url`` with a credential in its query string (ASVS 14.2.1), a generic-ODBC
     ``DATABASE`` hop
-    with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
-    ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
+    with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24),
+    ``tls_revocation_attested`` (ADR 0173) and a ``FHIR()`` outbound set to
+    ``update_url_form="path"`` (vault BACKLOG #2571) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
     the engine process (vault BACKLOG #2700), the OBSERVED launch flags and start-up code of its
     interpreter (vault BACKLOG #2701), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``ad_tls_verify``,
-    ``oidc_require_mfa_claim``, ``password_check_breached``) that are not reported here. Most are
+    ``oidc_require_mfa_claim``, ``notify_security_events``) that are not reported here. Most are
     gated elsewhere. ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
     every OIDC session with no factor met, and while ``require_mfa`` is on that session owes an
     engine factor. The parenthetical list above is enumerated in the floor test's exemption set so
@@ -7648,6 +8260,19 @@ def security_loosenings(
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
+    ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
+    ``[backup].allow_unencrypted`` (vault BACKLOG #2302).
+
+    **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
+    settings silence one or more of them with no refusal, and each is named here, so the serve-time
+    warning says so: ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` at ``0`` or
+    below their defaults, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
+    transport (:func:`_reminder_loosenings`). Not every way is named.
+    ``[auth].initial_password_expiry_hours = 0`` also stops a reminder and is unreported. The
+    paragraph above gives the reason as a new required parameter, and that premise no longer
+    holds: ``auth`` is already a parameter here, so naming it is one more arm, owed and not built.
+    ``[alerts].security_notifications_required = false`` with no recipient sends every reminder to
+    the log alone; serve audits that waiver, and this registry does not list it.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -7693,8 +8318,10 @@ def security_loosenings(
     ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment), and
-    ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24), and
-    ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173). They arrive as
+    ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24),
+    ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173), and
+    ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
+    ``update_url_form="path"`` (vault BACKLOG #2571). They arrive as
     plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
@@ -7702,7 +8329,8 @@ def security_loosenings(
     ``hostname_unchecked_hops``, which walks inbound as well as outbound; ``query_credential_hops``,
     which walks outbound and ``FhirLookup``; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
-    ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``). A caller that
+    ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``;
+    ``path_form_fhir_updates``, which walks outbound and already returns plain names). A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
@@ -7938,6 +8566,10 @@ def security_loosenings(
                 "key's 2**32-encrypt usage ceiling still refuses unconditionally)",
             )
         )
+    # --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4). Owner answer to
+    # #2006 (a): a silent weakening keeps the cell at partial. _reminder_loosenings says what each
+    # entry covers.
+    out.extend(_reminder_loosenings(cert_monitor, secret_rotation, alerts))
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to
     # reconcile against, so 0 is not a weaker choice, it is the only meaningful one.
     if auth.ad_enabled and not auth.ad_session_recheck_seconds:
@@ -7971,6 +8603,44 @@ def security_loosenings(
                 "mid-session",
             )
         )
+    # Vault BACKLOG #2600: action-bound step-up ships ON. Off, its routes fall back to the
+    # session-wide step-up window, which a sign-in can seed.
+    if not auth.require_action_step_up:
+        out.append(
+            (
+                "require_action_step_up",
+                "the routes that need a fresh proof bound to one action (docs/CONFIGURATION.md "
+                "lists them) accept the session-wide step-up window instead -- a session taken over "
+                "inside that window ([auth].step_up_max_age_seconds, which a sign-in can open) "
+                "can bind an authenticator, inject a message or export bodies in bulk with no "
+                "fresh proof",
+            )
+        )
+    # Vault BACKLOG #2600: the three local-password screens ship ON, and no gate refuses one off.
+    if not auth.password_check_breached:
+        out.append(
+            (
+                "password_check_breached",
+                "a local password is not screened against a common and breached password list "
+                "when it is set -- neither the bundled list nor a site list in "
+                "[auth].password_breach_corpus_file -- so a known-breached password is accepted",
+            )
+        )
+    if not auth.password_check_context:
+        out.append(
+            (
+                "password_check_context",
+                "a local password is not screened for context words when it is set -- neither the "
+                "shipped terms nor [auth].password_extra_context_words",
+            )
+        )
+    if not auth.password_check_username:
+        out.append(
+            (
+                "password_check_username",
+                "a local password may contain the account's own username",
+            )
+        )
     # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
@@ -7999,6 +8669,19 @@ def security_loosenings(
                 "the audit trail, the per-address sign-in limit and the new-client-IP step-up signal",
             )
         )
+    # Vault BACKLOG #2385: the [api] bools are under a completeness floor now, and this is the one
+    # that was a deviation with no entry. create_app registers the documentation routes only when
+    # it is on, and none of them asks for sign-in.
+    if api.expose_docs:
+        out.append(
+            (
+                "expose_docs",
+                "the engine serves its API documentation routes (at least /docs, /redoc and "
+                "/openapi.json) with NO sign-in -- anyone who can reach the API socket reads "
+                "every route, parameter and response shape the engine has (the schema, not "
+                "message data)",
+            )
+        )
     # BACKLOG #1179, owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS
     # 12.3.3 at partial, so the acknowledgement is named here as well as warned at serve. Conditional
     # on the hop actually being plaintext, by the predicate serve uses: with an operator tls_cert_file
@@ -8012,6 +8695,23 @@ def security_loosenings(
                 "it is the deploying site's job. At least sign-in credentials, session tokens and "
                 "PHI reads cross that hop unencrypted; isolating the hop limits who can read them "
                 "but encrypts nothing (set [api].tls_cert_file to serve it over TLS instead)",
+            )
+        )
+    # Vault BACKLOG #2302: the cleartext-archive escape. Named whenever it is set, with or without
+    # a store key, because it relaxes a refusal in both cases: the write-side one with no key, and
+    # the restore-verify downgrade one with a key. No instance is refused for setting it (a Manager
+    # decision recorded on engine PR 2183), so this entry and the `dr_backup` audit row are its
+    # records. The name carries its section because [security] has an `allow_unencrypted_phi`.
+    if backup.allow_unencrypted:
+        out.append(
+            (
+                "backup.allow_unencrypted",
+                "with no store key the backup runner writes its archive in CLEARTEXT "
+                "(.mfbak.plain) instead of refusing -- on a SQLite store that archive holds a "
+                "full snapshot, message bodies included, so it can hold PHI. With a store key the "
+                "archive is still sealed, but the restore-verify accepts a plaintext archive it "
+                "would otherwise refuse as a possible downgrade. Nothing refuses this flag, under "
+                "enforcement = enforce or otherwise",
             )
         )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
@@ -8167,6 +8867,21 @@ def security_loosenings(
                 "refusal would apply to those hops it is lifted, so a revoked certificate is caught "
                 "only if that external PKI control works; the attestation never lifts a cleartext "
                 "or verify-off refusal",
+            )
+        )
+    # Vault BACKLOG #2571: the FHIR path-form update, relaxing owner ruling R3 (ASVS 14.2.1). Advisory,
+    # like tls_allow_expired: no gate keys on it. What is in the URL is the resource id, so the
+    # text says where that id is written down and makes no claim about what the id is.
+    if path_form_fhir_hops:
+        named = ", ".join(sorted(path_form_fhir_hops))
+        out.append(
+            (
+                "update_url_form",
+                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form "
+                f"({named}) — each update puts the message's resource id in the request URL, "
+                "so the receiving server's access log, and any proxy log on the path, holds "
+                "it; an id can be a medical record number or another identifier. The shipped "
+                "transaction form keeps the id out of the URL",
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like
@@ -8334,6 +9049,11 @@ def load_settings(
     # After _reject_relocated_keys so a MOVED key keeps its specific "moved to [security].X" message, and
     # over `file_data` rather than `data` so it never sees a key the env overlay or the desugar wrote.
     _reject_unknown_file_keys(file_data)
+    # The same refusal for the environment layer (vault BACKLOG #2600). After the relocated-key
+    # check, so a moved or removed key keeps its own message. Before the model is built, so a
+    # typo that causes a validation error is named. Over `environ` itself, so it reports the
+    # variable as the operator spelled it; `data` is read for what the settings name.
+    _reject_unknown_env_keys(environ, data)
     _desugar_security(data)
 
     if cli:

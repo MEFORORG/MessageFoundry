@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 import httpx
 import pytest
 from _ui_clients import create_local_user_chosen, issue_continuation
+from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -1210,6 +1211,63 @@ async def test_edit_resend_reroute_redirects_to_child(engine: Engine, tmp_path: 
     child_row = await engine.store.get_message(child)
     assert child_row is not None and child_row["raw"] == EDITED  # the child carries the edited body
     assert json.loads(child_row["metadata"])["edited_from"] == mid  # correlated to the origin
+    # Vault BACKLOG #2615: the plain origin names the operator who sent it.
+    assert (child_row["origin"], child_row["origin_actor"]) == ("operator_edit", "op")
+
+
+async def test_console_edit_resend_audits_keyed_digests_and_origin(tmp_path: Path) -> None:
+    # Vault BACKLOG #2615: the console route reaches the engine's own handler, so its audit row
+    # carries the same provenance as the JSON route's: the origin and keyed digests of both bodies,
+    # which reproduce from the bodies under the store key.
+    from messagefoundry.store.crypto import generate_key, make_cipher, verify_audit_body_digest
+    from messagefoundry.store.store import MessageStore
+
+    (tmp_path / "in").mkdir(exist_ok=True)
+    store = await MessageStore.open(tmp_path / "keyed.db", cipher=make_cipher(generate_key()))
+    engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
+    try:
+        reg = Registry()
+        reg.add_inbound(
+            InboundConnection(
+                "ch1",
+                ConnectionSpec(
+                    ConnectorType.FILE,
+                    {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+                ),
+                router="r",
+            )
+        )
+        reg.add_router("r", lambda m: [])
+        engine.add_registry(reg)
+        service = await _service(engine)
+        await _add(service, "op", Role.OPERATOR)
+        mid = await _seed(engine)
+        async with _client(engine, service) as c:
+            await _cookie_login(c, "op")
+            await _mint_action(c, f"/ui/messages/{mid}/edit")
+            r = await c.post(
+                f"/ui/messages/{mid}/edit-resend",
+                data={"raw": EDITED, "idempotency_key": "k1", "mode": "reroute"},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+            assert r.status_code == 303
+        [rec] = [a for a in await store.list_audit() if a["action"] == "message_edit_resend"]
+        assert rec["actor"] == "op"
+        detail = json.loads(str(rec["detail"]))
+        assert detail["origin"] == "operator_edit"
+        digest = detail["body_digest"]
+        cipher = store.cipher()
+        kid = digest["key_id"]
+        assert verify_audit_body_digest(cipher, ADT, key_id=kid, digest=digest["original"])
+        assert verify_audit_body_digest(cipher, EDITED, key_id=kid, digest=digest["edited"])
+        assert "DOE^JOHN" not in str(rec["detail"])
+        child = await store.get_message(detail["new_message_id"])
+        assert child is not None and (child["origin"], child["origin_actor"]) == (
+            "operator_edit",
+            "op",
+        )
+    finally:
+        await engine.stop()
 
 
 async def test_edit_resend_direct_redirects_to_origin(engine: Engine, tmp_path: Path) -> None:
@@ -1257,6 +1315,11 @@ async def test_edit_resend_direct_redirects_to_origin(engine: Engine, tmp_path: 
     detail = str(rec[0]["detail"] or "")
     assert '"mode": "direct"' in detail
     assert EDITED not in detail and "DOE^JOHN" not in detail  # the edited body is NEVER audited
+    # Vault BACKLOG #2615: a keyless store records the origin and no digest, never a plain hash.
+    parsed = json.loads(detail)
+    assert parsed["origin"] == "operator_edit" and parsed["body_digest"] is None
+    child = await engine.store.get_message(parsed["new_message_id"])
+    assert child is not None and (child["origin"], child["origin_actor"]) == ("operator_edit", "op")
 
 
 async def test_edit_resend_direct_missing_to_rejects_generic(engine: Engine) -> None:
@@ -1420,7 +1483,9 @@ class _FakeWS:
         app: object,
         peer: tuple[str, int] = ("127.0.0.1", 123),
     ) -> None:
-        self.headers = {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
+        self.headers = Headers(  # has getlist (BACKLOG #2454)
+            {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
+        )
         self.app = app
         # ``scope["client"]`` is what ``client_ip`` reads for the denial rows (ADR 0150, BACKLOG
         # #1644, #2289). A real address by default, never None, so a client assertion cannot pass
@@ -2516,7 +2581,7 @@ def test_alerts_builder_escapes_hostile() -> None:
 
 
 def test_events_builder_escapes_hostile() -> None:
-    from messagefoundry.api.models import ConnectionEventInfo
+    from messagefoundry.api.models import ConnectionEventInfo, ConnectionEventList
     from messagefoundry_webconsole.pages import events
 
     rows = [
@@ -2531,7 +2596,9 @@ def test_events_builder_escapes_hostile() -> None:
             reason="<b>boom</b>",
         )
     ]
-    html = str(events(rows))
+    html = str(
+        events(ConnectionEventList(total=1, limit=100, offset=0, before_id=None, events=rows))
+    )
     assert "<b>boom</b>" not in html
     assert "&lt;b&gt;boom&lt;/b&gt;" in html
     assert "&lt;script&gt;" in html  # hostile peer_host escaped
@@ -7090,9 +7157,11 @@ async def test_replay_all_dead_letters_registered_and_gated(engine: Engine) -> N
 
 
 def test_events_filter_renders_kind_dropdown() -> None:
+    from messagefoundry.api.models import ConnectionEventList
     from messagefoundry_webconsole.pages import events
 
-    html = str(events([], connection="", kind="peer_reset"))
+    empty = ConnectionEventList(total=0, limit=100, offset=0, before_id=None, events=[])
+    html = str(events(empty, connection="", kind="peer_reset"))
     assert 'name="kind"' in html
     assert "All kinds" in html
     # Every canonical kind is an option, and the selected one is marked.
@@ -7140,7 +7209,7 @@ def _sys_status(*, update: object = None) -> object:
     )
 
 
-def _status_html(sys_status: object) -> str:
+def _status_html(sys_status: object, security: dict[str, object] | None = None) -> str:
     from messagefoundry.api.models import (
         ClusterNodeList,
         ClusterStatus,
@@ -7157,6 +7226,7 @@ def _status_html(sys_status: object) -> str:
         key_id=None,
         require_encryption=False,
         allow_unencrypted_phi=True,
+        security=security or {},
     )
     cluster = ClusterStatus(
         node_id="n1", clustered=False, is_leader=True, role="single-node", config_version=0
@@ -7165,6 +7235,25 @@ def _status_html(sys_status: object) -> str:
     svc = ServiceStatusInfo(enabled=False, state="disabled", service_name="")
     nodes = ClusterNodeList(nodes=[], leader_node_id=None, lease_owner=None, lease_expires_at=None)
     return str(status(sys_status, posture, cluster, nodes, dr, svc))
+
+
+def test_status_page_gives_each_retention_acknowledgement_its_own_row() -> None:
+    """Vault BACKLOG #2280: the posture table showed ``allow_keeping_phi_indefinitely`` only.
+
+    The switches are read off the engine's classification, so a tier given one there reds here
+    until the page shows it. A distinct marker per switch proves each row reads ITS key."""
+    from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
+
+    switches = [w.acknowledged_by for w in PHI_RETENTION_WINDOWS if w.acknowledged_by]
+    assert len(switches) >= 4  # a floor, so an emptied classification cannot pass this vacuously
+    labels = {s: "Allow " + s.removeprefix("allow_").replace("_", " ") for s in switches}
+    sys_status = _sys_status(update=None)
+    marked = _status_html(sys_status, {s: f"marker-{s}" for s in switches})
+    unset = _status_html(sys_status)
+    for switch, label in labels.items():
+        assert f"{label}</td><td>marker-{switch}<" in marked, switch
+        # The control: with no value the row is still there, and shows the dash.
+        assert f"{label}</td><td>—<" in unset, switch
 
 
 def test_status_update_banner() -> None:
@@ -8659,6 +8748,12 @@ async def test_a_cookie_replayed_from_a_second_address_is_sent_to_reauth(engine:
             "/ui/reauth", data={"next": f"/ui/messages/{mid}", "password": PW}, headers=same
         )
         assert (done.status_code, done.headers["location"]) == (303, f"/ui/messages/{mid}")
+        # Keep only the rotated cookie. The jar files the hand-set copy and the server's under
+        # different domains, so both would ride the next request, and two copies are refused
+        # (BACKLOG #2454). A browser holds one: the engine's cookie is host-only.
+        rotated = done.cookies["mf_session"]
+        b.cookies.clear()
+        b.cookies.set("mf_session", rotated)
         # The re-auth re-anchored the session at this address.
         assert (await b.get(f"/ui/messages/{mid}")).status_code == 200
     seen = [

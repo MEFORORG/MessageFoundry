@@ -1218,6 +1218,33 @@ another control that reads as running and never runs. A static scan of tracked f
 answers "does a committed script contain the bad shape" when the question is "did a session just type
 it", and no tracked file has ever contained one. So this stays a rule you read, not a gate.
 
+## Grant tools by bare name in the `--allowedTools` flag
+
+Moved verbatim from the root `CLAUDE.md` section 5, *The Manager plans, dispatches, and holds the
+owner's attention*, on 2026-10-07. The prompt-first trap above is its neighbour on the same command
+line.
+
+- **In the `--allowedTools` FLAG, grant tools by BARE NAME, never scoped to a command.**
+  `--allowedTools Bash PowerShell` works.
+  `--allowedTools "PowerShell(pwsh:*)"` silently disables the PowerShell tool: every command it
+  sends comes back `Command contains malformed syntax that cannot be parsed: pwsh exited with code
+  1: The command line is too long.` Consistent with the tool spawning `pwsh` to test a command
+  against a scoped pattern, and that spawn failing when the inherited environment is near the
+  8191-byte command-line limit. Nobody has read the tool's source, so the mechanism is inferred;
+  the paired test establishes only that the GRANT FORM is causal. An environment block is
+  per-PROCESS, not per-machine: one session measured 8105 bytes, and the size varies with config
+  root, worktree path and inherited `PATH`. A bare grant needs no parse.
+  **The careful spelling is the broken one**, which is why this cost four Builder launches before
+  anyone looked. Measured 2026-09-02, one variable, environment held constant. Bash is unaffected.
+  **The two rule sources are known asymmetrically, so do not generalise:** command-scoping is
+  measured to break BOTH the flag and a `settings.json` rule (a matching `Bash(git add:*)` executed
+  while its `PowerShell` twin died at the parse). A BARE name is measured to work **in the flag
+  only** -- nobody has put a bare tool name in a `settings.json` `permissions.allow` and spawned
+  without a flag. Do not "fix" a config root by bare-naming its rules on the strength of this line.
+  Three refusals that must not be conflated: `malformed syntax ... too long` is the parse dying and
+  says nothing about your rules; `This command requires approval` is a real permission decision;
+  `The term 'X' is not recognized` means the command RAN and the PATH is wrong.
+
 ## Announcing yourself (UserPromptSubmit hook)
 
 **What it fixes.** Everything above is **pull**-based: a new session discovers its peers and the peers

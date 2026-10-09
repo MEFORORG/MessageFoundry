@@ -32,6 +32,13 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# The shared glyph definition lives with the hook that gates commits. Appended, never prepended, and
+# only once, so it cannot shadow a stdlib module for the rest of the run.
+_QUALITY = str(Path(__file__).resolve().parents[1] / "quality")
+if _QUALITY not in sys.path:
+    sys.path.append(_QUALITY)
+from glyph_ranges import GLYPH  # noqa: E402
+
 # --------------------------------------------------------------------------- model
 
 
@@ -136,35 +143,17 @@ def _excerpt(text: str, around: int = 0, width: int = 110) -> str:
 # Each returns a Result. Each counts an OPPORTUNITY only when the session did something the
 # rule could apply to, and a VIOLATION only when that thing broke the rule.
 
-# Pictographs only, written as escapes so this file stays ASCII: a tool that bans glyphs must
-# not contain them. ARROWS ARE DELIBERATELY EXCLUDED (U+2190 to U+21FF). Measured 2026-09-02,
-# arrows were 167 of 167 hits on a real corpus, and an arrow is typography rather than a picture.
-# If the owner rules arrows in, restore the range AND add a self-test arm, or it ships unvalidated.
-# Pictograph ranges as integers, so this file contains no glyph of its own. A tool that bans them
-# must not carry them. ARROWS (U+2190 to U+21FF) ARE DELIBERATELY OUT: measured 2026-09-02 they
-# were 167 of 167 hits on a real corpus, and an arrow is typography rather than a picture. To rule
-# arrows in, add the pair AND a self-test arm, or the change ships unvalidated.
-_GLYPH_RANGES = (
-    (0x1F300, 0x1FAFF),  # emoji and pictographs
-    (0x2300, 0x23FF),  # technical symbols
-    (0x25A0, 0x271F),  # geometric shapes and dingbats, stopping short of the arrow block
-    (0x2B00, 0x2BFF),  # miscellaneous symbols
-    (0xFE0F, 0xFE0F),  # the variation selector that renders a character as emoji
-)
-_GLYPH = re.compile("[" + "".join(chr(lo) + "-" + chr(hi) for lo, hi in _GLYPH_RANGES) + "]")
+# The glyph class is ``GLYPH`` in ``scripts/quality/glyph_ranges.py``, which the new-glyph
+# pre-commit hook matches with too. That module says what is in, what is out and why. This file
+# stays ASCII, because a tool that grades glyphs must not carry one; a test holds it to that.
 
 
-# The rule has two stated exceptions and the checker must honour both, or it reports the project's
-# own conventions as violations. Measured 2026-09-02: all 7 hits on a real corpus were exempt.
-#
-#   1. Quoting a glyph as a token IN BACKTICKS is allowed. That is how you discuss the banner
-#      alphabet without adopting it, so code spans and fenced blocks come out before matching.
-#   2. The backlog status banners are a machine-parsed holdout. Their five code points are excluded.
-#
-# KNOWN BLIND SPOT, stated rather than hidden: exclusion 2 means this checker cannot catch a banner
-# glyph used decoratively outside the two backlog files. Catching that needs a different check, one
-# that knows which file it is looking at.
-_BANNER_HOLDOUT = "".join(chr(c) for c in (0x2705, 0x26D4, 0x1FAA6, 0x1F522, 0x1F6A7))
+# The rule has one stated exception: quoting a glyph as a token IN BACKTICKS is allowed, so code
+# spans and fenced blocks come out before matching. Measured 2026-09-02: all 7 hits on a real corpus
+# were that shape or the backlog banner alphabet. The banner alphabet was a second exception until
+# 2026-10-07. CLAUDE.md section 11 retired it when the ledger left, so a banner glyph now counts.
+# That is not backdated with EFFECTIVE: the exemption only ever covered the ledger's own banners,
+# so a banner glyph in a reply was decoration before the retirement too.
 # Built with chr(10) rather than an escape: a newline escape written into this file has broken it
 # three times, and the pattern is clearer without one.
 _CODE_SPAN = re.compile("```.*?```|`[^`" + chr(10) + "]*`", re.DOTALL)
@@ -178,12 +167,18 @@ def check_no_glyphs(events: list[Event]) -> Result:
             continue
         out.opportunities += 1
         prose = _CODE_SPAN.sub(" ", ev.text)
-        prose = "".join(ch for ch in prose if ch not in _BANNER_HOLDOUT)
-        hit = _GLYPH.search(prose)
+        hit = GLYPH.search(prose)
         if hit:
             out.violations += 1
             out.findings.append(
-                Finding(out.rule, f"glyph {hit.group()!r}", _excerpt(prose, hit.start()))
+                # Named by codepoint and folded to ASCII, so --evidence survives a cp1252 console.
+                Finding(
+                    out.rule,
+                    f"glyph U+{ord(hit.group()):04X}",
+                    _excerpt(prose, hit.start())
+                    .encode("ascii", "backslashreplace")
+                    .decode("ascii"),
+                )
             )
     return out
 
@@ -421,11 +416,17 @@ SELF_TEST: list[tuple[str, Callable[[list[Event]], Result], list[Event], list[Ev
     (
         "glyphs",
         check_no_glyphs,
-        # A rocket, deliberately NOT one of the five sanctioned banner code points, so this arm
-        # tests the rule rather than the exemption I just added.
-        [_ev_text("Done " + chr(0x1F680) + " shipped")],
+        # A rocket from the emoji plane, then one codepoint from each range this class gained on
+        # 2026-10-07 (U+2720-27BF and U+1F000-1F2FF), then a check mark, a banner glyph that was
+        # exempt until that day.
+        [
+            _ev_text("Done " + chr(0x1F680) + " shipped"),
+            _ev_text("Failed " + chr(0x274C)),
+            _ev_text("Tile " + chr(0x1F004)),
+            _ev_text("Closed " + chr(0x2705)),
+        ],
         # Known-good quotes a banner glyph in backticks, which the rule explicitly permits, and
-        # discusses the backlog alphabet. All 7 real-corpus hits were this shape.
+        # discusses the backlog alphabet.
         [
             _ev_text(
                 "The item carries a `" + chr(0x2705) + " SHIPPED` banner, so it reads as closed."
@@ -481,7 +482,8 @@ def run_self_test() -> int:
     failures = 0
     for name, fn, bad, good in SELF_TEST:
         rb, rg = fn(bad), fn(good)
-        trips = rb.violations >= 1
+        # Every known-bad EVENT must trip, so a list of several validates each one, not just one.
+        trips = rb.violations >= len(bad)
         quiet = rg.violations == 0
         # A checker that sees no opportunity in its own known-bad case is broken, not clean.
         saw_bad = rb.opportunities >= 1

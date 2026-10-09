@@ -13,7 +13,7 @@
 // Promote is offered (the same messagefoundry.promote command the connection editor reuses).
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
-import { openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { codeSetEditorScript } from "./codeSetEditorWebview";
 
 // §2 DETAIL/GRID — the shape `show` emits and `upsert` consumes. Rows are an array-of-arrays (a grid
@@ -271,6 +271,7 @@ export function codeSetFormHtml(
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <h2 id="title">New Translation Table</h2>
   <p class="sub">A code set is read-only reference data in <code>codesets/&lt;name&gt;.csv</code>. The
      <b>first column is the lookup key</b>; every cell is a string. One value column → a scalar; two or

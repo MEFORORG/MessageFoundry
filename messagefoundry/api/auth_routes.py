@@ -17,9 +17,10 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import StreamingResponse
 
 # The /ui admin pages moved to the messagefoundry_webconsole package (Option B, ADR 0065); this module
@@ -69,10 +70,15 @@ from messagefoundry.api.auth_models import (
     UserSummary,
     UserUpdateRequest,
 )
+from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
+    AUTH_NOT_CONFIGURED,
+    AuthenticatedBeforeBodyRoute,
+    RepeatedCredentialError,
     alert_administrator_granted,
     alert_directory_administrator_granted,
     answers_before_body,
+    authorization_header,
     bearer_token,
     bearer_token_dependency,
     client_ip,
@@ -80,12 +86,16 @@ from messagefoundry.api.security import (
     pending_credential_deadline,
     pending_credential_deadline_for,
     public_route,
+    record_repeated_credential,
     require,
     require_reauth_only_action,
     require_step_up,
     require_step_up_action,
 )
 from messagefoundry.api.validation import (
+    AUDIT_EXPORT_DEFAULT_LIMIT,
+    AUDIT_EXPORT_MAX_LIMIT,
+    PAGE_BIND_MAX,
     ActionFilter,
     ActorFilter,
     CustomRoleId,
@@ -93,6 +103,7 @@ from messagefoundry.api.validation import (
     EpochSeconds,
     ResourceId,
 )
+from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth import (
     BUILTIN_ROLE_PERMISSIONS,
     ROLE_METADATA,
@@ -101,7 +112,11 @@ from messagefoundry.auth import (
     Permission,
     Role,
 )
-from messagefoundry.auth.audit_visibility import audit_exclusion_for
+from messagefoundry.auth.audit_visibility import (
+    AUDIT_WITHHELD_HEADER,
+    audit_exclusion_for,
+    withholds_rows_from,
+)
 from messagefoundry.auth.ldap import LdapError, canonical_group_dn
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
@@ -127,6 +142,7 @@ from messagefoundry.auth.service import (
     InvalidNotifyEmail,
     LastAdministratorRefused,
     NotifyEmailAlreadySet,
+    SelfTargetOp,
     TemporaryPasswordUnavailable,
     UsernameTaken,
 )
@@ -214,28 +230,8 @@ async def _service(request: Request) -> AuthService:
     # here, so the check that runs before the body is read asks it first (vault BACKLOG #2739).
     auth = get_auth(request)
     if auth is None:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not enabled")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AUTH_NOT_CONFIGURED)
     return auth
-
-
-async def _no_store_reply(response: Response) -> None:
-    """Forbid caching a reply whose BODY carries a live credential (ASVS 7.2.4 delivery, 14.2.2).
-
-    A session token, a staged TOTP seed, one-time recovery codes and an admin-issued temporary
-    password all have to reach the client somehow, and the body is the only channel a bearer client
-    has. So none of those replies may sit in a proxy or browser cache, where a later reader could
-    lift a working credential out of one.
-
-    Every credential-bearing route declares this as a ROUTE-LEVEL dependency
-    (``dependencies=[Depends(_no_store_reply)]``), one mechanism for all of them. That form also
-    leaves the handler's own signature alone, which matters because the web console calls
-    ``enroll_mfa`` and ``reset_user_password`` as plain functions; their HTML replies are under
-    ``/ui``, which the security-header middleware already serves ``no-store``. A refusal raises
-    before the reply is built, and FastAPI drops the header with it, which is fine: a refusal carries
-    no credential. ``tests/test_credential_reply_no_store.py`` finds every route whose response model
-    carries one of the credential field names it lists, and drives each one on the wire (BACKLOG
-    #1185)."""
-    response.headers["Cache-Control"] = "no-store"
 
 
 def _current_user(identity: Identity) -> CurrentUser:
@@ -246,6 +242,45 @@ def _current_user(identity: Identity) -> CurrentUser:
         roles=sorted(r.value for r in identity.roles),
         permissions=sorted(p.value for p in identity.permissions),
     )
+
+
+#: The two federated-identity routes refuse the caller's own account in the same words.
+_OWN_BINDING = "another administrator must change your own binding"
+
+
+async def _refuse_if_self(
+    request: Request,
+    service: AuthService,
+    identity: Identity,
+    user_id: str,
+    target: UserRecord | None = None,
+    *,
+    op: SelfTargetOp,
+    detail: str,
+) -> None:
+    """Raise the 400 when an admin route targets the caller's own account, after the refusal's own
+    audit row (vault BACKLOG #3260).
+
+    The path's spelling OR the stored id decides (vault BACKLOG #3259). A store whose id column
+    compares case-insensitively (SQL Server) finds the caller's row from another spelling, and the
+    console's ``/ui/users/{user_id}/`` routes pass the path to these handlers as a plain str, past
+    the JSON plane's ``ResourceId`` pattern. ``target`` is the row the caller already read, if any.
+    When it is None the row is read here, and only when the path spelling did not match."""
+    if user_id != identity.user_id:
+        if target is None:
+            target = await service.store.get_user(user_id)
+        if target is None or target.id != identity.user_id:
+            return
+    # Soft, with no defect re-raised: a raise here would replace the 400 the caller is owed with a
+    # 500. The refusal stands either way, and a lost row is logged at ERROR.
+    await write_audit_soft(
+        lambda: service.audit_self_target_refused(identity, op=op, client=client_ip(request)),
+        log=_log,
+        message="the %s self-target refusal stands, but its audit row failed",
+        args=(op,),
+        defects=(),
+    )
+    raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
 
 
 def _login_response(
@@ -412,6 +447,20 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     :class:`AdminHandlers` type lives in the engine leaf ``api._ui_seam`` (never the console package),
     so this function — called UNCONDITIONALLY from ``create_app`` — imports with the console absent.
     """
+    # The credential replies below are served no-store by the route class, not by any route
+    # (BACKLOG #2372), so on a router without it they would go out cacheable.
+    if not issubclass(app.router.route_class, AuthenticatedBeforeBodyRoute):
+        raise RuntimeError("add_auth_routes needs the AuthenticatedBeforeBodyRoute route class")
+
+    async def _repeated_credential(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2454: every HTTP read of a repeated Authorization header or session cookie, on
+        # the engine or the mounted console, raises this one error, so it is logged and audited in
+        # one place. Then the ordinary 400 answer, the one a plain HTTPException gets.
+        assert isinstance(exc, RepeatedCredentialError)
+        await record_repeated_credential(request, exc.credential)
+        return await http_exception_handler(request, exc)
+
+    app.add_exception_handler(RepeatedCredentialError, _repeated_credential)
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)
@@ -435,7 +484,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/auth/login",
         response_model=LoginResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     @public_route("sign-in itself; a session does not exist yet")
     async def login(
@@ -485,7 +533,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/auth/negotiate",
         response_model=LoginResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     @public_route("Kerberos sign-in itself; a session does not exist yet")
     async def negotiate(
@@ -494,7 +541,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         client = client_ip(request)
         if not service.allow_login_attempt(client):
             raise _rate_limited(request, "negotiate")
-        header = request.headers.get("Authorization", "")
+        header = authorization_header(request)  # 400 on a repeated header (BACKLOG #2454)
         if not header.startswith("Negotiate "):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing SPNEGO token")
         try:
@@ -627,7 +674,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/me/reauth",
         response_model=ElevatedResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def reauth(
         body: ReauthRequest,
@@ -695,7 +741,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/auth/mfa-verify",
         response_model=ElevatedResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def mfa_verify(
         body: MfaVerifyRequest,
@@ -746,7 +791,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/me/mfa/enroll",
         response_model=MfaEnrollResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def enroll_mfa(
         service: AuthService = Depends(_service),
@@ -767,7 +811,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/me/mfa/confirm",
         response_model=MfaConfirmResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def confirm_mfa(
         body: MfaConfirmRequest,
@@ -795,7 +838,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
-        # _no_store_reply dependency keeps the reply out of every cache.
+        # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).
         return MfaConfirmResponse(
             recovery_codes=list(elevation.recovery_codes), token=elevation.token
         )
@@ -838,15 +881,41 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def my_security_events(
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
-        limit: int = Query(100, ge=1, le=1000),
+        # Annotated, not ``= Query(...)``: the web console calls this handler in-process, and a
+        # call that leaves one out must get the plain default, never a Query sentinel bound into SQL.
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+        offset: Annotated[int, Query(ge=0, le=PAGE_BIND_MAX)] = 0,
+        as_of: Annotated[EpochSeconds | None, Query()] = None,
     ) -> SecurityEventsList:
         """The caller's own security-event history (WP-L3-05, ASVS 6.3.5/6.3.7): the audited ``auth.*``
         actions on their account (sign-ins, lockouts, password changes), most-recent-first; which
         events that includes is stated once, in ``auth/notifications.py``. The out-of-band email push
         complements this for events the user should learn of without logging in (and for
-        admin-initiated changes, whose audit actor is the admin)."""
-        rows = await service.security_events_for(identity.username, limit=limit)
-        return SecurityEventsList(events=[SecurityEventInfo(**r) for r in rows])
+        admin-initiated changes, whose audit actor is the admin). ``offset`` and ``total`` page it,
+        and ``as_of`` pins the pages to the snapshot the first one read (BACKLOG #2438): the
+        caller's own requests elsewhere keep writing ``auth.*`` rows under their name. The pin is a
+        timestamp, never a row id, for the reason :mod:`messagefoundry.api.paging` gives."""
+
+        # Pass ``identity.username`` at each call, never through a local alias. The username
+        # access-key screen matches the argument's shape, and an alias hides both calls from it.
+        async def read(n: int, skip: int, pin: float | None) -> list[dict[str, Any]]:
+            return await service.security_events_for(
+                identity.username, limit=n, offset=skip, until=pin
+            )
+
+        async def count(pin: float | None) -> int:
+            return await service.count_security_events_for(identity.username, until=pin)
+
+        rows, total, as_of = await ts_pinned_page(
+            as_of, limit=limit, offset=offset, read=read, count=count, ts_of=lambda r: r["ts"]
+        )
+        return SecurityEventsList(
+            events=[SecurityEventInfo(**r) for r in rows],
+            total=total,
+            limit=limit,
+            offset=offset,
+            as_of=as_of,
+        )
 
     @app.delete("/me/sessions/{session_id}", response_model=SimpleMessage)
     async def revoke_my_session(
@@ -1042,8 +1111,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         "/users",
         response_model=UserCreatedResponse,
         status_code=status.HTTP_201_CREATED,
-        # ADR 0197 Amendment A (AC-A2): the reply carries the generated credential (ASVS 14.2.2).
-        dependencies=[Depends(_no_store_reply)],
+        # ADR 0197 Amendment A (AC-A2): the reply carries the generated credential (ASVS 14.2.2),
+        # so its CredentialReply model makes the route class serve it no-store (BACKLOG #2372).
     )
     async def create_user(
         body: UserCreateRequest,
@@ -1138,6 +1207,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def update_user(
         user_id: ResourceId,
         body: UserUpdateRequest,
+        request: Request,
         service: AuthService = Depends(_service),
         # 7.5.1 (ASVS): the one broad-admin route promoted to ACTION-binding (fresh single-use grant
         # bound to admin_user_update, not the shared login window). The other USERS_MANAGE routes keep
@@ -1149,10 +1219,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         current = await service.store.get_user(user_id)
         if current is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        # The stored id, not the path's spelling: a store whose id column compares case-insensitively
-        # (SQL Server) finds the row from another spelling, and the console seam passes a plain str.
-        if body.disabled and current.id == identity.user_id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot disable your own account")
+        if body.disabled:
+            await _refuse_if_self(
+                request,
+                service,
+                identity,
+                user_id,
+                current,
+                op="disable",
+                detail="cannot disable your own account",
+            )
         # SEC-015: disabling is a lock-out path equivalent to stripping the admin role, so it carries
         # the same last-admin guard. The guard is inside service.update_user now, in one store
         # transaction with the write (vault BACKLOG #2779); LastAdministratorRefused is mapped below.
@@ -1193,13 +1269,20 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.delete("/users/{user_id}", response_model=SimpleMessage)
     async def delete_user(
         user_id: ResourceId,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         target = await service.store.get_user(user_id)
-        # Compared on the stored id as well as the path's, for the reason update_user gives.
-        if user_id == identity.user_id or (target is not None and target.id == identity.user_id):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot delete your own account")
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            target,
+            op="delete",
+            detail="cannot delete your own account",
+        )
         if target is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
         # SEC-015: deleting the last enabled admin is the same lock-out path. service.delete_user
@@ -1258,10 +1341,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/users/{user_id}/reset-password",
         response_model=PasswordResetResponse,
-        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
     async def reset_user_password(
         user_id: ResourceId,
+        request: Request,
         service: AuthService = Depends(_service),
         # BACKLOG #1148 (ASVS 7.5.1): the proof must be BOUND TO THIS ACTION and single-use, not
         # the login-seeded window. require_step_up_ACTION, never the reauth_only variant -- that
@@ -1279,10 +1362,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         BACKLOG #1141 (ASVS 6.4.5): the response also carries ``expires_at``, the instant the login
         gate stops accepting this credential, so the administrator conveying it out-of-band can state
         the deadline. Nothing else on this path ever reaches the holder."""
-        if user_id == identity.user_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "use change-password for your own account"
-            )
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            op="password_reset",
+            detail="use change-password for your own account",
+        )
         try:
             issued = await service.admin_reset_password(user_id, actor=identity.username)
         except ValueError as exc:
@@ -1314,11 +1401,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post(
         "/users/{user_id}/reset-mfa",
         response_model=MfaResetResponse,
-        # ADR 0197 Amendment A (AC-A4): a local account's reply carries the generated credential.
-        dependencies=[Depends(_no_store_reply)],
+        # ADR 0197 Amendment A (AC-A4): a local account's reply carries the generated credential,
+        # so its CredentialReply model makes the route class serve it no-store (BACKLOG #2372).
     )
     async def reset_user_mfa(
         user_id: ResourceId,
+        request: Request,
         service: AuthService = Depends(_service),
         # BACKLOG #1148 (ASVS 7.5.1). This is the sharper of the two: one call clears the TOTP
         # secret, every recovery code and every passkey on the target account.
@@ -1349,11 +1437,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         #
         # Copied in shape from reset_user_password above, which has carried the same guard since
         # ASVS 6.4.6 -- the two admin routes now refuse the same case the same way.
-        if user_id == identity.user_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                "use the self-service MFA settings for your own account",
-            )
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            op="mfa_reset",
+            detail="use the self-service MFA settings for your own account",
+        )
         try:
             issued = await service.admin_reset_mfa(user_id, actor=identity.username)
         except TemporaryPasswordUnavailable as exc:
@@ -1416,6 +1507,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def bind_user_federated_identity(
         user_id: ResourceId,
         body: FederatedIdentityRequest,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
@@ -1429,10 +1521,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # SELF-EXCLUSION, as the two reset routes above do. Re-pointing or removing your own
         # federated identity ends every session you hold, the calling one included, and on a site
         # where you sign in only through the IdP it can leave the last administrator locked out.
-        if user_id == identity.user_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
-            )
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            op="federated_bind",
+            detail=_OWN_BINDING,
+        )
         try:
             bound = await service.bind_federated_subject(
                 user_id,
@@ -1461,6 +1557,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def unbind_user_federated_identity(
         user_id: ResourceId,
         body: ExpectedFederatedPair,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
@@ -1470,10 +1567,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         method). Its next federated login is refused until it is bound again. The body carries the
         pair the caller saw; a stored pair that differs is refused 409 with nothing changed
         (BACKLOG #2026)."""
-        if user_id == identity.user_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
-            )
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            op="federated_unbind",
+            detail=_OWN_BINDING,
+        )
         try:
             revoked = await service.unbind_federated_subject(
                 user_id,
@@ -1611,13 +1712,15 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         since: float | None = None,
         until: float | None = None,
         before_id: int | None = None,
+        offset: int = 0,
     ) -> Sequence[Any]:
         """THE ONE READ OF THE TRAIL FOR A CALLER. ``GET /audit``, the console's ``/ui/audit`` and
         ``GET /audit/export`` all come through here, so none of them can skip the owner-ruled lock-row
         exclusion of 2026-09-28 (BACKLOG #1131; :mod:`messagefoundry.auth.audit_visibility`). It is
         keyed on ``identity``, which is why this takes one: a caller without ``users:manage`` gets
-        the trail minus the lock rows, applied in SQL before ``limit`` so a page is never short.
-        ``before_id`` is the export's keyset cursor (vault BACKLOG #2776).
+        the trail minus the lock rows, applied in SQL before ``limit`` and ``offset`` so a page is
+        never short. ``before_id`` is the export's keyset cursor (vault BACKLOG #2776);
+        ``offset`` is the numbered pager's position (BACKLOG #2438).
 
         Every filter value is passed as a keyword to the store, which binds it as a SQL parameter
         across all three backends (BACKLOG #170) -- never string-interpolated into the query."""
@@ -1629,13 +1732,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             until=until,
             exclude=audit_exclusion_for(identity),
             before_id=before_id,
+            offset=offset,
         )
 
     async def _count_audit(
         service: AuthService,
         identity: Identity,
         *,
-        limit: int,
+        limit: int | None,
         actor: str | None,
         action: str | None,
         since: float | None,
@@ -1644,7 +1748,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> int:
         """How many rows :func:`_read_audit` would return for the same caller and arguments, under
         the same lock-row exclusion (BACKLOG #1131), counted in SQL rather than read. The export
-        records it before it streams (vault BACKLOG #2776)."""
+        records it before it streams (vault BACKLOG #2776). ``limit=None`` is the uncapped total a
+        pager states (BACKLOG #2438)."""
         return await service.store.count_audit(
             limit=limit,
             actor=actor,
@@ -1660,14 +1765,41 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity,
         *,
         limit: int = 100,
+        offset: int = 0,
+        as_of: float | None = None,
         actor: str | None = None,
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
     ) -> AuditList:
-        # Plain-default core shared by the HTTP route below and the webconsole seam wrapper.
-        rows = await _read_audit(
-            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
+        """Plain-default core shared by the HTTP route below and the webconsole seam wrapper.
+
+        The total is counted under the same exclusion as the page, so a reader without
+        users:manage is told how many rows IT can page through, never how many the trail holds
+        (BACKLOG #2438). Every page is pinned to rows at or before ``as_of``. A caller that names
+        none gets the newest row's ``ts``, and passes that back. Without the pin, the grant row
+        ``require(AUDIT_READ)`` writes before each read would push every row down one, so each
+        page would repeat the last row of the one before it. The pin is a timestamp and never a
+        row id: :mod:`messagefoundry.api.paging` says why an id would leak the lock rows."""
+
+        def bound(pin: float | None) -> float | None:
+            # The pin is one more ``until``, so the tighter of the two applies.
+            return pin if until is None else until if pin is None else min(pin, until)
+
+        filters: dict[str, Any] = {"actor": actor, "action": action, "since": since}
+
+        async def read(n: int, skip: int, pin: float | None) -> Sequence[Any]:
+            return await _read_audit(
+                service, identity, limit=n, offset=skip, until=bound(pin), **filters
+            )
+
+        async def count(pin: float | None) -> int:
+            return await _count_audit(
+                service, identity, limit=None, until=bound(pin), before_id=None, **filters
+            )
+
+        rows, total, as_of = await ts_pinned_page(
+            as_of, limit=limit, offset=offset, read=read, count=count, ts_of=lambda r: r["ts"]
         )
         return AuditList(
             entries=[
@@ -1680,7 +1812,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     detail=r["detail"],
                 )
                 for r in rows
-            ]
+            ],
+            total=total,
+            limit=limit,
+            offset=offset,
+            as_of=as_of,
+            # BACKLOG #2446: said by permission, never by whether a hidden row is in range.
+            withheld=withholds_rows_from(identity),
         )
 
     @app.get("/audit", response_model=AuditList)
@@ -1688,6 +1826,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require(Permission.AUDIT_READ)),
         limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0, le=PAGE_BIND_MAX),
+        as_of: EpochSeconds | None = Query(
+            None, description="the snapshot pin a previous page returned; omit it on the first page"
+        ),
         actor: ActorFilter | None = Query(None),
         action: ActionFilter | None = Query(None),
         since: EpochSeconds | None = Query(
@@ -1698,23 +1840,34 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ),
     ) -> AuditList:
         return await _audit_list(
-            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
+            service,
+            identity,
+            limit=limit,
+            offset=offset,
+            as_of=as_of,
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
         )
 
-    async def _audit_ui_list(*, service: AuthService, _: Identity, limit: int = 100) -> AuditList:
+    async def _audit_ui_list(
+        *,
+        service: AuthService,
+        _: Identity,
+        limit: int = 100,
+        offset: int = 0,
+        as_of: float | None = None,
+    ) -> AuditList:
         # The webconsole /ui/audit page invokes this seam callable DIRECTLY (not through FastAPI), so its
         # defaults MUST be plain values — a route Query(...) sentinel must never reach the store bind
-        # (BACKLOG #170 regression guard: 'type Query is not supported'). The UI shows the NEWEST
-        # `limit` rows and nothing older, which is not the full trail and must not be described as one
-        # (BACKLOG #1743): this wrapper takes no cursor, so there is no second page to reach and no
-        # total to compare against. The store's keyset cursor (list_audit's before_id) and its
-        # count_audit serve the export (vault BACKLOG #2776); no pager uses them. The filters are on GET
-        # /audit and the CSV is GET /audit/export, which is capped too (its own `limit`, no offset),
-        # so it does not hold the whole trail either. AUDIT_READ is
-        # enforced by the webconsole route's own require_ui dependency, so this wrapper carries no auth
-        # dependency of its own. The identity it is handed is the page's caller, and it decides which
-        # rows that caller may read (BACKLOG #1131).
-        return await _audit_list(service, _, limit=limit)
+        # (BACKLOG #170 regression guard: 'type Query is not supported'). It pages the trail newest
+        # first by ``offset`` under the ``as_of`` pin and returns the total the page states
+        # (BACKLOG #2438). The filters are on GET /audit and the CSV is GET /audit/export.
+        # AUDIT_READ is enforced by the webconsole route's own require_ui dependency, so this
+        # wrapper carries no auth dependency of its own. The identity it is handed is the page's
+        # caller, and it decides which rows that caller may read (BACKLOG #1131).
+        return await _audit_list(service, _, limit=limit, offset=offset, as_of=as_of)
 
     @app.get("/audit/export")
     async def export_audit(
@@ -1722,7 +1875,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require(Permission.AUDIT_EXPORT)),
         format: str = Query("csv", pattern="^csv$"),
-        limit: int = Query(10000, ge=1, le=1_000_000),
+        limit: int = Query(AUDIT_EXPORT_DEFAULT_LIMIT, ge=1, le=AUDIT_EXPORT_MAX_LIMIT),
         actor: ActorFilter | None = Query(None),
         action: ActionFilter | None = Query(None),
         since: EpochSeconds | None = Query(
@@ -1743,7 +1896,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         many rows).
 
         A caller without ``users:manage`` exports the trail without the lock rows, exactly as it reads
-        it (BACKLOG #1131), and ``count`` is the number of rows the export sends it.
+        it (BACKLOG #1131), and ``count`` is the number of rows the export sends it. The
+        ``X-Audit-Withheld`` header and the ``audit.export`` row's ``withheld`` say whether that
+        exclusion applied, by permission and never by the rows (BACKLOG #2446), so a filtered CSV
+        does not read as the whole trail.
 
         The rows are read in pages of ``_AUDIT_EXPORT_PAGE``, newest first, each page keyed below the
         last ``id`` of the one before (vault BACKLOG #2776), so the process holds one page and not the
@@ -1785,6 +1941,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 before_id=int(first[0]["id"]) + 1,
             )
         )
+        withheld = withholds_rows_from(identity)
         # Record the export as its own audit event BEFORE streaming — the detail is metadata only (the
         # applied filter + row count), never a message body.
         await service.store.record_audit(
@@ -1794,6 +1951,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 {
                     "format": "csv",
                     "count": count,
+                    "withheld": withheld,
                     "filter": {
                         "actor": actor,
                         "action": action,
@@ -1854,7 +2012,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         return StreamingResponse(
             _iter_csv(),
             media_type="text/csv",
-            headers={"Content-Disposition": 'attachment; filename="audit-export.csv"'},
+            headers={
+                "Content-Disposition": 'attachment; filename="audit-export.csv"',
+                AUDIT_WITHHELD_HEADER: "true" if withheld else "false",
+            },
         )
 
     # The /ui admin/account/audit pages moved to messagefoundry_webconsole (Option B, ADR 0065). Return
@@ -1886,6 +2047,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         enroll_mfa=enroll_mfa,
         disable_my_mfa=disable_my_mfa,
         list_audit=_audit_ui_list,
+        export_audit=export_audit,
         my_security_events=my_security_events,
         user_summary=_user_summary,
         federated_identity_view=_federated_identity_view,

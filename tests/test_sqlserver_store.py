@@ -5671,6 +5671,20 @@ async def test_list_audit_exclusion_runs_in_sql_before_limit_mssql(store) -> Non
     assert await store.count_audit(actor=who, exclude=ex, limit=10, before_id=ids[0]) == 2
 
 
+async def test_audit_events_and_security_events_page_by_offset_mssql(store) -> None:
+    """BACKLOG #2438: offset-and-total paging on the real backend, through the shared contract that
+    ``tests/test_audit_event_paging.py`` runs on SQLite."""
+    from tests._audit_event_paging_contract import (
+        check_audit_paging,
+        check_connection_event_paging,
+        check_security_events_paging,
+    )
+
+    await check_audit_paging(store, "mssql")
+    await check_security_events_paging(store, "mssql")
+    await check_connection_event_paging(store, "mssql")
+
+
 # --- BACKLOG #2097: can a pooled session carry SET NOCOUNT ON? --------------------------------------
 
 
@@ -5740,3 +5754,11 @@ async def test_backlog_2097_nocount_persistence_probe() -> None:
     assert spid == spid_p == spid_c, "the arms read different sessions, so they compare nothing"
     assert plain == 512, "the positive control did not see NOCOUNT: the instrument is dead"
     assert restored == 0
+
+
+async def test_transit_bound_attestation_roundtrip_ss(store) -> None:
+    """BACKLOG #2337: record, replace and withdraw the vault_transit bound attestation, each with its
+    audit row in the same transaction."""
+    from tests.test_transit_bound_attestation_server_backends import attestation_roundtrip
+
+    await attestation_roundtrip(store)

@@ -20,7 +20,10 @@ switch be added at an insecure value with nothing reporting it.
 from __future__ import annotations
 
 import ipaddress
+import math
+from collections.abc import Collection
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -32,6 +35,8 @@ from messagefoundry.config.settings import (
     ApiSettings,
     ApprovalsSettings,
     AuthSettings,
+    BackupSettings,
+    CertMonitorSettings,
     EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -71,8 +76,11 @@ def _pairs(
     db_hops: tuple[str, ...] = (),
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
+    path_form_hops: tuple[str, ...] = (),
     api: ApiSettings | None = None,
     approvals: ApprovalsSettings | None = None,
+    cert_monitor: CertMonitorSettings | None = None,
+    backup: BackupSettings | None = None,
 ) -> list[tuple[str, str]]:
     """The loosening ``(switch, risk)`` pairs for a settings combination (defaults where not
     overridden)."""
@@ -89,8 +97,11 @@ def _pairs(
         unverified_db_hops=db_hops,
         attested_hops=attested_hops,
         revocation_attested_hops=revocation_hops,
+        path_form_fhir_hops=path_form_hops,
         api=api or ApiSettings(),
         approvals=approvals or ApprovalsSettings(),
+        cert_monitor=cert_monitor or CertMonitorSettings(),
+        backup=backup or BackupSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
@@ -142,8 +153,11 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -175,8 +189,11 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -205,8 +222,11 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -230,6 +250,46 @@ def test_recheck_zero_without_ad_is_NOT_a_loosening() -> None:
 
 def test_recheck_at_the_default_with_ad_enabled_is_not_a_loosening() -> None:
     assert "ad_session_recheck_seconds" not in _names(auth=_ad())
+
+
+# --- [auth].ad_connect_timeout / ad_receive_timeout (vault BACKLOG #2567) -----------------------
+
+_AD_TIMEOUTS = ["ad_connect_timeout", "ad_receive_timeout"]
+
+
+@pytest.mark.parametrize("field", _AD_TIMEOUTS)
+def test_an_ad_timeout_above_its_default_is_a_named_loosening(field: str) -> None:
+    """Each timeout is named alone, with its value and the default, at the load's ceiling and just
+    past the default alike."""
+    risks = dict(_pairs(auth=_ad(**{field: 3600.0})))
+    assert "3600.0 s, above the default of 10 s" in risks[field]
+    assert "worker thread" in risks[field]
+    assert [n for n in risks if n in _AD_TIMEOUTS] == [field]
+    # Only the receive timeout is rounded, and to a WHOLE second: auth/ldap.py applies math.ceil.
+    # The text once said "rounded up to 1 s", which reads as a one-second bound.
+    assert ("rounded up to a whole second" in risks[field]) is (field == "ad_receive_timeout")
+    assert "to 1 s" not in risks[field]
+    # A value just past the default is named, and never printed as the default itself. The second
+    # is the next float above 10.0, which 15 significant digits would print as "10".
+    assert "is 10.0001 s" in dict(_pairs(auth=_ad(**{field: 10.0001})))[field]
+    next_up = math.nextafter(10.0, math.inf)
+    assert f"is {next_up!r} s" in dict(_pairs(auth=_ad(**{field: next_up})))[field]
+    assert repr(next_up) != "10.0"
+
+
+@pytest.mark.parametrize("field", _AD_TIMEOUTS)
+@pytest.mark.parametrize("value", [10.0, 9.99, 0.5])
+def test_an_ad_timeout_at_or_below_its_default_is_not_a_loosening(field: str, value: float) -> None:
+    """A shorter timeout fails a stalled directory call sooner, which is stricter."""
+    assert field not in _names(auth=_ad(**{field: value}))
+
+
+@pytest.mark.parametrize("field", _AD_TIMEOUTS)
+def test_an_ad_timeout_without_ad_is_not_a_loosening(field: str) -> None:
+    """CONDITIONAL, like the recheck above: with no directory nothing reads the timeout. The second
+    line is the control that the same value fires once AD is on."""
+    assert field not in _names(auth=AuthSettings(**{field: 3600.0}))  # type: ignore[arg-type]
+    assert field in _names(auth=_ad(**{field: 3600.0}))
 
 
 # --- [auth].admin_new_ip_step_up (BACKLOG #288) ----------------------------------------------
@@ -256,8 +316,11 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -283,7 +346,6 @@ _SIGN_IN_OFF_VALUES = [
     ("login_rate_limit_global", 0),
     ("login_rate_limit_window_seconds", 0.0),
     ("login_rate_limit_window_seconds", -1.0),
-    ("login_rate_limit_window_seconds", float("-inf")),
     ("lockout_minutes", 0),
     ("lockout_minutes", -5),
     ("lockout_threshold", LOCKOUT_THRESHOLD_CEILING + 1),
@@ -333,7 +395,8 @@ _LOOSER_THAN_DEFAULT = [
 #: (field, value at or stricter than its shipped default). None is named. The defaults are listed
 #: too, so a direction flipped to ">=" or "<=" reds here.
 _STRICTER_OR_DEFAULT = [
-    # A negative count refuses more, and a NaN or +inf window never prunes, so each refuses MORE.
+    # A negative count refuses more. A NaN or infinite window is refused at load (vault BACKLOG
+    # #2466), so it is in _NON_FINITE_WINDOWS below and not here.
     ("login_rate_limit_per_ip", 10),
     ("login_rate_limit_per_ip", 9),
     ("login_rate_limit_per_ip", 1),
@@ -343,8 +406,6 @@ _STRICTER_OR_DEFAULT = [
     ("login_rate_limit_global", -1),
     ("login_rate_limit_window_seconds", 60.0),
     ("login_rate_limit_window_seconds", 61.0),
-    ("login_rate_limit_window_seconds", float("inf")),
-    ("login_rate_limit_window_seconds", float("nan")),
     ("lockout_minutes", 15),
     ("lockout_minutes", 16),
     # 0 or less locks on the FIRST failure.
@@ -362,8 +423,6 @@ _STRICTER_OR_DEFAULT = [
     ("phi_read_rate_limit_global", 1),
     ("phi_read_rate_limit_window_seconds", 60.0),
     ("phi_read_rate_limit_window_seconds", 61.0),
-    ("phi_read_rate_limit_window_seconds", float("inf")),
-    ("phi_read_rate_limit_window_seconds", float("nan")),
     ("admin_write_rate_limit_per_actor", 12),
     ("admin_write_rate_limit_per_actor", 11),
     ("admin_write_rate_limit_per_actor", -1),
@@ -398,8 +457,11 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -541,7 +603,7 @@ async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine)
     assert admitted(off, addresses=1) == 200
     assert admitted(off, addresses=1, ceremony=True) == 200
 
-    for window in (0.0, -1.0, float("-inf")):
+    for window in (0.0, -1.0):
         no_window = AuthSettings(login_rate_limit_window_seconds=window)
         assert admitted(no_window, addresses=1) == 200
         assert admitted(no_window, addresses=1, ceremony=True) == 200
@@ -555,14 +617,83 @@ async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine)
 
     # The values the registry does NOT name, because each refuses more: none may admit more than
     # the default does.
-    for window in (float("nan"), float("inf")):
-        unpruned = AuthSettings(login_rate_limit_window_seconds=window)
-        assert admitted(unpruned, addresses=1) <= 10
-        assert admitted(unpruned, addresses=50) <= 60
-        assert admitted(unpruned, addresses=1, ceremony=True) <= 10
     assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1) <= 10
     assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1, ceremony=True) <= 10
     assert admitted(AuthSettings(login_rate_limit_global=-1), addresses=50) <= 60
+
+
+#: The two [auth] windows that were bare floats (vault BACKLOG #2466), and the values no float
+#: window may load. The admin-write window already refused them.
+_BARE_WINDOWS = ["login_rate_limit_window_seconds", "phi_read_rate_limit_window_seconds"]
+_NON_FINITE_WINDOWS = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("field", [*_BARE_WINDOWS, "admin_write_rate_limit_window_seconds"])
+@pytest.mark.parametrize("value", _NON_FINITE_WINDOWS)
+def test_a_non_finite_window_is_refused_at_load(field: str, value: float) -> None:
+    """A NaN or +inf window never prunes, so its counts fill once and then refuse for good."""
+    with pytest.raises(ValueError, match="finite number"):
+        AuthSettings(**{field: value})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", _BARE_WINDOWS)
+@pytest.mark.parametrize("text", ["nan", "inf", "-inf", "NaN", "Infinity"])
+def test_a_non_finite_window_from_the_environment_is_refused(field: str, text: str) -> None:
+    """The same refusal on the env path, where the value arrives as text."""
+    with pytest.raises(ValueError, match="finite number"):
+        load_settings(environ={f"MEFOR_AUTH_{field.upper()}": text}, default_file=False)
+
+
+@pytest.mark.parametrize("field", _BARE_WINDOWS)
+@pytest.mark.parametrize("value", [0.0, -1.0, 1e-6, 3600.0, 86400.0])
+def test_a_finite_window_still_loads(field: str, value: float) -> None:
+    """The control for the refusals around it: a finite value up to the cap loads. A window of 0 or
+    less stays the named off value it was."""
+    assert getattr(AuthSettings(**{field: value}), field) == value  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", [*_BARE_WINDOWS, "admin_write_rate_limit_window_seconds"])
+@pytest.mark.parametrize("value", [math.nextafter(86400.0, math.inf), 1e12, 1e300])
+def test_a_window_past_one_day_is_refused_at_load(field: str, value: float) -> None:
+    """A huge finite window holds every counted attempt for longer than the process lives, which
+    is the NaN failure by another spelling. Review round 1 measured 1e12 loading unnamed."""
+    with pytest.raises(ValueError, match="less than or equal to 86400"):
+        AuthSettings(**{field: value})  # type: ignore[arg-type]
+    assert AuthSettings(**{field: 86400.0})  # type: ignore[arg-type]
+
+
+def test_the_guide_quotes_the_window_cap_the_load_applies() -> None:
+    """The guide restates the cap, so it is tied to the constant: moving one reds this."""
+    from messagefoundry.config.settings import _RATE_WINDOW_MAX_SECONDS
+
+    guide = (Path(__file__).parents[1] / "docs" / "SECURITY-LOOSENING.md").read_text("utf-8")
+    assert f"A window above `{_RATE_WINDOW_MAX_SECONDS:g}` s (one day)" in guide
+    assert _RATE_WINDOW_MAX_SECONDS == 24 * 60 * 60
+
+
+def test_an_unpruned_window_refuses_every_attempt_once_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Why the load refuses NaN and +inf, shown on the limiter those settings build: the count fills
+    and never drains, however much time passes. A finite window drains."""
+    from types import SimpleNamespace
+
+    from messagefoundry.auth import ratelimit
+
+    # The limiter's own clock only, as its other tests replace it; never the process-wide one.
+    clock = [0.0]
+    monkeypatch.setattr(ratelimit, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def after_a_long_wait(window: float) -> bool:
+        clock[0] = 0.0
+        limiter = ratelimit.SlidingWindowRateLimiter(per_key=2, glob=0, window_seconds=window)
+        assert [limiter.allow("a") for _ in range(3)] == [True, True, False]
+        clock[0] = 1e9
+        return limiter.allow("a")
+
+    assert after_a_long_wait(float("nan")) is False
+    assert after_a_long_wait(float("inf")) is False
+    assert after_a_long_wait(60.0) is True
 
 
 @pytest.mark.parametrize("escalate", [True, False])
@@ -890,6 +1021,144 @@ async def test_posture_route_reports_the_approval_dwell_the_app_was_built_with(
     assert "min_dwell_seconds" not in default and "expiry_hours" not in default
 
 
+# --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4) --------------------
+
+
+def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
+    """BACKLOG #2227: each warn_days = 0 turned its reminder off with only a runner debug line."""
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(warn_days=0),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(warn_days=0),
+        )
+    )
+    assert "cert_expiry reminder" in named["cert_monitor.warn_days"]
+    assert "periodic secret-rotation reminder off" in named["secret_rotation.warn_days"]
+    # Not "however overdue": under enforce the start-time checks still alert, and the text says so.
+    assert "start-time expiry checks are the only source" in named["secret_rotation.warn_days"]
+    # The control: the shipped leads, and longer ones, name nothing.
+    for cert, rotation in ((30, 14), (90, 60)):
+        on = _names(
+            cert_monitor=CertMonitorSettings(warn_days=cert),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(warn_days=rotation),
+        )
+        assert "cert_monitor.warn_days" not in on and "secret_rotation.warn_days" not in on
+
+
+def test_a_reminder_lead_below_its_default_is_a_named_loosening() -> None:
+    """As #1131 names a limit looser than its default: a one-day lead leaves no time to renew."""
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(warn_days=29),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(warn_days=1),
+        )
+    )
+    assert "warn_days = 29, shorter than the default of 30" in named["cert_monitor.warn_days"]
+    assert "warn_days = 1, shorter than the default of 14" in named["secret_rotation.warn_days"]
+
+
+def _rules(*rules: dict[str, object]) -> AlertsSettings:
+    return AlertsSettings.model_validate({"rules": list(rules)})
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        pytest.param({"event_type": "any", "mute": True}, id="catch-all-mute"),
+        pytest.param({"event_type": "cert_expiry", "transports": []}, id="no-transport"),
+        pytest.param(
+            {"event_type": "secret_rotation", "escalate": [{"after_count": 2, "transports": []}]},
+            id="escalate-tier-to-nowhere",
+        ),
+        pytest.param(
+            {"event_type": "initial_credential_expiring", "connection": "a*", "mute": True},
+            id="glob-scoped-mute",
+        ),
+    ],
+)
+def test_a_rule_that_can_silence_a_reminder_is_a_named_loosening(rule: dict[str, object]) -> None:
+    """BACKLOG #2008 step 4: what ASVS 6.4.5's trigger 1 names. The rule decision sends a matching
+    reminder to no transport, after the recipient gate has passed, and nothing said so."""
+    named = dict(_pairs(alerts=_rules(rule)))
+    assert "rules[0]" in named["alerts.rules"]
+    assert "to no transport" in named["alerts.rules"]
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        pytest.param({"event_type": "connection_stopped", "mute": True}, id="other-event"),
+        pytest.param(
+            {"event_type": "any", "min_depth": 5, "mute": True}, id="depth-rule-never-matches"
+        ),
+        pytest.param({"event_type": "any", "transports": ["email"]}, id="routes-somewhere"),
+        pytest.param(
+            {"event_type": "cert_expiry", "escalate": [{"after_count": 2, "severity": "critical"}]},
+            id="tier-keeps-transports",
+        ),
+    ],
+)
+def test_a_rule_that_cannot_silence_a_reminder_is_not_named(rule: dict[str, object]) -> None:
+    assert "alerts.rules" not in _names(alerts=_rules(rule))
+
+
+def test_the_silencing_entry_names_each_rule_and_quotes_its_id() -> None:
+    """Every silencing rule is named, by position and by its id. The id is operator text, so it is
+    quoted with repr and a control character in it never reaches the log raw."""
+    named = dict(
+        _pairs(
+            alerts=_rules(
+                {"event_type": "connection_stopped", "mute": True},
+                {"event_type": "cert_expiry", "mute": True, "id": "quiet\ncerts"},
+                {"event_type": "any", "transports": []},
+            )
+        )
+    )
+    risk = named["alerts.rules"]
+    assert risk.startswith("2 [[alerts.rules]] entries")
+    assert "rules[1] (id 'quiet\\ncerts') matches cert_expiry, " in risk
+    assert "rules[2] matches initial_credential_expiring/cert_expiry/secret_rotation" in risk
+    assert "\n" not in risk
+    # The serve warning joins whole entries with "; ", so the entry must not use it inside itself.
+    assert "; " not in risk
+
+
+def test_the_reminder_event_types_are_rule_targetable_and_emitted() -> None:
+    """The silencing check names rules by these types, so each must be one a rule can match and
+    one the notifier actually emits. A renamed type would make the check under-report silently."""
+    from messagefoundry.config.settings import (
+        _ALERT_EVENT_TYPES,
+        CREDENTIAL_REMINDER_EVENT_TYPES,
+    )
+    from messagefoundry.pipeline import alert_sinks
+
+    source = Path(alert_sinks.__file__).read_text(encoding="utf-8")
+    for event_type in CREDENTIAL_REMINDER_EVENT_TYPES:
+        assert event_type in _ALERT_EVENT_TYPES, event_type
+        assert f'"type": "{event_type}"' in source, event_type
+
+
+async def test_posture_route_reports_the_cert_monitor_the_app_was_given(engine: Engine) -> None:
+    """The route reads [cert_monitor] off app.state, where the managed lifespan stashes it. The
+    default app is the control."""
+
+    async def switches(cert_monitor: CertMonitorSettings | None) -> list[str]:
+        app = create_app(engine, allow_no_auth=True)
+        if cert_monitor is not None:
+            app.state.cert_monitor_settings = cert_monitor
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            resp = await client.get("/security/posture")
+        assert resp.status_code == 200
+        return [entry["switch"] for entry in resp.json()["loosenings"]]
+
+    assert "cert_monitor.warn_days" in await switches(CertMonitorSettings(warn_days=0))
+    assert "cert_monitor.warn_days" not in await switches(None)
+
+
 def test_a_zero_flow_cache_cap_refuses_every_flow() -> None:
     """Ground the direction in FlowCache: 0 is stricter, which is why it is not named."""
     from messagefoundry.auth.oidc.flow import FlowCache, FlowCacheFullError, PendingFlow
@@ -1024,8 +1293,11 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=_proxied(*entries),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1056,8 +1328,11 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=_proxied("::/0", "::/0"),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1120,8 +1395,11 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=_terminated(ack=True),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1686,6 +1964,58 @@ def test_the_url_query_credential_is_actually_wired() -> None:
     assert "url_query_credential" not in _names()  # control: nothing declared, nothing named
 
 
+def _fhir_update_registry() -> Any:
+    """A graph with one path-form ``FHIR()`` update and one transaction-form update beside it."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, Registry, build_outbound_connection
+
+    reg = Registry()
+    for name, extra in (("OB_PATH", {"update_url_form": "path"}), ("OB_TXN", {})):
+        settings = {"url": "https://fhir.example.org/fhir", "interaction": "update", **extra}
+        reg.add_outbound(
+            build_outbound_connection(
+                name, ConnectionSpec(type=ConnectorType.FHIR, settings=settings)
+            )
+        )
+    return reg
+
+
+def test_the_fhir_path_form_update_is_actually_wired() -> None:
+    """Vault BACKLOG #2571: driven through its reader AND through ``security_loosenings``. The
+    transaction-form connection beside it is the control that must not be named."""
+    from messagefoundry.config.wiring import path_form_fhir_updates
+
+    hops = tuple(path_form_fhir_updates(_fhir_update_registry()))
+    assert hops == ("OB_PATH",)
+    risk = dict(_pairs(path_form_hops=hops))["update_url_form"]
+    assert "OB_PATH" in risk and "OB_TXN" not in risk
+    assert "request URL" in risk
+    assert "update_url_form" not in _names()  # control: nothing declared, nothing named
+
+
+async def test_posture_route_names_a_fhir_path_form_update(engine: Engine) -> None:
+    """``GET /security/posture`` reads the path-form set off the live graph. A graph holding only
+    a transaction-form update names nothing, so the entry comes from the connection's setting."""
+    engine.add_registry(_fhir_update_registry())
+    body = await _posture_body(engine)
+    entry = next(
+        e
+        for e in body["loosenings"]  # type: ignore[union-attr]
+        if e["switch"] == "update_url_form"
+    )
+    assert "OB_PATH" in entry["risk"] and "OB_TXN" not in entry["risk"]
+
+
+async def test_posture_route_does_not_name_a_transaction_form_update(engine: Engine) -> None:
+    """The control for the test above, on a graph with the path-form connection removed."""
+    reg = _fhir_update_registry()
+    del reg.outbound["OB_PATH"]
+    engine.add_registry(reg)
+    body = await _posture_body(engine)
+    assert "update_url_form" not in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+    assert body["loosenings_scope"] is None
+
+
 def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> None:
     """CORRECTED (ASVS 12.3.2 re-read): the entry said the hostname match is "still fully verified"
     for every listed hop. It now conditions that on the hop leaving the name check on."""
@@ -1781,8 +2111,13 @@ async def test_posture_route_reports_the_plaintext_hop_acknowledgement(engine: E
 
 
 @pytest.mark.usefixtures("remote_debugging_off")
-async def test_posture_route_reports_nothing_at_the_shipped_defaults(engine: Engine) -> None:
+async def test_posture_route_reports_only_the_harness_entry_at_the_shipped_defaults(
+    engine: Engine,
+) -> None:
     """The route must be quiet on a default instance, or its signal is worthless.
+
+    Quiet here is one entry, not none: the harness reaches the route through the open mode,
+    and the route names that mode (``_HARNESS_ONLY``).
 
     Default SETTINGS, on an interpreter started with remote debugging off. A default launch through
     the console script leaves it on, and the route then names it: see
@@ -1812,8 +2147,11 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1857,8 +2195,11 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1893,8 +2234,11 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             unverified_db_hops=("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1926,8 +2270,11 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
+            cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2306,23 +2653,32 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
     }
     exempt_auth = {
-        # HARDENINGS / topology choices — a flip is not a weakening of the shipped posture.
-        "require_action_step_up",
+        # Vault BACKLOG #2600 re-read this set. require_action_step_up and the three
+        # password_check_* screens left it: each ships ON, nothing refuses it off, and the
+        # registry now names it. What stays is below, each with its reason.
+        #
+        # Sign-in pathways, each shipped OFF. Turning one on adds a way to sign in, which is a
+        # deployment's topology and has its own load-time requirements. Not a weakening of a
+        # control that shipped on.
         "ad_enabled",
-        "ad_use_nested_groups",
         "kerberos_enabled",
         "oidc_enabled",
+        # Ships ON. Off, a directory user gets the roles of their DIRECT groups only, so it
+        # resolves fewer grants, never more.
+        "ad_use_nested_groups",
+        # Ships ON. The claim it trims is a hint and not the account key (ADR 0184), so neither
+        # value changes which account a login reaches.
         "oidc_username_strip_domain",
+        # Ships ON, and off it DOES remove a control: the push notice of account-security events.
+        # Gated elsewhere: with no notice channel, serve refuses under enforcement = enforce unless
+        # [alerts].security_notifications_required = false, and it logs that waiver. Not named by
+        # the registry, which is an owed gap and is recorded as one.
         "notify_security_events",
-        # Password-policy composition rules: individually neither secure nor insecure (the policy is
-        # scored as a whole), and none is a posture switch.
+        # Composition rules, each shipped OFF. Turning one on ADDS a requirement.
         "password_require_uppercase",
         "password_require_lowercase",
         "password_require_digit",
         "password_require_symbol",
-        "password_check_context",
-        "password_check_username",
-        "password_check_breached",
         # REPORTED, so not an owed gap: named only with a live ldap:// bind, which this loop's lone
         # flip never builds (ad_enabled stays off). The plain-LDAP section above pins it (#2354).
         "ad_allow_insecure_ldap",
@@ -2342,16 +2698,204 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         (StoreSettings, exempt_store, "store"),
         (AuthSettings, exempt_auth, "auth"),
     ):
-        for field, info in model.model_fields.items():
-            if field in exempt or not isinstance(info.default, bool):
-                continue
-            flipped = model(**{field: not info.default})  # type: ignore[arg-type]
-            kwargs = {"store": flipped} if section == "store" else {"auth": flipped}
-            assert field in _names(**kwargs), (  # type: ignore[arg-type]
-                f"[{section}].{field} at its insecure value ({not info.default}) is NOT named by "
-                "security_loosenings(). Add it to the registry, or add it to this test's exemption "
-                "set with the reason — silence is not an option."
-            )
+        unreported = _unreported_bools(model, exempt, section)
+        assert unreported == [], (
+            f"[{section}] bool(s) {unreported} at the non-default value are NOT named by "
+            "security_loosenings(). Add each to the registry, or add it to this test's exemption "
+            "set with the reason — silence is not an option."
+        )
+        # The two controls the [api] floor has, against THESE exemption sets. An exemption must
+        # still name a bool field, or it exempts nothing and reads as a decision. And the floor
+        # must still fire with the real set in place, or a set that swallowed every field passes.
+        bools = {f for f, info in model.model_fields.items() if isinstance(info.default, bool)}
+        assert exempt <= bools, f"[{section}] exemptions name no bool field: {exempt - bools}"
+
+        class _WithANewSwitch(model):  # type: ignore[misc,valid-type]
+            made_up_allow_anonymous_stats: bool = False
+
+        assert _unreported_bools(_WithANewSwitch, exempt, section) == [
+            "made_up_allow_anonymous_stats"
+        ]
+
+
+def _unreported_bools(model: type[Any], exempt: Collection[str], section: str) -> list[str]:
+    """The bools of ``model`` that, flipped alone from their default, are neither named by
+    ``security_loosenings()`` nor in ``exempt``. ``section`` is the :func:`_pairs` keyword the
+    model is passed as. Takes the model so a control can add a field to a subclass."""
+    return [
+        field
+        for field, info in model.model_fields.items()
+        if field not in exempt
+        and isinstance(info.default, bool)
+        and field not in _names(**{section: model(**{field: not info.default})})
+    ]
+
+
+@pytest.mark.parametrize(
+    ("switch", "words"),
+    [
+        ("require_action_step_up", "session-wide step-up window"),
+        ("password_check_breached", "breached"),
+        ("password_check_context", "context words"),
+        ("password_check_username", "username"),
+    ],
+)
+def test_auth_switches_that_ship_on_are_named_when_off(switch: str, words: str) -> None:
+    """Vault BACKLOG #2600: each of these left the [auth] floor's exemption set. Off it is named,
+    and at the shipped value it is not."""
+    assert switch not in _names()
+    assert AuthSettings.model_fields[switch].default is True
+    risk = dict(_pairs(auth=AuthSettings(**{switch: False})))[switch]
+    assert words in risk
+
+
+@pytest.mark.parametrize(
+    ("model", "section"), [(StoreSettings, "store"), (AuthSettings, "auth"), (ApiSettings, "api")]
+)
+def test_each_bool_floor_fires_on_an_unlisted_bool(model: type[Any], section: str) -> None:
+    """The control that makes an empty result mean something, for all three floors: a made-up bool
+    that the registry does not name and nobody exempted is the one field the floor returns. Every
+    real bool is exempted here, so the answer does not depend on which of them are reported."""
+
+    class _WithANewSwitch(model):  # type: ignore[misc]
+        made_up_allow_anonymous_stats: bool = False
+
+    real = {f for f, info in model.model_fields.items() if isinstance(info.default, bool)}
+    assert _unreported_bools(_WithANewSwitch, real, section) == ["made_up_allow_anonymous_stats"]
+
+
+#: ``[api]`` bools the floor below does not require, each with its reason (vault BACKLOG #2385).
+_API_BOOLS_EXEMPT = {
+    # The desugared copy of [security].serve_web_console, which the [security] floor exempts for the
+    # same reason: turning the console off SHRINKS the surface.
+    "serve_ui": "surface-reducing when flipped",
+    # A topology declaration, not a weakening by itself, and its lone flip does not load (it needs
+    # trusted_proxies). The plaintext hop it can create is named through the acknowledgement below.
+    "tls_terminated_upstream": "topology declaration; its plaintext hop is named by the next entry",
+    # REPORTED, so not an owed gap: named only beside a terminator with no operator certificate, and
+    # its lone flip is refused at load. The plaintext-hop section above pins it (#1179).
+    "plaintext_upstream_hop_acknowledged": "reported, conditional on the topology",
+}
+
+
+def test_every_api_bool_is_reported_or_exempt() -> None:
+    """The completeness floor over ``[api]`` (vault BACKLOG #2385).
+
+    The two floors above reach ``[security]``, ``[store]`` and ``[auth]``. The registry takes ``api``
+    too, and nothing looked at its bools, so a new one could ship at an insecure value unnamed."""
+    assert _unreported_bools(ApiSettings, _API_BOOLS_EXEMPT, "api") == [], (
+        "an [api] bool at its non-default value is NOT named by security_loosenings(). Add it to "
+        "the registry, or to _API_BOOLS_EXEMPT with the reason -- silence is not an option."
+    )
+
+
+def test_the_api_floor_fires_with_its_real_exemptions() -> None:
+    """The same control as above, run against the real ``[api]`` exemption list, so an exemption
+    that swallowed every field would red here."""
+
+    class _ApiWithANewSwitch(ApiSettings):
+        made_up_allow_anonymous_stats: bool = False
+
+    unreported = _unreported_bools(_ApiWithANewSwitch, _API_BOOLS_EXEMPT, "api")
+    assert unreported == ["made_up_allow_anonymous_stats"]
+
+
+def test_no_api_exemption_outlives_its_field() -> None:
+    """An exemption for a field that is gone, or is no longer a bool, would exempt nothing and read
+    as a decision. Each one must still name a bool ``[api]`` field."""
+    bools = {f for f, info in ApiSettings.model_fields.items() if isinstance(info.default, bool)}
+    assert set(_API_BOOLS_EXEMPT) <= bools
+
+
+def test_exposed_api_docs_are_a_named_loosening() -> None:
+    """``[api].expose_docs`` was the one ``[api]`` bool the new floor found unnamed. The text says
+    what is served and that it asks for no sign-in, and the default names nothing."""
+    assert "expose_docs" not in _names()
+    risk = dict(_pairs(api=ApiSettings(expose_docs=True)))["expose_docs"]
+    assert "/openapi.json" in risk
+    assert "NO sign-in" in risk
+
+
+async def test_posture_route_reports_docs_an_embedder_turned_on(engine: Engine) -> None:
+    """The docs routes are built from ``create_app``'s own argument. An app built with it on and no
+    settings stashed serves them, so the posture route reads the app and not the [api] default."""
+
+    async def switches(**kwargs: bool) -> list[str]:
+        app = create_app(engine, allow_no_auth=True, **kwargs)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            served = (await client.get("/openapi.json")).status_code == 200
+            body = (await client.get("/security/posture")).json()
+        names = [entry["switch"] for entry in body["loosenings"]]
+        assert served is ("expose_docs" in names)  # the read-out matches what is served
+        return names
+
+    assert "expose_docs" in await switches(expose_docs=True)
+    assert "expose_docs" not in await switches()
+
+
+async def test_posture_route_reads_the_docs_switch_off_the_app_in_both_directions(
+    engine: Engine,
+) -> None:
+    """What the app serves wins over a stashed ``[api]`` value it was not built with. Settings that
+    say the docs are on, beside an app built with them off, report nothing: nothing is served."""
+    stashed = ServiceSettings(api=ApiSettings(expose_docs=True))
+    body = await _posture_body(engine, static_credential_settings=stashed)
+    assert "expose_docs" not in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+
+    # The other direction: settings that say the docs are OFF, beside an app built with them ON.
+    # The docs are served, so the read-out names them.
+    app = create_app(engine, allow_no_auth=True, expose_docs=True)
+    app.state.static_credential_settings = ServiceSettings(api=ApiSettings(expose_docs=False))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        assert (await client.get("/openapi.json")).status_code == 200
+        named = [e["switch"] for e in (await client.get("/security/posture")).json()["loosenings"]]
+    assert "expose_docs" in named
+
+
+def test_the_backup_cleartext_flag_is_named_and_its_default_is_not() -> None:
+    """``[backup].allow_unencrypted = true`` lets a keyless instance write a cleartext archive, so
+    the registry names it (vault BACKLOG #2302). The control is the shipped default, which names
+    nothing: an entry that fired on every ``[backup]`` section would pass the first half alone."""
+    assert BackupSettings.model_fields["allow_unencrypted"].default is False
+    assert "backup.allow_unencrypted" not in _names()
+    assert "backup.allow_unencrypted" not in _names(backup=BackupSettings(allow_unencrypted=False))
+    risk = dict(_pairs(backup=BackupSettings(allow_unencrypted=True)))["backup.allow_unencrypted"]
+    assert "CLEARTEXT" in risk
+    assert "PHI" in risk
+    # Named with a store key too: the flag also relaxes the restore-verify downgrade refusal.
+    keyed = _names(
+        store=StoreSettings(encryption_key="k" * 44),
+        backup=BackupSettings(allow_unencrypted=True),
+    )
+    assert "backup.allow_unencrypted" in keyed
+    # No other [backup] setting at a non-default value produces this entry.
+    assert "backup.allow_unencrypted" not in _names(
+        backup=BackupSettings(retention_keep=0, verify_after_backup=False)
+    )
+
+
+async def test_posture_route_reports_the_backup_cleartext_flag(engine: Engine) -> None:
+    """``GET /security/posture`` reads the stashed ``[backup]`` section, and an app with none
+    stashed is read at the shipped default, which names nothing."""
+    body = await _posture_body(engine, backup_settings=BackupSettings(allow_unencrypted=True))
+    assert "backup.allow_unencrypted" in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+    control = await _posture_body(engine)
+    assert "backup.allow_unencrypted" not in [e["switch"] for e in control["loosenings"]]  # type: ignore[index,union-attr]
+
+
+def test_the_guide_says_the_backup_cleartext_flag_is_reported() -> None:
+    """The guide's row and entry for the flag name the registry entry, and no longer say it is
+    unreported. Reads two places in one document; it does not prove the prose is right elsewhere."""
+    guide = (Path(__file__).parents[1] / "docs" / "SECURITY-LOOSENING.md").read_text("utf-8")
+    row = next(line for line in guide.splitlines() if line.startswith("| | `[backup].allow_un"))
+    assert "Not reported yet" not in row
+    assert "`backup.allow_unencrypted`" in row
+    entry = guide.split("### `[backup].allow_unencrypted = true`", 1)[1].split("\n### ", 1)[0]
+    assert "not yet" not in entry
+    assert "`backup.allow_unencrypted`" in entry
+    assert "`encrypted: false`" in entry
 
 
 async def test_posture_route_declares_its_scope_when_no_graph_is_loaded(engine: Engine) -> None:
@@ -2363,6 +2907,7 @@ async def test_posture_route_declares_its_scope_when_no_graph_is_loaded(engine: 
     body = await _posture_body(engine)
     assert body["loosenings_scope"] is not None
     assert "cleartext_accepted" in str(body["loosenings_scope"])
+    assert "update_url_form" in str(body["loosenings_scope"])
 
 
 async def test_posture_route_scope_is_none_once_a_graph_is_loaded(engine: Engine) -> None:
@@ -2394,6 +2939,9 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
             ad_session_recheck_seconds=0, require_mfa=False, notify_security_events=False
         ),
         egress_settings=EgressSettings(deny_by_default=False),
+        # Vault BACKLOG #2302: the same lifespan must stash [backup]. The section stays
+        # disabled, so no backup runs; only the flag is read.
+        backup_settings=BackupSettings(allow_unencrypted=True),
     )
     transport = httpx.ASGITransport(app=app, client=_DEFAULT_PEER)
     async with (
@@ -2407,3 +2955,4 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
     assert resp.status_code == 200, resp.text
     switches = [entry["switch"] for entry in resp.json()["loosenings"]]
     assert "ad_session_recheck_seconds" in switches
+    assert "backup.allow_unencrypted" in switches

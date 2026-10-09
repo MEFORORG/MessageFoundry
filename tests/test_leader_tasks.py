@@ -21,6 +21,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
+from messagefoundry.store.crypto import CipherInfo
 
 
 class _Coordinator(NullCoordinator):
@@ -181,6 +182,11 @@ class _RecordingStore:
 
     async def close(self) -> None:
         return None
+
+    def cipher_info(self) -> CipherInfo:
+        # Read first by Engine.start's vault_transit attestation gate (BACKLOG #2337): a keyless
+        # store has no Transit key, so the gate does nothing here.
+        return CipherInfo(encrypts=False, active_key_id=None)
 
 
 async def test_engine_single_node_resets_and_spawns_no_leader_task() -> None:

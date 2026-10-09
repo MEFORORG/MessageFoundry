@@ -122,8 +122,13 @@ async def _login(c: httpx.AsyncClient, username: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {r.json()['token']}"}
 
 
-def _by_reason_source(events: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The two seeded events, told apart by their message id rather than by the masked reason."""
+def _by_reason_source(
+    body: list[dict[str, Any]] | dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The two seeded events, told apart by their message id rather than by the masked reason.
+    ``GET /events`` wraps its page in a ``ConnectionEventList`` (BACKLOG #2438), and the
+    per-connection route returns a bare list, so either body is accepted."""
+    events = body["events"] if isinstance(body, dict) else body
     first = next(e for e in events if e["message_id"] == "m1")
     second = next(e for e in events if e["message_id"] == "m2")
     return first, second
@@ -163,7 +168,8 @@ async def test_a_holder_gets_the_event_reason_masked_until_one_audited_reveal(
 
         # A reveal is an act, not a status: the next bare load is masked again.
         again = (await c.get(path, headers=h)).json()
-        assert all(e["reason"] == "****" for e in again)
+        rows = again["events"] if isinstance(again, dict) else again
+        assert all(e["reason"] == "****" for e in rows)
     audits = await _reveal_audits(engine, "connection_event_reveal")
     assert audits == [
         {
@@ -185,7 +191,7 @@ async def test_a_monitoring_only_role_gets_no_reason_but_still_sees_the_event(
     await _add(service, "mon", role)
     async with _client(engine, service) as c:
         h = await _login(c, "mon")
-        events = (await c.get("/events", headers=h)).json()
+        events = (await c.get("/events", headers=h)).json()["events"]
         first, second = _by_reason_source(events)
         assert first["reason"] is None and second["reason"] is None
         # THAT the connection went down, and what kind of event it was, stays visible.
@@ -214,7 +220,7 @@ async def test_a_json_reveal_charges_the_phi_read_budget_and_a_bare_load_does_no
         h = await _login(c, "op")
         for _ in range(3):
             assert (await c.get("/events", headers=h)).status_code == 200
-        first, _second = _by_reason_source((await c.get("/events", headers=h)).json())
+        first, _second = _by_reason_source((await c.get("/events", headers=h)).json()["events"])
         ok = await c.get("/events", params={"reveal": first["id"]}, headers=h)
         assert ok.status_code == 200
         throttled = await c.get("/events", params={"reveal": first["id"]}, headers=h)
@@ -263,7 +269,7 @@ async def test_a_reveal_of_an_id_not_on_the_page_is_audited_as_revealing_nothing
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         h = await _login(c, "op")
-        events = (await c.get("/events", params={"reveal": 999_999}, headers=h)).json()
+        events = (await c.get("/events", params={"reveal": 999_999}, headers=h)).json()["events"]
         assert all(e["reason"] == "****" for e in events)
     assert await _reveal_audits(engine, "connection_event_reveal") == [
         {"actor": "op", "channel": None, "id": 999_999, "connection": None, "revealed": []}

@@ -100,3 +100,109 @@ def test_runbook_cites_transit_security_standards() -> None:
     assert "800-52r2" in text
     assert "164.312(e)(1)" in text
     assert "CWE-295" in text
+
+
+# --- The host cipher policy step for the ODBC hops (BACKLOG #2379, owner ruling R3 of 2026-09-28) ---
+
+_CONNECTIONS = _ROOT / "docs" / "CONNECTIONS.md"
+_CIPHER_HEADING = "### 5.4 Host cipher policy for the ODBC hops (operator precondition)"
+_CIPHER_ANCHOR = "#54-host-cipher-policy-for-the-odbc-hops-operator-precondition"
+_WINDOWS_HEADING = "#### Windows: SChannel policy"
+_LINUX_HEADING = "#### Linux: the host OpenSSL configuration binds the driver (measured)"
+_AFTER_HEADING = "#### Both platforms: what to expect afterwards"
+
+
+def _cipher_step(text: str) -> str:
+    """The step's own text: from its heading to the next section at its level or above."""
+    assert text.count(_CIPHER_HEADING) == 1, (
+        "the ODBC host cipher policy step must exist exactly once"
+    )
+    step = text.split(_CIPHER_HEADING, 1)[1]
+    return step.split("\n### ", 1)[0].split("\n## ", 1)[0]
+
+
+def _between(step: str, start: str, end: str) -> str:
+    assert step.count(start) == 1, f"the step lost its {start!r} heading"
+    assert step.count(end) == 1, f"the step lost its {end!r} heading"
+    return step.split(start, 1)[1].split(end, 1)[0]
+
+
+def test_odbc_cipher_step_states_the_precondition() -> None:
+    """The step names the hops, the policy, and that the engine cannot enforce it."""
+    step = _cipher_step(_deploy_db_text())
+    for term in (
+        "SQL Server message store",
+        "DATABASE connector",
+        "`db_lookup`",
+        "`DatabaseRef(...)` reference sync",
+        "The engine cannot set TLS cipher suites on its ODBC hops",
+        "Allow only AEAD cipher suites at TLS 1.2",
+        "Turn TLS 1.0 and TLS 1.1 off",
+        "ruling R3 of 2026-09-28",
+    ):
+        assert term in step, f"the ODBC host cipher policy step lost {term!r}"
+    for label in ("- **Measured**:", "- **Vendor-documented**:", "- **Unmeasured**:"):
+        assert label in step, f"the step lost the {label} line of its label legend"
+    # The engine's approved suite list is stated under tls_ciphers; the step links to it.
+    assert "[`CONFIGURATION.md`](CONFIGURATION.md)" in step
+
+
+def test_odbc_cipher_step_windows_half() -> None:
+    """Windows carries what to set, the reboot, a check, and how far each is proven."""
+    windows = _between(_cipher_step(_deploy_db_text()), _WINDOWS_HEADING, _LINUX_HEADING)
+    for term in (
+        "SSL Cipher Suite Order",
+        "Disable-TlsCipherSuite",
+        r"SCHANNEL\Protocols\$v\Client",
+        "if (-not (Test-Path $key))",
+        "Reboot the host",
+        "A healthy host prints nothing",
+        "a healthy host prints 0 twice",
+        "(vendor-documented)",
+        "**Measured**",
+        "**unmeasured**",
+    ):
+        assert term in windows, f"the Windows half of the ODBC cipher step lost {term!r}"
+
+
+def test_odbc_cipher_step_linux_half() -> None:
+    """Linux carries the measurement, what to set, a check with its control, and the limits."""
+    linux = _between(_cipher_step(_deploy_db_text()), _LINUX_HEADING, _AFTER_HEADING)
+    for term in (
+        "/etc/ssl/openssl.cnf",
+        "CipherString = ECDHE+AESGCM+AES256:ECDHE+CHACHA20:@SECLEVEL=2",
+        "MinProtocol = TLSv1.2",
+        "openssl ciphers -s -v | grep -c .",
+        "openssl ciphers -s -v | grep -v -c AEAD",
+        "OPENSSL_CONF",
+        "In a container",
+        "(measured)",
+        "**unmeasured**",
+    ):
+        assert term in linux, f"the Linux half of the ODBC cipher step lost {term!r}"
+
+
+def test_odbc_cipher_windows_check_enumerates_suite_names() -> None:
+    """Measured 2026-10-08: piping ``Get-TlsCipherSuite`` straight into ``Where-Object Name`` does
+    not filter by name, and one spelling printed nothing on an unconfigured host. A check that reads
+    healthy on an unhealthy host is worse than no check, so pin the form that was measured to fire."""
+    step = _cipher_step(_deploy_db_text())
+    check = "(Get-TlsCipherSuite).Name | Where-Object { $_ -notmatch 'GCM|CCM|CHACHA20_POLY1305' }"
+    assert check in step
+    assert "(Get-TlsCipherSuite).Name.Count" in step, "check 1 lost its control line"
+    assert "Get-TlsCipherSuite |" not in step
+    assert "Get-TlsCipherSuite|" not in step
+
+
+def test_odbc_cipher_step_is_linked_from_the_checklist_and_the_connector_reference() -> None:
+    """The checklist and the connector reference point at the step."""
+    text = _deploy_db_text()
+    # GitHub's heading slug: lower-case, drop the punctuation, spaces to hyphens.
+    title = _CIPHER_HEADING.removeprefix("### ").lower()
+    slug = "".join(ch for ch in title if ch.isalnum() or ch in " -").replace(" ", "-")
+    assert "#" + slug == _CIPHER_ANCHOR
+    checklist = text.split("## 6. Pre-flight checklist", 1)[1]
+    assert _CIPHER_ANCHOR in checklist
+    assert "DEPLOY-SERVER-DB.md" + _CIPHER_ANCHOR in _CONNECTIONS.read_text(encoding="utf-8")
+    aoag = (_ROOT / "docs" / "AOAG-DEPLOYMENT.md").read_text(encoding="utf-8")
+    assert "DEPLOY-SERVER-DB.md" + _CIPHER_ANCHOR in aoag

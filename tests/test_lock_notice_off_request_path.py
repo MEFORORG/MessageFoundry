@@ -29,6 +29,7 @@ from messagefoundry.auth import service as service_module
 from messagefoundry.auth.notifications import ACCOUNT_LOCKED, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AlertsSettings, AuthSettings, EgressSettings
+from messagefoundry.keyed_lock import hold_keyed_lock
 from messagefoundry.store import open_store, sqlite_settings
 from messagefoundry.store.store import LockoutIncrement, MessageStore, UserRecord
 from tests._admin_account import ADMIN_USERNAME, create_admin
@@ -301,7 +302,7 @@ class _QueueProbe(_Progress):
         super().__init__()
         self.arrived = 0
         self.entered = 0
-        real = service_module._hold_keyed_lock
+        real = hold_keyed_lock  # the helper the service imports as _hold_keyed_lock
         notices = service._lock_notice_locks
 
         @asynccontextmanager

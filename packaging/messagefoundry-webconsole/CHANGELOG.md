@@ -22,6 +22,37 @@ this line.**
 
 ### Added
 
+- **The status page shows the four per-tier retention acknowledgements.** The security posture
+  table on `/ui/status` showed `allow_keeping_phi_indefinitely` only. It now also shows the
+  transform-state, search-preset, app-log and backup-archive switches, each on its own row. The
+  table stays read-only. (BACKLOG #2280)
+- **The status page and the health indicator show the off-box log forwarder.** With a forwarder
+  configured, the engine table on `/ui/status` has an "Off-box log forwarding" row. It reads
+  `healthy`, or says that forwarding is not running or is degraded, with how many records were
+  lost since the process started. The health indicator turns to warn when forwarding is not
+  running or is degraded. A UDP forwarder is never called healthy: the row says that delivery is
+  not confirmed, because the engine counts no failed send over UDP, and the indicator does not
+  warn for that alone. With no forwarder configured there is no row. Under engine shards the row describes the
+  process that answered. Seam change: `SystemStatus` carries `log_forwarder`, and the console
+  imports `LogForwarderInfo`. (`BACKLOG #2612`)
+- **The audit, security-event and event-log pages page past their first window.** `/ui/audit`,
+  `/ui/security-events` and `/ui/events` take `limit` and `offset` and draw the shared pager, so
+  each says which rows of how many it shows, with Previous and Next links. They used to show only
+  the newest rows, with no way to reach older ones from the console. Each pager link carries the
+  snapshot the first page was read under, so rows written between clicks do not shift the pages.
+  The event log's pager and its reason reveals carry the page's filters, position and snapshot, so
+  a reveal reads the window it was clicked on. Seam change: `AuditList`, `SecurityEventsList` and
+  the new `ConnectionEventList` carry `total`, `limit` and `offset`, plus their snapshot (`as_of`
+  on the first two, `before_id` on the third), and `CoreHandlers` gains `connection_event_page`.
+  (BACKLOG #2438)
+- **The audit page exports, and says when rows are withheld.** `/ui/audit` links to the new
+  `/ui/audit/export` for a holder of `audit:export`. That route streams the engine's audit CSV from
+  the console session, so an auditor who signs in only through OIDC, and so holds no bearer token,
+  can export. For a reader without `users:manage` the page says account-lock entries are left out
+  of its list, count and export, and never which. `/ui/security-events` says that a change an
+  administrator made to the account is not listed there, and that it is emailed when it can be.
+  Seam change: `AuditList` carries `withheld`, and `AdminHandlers` gains `export_audit`.
+  (BACKLOG #2446)
 - **The approvals page resolves an interrupted release, and shows what each hold captured.** An
   `interrupted` release offers the resolve, *Effects applied* or *Effects not applied*, behind a
   required "I checked its effects" box, through `POST /ui/approvals/{id}/resolve/{outcome}`. It
@@ -34,8 +65,18 @@ this line.**
   `caller_is_requester` and `gated`. The console also imports `ResolveOutcome` from
   `messagefoundry.api.models`, so on an older engine it fails at import, before the seam check.
 
+### Changed
+
+- **Seam only: the engine's posture model grew.** `SecurityPosture` gains
+  `transit_bound_attestation`, a `TransitBoundAttestationView` (`BACKLOG #2337`). The console
+  renders nothing new, but the field is on the seam it pins, so the supported digest moved.
+
 ### Fixed
 
+- **A throttled `/ui` write now says how long to wait.** The admin-write `429` carried a literal
+  `Retry-After: 10`, whatever the engine's window was. It now carries the time until that account's
+  next write would be admitted, in whole seconds, the same value the JSON API sends. Seam change:
+  the console calls the new `AuthService.admin_write_retry_after`. (vault BACKLOG #2144)
 - **A temporary password's deadline is stated in the past tense once it has passed.** The factor
   page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
   working" at an instant already gone. They now say it stopped working then, and to ask an
@@ -43,6 +84,27 @@ this line.**
 
 ### Security
 
+- **A `/ui` write that does not name where it came from is refused.** It answers `403` and
+  changes nothing. At least two cases that used to pass are refused now: a write with neither
+  `Sec-Fetch-Site` nor `Origin`, which left the sign-in POST with no cross-site control, and a
+  write whose `Sec-Fetch-Site` is a non-empty value other than the four the Fetch Metadata
+  standard defines.
+  A current browser sends `Sec-Fetch-Site` on every request, so the console's pages are unaffected
+  there. A browser that sends neither header on its own form POST could not sign in with a
+  password or change anything, sign-out included; `docs/BROWSER-SUPPORT.md` says what is and is
+  not measured about such a browser. A
+  script that drives `/ui` must now send `Origin`. The CSP report sink `/ui/csp-report` still
+  accepts a report with neither. A GET is not held to this: three sign-in GETs are deliberately
+  not blocked for missing fetch metadata, under owner rulings R4 and R4b of 2026-09-28: `GET
+  /ui/sso`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped.
+  The complete rule is the table in the `assert_same_origin` docstring
+  (`messagefoundry_webconsole/_auth.py`). No seam change. (BACKLOG #1116, #1124)
+- **The user page's self-target refusals are audited, with your address.** Reset-password,
+  reset-mfa, link, unlink, disable and delete now pass the request to the engine's handler. The
+  engine refuses your own account by its stored id too, and writes `auth.self_target_refused`.
+  The seam digest did not move, because it records handler names and not their parameters. A
+  console without this change would get a TypeError from those six against this engine. (vault
+  BACKLOG #3259, #3260)
 - **Resend, edit-resend, upload resend, queue purge and config reload each take a proof bound to
   that action.** A fresh session window no longer reaches them. Each needs a re-authentication made
   for it, which it spends. The re-auth page mints that proof when it continues to the action's

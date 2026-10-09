@@ -838,3 +838,40 @@ def _provision_admin_enrols_a_synthetic_authenticator() -> Iterator[None]:
         patch.setattr(cli, "_enrol_totp_at_terminal", _stub)
         patch.setattr(cli, "_show_on_terminal", _drop)
         yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
+    """Give a state-changing /ui request that names no provenance ``Sec-Fetch-Site: same-origin``.
+
+    The console's ``assert_same_origin`` refuses a write carrying neither ``Sec-Fetch-Site`` nor
+    ``Origin`` (BACKLOG #1116, #1124). The tests here that reach /ui drive it through an in-process
+    ASGI client standing in for the operator's browser, and a browser sends ``Sec-Fetch-Site`` on
+    its own form POST. It only fills a GAP: a request that already carries either header is sent
+    untouched, and only the in-process ASGI transport is wrapped.
+
+    The console suite's own ``conftest.py`` carries the same stand-in, with the opt-out its refusal
+    tests need. That suite does not inherit this file, which is why there are two.
+    """
+    import httpx
+
+    original = httpx.ASGITransport.handle_async_request
+
+    @functools.wraps(original)
+    async def as_a_browser(self: httpx.ASGITransport, request: httpx.Request) -> httpx.Response:
+        if (
+            request.method not in {"GET", "HEAD", "OPTIONS"}
+            and request.url.path.startswith("/ui")
+            # The console suite's opt-out (its _ui_clients.HEADERLESS_UI_REQUEST). Honoured here
+            # too: one run collects both suites, and this session-scoped wrapper then sits under
+            # the console's own, where it would re-add the header a refusal test left off.
+            and not request.extensions.get("mf_headerless_ui_request")
+            and "sec-fetch-site" not in request.headers
+            and "origin" not in request.headers
+        ):
+            request.headers["sec-fetch-site"] = "same-origin"
+        return await original(self, request)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(httpx.ASGITransport, "handle_async_request", as_a_browser)
+        yield

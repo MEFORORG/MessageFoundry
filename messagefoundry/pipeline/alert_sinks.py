@@ -31,7 +31,7 @@ import string
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar
@@ -53,6 +53,8 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
+from messagefoundry.connection_names import is_connection_name
+from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
     config_changed_detail,
     crl_expiry_detail,
@@ -76,11 +78,20 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-#: #144 (ADR 0128): the injected async connection-control callback the notifier calls when a rule with a
-#: ``control_action`` fires — ``(action, target)`` where ``action`` is ``restart_inbound`` /
-#: ``restart_outbound`` and ``target`` is the connection name. Wired from ``api/app.py`` to the
-#: ``RegistryRunner`` so the sink never imports the runner (ADR 0128 §2).
-ControlCallback = Callable[[str, str], Awaitable[None]]
+
+class ControlCallback(Protocol):
+    """#144 (ADR 0128): the injected async connection-control callback the notifier calls when a rule
+    with a ``control_action`` fires. ``action`` is ``restart_inbound`` / ``restart_outbound`` and
+    ``target`` is the connection name. Wired from ``api/app.py`` to the ``RegistryRunner`` so the sink
+    never imports the runner (ADR 0128 §2).
+
+    ``default_target`` is True when the rule set no ``control_target``, so ``target`` is the event's
+    own bare name. The event does not say which namespace that name came from, and inbound and
+    outbound names are separate namespaces, so the callback must not aim it at the other side
+    (BACKLOG #2528)."""
+
+    def __call__(self, action: str, target: str, *, default_target: bool) -> Awaitable[None]: ...
+
 
 # Bound the in-memory backlog so a wedged transport (unreachable webhook) can't grow without limit;
 # excess events are dropped with a warning rather than stalling the worker that enqueues them.
@@ -794,6 +805,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
         self._store = store
         self._state_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #2272 defect 8: a FIFO lock per "<type>:<connection>" instance key. Each state write
+        # holds its key's lock, so a raise and its clear land in emit order; writes for different keys
+        # stay concurrent. An entry is dropped once no write holds or awaits it.
+        self._state_locks: dict[str, KeyedLock] = {}
         # #143 (ADR 0044 amendment): windowed NOTIFICATION-mute cache — (type:connection) → until-epoch.
         # The synchronous suspend gate _emit consults; in-memory + per-node (the same advisory posture as
         # the _last_sent throttle above). The DURABLE record is alert_instance.suspended_until; this cache
@@ -884,6 +899,20 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def log_forward_failed(self, name: str, *, reason: str, count: int = 0) -> None:
+        # BACKLOG #2612: the off-box forwarder is absent, losing records or not sending. The
+        # caller's `forwarder:<kind>` label, with its process suffix where one applies, stands in
+        # for "connection", as the sink label does for log_write_failed, so the throttle and the
+        # alert row are per kind and per process.
+        self._emit(
+            {
+                "type": "log_forward_failed",
+                "connection": name,
+                "detail": reason,
+                "count": count,
+            }
+        )
+
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         # The DB path stands in for "connection" so the realert throttle + subject keying work
         # uniformly; the event carries no message content (no PHI), only sizes.
@@ -899,9 +928,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def intake_paused(
         self, name: str, *, reason: str, value: int, limit: int, store_kind: str
     ) -> None:
-        # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>` stands in for "connection",
-        # so each bound is its own instance and throttle key. `detail` is what the instance's reason
-        # column shows, built by the same helper the logging sink uses. The monitor re-raises this
+        # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>[@<process>]` stands in for
+        # "connection", so each bound on each engine process is its own instance and throttle key.
+        # `detail` is what the instance's reason column shows, built by the same helper the logging
+        # sink uses. The monitor re-raises this
         # while a pause holds, and _emit's (type, connection) throttle collapses the repeats, as
         # for queue_buildup. Counts and sizes only: no message content, no PHI.
         self._emit(
@@ -1270,6 +1300,12 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # dr_activated instance via _AUTO_RESOLVE (ADR 0044).
         self._record_state({"type": "dr_released", "connection": node}, "info")
 
+    def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
+        # vault BACKLOG #2613: one detector of the audit-stream rule layer fired. `signal` is the
+        # event type, so each detector routes and throttles on its own; the subject stands in for
+        # "connection". A count and a fixed sentence only: never a body, an id or a row's detail.
+        self._emit({"type": signal, "connection": name, "count": count, "detail": detail})
+
     def set_store(self, store: _AlertStateStore | None) -> None:
         """Wire (or clear) the alert-state store (ADR 0044, #56). The lifespan calls this once the store
         is open, since :func:`notifier_from_settings` builds the sink from settings before the store
@@ -1387,19 +1423,32 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # BEFORE the transport-suppression return, so a rule may auto-remediate QUIETLY (transports=[]) or
         # alongside a page. Dispatched off-worker + never-raise (see _dispatch_control).
         if decision.control_action is not None:
-            if event["type"] in _ALERT_CONTROL_EVENT_TYPES:
-                target = decision.control_target or str(event["connection"])
-                self._dispatch_control(decision.control_action, target)
-            else:
+            subject = str(event["connection"])
+            if event["type"] not in _ALERT_CONTROL_EVENT_TYPES:
                 # BACKLOG #1898: AlertRule refuses this pair at load, so a loaded rule never reaches
-                # here. This covers only a rule built past that validator (model_construct). It checks
-                # the event TYPE and cannot see a stand-in raised under an allowed type (see the
-                # KNOWN GAPS on _ALERT_CONTROL_EVENT_TYPES).
+                # here. This covers only a rule built past that validator (model_construct).
                 log.warning(
                     "alert control_action %s skipped: event type %r is not connection-scoped",
                     decision.control_action,
                     event["type"],
                 )
+            elif not is_connection_name(subject):
+                # BACKLOG #2527: an allowed type can still carry a stand-in. reference_sync and
+                # state_convergence raise connection_stopped under a colon key, which no connection
+                # name can hold. The event is then not about a connection, so no restart fires,
+                # not even at an explicit control_target. The subject is not logged: a stand-in is
+                # not a connection name, and this line must not echo whatever it is.
+                log.warning(
+                    "alert control_action %s skipped: the %r event is not about a connection",
+                    decision.control_action,
+                    event["type"],
+                )
+            elif decision.control_target is not None:
+                self._dispatch_control(
+                    decision.control_action, decision.control_target, default_target=False
+                )
+            else:
+                self._dispatch_control(decision.control_action, subject, default_target=True)
         # #143 (ADR 0044 amendment): the windowed suspend gate — NOTIFICATION-only. The durable instance
         # was already recorded above (AC-3: a suspended alert stays open/counted/visible), and any #144
         # control action already dispatched; a still-active suspend window only mutes the transport enqueue.
@@ -1442,14 +1491,22 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         connection = str(event.get("connection", ""))
         inverse_of = _AUTO_RESOLVE.get(etype)
         coro: Coroutine[Any, Any, Any]
+        # The instance key both writes touch: an upsert's own type, or the failure type a clear resolves.
+        key = f"{inverse_of or etype}:{connection}"
+        # Stamp the row with the emit time: a write may now wait behind a slow one for the same key,
+        # and first_seen / last_seen / resolved_at should say when the condition changed, not when
+        # the store caught up.
+        now = time.time()
         if inverse_of is not None:
             # #143/#81: a resolved condition has nothing left to mute OR escalate — drop the windowed-
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
             # re-open of the SAME key starts un-suspended at the base tier (the durable suspended_until /
             # escalation_tier were on the now-resolved row and never return via list_active).
-            self._suspended.pop(f"{inverse_of}:{connection}", None)
-            self._occurrences.pop(f"{inverse_of}:{connection}", None)
-            coro = store.resolve_alert_instances_for(event_type=inverse_of, connection=connection)
+            self._suspended.pop(key, None)
+            self._occurrences.pop(key, None)
+            coro = store.resolve_alert_instances_for(
+                event_type=inverse_of, connection=connection, now=now
+            )
         else:
             # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
             raw_reason = event.get("detail") or event.get("reason")
@@ -1460,29 +1517,53 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 severity=severity,
                 reason=reason,
                 escalation_tier=escalation_tier,
+                now=now,
             )
+        wrapper = self._run_state(coro, key)
         try:
-            task = asyncio.ensure_future(self._run_state(coro))
+            task = asyncio.ensure_future(wrapper)
         except RuntimeError:
             # No running loop (e.g. an emit on a non-async test path) — the state write is best-effort,
             # so drop it rather than raise into the caller. The notification path is unaffected.
+            # Close both coroutines so neither warns "never awaited".
+            wrapper.close()
             coro.close()
             return
         self._state_tasks.add(task)
-        task.add_done_callback(self._state_tasks.discard)
 
-    @staticmethod
-    async def _run_state(coro: Any) -> None:
+        def _done(t: asyncio.Task[None]) -> None:
+            self._state_tasks.discard(t)
+            # A task cancelled before its first step never reached the await; close the store
+            # coroutine so it does not warn "never awaited". Closing a finished coroutine is a no-op.
+            coro.close()
+
+        task.add_done_callback(_done)
+
+    async def _run_state(self, coro: Coroutine[Any, Any, Any], key: str) -> None:
+        # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
+        # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
+        # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
+        # they queue on the lock in emit order, and a waiter cancelled mid-queue keeps the rest in order.
         try:
-            await coro
+            async with hold_keyed_lock(self._state_locks, key):
+                await coro
         except Exception:
             # The alert-instance write is a side observer: a store error must never wedge a delivery
             # worker or drop the notification. Log metadata only (no event body).
             log.warning("alert-instance state write failed", exc_info=True)
 
+    async def drain_state(self, timeout: float) -> None:
+        """Wait up to ``timeout`` seconds for the alert-instance writes already scheduled. The engine
+        calls it before it closes the store, so a clear raised on the way out (an unpinned cluster
+        node's intake_resumed, BACKLOG #2272) is written rather than lost to the close. A write
+        still running at the deadline is left to fail as before; this never raises."""
+        pending = set(self._state_tasks)
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
+
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
-    def _dispatch_control(self, action: str, target: str) -> None:
+    def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
         task, exactly like the ADR 0044 state observer). Synchronous + non-blocking: it only creates the
         task, never awaits the runner, so a slow/hung restart can never stall the worker that emitted the
@@ -1496,7 +1577,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             )
             return
         try:
-            task = asyncio.ensure_future(self._run_control(cb, action, target))
+            task = asyncio.ensure_future(
+                self._run_control(cb, action, target, default_target=default_target)
+            )
         except RuntimeError:
             # No running loop (e.g. a control emit on a non-async test path) — best-effort, drop it rather
             # than raise into the caller. The notification path is unaffected.
@@ -1505,9 +1588,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         task.add_done_callback(self._control_tasks.discard)
 
     @staticmethod
-    async def _run_control(cb: ControlCallback, action: str, target: str) -> None:
+    async def _run_control(
+        cb: ControlCallback, action: str, target: str, *, default_target: bool
+    ) -> None:
         try:
-            await cb(action, target)
+            await cb(action, target, default_target=default_target)
         except Exception:
             # NEVER-RAISE (ADR 0128 §3): a rejected/hung restart (unknown / not-deployed / shard-not-owner
             # connection) must never break alerting or delivery. Swallow + log metadata only (no PHI).

@@ -212,6 +212,19 @@ The complete procedure — least-privilege accounts, locking down the config/log
 
 `messagefoundry dryrun` and `messagefoundry generate` print **full message bodies** to stdout/stderr (`dryrun` only with `--show-phi`; redacted otherwise). Run them against **synthetic HL7 only** — never real PHI — and never redirect their output into a committed file, ticket, or CI log. See [PHI.md](PHI.md).
 
+### Command options that depend on each other
+
+Some `messagefoundry` commands refuse a set of options that do not fit together. The rule is about the combination, not about one option's value. The table lists at least the rules a search of the command-line code found. It is not a complete list, so run a command with `--help` for its own options.
+
+| Command | Options | Rule | When the rule is broken |
+|---|---|---|---|
+| `impact` | `--rename-to` and `--delete` | Never both. Either one alone is fine, and so is neither. | An error message and a non-zero exit |
+| `impact` | `--apply` | Valid only with `--rename-to`. | An error message and a non-zero exit |
+| `audit-verify` | `--expected-anchor` and `--expected-anchor-file` | Never both, because they carry the same anchor. Neither is required. | The argument parser refuses the command |
+| `serve` | `--shard` and the `[cluster].enabled` setting | Engine sharding cannot run with active-passive clustering. | An error message and exit code 2 |
+
+All four rules are in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py). The table leaves out a rule that one action needs one option, such as `service install` needing `--env`. The rules for the engine's API and the web console are in [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md#rules-over-two-or-more-items), which also says how the search ran.
+
 ---
 
 ## Quickstart: send your first message
@@ -428,6 +441,23 @@ Routers and Handlers work against the mutable HL7 `Message` in [messagefoundry/p
 
 A non-HL7 inbound (`content_type` other than `hl7v2`) delivers a `RawMessage` instead — read `.raw` / `.text` / `.json()` / `.xml()` (the XML accessor is XXE-safe via defusedxml: DOCTYPE, external-entity, and billion-laughs payloads raise) and `Send` a built string. For cross-field business-rule checks beyond what schema validation catches, compose the primitives in `parsing/consistency.py`, as [samples/consistency/validated_adt.py](../samples/consistency/validated_adt.py) does (raise `ConsistencyError` → dead-letter, or `return None` → filter). The three validation tiers are laid out in [HL7-VALIDATION.md](HL7-VALIDATION.md).
 
+**Those primitives read an HL7 `Message` only.** Each one calls `msg.field(path)` with an HL7 path. A `RawMessage` has no `field` method, so they do not work on a JSON, XML, FHIR, DICOM or X12 payload.
+
+For such a payload, write the cross-field comparison in your Handler, as plain Python over the value you parsed. Then decide the same way: `return None` to filter the message, or raise to dead-letter it.
+
+You can still raise `ConsistencyError`. It takes any list of `Violation`, and a `Violation` is a rule name plus the paths involved. `Violation("dates_in_order", ("admit", "discharge"))` is one you could build yourself. Put names and paths in it, never a value from the message.
+
+The engine ships validators for some of these formats. All are opt-in: nothing runs one unless your Handler calls it. They include at least these:
+
+| Format | Call | What it checks |
+|---|---|---|
+| X12 | `check_integrity`, in `messagefoundry.parsing.x12` | Whether the envelope agrees with itself: the control-number pairs (ISA13 with IEA02, GS06 with GE02, ST02 with SE02) and the group, set and segment counts |
+| X12 | `validate`, in `messagefoundry.parsing.x12.validate` | The interchange against an implementation guide. It needs the `[x12]` extra |
+| XML | `validate_against`, in `messagefoundry.parsing.xml.schema` | The document against an XML Schema you supply. It needs the `[xml]` extra |
+| FHIR | `FhirResource.parse`, in `messagefoundry.parsing.fhir.resource` | The resource's structure and cardinality. It needs the `[fhir]` extra |
+
+Only the first row is a cross-field check this guide can vouch for. The other three check a payload against a guide, a schema or a model. Which cross-field rules that covers depends on the guide, schema or model, so read it before you rely on it. `check_integrity` quotes the control numbers it compared in its problem text, so treat that text as message content when you log.
+
 ### 4. Translation tables (code sets)
 
 A Router or Handler often maps a coded value to a downstream one — a sending-facility code to a mnemonic (the `FACILITY_MNEMONICS` lookup in the Handler above), an order code to a partner's code, a bed location to a room. Rather than hand-maintain a Python dict, you can back that lookup with a **translation table** (internally a *code set*): a `codesets/<name>.csv` file in your config dir (the name is the file stem). It **loads with the graph and reloads on promote**, and the lookup is **pure**, so it's safe under the staged pipeline.
@@ -631,7 +661,7 @@ The SMTP password is a secret — supply it via `MEFOR_ALERTS_EMAIL_PASSWORD`, n
 - **A connection shows `failed`.** A connection that can't build or bind **at startup** (bad settings, a port already in use) is isolated as a degraded `failed` status instead of taking the engine down — every other lane keeps running ([ADR 0031](adr/0031-startup-connection-fault-isolation.md)). Fix the config/bind, then recover it: restart an inbound (`POST /connections/{name}/start`), or reload to rebuild a failed outbound. (Reload itself stays fail-fast — a broken config is rejected whole, never partially applied.)
 - **Backlog growing.** A `queue_buildup` alert usually means a head is retrying its way toward the cap and blocking its FIFO lane, or the downstream is down. Check the destination, then inspect/purge or replay the blocking row.
 - **Console can't reach the engine.** The API binds `127.0.0.1:8765` by default and requires auth; confirm the engine is serving (`python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev`), that the `messagefoundry-webconsole` distribution is installed and `[security].serve_web_console` has not been set to `false`, and that your browser is pointed at `https://` on that host/port's `/ui`.
-- **Intake paused.** An `intake_paused` alert means the engine paused intake, because the staged backlog went over `[inbound].max_staged_depth` or free disk fell below `[retention].min_free_disk_mb`. Its `connection` names which: `intake:staged_depth` or `intake:disk_floor`. Not every source honours the pause (the `max_staged_depth` row under `[inbound]` in [CONFIGURATION.md](CONFIGURATION.md) says which), so the backlog can still grow. Nothing already received is lost. Clear the cause (a stalled router or transform, or a full volume) and intake resumes on its own (`[inbound]` in [CONFIGURATION.md](CONFIGURATION.md)).
+- **Intake paused.** An `intake_paused` alert means the engine paused intake, because the staged backlog went over `[inbound].max_staged_depth` or free disk fell below `[retention].min_free_disk_mb`. Its `connection` names which, and which engine process paused: `intake:staged_depth` or `intake:disk_floor`, followed by `@node:<node_id>` or `@shard:<id>` when several processes share the store. Each process raises and clears its own alert. Not every source honours the pause (the `max_staged_depth` row under `[inbound]` in [CONFIGURATION.md](CONFIGURATION.md) says which), so the backlog can still grow. Nothing already received is lost. Clear the cause (a stalled router or transform, or a full volume) and intake resumes on its own (`[inbound]` in [CONFIGURATION.md](CONFIGURATION.md)).
 - **Low disk / store growing.** `GET /status` reports DB size and free disk; a `storage_threshold` alert fires past `[retention].max_db_mb`. Tune retention in `[retention]` ([CONFIGURATION.md](CONFIGURATION.md)) — purges null PHI bodies while keeping the message/disposition rows, so counts and audit stay intact. The row is kept; its PHI columns — operator-attached `metadata` included — are blanked.
 
 ---

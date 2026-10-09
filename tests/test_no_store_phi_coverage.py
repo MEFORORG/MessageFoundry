@@ -161,7 +161,6 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     ("IntegrityResult", "detail"): None,  # the backend's own integrity-check output
     ("PendingApprovalResponse", "detail"): None,  # why the action is held for a second approver
     ("AlertTestEmailResult", "detail"): None,  # a safe_exc-scrubbed SMTP send failure
-    ("ConnectionTestResult", "detail"): None,  # a reachability-probe outcome
     # The store-privilege preflight's own outcome. app.py copies it from the in-memory
     # StorePrivilegePosture the serve lifespan stashed, so the route reads no store row: per
     # backend the string is a fixed literal, or a driver exception's class name plus str(exc)
@@ -175,12 +174,18 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     # built from parsed parts, with an unparseable address withheld rather than echoed.
     ("StaticCredentialHopView", "detail"): None,
     ("AiPolicy", "reason"): None,  # why the AI policy clamped, derived from config
+    # BACKLOG #2337: the operator's own attestation reason, typed at `store attest-transit-bound`
+    # and read from transit_bound_attestation, a non-PHI table no PHI.md row classifies.
+    ("TransitBoundAttestationView", "reason"): None,
     ("ConnectionMetadata", "metadata"): None,  # the operator's own connections.toml label table
     # --- live fields rated with a stored twin (BACKLOG #1185, Manager decision 2026-09-24) ----------
     # Live engine state, so no section 2 ROW names them. Section 2's prose rates each FIELD with its
     # stored twin and says why that column is the twin.
     ("ConnectionRow", "error"): "alert_instance.reason",
     ("ConnectionMetadata", "error"): "alert_instance.reason",
+    # A reachability-probe outcome. Both test routes write it into their audit row, so its stored
+    # twin is audit_log.detail (PL-4). Section 2's prose rates it (BACKLOG #2372).
+    ("ConnectionTestResult", "detail"): "audit_log.detail",
 }
 
 
@@ -424,6 +429,20 @@ def test_the_live_error_fields_are_rated_in_prose() -> None:
     level = _classified_columns()[column]
     assert f"`{column}`" in rating[0], f"the rating paragraph no longer names {column}"
     assert level in rating[0], f"the rating paragraph no longer states {level}"
+
+
+def test_the_connection_test_detail_is_rated_in_prose() -> None:
+    """BACKLOG #2372. ``ConnectionTestResult.detail`` is bound to ``audit_log.detail``, which is only
+    honest while one section 2 paragraph names the field, that column and the column's level.
+    Re-binding the field or re-rating the column without updating the prose reds here."""
+    prose = "\n".join(line for line in _section(2).splitlines() if not line.strip().startswith("|"))
+    paragraphs = [" ".join(p.split()) for p in re.split(r"\n\s*\n", prose)]
+    rating = [p for p in paragraphs if "`ConnectionTestResult.detail`" in p]
+    assert len(rating) == 1, f"expected one section 2 paragraph rating it, got {len(rating)}"
+    column = _RESPONSE_FIELD_COLUMN[("ConnectionTestResult", "detail")]
+    assert column is not None
+    assert f"`{column}`" in rating[0], f"the rating paragraph no longer names {column}"
+    assert _classified_columns()[column] in rating[0], "the paragraph no longer states the level"
 
 
 def test_every_bound_column_is_classified_in_phi_md() -> None:

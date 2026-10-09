@@ -24,10 +24,12 @@ from fastapi import HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import RedirectResponse
 
 from messagefoundry.api.security import (
+    RepeatedCredentialError,
     client_ip,
     enforce_phi_read_hop,
     get_auth,
     mark_route_gate,
+    record_repeated_credential,
 )
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
@@ -194,8 +196,43 @@ def session_cookie_name(conn: Request | WebSocket) -> str:
     return HOST_COOKIE_NAME if browser_hardening_enabled() else SECURE_COOKIE_NAME
 
 
+#: The 400 detail for a request carrying more than one copy of the session cookie (BACKLOG #2454).
+#: A fixed string: it names the rule, never a value.
+REPEATED_SESSION_COOKIE_DETAIL = "more than one session cookie"
+
+
+def session_cookie_copies(conn: Request | WebSocket) -> int:
+    """How many copies of this connection's session cookie the request carries, over every
+    ``Cookie`` header line (BACKLOG #2454, the cookie half).
+
+    Starlette's ``conn.cookies`` keeps only the LAST copy of a name, so it cannot see a repeat; this
+    reads the raw lines instead. A chunk is counted exactly when Starlette's own ``cookie_parser``
+    would file it under the name: it holds an ``=``, and the text before the first one, stripped,
+    is the name.
+
+    A browser holding this engine's cookie sends one copy: the engine sets it with ``Path=/`` and no
+    ``Domain``. Two copies mean another writer set a second one, such as a sibling host writing the
+    ``__Secure-`` or plain name for a parent domain, or a crafted client. RFC 6265 section 5.4 says
+    a server should not rely on the order of such copies, so neither is chosen. The cost is that a
+    browser holding a planted copy is refused until it drops it. The ``__Host-`` name, the shipped
+    default, cannot be planted from another host."""
+    name = session_cookie_name(conn)
+    return sum(
+        1
+        for line in conn.headers.getlist("cookie")
+        for chunk in line.split(";")
+        if "=" in chunk and chunk.split("=", 1)[0].strip() == name
+    )
+
+
 def session_token(conn: Request | WebSocket) -> str | None:
-    """Read the session token from whichever cookie name applies to this connection's scheme."""
+    """Read the session token from whichever cookie name applies to this connection's scheme.
+
+    Raises 400 when the request carries the cookie more than once (BACKLOG #2454), as the engine's
+    ``RepeatedCredentialError``, whose handler logs and audits it. A WebSocket caller checks
+    :func:`session_cookie_copies` first, because a raise there is not an answer."""
+    if session_cookie_copies(conn) > 1:
+        raise RepeatedCredentialError("session_cookie", REPEATED_SESSION_COOKIE_DETAIL)
     return conn.cookies.get(session_cookie_name(conn))
 
 
@@ -212,6 +249,9 @@ UI_CSP = (
 # state-changing /ui POSTs (M2). "same-site" (a sibling subdomain) is rejected too: /ui is strictly
 # same-origin. "same-origin" and "none" (a user-initiated navigation) are allowed.
 _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
+#: The ``Sec-Fetch-Site`` values a /ui WRITE is accepted with (:func:`assert_same_origin`): the
+#: browser calls the request same-origin, or user-initiated (``none``). A GET is not held to this.
+_SAME_ORIGIN_FETCH = frozenset({"same-origin", "none"})
 
 
 #: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
@@ -552,12 +592,13 @@ def require_ui(
         if not write:
             return identity
         # Its own `if`, not `write and ...`: tests/test_security_doc_rate_limits.py reads this exact
-        # test line to plant its mutations.
+        # test line to plant its mutations. It reads the Retry-After line below the same way.
         if not auth.allow_admin_write(identity.user_id):
+            # BACKLOG #2144: the actor's own wait, the same value the JSON floor sends.
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "too many requests; please slow down",
-                headers={"Retry-After": "10"},
+                headers={"Retry-After": str(auth.admin_write_retry_after(identity.user_id))},
             )
         return identity
 
@@ -634,7 +675,8 @@ def assert_same_origin(request: Request) -> None:
 
     The **primary** CSRF defense is the SameSite=Strict session cookie: a cross-site POST carries no
     ``mf_session`` cookie, so ``require_ui`` already fails it (303 to login) before any action runs.
-    This adds an explicit origin check on top: modern browsers send ``Sec-Fetch-Site`` on every request
+    This adds an explicit origin check on top, whose exact rule is the table below. In outline:
+    modern browsers send ``Sec-Fetch-Site`` on every request
     (reject ``cross-site``/``same-site``); for older clients that omit it, fall back to comparing the
     ``Origin`` to our own origin (``[api].public_origin`` when set, else the request ``Host``, except
     behind a proxy in front of a loopback bind, where nothing matches). A same-origin form POST (the
@@ -645,16 +687,83 @@ def assert_same_origin(request: Request) -> None:
     state-changing POSTs (ASVS 3.5.1): ``POST /ui/login``, where SameSite=Strict supplies nothing
     because no session cookie exists yet, and ``POST /ui/logout``, which has no ``Depends`` gate at all
     (by design — a must-change-confined session must be able to revoke itself, ASVS 7.4.4) and so has
-    no other request-provenance control. The header-less fallthrough is safe by construction: a browser
-    attaches ``Sec-Fetch-Site`` or ``Origin`` to every cross-site POST, so only a non-browser client —
-    which cannot be CSRF-ridden — passes header-less.
+    no other request-provenance control.
+
+    **THE RULE, stated once.** This table is the one statement of what the check does with the
+    method and ONE line of each header. Other documents say the one fact they need and point here.
+    ``test_ui_origin_guard.py`` reads the table out of this docstring and drives the function over
+    every row, on the Host-fallback posture; a change to the table or to these branches that
+    leaves the other behind fails there.
+
+    What the table does not state, so it is not read as covering it:
+
+    * "matches" means :func:`_origin_matches` accepts the ``Origin``. What that function compares
+      is its own subject (a configured public origin, the ``Host`` fallback, the proxied-loopback
+      refusal) and is not restated or re-tested by the table.
+    * A repeated ``Sec-Fetch-Site`` line: this function reads the first, and
+      :class:`._security.UiFetchMetadataMiddleware` keeps the last.
+    * Values are compared as this function receives them. "any other value" is any non-empty value
+      outside the four named, so another letter case or padding is another value HERE; an HTTP
+      server may trim padding before the request arrives.
+
+    A refusal is a 403. "write" is any method but GET, to match ``require_ui``.
+
+    ======  =======================  ===============  =======
+    Method  Sec-Fetch-Site           Origin           Verdict
+    ======  =======================  ===============  =======
+    write   absent                   absent or empty  refuse
+    write   absent                   matches          accept
+    write   absent                   does not match   refuse
+    write   empty                    absent or empty  refuse
+    write   empty                    matches          accept
+    write   empty                    does not match   refuse
+    write   cross-site or same-site  any              refuse
+    write   same-origin or none      any              accept
+    write   any other value          any              refuse
+    GET     absent                   absent or empty  accept
+    GET     absent                   matches          accept
+    GET     absent                   does not match   refuse
+    GET     empty                    any              accept
+    GET     cross-site or same-site  any              refuse
+    GET     same-origin or none      any              accept
+    GET     any other value          any              accept
+    ======  =======================  ===============  =======
+
+    The write rows fail closed where the request names no provenance this code recognises
+    (BACKLOG #1116, #1124). Before that change a write was refused only for ``cross-site``,
+    ``same-site`` or a non-matching ``Origin`` with no ``Sec-Fetch-Site`` line; every other write
+    row passed, on the reasoning that a browser attaches one of the two headers to every cross-site
+    POST. That is an assumption about the browser, and nothing told the operator when it did not
+    hold. No shipped first-party client posts to ``/ui`` without a browser.
+
+    **The GET rows are the rule a GET had before that change, and must stay.** At least one GET
+    reaches this check: ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in
+    navigation. Owner rulings R4 and R4b of 2026-09-28 hold that a sign-in GET is never blocked for
+    missing fetch metadata.
     """
-    sec_fetch_site = request.headers.get("sec-fetch-site")
-    if sec_fetch_site is not None:
+    # "GET" and nothing wider, to match require_ui's own definition of a write.
+    write = request.method != "GET"
+    site = request.headers.get("sec-fetch-site")
+    # On a write an EMPTY Sec-Fetch-Site names no provenance, so it is absence, as an empty Origin
+    # is below. On a GET any present line settles it, which is the pre-#1116 rule unchanged.
+    if site if write else site is not None:
         assert_not_cross_site(request)
+        # An ALLOW set on a write, not only the two refused values above. The Fetch Metadata
+        # values are four exact lowercase tokens; anything else (an unknown token, another case,
+        # padding) is not a browser naming this request same-origin, so it fails closed.
+        if write and site not in _SAME_ORIGIN_FETCH:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "unrecognised Sec-Fetch-Site value rejected"
+            )
         return
     origin = request.headers.get("origin")
-    if origin and not _origin_matches(request.app.state, origin, request.headers.get("host")):
+    if not origin:
+        if write:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "request carries neither Sec-Fetch-Site nor Origin"
+            )
+        return
+    if not _origin_matches(request.app.state, origin, request.headers.get("host")):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-origin request rejected")
 
 
@@ -1556,6 +1665,12 @@ async def authorize_ui_ws(
         return None, None  # native client (no Origin) — the header path handles it
     if not _origin_matches(websocket.app.state, origin, websocket.headers.get("host")):
         return None, None  # cross-origin browser handshake (CSWSH) — reject
+    if session_cookie_copies(websocket) > 1:
+        # BACKLOG #2454: a repeated session cookie authenticates nothing, and the refusal is logged
+        # and audited here, since a handshake has no exception handler. The caller falls back to
+        # the header path, whose Origin check refuses a browser handshake.
+        await record_repeated_credential(websocket, "session_cookie")
+        return None, None
     token = session_token(websocket)
     if not token:
         return None, None
