@@ -4,7 +4,10 @@
 // The Test Bench webview's inline script, split out of testBench.ts so it can be loaded without
 // `vscode`. testBench.ts builds the page and embeds this; the unit suite evaluates the SAME source in
 // a jsdom page (test-bench-webview.test.ts), so what the tests exercise is what ships.
-import { WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, guardScript } from "./webviewMessaging";
+import { LINE_STATUSES } from "./hl7diff";
+import { DELIVERY_STATUSES } from "./testCollections";
+import { LINE_ROLES } from "./traceView";
+import { WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
 
 /**
  * The whole inline `<script>` body for one Test Bench render, guard included.
@@ -42,6 +45,12 @@ export function testBenchScript(token: string): string {
     function isBool(x){ return typeof x === 'boolean'; }
     function isObj(x){ return !!x && typeof x === 'object' && !Array.isArray(x); }
     function isInt(x){ return Number.isSafeInteger(x); }
+    // A field the host types as a closed set of strings: the set is its type. Each list below is the
+    // const that host type is derived from (hl7diff.ts, traceView.ts, testCollections.ts).
+    function isOneOf(x, set){ return typeof x === 'string' && set.indexOf(x) !== -1; }
+    const LINE_STATUSES = ${embedJson(LINE_STATUSES)};
+    const LINE_ROLES = ${embedJson(LINE_ROLES)};
+    const DELIVERY_STATUSES = ${embedJson(DELIVERY_STATUSES)};
     // null is a value, not an absence: only a field the host types "T | null" goes through this.
     function isNullable(x, f){ return x === null || f(x) === true; }
     function isArrOf(x, f){
@@ -54,7 +63,7 @@ export function testBenchScript(token: string): string {
     const HEX_PAIR = /^[0-9a-f]{2}$/;
 
     function isDiffCell(c){
-      return isObj(c) && isBool(c.seg) && isStr(c.status) && isStr(c.sep) &&
+      return isObj(c) && isBool(c.seg) && isOneOf(c.status, LINE_STATUSES) && isStr(c.sep) &&
         isArrOf(c.fields, (f) => isObj(f) && isStr(f.t) && isBool(f.c));
     }
     // Every field TraceDetail and its parts declare (traceView.ts), read here or not: a message
@@ -65,7 +74,7 @@ export function testBenchScript(token: string): string {
         isNullable(c.module, isStr) && isNullable(c.file, isStr) &&
         isInt(c.defLine) && isInt(c.startLine) && isInt(c.endLine) &&
         isArrOf(c.lines, (l) => isObj(l) && isCount(l.line) && isCount(l.hits) && isStr(l.text) &&
-          isStr(l.role) && isBool(l.executable) && isBool(l.executed));
+          isOneOf(l.role, LINE_ROLES) && isBool(l.executable) && isBool(l.executed));
     }
     function isProfile(p){
       return isObj(p) && isStr(p.kind) && isStr(p.name) && isBool(p.hasTiming) && isNum(p.totalSeconds) &&
@@ -93,7 +102,7 @@ export function testBenchScript(token: string): string {
       collectionRun: (m) => isStr(m.name) && isCount(m.run) && isCount(m.passed) && isCount(m.total) &&
         isArrOf(m.results, (r) => isObj(r) && isStr(r.name) && isBool(r.pass) && isStr(r.disposition)),
       caseDetail: (m) => isCount(m.run) && isCount(m.index) && isNullable(m.error, isStr) &&
-        isArrOf(m.deliveries, (d) => isObj(d) && isStr(d.to) && isStr(d.status) &&
+        isArrOf(m.deliveries, (d) => isObj(d) && isStr(d.to) && isOneOf(d.status, DELIVERY_STATUSES) &&
           isArrOf(d.differences, isFieldDifference)),
     };
     function shapeOk(m){

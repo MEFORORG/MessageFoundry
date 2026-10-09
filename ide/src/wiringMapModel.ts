@@ -11,7 +11,12 @@
 
 import { normalize, type ElementKind, type Graph, type NormalGraph } from "./graphModel";
 
-export type MapProvenance = "declared" | "literal" | "heuristic" | "dynamic";
+// The members live in a const so a webview page can be handed the same list its host is typed by
+// (ASVS 3.5.5, BACKLOG #1123). The type is derived from it, so the two cannot drift.
+// The first three are what "graph --json" prints (EdgeProvenance, config/graph.py); "dynamic" is
+// added here, for the edge to a stub.
+export const MAP_PROVENANCES = ["declared", "literal", "heuristic", "dynamic"] as const;
+export type MapProvenance = (typeof MAP_PROVENANCES)[number];
 
 export interface MapFocus {
   kind: ElementKind;

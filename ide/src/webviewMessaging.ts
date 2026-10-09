@@ -256,6 +256,11 @@ export const SHAPE_HELPERS = `
     // host's type for the field and from what the sender really sends.
     function mfOpt(x, f) { return x === undefined || f(x) === true; }
     function mfNullable(x, f) { return x === null || f(x) === true; }
+    // A field the host types as a closed set of strings: the set is its TYPE, so a string outside
+    // it is the wrong type, not an out-of-range value. indexOf, not "in": a set is an array handed
+    // to the page from the const the host's type is derived from, and "in" would match a key of
+    // Object.prototype.
+    function mfOneOf(x, set) { return typeof x === 'string' && set.indexOf(x) !== -1; }
     // The kind of a value, for a refusal a panel shows. Never the value itself. A number that is not
     // an int says which way, or "must be a whole number, got number" would name no difference.
     function mfKind(v) {

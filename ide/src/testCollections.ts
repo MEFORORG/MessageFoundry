@@ -61,7 +61,10 @@ export interface CompareResult {
   diff: MessageDiff; // the aligned before/after cells, for rendering
 }
 
-export type DeliveryStatus = "match" | "mismatch" | "missing" | "unexpected";
+// The members live in a const so a webview page can be handed the same list its host is typed by
+// (ASVS 3.5.5, BACKLOG #1123). The type is derived from it, so the two cannot drift.
+export const DELIVERY_STATUSES = ["match", "mismatch", "missing", "unexpected"] as const;
+export type DeliveryStatus = (typeof DELIVERY_STATUSES)[number];
 
 /** The outcome of comparing one expected delivery against the rerun's actual deliveries. */
 export interface DeliveryComparison {

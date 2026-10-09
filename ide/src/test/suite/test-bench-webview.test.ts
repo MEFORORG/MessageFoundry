@@ -3,10 +3,11 @@
 import * as assert from "assert";
 
 import { hexdump } from "../../hexdump";
-import { diffMessages } from "../../hl7diff";
+import { diffMessages, LINE_STATUSES } from "../../hl7diff";
 import { testBenchScript } from "../../testBenchWebview";
 import { heldAfterIncoming, judgeCollectionRun, pickCaseDetail, releaseRun } from "../../testCollections";
-import { buildTraceDetail, type TraceEntry } from "../../traceView";
+import { DELIVERY_STATUSES } from "../../testCollections";
+import { buildTraceDetail, LINE_ROLES, type TraceEntry } from "../../traceView";
 import { CHANNEL_FIELD } from "../../webviewMessaging";
 
 // ASVS 3.5.5 (BACKLOG #1123), the syntax half at the Test Bench receiver.
@@ -412,6 +413,7 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       ...required.map(([what, at, key, bad]): [string, (p: Payload) => void] => [`${what} mistyped`, (p) => (at(p)[key] = bad)]),
       // null is declared for module and file only (string | null). Elsewhere it is a wrong type.
       ["traceOk null", (p) => (p.detail.traceOk = null)],
+      ["a role outside LineRole", (p) => (inv(p).coverage.lines[0].role = "docstring")],
       ["coverage.defLine null", (p) => (inv(p).coverage.defLine = null)],
       ["coverage line role null", (p) => (inv(p).coverage.lines[0].role = null)],
     ]);
@@ -437,6 +439,21 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
     assert.strictEqual(good.detail.traceOk, true);
     assertRendered(good, "trace with trace_ok");
     assertRendered(good, "trace with trace_ok, profiling", { traceMode: "profile" });
+  });
+
+  test("every member of LineStatus and LineRole is accepted (control)", () => {
+    // One fixture does not reach every member, so each is set on a copy. A membership check that
+    // refused a real member fails here.
+    for (const status of LINE_STATUSES) {
+      const p = clone(DETAIL);
+      p.diff.before[0].status = status;
+      assertRendered(p, `detail with status ${status}`);
+    }
+    for (const role of LINE_ROLES) {
+      const p = clone(TRACE);
+      p.detail.invocations[0].coverage.lines[0].role = role;
+      assertRendered(p, `trace with role ${role}`);
+    }
   });
 
   test("collectionRun: well-formed renders (control)", () => {
@@ -488,6 +505,8 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       ["a numeric field text", (p) => (p.diff.before[0].fields[0].t = 5)],
       ["a string changed flag", (p) => (p.diff.before[0].fields[0].c = "true")],
       ["a string seg flag", (p) => (p.diff.after[0].seg = "yes")],
+      ["a status outside LineStatus", (p) => (p.diff.before[0].status = "moved")],
+      ["a status carrying a class name", (p) => (p.diff.after[0].status = "added ln-del")],
       ["after not an array", (p) => (p.diff.after = {})],
       ["a hole in before", (p) => hole(p.diff.before)],
       ["a hole in after", (p) => hole(p.diff.after)],
@@ -654,6 +673,18 @@ suite("Test Bench webview — a collection run reveals values one case at a time
     assert.ok(b.detail.textContent.includes("No differences."));
   });
 
+  test("caseDetail: every member of DeliveryStatus is accepted (control)", () => {
+    for (const status of DELIVERY_STATUSES) {
+      const b = runOnScreen();
+      button(b, 0).click();
+      const p = clone(caseDetail(0));
+      p.deliveries[0].status = status;
+      b.deliver(p);
+      assert.deepStrictEqual(b.errors.map(String), [], `caseDetail with status ${status}: the page threw`);
+      assert.deepStrictEqual(b.warnings, [], `caseDetail with status ${status}: discarded`);
+    }
+  });
+
   test("caseDetail: malformed payloads are discarded by the shape check", () => {
     // Control: the unmutated JSON copy renders, and warns nothing.
     const control = runOnScreen();
@@ -666,6 +697,7 @@ suite("Test Bench webview — a collection run reveals values one case at a time
       ["a string difference index", (p) => (p.deliveries[0].differences[0].index = "3")],
       ["markup as a difference index", (p) => (p.deliveries[0].differences[0].index = XSS)],
       ["a numeric before value", (p) => (p.deliveries[0].differences[0].before = 5)],
+      ["a status outside DeliveryStatus", (p) => (p.deliveries[0].status = "skipped")],
       ["a numeric error", (p) => (p.error = 5)],
       ["deliveries not an array", (p) => (p.deliveries = null)],
       ["a hole in deliveries", (p) => hole(p.deliveries)],

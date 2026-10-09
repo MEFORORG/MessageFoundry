@@ -6,14 +6,20 @@ import * as path from "path";
 
 import { alertEditorScript } from "../../alertEditorWebview";
 import { codeSetEditorScript } from "../../codeSetEditorWebview";
-import { buildForm, type ConnectionSchema, type SchemaParam } from "../../connectionForm";
+import {
+  buildForm,
+  FIELD_CONTROLS,
+  PARAM_TYPES,
+  type ConnectionSchema,
+  type SchemaParam,
+} from "../../connectionForm";
 import { connectionEditorScript } from "../../connectionEditorWebview";
-import type { Graph } from "../../graphModel";
+import { ELEMENT_KINDS, type Graph } from "../../graphModel";
 import { homeScript } from "../../homeWebview";
 import { FIELDS, securityEditorScript } from "../../securityEditorWebview";
 import { sourceControlScript } from "../../sourceControlWebview";
 import { CHANNEL_FIELD, SHAPE_HELPERS } from "../../webviewMessaging";
-import { wiringMapPayload } from "../../wiringMapModel";
+import { MAP_PROVENANCES, wiringMapPayload } from "../../wiringMapModel";
 import { wiringMapScript } from "../../wiringMapWebview";
 
 // ASVS 3.5.5 (BACKLOG #1123), the syntax half at the seven receivers other than Test Bench.
@@ -348,6 +354,8 @@ const SCHEMA: ConnectionSchema = {
         mode: param({ choices: ["fifo", "unordered"], default: "fifo" }),
         tls: param({ type: "bool", default: false, section: "--- TLS ---" }),
         tls_key_password: param({ secret: true, help: "passphrase for the key file" }),
+        headers: param({ type: "table" }),
+        connect_timeout: param({ type: "float", default: 5.0 }),
         // A heading too long for a title, so its group carries the full text as `description`.
         max_frame_bytes: param({
           type: "int",
@@ -421,6 +429,11 @@ const connection: Receiver = {
       ["cast is null", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].cast = null))],
       ["description is null", variant(FIELDS_OK, (c) => (c.groups[0].description = null))],
       ["no choices", variant(FIELDS_OK, (c) => delete c.groups[0].fields[0].choices)],
+      // FieldControl and ParamType are closed sets (connectionForm.ts). A string outside one is the
+      // wrong type, not an out-of-range value.
+      ["a control outside FieldControl", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].control = "slider"))],
+      ["a type outside ParamType", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].type = "date"))],
+      ["a control that is a member in another case", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].control = "Text"))],
     ],
   },
 };
@@ -735,6 +748,15 @@ const wiringMap: Receiver = {
       ["a node's stub is null", variant(MAP_OK, (c) => (c.map.columns[0][0].stub = null))],
       ["a node's port is a number", variant(MAP_OK, (c) => (c.map.columns[0][0].port = 6661))],
       ["a node's stub is a string", variant(MAP_OK, (c) => (c.map.columns[0][0].stub = "yes"))],
+      // ElementKind and MapProvenance are closed sets. A string outside one is the wrong type.
+      ["a name's kind outside ElementKind", variant(MAP_OK, (c) => (c.names[0].kind = "channel"))],
+      ["focus kind outside ElementKind", variant(MAP_OK, (c) => (c.focus.kind = "channel"))],
+      ["a node's kind outside ElementKind", variant(MAP_OK, (c) => (c.map.columns[0][0].kind = "channel"))],
+      ["a node's kind carrying a second class name", variant(MAP_OK, (c) => (c.map.columns[0][0].kind = "inbound focus"))],
+      ["an edge's fromKind outside ElementKind", variant(MAP_OK, (c) => (c.map.edges[0].fromKind = "channel"))],
+      ["an edge's toKind outside ElementKind", variant(MAP_OK, (c) => (c.map.edges[0].toKind = "channel"))],
+      ["an edge's provenance outside MapProvenance", variant(MAP_OK, (c) => (c.map.edges[0].provenance = "guessed"))],
+      ["a kind that is an Object.prototype key", variant(MAP_OK, (c) => (c.names[0].kind = "constructor"))],
       // map and focus are the other way round: required, and null is declared. Absent is refused
       // above ("no map field", "no focus field"); null renders (the second well-formed fixture).
     ],
@@ -802,6 +824,38 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.strictEqual(typeof MAP_OK.map.columns[0][0].port, "string", "the inbound node carries a port");
     assert.ok(ALERT_RULES.some((r) => "min_depth" in r) && ALERT_RULES.some((r) => !("min_depth" in r)));
     assert.ok(Array.isArray(SECURITY_SHOW.set));
+    // The really-sent controls for the closed sets: the ACCEPTS fixtures carry EVERY member of each
+    // one, so a membership check that refused a real member would fail there.
+    const members = (xs: unknown[]): string[] => [...new Set(xs.map(String))].sort();
+    assert.deepStrictEqual(members(fields.map((f) => f.control)), [...FIELD_CONTROLS].sort());
+    assert.deepStrictEqual(members(MAP_OK.names.map((n: Payload) => n.kind)), [...ELEMENT_KINDS].sort());
+    assert.deepStrictEqual(members(nodes.map((n) => n.kind)), [...ELEMENT_KINDS].sort());
+    assert.deepStrictEqual(members(MAP_OK.map.edges.map((e: Payload) => e.provenance)), [...MAP_PROVENANCES].sort());
+  });
+
+  test("connection editor: every ParamType member is accepted", () => {
+    // buildForm() over one small schema does not reach every tag, and the page does not read
+    // `type`, so each member is set on a copy of the fixture. Nothing may be discarded.
+    for (const type of PARAM_TYPES) {
+      const p = connection.load();
+      p.deliver(variant(FIELDS_OK, (c) => (c.groups[0].fields[0].type = type)));
+      assert.deepStrictEqual(p.errors.map(String), [], `${type}: the page threw`);
+      assert.deepStrictEqual(p.warnings, [], `${type}: discarded`);
+    }
+  });
+
+  test("the engine prints only edge provenances this page's set holds", () => {
+    // The first three members of MAP_PROVENANCES are not made here: they pass through from
+    // "graph --json". This reads the engine's own definition, so a provenance added there fails
+    // here instead of blanking the Wiring Map.
+    const source = fs.readFileSync(path.resolve(__dirname, "../../../../messagefoundry/config/graph.py"), "utf8");
+    const line = /^EdgeProvenance = Literal\[([^\]]+)\]/m.exec(source);
+    assert.ok(line, "config/graph.py no longer defines EdgeProvenance as a one-line Literal");
+    const engine = [...line[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    assert.ok(engine.length >= 3, `read too few members: ${engine.join(", ")}`);
+    for (const provenance of engine) {
+      assert.ok((MAP_PROVENANCES as readonly string[]).includes(provenance), `the engine prints "${provenance}"`);
+    }
   });
 
   test("Security Settings: Save stays off until a state renders, and a discarded state turns it off again", () => {

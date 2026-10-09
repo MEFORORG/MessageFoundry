@@ -34,7 +34,10 @@ export interface DiffField {
   c: boolean; // changed vs the aligned counterpart
 }
 
-export type LineStatus = "same" | "changed" | "added" | "removed";
+// The members live in a const so a webview page can be handed the same list its host is typed by
+// (ASVS 3.5.5, BACKLOG #1123). The type is derived from it, so the two cannot drift.
+export const LINE_STATUSES = ["same", "changed", "added", "removed"] as const;
+export type LineStatus = (typeof LINE_STATUSES)[number];
 
 export interface DiffCell {
   seg: boolean; // true = a real segment on this side; false = a gap opposite an add/remove
