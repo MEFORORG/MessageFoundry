@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
@@ -1865,6 +1866,55 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
     return str(_forward_spool_root(settings, str(store_path)) / "supervisor")
 
 
+#: The refusal ``serve`` and ``supervise`` share when no environment is named (ADR 0017).
+_NO_ACTIVE_ENVIRONMENT = (
+    "no active environment set — pass --env <name> or set [ai].environment. It selects "
+    "environments/<name>.toml and, with [security].production_instance, the instance's "
+    "production tier."
+)
+
+
+def _static_credential_settings_gate(
+    settings: ServiceSettings, *, enforcing: bool
+) -> tuple[StaticCredentialGateOutcome | None, bool]:
+    """Run the settings half of the opt-in static-credential gate and report it on stderr.
+
+    Returns the outcome and whether the start is refused. One body for ``serve`` and ``supervise``
+    (BACKLOG #2356): the half reads settings only, and its ``settings:logging.forward`` hop is the
+    off-box collector, so the supervisor must not install its forwarder past a refusal an engine
+    shard would make. The audit lines and a warn-mode refusal go to stderr here, where no log
+    level filters them; :func:`_log_static_credential_outcome` writes them to the log once the
+    caller has configured it (BACKLOG #1989)."""
+    from messagefoundry.config.static_credentials import run_static_credential_gate
+    from messagefoundry.controlchars import scrub_control_chars
+
+    outcome = run_static_credential_gate(settings, registry=None)
+    if outcome is None:
+        return None, False
+    for line in outcome.audit:
+        # Scrubbed as the logged copy is: an operator's reason is free text, and a newline in it
+        # must not forge a second stderr line.
+        print(f"warning: {scrub_control_chars(line)}", file=sys.stderr)
+    if outcome.refusal is not None:
+        if enforcing:
+            print(f"error: {outcome.refusal}; refusing to start.", file=sys.stderr)
+            return outcome, True
+        print(f"warning: {outcome.refusal}.", file=sys.stderr)
+    return outcome, False
+
+
+def _log_static_credential_outcome(outcome: StaticCredentialGateOutcome | None) -> None:
+    """Log what :func:`_static_credential_settings_gate` printed, once logging is configured, so
+    the lines reach the handlers and the forwarder (BACKLOG #1989). A warn-mode refusal too."""
+    if outcome is None:
+        return
+    log = logging.getLogger(__name__)
+    for line in outcome.audit:
+        log.warning("%s", line)
+    if outcome.refusal is not None:
+        log.warning("%s", outcome.refusal)
+
+
 def _start_logging(
     settings: ServiceSettings,
     *,
@@ -2226,12 +2276,7 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.config.ai_policy import SecurityEnforcement
 
     if settings.ai.environment is None:
-        print(
-            "error: no active environment set — pass --env <name> or set [ai].environment. It selects "
-            "environments/<name>.toml and, with [security].production_instance, the instance's "
-            "production tier.",
-            file=sys.stderr,
-        )
+        print(f"error: {_NO_ACTIVE_ENVIRONMENT}", file=sys.stderr)
         return 2
     try:
         production = settings.ai.require_posture()
@@ -2300,24 +2345,12 @@ def _serve(args: argparse.Namespace) -> int:
     # which every exit before configure_logging still sees and no log level can filter, and to the
     # configured handlers after configure_logging below. Under NSSM both streams are captured, so a
     # line can appear in both captures; that duplicate is the price of losing it from neither.
-    from messagefoundry.config.static_credentials import (
-        make_static_credential_guard,
-        run_static_credential_gate,
-    )
-    from messagefoundry.controlchars import scrub_control_chars
+    from messagefoundry.config.static_credentials import make_static_credential_guard
 
     _credlog = logging.getLogger(__name__)
-    sc_outcome = run_static_credential_gate(settings, registry=None)
-    if sc_outcome is not None:
-        for line in sc_outcome.audit:
-            # Scrubbed as the logged copy is: an operator's reason is free text, and a newline in it
-            # must not forge a second stderr line.
-            print(f"warning: {scrub_control_chars(line)}", file=sys.stderr)
-    if sc_outcome is not None and sc_outcome.refusal is not None:
-        if enforcing:
-            print(f"error: {sc_outcome.refusal}; refusing to start.", file=sys.stderr)
-            return 2
-        print(f"warning: {sc_outcome.refusal}.", file=sys.stderr)
+    sc_outcome, sc_refused = _static_credential_settings_gate(settings, enforcing=enforcing)
+    if sc_refused:
+        return 2
     static_credential_guard = make_static_credential_guard(
         settings, enforcing=enforcing, log=_credlog
     )
@@ -2597,11 +2630,7 @@ def _serve(args: argparse.Namespace) -> int:
     # BACKLOG #1989: the static-credential gate's settings-half audit lines, written to stderr where
     # the gate ran above and logged again here, so they reach the handlers and forwarder
     # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
-    if sc_outcome is not None:
-        for line in sc_outcome.audit:
-            _credlog.warning("%s", line)
-        if sc_outcome.refusal is not None:
-            _credlog.warning("%s", sc_outcome.refusal)
+    _log_static_credential_outcome(sc_outcome)
 
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and
@@ -4593,6 +4622,18 @@ def _supervise(args: argparse.Namespace) -> int:
         print(f"error: {detail}", file=sys.stderr)
         return 2
 
+    # The environment each engine shard is started with: `--env` when given, else the settings'.
+    # `serve` refuses to start with neither (ADR 0017), so every engine shard would; refused here
+    # in serve's words instead of spawning them (BACKLOG #2356).
+    env_name = args.env if args.env is not None else settings.ai.environment
+    if env_name is None:
+        print(
+            f"error: {_NO_ACTIVE_ENVIRONMENT} Every engine shard would refuse to start; refusing "
+            "to start the fleet.",
+            file=sys.stderr,
+        )
+        return 2
+
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.
     floor = _protocol_floor_or_refusal("start the fleet")
@@ -4668,6 +4709,13 @@ def _supervise(args: argparse.Namespace) -> int:
     # as in `serve`, and before the renewal below, so a refused start changes nothing on disk.
     # The logging call is the bare one at the top plus the forwarder. `--env` is what each engine
     # shard is started with, so it names the environment here as well.
+    #
+    # First the settings half of the static-credential gate, which `serve` runs ahead of its own
+    # forwarder. Its `settings:logging.forward` hop is this collector, and the half reads settings
+    # only, so every engine shard reaches the same verdict.
+    sc_outcome, sc_refused = _static_credential_settings_gate(settings, enforcing=enforcing)
+    if sc_refused:
+        return 2
     forwarder_installed = False
 
     def configure_with_forwarder(forward: SyslogForward | None) -> bool:
@@ -4677,13 +4725,14 @@ def _supervise(args: argparse.Namespace) -> int:
 
     logging_refused = _start_logging(
         settings,
-        env_name=args.env or settings.ai.environment,
+        env_name=env_name,
         enforcing=enforcing,
         spool_dir=_supervisor_forward_spool_dir(settings, db_base),
         configure=configure_with_forwarder,
     )
     if logging_refused is not None:
         return logging_refused
+    _log_static_credential_outcome(sc_outcome)
     if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
         # off-box copy has them. With no forwarder installed this writes nothing.
@@ -4719,7 +4768,7 @@ def _supervise(args: argparse.Namespace) -> int:
             acknowledged=settings.retention.allow_unbounded_phi,
             enforcing=enforcing,
             # The engine shards take --env; the settings loaded here do not carry it.
-            env_name=args.env if args.env is not None else settings.ai.environment,
+            env_name=env_name,
         )
         if verdict.refusal is not None:
             raise WiringError(

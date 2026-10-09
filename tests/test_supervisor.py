@@ -137,9 +137,9 @@ def test_shard_db_composes_under_project_root(tmp_path: object) -> None:
     # forwarded.
     from tests._phi_gate_provisions import make_syslog_ca_and_crl, setenv_verified_log_forwarding
 
-    setenv_verified_log_forwarding(monkey, make_syslog_ca_and_crl(Path(str(tmp_path))))
-    monkey.setattr(cli, "configure_logging", lambda *args, **kwargs: False)
     try:
+        setenv_verified_log_forwarding(monkey, make_syslog_ca_and_crl(Path(str(tmp_path))))
+        monkey.setattr(cli, "configure_logging", lambda *args, **kwargs: False)
         args = argparse.Namespace(
             config="config",  # relative — must resolve under R
             db="mefor.db",  # relative — must resolve under R
