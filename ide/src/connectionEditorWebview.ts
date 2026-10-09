@@ -296,11 +296,12 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // this page. Both post "error"; only connectionEditor.ts answers with "fields". A field is a
     // FieldDescriptor from connectionForm.ts: its declared fields with their types. The two
     // unknown-typed values (value, defaultValue) and the carried-through envDefault and
-    // preserveValue are not typed there either.
+    // preserveValue are not typed there either. choices is required and may be null; envKey, cast
+    // and a group's description may be absent and are never null.
     function mfFieldDescriptor(f) {
       return mfObj(f) && mfStr(f.key) && mfStr(f.label) && mfStr(f.control) && mfStr(f.type) &&
         mfStr(f.help) && mfBool(f.required) && mfBool(f.conditionallyRequired) && mfBool(f.secret) &&
-        mfBool(f.envAllowed) && mfBool(f.secretOnlyEnv) && (f.choices === null || Array.isArray(f.choices)) &&
+        mfBool(f.envAllowed) && mfBool(f.secretOnlyEnv) && mfNullable(f.choices, Array.isArray) &&
         mfStr(f.placeholder) && mfBool(f.isEnvRef) && mfStr(f.group) && mfBool(f.known) &&
         mfBool(f.offDirection) && mfOpt(f.envKey, mfStr) && mfOpt(f.cast, mfStr);
     }

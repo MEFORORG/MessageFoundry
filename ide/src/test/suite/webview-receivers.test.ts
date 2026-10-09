@@ -176,8 +176,14 @@ const ALERT_RULES = [
 ];
 
 /** Recorded the same day from `alert list --json` over a HAND-EDITED file with `min_depth = "500"`.
- *  The row is the raw TOML table, and the engine's lax model loads that quoted number. */
+ *  The row is the raw TOML table, and the engine's lax model loads that quoted number. The host's
+ *  type for the field is `number | null`, so this is DISCARDED now (Manager ruling on MR2,
+ *  2026-10-08): a present field has its declared type. It was a well-formed fixture before. */
 const ALERT_RULES_QUOTED = [{ event_type: "queue_buildup", min_depth: "500", index: 0 }];
+
+/** A rule with every optional field absent. `alert list` adds only the ordinal to the TOML table,
+ *  so a bare `[[alerts.rules]]` arrives as this. */
+const ALERT_RULES_BARE = [{ index: 0 }];
 
 /** alertEditor.ts posts `String(e)` for a thrown CLI error; this is a recorded CLI refusal. */
 const CLI_ERROR = String(
@@ -214,7 +220,7 @@ const alertRules: Receiver = {
        <div id="error">${SENTINEL}</div><button id="add"></button><button id="close"></button>`,
     ),
   wellFormed: {
-    rules: [ALERT_OK, { command: "rules", rules: ALERT_RULES_QUOTED }, { command: "rules", rules: [] }],
+    rules: [ALERT_OK, { command: "rules", rules: ALERT_RULES_BARE }, { command: "rules", rules: [] }],
     error: [ERROR_OK],
   },
   malformed: {
@@ -233,6 +239,19 @@ const alertRules: Receiver = {
       ["the rules array has holes", variant(ALERT_OK, (c) => (c.rules.length = 5))],
       ["connection is a number", variant(ALERT_OK, (c) => (c.rules[0].connection = 7))],
       ["severity is an array", variant(ALERT_OK, (c) => (c.rules[0].severity = ["critical"]))],
+      // The host types the three numerics as number. A present one is a number or the list is discarded.
+      ["min_depth is a quoted number", { command: "rules", rules: ALERT_RULES_QUOTED }],
+      ["min_depth is a word", variant(ALERT_OK, (c) => (c.rules[0].min_depth = "abc"))],
+      ["min_oldest_seconds is a boolean", variant(ALERT_OK, (c) => (c.rules[0].min_oldest_seconds = true))],
+      ["cooldown_seconds is a quoted number", variant(ALERT_OK, (c) => (c.rules[1].cooldown_seconds = "300"))],
+      // null is a value, not an absence. TOML has none, so "alert list" never prints one.
+      ["min_depth is null", variant(ALERT_OK, (c) => (c.rules[0].min_depth = null))],
+      ["min_oldest_seconds is null", variant(ALERT_OK, (c) => (c.rules[0].min_oldest_seconds = null))],
+      ["cooldown_seconds is null", variant(ALERT_OK, (c) => (c.rules[1].cooldown_seconds = null))],
+      ["transports is null", variant(ALERT_OK, (c) => (c.rules[0].transports = null))],
+      ["event_type is null", variant(ALERT_OK, (c) => (c.rules[0].event_type = null))],
+      ["connection is null", variant(ALERT_OK, (c) => (c.rules[0].connection = null))],
+      ["severity is null", variant(ALERT_OK, (c) => (c.rules[0].severity = null))],
     ],
     error: badMessages(ERROR_OK),
   },
@@ -286,6 +305,12 @@ const SCHEMA: ConnectionSchema = {
         mode: param({ choices: ["fifo", "unordered"], default: "fifo" }),
         tls: param({ type: "bool", default: false, section: "--- TLS ---" }),
         tls_key_password: param({ secret: true, help: "passphrase for the key file" }),
+        // A heading too long for a title, so its group carries the full text as `description`.
+        max_frame_bytes: param({
+          type: "int",
+          default: 1048576,
+          section: "Inbound DoS guards: bounds on what one peer may make this listener hold in memory at once",
+        }),
       },
     },
   },
@@ -345,6 +370,14 @@ const connection: Receiver = {
       ["required is a string", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].required = "yes"))],
       ["choices is a string", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].choices = "a,b"))],
       ["envKey is a number", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].envKey = 5))],
+      ["cast is a number", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].cast = 1))],
+      ["description is a number", variant(FIELDS_OK, (c) => (c.groups[0].description = 1))],
+      // FieldDescriptor.envKey and .cast, and FieldGroup.description, are `?: string`: absent or a
+      // string. buildForm() sets each only when it has one, so null is never sent.
+      ["envKey is null", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].envKey = null))],
+      ["cast is null", variant(FIELDS_OK, (c) => (c.groups[0].fields[0].cast = null))],
+      ["description is null", variant(FIELDS_OK, (c) => (c.groups[0].description = null))],
+      ["no choices", variant(FIELDS_OK, (c) => delete c.groups[0].fields[0].choices)],
     ],
   },
 };
@@ -524,6 +557,12 @@ const security: Receiver = {
       ["set is a string", variant(STATE_OK, (c) => (c.state.set = "require_mfa"))],
       ["a loosening has no risk", variant(STATE_OK, (c) => delete c.state.loosenings[0].risk)],
       ["loosenings is an object", variant(STATE_OK, (c) => (c.state.loosenings = c.state.loosenings[0]))],
+      // ShowResult.set and .loosenings are required, and "security show" always prints both. The
+      // page reads neither, and a state without one is still not the message the host declares.
+      ["no set", variant(STATE_OK, (c) => delete c.state.set)],
+      ["no loosenings", variant(STATE_OK, (c) => delete c.state.loosenings)],
+      ["set is null", variant(STATE_OK, (c) => (c.state.set = null))],
+      ["loosenings is null", variant(STATE_OK, (c) => (c.state.loosenings = null))],
       // One per FIELDS type, on values and on defaults (BACKLOG #2447). Types only, never ranges.
       ["a bool value is a string", variant(STATE_OK, (c) => (c.state.values.require_mfa = "false"))],
       ["a bool value is null", variant(STATE_OK, (c) => (c.state.values.local_access_only = null))],
@@ -646,6 +685,15 @@ const wiringMap: Receiver = {
       ["an edge's provenance is a number", variant(MAP_OK, (c) => (c.map.edges[0].provenance = 1))],
       ["edges is missing", variant(MAP_OK, (c) => delete c.map.edges)],
       ["truncated is a string", variant(MAP_OK, (c) => (c.map.truncated = "no"))],
+      // MapNode.port, .open and .stub are `?:` with no null. buildWiringMap() sets each only when it
+      // has one, so null is never sent.
+      ["a node's port is null", variant(MAP_OK, (c) => (c.map.columns[0][0].port = null))],
+      ["a node's open is null", variant(MAP_OK, (c) => (c.map.columns[0][0].open = null))],
+      ["a node's stub is null", variant(MAP_OK, (c) => (c.map.columns[0][0].stub = null))],
+      ["a node's port is a number", variant(MAP_OK, (c) => (c.map.columns[0][0].port = 6661))],
+      ["a node's stub is a string", variant(MAP_OK, (c) => (c.map.columns[0][0].stub = "yes"))],
+      // map and focus are the other way round: required, and null is declared. Absent is refused
+      // above ("no map field", "no focus field"); null renders (the second well-formed fixture).
     ],
   },
 };
@@ -676,6 +724,21 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.ok(FIELDS_OK.groups[0].fields.length > 0);
     assert.ok(FIELDS_OK.groups.flatMap((g) => g.fields).some((f) => f.envKey === "PEER_HOST"));
     assert.ok(SECURITY_SHOW.loosenings.length > 0);
+    // The really-sent controls for the optional fields: each ACCEPTS fixture must carry the field
+    // present AND absent, or a check that refused one of the two would go unseen.
+    const fields = FIELDS_OK.groups.flatMap((g) => g.fields);
+    assert.ok(fields.some((f) => typeof f.envKey === "string" && typeof f.cast === "string"));
+    assert.ok(fields.some((f) => !("envKey" in f) && !("cast" in f)));
+    assert.ok(FIELDS_OK.groups.some((g) => typeof g.description === "string"), "no group has a description");
+    assert.ok(FIELDS_OK.groups.some((g) => !("description" in g)));
+    assert.ok(fields.some((f) => f.choices === null) && fields.some((f) => Array.isArray(f.choices)));
+    const nodes: Payload[] = MAP_OK.map.columns.flat();
+    assert.ok(nodes.some((n) => typeof n.port === "string") && nodes.some((n) => !("port" in n)));
+    assert.ok(nodes.some((n) => n.open) && nodes.some((n) => !("open" in n)));
+    assert.ok(nodes.some((n) => n.stub === true) && nodes.some((n) => !("stub" in n)));
+    assert.strictEqual(typeof MAP_OK.map.columns[0][0].port, "string", "the inbound node carries a port");
+    assert.ok(ALERT_RULES.some((r) => "min_depth" in r) && ALERT_RULES.some((r) => !("min_depth" in r)));
+    assert.ok(Array.isArray(SECURITY_SHOW.set));
   });
 
   test("Security Settings: Save stays off until a state renders, and a discarded state turns it off again", () => {
@@ -719,6 +782,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       ["a tristate that is a string", (c) => (c.state.values.production_instance = SENT), "values.production_instance must be true, false or null, got string"],
       ["a tristate that is a number", (c) => (c.state.values.production_instance = 0), "values.production_instance must be true, false or null, got number"],
       ["no values object", (c) => delete c.state.values, "values is missing or is not an object"],
+      ["no set", (c) => delete c.state.set, "set is missing or is not a list of text"],
+      ["loosenings is null", (c) => (c.state.loosenings = null), "loosenings is missing or is not a list of switch and risk entries"],
       ["no state", (c) => delete c.state, "state is missing or is not an object"],
     ];
     for (const [why, change, problem] of cases) {
@@ -765,10 +830,10 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     );
     const doc = p.window.document;
     // The control: with the switch present this form renders, so the refusal below is about its absence.
-    p.deliver({ command: "state", state: { values: { [key]: true }, defaults: { [key]: true } } });
+    p.deliver({ command: "state", state: { values: { [key]: true }, defaults: { [key]: true }, set: [], loosenings: [] } });
     assert.strictEqual(doc.getElementById("save").disabled, false, "the control state did not render");
     assert.strictEqual(refusalShown(p), "", "the error element is showing before any refusal");
-    p.deliver({ command: "state", state: { values: {}, defaults: { [key]: true } } });
+    p.deliver({ command: "state", state: { values: {}, defaults: { [key]: true }, set: [], loosenings: [] } });
     const error = doc.getElementById("error");
     assert.ok(refusalShown(p).includes(`values.${key} is missing`), `shown: "${refusalShown(p)}"`);
     assert.strictEqual(error.children.length, 0, "the switch name was parsed as markup");
@@ -807,7 +872,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     for (const [why, change] of [
       ["an unknown key of another type", (c: Payload) => { c.state.values.a_future_switch = { nested: [1] }; c.state.defaults.a_future_switch = 7; }],
       ["a tristate that is set", (c: Payload) => { c.state.values.production_instance = true; }],
-      ["no set and no loosenings, which the form does not read", (c: Payload) => { delete c.state.set; delete c.state.loosenings; }],
+      ["an empty set and no loosening, which a file with no [security] table prints", (c: Payload) => { c.state.set = []; c.state.loosenings = []; }],
     ] as [string, (c: Payload) => void][]) {
       const p = security.load();
       p.deliver(variant(STATE_OK, change));

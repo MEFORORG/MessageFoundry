@@ -250,8 +250,12 @@ export const SHAPE_HELPERS = `
       for (let i = 0; i < x.length; i++) { if (f(x[i]) !== true) { return false; } }
       return true;
     }
-    // An OPTIONAL field: absent (or null) passes, present must match.
-    function mfOpt(x, f) { return x === undefined || x === null || f(x) === true; }
+    // Absent and null are declared separately, and neither is implied: null is a value, not an
+    // absence. A plain check is "neither". mfOpt is absent-ok, mfNullable is null-ok, and a field
+    // that is both says so: mfOpt(x, (v) => mfNullable(v, f)). A receiver takes its choice from the
+    // host's type for the field and from what the sender really sends.
+    function mfOpt(x, f) { return x === undefined || f(x) === true; }
+    function mfNullable(x, f) { return x === null || f(x) === true; }
     function mfShapeOk(d, key, shapes, panel) {
       const k = d[key];
       const check = typeof k === 'string' && Object.prototype.hasOwnProperty.call(shapes, k) ? shapes[k] : null;

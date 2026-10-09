@@ -246,8 +246,8 @@ export function securityEditorScript(token: string, fields: unknown): string {
     }
 
     // What is wrong with a 'state' message, or null. The state is ShowResult, the JSON "security
-    // show" prints. The two objects the form renders from are required, with every switch; the two
-    // fields it does not read are typed only when present.
+    // show" prints. All four of its fields are required: the two objects the form renders from, with
+    // every switch, and the two it does not read (set, loosenings), which the command always prints.
     function stateProblem(d) {
       const s = d.state;
       if (!mfObj(s)) { return 'state is missing or is not an object'; }
@@ -256,9 +256,9 @@ export function securityEditorScript(token: string, fields: unknown): string {
         const problem = switchProblem(s[where], where);
         if (problem !== null) { return problem; }
       }
-      if (!mfOpt(s.set, (x) => mfArrOf(x, mfStr))) { return 'set must be a list of text'; }
-      if (!mfOpt(s.loosenings, (ls) => mfArrOf(ls, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk)))) {
-        return 'loosenings must be a list of switch and risk entries';
+      if (!mfArrOf(s.set, mfStr)) { return 'set is missing or is not a list of text'; }
+      if (!mfArrOf(s.loosenings, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk))) {
+        return 'loosenings is missing or is not a list of switch and risk entries';
       }
       return null;
     }

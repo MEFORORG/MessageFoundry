@@ -192,7 +192,7 @@ export function wiringMapScript(token: string): string {
     });
 
     // The one message the host posts: WiringMapPayload (wiringMapModel.ts). map and focus are
-    // required and may be null; a node's port, open and stub are optional.
+    // required and may be null; a node's port, open and stub may be absent and are never null.
     function mfElementRef(r) { return mfObj(r) && mfStr(r.kind) && mfStr(r.name); }
     function mfMapNode(nd) {
       return mfObj(nd) && mfStr(nd.kind) && mfStr(nd.name) && mfInt(nd.row) && mfBool(nd.dynamic) &&
@@ -204,10 +204,10 @@ export function wiringMapScript(token: string): string {
         mfStr(e.provenance);
     }
     const SHAPES = {
-      map: (m) => mfArrOf(m.names, mfElementRef) && (m.focus === null || mfElementRef(m.focus)) &&
-        (m.map === null || (mfObj(m.map) && mfBool(m.map.truncated) && mfBool(m.map.focusMissing) &&
-          Array.isArray(m.map.columns) && m.map.columns.length === 4 &&
-          mfArrOf(m.map.columns, (c) => mfArrOf(c, mfMapNode)) && mfArrOf(m.map.edges, mfMapEdge))),
+      map: (m) => mfArrOf(m.names, mfElementRef) && mfNullable(m.focus, mfElementRef) &&
+        mfNullable(m.map, (w) => mfObj(w) && mfBool(w.truncated) && mfBool(w.focusMissing) &&
+          Array.isArray(w.columns) && w.columns.length === 4 &&
+          mfArrOf(w.columns, (c) => mfArrOf(c, mfMapNode)) && mfArrOf(w.edges, mfMapEdge)),
     };
     ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (ev) => {
