@@ -178,7 +178,7 @@ draw it. The line is narrower than the passage, which also accepts a decision ke
 
 **What this ruling does not decide.** It leaves at least these alone:
 
-- It applies to requirements that ask about documentation. It does not change what counts as
+- It applies to requirements that ask what the documentation defines. It does not change what counts as
   evidence that a control exists: code and tests remain evidence (§3).
 - It names which text may be counted. Rules 1 to 6 still grade the cell, and the ruling does not say
   which verdict follows when no text counts.
@@ -188,7 +188,7 @@ draw it. The line is narrower than the passage, which also accepts a decision ke
 
 The ruling was given in session on 2026-10-08, after adversarial review. It is recorded on a pull
 request in the `MessageFoundry-vault` repository, and a rulings file there is pending. As in
-§1.1a, this document records the rule and not the cells it moves.
+§1.1a, this document names no cell the ruling touches.
 
 ### 1.2 Worked examples — the ones that actually broke
 
@@ -487,7 +487,8 @@ At least these passes leave both stamps alone:
   carries the other grounds forward unread. It records its own date and engine commit inside its own
   dated layer, which is the dated entry the pass adds to the cell's prose. The ruling lets it move
   `reviewed_by` if it set or re-derived the verdict. A `reviewed_by` date can then be later than
-  `last_verified`, and that is not an error.
+  `last_verified`, and that is not an error. It tells a reader that a partial re-read set the
+  verdict after the last full read.
 - **A pass that only repairs anchors or refreshes line numbers moves neither stamp.**
 
 **Why the stamps are held to the whole cell.** At least two things already treat them that way:
