@@ -299,8 +299,8 @@ in-flight rows stranded.
 > the outbounds an activation would start, as it judges the listeners one would bind.
 >
 > **The release (owner ruling 2026-10-08).** The drain runs as before. When it ends, the release parks
-> every outbound, without waiting for a reload, and closes their connectors. The park does not cut off a
-> row in flight; a send the close interrupts is retried after the next activation. This supersedes two
+> every outbound, without waiting for a reload, and closes the connector of each lane once it is idle. The
+> park does not cut off a row in flight. This supersedes two
 > sentences above: Decision 3's *"A lane the engine parked then comes up"*, and the #3140 amendment's
 > restatement of it. A released box cannot tell a row it accepted while active from a row the seed
 > carried, and the primary is back by then, so that reload was the same defect by another route. Rows left
@@ -317,7 +317,11 @@ in-flight rows stranded.
 >   broadcast would re-arm it and it would deliver on a passive box. The activation's reload then re-arms
 >   it, as a reload re-arms such a STOP on any box. An operator's pause is different: it survives.
 > - A lane a reload dropped while it still had work is parked too, keeps its connector, and goes back to
->   draining on the first reload after the box stops being passive.
+>   draining on the first reload after the box stops being passive. A lane dropped while it was parked has
+>   no connector, so it stays parked, and the next engine start dead-letters its rows for a destination the
+>   graph no longer has.
+> - An `auto_start = false` lane an operator had started takes its gate's answer after the park, as
+>   Decision 3 already says of one started before DR.
 >
 > A reload that is refused or rolled back on a passive box leaves every marker as it was.
 >

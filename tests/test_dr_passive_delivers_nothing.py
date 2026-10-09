@@ -375,3 +375,96 @@ async def test_a_dropped_lane_still_draining_is_held_while_passive_and_drains_on
     finally:
         await runner.stop()
         await store.close()
+
+
+def _one_outbound_graph(tmp_path: Path, **settings: object) -> Registry:
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB_X", MLLP(port=_free_ports(1)[0]), router="r"))
+    spec = ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "OB_X"), **settings})
+    reg.add_outbound(build_outbound_connection("OB_X", spec))
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB_X", m))
+    return reg
+
+
+async def test_an_activation_on_a_shard_that_does_not_own_a_lane_leaves_it_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Engine shards share one store, and each parks every outbound while passive. Only the
+    owning shard may arm a lane again (ADR 0073). Red before the repair: the activation's unpark
+    resumed the lane on this shard's dispatcher, which claimed and sent the held row."""
+    store = await MessageStore.open(tmp_path / "shard.db")
+    runner = RegistryRunner(
+        _one_outbound_graph(tmp_path),
+        store,
+        poll_interval=0.02,
+        dr_standby=Priority.NORMAL,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
+    )
+    owned = True
+    monkeypatch.setattr(runner, "_owns_destination", lambda name: owned)
+    await runner.start()
+    try:
+        owned = False  # another engine shard owns OB_X from here on
+        await store.enqueue_message(
+            channel_id="IB_X", raw=_adt("X1"), deliveries=[("OB_X", _adt("X1"))]
+        )
+        runner.set_dr_threshold(Priority.NORMAL, standby=None)  # the activation
+        await runner.reload()
+        collected = _CollectingDestination()
+        runner._destinations["OB_X"] = collected  # type: ignore[assignment]
+        runner.notify_work()
+        await asyncio.sleep(_SETTLE_SECONDS)
+        assert collected.sent == []
+        assert (await store.pending_depth("OB_X"))[0] == 1
+
+        owned = True  # control: the owner's reload does arm it, so the probe above can fire
+        runner.set_dr_threshold(None, standby=Priority.NORMAL)
+        runner.set_dr_threshold(Priority.NORMAL, standby=None)
+        await runner.reload()
+        runner._destinations["OB_X"] = collected  # type: ignore[assignment]
+        runner.notify_work()
+        await _wait_until(lambda: len(collected.sent) == 1)
+    finally:
+        await runner.stop()
+        await store.close()
+
+
+async def test_a_release_charges_no_attempt_to_a_row_its_lane_had_claimed(tmp_path: Path) -> None:
+    """A paced lane holds a claimed row while it waits out its interval. Red before the repair:
+    the release closed the connector under it, and the row was charged a failed attempt for a
+    park. The release now waits for the lane to go idle first."""
+    store = await MessageStore.open(tmp_path / "paced.db")
+    runner = RegistryRunner(
+        _one_outbound_graph(tmp_path, send_min_interval_seconds=0.6),
+        store,
+        poll_interval=0.02,
+        dr_threshold=Priority.NORMAL,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    try:
+        ids = [
+            await store.enqueue_message(
+                channel_id="IB_X", raw=_adt(cid), deliveries=[("OB_X", _adt(cid))]
+            )
+            for cid in ("P1", "P2")
+        ]
+        runner.notify_work()
+
+        async def first_sent() -> bool:
+            (row,) = await store.outbox_for(ids[0])
+            return bool(row["status"] == "done")
+
+        await _until(first_sent)
+        await asyncio.sleep(0.1)  # the second row is claimed and waiting out the interval
+        runner.set_dr_threshold(None, standby=Priority.NORMAL)  # the release's flip to passive
+        await runner.close_passive_connectors()
+        await asyncio.sleep(1.0)  # past the interval, so the claimed row has resolved
+        (second,) = await store.outbox_for(ids[1])
+        assert (second["status"], second["last_error"]) == ("done", None)  # sent, never failed
+    finally:
+        await runner.stop()
+        await store.close()

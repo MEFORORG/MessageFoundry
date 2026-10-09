@@ -359,6 +359,10 @@ class NotDeployedError(RuntimeError):
         self.name = name
 
 
+#: How long a release waits for the lanes it parked to quiesce before it closes their connectors
+#: (:meth:`RegistryRunner.close_passive_connectors`).
+_PASSIVE_QUIESCE_WAIT_SECONDS = 5.0
+
 #: How a passive standby's ``filtered`` reason starts. :meth:`RegistryRunner._refuse_dr_parked`
 #: reads it back to say which call lifts the park.
 _DR_PASSIVE_REASON = "DR standby is passive"
@@ -2681,14 +2685,35 @@ class RegistryRunner:
         """Close the connector of every outbound a passive standby parks (vault BACKLOG #3262).
         The engine calls it when a release has made the box passive, so the released box holds
         no session open to a partner the primary must reach. A lane the next activation starts
-        builds a new one. A row still in flight on a lane fails that send and is retried, as
-        when a reload replaces a connector. A lane a reload dropped keeps its connector: the
-        graph no longer says how to build one, and the lane must drain after an activation."""
+        builds a new one. A lane a reload dropped keeps its connector: the graph no longer says
+        how to build one, and the lane must drain after an activation.
+
+        Only a quiesced lane's connector is closed. A row its lane had already claimed looks the
+        connector up when it is sent, and one that found none was charged a failed attempt for a
+        park. So this waits a bounded time for the parked lanes to quiesce, and leaves a lane
+        that is still busy its connector, for the next reload to close."""
+
+        def closable() -> list[str]:
+            declared = self.registry.outbound
+            return [n for n in self._destinations if n in declared and self._dr_parked(n)]
+
+        deadline = time.monotonic() + _PASSIVE_QUIESCE_WAIT_SECONDS
+        while time.monotonic() < deadline and self._dr_passive:
+            if all(self.outbound_quiesced(n) for n in closable()):
+                break
+            if await self._stop_or_sleep(_BATCH_POLL_SECONDS):
+                return
         async with self._reload_lock:
             if not self._dr_passive:
                 return
-            declared = self.registry.outbound
-            for name in [n for n in self._destinations if n in declared and self._dr_parked(n)]:
+            for name in closable():
+                if not self.outbound_quiesced(name):
+                    log.info(
+                        "DR release: outbound %r still has a row in flight; its connector stays "
+                        "open until the next reload",
+                        name,
+                    )
+                    continue
                 await self._aclose_quietly(self._destinations.pop(name), name)
 
     def _restore_dr_markers(self, cleared: dict[tuple[Direction, str], str] | None) -> None:
@@ -3244,7 +3269,12 @@ class RegistryRunner:
             ev.clear()
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
-            if d is not None:
+            # Only the owning engine shard arms a lane (ADR 0073). A park registers the lane
+            # PAUSED on every shard's dispatcher, and a resume makes it READY with no ownership
+            # test of its own, so a non-owner that resumed it would claim beside the owner. A
+            # passive standby parks every lane, which made that every lane at an activation
+            # (vault BACKLOG #3262).
+            if d is not None and self._owns_destination(name):
                 self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             self._outbound_resume.setdefault(name, asyncio.Event()).set()
@@ -6173,7 +6203,10 @@ class RegistryRunner:
         if not self._dr_passive and not self._delivery_halted:
             # One the passive park held goes back to draining (vault BACKLOG #3262). It was
             # running when the box went passive, and the loop above never reads it. Its
-            # connector is the test: every other engine park of a lane drops the connector.
+            # connector is the test. A dropped lane with none has nothing to deliver through
+            # and no spec to build one from, so it stays parked, as a dropped lane an
+            # auto_start gate parked does: its rows are held, and the next engine start
+            # dead-letters them for a destination the graph no longer has.
             for name in [
                 n for n in self._gate_parked if n not in new.outbound and n in self._destinations
             ]:
