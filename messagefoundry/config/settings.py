@@ -26,7 +26,7 @@ documented ``MEFOR_*`` variables are read straight from ``os.environ`` by their 
 and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED``
 and siblings); those are spared by name. A variable whose SECTION part matches no section with
 an env layer is refused when it names a modelled section. When it names none it is not applied:
-:func:`_unread_env_notes` logs a WARNING for at least some such names, and the rest are dropped
+:func:`load_settings` logs a WARNING for at least some such names, and the rest are dropped
 with no message. The ``cli`` mapping is not checked: its keys are engine-written
 from parsed arguments, never operator-spelled, and an operator's unknown flag never reaches them,
 because argparse refuses it first with exit 2. ``[security]`` has its own refusal from env (the
@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, get_args, get_origin
+from typing import Any, Literal, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -7173,9 +7173,9 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
 
     * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, a harness
       variable, another tool's). So a typo in the SECTION part of a name is not refused.
-      :func:`_unread_env_notes` warns about at least some of those, and the rest are dropped
-      with no message;
-    * one with no key part, which the same function warns about when it is a section's name;
+      :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
+      for at least some of those, and the rest are dropped with no message;
+    * one with no key part, which gets the same note when it is a section's name;
     * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;
     * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message, and the
       renamed ``[logging]`` keys in :data:`_RENAMED_LOGGING_KEYS`, which the model refuses naming
@@ -7234,21 +7234,27 @@ def _unspared_env_names(
             yield name, name[len(_ENV_PREFIX) :].lower()
 
 
-def _holds_model(annotation: Any) -> bool:
-    """Whether ``annotation`` is a settings model or has one inside it (``list[AlertRule]``,
-    ``SubTable | None``)."""
-    base = get_origin(annotation) or annotation
-    if isinstance(base, type) and issubclass(base, BaseModel):
-        return True
-    return any(_holds_model(arg) for arg in get_args(annotation))
+#: Pydantic error types that mean one string can never be the field's shape.
+_SHAPE_ERRORS = frozenset(
+    {"list_type", "dict_type", "tuple_type", "set_type", "frozen_set_type", "model_type"}
+)
 
 
-def _env_can_hold(field: Any) -> bool:
-    """Whether the one string the env layer gives ``field`` can validate. Not when the field is or
-    holds a model: a sub-table (``[cluster].vip``) or a list of tables (``[alerts].rules``). A hint
-    naming such a field would point at a variable that fails the load. A list of strings stays
-    a hint: several are filled from one comma-separated string (``[alerts].email_to``)."""
-    return not _holds_model(field.annotation)
+def _env_can_hold(model: type[BaseModel], key: str) -> bool:
+    """Whether one string, all the env layer gives a field, can have ``model``'s ``key`` shape.
+
+    PROBED, not read off the annotation: a field's ``mode="before"`` validator decides, and some
+    split one comma-separated string into a list (``[alerts].email_to``) while other lists, and
+    every dict and sub-table, have no string form (``[approvals].operations``,
+    ``[cluster].vip``). A hint naming such a field would point at a variable that fails the load.
+    Only a shape error at ``key`` says no; a bad value or a cross-field check is not about shape."""
+    try:
+        model.model_validate({key: "x"})
+    except ValidationError as exc:
+        return not any(
+            err["loc"][:1] == (key,) and err["type"] in _SHAPE_ERRORS for err in exc.errors()
+        )
+    return True
 
 
 def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
@@ -7309,7 +7315,7 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
             # :func:`_near_env_name` knows, so it is no hint either.
             is_field = field is not None and (near[0], key) not in gone
             if near[0] in _SECTIONS and (
-                (is_field and _env_can_hold(field)) or meant in _OUT_OF_BAND_ENV
+                (is_field and _env_can_hold(models[near[0]], key)) or meant in _OUT_OF_BAND_ENV
             ):
                 hint = f"{meant}?"
             elif near[0] not in _SECTIONS and is_field:

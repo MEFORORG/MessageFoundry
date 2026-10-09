@@ -195,8 +195,13 @@ def test_a_name_that_looks_like_an_unread_setting_is_warned_about(name: str, hin
         # Near [cluster], and vip is a sub-table there. MEFOR_CLUSTER_VIP would fail validation,
         # so it is not offered.
         "MEFOR_CLUSTR_VIP",
-        # Near [alerts], and rules is a list of tables: one string cannot fill it.
+        # Near a section, and the key has no one-string form: a list of tables, a list with no
+        # comma splitter, a dict. The hinted variable would fail the load on its shape.
         "MEFOR_ALERT_RULES",
+        "MEFOR_APPROVAL_OPERATIONS",
+        "MEFOR_AIS_ALLOWED_ENDPOINTS",
+        "MEFOR_APIS_TLS_CLIENT_CERT_IDENTITIES",
+        "MEFOR_SECURTY_STATIC_CREDENTIAL_ACCEPTED",
         # Near [auth] and [api], and each key moved to [security]: that spelling is refused.
         "MEFOR_AUHT_REQUIRE_MFA",
         "MEFOR_APII_HOST",
