@@ -729,12 +729,19 @@ async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isol
         runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
         await runner.reload()
         assert runner.outbound_filtered(_OB_CA) is None
-        # Still shown: the passive start's record was dropped here once, and the lane read stopped.
-        assert _PASSIVE_REFUSED in (runner.outbound_failed(_OB_CA) or "")
+        # Still shown as failed, in words that fit an active box, and not yet a failed build: the
+        # halt kept the build from running. Red when the passive start's record stood unchanged:
+        # it asked for an activation that had run, and the lane read as failed at its build, so
+        # the scheduler and an alert rule's restart passed it over and it paged during the halt.
+        held = runner.outbound_failed(_OB_CA) or ""
+        assert "passive start" in held and "POST /dr/activate needs it" not in held
+        assert not runner.outbound_dr_failed(_OB_CA)
 
         guard.writable = True  # the disk is repaired
         await runner.reload()  # raised WiringError before
-        assert "its tls_ca_file was refused" in (runner.outbound_failed(_OB_CA) or "")
+        built = runner.outbound_failed(_OB_CA) or ""
+        assert "its tls_ca_file was refused" in built and "passive" not in built
+        assert runner.outbound_dr_failed(_OB_CA)
         await runner.start_outbound(_OB_CA)
         await asyncio.sleep(0.3)
         assert await _ca_row(store, row_id) == ("pending", 0)
