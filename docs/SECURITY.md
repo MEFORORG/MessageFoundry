@@ -653,20 +653,18 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   callback is floored only sometimes*, above, gives the rule. So a client could avoid the floor by
   authenticating at the IdP before the flow starts, by script or by hand. It cannot forge the
   verified `auth_time`, but it chooses when that sign-on happens. One sign-on could then serve
-  unfloored sign-ins until `[auth].oidc_max_age_seconds` runs out. The engine has no human step to
-  time between such a start and its callback, and it cannot check the IdP's own anti-automation.
-  This was decided on 2026-10-09 as a limitation of the floors (BACKLOG #1115), and the owner can
-  overturn it. It still counts as a gap. A site that turns OIDC on would have it from the first
-  sign-in. What would still limit that path is a rate, which does not detect automation either.
-  While `[auth].login_rate_limit_enabled` is on, both legs charge the sign-in window, in each engine
-  process; the route to limiter map under [Brute-force & abuse
-  protection](#brute-force--abuse-protection) gives its size and conditions. A site can also set
-  `[auth].oidc_prompt = "login"`. An IdP that honours it re-authenticates inside every flow, so the
-  floor would apply to every sign-in, at the cost of single sign-on. Revisit the decision if OIDC
-  ever ships on by default. One human step does sit before the start: the confirm on the "you are
-  leaving this site" page, shown by default unless the IdP's host is inside
-  `[security].organization_domains` or on `[security].external_link_allowlist`. Nothing times that confirm today, and the page holds no state
-  to time it with.
+  unfloored sign-ins for as long as `[auth].oidc_max_age_seconds` accepts it, and a fresh sign-on
+  starts that again. The engine has no human step to time between such a start and its callback,
+  and it cannot check the IdP's own anti-automation. The owner did not rule on this. A delegated
+  review decided on 2026-10-09 to record it as a limitation of the floors (BACKLOG #1115), and the
+  owner can overturn that. It still counts as a gap. A site that turns OIDC on would have it from
+  the first sign-in. What would still limit that path is a rate, which does not detect automation
+  either. While `[auth].login_rate_limit_enabled` is on, both legs charge the sign-in window, in
+  each engine process. With it off, that rate is gone. The route to limiter map under [Brute-force
+  & abuse protection](#brute-force--abuse-protection) gives the window's size and conditions. It
+  also says when the "you are leaving this site" confirm is shown before the start. That confirm is
+  no control on this path: a script can post the start without loading the page, and nothing times
+  the confirm. Revisit the decision if OIDC ever ships on by default.
 - The MFA floor compares two wall-clock readings, as the approval dwell does. A clock step backward
   refuses a good code until the clocks agree again. A step forward lets a code through early.
 - The response hides the reason, but the audit row names it. The account holder's own security
