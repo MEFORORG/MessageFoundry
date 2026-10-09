@@ -2435,6 +2435,7 @@ def _typed_only_refusal(op: str, line_start: int, line_end: int, why: str) -> Le
 
 
 _UNTYPED = "it would move or remove code the Steps view does not show as typed steps"
+_TOO_DEEP = "its blocks are nested too deeply to check"
 _NEVER_RUNS = (
     "it would leave a row that never runs, or that runs less surely than it did, below a return, "
     "raise, break or continue, or below a block that may not fall through"
@@ -3027,9 +3028,10 @@ def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True, level: int = _DEAD)
     ``level`` says how sure the answer must be, and it matters for a ``with`` only, because a
     context manager may swallow an exception and let control fall through:
 
-    * ``_DEAD``, surely terminal: one context manager, and a first body statement that is a
-      ``break``, a ``continue``, or a ``return`` of nothing, a constant or a name. Nothing there
-      can raise inside the ``with``;
+    * ``_DEAD``, surely terminal: one context manager, with no ``as`` target or a plain name,
+      and a first body statement that is a ``break``, a ``continue``, or a ``return`` of nothing,
+      a constant or a name. Nothing there can raise inside the ``with``. Any other target can:
+      binding it unpacks, or sets an attribute or an item;
     * ``_COUNTED_DEAD``, counted as terminal: the first body statement is a ``return``, ``break``
       or ``continue``, or another such ``with``. Working out the returned value, or entering an
       inner manager, could still raise;
@@ -3046,14 +3048,25 @@ def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True, level: int = _DEAD)
         return _ends(stmts, raise_ends=raise_ends, level=level)
 
     if isinstance(stmt, ast.If):
-        return ends(stmt.body) and ends(stmt.orelse)
+        # An ``elif`` is an ``if`` alone in the ``else``. The chain is walked in a loop, so a long
+        # one costs no stack: a call per arm hit the depth wall near 250 arms.
+        arm = stmt
+        while ends(arm.body):
+            if len(arm.orelse) != 1 or not isinstance(arm.orelse[0], ast.If):
+                return ends(arm.orelse)
+            arm = arm.orelse[0]
+        return False
     if isinstance(stmt, ast.With | ast.AsyncWith):
         first = stmt.body[0]
         if level <= _MAYBE_DEAD:
             return _ends(stmt.body, raise_ends=False, level=level)
         if level == _COUNTED_DEAD and isinstance(first, ast.With | ast.AsyncWith):
             return _is_terminal(first, level=level)
-        if level == _DEAD and (len(stmt.items) > 1 or not _returns_without_raising(first)):
+        if level == _DEAD and not (
+            len(stmt.items) == 1
+            and isinstance(stmt.items[0].optional_vars, ast.Name | None)
+            and _returns_without_raising(first)
+        ):
             return False
         return isinstance(first, ast.Return | ast.Break | ast.Continue)
     if isinstance(stmt, ast.Try | ast.TryStar):
@@ -3597,19 +3610,23 @@ def rewrite_source(
                 tree, after_tree, row, role, f"{op} at lines {line_start}-{line_end}"
             )
         if typed_only:
-            _refuse_typed_only_result(
-                tree,
-                handler_node,
-                after_tree,
-                src,
-                result,
-                row,
-                role,
-                edit,
-                op,
-                line_start,
-                line_end,
-            )
+            try:
+                _refuse_typed_only_result(
+                    tree,
+                    handler_node,
+                    after_tree,
+                    src,
+                    result,
+                    row,
+                    role,
+                    edit,
+                    op,
+                    line_start,
+                    line_end,
+                )
+            except RecursionError:
+                # A check that cannot finish refuses the edit; it never crashes the rewrite.
+                raise _typed_only_refusal(op, line_start, line_end, _TOO_DEEP) from None
     return ("\ufeff" + result) if bom else result
 
 

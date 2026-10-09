@@ -1408,16 +1408,20 @@ invariant rather than a property of the moved row):
    - it is counted as never running: it sits below a `with` whose first body statement is a
      `return`, `break` or `continue`, or another such `with`. Working out the returned value, or
      entering an inner manager, could still raise, so the row could run;
-   - it surely never runs. For a `with`, that needs one context manager and a first body
-     statement that is a `break`, a `continue`, or a `return` of nothing, a constant or a name.
+   - it surely never runs. For a `with`, that needs one context manager, with no `as` target or
+     a plain name, and a first body statement that is a `break`, a `continue`, or a `return` of
+     nothing, a constant or a name. Any other target can raise inside the `with` when it is
+     bound: a tuple unpacks, and an attribute or an item is set (repair of 2026-10-09, after the
+     Lander's fifth review).
 
    A row inside a block takes the block's level, and two suites are deader than their block: a
    `try`'s `else` runs only when the body reaches its end, and the `else` of a `while True:`
    never runs. A row the edit kept, moved or rewrote is refused when its level gets worse by any
    step. Only a row that surely never ran is exempt, wherever a move puts it. A row the edit
    wrote is refused at the last two levels. A row written where it might not run is accepted,
-   since it is as live as the rows already there (same repair; the levels are the Builder's
-   reading of that review and of its own code review, and a Manager has not yet confirmed them).
+   since it is as live as the rows already there (same repair). The levels were confirmed by the
+   Manager holding the PR on 2026-10-09: a kept row is refused when its level gets worse, and a
+   written row is accepted at "might not run" and refused at "counted dead" and "surely dead".
    The default mode applies none of this rule (Manager decision 2026-10-08; AC-G7).
 
 A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
@@ -1574,6 +1578,13 @@ is closed for the cases its tests pin:
     cannot move below a `return`;
   - only a `with` separates the levels. A `return` of a constant or a name is taken not to raise,
     and a `try` whose handlers all end is taken to end;
+  - the lens does not know which context managers swallow exceptions, so it treats every one as
+    if it might. Take `with LOCK:` whose body is a statement and then `return Send(...)`, where
+    `LOCK` swallows nothing. A row below it never runs. The lens rates that place "might not
+    run", so an inserted row or a send template there is accepted and never runs. That is the
+    levels rule working as stated, and it is a recorded limit;
+  - a check that runs out of stack on deeply nested blocks refuses the edit in typed-only mode.
+    A long `elif` chain is walked in a loop and is not such a case; a 300-arm chain is pinned;
   - a `return` moved below another `return` of the same text is refused as itself, because it ran
     and would not. Moving the rows between them up gives the same text and is accepted;
   - row identity is exact for a `set_params`, a delete, a move and an insert at its anchor row.

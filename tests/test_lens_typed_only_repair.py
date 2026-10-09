@@ -2156,3 +2156,96 @@ def test_rule_8_a_row_that_never_ran_may_move_where_it_never_runs() -> None:
     )
     out = rewrite_source(inner_dead, _edit("move_row", 3, direction="down"), typed_only=True)
     assert out.index('msg.set("B", "2")') < out.index('msg.set("D", "4")')
+
+
+# --- Lander review 5 of PR 2201: a ``with`` target that can raise, and a deep chain -------------
+
+_TARGET = """@handler("H")
+def h(msg):
+    with {items}:
+        return None
+    if msg.field("PID-3"):
+        return []
+    msg.set("B", "2")
+"""
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        "suppress(Exception) as (a, b)",
+        "suppress(Exception) as msg.x",
+        "suppress(Exception) as d[k()]",
+        "suppress(Exception), lock as (a, b)",
+        "suppress(Exception) as [a, *b]",
+    ],
+    ids=["tuple", "attribute", "subscript", "second-item", "starred-list"],
+)
+def test_rule_8_a_with_target_that_can_raise_is_not_surely_dead(items: str) -> None:
+    # Binding the target runs inside the ``with``: unpacking, ``__setattr__`` or ``__setitem__``
+    # may raise, and the manager may swallow it. So the row below may run and is not exempt.
+    src = _TARGET.format(items=items)
+    body = src.split("def h(msg):\n")[1].replace('msg.set("B", "2")', "f()")
+    assert _level(body) == lens._COUNTED_DEAD
+    move = _edit("move_row", 7, to_line_start=6, to_position="after")
+    assert rewrite_source(src, move) != src  # the default mode applies no rule 8
+    _refused(src, move, match=NEVER_RUNS, typed_only=True)
+
+
+@pytest.mark.parametrize(
+    "items", ["lock", "lock as held", "open(p) as fh"], ids=["none", "name", "call-name"]
+)
+def test_rule_8_control_a_with_of_no_target_or_a_name_is_still_surely_dead(items: str) -> None:
+    # Control: binding a plain name cannot raise, so the row below surely never ran and is
+    # exempt, as before. It may move within the dead code.
+    src = _TARGET.format(items=items)
+    body = src.split("def h(msg):\n")[1].replace('msg.set("B", "2")', "f()")
+    assert _level(body) == lens._DEAD
+    move = _edit("move_row", 7, to_line_start=6, to_position="after")
+    assert rewrite_source(src, move, typed_only=True) == rewrite_source(src, move) != src
+
+
+def _chain(arms: int) -> str:
+    """A handler that is one ``if`` of ``arms`` arms, each ending in a return, then one row."""
+    lines = ['@handler("H")', "def h(msg):"]
+    for i in range(arms):
+        lines.append(f'    {"if" if i == 0 else "elif"} msg.field("PID-3") == "{i}":')
+        lines.append(f'        msg.set("A", "{i}")')
+        lines.append("        return []")
+    lines.append('    msg.set("B", "2")')
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize("arms", [3, 300], ids=["short", "long"])
+def test_typed_only_edit_on_a_long_elif_chain_never_crashes(arms: int) -> None:
+    # An ``elif`` chain nests one ``if`` per arm. The rule 8 walk took a call per arm that ends,
+    # and at 300 arms it raised RecursionError in typed-only mode only. Every edit here is one
+    # both modes accept, and the short chain is the control.
+    src = _chain(arms)
+    last = len(src.splitlines())
+    edits = [
+        _edit("set_params", last, params={"value": "9"}),
+        _edit("insert_row", last, position="before", **_SET_PID8),
+        _edit("insert_row", 4, position="before", **_SET_PID8),
+        _edit("delete_row", 4),
+        _edit("move_row", last, to_line_start=3, to_position="before"),
+    ]
+    for edit in edits:
+        out = rewrite_source(src, edit, typed_only=True)
+        assert out == rewrite_source(src, edit) != src
+    # Below an arm's return a row never runs, and the long chain refuses that as the short does.
+    _refused(src, _edit("insert_row", 5, **_SET_PID8), match=NEVER_RUNS, typed_only=True)
+
+
+def test_a_typed_only_check_that_runs_out_of_stack_refuses_the_edit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The backstop for nesting no loop removes: the check gives up, and the edit is refused.
+    def too_deep(*_: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    edit = _edit("set_params", 6, params={"value": "9"})
+    expected = rewrite_source(_TERMINAL, edit, typed_only=True)
+    monkeypatch.setattr(lens, "_reachability", too_deep)
+    assert rewrite_source(_TERMINAL, edit) == expected  # the default mode runs no such check
+    _refused(_TERMINAL, edit, match="nested too deeply", typed_only=True)
