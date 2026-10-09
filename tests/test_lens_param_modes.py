@@ -309,24 +309,24 @@ def test_param_modes_is_total_over_params(name: str, source: str) -> None:
 
 
 def test_the_corpus_actually_carries_rows_of_every_emission_site() -> None:
-    """POSITIVE CONTROL ON THE CORPUS, and it is the reason the samples leg is not the evidence.
+    """POSITIVE CONTROL ON THE CORPUS: the samples leg is evidence only while it carries param rows.
 
-    MEASURED 2026-09-15: `samples/config` produces 28 rows at CONTRACT_V1 and 67 at CONTRACT_V2, and
-    NOT ONE of them carries `params` -- the shipped samples use native `msg[...]` assignment and
-    helper calls the vocabulary does not name, so the corpus contains no action, diagnostic or lookup
-    row. A corpus-wide AC-M1/AC-M2 test over `samples/config` alone therefore passes over an empty
-    set, which is indistinguishable from a correct implementation.
+    MEASURED 2026-09-15: `samples/config` produced 28 rows at CONTRACT_V1 and 67 at CONTRACT_V2, and
+    NOT ONE of them carried `params`, so the samples leg of AC-M1/AC-M2 passed over an empty set.
+    The typed-Steps sample (`IB_STEPS_ORU_handler.py`, 2026-10-07) is written in the vocabulary, so
+    the samples now carry action, diagnostic and lookup rows and that leg tests something. If this
+    goes red, the samples leg has gone vacuous again; `VOCAB_CORPUS` below still covers the shapes.
     """
-    samples_with_params = [
-        row
+    sample_kinds = {
+        row["kind"]
         for name, source in CORPUS
         if name != "adversarial"
         for row in _rows(source, contract=CONTRACT_V2, module=name)
         if "params" in row
-    ]
-    assert not samples_with_params, (
-        "samples/config now carries param rows -- the vacuity note above is stale, and the corpus "
-        "leg has become real evidence rather than a tripwire"
+    }
+    assert {"action", "diagnostic", "lookup"} <= sample_kinds, (
+        f"samples/config carries param rows of kinds {sorted(sample_kinds)} only -- the corpus leg "
+        "of AC-M1/AC-M2 is vacuous for the missing kinds"
     )
     kinds = [r["kind"] for r in _rows(VOCAB_CORPUS, contract=CONTRACT_V2) if "params" in r]
     assert kinds.count("action") >= 2, "need both a wrapper and a native action row"

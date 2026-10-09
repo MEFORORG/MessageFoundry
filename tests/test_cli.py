@@ -112,6 +112,7 @@ def test_graph_of_sample(capsys: pytest.CaptureFixture[str]) -> None:
         "fhir_router",
         "sr_router",
         "demo_oru_router",  # per-feed "Hybrid" layout demo (IB_DEMO_ORU_router.py)
+        "steps_oru_router",  # typed-Steps example (IB_STEPS_ORU_router.py)
         "stream_mdm_router",  # #149 streaming: MDM-with-embedded-PDF pass-through (IB_STREAM_MDM.py)
         "pdf_mdm_router",  # #149 streaming: PDF-file → base64 → MDM build (IB_PDF_TO_MDM.py)
     }
@@ -126,6 +127,7 @@ def test_graph_of_sample(capsys: pytest.CaptureFixture[str]) -> None:
         "fhir_handler",
         "sr_to_oru",
         "demo_oru_relay",  # per-feed "Hybrid" layout demo (IB_DEMO_ORU_handler.py)
+        "steps_oru_handler",  # typed-Steps example (IB_STEPS_ORU_handler.py)
         "stream_mdm_handler",  # #149 streaming (IB_STREAM_MDM.py)
         "pdf_mdm_handler",  # #149 streaming (IB_PDF_TO_MDM.py)
     }
