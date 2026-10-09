@@ -160,7 +160,7 @@ def test_only_client_ip_reads_the_client_address() -> None:
         ),
         pytest.param(
             "messagefoundry/api/client_networks.py",
-            "host = client_ip(HTTPConnection(scope))",
+            "host = client_ip(StarletteConnection(scope))",
             "host = scope.get('client')",
             1,
             id="network-gate",

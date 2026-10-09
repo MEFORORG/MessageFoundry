@@ -45,7 +45,9 @@ import logging
 import time
 from typing import Any
 
-from starlette.requests import HTTPConnection
+# Aliased: tests/test_reply_framing.py::test_no_engine_module_builds_a_stock_opener finds calls by
+# NAME, and a bare ``HTTPConnection(...)`` call here reads to it as ``http.client``'s class.
+from starlette.requests import HTTPConnection as StarletteConnection
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -184,8 +186,8 @@ class ClientNetworkMiddleware:
             return
 
         # Through client_ip, the one client-address extractor (BACKLOG #2289; its docstring lists
-        # who else reads it). HTTPConnection is the base of Request and WebSocket.
-        host = client_ip(HTTPConnection(scope))
+        # who else reads it). starlette's HTTPConnection is the base of Request and WebSocket.
+        host = client_ip(StarletteConnection(scope))
         _record_observation(state, host)
         if client_network_allowed(host, networks):
             await self.app(scope, receive, send)
