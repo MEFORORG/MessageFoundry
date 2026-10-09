@@ -322,15 +322,22 @@ def test_the_frame_deadline_ships_on_and_refuses_a_negative(kind: str) -> None:
 @pytest.mark.parametrize("kind", ["tcp", "x12"])
 async def test_a_pipelined_sender_is_not_cut_off_by_the_frame_deadline(kind: str) -> None:
     """The clock restarts for each frame, so a feed that runs longer than the deadline in total,
-    one complete frame at a time, is never dropped."""
+    one complete frame at a time, is never dropped.
+
+    The sender and the listener share one event loop, and the deadline is many gaps long, so only
+    a loop stall longer than ``deadline - gap`` can cut the feed. Sleeps only run long, so the
+    whole feed always outlasts the deadline, and a clock that never restarted would cut it.
+    """
     events = _Events()
     received: list[bytes] = []
+    deadline, gap, writes = 2.0, 0.1, 23
+    assert writes * gap > deadline  # the feed must outlast the deadline in total
 
     async def handler(raw: bytes) -> str | None:
         received.append(raw)
         return None
 
-    source = _build(kind, max_frame_seconds=0.4, receive_timeout=5.0)
+    source = _build(kind, max_frame_seconds=deadline, receive_timeout=5.0)
     source.on_connection_event = events
     frame = _whole_frame(kind)
 
@@ -339,13 +346,13 @@ async def test_a_pipelined_sender_is_not_cut_off_by_the_frame_deadline(kind: str
         # Each write ends half way through the next frame, so a frame is always open between reads.
         half = len(frame) // 2
         writer.write(frame[:half])
-        for _ in range(8):
+        for _ in range(writes):
             writer.write(frame[half:] + frame[:half])
             await writer.drain()
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(gap)
         writer.write(frame[half:])
         await writer.drain()
-        assert await _until(lambda: len(received) == 9)
+        assert await _until(lambda: len(received) == writes + 1)
         await _close(writer)
 
     await _run(source, body, handler)

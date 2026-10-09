@@ -278,6 +278,12 @@ def test_an_ack_over_the_frame_cap_is_refused_not_buffered(
     assert "MSH" not in captured.err
 
 
+#: How long the peer below trickles before it hangs up: ten times the sender's --timeout. So the
+#: test reads behavior, not speed. One overall deadline times out while bytes still arrive; a wait
+#: reset per read is still waiting at the hang-up, and sees a close instead of a TimeoutError.
+_TRICKLE_SECONDS = 10.0
+
+
 def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_path: Path) -> None:
     # Each byte arrives inside --timeout, so only a deadline for the whole reply ends the wait.
     path = tmp_path / "clean.hl7"
@@ -294,20 +300,21 @@ def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_p
                 if not chunk:
                     return
                 received += chunk
+            stop_at = time.monotonic() + _TRICKLE_SECONDS
             try:
                 conn.sendall(bytes([SB]))
                 while not done.wait(0.2):
+                    if time.monotonic() >= stop_at:
+                        return
                     conn.sendall(b"x")
             except OSError:
                 return
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
-    started = time.monotonic()
     try:
         with pytest.raises(TimeoutError):
             _load().main([str(path), "--port", _port(listener), "--timeout", "1"])
     finally:
         done.set()
-    assert time.monotonic() - started < 4
     thread.join(5)
