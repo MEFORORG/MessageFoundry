@@ -278,13 +278,14 @@ def test_an_ack_over_the_frame_cap_is_refused_not_buffered(
     assert "MSH" not in captured.err
 
 
-#: The --timeout the test passes, and how long its peer trickles before it hangs up. A wait reset
-#: per read is still waiting at the hang-up, so it sees a close instead of a TimeoutError.
+#: The --timeout the test passes.
 _TIMEOUT = 1.0
-_TRICKLE_SECONDS = 16 * _TIMEOUT
-#: The sender must give up well inside the trickle. Half of it is 8 s for a 1 s --timeout: a hosted
-#: Windows runner took 4.44 s in all, against an older bound of 4 s.
-_GAVE_UP_WITHIN = _TRICKLE_SECONDS / 2
+#: The sender must give up within this. A hosted Windows runner once took 4.44 s against an older
+#: 4 s bound. It stays below the script's own 10 s default, so a sender that drops --timeout fails.
+_GAVE_UP_WITHIN = 8 * _TIMEOUT
+#: How long the peer trickles before it hangs up. A wait reset per read is still waiting then, so
+#: it sees a close instead of a TimeoutError.
+_TRICKLE_SECONDS = 2 * _GAVE_UP_WITHIN
 
 
 def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_path: Path) -> None:
@@ -315,12 +316,14 @@ def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_p
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
+    module = _load()  # outside the timed window: loading the script is not the deadline
     started = time.monotonic()
     try:
         with pytest.raises(TimeoutError):
-            _load().main([str(path), "--port", _port(listener), "--timeout", str(_TIMEOUT)])
+            module.main([str(path), "--port", _port(listener), "--timeout", str(_TIMEOUT)])
     finally:
         done.set()
-    # The deadline follows --timeout: one that ignored it would outlast this bound.
-    assert time.monotonic() - started < _GAVE_UP_WITHIN
+    elapsed = time.monotonic() - started
+    # The deadline follows --timeout from both sides. The 0.1 s allows for timer granularity.
+    assert _TIMEOUT - 0.1 <= elapsed < _GAVE_UP_WITHIN, elapsed
     thread.join(5)

@@ -325,10 +325,10 @@ async def test_a_pipelined_sender_is_not_cut_off_by_the_frame_deadline(kind: str
     """The clock restarts for each frame, so a feed that runs longer than the deadline in total,
     one complete frame at a time, is never dropped.
 
-    The sender and the listener share one event loop, and the deadline is many gaps long, so only
-    a loop stall longer than ``deadline - gap`` can cut the feed. These are the margins of the
-    MLLP twin in tests/test_connection_event_emit.py. Sleeps only run long, so the whole feed
-    always outlasts the deadline, and a clock that never restarted would cut it.
+    The sender and the listener share one event loop. The deadline is many gaps long. So only a
+    loop stall longer than ``deadline - gap`` can cut the feed. The MLLP twin in
+    tests/test_connection_event_emit.py uses the same margins. Sleeps only run long, so the feed
+    always outlasts the deadline. A clock that never restarted would cut it.
     """
     events = _Events()
     received: list[bytes] = []
@@ -347,19 +347,24 @@ async def test_a_pipelined_sender_is_not_cut_off_by_the_frame_deadline(kind: str
         _reader, writer = await asyncio.open_connection("127.0.0.1", port)
         # Each write ends half way through the next frame, so a frame is always open between reads.
         half = len(frame) // 2
-        # A drop surfaces as a short count below, which names the defect, not as a reset here.
-        with contextlib.suppress(OSError):
-            writer.write(frame[:half])
-            for _ in range(writes):
-                writer.write(frame[half:] + frame[:half])
+        reset: OSError | None = None
+        try:
+            try:
+                writer.write(frame[:half])
+                for _ in range(writes):
+                    writer.write(frame[half:] + frame[:half])
+                    await writer.drain()
+                    await asyncio.sleep(gap)
+                writer.write(frame[half:])
                 await writer.drain()
-                await asyncio.sleep(gap)
-            writer.write(frame[half:])
-            await writer.drain()
-        assert await _until(lambda: len(received) == writes + 1), (
-            f"{len(received)} of {writes + 1} frames arrived: the frame clock ran across frames"
-        )
-        await _close(writer)
+            except OSError as exc:  # a drop: reported below with the listener's own close reason
+                reset = exc
+            assert await _until(lambda: len(received) == writes + 1), (
+                f"{len(received)} of {writes + 1} frames arrived; "
+                f"sender saw {reset!r}; listener events {events.events}"
+            )
+        finally:
+            await _close(writer)
 
     await _run(source, body, handler)
     assert "frame_deadline" not in events.reasons("closed")
@@ -377,6 +382,8 @@ def test_the_frame_clock_restarts_on_each_completed_frame(monkeypatch: pytest.Mo
     clock.after_read(in_frame=True, decoded=1, trailer_only=False)
     assert clock.opened_at == 100.8  # a frame completed and the next one opened: a fresh budget
     now = 101.5
+    # 1.5 s since the first frame opened, past the 1.0 s deadline, yet this frame has 0.3 s left.
+    assert admission._frame_seconds_left(clock.opened_at, 1.0) == pytest.approx(0.3)
     clock.after_read(in_frame=True, decoded=0, trailer_only=False)
     assert clock.opened_at == 100.8  # still the same frame: its clock keeps running
     clock.after_read(in_frame=False, decoded=1, trailer_only=False)
