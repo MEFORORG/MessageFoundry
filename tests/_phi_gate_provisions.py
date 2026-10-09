@@ -109,6 +109,13 @@ RETENTION_WINDOWS_ENV: dict[str, str] = {
 }
 
 
+def setenv_declared_egress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Satisfy the open-egress gate alone, the way :data:`PHI_GATE_PROVISIONS_ENV` does. For a
+    ``supervise`` fixture that provisions nothing else: the supervisor runs that gate before it
+    installs its log forwarder (BACKLOG #2356)."""
+    monkeypatch.setenv("MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND", "true")
+
+
 def setenv_retention_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set :data:`RETENTION_WINDOWS_ENV` on the environment for one test."""
     for name, value in RETENTION_WINDOWS_ENV.items():

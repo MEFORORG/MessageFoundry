@@ -73,13 +73,16 @@ def _run(
     provisions: str = PHI_GATE_PROVISIONS_TOML,
     recorder: _Recorder | None = None,
     client_cert: bool = True,
+    env: str | None = "prod",
 ) -> tuple[int, _Recorder]:
     """Run ``serve`` or ``supervise`` as a prod instance with every OTHER gate pre-cleared.
 
     ``allowed_syslog`` overrides the ``[egress].allowed_syslog`` value the forwarding provision
     sets, which lists its own collector; ``None`` leaves the list unset. ``recorder`` is the
     caller's own, for a test that watches it while the command runs. ``client_cert=False`` drops
-    the client certificate the forwarding provision sets."""
+    the client certificate the forwarding provision sets. ``env`` is the ``--env`` value, and
+    ``None`` passes no flag."""
+    assert client_cert or verified_forwarding, "client_cert=False needs verified_forwarding=True"
     from messagefoundry.__main__ import main
 
     recorder = recorder or _Recorder()
@@ -101,7 +104,8 @@ def _run(
     monkeypatch.setattr(socket, "create_connection", _no_network)
     monkeypatch.setattr(socket, "getaddrinfo", _no_network)
     monkeypatch.setattr(socket, "gethostbyname", _no_network)
-    rc = main([command, "--config", str(_SAMPLES_CONFIG), "--env", "prod"])
+    argv = [command, "--config", str(_SAMPLES_CONFIG)]
+    rc = main(argv if env is None else [*argv, "--env", env])
     return rc, recorder
 
 
@@ -329,10 +333,40 @@ def test_a_fail_open_note_still_reaches_stderr_when_the_next_gate_refuses_the_st
     assert "is not in the [egress].allowed_syslog allowlist" in _errors(err)[0]
 
 
-# --- the static-credential gate's collector leg, and the environment ----------------------------
+# --- the other gates `serve` makes ahead of its forwarder ----------------------------------------
+#
+# Each reads settings only and guards the collector or the store the supervisor itself opens. The
+# supervisor runs them through the helpers `serve` calls, so each refusal is serve's own text.
 
 _NONSTATIC = "security.require_nonstatic_credentials = true\n"
 _FORWARD_HOP = "settings:logging.forward"
+_WARN = 'security.enforcement = "warn"\n'
+_OPEN_EGRESS = PHI_GATE_PROVISIONS_TOML.replace(
+    "security.block_unlisted_outbound = true\n", "security.block_unlisted_outbound = false\n"
+)
+
+
+def _refused_alike(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    needle: str,
+    **run: Any,
+) -> str:
+    """Run ``serve`` then ``supervise`` the same way. Both must exit 2 on one error line holding
+    ``needle``; the supervisor's must start with serve's, and it must have spawned and forwarded
+    nothing. Returns what the supervisor's line adds."""
+    rc, _ = _run("serve", tmp_path, monkeypatch, **run)
+    serve_errors = _errors(capsys.readouterr().err)
+    assert rc == 2 and len(serve_errors) == 1 and needle in serve_errors[0], serve_errors
+
+    rc, recorder = _run("supervise", tmp_path, monkeypatch, **run)
+    fleet_errors = _errors(capsys.readouterr().err)
+    assert rc == 2 and len(fleet_errors) == 1, fleet_errors
+    assert fleet_errors[0].startswith(serve_errors[0]), (serve_errors, fleet_errors)
+    assert recorder.spawned == 0, "the supervisor spawned engine shards past the refusal"
+    assert recorder.forwards == [], "the supervisor installed a forwarder past the refusal"
+    return fleet_errors[0][len(serve_errors[0]) :]
 
 
 def test_the_supervisor_is_refused_by_the_static_credential_gate_exactly_as_serve_is(
@@ -341,56 +375,116 @@ def test_the_supervisor_is_refused_by_the_static_credential_gate_exactly_as_serv
     """``serve`` runs the settings half of the opt-in static-credential gate ahead of its
     forwarder. A TLS collector with no client certificate is one of its hops, so the supervisor
     must refuse on it too, in the same words, and install no forwarder."""
-
-    def run(command: str) -> tuple[int, _Recorder]:
-        # Without the provision's client certificate the collector hop presents nothing.
-        return _run(
-            command, tmp_path, monkeypatch, _NONSTATIC, verified_forwarding=True, client_cert=False
-        )
-
-    rc, _ = run("serve")
-    serve_errors = _errors(capsys.readouterr().err)
-    assert rc == 2 and len(serve_errors) == 1, serve_errors
-    assert _FORWARD_HOP in serve_errors[0] and "require_nonstatic_credentials" in serve_errors[0]
-
-    rc, recorder = run("supervise")
-    assert rc == 2
-    assert _errors(capsys.readouterr().err) == serve_errors
-    assert recorder.spawned == 0, "the supervisor spawned engine shards past the refusal"
-    assert recorder.forwards == [], "the supervisor installed a forwarder past the refusal"
+    added = _refused_alike(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        _FORWARD_HOP,
+        toml=_NONSTATIC,
+        verified_forwarding=True,
+        client_cert=False,
+    )
+    assert added == ""
 
 
+@pytest.mark.parametrize("command", ["serve", "supervise"])
 def test_a_collector_with_a_client_certificate_is_not_a_static_credential_hop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The control for the test above: with the provision's client certificate the same gate
-    names no collector hop, so the refusal there is the missing certificate's and nothing else's."""
-    _run("supervise", tmp_path, monkeypatch, _NONSTATIC, verified_forwarding=True)
-    assert _FORWARD_HOP not in capsys.readouterr().err
+    passes and the start goes on, so the refusal there is the missing certificate's."""
+    rc, recorder = _run(command, tmp_path, monkeypatch, _NONSTATIC, verified_forwarding=True)
+    assert rc == 0 and len(recorder.forwards) == 1
+    assert _errors(capsys.readouterr().err) == []
 
 
-def test_the_supervisor_refuses_a_start_with_no_environment_in_serves_words(
+def test_under_warn_the_supervisor_logs_the_static_credential_refusal_for_its_forwarder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Under ``enforcement = warn`` the gate warns on stderr and the start goes on. The refusal
+    is then logged once the forwarder is installed, so the off-box copy has it, as in ``serve``."""
+    with caplog.at_level("WARNING"):
+        rc, recorder = _run(
+            "supervise",
+            tmp_path,
+            monkeypatch,
+            _NONSTATIC + _WARN,
+            verified_forwarding=True,
+            client_cert=False,
+        )
+    assert rc == 0 and recorder.spawned == 1 and len(recorder.forwards) == 1
+    assert f"{_FORWARD_HOP} (" in capsys.readouterr().err
+    logged = [r for r in caplog.records if _FORWARD_HOP in r.getMessage()]
+    assert [r.name for r in logged] == ["messagefoundry.__main__"], logged
+
+
+def test_the_supervisor_is_refused_by_the_open_egress_gate_exactly_as_serve_is(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``serve`` refuses with no environment named, so every engine shard would. The supervisor
-    used to go on and print ``(None)`` in its own refusals."""
-    from messagefoundry.__main__ import main
+    """With ``block_unlisted_outbound`` written false and no destination list, ``serve`` refuses
+    before its forwarder. That is also the state in which an empty ``allowed_syslog`` allows any
+    collector, so the supervisor must not forward past it."""
+    assert _OPEN_EGRESS != PHI_GATE_PROVISIONS_TOML
+    added = _refused_alike(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        "outbound egress is UNRESTRICTED",
+        provisions=_OPEN_EGRESS,
+        verified_forwarding=True,
+        allowed_syslog=None,
+    )
+    assert added == ""
 
-    monkeypatch.chdir(tmp_path)
+
+def test_the_supervisor_is_refused_by_the_managed_identity_gate_exactly_as_serve_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The supervisor opens the store itself when it renews the API pair, so it must not do so
+    with a credential ``[store].require_managed_identity`` refuses. The precondition's answer is
+    stubbed: a real one needs a server database, and the subject here is who asks."""
+    from messagefoundry.config.settings import StoreSettings
+
+    monkeypatch.setattr(
+        StoreSettings, "managed_identity_precondition", lambda self: "the store login is static"
+    )
+    added = _refused_alike(
+        tmp_path, monkeypatch, capsys, "the store login is static", verified_forwarding=True
+    )
+    assert added == ""
+
+
+_FLEET = " Every engine shard would refuse to start; refusing to start the fleet."
+
+
+@pytest.mark.parametrize(
+    ("env", "needle"),
+    [
+        pytest.param(None, "no active environment set", id="no-environment"),
+        pytest.param("qa", "no built-in security posture", id="no-production-tier"),
+        pytest.param("", "", id="empty-name"),
+    ],
+)
+def test_the_supervisor_refuses_an_environment_serve_refuses_in_serves_words(
+    env: str | None,
+    needle: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``serve`` refuses a start with no environment, with a custom name that has no production
+    tier, and with a name its settings refuse at load. Every engine shard would, so the
+    supervisor refuses the fleet. It used to go on, and print ``(None)`` in its own refusals."""
     monkeypatch.delenv("MEFOR_AI_ENVIRONMENT", raising=False)
-    (tmp_path / "messagefoundry.toml").write_text(PHI_GATE_PROVISIONS_TOML, encoding="utf-8")
-    recorder = _Recorder()
-    monkeypatch.setattr("messagefoundry.__main__.configure_logging", recorder.configure_logging)
-    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", recorder.supervise)
-
-    assert main(["serve", "--config", str(_SAMPLES_CONFIG)]) == 2
-    (serve_error,) = _errors(capsys.readouterr().err)
-    assert "no active environment set" in serve_error
-
-    assert main(["supervise", "--config", str(_SAMPLES_CONFIG)]) == 2
-    (fleet_error,) = _errors(capsys.readouterr().err)
-    assert fleet_error.startswith(serve_error) and "(None)" not in fleet_error
-    assert recorder.spawned == 0 and recorder.forwards == []
+    added = _refused_alike(tmp_path, monkeypatch, capsys, needle, verified_forwarding=True, env=env)
+    # A name the settings refuse at load is one error for both; the gate adds why the fleet stops.
+    assert added == ("" if env == "" else _FLEET)
 
 
 # --- forwarding not configured ------------------------------------------------------------------

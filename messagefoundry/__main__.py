@@ -1866,6 +1866,106 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
     return str(_forward_spool_root(settings, str(store_path)) / "supervisor")
 
 
+def _open_egress_gate(
+    settings: ServiceSettings, *, production: bool, env_name: str, enforcing: bool
+) -> tuple[bool, bool]:
+    """The open-egress posture gate (Q5b). Returns whether the start is refused, and whether the
+    operator wrote ``[security].block_unlisted_outbound``.
+
+    One body for ``serve`` and ``supervise`` (BACKLOG #2356). It reads settings only, and the
+    state it refuses is the one in which an empty ``[egress].allowed_syslog`` is unrestricted, so
+    the supervisor must not install its forwarder past it. ``_serve`` holds the reasoning, above
+    its call."""
+    eg = settings.egress
+    listed = (
+        eg.allowed_mllp
+        or eg.allowed_tcp
+        or eg.allowed_http
+        or eg.allowed_db
+        or eg.allowed_remote
+        or eg.allowed_file_dirs
+    )
+    deny_written = "deny_by_default" in eg.model_fields_set
+    if not deny_written:
+        listed = listed or eg.allowed_smtp or eg.allowed_direct
+    # The gate reads whether the operator WROTE the switch, not only the field's value. The model
+    # default has been deny since vault BACKLOG #2605, so the value alone is true on a stock instance
+    # and this refusal would never fire. Without it a stock instance would start and fail every
+    # outbound as a degraded lane, rather than refusing here with one clear message. The two states
+    # the gate catches differ, and each message says which: written false is allow-any egress, and
+    # left unset with nothing declared is every outbound refused.
+    egress_open = not (deny_written and eg.deny_by_default) and not listed
+    if egress_open:
+        tier = f"{'production ' if production else ''}PHI instance ({env_name!r})"
+        if deny_written:
+            # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when the
+            # switch was written false (otherwise those two count above), so name that override
+            # rather than leaving the operator to wonder why a declared allowlist did not count.
+            mail_only_note = (
+                " You have declared [egress].allowed_smtp/allowed_direct, but those satisfy this "
+                "gate only when [security].block_unlisted_outbound is left unset — setting it false "
+                "opts out of the deny default, which would leave every OTHER transport allow-any. "
+                "Remove that override (or set it true) and a mail-only/Direct-only allowlist is "
+                "accepted."
+                if (eg.allowed_smtp or eg.allowed_direct)
+                else ""
+            )
+            if enforcing:
+                print(
+                    f"error: outbound egress is UNRESTRICTED on a {tier}; refusing to start — a "
+                    "transform could send PHI to any destination. Set "
+                    "[security].block_unlisted_outbound=true, or declare the permitted destinations "
+                    f"with per-transport [egress].allowed_* allowlists.{mail_only_note}",
+                    file=sys.stderr,
+                )
+                return True, deny_written
+            print(
+                "warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
+                f"({env_name!r}) — a transform may send to any destination. Set "
+                "[security].block_unlisted_outbound=true, or declare per-transport "
+                f"[egress].allowed_* allowlists, to fail closed.{mail_only_note}",
+                file=sys.stderr,
+            )
+        else:
+            if enforcing:
+                print(
+                    f"error: no outbound destination is declared on a {tier}; refusing to start — "
+                    "[security].block_unlisted_outbound is on by default, so every outbound would "
+                    "be refused. Declare the permitted destinations with per-transport "
+                    "[egress].allowed_* allowlists.",
+                    file=sys.stderr,
+                )
+                return True, deny_written
+            print(
+                f"warning: no outbound destination is declared on a {tier} — "
+                "[security].block_unlisted_outbound is on by default, so every outbound will be "
+                "refused. Declare the permitted destinations with per-transport "
+                "[egress].allowed_* allowlists.",
+                file=sys.stderr,
+            )
+    return False, deny_written
+
+
+def _managed_identity_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
+    """The ``[store].require_managed_identity`` precondition (#203). Returns whether the start is
+    refused. One body for ``serve`` and ``supervise`` (BACKLOG #2356): the supervisor opens the
+    store itself when it renews the API pair, and every engine shard would refuse."""
+    mi_reason = settings.store.managed_identity_precondition()
+    if mi_reason is None:
+        return False
+    if enforcing:
+        print(
+            f"error: [store].require_managed_identity is set but {mi_reason}; refusing to start.",
+            file=sys.stderr,
+        )
+        return True
+    print(
+        f"warning: [store].require_managed_identity is set but {mi_reason}.",
+        file=sys.stderr,
+    )
+    return False
+
+
 #: The refusal ``serve`` and ``supervise`` share when no environment is named (ADR 0017).
 _NO_ACTIVE_ENVIRONMENT = (
     "no active environment set — pass --env <name> or set [ai].environment. It selects "
@@ -1926,9 +2026,11 @@ def _start_logging(
     """Pass the off-box forwarding gates, then install this process's log handlers.
 
     Returns the exit code of a refused start, or ``None`` once logging is configured. One body for
-    ``serve`` and ``supervise`` (BACKLOG #2356), so the supervisor process cannot forward past a
-    gate an engine process refuses, and both print the same refusal. ``spool_dir`` is this process's
-    own spool directory (:func:`_forward_spool_dir`); the spool locks it.
+    ``serve`` and ``supervise`` (BACKLOG #2356), so both pass the gates in it and print the same
+    refusal. It does not hold every gate that guards the collector: at least the static-credential
+    and open-egress gates run in each caller before it, so a new one must be given to both.
+    ``spool_dir`` is this process's own spool directory (:func:`_forward_spool_dir`); the spool
+    locks it.
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
@@ -2111,7 +2213,7 @@ def _start_logging(
     # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged again now that the
     # caller's handlers are installed, at WARNING and the ordinary way, so the caller's log level
     # applies to them. Logged whether or not a forwarder came up: stdout and the log file are
-    # handlers too. `serve` logs its #1989 static-credential lines next, for the same reason.
+    # handlers too. Each caller logs its #1989 static-credential lines next, for the same reason.
     for _gate_note in _gate_notes:
         logging.getLogger(__name__).warning("%s", _gate_note)
     if forwarder_live and log_forward is not None:
@@ -2319,18 +2421,8 @@ def _serve(args: argparse.Namespace) -> int:
     # turns this on and leaves a static credential is REFUSED, not warned. It downgrades to a warning
     # only under enforcement = warn. Off by default → byte-identical. Admin device posture and AD/SMTP
     # managed identity stay deployment-delegated (documented in docs/SECURITY.md), not engine-checked.
-    mi_reason = settings.store.managed_identity_precondition()
-    if mi_reason is not None:
-        if enforcing:
-            print(
-                f"error: [store].require_managed_identity is set but {mi_reason}; refusing to start.",
-                file=sys.stderr,
-            )
-            return 2
-        print(
-            f"warning: [store].require_managed_identity is set but {mi_reason}.",
-            file=sys.stderr,
-        )
+    if _managed_identity_gate(settings, enforcing=enforcing):
+        return 2
 
     # Static-credential refusal (BACKLOG #1182, ASVS 13.2.1), OPT-IN and off by default (owner decision
     # 2026-09-23). [security].require_nonstatic_credentials refuses every backend hop that presents an
@@ -2483,73 +2575,11 @@ def _serve(args: argparse.Namespace) -> int:
     # transport closed, so such an instance starts fail-closed. An instance that explicitly opted OUT
     # of deny-by-default is deliberately unchanged: it cannot satisfy this gate on smtp/direct alone,
     # because there the other six transports stay allow-any.
-    eg = settings.egress
-    listed = (
-        eg.allowed_mllp
-        or eg.allowed_tcp
-        or eg.allowed_http
-        or eg.allowed_db
-        or eg.allowed_remote
-        or eg.allowed_file_dirs
+    egress_refused, deny_written = _open_egress_gate(
+        settings, production=production, env_name=env_name, enforcing=enforcing
     )
-    deny_written = "deny_by_default" in eg.model_fields_set
-    if not deny_written:
-        listed = listed or eg.allowed_smtp or eg.allowed_direct
-    # The gate reads whether the operator WROTE the switch, not only the field's value. The model
-    # default has been deny since vault BACKLOG #2605, so the value alone is true on a stock instance
-    # and this refusal would never fire. Without it a stock instance would start and fail every
-    # outbound as a degraded lane, rather than refusing here with one clear message. The two states
-    # the gate catches differ, and each message says which: written false is allow-any egress, and
-    # left unset with nothing declared is every outbound refused.
-    egress_open = not (deny_written and eg.deny_by_default) and not listed
-    if egress_open:
-        tier = f"{'production ' if production else ''}PHI instance ({env_name!r})"
-        if deny_written:
-            # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when the
-            # switch was written false (otherwise those two count above), so name that override
-            # rather than leaving the operator to wonder why a declared allowlist did not count.
-            mail_only_note = (
-                " You have declared [egress].allowed_smtp/allowed_direct, but those satisfy this "
-                "gate only when [security].block_unlisted_outbound is left unset — setting it false "
-                "opts out of the deny default, which would leave every OTHER transport allow-any. "
-                "Remove that override (or set it true) and a mail-only/Direct-only allowlist is "
-                "accepted."
-                if (eg.allowed_smtp or eg.allowed_direct)
-                else ""
-            )
-            if enforcing:
-                print(
-                    f"error: outbound egress is UNRESTRICTED on a {tier}; refusing to start — a "
-                    "transform could send PHI to any destination. Set "
-                    "[security].block_unlisted_outbound=true, or declare the permitted destinations "
-                    f"with per-transport [egress].allowed_* allowlists.{mail_only_note}",
-                    file=sys.stderr,
-                )
-                return 2
-            print(
-                "warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
-                f"({env_name!r}) — a transform may send to any destination. Set "
-                "[security].block_unlisted_outbound=true, or declare per-transport "
-                f"[egress].allowed_* allowlists, to fail closed.{mail_only_note}",
-                file=sys.stderr,
-            )
-        else:
-            if enforcing:
-                print(
-                    f"error: no outbound destination is declared on a {tier}; refusing to start — "
-                    "[security].block_unlisted_outbound is on by default, so every outbound would "
-                    "be refused. Declare the permitted destinations with per-transport "
-                    "[egress].allowed_* allowlists.",
-                    file=sys.stderr,
-                )
-                return 2
-            print(
-                f"warning: no outbound destination is declared on a {tier} — "
-                "[security].block_unlisted_outbound is on by default, so every outbound will be "
-                "refused. Declare the permitted destinations with per-transport "
-                "[egress].allowed_* allowlists.",
-                file=sys.stderr,
-            )
+    if egress_refused:
+        return 2
 
     # Egress deny-by-default (#186c, ASVS 13.2.4/13.2.5): EVERY instance runs FAIL-CLOSED egress unless
     # the operator wrote [security].block_unlisted_outbound=false, so a transport whose per-type
@@ -4616,22 +4646,15 @@ def _supervise(args: argparse.Namespace) -> int:
     # anchor_under_root(None, ...) returns None (config/anchor.py), so this is safe when unset; each child
     # re-anchors the raw --service-config to the same path under the forwarded --project-root.
     service_config = anchor_under_root(args.service_config, root, cwd=cwd)
-    settings, detail = _load_service_settings(service_config)
+    # `--env` goes into the settings as `serve` puts it (BACKLOG #2356), so one validated value
+    # names the environment for every gate below, and a name `serve` refuses at load is refused
+    # here. Each engine shard is still started with the flag itself.
+    settings, detail = _load_service_settings(
+        service_config, cli={"ai": {"environment": args.env}} if args.env is not None else None
+    )
     if settings is None:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
-        return 2
-
-    # The environment each engine shard is started with: `--env` when given, else the settings'.
-    # `serve` refuses to start with neither (ADR 0017), so every engine shard would; refused here
-    # in serve's words instead of spawning them (BACKLOG #2356).
-    env_name = args.env if args.env is not None else settings.ai.environment
-    if env_name is None:
-        print(
-            f"error: {_NO_ACTIVE_ENVIRONMENT} Every engine shard would refuse to start; refusing "
-            "to start the fleet.",
-            file=sys.stderr,
-        )
         return 2
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
@@ -4641,6 +4664,26 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     # The same again for the client-certificate shim, when the settings ask each shard for one.
     if not _client_cert_shim_or_refusal(settings, *floor, "start the fleet")[0]:
+        return 2
+
+    # The environment gate `serve` makes (ADR 0017, BACKLOG #2356): a name, and a production tier
+    # for it. Every engine shard would refuse on either, so the fleet is refused here in serve's
+    # words instead of being spawned.
+    env_name = settings.ai.environment
+    if env_name is None:
+        print(
+            f"error: {_NO_ACTIVE_ENVIRONMENT} Every engine shard would refuse to start; refusing "
+            "to start the fleet.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        production = settings.ai.require_posture()
+    except ValueError as exc:
+        print(
+            f"error: {exc} Every engine shard would refuse to start; refusing to start the fleet.",
+            file=sys.stderr,
+        )
         return 2
 
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
@@ -4667,6 +4710,17 @@ def _supervise(args: argparse.Namespace) -> int:
         logging.getLogger(__name__).warning(
             "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *startup_entry
         )
+
+    # BACKLOG #2356: the two credential gates `serve` makes next, in its order, so one config
+    # gets one refusal from both commands. The managed-identity gate, because the renewal below
+    # opens the store with the credential it judges. Then the settings half of the
+    # static-credential gate: its `settings:logging.forward` hop is the collector this process
+    # forwards to, and the half reads settings only, so every engine shard reaches this verdict.
+    if _managed_identity_gate(settings, enforcing=enforcing):
+        return 2
+    sc_outcome, sc_refused = _static_credential_settings_gate(settings, enforcing=enforcing)
+    if sc_refused:
+        return 2
 
     # BACKLOG #1916: the at-rest gate each shard's `serve` applies, checked once here and BEFORE the
     # renewal below. Renewing first and then refusing to audit it would replace the pair with no
@@ -4710,11 +4764,12 @@ def _supervise(args: argparse.Namespace) -> int:
     # The logging call is the bare one at the top plus the forwarder. `--env` is what each engine
     # shard is started with, so it names the environment here as well.
     #
-    # First the settings half of the static-credential gate, which `serve` runs ahead of its own
-    # forwarder. Its `settings:logging.forward` hop is this collector, and the half reads settings
-    # only, so every engine shard reaches the same verdict.
-    sc_outcome, sc_refused = _static_credential_settings_gate(settings, enforcing=enforcing)
-    if sc_refused:
+    # Last before it, the open-egress gate, where `serve` runs it. The state it refuses is the
+    # one in which an empty `[egress].allowed_syslog` is unrestricted.
+    egress_refused, _ = _open_egress_gate(
+        settings, production=production, env_name=env_name, enforcing=enforcing
+    )
+    if egress_refused:
         return 2
     forwarder_installed = False
 

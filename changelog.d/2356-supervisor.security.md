@@ -7,4 +7,8 @@
   beside its engine shards' spool directories. With no collector configured it installs no
   forwarder. Under the default `enforce` it then refuses the fleet at once, where each engine
   shard used to refuse on its own; under `warn` it prints the warning and starts.
+  `supervise` now also refuses the fleet, in `serve`'s words, on five settings checks each
+  engine shard would refuse on: no environment named, a custom environment with no
+  production tier, `[store].require_managed_identity`, the service-settings half of
+  `[security].require_nonstatic_credentials`, and the open-egress gate.
   (`BACKLOG #2356`)
