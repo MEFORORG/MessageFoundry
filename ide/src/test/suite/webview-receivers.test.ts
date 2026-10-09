@@ -23,8 +23,9 @@ import { wiringMapScript } from "../../wiringMapWebview";
 // required field or has one of the wrong JS type, is DISCARDED. Nothing on the page changes and
 // nothing throws. Value ranges are a different requirement and are not tested here.
 //
-// One receiver SHOWS the discard: Security Settings, for a `state` (see its `shownDiscard`). An
-// empty settings form with no reason given reads as a broken panel.
+// A receiver with a `shownDiscard` SHOWS the discard instead: at least Security Settings for a
+// `state` and Alert Rules for a `rules`. A panel left empty, or left acting on what it showed
+// before, with no reason given reads as broken, and for Alert Rules it is unsafe.
 //
 // Each panel's REAL script is evaluated in a jsdom page, so what runs here is what ships. Each
 // well-formed fixture is built by the host's own pure function where there is one (buildForm,
@@ -905,18 +906,19 @@ suite("webview receivers discard a malformed payload and render a well-formed on
 
   test("Alert Rules: a discarded list names the rule, the field and what was wrong", () => {
     const SENT = '<img src=x onerror="window.pwned=1"><b id="planted">';
-    const cases: [string, (c: Payload) => void, string][] = [
-      ["a quoted number", (c) => (c.rules[2].min_depth = "500"), "rule 2, min_depth: expected a number, got string"],
-      ["a boolean age", (c) => (c.rules[0].min_oldest_seconds = true), "rule 0, min_oldest_seconds: expected a number, got boolean"],
-      ["a null cooldown", (c) => (c.rules[1].cooldown_seconds = null), "rule 1, cooldown_seconds: expected a number, got null"],
-      ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "rule 1, min_depth: expected a number, got string"],
-      ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "rule 0, connection: expected text, got list"],
-      ["transports is text", (c) => (c.rules[0].transports = SENT), "rule 0, transports: expected a list of text, got string"],
-      ["a rule with no index", (c) => delete c.rules[1].index, "entry 2 of the list has no whole-number index"],
-      ["an entry that is text", (c) => (c.rules[2] = SENT), "entry 3 of the list is not a rule"],
-      ["no list", (c) => delete c.rules, "the list is missing or is not a list"],
+    // The last column: true when the problem is a value in the file, which the operator can fix.
+    const cases: [string, (c: Payload) => void, string, boolean][] = [
+      ["a quoted number", (c) => (c.rules[2].min_depth = "500"), "rule 2, min_depth: expected a number, got string", true],
+      ["a boolean age", (c) => (c.rules[0].min_oldest_seconds = true), "rule 0, min_oldest_seconds: expected a number, got boolean", true],
+      ["a null cooldown", (c) => (c.rules[1].cooldown_seconds = null), "rule 1, cooldown_seconds: expected a number, got null", true],
+      ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "rule 1, min_depth: expected a number, got string", true],
+      ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "rule 0, connection: expected text, got list", true],
+      ["transports is text", (c) => (c.rules[0].transports = SENT), "rule 0, transports: expected a list of text, got string", true],
+      ["a rule with no index", (c) => delete c.rules[1].index, "entry 2 of the list has no whole-number index", false],
+      ["an entry that is text", (c) => (c.rules[2] = SENT), "entry 3 of the list is not a rule", false],
+      ["no list", (c) => delete c.rules, "the list is missing or is not a list", false],
     ];
-    for (const [why, change, problem] of cases) {
+    for (const [why, change, problem, inFile] of cases) {
       const p = alertRules.load();
       const doc = p.window.document;
       p.deliver(variant(ALERT_OK, change));
@@ -924,7 +926,9 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       const shown = refusalShown(p);
       assert.ok(shown.startsWith(ALERT_REFUSAL), `${why}: no refusal, got "${shown}"`);
       assert.ok(shown.includes(problem), `${why}: the refusal does not say "${problem}": "${shown}"`);
-      assert.ok(shown.includes("a number must not be quoted"), `${why}: the refusal does not say what to do`);
+      // Only a value in the file is the operator's to fix. The rest is not, and must not say so.
+      assert.strictEqual(shown.includes("a number must not be quoted"), inFile, `${why}: wrong advice: "${shown}"`);
+      assert.strictEqual(shown.includes("No edit to the file fixes this"), !inFile, `${why}: wrong advice: "${shown}"`);
       assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "rules"')), `${why}: console.warn was dropped`);
       // Nothing the message carried is echoed, and nothing in it became an element.
       assert.ok(!shown.includes("onerror"), `${why}: the refusal echoed a value from the message`);
@@ -968,12 +972,36 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.ok(shown.includes("Remove and Add stay off"), "nothing says why the page is still off");
     assert.strictEqual(doc.getElementById("add").disabled, true);
     assert.strictEqual(removeButtons(p).length, 0);
-    // The control: with no refusal up, an error shows alone and is visible under the panel's CSS.
-    const q = alertRules.load();
-    q.deliver(ALERT_OK);
-    q.deliver(ERROR_OK);
-    assert.strictEqual(refusalShown(q), CLI_ERROR);
-    assert.strictEqual(q.window.document.getElementById("add").disabled, false);
+  });
+
+  test("Alert Rules: after an error, Remove is off until the list is read again, and Add stays on", () => {
+    // The host posts "error" for a failed add, a failed remove and a failed re-read alike. After
+    // the last two the rows may no longer match the file, and the page cannot tell which it was.
+    const p = alertRules.load();
+    const doc = p.window.document;
+    doc.getElementById("connection").value = "OB_*";
+    p.deliver(ALERT_OK);
+    const buttons = removeButtons(p);
+    p.deliver(ERROR_OK);
+    const shown = refusalShown(p);
+    assert.ok(shown.startsWith(CLI_ERROR), `the error is not shown, or not visible: "${shown}"`);
+    assert.ok(shown.includes("Remove is off"), "nothing says Remove is off");
+    assert.strictEqual(buttons.length, 3);
+    for (const button of buttons) {
+      assert.strictEqual(button.disabled, true, "a Remove stayed enabled over rows nobody re-read");
+      button.disabled = false; // the handler must hold on its own, not only the attribute
+      button.click();
+    }
+    assert.strictEqual(p.posted.length, 0, `a Remove posted after an error: ${JSON.stringify(p.posted)}`);
+    // Add appends and names no ordinal, so the form stays usable: a failed Add is fixed and re-sent.
+    assert.strictEqual(doc.getElementById("add").disabled, false);
+    doc.getElementById("add").click();
+    assert.strictEqual(p.posted.length, 1);
+    assert.strictEqual(p.posted[0].command, "add");
+    // The next list the host reads brings Remove back.
+    p.deliver(ALERT_OK);
+    removeButtons(p)[0].click();
+    assert.strictEqual(JSON.stringify(p.posted[1]), JSON.stringify({ command: "remove", index: 0 }));
   });
 
   test("Security Settings: an error that follows a refusal keeps the reason on the page", () => {
