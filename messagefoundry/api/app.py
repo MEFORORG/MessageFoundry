@@ -829,9 +829,10 @@ async def _alert_control_action(
     """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
 
     Re-reads ``engine.registry_runner`` on each call, so it stays right across a reload that swaps
-    the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067); that
-    is the rule working as designed, not a failure, so it is logged once here at INFO and nothing
-    else happens. Any other error reaches the notifier, which logs it and never raises.
+    the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067), nor
+    an outbound whose build failed as it left that park (vault BACKLOG #3263); that is the rule
+    working as designed, not a failure, so it is logged once here at INFO and nothing else
+    happens. Any other error reaches the notifier, which logs it and never raises.
 
     ``default_target`` means the rule set no ``control_target``, so ``target`` is the event's own
     bare name, and the event does not say whether that name is an inbound or an outbound. The two
@@ -877,6 +878,16 @@ async def _alert_control_action(
             return
         await rr.restart_inbound(target)
     elif action == "restart_outbound":
+        if rr.outbound_dr_failed(target):
+            # Its build failed as it left the DR park (vault BACKLOG #3263). A reload or an
+            # operator start builds it again; a rule firing on its own alert would only read the
+            # CA again, and could alert again and fire again.
+            _log.info(
+                "alert control_action restart_outbound for %r not run: it failed to start at the "
+                "DR activation; a reload or an operator start builds it again",
+                target,
+            )
+            return
         try:
             await rr.restart_outbound(target)
         except DrParkedError:

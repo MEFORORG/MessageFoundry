@@ -11,13 +11,23 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, time
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 import messagefoundry.auth.trust_anchors as ta
-from messagefoundry.config.models import ConnectorType, Priority
+from messagefoundry.api.app import _alert_control_action
+from messagefoundry.config.models import (
+    ActiveWindow,
+    BuildupThreshold,
+    ConnectorType,
+    Priority,
+    Schedule,
+)
 from messagefoundry.config.settings import DrSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import (
     MLLP,
@@ -63,7 +73,14 @@ def judged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
 
 
-def _graph(tmp_path: Path, ca: Path, pin: str, **file_settings: object) -> Registry:
+def _graph(
+    tmp_path: Path,
+    ca: Path,
+    pin: str,
+    *,
+    ca_schedule: Schedule | None = None,
+    **file_settings: object,
+) -> Registry:
     """A critical MLLP inbound, a Rest outbound with a pinned CA and a File outbound."""
     reg = Registry()
     reg.add_inbound(
@@ -72,7 +89,9 @@ def _graph(tmp_path: Path, ca: Path, pin: str, **file_settings: object) -> Regis
         )
     )
     rest = Rest(url="https://partner.example.org/api", tls_ca_file=str(ca), tls_ca_pin=pin)
-    reg.add_outbound(build_outbound_connection(_OB_CA, rest, priority=Priority.CRITICAL))
+    reg.add_outbound(
+        build_outbound_connection(_OB_CA, rest, priority=Priority.CRITICAL, schedule=ca_schedule)
+    )
     out = tmp_path / _OB_FILE
     if "directory" not in file_settings:
         out.mkdir(exist_ok=True)
@@ -84,13 +103,9 @@ def _graph(tmp_path: Path, ca: Path, pin: str, **file_settings: object) -> Regis
 
 
 def _runner(store: MessageStore, reg: Registry, **kw: Any) -> RegistryRunner:
+    kw.setdefault("lane_anchor_check", ta.make_lane_anchor_check(store, enforcing=True))
     return RegistryRunner(
-        reg,
-        store,
-        poll_interval=0.02,
-        egress=EgressSettings(deny_by_default=False),
-        lane_anchor_check=ta.make_lane_anchor_check(store, enforcing=True),
-        **kw,
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False), **kw
     )
 
 
@@ -340,6 +355,259 @@ async def test_a_passive_start_reads_the_other_lanes_when_one_does_not_resolve(
         await runner.stop()
 
 
+async def test_an_activation_on_a_shard_that_does_not_own_a_lane_fails_that_lane_only(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every engine shard builds every lane at a start, so each one takes the start's checks at
+    an activation too (ADR 0073). Red when only the owning shard did: the shard that does not own
+    the lane sent it to the reload's CA pre-check, and one refused CA refused its whole takeover."""
+    ca, pin = _swapped_ca(tmp_path)
+    runner = _runner(store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL)
+    monkeypatch.setattr(runner, "_owns_destination", lambda name: name != _OB_CA)
+    await runner.start()
+    try:
+        await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(_OB_FILE, _ADT)])
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+
+        assert runner.inbound_running(_IB)
+        assert "its tls_ca_file was refused" in (runner.outbound_failed(_OB_CA) or "")
+        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
+    finally:
+        await runner.stop()
+
+
+# --- a lane that failed at an activation --------------------------------------------------
+
+_ALWAYS = Schedule(
+    windows=[
+        ActiveWindow(days=frozenset(range(7)), start=time(0, 0), end=time(23, 59), timezone="UTC")
+    ]
+)
+_NOON = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+
+
+class _PageSink(_CountingSink):
+    """Records ``queue_buildup`` pages as well."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buildup: list[str] = []
+
+    def queue_buildup(self, name: str, **_kw: object) -> None:
+        self.buildup.append(name)
+
+
+@asynccontextmanager
+async def _after_a_failed_activation(
+    store: MessageStore, tmp_path: Path, *, ca_schedule: Schedule | None = None, **kw: Any
+) -> AsyncIterator[tuple[RegistryRunner, Path, str]]:
+    """A passive box with a row held on each outbound, activated with the CA lane refused. The
+    File lane has delivered its row when this yields."""
+    ca, pin = _swapped_ca(tmp_path)
+    reg = _graph(tmp_path, ca, pin, ca_schedule=ca_schedule)
+    runner = _runner(store, reg, dr_standby=Priority.CRITICAL, **kw)
+    await runner.start()
+    try:
+        row_id = await store.enqueue_message(
+            channel_id=_IB, raw=_ADT, deliveries=[(_OB_CA, _ADT), (_OB_FILE, _ADT)]
+        )
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
+        assert _OB_CA not in runner._destinations
+        yield runner, ca, row_id
+    finally:
+        await runner.stop()
+
+
+async def _ca_row(store: MessageStore, row_id: str) -> tuple[str, int]:
+    """The status and attempts of the row held on the CA lane."""
+    (row,) = [r for r in await store.outbox_for(row_id) if r["destination_name"] == _OB_CA]
+    return row["status"], row["attempts"]
+
+
+async def test_the_scheduler_leaves_a_lane_that_failed_at_an_activation_held(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Red when the lane had no DR marker the scheduler read: the reload's new scheduler task
+    found it in its window and not running, started it with no connector, and charged the held
+    row an attempt (ADR 0048: a parked row is never charged). Nor does a tick read the CA again."""
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    reads: list[str] = []
+
+    async def counting(direction: str, name: str, settings: Any) -> None:
+        reads.append(name)
+        await check(direction, name, settings)
+
+    async with _after_a_failed_activation(
+        store,
+        tmp_path,
+        ca_schedule=_ALWAYS,
+        schedule_tick=0.02,
+        schedule_clock=lambda: _NOON,
+        lane_anchor_check=counting,
+    ) as (runner, _ca, row_id):
+        before = reads.count(_OB_CA)
+        await asyncio.sleep(0.3)
+        assert await _ca_row(store, row_id) == ("pending", 0)
+        assert not runner.outbound_running(_OB_CA)
+        assert reads.count(_OB_CA) == before
+
+
+async def test_a_start_or_restart_of_a_lane_that_failed_at_an_activation_charges_nothing(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """The CA is still refused. Red when the doors resumed the lane once its build failed again:
+    the held row was claimed with no connector and charged an attempt."""
+    async with _after_a_failed_activation(store, tmp_path) as (runner, _ca, row_id):
+        await runner.restart_outbound(_OB_CA)
+        await runner.start_outbound(_OB_CA)
+        await asyncio.sleep(0.3)
+        assert await _ca_row(store, row_id) == ("pending", 0)
+        assert not runner.outbound_running(_OB_CA)
+        assert "its tls_ca_file was refused" in (runner.outbound_failed(_OB_CA) or "")
+
+
+async def test_an_alert_rule_does_not_restart_a_lane_that_failed_at_an_activation(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An alert rule is the engine, as the scheduler is. Red when its restart reached the lane:
+    each fire read the CA again and could alert again, which can fire the rule again."""
+    async with _after_a_failed_activation(store, tmp_path) as (runner, _ca, _row_id):
+        restarted: list[str] = []
+
+        async def record(name: str) -> None:
+            restarted.append(name)
+
+        monkeypatch.setattr(runner, "restart_outbound", record)
+        engine = cast(Engine, SimpleNamespace(registry_runner=runner))
+        await _alert_control_action(engine, "restart_outbound", _OB_CA, default_target=False)
+        await _alert_control_action(engine, "restart_outbound", _OB_FILE, default_target=False)
+        assert restarted == [_OB_FILE]  # the control: a healthy lane is restarted
+
+
+async def test_a_lane_that_failed_at_an_activation_still_pages_its_buildup(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0031 paging holds for the held lane. Red when its park silenced it: a paused lane's
+    buildup page is suppressed, so a critical feed held at the takeover never paged."""
+    monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
+    sink = _PageSink()
+    async with _after_a_failed_activation(
+        store, tmp_path, alert_sink=sink, buildup_default=BuildupThreshold(max_depth=1)
+    ):
+        await _wait_until(lambda: _OB_CA in sink.buildup)
+
+
+async def test_a_passive_box_does_not_page_the_rows_it_holds(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the page above: on a passive box the park is the design, not a fault."""
+    monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
+    sink = _PageSink()
+    ca, pin = _swapped_ca(tmp_path)
+    runner = _runner(
+        store,
+        _graph(tmp_path, ca, pin),
+        dr_standby=Priority.CRITICAL,
+        alert_sink=sink,
+        buildup_default=BuildupThreshold(max_depth=1),
+    )
+    await runner.start()
+    try:
+        await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(_OB_CA, _ADT)])
+        await asyncio.sleep(0.3)
+        assert sink.buildup == []
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_builds_a_lane_that_failed_at_an_activation_once_its_ca_is_fixed(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Red when a reload lifted the park and built nothing: with the CA still refused the held
+    row was charged attempts, and with it fixed the lane stayed down until an operator start."""
+    async with _after_a_failed_activation(store, tmp_path) as (runner, ca, row_id):
+        await runner.reload()  # the CA is still refused
+        await asyncio.sleep(0.3)
+        assert await _ca_row(store, row_id) == ("pending", 0)
+        assert not runner.outbound_running(_OB_CA)
+
+        ca.write_bytes(_block(b"partner-ca"))
+        await runner.reload()
+        assert _OB_CA in runner._destinations and runner.outbound_failed(_OB_CA) is None
+        assert runner.outbound_running(_OB_CA)
+
+
+async def test_a_lane_built_while_the_box_turns_passive_again_stays_parked(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A failed activation hands the threshold back without the reload lock, so the box can turn
+    passive while a lane's first build awaits. Red when the unpark did not look again: the lane
+    delivered its held row on a passive box."""
+    ca = _ca(tmp_path)
+    armed, building, go = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def held(direction: str, name: str, settings: object) -> None:
+        if name == _OB_FILE and armed.is_set():
+            building.set()
+            await go.wait()
+
+    runner = _runner(
+        store, _graph(tmp_path, ca, _sha(ca)), lane_anchor_check=held, dr_standby=Priority.CRITICAL
+    )
+    await runner.start()
+    try:
+        await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(_OB_FILE, _ADT)])
+        armed.set()
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        reload = asyncio.create_task(runner.reload())
+        await asyncio.wait_for(building.wait(), timeout=10)
+        runner.set_dr_threshold(None, standby=Priority.CRITICAL)  # and its rollback
+        go.set()
+        await reload
+        await asyncio.sleep(0.3)
+
+        assert not runner.outbound_running(_OB_FILE)
+        assert (runner.outbound_filtered(_OB_FILE) or "").startswith("DR standby is passive")
+        assert not any((tmp_path / _OB_FILE).iterdir())
+    finally:
+        await runner.stop()
+
+
+async def test_a_cancelled_first_build_closes_the_connector_it_built(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red when the cancellation skipped the close: the built connector was dropped open."""
+    closed: list[str] = []
+    entered = asyncio.Event()
+
+    async def hang(self: FileDestination) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    async def aclose(self: FileDestination) -> None:
+        closed.append(self.directory.name)
+
+    monkeypatch.setattr(FileDestination, "validate_startup", hang)
+    monkeypatch.setattr(FileDestination, "aclose", aclose)
+    ca = _ca(tmp_path)
+    runner = _runner(store, _graph(tmp_path, ca, _sha(ca)), dr_standby=Priority.CRITICAL)
+    await runner.start()
+    try:
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)
+        runner._filtered.pop(("outbound", _OB_FILE), None)  # as the reconcile does first
+        build = asyncio.create_task(runner._ensure_destination_built(_OB_FILE))
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        build.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await build
+        assert closed == [_OB_FILE] and _OB_FILE not in runner._destinations
+    finally:
+        await runner.stop()
+
+
 # --- an activation under a log halt -------------------------------------------------------
 
 
@@ -374,6 +642,39 @@ async def test_an_activation_under_a_log_halt_drops_the_passive_marker(
         guard.writable = True  # the disk is repaired
         await runner.start_outbound(_OB_FILE)  # raised DrParkedError before
         await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
+    finally:
+        await runner.stop()
+
+
+async def test_a_lane_a_reload_adds_under_a_log_halt_takes_its_dr_marker(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An active box, under a halt, reloads a graph that adds a feed below the threshold. The
+    halt pauses that lane now. Red when only a lane already paused was judged: the new lane had no
+    marker, so a start of it once the log was repaired built a feed the profile parks."""
+    ca = _ca(tmp_path)
+    guard = _DeadLogGuard()
+    runner = _runner(
+        store,
+        _graph(tmp_path, ca, _sha(ca)),
+        dr_threshold=Priority.CRITICAL,
+        alert_sink=_LogPageSink(),
+    )
+    await runner.start()
+    try:
+        monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+        await runner._respond_to_log_sink_event(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        reg = _graph(tmp_path, ca, _sha(ca))
+        low = ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / _OB_FILE)})
+        reg.add_outbound(build_outbound_connection("OB_LOW", low, priority=Priority.NORMAL))
+        await runner.reload(reg)
+
+        assert runner.outbound_filtered("OB_LOW") is not None
+        guard.writable = True  # the disk is repaired
+        with pytest.raises(DrParkedError):
+            await runner.start_outbound("OB_LOW")
     finally:
         await runner.stop()
 
@@ -562,3 +863,29 @@ async def test_a_refused_activation_keeps_a_listener_an_operator_had_started(
     with pytest.raises(WiringError):
         await engine._dr_activate_profile()
     assert engine.dr_active is False and rr.inbound_running(_IB)
+
+
+async def test_a_refused_activation_closes_sessions_when_its_unbind_fails(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unbind and the close are separate steps. Red when one try held both: an unbind error
+    skipped the close, and the outbound sessions the attempt opened stayed open."""
+    rr = await _started(engine, tmp_path)
+
+    async def refuse(*_args: object) -> list[tuple[Any, str]]:
+        raise WiringError("a trust anchor this graph names is not readable")
+
+    async def unbind_fails(*_args: object, **_kw: object) -> None:
+        raise OSError("the listener would not close")
+
+    closed: list[bool] = []
+
+    async def close() -> None:
+        closed.append(True)
+
+    monkeypatch.setattr(rr, "_check_reload_lane_anchors", refuse)
+    monkeypatch.setattr(rr, "park_intake", unbind_fails)
+    monkeypatch.setattr(rr, "close_passive_connectors", close)
+    with pytest.raises(WiringError):
+        await engine._dr_activate_profile()
+    assert closed == [True] and engine.dr_active is False
