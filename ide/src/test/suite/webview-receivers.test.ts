@@ -12,7 +12,7 @@ import type { Graph } from "../../graphModel";
 import { homeScript } from "../../homeWebview";
 import { FIELDS, securityEditorScript } from "../../securityEditorWebview";
 import { sourceControlScript } from "../../sourceControlWebview";
-import { CHANNEL_FIELD } from "../../webviewMessaging";
+import { CHANNEL_FIELD, SHAPE_HELPERS } from "../../webviewMessaging";
 import { wiringMapPayload } from "../../wiringMapModel";
 import { wiringMapScript } from "../../wiringMapWebview";
 
@@ -185,6 +185,22 @@ const ALERT_RULES_QUOTED = [{ event_type: "queue_buildup", min_depth: "500", ind
  *  so a bare `[[alerts.rules]]` arrives as this. */
 const ALERT_RULES_BARE = [{ index: 0 }];
 
+/** A HAND-EDITED rule carrying AlertRule keys the host's Rule does not name (settings.py). The
+ *  receiver reads none of them and must not refuse a list for having them. */
+const ALERT_RULES_EXTRA_KEYS = [
+  {
+    event_type: "queue_buildup",
+    min_depth: 10,
+    recipients: ["oncall@example.org"],
+    id: "depth-page",
+    mute: false,
+    control_action: "restart_outbound",
+    schedule: { days: ["mon"], start: "08:00", end: "17:00" },
+    escalate: [{ after_occurrences: 3, severity: "critical" }],
+    index: 0,
+  },
+];
+
 /** alertEditor.ts posts `String(e)` for a thrown CLI error; this is a recorded CLI refusal. */
 const CLI_ERROR = String(
   new Error(
@@ -220,7 +236,12 @@ const alertRules: Receiver = {
        <div id="error">${SENTINEL}</div><button id="add"></button><button id="close"></button>`,
     ),
   wellFormed: {
-    rules: [ALERT_OK, { command: "rules", rules: ALERT_RULES_BARE }, { command: "rules", rules: [] }],
+    rules: [
+      ALERT_OK,
+      { command: "rules", rules: ALERT_RULES_BARE },
+      { command: "rules", rules: ALERT_RULES_EXTRA_KEYS },
+      { command: "rules", rules: [] },
+    ],
     error: [ERROR_OK],
   },
   malformed: {
@@ -712,6 +733,26 @@ suite("webview receivers discard a malformed payload and render a well-formed on
         Object.keys(r.wellFormed).sort(),
         `${r.panel}: every handled type needs both a well-formed fixture and malformed cases`,
       );
+    }
+  });
+
+  test("absent-ok and null-ok are separate declarations, and a field may be both", () => {
+    // SHAPE_HELPERS is the source every receiver embeds, so this runs the shipped helpers.
+    type Check = (x: unknown) => boolean;
+    const h = new Function(`${SHAPE_HELPERS}; return { mfOpt, mfNullable, mfStr };`)() as {
+      mfOpt(x: unknown, f: Check): boolean;
+      mfNullable(x: unknown, f: Check): boolean;
+      mfStr: Check;
+    };
+    const modes: [string, Check, boolean[]][] = [
+      // What each accepts of: a string, undefined, null, a number.
+      ["neither", h.mfStr, [true, false, false, false]],
+      ["absent-ok", (x) => h.mfOpt(x, h.mfStr), [true, true, false, false]],
+      ["null-ok", (x) => h.mfNullable(x, h.mfStr), [true, false, true, false]],
+      ["both", (x) => h.mfOpt(x, (v) => h.mfNullable(v, h.mfStr)), [true, true, true, false]],
+    ];
+    for (const [mode, check, want] of modes) {
+      assert.deepStrictEqual(["s", undefined, null, 7].map(check), want, mode);
     }
   });
 

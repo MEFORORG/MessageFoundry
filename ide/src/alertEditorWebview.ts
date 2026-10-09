@@ -98,8 +98,9 @@ export function alertEditorScript(
 
     // One entry per message the host posts (at least alertEditor.ts). A rule is one "alert list" row,
     // typed as the host's Rule: the ordinal is always there, and every other field may be absent but
-    // has its declared type when present. None may be null: the row is a TOML table, and TOML has no
-    // null. The three numerics are numbers. A hand-edited file can hold a quoted number, which the
+    // has its declared type when present. None may be null, although Rule (alertEditor.ts) declares
+    // "| null" on four of them: the row is a TOML table, TOML has no null, and so none is ever sent.
+    // renderRules() still tests "== null", which is how it sees an absent field. The three numerics are numbers. A hand-edited file can hold a quoted number, which the
     // engine's lax model loads; that row is not a Rule, so the list is discarded (BACKLOG #1123).
     const SHAPES = {
       rules: (d) => mfArrOf(d.rules, (r) => mfObj(r) && mfInt(r.index) &&

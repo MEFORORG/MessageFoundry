@@ -181,8 +181,8 @@ export function securityEditorScript(token: string, fields: unknown): string {
     function refuse(problem) {
       $('save').disabled = true;
       $('form').style.display = 'none';
-      refusal = 'These settings cannot be shown. The engine sent a state this form cannot read: ' + problem +
-        '. Save is off until a readable state arrives.';
+      refusal = 'These settings cannot be shown. The state sent to this form is malformed: ' + problem +
+        '. Save is off until a well-formed state arrives.';
       show(refusal);
     }
 
