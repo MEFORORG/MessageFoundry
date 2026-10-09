@@ -575,7 +575,8 @@ def _serve(
     host: str | None = None,
 ) -> int:
     """A prod-PHI serve with every OTHER gate pre-cleared, so only forwarding decides it. ``host``
-    replaces the verified collector's name, for a test that needs an IP-literal one."""
+    replaces the verified collector's name, for a test that needs an IP-literal one; it needs
+    ``forwarding``, which also lists that host in ``[egress].allowed_syslog`` (BACKLOG #2356)."""
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import (
         PHI_GATE_PROVISIONS_TOML,
@@ -586,13 +587,13 @@ def _serve(
 
     monkeypatch.chdir(tmp_path)
     setenv_retention_windows(monkeypatch)
+    assert forwarding or host is None
     if forwarding:
-        setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path))
-    if host is not None:
-        monkeypatch.setenv("MEFOR_LOGGING_FORWARD_HOST", host)
-        # BACKLOG #2356: the collector is an egress destination too, and the next start check
-        # refuses one that is not listed. Listed here so only the forwarding gate decides.
-        monkeypatch.setenv("MEFOR_EGRESS_ALLOWED_SYSLOG", host)
+        bundle = make_syslog_ca_and_crl(tmp_path)
+        if host is None:
+            setenv_verified_log_forwarding(monkeypatch, bundle)
+        else:
+            setenv_verified_log_forwarding(monkeypatch, bundle, host)
     (tmp_path / "messagefoundry.toml").write_text(
         PHI_GATE_PROVISIONS_TOML + extra, encoding="utf-8"
     )

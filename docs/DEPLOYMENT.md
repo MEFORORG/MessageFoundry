@@ -463,7 +463,8 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    `enforce` this is required, not optional: set `forward_host` (a collector on another host),
    `forward_port` (usually 6514), `forward_protocol = "tls"`, `forward_tls_ca_file` and
    `forward_tls_crl_file`, or `serve` refuses to start (BACKLOG #1966). A local TLS agent on 127.0.0.1
-   does not satisfy it. Leave `[security].require_mfa` on. It defaults on for every account,
+   does not satisfy it, and neither does this host's own name or address. List the collector in
+   `[egress].allowed_syslog` too, or the start is refused on that list. Leave `[security].require_mfa` on. It defaults on for every account,
    directory accounts included ([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)).
 
 ---

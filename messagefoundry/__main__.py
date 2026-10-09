@@ -2010,9 +2010,11 @@ def _start_logging(
 
     # BACKLOG #2356: the collector is an outbound destination, and until this check no [egress]
     # list governed it. The forwarder is not a connection, so the graph's egress check never sees
-    # it. Decided here, last of the forwarding gates and before the handler is installed, so a
-    # refused collector is never dialled. It refuses under either enforcement dial, as every
-    # [egress] list does.
+    # it. Decided here, last of the forwarding gates and before the handler is installed, so the
+    # forwarder never dials a refused collector and no packet goes to it. The forwarding gate
+    # above has already asked the routing table about an IP-literal collector, which connects a
+    # UDP socket and sends nothing. It refuses under either enforcement dial, as every [egress]
+    # list does.
     if log_forward is not None:
         from messagefoundry.transports.egress import syslog_forward_refusal
 
@@ -2057,8 +2059,9 @@ def _start_logging(
         print(f"error: {exc}", file=sys.stderr)
         return 2
     # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged again now that the
-    # handlers and the forwarder exist, at WARNING and the ordinary way, so [logging].level
-    # applies to them as it does to the #1989 lines the caller logs next.
+    # caller's handlers are installed, at WARNING and the ordinary way, so the caller's log level
+    # applies to them. Logged whether or not a forwarder came up: stdout and the log file are
+    # handlers too. `serve` logs its #1989 static-credential lines next, for the same reason.
     for _gate_note in _gate_notes:
         logging.getLogger(__name__).warning("%s", _gate_note)
     if forwarder_live and log_forward is not None:

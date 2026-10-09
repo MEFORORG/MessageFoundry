@@ -71,14 +71,16 @@ def _run(
     verified_forwarding: bool = False,
     allowed_syslog: str | None = _PROVISIONED,
     provisions: str = PHI_GATE_PROVISIONS_TOML,
+    recorder: _Recorder | None = None,
 ) -> tuple[int, _Recorder]:
     """Run ``serve`` or ``supervise`` as a prod instance with every OTHER gate pre-cleared.
 
     ``allowed_syslog`` overrides the ``[egress].allowed_syslog`` value the forwarding provision
-    sets, which lists its own collector; ``None`` leaves the list unset."""
+    sets, which lists its own collector; ``None`` leaves the list unset. ``recorder`` is the
+    caller's own, for a test that watches it while the command runs."""
     from messagefoundry.__main__ import main
 
-    recorder = _Recorder()
+    recorder = recorder or _Recorder()
     monkeypatch.chdir(tmp_path)
     setenv_retention_windows(monkeypatch)
     if verified_forwarding:
@@ -206,8 +208,10 @@ def test_the_supervisor_is_refused_by_each_gate_exactly_as_serve_is(
 
 # --- the own-host refusal and its fail-open notes (vault BACKLOG #2375) --------------------------
 #
-# Both came to `serve` after the gates moved into the shared helper. These two tests fail if the
-# helper loses either, which is the only way the supervisor could come to differ from `serve`.
+# Both came to `serve` after the gates moved into the shared helper. The tests below fail if the
+# helper loses either. They cover at least: the refusal, the note on stderr before logging is
+# configured, and the note in the log after it. The own-host rule itself is pinned in
+# tests/test_forwarding_gate.py.
 
 
 def test_a_collector_that_is_this_host_is_refused_for_the_supervisor_exactly_as_for_serve(
@@ -229,50 +233,73 @@ def test_a_collector_that_is_this_host_is_refused_for_the_supervisor_exactly_as_
     assert recorder.forwards == [], "the supervisor installed a forwarder to its own host"
 
 
+_NO_NAME_NOTE = "the OS gave no host name"
+
+
+class _NoteWatch(_Recorder):
+    """A recorder that notes what stderr held when the forwarding ``configure_logging`` call was
+    made, and reports no live forwarder when ``live`` is false, as a collector that is down does."""
+
+    def __init__(self, capsys: pytest.CaptureFixture[str], *, live: bool) -> None:
+        super().__init__()
+        self._capsys = capsys
+        self._live = live
+        self.stderr_before_configure = ""
+
+    def configure_logging(self, *args: Any, **kwargs: Any) -> bool:
+        if "forward" in kwargs:
+            self.stderr_before_configure += self._capsys.readouterr().err
+        return super().configure_logging(*args, **kwargs) and self._live
+
+    @property
+    def configured(self) -> bool:
+        return any("forward" in kw for _, kw in self.logging_calls)
+
+
+@pytest.mark.parametrize("live", [True, False], ids=["forwarder-up", "forwarder-down"])
 @pytest.mark.parametrize("command", ["serve", "supervise"])
-def test_a_fail_open_note_is_printed_before_logging_and_logged_after_the_forwarder_exists(
+def test_a_fail_open_note_is_printed_before_logging_and_logged_after_it_is_configured(
     command: str,
+    live: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The own-host check fails open when the OS gives no name, and its note is the record of
-    that pass. It goes to stderr at the gate, then to the log once the forwarder is installed."""
+    that pass. It goes to stderr at the gate, once and before ``configure_logging``, because a
+    start refused after the gate never configures logging. It is logged once that call has
+    returned, whether or not a forwarder came up: stdout and the log file are handlers too."""
 
     def no_name() -> str:
         raise OSError("no host name")
 
     monkeypatch.setattr(socket, "gethostname", no_name)
-    installed_when_logged: list[int] = []
+    recorder = _NoteWatch(capsys, live=live)
+    configured_when_logged: list[bool] = []
 
     class _Watch(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
-            if "the OS gave no host name" in record.getMessage():
-                installed_when_logged.append(len(recorder_box[0].forwards))
+            if _NO_NAME_NOTE in record.getMessage():
+                configured_when_logged.append(recorder.configured)
 
-    recorder_box: list[_Recorder] = []
-    real_init = _Recorder.__init__
-
-    def tracking_init(self: _Recorder) -> None:
-        real_init(self)
-        recorder_box.append(self)
-
-    monkeypatch.setattr(_Recorder, "__init__", tracking_init)
     watch = _Watch(level=logging.WARNING)
     main_log = logging.getLogger("messagefoundry.__main__")
     main_log.addHandler(watch)
     try:
         with caplog.at_level("WARNING"):
-            rc, recorder = _run(command, tmp_path, monkeypatch, verified_forwarding=True)
+            rc, _ = _run(
+                command, tmp_path, monkeypatch, verified_forwarding=True, recorder=recorder
+            )
     finally:
         main_log.removeHandler(watch)
     assert rc == 0 and len(recorder.forwards) == 1
-    assert "warning: the OS gave no host name" in capsys.readouterr().err
-    # Logged once, by the start code and not by the gate itself, and only with a forwarder up.
-    notes = [r for r in caplog.records if "the OS gave no host name" in r.getMessage()]
+    assert recorder.stderr_before_configure.count(f"warning: {_NO_NAME_NOTE}") == 1
+    assert _NO_NAME_NOTE not in capsys.readouterr().err, "printed again after configure_logging"
+    # Logged once, by the start code and not by the gate itself, and only once configured.
+    notes = [r for r in caplog.records if _NO_NAME_NOTE in r.getMessage()]
     assert [r.name for r in notes] == ["messagefoundry.__main__"], notes
-    assert installed_when_logged == [1]
+    assert configured_when_logged == [True]
 
 
 # --- forwarding not configured ------------------------------------------------------------------
