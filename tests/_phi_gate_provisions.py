@@ -220,7 +220,8 @@ def verified_log_forwarding_env(bundle: str, host: str | None = None) -> dict[st
     """The environment that satisfies the #1966 gate and lists its collector in
     ``[egress].allowed_syslog``, given a CA+CRL bundle path. ``host`` replaces the collector, for
     a test that needs an IP-literal one."""
-    host = host or VERIFIED_LOG_FORWARDING_HOST
+    if host is None:
+        host = VERIFIED_LOG_FORWARDING_HOST
     return {
         "MEFOR_LOGGING_FORWARD_HOST": host,
         "MEFOR_LOGGING_FORWARD_PROTOCOL": "tls",

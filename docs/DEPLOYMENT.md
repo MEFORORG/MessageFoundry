@@ -463,7 +463,7 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    `enforce` this is required, not optional: set `forward_host` (a collector on another host),
    `forward_port` (usually 6514), `forward_protocol = "tls"`, `forward_tls_ca_file` and
    `forward_tls_crl_file`, or `serve` and `supervise` refuse to start (BACKLOG #1966). A local TLS
-   agent on 127.0.0.1 does not satisfy it; [SECURITY.md, *Audit*](SECURITY.md#audit) says what else the gate checks. The
+   agent on 127.0.0.1 does not satisfy it; [SECURITY.md, *Audit*](SECURITY.md#audit-1) says what else the gate checks. The
    collector is an egress destination too, so list it in
    [`[egress].allowed_syslog`](CONFIGURATION.md#egress), which says when an unlisted one is
    refused. Leave `[security].require_mfa` on. It defaults on for every account,

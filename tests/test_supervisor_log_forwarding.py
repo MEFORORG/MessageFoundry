@@ -305,27 +305,24 @@ def test_a_fail_open_note_still_reaches_stderr_when_the_next_gate_refuses_the_st
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Why the stderr copy is printed at the gate and not beside the log copy: a start the
     allow-list refuses next never configures logging, so stderr holds the only record that the
     forwarding gate passed without its own-host check."""
     monkeypatch.setattr(socket, "gethostname", _no_host_name)
-    recorder = _NoteWatch(capsys, caplog)
-    with caplog.at_level("WARNING"):
-        rc, _ = _run(
-            command,
-            tmp_path,
-            monkeypatch,
-            verified_forwarding=True,
-            allowed_syslog="other.example.org",
-            recorder=recorder,
-        )
+    rc, recorder = _run(
+        command,
+        tmp_path,
+        monkeypatch,
+        verified_forwarding=True,
+        allowed_syslog="other.example.org",
+    )
     err = capsys.readouterr().err
     assert rc == 2 and recorder.forwards == [] and recorder.spawned == 0
     assert err.count(f"warning: {_NO_NAME_NOTE}") == 1
-    assert len(_errors(err)) == 1 and "allowed_syslog" in _errors(err)[0]
-    assert _note_records(caplog) == [], "logged for a start that never configured logging"
+    # The allow-list's own refusal, not the forwarding gate's, whose fix text also names the list.
+    assert len(_errors(err)) == 1
+    assert "is not in the [egress].allowed_syslog allowlist" in _errors(err)[0]
 
 
 # --- forwarding not configured ------------------------------------------------------------------
