@@ -216,12 +216,15 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
 def _error_text(exc: BaseException) -> str:
     """``Type: message`` for an error reported across the process boundary. A Unicode error's str()
     names the character or byte it failed on (vault BACKLOG #3185), and mode=off renders it from its
-    attributes, so this boundary must too. Never raises: the error's own __str__ may, and so may the
-    import after untrusted config has run, and either would kill the worker mid-report."""
+    attributes, so this boundary must too. An error that HOLDS one, as ``ValueError("bad", exc)``,
+    prints that error's repr, the whole input, so it renders the same way (vault BACKLOG #3295).
+    Never raises: the error's own __str__ may, and so may the import after untrusted config has
+    run, and either would kill the worker mid-report."""
     try:
-        from messagefoundry.redaction import safe_exc  # cached: logging_setup imported it at load
+        # cached: logging_setup imported it at load
+        from messagefoundry.redaction import codec_safe_line
 
-        return safe_exc(exc) if isinstance(exc, UnicodeError) else f"{type(exc).__name__}: {exc}"
+        return codec_safe_line(exc)
     except Exception:  # noqa: BLE001 — the class name is all that is left to report
         return type(exc).__name__
 

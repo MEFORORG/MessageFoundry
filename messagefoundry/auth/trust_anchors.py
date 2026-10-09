@@ -119,6 +119,7 @@ from messagefoundry.auth.anchor_path import (
     anchor_path_verdict,
 )
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
+from messagefoundry.redaction import codec_safe_str
 from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
@@ -1544,7 +1545,11 @@ def make_settings_anchor_preflight(
             raise WiringError(f"a settings trust anchor was refused: {exc}") from exc
         except (OSError, ValueError) as exc:
             # An unreadable anchor is a refused anchor, as it was when the reload route ran this.
-            unreadable = TrustAnchorError(f"a trust anchor could not be read: {exc}")
+            # codec_safe_str: a file that is not UTF-8 arrives here as a ValueError too, and its
+            # own text names the byte (vault BACKLOG #3295).
+            unreadable = TrustAnchorError(
+                f"a trust anchor could not be read: {codec_safe_str(exc)}"
+            )
             unreadable.__cause__ = exc
             raise WiringError(f"a settings trust anchor was refused: {unreadable}") from unreadable
         await _report_restart_required(frozen, store, seen=seen)
