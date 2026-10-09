@@ -960,19 +960,22 @@ suite("webview receivers discard a malformed payload and render a well-formed on
 
   test("Alert Rules: a discarded list names the rule, the field and what was wrong", () => {
     const SENT = '<img src=x onerror="window.pwned=1"><b id="planted">';
-    // The last column: true when the problem is a value in the file, which the operator can fix.
-    const cases: [string, (c: Payload) => void, string, boolean][] = [
-      ["a quoted number", (c) => (c.rules[2].min_depth = "500"), "rule 2, min_depth: expected a number, got string", true],
-      ["a boolean age", (c) => (c.rules[0].min_oldest_seconds = true), "rule 0, min_oldest_seconds: expected a number, got boolean", true],
-      ["a null cooldown", (c) => (c.rules[1].cooldown_seconds = null), "rule 1, cooldown_seconds: expected a number, got null", true],
-      ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "rule 1, min_depth: expected a number, got string", true],
-      ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "rule 0, connection: expected text, got list", true],
-      ["transports is text", (c) => (c.rules[0].transports = SENT), "rule 0, transports: expected a list of text, got string", true],
-      ["a rule with no index", (c) => delete c.rules[1].index, "entry 2 of the list has no whole-number index", false],
-      ["an entry that is text", (c) => (c.rules[2] = SENT), "entry 3 of the list is not a rule", false],
-      ["no list", (c) => delete c.rules, "the list is missing or is not a list", false],
+    // The last two columns: the problem is a value in the file, which the operator can fix; and
+    // it is a string where a number belongs, the one case the quoting hint fits.
+    const cases: [string, (c: Payload) => void, string, boolean, boolean][] = [
+      ["a quoted number", (c) => (c.rules[2].min_depth = "500"), "rule 2, min_depth: expected a number, got string", true, true],
+      ["a boolean age", (c) => (c.rules[0].min_oldest_seconds = true), "rule 0, min_oldest_seconds: expected a number, got boolean", true, false],
+      // TOML has no null, so a null did not come from the file.
+      ["a null cooldown", (c) => (c.rules[1].cooldown_seconds = null), "rule 1, cooldown_seconds: expected a number, got null", false, false],
+      ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "rule 1, min_depth: expected a number, got string", true, true],
+      ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "rule 0, connection: expected text, got list", true, false],
+      ["transports is text", (c) => (c.rules[0].transports = SENT), "rule 0, transports: expected a list of text, got string", true, false],
+      // Positions count from 0, as the ordinals in the table's first column do.
+      ["a rule with no index", (c) => delete c.rules[1].index, "the entry at position 1 of the list has no whole-number index", false, false],
+      ["an entry that is text", (c) => (c.rules[2] = SENT), "the entry at position 2 of the list is not a rule", false, false],
+      ["no list", (c) => delete c.rules, "the list is missing or is not a list", false, false],
     ];
-    for (const [why, change, problem, inFile] of cases) {
+    for (const [why, change, problem, inFile, quoted] of cases) {
       const p = alertRules.load();
       const doc = p.window.document;
       p.deliver(variant(ALERT_OK, change));
@@ -981,7 +984,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       assert.ok(shown.startsWith(ALERT_REFUSAL), `${why}: no refusal, got "${shown}"`);
       assert.ok(shown.includes(problem), `${why}: the refusal does not say "${problem}": "${shown}"`);
       // Only a value in the file is the operator's to fix. The rest is not, and must not say so.
-      assert.strictEqual(shown.includes("a number must not be quoted"), inFile, `${why}: wrong advice: "${shown}"`);
+      assert.strictEqual(shown.includes("Fix that value in [[alerts.rules]]"), inFile, `${why}: wrong advice: "${shown}"`);
+      assert.strictEqual(shown.includes("a number must not be quoted"), quoted, `${why}: wrong hint: "${shown}"`);
       assert.strictEqual(shown.includes("No edit to the file fixes this"), !inFile, `${why}: wrong advice: "${shown}"`);
       assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "rules"')), `${why}: console.warn was dropped`);
       // Nothing the message carried is echoed, and nothing in it became an element.
@@ -1052,10 +1056,28 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     doc.getElementById("add").click();
     assert.strictEqual(p.posted.length, 1);
     assert.strictEqual(p.posted[0].command, "add");
+    // That valid Add did not take down the only line saying why Remove is off.
+    assert.ok(refusalShown(p).includes("Remove is off"), `the reason went with the Add: "${refusalShown(p)}"`);
     // The next list the host reads brings Remove back.
     p.deliver(ALERT_OK);
     removeButtons(p)[0].click();
     assert.strictEqual(JSON.stringify(p.posted[1]), JSON.stringify({ command: "remove", index: 0 }));
+  });
+
+  test("Alert Rules: an error before any list has rendered takes down the seed 'No rules yet' note", () => {
+    // On first open the note is the page's own markup. If the first read fails, it would stand
+    // beside the error as a claim about a file nobody read.
+    const p = alertRules.load();
+    const empty = p.window.document.getElementById("empty");
+    assert.notStrictEqual(empty.style.display, "none", "the seed note is not up before any message");
+    p.deliver(ERROR_OK);
+    assert.strictEqual(empty.style.display, "none", "the note stands beside the error");
+    assert.strictEqual(refusalShown(p), CLI_ERROR);
+    // The control: after an EMPTY list has rendered, the note is a reading, and an error leaves it.
+    const q = alertRules.load();
+    q.deliver({ command: "rules", rules: [] });
+    q.deliver(ERROR_OK);
+    assert.strictEqual(q.window.document.getElementById("empty").style.display, "");
   });
 
   test("Security Settings: an error that follows a refusal keeps the reason on the page", () => {

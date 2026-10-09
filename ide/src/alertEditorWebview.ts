@@ -25,9 +25,10 @@ export function alertEditorScript(
     // failed remove and a failed re-read alike, and after the last two the rows may not match the
     // file. Remove names an ordinal, so it waits for a list that was read after the error.
     let unconfirmed = false;
-    // What rulesProblem() said of the last 'rules' message, kept so one walk serves both the shape
-    // check and the refusal.
-    let lastProblem = null;
+    const REMOVE_OFF = 'Remove is off until the rules are read again: run the Alert Rules command again, or add a rule.';
+    // True once a list has rendered. Until then the "No rules yet" note is the page's seed text,
+    // not something read from the file.
+    let listed = false;
 
     for (const t of EVENT_TYPES) { const o = document.createElement('option'); o.value = t; o.textContent = t; $('event_type').appendChild(o); }
     for (const s of SEVERITIES) { const o = document.createElement('option'); o.value = s; o.textContent = s; $('severity').appendChild(o); }
@@ -67,7 +68,8 @@ export function alertEditorScript(
       for (const [k, label] of [['min_depth','Min depth'],['min_oldest_seconds','Min oldest'],['cooldown_seconds','Cooldown']]) {
         if (rule[k] !== undefined && !Number.isFinite(rule[k])) { show(label + ' must be a number.'); return false; }
       }
-      errorEl.style.display = 'none';
+      // While Remove is off, the line saying so stays up: it is the only reason on the page.
+      if (unconfirmed && $('rows').children.length > 0) { show(REMOVE_OFF); } else { errorEl.style.display = 'none'; }
       return true;
     }
     // 'block', not '': the page's stylesheet hides .error, and clearing the inline value would hand
@@ -84,11 +86,12 @@ export function alertEditorScript(
       $('rules').style.display = 'none';
       $('empty').style.display = 'none';
       $('add').disabled = true;
-      // Only a value in the file is the operator's to fix. A list that is not a list, or an entry
-      // with no ordinal, comes from the command that printed it, and no edit to the file changes it.
+      // Only a value in the file is the operator's to fix. A list that is not a list, an entry with
+      // no ordinal, or a null (TOML has none) comes from the command that printed it, and no edit to
+      // the file changes it. The quoting hint is given only for the case it fits.
       const todo = problem.inFile
-        ? ' Fix that value in [[alerts.rules]] of the service-settings file (a number must not be quoted),' +
-          ' then run the Alert Rules command again.'
+        ? ' Fix that value in [[alerts.rules]] of the service-settings file' +
+          (problem.quoted ? ' (a number must not be quoted)' : '') + ', then run the Alert Rules command again.'
         : ' No edit to the file fixes this: the command that lists the rules printed something this panel' +
           ' does not expect. Run the Alert Rules command again, and report it if this stays.';
       show('These rules cannot be shown. The list sent to this panel is malformed: ' + problem.text + '.' + todo +
@@ -96,6 +99,7 @@ export function alertEditorScript(
     }
 
     function renderRules(rules) {
+      listed = true;
       refused = false;
       unconfirmed = false;
       $('add').disabled = false;
@@ -147,26 +151,32 @@ export function alertEditorScript(
       ['cooldown_seconds', mfNum, 'a number'], ['transports', (t) => mfArrOf(t, mfStr), 'a list of text'],
     ];
     // What is wrong with the first entry of a 'rules' message that is not a Rule, or null. It names
-    // the rule by its ordinal, the field, and the kind of value found. Never the value. inFile says
-    // whether the problem is a value in the file, which is the only kind the operator can fix.
+    // the rule by its ordinal, the field, and the kind of value found. Never the value. An entry
+    // with no usable ordinal is named by its position, counted from 0 as the ordinals are. inFile
+    // says whether the problem is a value in the file, the only kind the operator can fix; quoted
+    // says it is a string where a number belongs.
     function rulesProblem(d) {
-      const problem = (text, inFile) => ({ text: text, inFile: inFile });
-      if (!Array.isArray(d.rules)) { return problem('the list is missing or is not a list', false); }
+      const problem = (text, inFile, quoted) => ({ text: text, inFile: inFile, quoted: quoted });
+      if (!Array.isArray(d.rules)) { return problem('the list is missing or is not a list', false, false); }
       // By index, not for-of or every(): a hole must be seen as an entry that is not a rule.
       for (let i = 0; i < d.rules.length; i++) {
         const r = d.rules[i];
-        if (!mfObj(r)) { return problem('entry ' + (i + 1) + ' of the list is not a rule', false); }
-        if (!mfInt(r.index)) { return problem('entry ' + (i + 1) + ' of the list has no whole-number index', false); }
+        if (!mfObj(r)) { return problem('the entry at position ' + i + ' of the list is not a rule', false, false); }
+        if (!mfInt(r.index)) {
+          return problem('the entry at position ' + i + ' of the list has no whole-number index', false, false);
+        }
         for (const [key, ok, want] of RULE_FIELDS) {
-          if (!mfOpt(r[key], ok)) {
-            return problem('rule ' + r.index + ', ' + key + ': expected ' + want + ', got ' + mfKind(r[key]), true);
+          const v = r[key];
+          if (!mfOpt(v, ok)) {
+            return problem('rule ' + r.index + ', ' + key + ': expected ' + want + ', got ' + mfKind(v),
+              v !== null, want === 'a number' && typeof v === 'string');
           }
         }
       }
       return null;
     }
     const SHAPES = {
-      rules: (d) => (lastProblem = rulesProblem(d)) === null,
+      rules: (d) => rulesProblem(d) === null,
       error: (d) => mfStr(d.message),
     };
     ${WEBVIEW_GUARD_NOTE}
@@ -175,7 +185,10 @@ export function alertEditorScript(
       if (!d) { return; }
       if (!mfShapeOk(d, 'command', SHAPES, 'Alert Rules')) {
         // A discarded list is shown as well as warned, and the page stops acting on the old one.
-        if (d.command === 'rules' && lastProblem !== null) { refuse(lastProblem); }
+        // rulesProblem() runs again here, as stateProblem() does in the Security Settings page: the
+        // shape entry stays a pure check, and the second walk happens only for a discarded list.
+        const problem = d.command === 'rules' ? rulesProblem(d) : null;
+        if (problem !== null) { refuse(problem); }
         return;
       }
       if (d.command === 'rules') { renderRules(d.rules); errorEl.style.display = 'none'; }
@@ -187,10 +200,12 @@ export function alertEditorScript(
           return;
         }
         unconfirmed = true;
+        // Before any list has rendered, "No rules yet" is seed text and would stand beside this
+        // error as a claim about a file nobody read.
+        if (!listed) { $('empty').style.display = 'none'; }
         const stale = $('rows').querySelectorAll('button');
         for (let i = 0; i < stale.length; i++) { stale[i].disabled = true; }
-        show(stale.length === 0 ? d.message : d.message +
-          ' Remove is off until the rules are read again: run the Alert Rules command again, or add a rule.');
+        show(stale.length === 0 ? d.message : d.message + ' ' + REMOVE_OFF);
       }
     });
   `;
