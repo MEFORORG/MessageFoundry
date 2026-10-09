@@ -7223,14 +7223,19 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
       (``MEFOR_UPDATE_CHECK=false``, ``MEFOR_STORE``). No setting has that name;
     * the name splits as ``MEFOR_<NEAR>_<KEY>`` where ``NEAR`` is no section, is close to one, and
       ``KEY`` is a real setting of that section or the rest of a :data:`_OUT_OF_BAND_ENV` name
-      (``MEFOR_STOER_PATH``). Requiring a real key keeps an unrelated tool's variable out.
+      (``MEFOR_STOER_PATH``). ``NEAR`` is compared only with sections of as many ``_``-parts as it
+      has. Without that, the test suite's own ``MEFOR_TEST_FORCE_AAD_BIND`` read ``TEST_FORCE`` as
+      close to ``store``, and ``aad_bind`` is a setting there. Requiring a real key keeps out at
+      least some other names that belong to other tools.
 
     Everything else is still dropped with no message: at least a name close to no section, and a
     name with a typo in BOTH parts. Closeness is :func:`difflib.get_close_matches` at its default
     cutoff, as :func:`_near_field` uses it."""
     models = _section_models()
     referenced = _env_secret_reference_names(data)
-    sections = sorted(models)
+    by_parts: dict[int, list[str]] = {}
+    for section in sorted(models):
+        by_parts.setdefault(section.count("_") + 1, []).append(section)
     notes: list[str] = []
     for name in sorted(environ):
         if (
@@ -7252,7 +7257,7 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
             if near_part in models:
                 # A real section with a key: the refusal above already judged this name.
                 break
-            near = difflib.get_close_matches(near_part, sections, n=1)
+            near = difflib.get_close_matches(near_part, by_parts.get(cut, []), n=1)
             if not near:
                 continue
             meant = f"{_ENV_PREFIX}{near[0].upper()}_{key.upper()}"

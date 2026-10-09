@@ -184,6 +184,12 @@ def test_a_name_that_looks_like_an_unread_setting_is_warned_about(name: str, hin
         "MEFOR_STOER_ZZZZ",  # near a section, and the key is no setting of it
         "MEFOR_PORT",  # what a Kubernetes Service named "mefor" injects
         "MEFOR_PORT_8765_TCP_ADDR",
+        # The test suite's own switches (tests/conftest.py and ci.yml). TEST_FORCE is close to
+        # "store" and aad_bind is a [store] setting, so only the part count keeps this one out.
+        "MEFOR_TEST_FORCE_AAD_BIND",
+        "MEFOR_TEST_SQLSERVER",
+        "MEFOR_TEST_POSTGRES",
+        "MEFOR_TEST_PORT_BASE",
         "PATH",
     ],
 )
