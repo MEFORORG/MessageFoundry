@@ -611,7 +611,8 @@ sign-in on every retry. So the sign-in is floored only when the verified `auth_t
 the flow's start, which means the person signed in at the IdP inside this flow. An IdP clock that
 runs ahead can make an older sign-on look fresh. The refusal then clears once the skew has passed,
 and it never lets a flow through early. An IdP clock that runs behind can do the reverse, and then
-that sign-in is not floored.
+that sign-in is not floored. The list under *What these floors do not do*, below, records what that
+rule leaves unpaced.
 
 **Where the defaults come from.** Both are **provisional**, taken from published human-timing
 research under the owner's ruling of 2026-09-23, not from a timed session on this console. The
@@ -648,6 +649,18 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   only the floor. While `oidc_require_mfa_claim` is on, the token must still carry another `amr`
   in `oidc_mfa_amr_values` or an `acr` in `oidc_required_acr_values`, so an IdP that sends only
   the exempt value is refused as `mfa_claim_missing`.
+- A sign-in that rides a live single sign-on session at the IdP would not be paced. *Why a sign-in
+  callback is floored only sometimes*, above, gives the rule. So a client could avoid the floor by
+  authenticating at the IdP first, by script or by hand, and starting the flow afterwards. It
+  cannot forge the verified `auth_time`, but it chooses when that sign-on happens. The engine has
+  no human step to time between such a start and its callback. It also cannot check the IdP's own
+  anti-automation. This is a decided limitation of the floors, and it stays an open gap (BACKLOG
+  #1115). What would still bound that path is a rate, which does not detect automation either. Both
+  legs charge the sign-in window (see the route to limiter map, under [Brute-force & abuse
+  protection](#brute-force--abuse-protection)), and that section's federated pending-flow bound
+  holds the start leg. `[auth].oidc_enabled` ships off. Revisit this if OIDC ever ships on by
+  default with an IdP outside the engine's control. There the confirm on the "you are leaving this
+  site" page is a human step the engine could time, and nothing times it today.
 - The MFA floor compares two wall-clock readings, as the approval dwell does. A clock step backward
   refuses a good code until the clocks agree again. A step forward lets a code through early.
 - The response hides the reason, but the audit row names it. The account holder's own security
