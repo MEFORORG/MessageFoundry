@@ -74,6 +74,8 @@ section reference.
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
 | | `[auth].ad_connect_timeout`, `ad_receive_timeout` | `10` s / `10` s (*conditional* — a loosening only once `ad_enabled`; a timeout above `10` s is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
 | | `[auth].admin_new_ip_step_up` | `true` |
+| | `[auth].require_action_step_up` | `true` (`false` lets the action-bound step-up routes accept the session-wide step-up window) |
+| | `[auth].password_check_breached`, `password_check_context`, `password_check_username` | `true` (each `false` turns off one screen of a local password) |
 | | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
 | | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
 | | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (`false`, a count of `0` or above `120`, or a window below `60` s) |
@@ -103,7 +105,8 @@ section reference.
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
 `[auth].ad_allow_insecure_ldap`, `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
-`[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
+`[auth].admin_new_ip_step_up`, `[auth].require_action_step_up`, the three
+`[auth].password_check_*` keys, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
 keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
 `[auth].oidc_callback_floor_exempt_amr`,
@@ -671,6 +674,42 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   how many start per window, not how many are held, and a session recheck does not pass it. So
   raise the timeout only as far as the measured round trip needs.
 - **Reversible:** yes, immediately — restore `10` (or delete the line) and restart.
+
+### `[auth].require_action_step_up = false` — the action-bound step-up falls back to the session window
+> Reported whenever it is `false` (vault BACKLOG #2600). The default is `true`
+> ([ADR 0077](adr/0077-action-bound-step-up.md)).
+- **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
+  once. They include at least the self-service factor and session-terminate routes, the admin
+  user-update, reset-password, reset-mfa and federated-identity routes, and resend, edit-resend,
+  upload resend, export, purge and config reload. With the switch off, those routes accept the
+  session-wide step-up window instead. A sign-in can open that window, so a session taken over
+  inside it can bind an authenticator, inject a message or export bodies in bulk with no fresh
+  proof.
+- **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
+  while a client that cannot send the bound proof is updated.
+- **Compensating controls:** keep `[auth].step_up_max_age_seconds` short, keep
+  `[auth].admin_new_ip_step_up` on, and restrict the operator surface with
+  `[security].allowed_client_networks`.
+- **Where it is reported:** `security_loosenings()` names it, so the serve-time warning,
+  `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses it.
+- **Reversible:** yes, immediately. Set it back to `true`, or delete the line, and restart.
+
+### `[auth].password_check_breached`, `password_check_context` or `password_check_username` `= false` — a local-password screen is off
+> Each is reported whenever it is `false` (vault BACKLOG #2600), under its own name. All three
+> default to `true`. They screen local passwords.
+- **What you lose:** with `password_check_breached` off, a password is not checked against the
+  bundled common and breached password list when it is set. With `password_check_context` off, it
+  is not checked for context words, neither the shipped terms nor
+  `[auth].password_extra_context_words`. With `password_check_username` off, it may contain the
+  account's own username.
+- **When acceptable:** `password_check_breached = false` is the documented way to start when the
+  bundled list cannot be read and the wheel cannot be reinstalled yet.
+- **Compensating controls:** keep `[auth].password_min_length` at its default or longer, and keep
+  `[security].require_mfa` on.
+- **Where it is reported:** `security_loosenings()` names each, so the serve-time warning,
+  `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses one.
+- **Reversible:** yes. Set it back to `true` and restart. Passwords set while a screen was off are
+  not re-screened.
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
 > Reported whenever it is `false`. No sign-in condition applies, since no setting turns sign-in off

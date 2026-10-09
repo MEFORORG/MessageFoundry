@@ -24,20 +24,31 @@
 > engine that does not model it. The refusal never repeats the offending value, because this file can
 > carry secrets.
 >
-> **The refusal covers the FILE, and the CLI refuses an unknown flag too. Env mostly does not — check
-> `MEFOR_*` spellings yourself.** An unknown `serve` flag stops the command: argparse prints
-> `unrecognized arguments` and exits 2. Its default prefix matching still applies, so an unambiguous
-> prefix of a real flag (`--service-conf`) is read as that flag. A misspelled `MEFOR_*` variable is
-> dropped with no warning, whether the typo is in its section part or its key part. Some env input is
-> refused anyway: at least an unrecognized `[security]` key and the renamed `[logging]` keys, both
-> described below. The env layer is where
-> secrets belong, and it already drops a var aimed at one of the four sections that have no env layer
-> ([Mechanism](#mechanism)). The loader also cannot tell such a typo from one of the documented
-> `MEFOR_*` variables its consuming module reads straight from the environment rather than declaring as
-> a field (`MEFOR_STORE_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and siblings). **One exception:**
-> an unrecognized `[security]` posture switch is refused from **env as well as the file**, because every
-> shipped `MEFOR_SECURITY_*` name maps to a real field, so there is no out-of-band variable to collide
-> with — and believing a posture control is on when it is not is the worst case of the class.
+> **The refusal covers the FILE, and the CLI refuses an unknown flag too. Env is covered in part —
+> check the SECTION part of a `MEFOR_*` spelling yourself.** An unknown `serve` flag stops the
+> command: argparse prints `unrecognized arguments` and exits 2. Its default prefix matching still
+> applies, so an unambiguous prefix of a real flag (`--service-conf`) is read as that flag.
+>
+> **A `MEFOR_<SECTION>_<KEY>` variable whose section is real and whose key is not is REFUSED at
+> load** (vault BACKLOG #2600). `MEFOR_STORE_REQUIRE_ENCRYPTON=true` used to be dropped with no
+> warning, so the instance started without the hardening its environment asked for. The refusal
+> names the variable and, when one fits, the nearest real one. It never repeats the value, because
+> the environment is where secrets belong. Unset the variable or fix its spelling.
+>
+> **What env still drops in silence:** a variable whose SECTION part matches no known section. A
+> typo there (`MEFOR_STOER_PATH`) is not refused, and neither is a var aimed at one of the four
+> sections that have no env layer ([Mechanism](#mechanism)). The loader cannot tell those from the
+> `MEFOR_*` variables that belong to no section at all, such as `MEFOR_ALLOW_INSECURE_TLS`.
+>
+> **Variables that are not settings are spared by name.** Their consuming module reads them straight
+> from the environment and they are not fields here: at least `MEFOR_STORE_VAULT_ADDR`,
+> `MEFOR_STORE_VAULT_TOKEN`, `MEFOR_SECRETS_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and the two
+> phase-timing variables. The list is `_OUT_OF_BAND_ENV` in `messagefoundry/config/settings.py`. A
+> name on it is spared only as spelled there, in upper case.
+>
+> An unrecognized `[security]` posture switch is refused from **env as well as the file**, with a
+> message that names the section and key. So are the renamed `[logging]` keys described below, by a
+> message that names the replacement.
 >
 > A handful of keys are **declared but not yet read** — they load, they just do nothing yet:
 > `[retention].audit_days` (**reserved/keep-forever by design**), `[reference].max_staleness_seconds`,
@@ -1885,7 +1896,7 @@ then. The design, including what it can and cannot promise about split-brain on 
 Leaving the block out, or switching `enabled` off, changes nothing. A switched-off block is never
 refused for the values it holds, but unknown keys in it are still refused, as in every section. The
 block is file-only. There is no `MEFOR_CLUSTER_VIP_*` environment override, and such a variable is
-dropped like any other unrecognized env key.
+refused at load like any other unrecognized key under a known section.
 
 With `enabled = true` the engine **refuses to load** when:
 

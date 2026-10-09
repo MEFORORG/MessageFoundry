@@ -390,7 +390,7 @@ class _InputHidingModel(BaseModel):
 
 class _Section(_InputHidingModel):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
-    # (_reject_unknown_file_keys). A model-level extra="forbid" would refuse the engine's OWN writes:
+    # (_reject_unknown_file_keys for the file, _reject_unknown_env_keys for the environment). A model-level extra="forbid" would refuse the engine's OWN writes:
     # _env_overrides scrapes every MEFOR_<section>_<key> into its section dict, and a dozen documented
     # variables are read straight from os.environ by their consuming module rather than being fields here
     # (the Vault KMS/Transit and secret-provider credentials, MEFOR_TLS_REVOCATION_ATTESTED, the two
@@ -2392,11 +2392,11 @@ class LoggingSettings(_Section):
         replacement — the loader's nearest-name heuristic does not reach ``file_backup_count``.
 
         **The layer this one covers is ENV, which the file refusal deliberately does not.**
-        ``_env_overrides`` scrapes ``MEFOR_LOGGING_*`` straight into the section dict, and a
-        misspelled env var is otherwise dropped in silence (docs/CONFIGURATION.md, "The refusal covers
-        the FILE"). Measured: ``MEFOR_LOGGING_MAX_BYTES`` and ``MEFOR_LOGGING_BACKUPS`` each reach
-        this validator and are refused naming their replacement. So the two spellings are the rare
-        env keys that fail loudly, and that is worth keeping rather than folding into the loader."""
+        ``_env_overrides`` scrapes ``MEFOR_LOGGING_*`` straight into the section dict. Measured:
+        ``MEFOR_LOGGING_MAX_BYTES`` and ``MEFOR_LOGGING_BACKUPS`` each reach this validator and are
+        refused naming their replacement. Since vault BACKLOG #2600 the loader refuses any other
+        unknown env key under a modelled section (:func:`_reject_unknown_env_keys`). That check
+        runs after the model is built, so these two keep the message that names the replacement."""
         if isinstance(data, dict):
             for legacy, actual in (
                 ("max_bytes", "file_max_bytes"),
@@ -6996,12 +6996,13 @@ def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
     while the operator believed it failed closed. Nothing reads a section of this file that the model
     does not define, so there is no legitimate unmodelled section to spare.
 
-    Scoped to the FILE deliberately. The env layer (:func:`_env_overrides`) scrapes any
-    ``MEFOR_<section>_<key>`` into its section dict, including a dozen documented variables that their
-    consuming module reads straight from ``os.environ`` and that are not fields here — refusing there
-    would refuse a variable the shipped docs tell operators to set. It drops a variable naming no
-    modelled section before this point, so it never reaches the section check either. The CLI layer and
-    the ``[security]`` desugar write only real fields, and the file is the surface the ruling names."""
+    Scoped to the FILE. The env layer (:func:`_env_overrides`) scrapes any ``MEFOR_<section>_<key>``
+    into its section dict, including documented variables that their consuming module reads straight
+    from ``os.environ`` and that are not fields here, so this check cannot run over the merged data.
+    The environment has its own refusal, :func:`_reject_unknown_env_keys` (vault BACKLOG #2600),
+    which spares those variables by name. The env layer drops a variable naming no modelled section
+    before this point, so it never reaches the section check here. The CLI layer and the
+    ``[security]`` desugar write only real fields, and nothing checks a CLI key."""
     models = _section_models()
     sections: list[str] = []
     stray = False
@@ -7027,6 +7028,80 @@ def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
             + (" A key above the first [section] header belongs to no section." if stray else "")
             + " Check the spelling against docs/CONFIGURATION.md; a key that MOVED to another section "
             "is reported by name instead."
+        )
+
+
+#: ``MEFOR_<SECTION>_<KEY>`` names under a modelled section that are NOT settings fields, because the
+#: module that uses each reads it straight from ``os.environ`` (vault BACKLOG #2600). They are spared
+#: by :func:`_reject_unknown_env_keys`, exactly as spelled. ``tests/test_settings_env_keys.py`` reds
+#: when engine code names a ``MEFOR_<known section>_*`` variable that is neither a field nor listed
+#: here, and when an entry here is no longer named by any engine module.
+_OUT_OF_BAND_ENV: frozenset[str] = frozenset(
+    {
+        # The two phase-timing diagnostics (pipeline/phase_timing.py).
+        "MEFOR_DELIVERY_PHASE_TIMING",
+        "MEFOR_PIPELINE_LANE_EPISODE_TIMING",
+        # The connector SecretProvider's Vault credentials (config/secretprovider_vault.py).
+        "MEFOR_SECRETS_VAULT_ADDR",
+        "MEFOR_SECRETS_VAULT_CA_FILE",
+        "MEFOR_SECRETS_VAULT_KV_MOUNT",
+        "MEFOR_SECRETS_VAULT_TOKEN",
+        # The store's Vault KeyProvider and Transit cipher (store/keyprovider_vault.py,
+        # store/crypto_transit.py).
+        "MEFOR_STORE_TRANSIT_AUDIT_KEY",
+        "MEFOR_STORE_TRANSIT_KEY",
+        "MEFOR_STORE_VAULT_ADDR",
+        "MEFOR_STORE_VAULT_CA_FILE",
+        "MEFOR_STORE_VAULT_TOKEN",
+        "MEFOR_STORE_VAULT_TRANSIT_KEY",
+        "MEFOR_STORE_VAULT_WRAPPED_DEK",
+        # The process-wide revocation attestation (config/tls_policy.py).
+        "MEFOR_TLS_REVOCATION_ATTESTED",
+    }
+)
+
+
+def _reject_unknown_env_keys(environ: Mapping[str, str]) -> None:
+    """Raise ``ValueError`` if the environment sets a ``MEFOR_<SECTION>_<KEY>`` variable whose section
+    is modelled and whose key that section does not define (vault BACKLOG #2600).
+
+    The same failure :func:`_reject_unknown_file_keys` refuses in the file: a mistyped
+    ``MEFOR_STORE_REQUIRE_ENCRYPTON`` used to be scraped into ``[store]``, ignored by the model, and
+    reported by nothing, so the instance started without the hardening its environment asked for.
+
+    Names the VARIABLE and **never its value**, which may be a secret. Three kinds of name are spared:
+
+    * one whose section is not modelled (``MEFOR_ALLOW_INSECURE_TLS``, a harness variable, another
+      tool's). :func:`_env_overrides` never read those, and this does not start to. So a typo in the
+      SECTION part of a name is still dropped silently;
+    * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;
+    * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message.
+
+    :func:`load_settings` calls this after the model is built, so a key with a refusal of its own
+    never reaches here: a relocated or removed key (:func:`_reject_relocated_keys`), and the
+    renamed ``[logging]`` keys the model refuses naming their replacement. A load that fails
+    validation for another reason reports that reason first, and this one on the next attempt.
+    The section and key are matched in lower case, as :func:`_env_overrides` matches them."""
+    models = _section_models()
+    offenders: list[str] = []
+    for name in sorted(environ):
+        if not name.startswith(_ENV_PREFIX) or name in _OUT_OF_BAND_ENV:
+            continue
+        section, _, key = name[len(_ENV_PREFIX) :].lower().partition("_")
+        model = models.get(section)
+        if model is None or section == "security" or not key or key in model.model_fields:
+            continue
+        prefix = f"{_ENV_PREFIX}{section.upper()}_"
+        known = [f"{prefix}{field.upper()}" for field in model.model_fields]
+        known += [spared for spared in _OUT_OF_BAND_ENV if spared.startswith(prefix)]
+        near = difflib.get_close_matches(name.upper(), sorted(known), n=1)
+        offenders.append(_printable(name) + (f" (did you mean {near[0]}?)" if near else ""))
+    if offenders:
+        raise ValueError(
+            f"unrecognized environment variable(s): {', '.join(offenders)}. Each names a config "
+            "section and a key that section does not define. It is REFUSED, not ignored — a dropped "
+            "one leaves the setting it was meant to apply silently un-applied. Check the spelling "
+            "against docs/CONFIGURATION.md, or unset the variable."
         )
 
 
@@ -8020,7 +8095,9 @@ def security_loosenings(
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
-    bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288), the ``[auth]``
+    bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288),
+    ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
+    BACKLOG #2600), the ``[auth]``
     sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache
     and AD timeout
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
@@ -8045,7 +8122,7 @@ def security_loosenings(
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``ad_tls_verify``,
-    ``oidc_require_mfa_claim``, ``password_check_breached``) that are not reported here. Most are
+    ``oidc_require_mfa_claim``, ``notify_security_events``) that are not reported here. Most are
     gated elsewhere. ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
     every OIDC session with no factor met, and while ``require_mfa`` is on that session owes an
     engine factor. The parenthetical list above is enumerated in the floor test's exemption set so
@@ -8418,6 +8495,44 @@ def security_loosenings(
                 "a session token used from a NEW client address can perform a sensitive admin action "
                 "without a fresh step-up -- nothing audits, notifies or challenges the address change "
                 "mid-session",
+            )
+        )
+    # Vault BACKLOG #2600: action-bound step-up ships ON. Off, its routes fall back to the
+    # session-wide step-up window, which a sign-in can seed.
+    if not auth.require_action_step_up:
+        out.append(
+            (
+                "require_action_step_up",
+                "the routes that need a fresh proof bound to one action (at least the self-service "
+                "factor routes, the admin account-change routes, resend, export, purge and config "
+                "reload) accept the session-wide step-up window instead -- a session taken over "
+                "inside that window ([auth].step_up_max_age_seconds, which a sign-in can open) "
+                "can bind an authenticator, inject a message or export bodies in bulk with no "
+                "fresh proof",
+            )
+        )
+    # Vault BACKLOG #2600: the three local-password screens ship ON, and no gate refuses one off.
+    if not auth.password_check_breached:
+        out.append(
+            (
+                "password_check_breached",
+                "a local password is not screened against the bundled common and breached "
+                "password list when it is set, so a known-breached password is accepted",
+            )
+        )
+    if not auth.password_check_context:
+        out.append(
+            (
+                "password_check_context",
+                "a local password is not screened for context words when it is set -- neither the "
+                "shipped terms nor [auth].password_extra_context_words",
+            )
+        )
+    if not auth.password_check_username:
+        out.append(
+            (
+                "password_check_username",
+                "a local password may contain the account's own username",
             )
         )
     # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control
@@ -8834,6 +8949,11 @@ def load_settings(
         _merge(data, cli)
 
     settings = ServiceSettings.model_validate(data)
+    # The unknown-key refusal for the environment layer (vault BACKLOG #2600). LAST of the
+    # refusals, so a key with a message of its own keeps it: a relocated or removed key, an
+    # unknown [security] key, and the renamed [logging] keys the model refuses by name. Over
+    # `environ` itself, so it reports the variable as the operator spelled it.
+    _reject_unknown_env_keys(environ)
     # AFTER the CLI merge, so a `--host` that moved the socket off-box is reported as the posture
     # loosening it is. One-way: it only ever ADDS a loosening. See the helper for why.
     _reconcile_effective_bind(settings)

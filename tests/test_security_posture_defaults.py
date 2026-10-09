@@ -2648,23 +2648,32 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
     }
     exempt_auth = {
-        # HARDENINGS / topology choices — a flip is not a weakening of the shipped posture.
-        "require_action_step_up",
+        # Vault BACKLOG #2600 re-read this set. require_action_step_up and the three
+        # password_check_* screens left it: each ships ON, nothing refuses it off, and the
+        # registry now names it. What stays is below, each with its reason.
+        #
+        # Sign-in pathways, each shipped OFF. Turning one on adds a way to sign in, which is a
+        # deployment's topology and has its own load-time requirements. Not a weakening of a
+        # control that shipped on.
         "ad_enabled",
-        "ad_use_nested_groups",
         "kerberos_enabled",
         "oidc_enabled",
+        # Ships ON. Off, a directory user gets the roles of their DIRECT groups only, so it
+        # resolves fewer grants, never more.
+        "ad_use_nested_groups",
+        # Ships ON. The claim it trims is a hint and not the account key (ADR 0184), so neither
+        # value changes which account a login reaches.
         "oidc_username_strip_domain",
+        # Ships ON, and off it DOES remove a control: the push notice of account-security events.
+        # Gated elsewhere: with no notice channel, serve refuses under enforcement = enforce unless
+        # [alerts].security_notifications_required = false, and it logs that waiver. Not named by
+        # the registry, which is an owed gap and is recorded as one.
         "notify_security_events",
-        # Password-policy composition rules: individually neither secure nor insecure (the policy is
-        # scored as a whole), and none is a posture switch.
+        # Composition rules, each shipped OFF. Turning one on ADDS a requirement.
         "password_require_uppercase",
         "password_require_lowercase",
         "password_require_digit",
         "password_require_symbol",
-        "password_check_context",
-        "password_check_username",
-        "password_check_breached",
         # REPORTED, so not an owed gap: named only with a live ldap:// bind, which this loop's lone
         # flip never builds (ad_enabled stays off). The plain-LDAP section above pins it (#2354).
         "ad_allow_insecure_ldap",
@@ -2715,6 +2724,24 @@ def _unreported_bools(model: type[Any], exempt: Collection[str], section: str) -
         and isinstance(info.default, bool)
         and field not in _names(**{section: model(**{field: not info.default})})
     ]
+
+
+@pytest.mark.parametrize(
+    ("switch", "words"),
+    [
+        ("require_action_step_up", "session-wide step-up window"),
+        ("password_check_breached", "breached"),
+        ("password_check_context", "context words"),
+        ("password_check_username", "username"),
+    ],
+)
+def test_auth_switches_that_ship_on_are_named_when_off(switch: str, words: str) -> None:
+    """Vault BACKLOG #2600: each of these left the [auth] floor's exemption set. Off it is named,
+    and at the shipped value it is not."""
+    assert switch not in _names()
+    assert AuthSettings.model_fields[switch].default is True
+    risk = dict(_pairs(auth=AuthSettings(**{switch: False})))[switch]
+    assert words in risk
 
 
 @pytest.mark.parametrize(
