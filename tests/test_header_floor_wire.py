@@ -66,7 +66,7 @@ from messagefoundry.pipeline import Engine
 _MEASURED_UVICORN = "0.54.0"
 #: The websockets library writes both WebSocket protocols' own handshake rejections, so it is
 #: pinned too.
-_MEASURED_WEBSOCKETS = "17.1"
+_MEASURED_WEBSOCKETS = "17.2"
 
 _HANDSHAKE = (
     "GET {path} HTTP/1.1\r\n"
@@ -784,7 +784,7 @@ def test_a_changed_conn_writer_signature_reaches_the_library_unchanged(
 def test_a_changed_handshake_writer_signature_reaches_the_server_unchanged(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Degrade on a signature change: a writer called with one argument, where 16.0 and 17.1
+    """Degrade on a signature change: a writer called with one argument, where 16.0, 17.1 and 17.2
     pass (status, headers, body), must still write, not raise inside the override."""
     written: list[tuple[Any, ...]] = []
 

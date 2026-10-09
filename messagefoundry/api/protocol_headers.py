@@ -470,7 +470,7 @@ def _send_floored_handshake_response(conn_ref: weakref.ref[Any], *args: Any, **k
         # for a connection it answered and has not finished closing. See the module docstring.
         return
     try:
-        # No named parameters, for the reason write_http_response below gives. At websockets 17.1
+        # No named parameters, for the reason write_http_response below gives. At websockets 17.1 and 17.2
         # it is (response).
         response = kwargs["response"] if "response" in kwargs else args[0]
         _add_where_absent(response.headers)
@@ -619,7 +619,7 @@ def _build_floored_legacy_ws(base: type[Any]) -> type[asyncio.Protocol]:
         # absent, so the 101 and the denial, which the floor already covered, are not stamped twice.
         def write_http_response(self, *args: Any, **kwargs: Any) -> None:
             # No named parameters, so a changed signature reaches the server's own method
-            # unchanged instead of raising here. At 16.0 and at 17.1 it is
+            # unchanged instead of raising here. At 16.0, 17.1 and 17.2 it is
             # (status, headers, body=None).
             try:
                 _add_where_absent(kwargs["headers"] if "headers" in kwargs else args[1])
