@@ -359,8 +359,9 @@ def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> 
     Each error keeps its location, type and message, and a known type keeps its ``ctx`` (a
     validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT ONLY. The message
     and ``ctx`` are written by the validator, and a validator that quotes the value it refused
-    still shows it there: at least the ``[backup]`` and ``[dr]`` cloud-URL refusals and the
-    ``[api].trusted_proxies`` entry refusals do. None of those is meant to hold a secret, but a URL
+    still shows it there: at least the ``[api].trusted_proxies`` entry refusals do (the ``[backup]``
+    and ``[dr]`` URL refusals quote only the scheme since vault BACKLOG #2600, and
+    :func:`settings_error_detail` keeps the current list). None is meant to hold a secret, but a URL
     can carry one, so a validator message must name the setting, never quote a secret value.
     """
     try:
@@ -7234,12 +7235,26 @@ def _unspared_env_names(
             yield name, name[len(_ENV_PREFIX) :].lower()
 
 
-#: Pydantic error types that mean one string can never be the field's shape.
+#: Pydantic error types that mean one string can never be the field's shape. At least these.
 _SHAPE_ERRORS = frozenset(
-    {"list_type", "dict_type", "tuple_type", "set_type", "frozen_set_type", "model_type"}
+    {
+        "list_type",
+        "dict_type",
+        "mapping_type",
+        "tuple_type",
+        "set_type",
+        "frozen_set_type",
+        "sequence_str",
+        "model_type",
+        "model_attributes_type",
+        "dataclass_type",
+        "dataclass_exact_type",
+        "is_instance_of",
+    }
 )
 
 
+@functools.cache
 def _env_can_hold(model: type[BaseModel], key: str) -> bool:
     """Whether one string, all the env layer gives a field, can have ``model``'s ``key`` shape.
 
@@ -7247,13 +7262,14 @@ def _env_can_hold(model: type[BaseModel], key: str) -> bool:
     split one comma-separated string into a list (``[alerts].email_to``) while other lists, and
     every dict and sub-table, have no string form (``[approvals].operations``,
     ``[cluster].vip``). A hint naming such a field would point at a variable that fails the load.
-    Only a shape error at ``key`` says no; a bad value or a cross-field check is not about shape."""
+    Only shape errors at ``key`` say no, and only when every error there is one: a union with one
+    string-shaped branch (``int | list[int]``) can hold one. A bad value or a cross-field check is
+    not about shape. Cached: the answer depends on the model and the key alone."""
     try:
         model.model_validate({key: "x"})
     except ValidationError as exc:
-        return not any(
-            err["loc"][:1] == (key,) and err["type"] in _SHAPE_ERRORS for err in exc.errors()
-        )
+        at_key = [err["type"] for err in exc.errors() if err["loc"][:1] == (key,)]
+        return not (at_key and all(kind in _SHAPE_ERRORS for kind in at_key))
     return True
 
 
@@ -7322,6 +7338,9 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
                 hint = (
                     f"[{near[0]}].{key}? That section has no environment layer; set it in the file"
                 )
+            elif is_field:
+                # A real setting one string cannot fill: still noted, with the file as the fix.
+                hint = f"[{near[0]}].{key}? It has no environment form; set it in the file"
             else:
                 continue
             notes.append(

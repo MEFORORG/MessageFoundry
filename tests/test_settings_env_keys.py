@@ -162,6 +162,21 @@ def test_a_name_that_names_no_modelled_section_is_not_refused(name: str) -> None
         # A list of strings, filled from one comma-separated string: still a hint.
         ("MEFOR_ALERT_EMAIL_TO", "did you mean MEFOR_ALERTS_EMAIL_TO?"),
         ("MEFOR_SECURTY_ALLOWED_CLIENT_NETWORKS", "MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS?"),
+        # A real setting with no one-string form (a list of tables, a list with no comma
+        # splitter, a dict): still noted, and pointed at the file, not at a variable that would
+        # fail the load on its shape.
+        ("MEFOR_ALERT_RULES", "[alerts].rules? It has no environment form"),
+        ("MEFOR_APPROVAL_OPERATIONS", "[approvals].operations? It has no environment form"),
+        ("MEFOR_AIS_ALLOWED_ENDPOINTS", "[ai].allowed_endpoints? It has no environment form"),
+        (
+            "MEFOR_APIS_TLS_CLIENT_CERT_IDENTITIES",
+            "[api].tls_client_cert_identities? It has no environment form",
+        ),
+        (
+            "MEFOR_SECURTY_STATIC_CREDENTIAL_ACCEPTED",
+            "[security].static_credential_accepted? It has no environment form",
+        ),
+        ("MEFOR_CLUSTR_VIP", "[cluster].vip? It has no environment form"),
         ("MEFOR_CERT_MONITR_WARN_DAYS", "[cert_monitor].warn_days"),  # a file-only section
         (
             "MEFOR_STORE",
@@ -192,16 +207,6 @@ def test_a_name_that_looks_like_an_unread_setting_is_warned_about(name: str, hin
         "MEFOR_CERTIFICATE_PATH",  # close to no section
         "MEFOR_STOER_PATHH",  # a typo in BOTH parts: still dropped with no message
         "MEFOR_STOER_ZZZZ",  # near a section, and the key is no setting of it
-        # Near [cluster], and vip is a sub-table there. MEFOR_CLUSTER_VIP would fail validation,
-        # so it is not offered.
-        "MEFOR_CLUSTR_VIP",
-        # Near a section, and the key has no one-string form: a list of tables, a list with no
-        # comma splitter, a dict. The hinted variable would fail the load on its shape.
-        "MEFOR_ALERT_RULES",
-        "MEFOR_APPROVAL_OPERATIONS",
-        "MEFOR_AIS_ALLOWED_ENDPOINTS",
-        "MEFOR_APIS_TLS_CLIENT_CERT_IDENTITIES",
-        "MEFOR_SECURTY_STATIC_CREDENTIAL_ACCEPTED",
         # Near [auth] and [api], and each key moved to [security]: that spelling is refused.
         "MEFOR_AUHT_REQUIRE_MFA",
         "MEFOR_APII_HOST",
@@ -244,12 +249,26 @@ def test_a_clean_environment_logs_no_such_warning(caplog: pytest.LogCaptureFixtu
     assert not [r for r in caplog.records if "NOT applied" in r.getMessage()]
 
 
-def test_a_sub_table_is_not_offered_but_a_scalar_beside_it_is() -> None:
-    """``[cluster].vip`` is a sub-table, so ``MEFOR_CLUSTER_VIP`` would fail validation. The
-    control: a scalar of the same section is offered."""
-    assert _unread_env_notes({"MEFOR_CLUSTR_VIP": "true"}, {}) == []
+def test_a_sub_table_is_not_offered_as_a_variable_but_a_scalar_beside_it_is() -> None:
+    """``[cluster].vip`` is a sub-table, so ``MEFOR_CLUSTER_VIP`` would fail validation: the note
+    points at the file. The control: a scalar of the same section is offered as a variable."""
+    (vip,) = _unread_env_notes({"MEFOR_CLUSTR_VIP": "true"}, {})
+    assert "MEFOR_CLUSTER_VIP" not in vip and "set it in the file" in vip
     (note,) = _unread_env_notes({"MEFOR_CLUSTR_ENABLED": "true"}, {})
     assert "did you mean MEFOR_CLUSTER_ENABLED?" in note
+
+
+def test_a_union_with_a_string_shaped_branch_can_hold_one_string() -> None:
+    """Only shape errors at the key say no. ``int | list[int]`` fails ``"x"`` on value in one
+    branch and on shape in the other, and ``"5"`` would load."""
+    from pydantic import BaseModel
+
+    class _Probe(BaseModel):
+        knob: int | list[int] = 0
+        table: list[int] = []
+
+    assert settings_module._env_can_hold(_Probe, "knob") is True
+    assert settings_module._env_can_hold(_Probe, "table") is False  # the control
 
 
 def test_serve_logs_the_warnings_again_after_configure_logging() -> None:
