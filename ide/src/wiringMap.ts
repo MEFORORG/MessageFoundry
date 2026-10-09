@@ -14,7 +14,7 @@ import * as vscode from "vscode";
 import type { ElementKind } from "./graphModel";
 import { wiringMapPayload, type MapFocus } from "./wiringMapModel";
 import type { GraphProvider } from "./graphTree";
-import { openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { wiringMapScript } from "./wiringMapWebview";
 
 type Incoming =
@@ -172,6 +172,7 @@ export class WiringMapPanel {
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <div class="bar">
     <span class="focuslbl" id="focusLbl" data-tip="Current focus element"></span>
     <input id="search" list="elementNames" placeholder="Jump to an element…" />

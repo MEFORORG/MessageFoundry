@@ -4,7 +4,7 @@
 // The Test Bench webview's inline script, split out of testBench.ts so it can be loaded without
 // `vscode`. testBench.ts builds the page and embeds this; the unit suite evaluates the SAME source in
 // a jsdom page (test-bench-webview.test.ts), so what the tests exercise is what ships.
-import { WEBVIEW_GUARD_NOTE, guardScript } from "./webviewMessaging";
+import { WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, guardScript } from "./webviewMessaging";
 
 /**
  * The whole inline `<script>` body for one Test Bench render, guard included.
@@ -13,7 +13,7 @@ import { WEBVIEW_GUARD_NOTE, guardScript } from "./webviewMessaging";
  */
 export function testBenchScript(token: string): string {
   return `
-    const vscode = acquireVsCodeApi();${guardScript(token)}
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}${guardScript(token)}
     const results = document.getElementById('results');
     const detail = document.getElementById('detail');
     const back = document.getElementById('back');

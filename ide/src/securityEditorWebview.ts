@@ -5,7 +5,7 @@
 // without `vscode`. securityEditor.ts builds the page and embeds this; the unit suite evaluates the
 // SAME source in a jsdom page (webview-receivers.test.ts), so what the tests exercise is what
 // ships.
-import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, embedJson, guardScript } from "./webviewMessaging";
+import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
 
 // The switches live here rather than in securityEditor.ts so the unit suite renders the real list.
 export type FieldType = "bool" | "int" | "string" | "tristate";
@@ -100,7 +100,7 @@ export const FIELDS: Field[] = [
  *  channel token, minted by the caller with the nonce (webviewMessaging.ts). */
 export function securityEditorScript(token: string, fields: unknown): string {
   return `
-    const vscode = acquireVsCodeApi();${guardScript(token)}${SHAPE_HELPERS}
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}${guardScript(token)}${SHAPE_HELPERS}
     const FIELDS = ${embedJson(fields)};
     const $ = (id) => document.getElementById(id);
     const errorEl = $('error');

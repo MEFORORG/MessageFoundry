@@ -11,7 +11,7 @@ import { logChecks, showChecks } from "./checksChannel";
 import { baselineBypassRecord } from "./checksLog";
 import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
-import { openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { sourceControlScript } from "./sourceControlWebview";
 
 const GITIGNORE_MARKER = "# --- MessageFoundry ---";
@@ -493,6 +493,7 @@ function renderRepoStorageHtml(webview: vscode.Webview, current: string): string
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <h2>Config Repo Storage</h2>
   <p class="sub">Where this MessageFoundry config repo lives. Nothing is contacted here — you push later from the Source Control view.</p>
   <div class="current">Current: ${currentLabel}</div>

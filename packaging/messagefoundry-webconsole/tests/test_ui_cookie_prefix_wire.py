@@ -164,8 +164,11 @@ def _client_ssl() -> ssl.SSLContext:
 
 
 async def _login_set_cookie(base_url: str, headers: dict[str, str] | None = None) -> str:
+    # A real socket, so the suite's in-process browser stand-in does not apply: name the provenance a
+    # browser's own form POST carries, or assert_same_origin refuses the sign-in (BACKLOG #1116).
+    sent = {"Sec-Fetch-Site": "same-origin", **(headers or {})}
     async with httpx.AsyncClient(base_url=base_url, verify=_client_ssl(), timeout=20) as c:
-        r = await c.post("/ui/login", data={"username": "op", "password": PW}, headers=headers)
+        r = await c.post("/ui/login", data={"username": "op", "password": PW}, headers=sent)
         assert r.status_code == 303, r.text
         set_cookie: str = r.headers["set-cookie"]
     return set_cookie
