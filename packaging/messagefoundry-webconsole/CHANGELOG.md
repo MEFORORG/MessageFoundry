@@ -70,10 +70,10 @@ this line.**
 - **Seam only: the engine's posture model grew.** `SecurityPosture` gains
   `transit_bound_attestation`, a `TransitBoundAttestationView` (`BACKLOG #2337`). The console
   renders nothing new, but the field is on the seam it pins, so the supported digest moved.
-- **Seam only: `client_ip` takes starlette's `HTTPConnection`.** `api.security.client_ip` took
-  `Request | WebSocket` (`BACKLOG #2289`). The console still passes a `Request` or a `WebSocket`,
-  and both fit, so no console call changed. The signature is on the seam the console pins, so
-  the supported digest moved.
+- **Seam only: `client_ip` takes starlette's `HTTPConnection`.** `api.security.client_ip` now
+  takes that base class (`BACKLOG #2289`); it took `Request | WebSocket`. The console still
+  passes a `Request` or a `WebSocket`, and both fit, so no console call changed. The signature
+  is on the seam the console pins, so the supported digest moved.
 
 ### Fixed
 
