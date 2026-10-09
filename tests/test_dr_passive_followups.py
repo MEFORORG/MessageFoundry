@@ -385,6 +385,7 @@ _ALWAYS = Schedule(
     ]
 )
 _NOON = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+_LATE = datetime(2026, 6, 1, 23, 59, 30, tzinfo=UTC)  # outside _ALWAYS
 
 
 class _PageSink(_CountingSink):
@@ -496,6 +497,25 @@ async def test_a_lane_that_failed_at_an_activation_still_pages_its_buildup(
     sink = _PageSink()
     async with _after_a_failed_activation(
         store, tmp_path, alert_sink=sink, buildup_default=BuildupThreshold(max_depth=1)
+    ):
+        await _wait_until(lambda: _OB_CA in sink.buildup)
+
+
+async def test_a_lane_that_failed_outside_its_window_still_pages_its_buildup(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The activation falls outside the lane's schedule window, so the reload hands its park to
+    the calendar before the build. Red when the failed lane stayed the calendar's: the calendar
+    leaves a failed lane alone, and the paging check passed it over, so it never paged."""
+    monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
+    sink = _PageSink()
+    async with _after_a_failed_activation(
+        store,
+        tmp_path,
+        ca_schedule=_ALWAYS,
+        schedule_clock=lambda: _LATE,
+        alert_sink=sink,
+        buildup_default=BuildupThreshold(max_depth=1),
     ):
         await _wait_until(lambda: _OB_CA in sink.buildup)
 
@@ -642,6 +662,40 @@ async def test_an_activation_under_a_log_halt_drops_the_passive_marker(
         guard.writable = True  # the disk is repaired
         await runner.start_outbound(_OB_FILE)  # raised DrParkedError before
         await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
+    finally:
+        await runner.stop()
+
+
+async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isolation(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The halt holds the lane at the activation, so its first build has not run, and its CA is
+    refused. Red when the halt branch dropped the passive marker and kept no other record: once
+    the log was repaired, a reload sent the lane to its CA pre-check and was refused whole, and
+    a start resumed the lane with no connector and charged its held row an attempt."""
+    ca, pin = _swapped_ca(tmp_path)
+    guard = _DeadLogGuard()
+    runner = _runner(
+        store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL, alert_sink=_LogPageSink()
+    )
+    await runner.start()
+    try:
+        row_id = await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(_OB_CA, _ADT)])
+        monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+        await runner._respond_to_log_sink_event(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+        assert runner.outbound_filtered(_OB_CA) is None
+
+        guard.writable = True  # the disk is repaired
+        await runner.reload()  # raised WiringError before
+        assert "its tls_ca_file was refused" in (runner.outbound_failed(_OB_CA) or "")
+        await runner.start_outbound(_OB_CA)
+        await asyncio.sleep(0.3)
+        assert await _ca_row(store, row_id) == ("pending", 0)
+        assert not runner.outbound_running(_OB_CA)
     finally:
         await runner.stop()
 

@@ -870,7 +870,7 @@ class Engine:
             standby = self._dr_standby_threshold()
             if rr is not None and standby is not None:
                 # The box is passive again, so it must answer on nothing (vault BACKLOG #3263).
-                # Two paths left a listener bound here. A reload that committed and was then
+                # At least two paths left a listener bound here. A reload that committed and was then
                 # cancelled had bound the critical set. And an operator reload already running
                 # when the latch flipped bound that set under the new threshold, before this
                 # call's own reload was refused. The park takes the reload lock, so it also

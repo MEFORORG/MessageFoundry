@@ -385,10 +385,12 @@ in-flight rows stranded.
 > behind it and the activation's answer.
 >
 > **A failed activation unbinds the listeners the attempt bound.** The box is passive again, so
-> the engine unbinds them and closes the outbound sessions the attempt opened. Two paths needed
-> it: a reload that committed and was then cancelled, and an operator reload already running
-> when the threshold flipped. It is not a guarantee that nothing is bound. A listener an
-> operator had started before the attempt is left as it is. An error in the unbind is logged,
+> the engine unbinds them and closes the outbound sessions the attempt opened. At least two
+> paths needed it: a reload that committed and was then cancelled, and an operator reload
+> already running when the threshold flipped. It is not a guarantee that nothing is bound. A
+> listener an operator had started before the attempt is left as it is. The engine reads which
+> those are when the attempt begins, so a listener an operator starts during the attempt is
+> unbound with the rest. An error in the unbind is logged,
 > and a second cancellation stops it; a reload then unbinds.
 >
 > **A release is complete once its `dr.release` row is written.** The engine turns the profile
@@ -399,7 +401,10 @@ in-flight rows stranded.
 >
 > **An activation under a log halt still judges each lane's DR marker.** The halt keeps the lane
 > down, and the marker now says what the profile says. So the halt's recovery, starting the
-> connection, works on the active box. It used to answer `409` and ask for an activation.
+> connection, works on the active box. It used to answer `409` and ask for an activation. A lane
+> the halt kept from its first build is marked as not yet built. Once the log is repaired, the
+> reload or the start that builds it takes the first build described above, isolated to that
+> lane, and a build that fails holds its rows as it does at the activation.
 >
 > **`[dr].enabled` with `[cluster].enabled` is refused at load**, as `[dr].activate` already was.
 > A cluster member that is a passive DR box could win the lease and serve nothing.
