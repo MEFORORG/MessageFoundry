@@ -29,16 +29,31 @@
 > command: argparse prints `unrecognized arguments` and exits 2. Its default prefix matching still
 > applies, so an unambiguous prefix of a real flag (`--service-conf`) is read as that flag.
 >
-> **A `MEFOR_<SECTION>_<KEY>` variable whose section is real and whose key is not is REFUSED at
-> load** (vault BACKLOG #2600). `MEFOR_STORE_REQUIRE_ENCRYPTON=true` used to be dropped with no
+> **A `MEFOR_<SECTION>_<KEY>` variable whose section has an env layer and whose key is not real is
+> REFUSED at load** (vault BACKLOG #2600). `MEFOR_STORE_REQUIRE_ENCRYPTON=true` used to be dropped with no
 > warning, so the instance started without the hardening its environment asked for. The refusal
 > names the variable and, when one fits, the nearest real one. It never repeats the value, because
 > the environment is where secrets belong. Unset the variable or fix its spelling.
 >
-> **What env still drops in silence:** a variable whose SECTION part matches no known section. A
-> typo there (`MEFOR_STOER_PATH`) is not refused, and neither is a var aimed at one of the four
-> sections that have no env layer ([Mechanism](#mechanism)). The loader cannot tell those from the
-> `MEFOR_*` variables that belong to no section at all, such as `MEFOR_ALLOW_INSECURE_TLS`.
+> **What env still drops in silence:** a variable whose SECTION part matches no section with an
+> env layer. A typo there (`MEFOR_STOER_PATH`) is not refused, and neither is a var aimed at one
+> of the four sections that have no env layer ([Mechanism](#mechanism)). The loader cannot tell
+> those from the `MEFOR_*` variables that belong to no section at all, such as
+> `MEFOR_ALLOW_INSECURE_TLS`.
+>
+> **Under `[secrets].provider = "env"` the unknown variable is WARNED about, not refused.** That
+> provider reads a secret reference as the name of an environment variable you choose. A variable
+> that a setting names, such as the value of `[alerts].email_password_secret`, is spared. A
+> connection can carry a reference no setting names, and the settings loader cannot see
+> connections. So there an unknown `MEFOR_<SECTION>_<KEY>` variable is named in a WARNING and the
+> load continues. With that provider, check the spelling of every such variable yourself.
+>
+> **The check reads the whole process environment.** A platform that injects variables can trip
+> it. Kubernetes service links are the known case: a Service named `mefor-auth` in the engine's
+> namespace gives the pod `MEFOR_AUTH_SERVICE_HOST`, and the load is refused. The Services in the
+> shipped manifests have names that start `mefor-engine`, and `engine` is not a section, so those
+> do not trip it. Name your own Services clear of the section names, or set
+> `enableServiceLinks: false` on the pod.
 >
 > **Variables that are not settings are spared by name.** Their consuming module reads them straight
 > from the environment and they are not fields here: at least `MEFOR_STORE_VAULT_ADDR`,
@@ -58,8 +73,8 @@
 > #122 / ADR 0162 made it a real, engine-owned field, and the two legacy spellings beside it refuse.
 > **They refuse on BOTH layers, and only one of those is the general rule.** In the file they hit the
 > unknown-key refusal above (`max_bytes` is even suggested onward as `file_max_bytes`; `backups` is
-> refused naming nothing). From **env** — where a misspelled `MEFOR_*` is otherwise dropped in
-> silence — they hit a dedicated `[logging]` validator that names the replacement for both.
+> refused naming nothing). From **env** they hit a dedicated `[logging]` validator that names the
+> replacement for both; the env unknown-key refusal above leaves these two to it.
 
 ## Principle — two kinds of configuration
 

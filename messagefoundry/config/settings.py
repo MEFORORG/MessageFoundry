@@ -19,17 +19,18 @@ silently-dropped key leaves the setting it was meant to apply un-applied, with n
 reporting a problem. An unknown top-level **section**, or a top-level key outside any section, is
 refused the same way and for the same reason: a misspelt ``[integrty]`` drops every key under it.
 
-The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
-oversight: the **env** layer and the ``cli`` mapping still drop an unrecognized key silently. Env
-cannot be checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read
-straight from ``os.environ`` by their consuming module and are not fields on any section
-(``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership
-test would refuse a correctly-configured deployment. ``cli`` keys are engine-written from parsed
-arguments, never operator-spelled; an operator's unknown flag never reaches them, because argparse
-refuses it first with exit 2. The one
-exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
-Anything stated to an operator about this refusal must carry that scope — see
-``docs/CONFIGURATION.md``.
+The **env** layer has a refusal of its own, narrower than the file's
+(:func:`_reject_unknown_env_keys`, vault BACKLOG #2600): a ``MEFOR_<SECTION>_<KEY>`` variable whose
+section has an env layer and whose key that section does not define. It is narrower because some
+documented ``MEFOR_*`` variables are read straight from ``os.environ`` by their consuming module
+and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED``
+and siblings); those are spared by name. A variable whose SECTION part matches no section with
+an env layer is still dropped silently, and under ``[secrets].provider = "env"`` an unknown key
+is warned about and not refused. The ``cli`` mapping is not checked: its keys are engine-written
+from parsed arguments, never operator-spelled, and an operator's unknown flag never reaches them,
+because argparse refuses it first with exit 2. ``[security]`` has its own refusal from env (the
+arm inside :func:`_desugar_security`). Anything stated to an operator about these refusals must
+carry that scope — see ``docs/CONFIGURATION.md``.
 """
 
 from __future__ import annotations
@@ -191,6 +192,13 @@ _DEFAULT_FILE = "messagefoundry.toml"
 _ERROR_DETAIL_ROWS = 5
 
 _log = logging.getLogger(__name__)
+
+#: The legacy ``[logging]`` rotation keys and the field each became (BACKLOG #122, ADR 0162). The
+#: model refuses each by name, and the env unknown-key refusal leaves them to it.
+_RENAMED_LOGGING_KEYS: dict[str, str] = {
+    "max_bytes": "file_max_bytes",
+    "backups": "file_backup_count",
+}
 
 #: (section, key) secrets that belong in env, never the config file (see _warn_file_secrets).
 _FILE_SECRET_KEYS = (
@@ -2395,13 +2403,10 @@ class LoggingSettings(_Section):
         ``_env_overrides`` scrapes ``MEFOR_LOGGING_*`` straight into the section dict. Measured:
         ``MEFOR_LOGGING_MAX_BYTES`` and ``MEFOR_LOGGING_BACKUPS`` each reach this validator and are
         refused naming their replacement. Since vault BACKLOG #2600 the loader refuses any other
-        unknown env key under a modelled section (:func:`_reject_unknown_env_keys`). That check
-        runs after the model is built, so these two keep the message that names the replacement."""
+        unknown env key under a section with an env layer (:func:`_reject_unknown_env_keys`). That
+        check spares these two, so they keep the message that names the replacement."""
         if isinstance(data, dict):
-            for legacy, actual in (
-                ("max_bytes", "file_max_bytes"),
-                ("backups", "file_backup_count"),
-            ):
+            for legacy, actual in _RENAMED_LOGGING_KEYS.items():
                 if legacy in data:
                     raise ValueError(
                         f"[logging].{legacy} is not a setting — the engine-managed application-log "
@@ -7031,11 +7036,11 @@ def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
         )
 
 
-#: ``MEFOR_<SECTION>_<KEY>`` names under a modelled section that are NOT settings fields, because the
+#: ``MEFOR_<SECTION>_<KEY>`` names under a known section that are NOT settings fields, because the
 #: module that uses each reads it straight from ``os.environ`` (vault BACKLOG #2600). They are spared
 #: by :func:`_reject_unknown_env_keys`, exactly as spelled. ``tests/test_settings_env_keys.py`` reds
-#: when engine code names a ``MEFOR_<known section>_*`` variable that is neither a field nor listed
-#: here, and when an entry here is no longer named by any engine module.
+#: when engine code spells a ``MEFOR_<known section>_*`` variable that is neither a field nor listed
+#: here, and when an entry here is spelled by no engine module other than this one.
 _OUT_OF_BAND_ENV: frozenset[str] = frozenset(
     {
         # The two phase-timing diagnostics (pipeline/phase_timing.py).
@@ -7061,48 +7066,101 @@ _OUT_OF_BAND_ENV: frozenset[str] = frozenset(
 )
 
 
-def _reject_unknown_env_keys(environ: Mapping[str, str]) -> None:
+def _string_values(value: Any) -> Iterator[str]:
+    """Every string held anywhere in ``value``, a nest of mappings and sequences."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _string_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _string_values(item)
+
+
+def _near_env_name(section: str, key: str, model: type[BaseModel]) -> str | None:
+    """The closest variable an operator could mean by ``MEFOR_<section>_<key>``, or ``None``.
+
+    Matched on the KEY part alone, as :func:`_near_field` matches a file key, so the shared
+    ``MEFOR_<SECTION>_`` prefix cannot make two unrelated names look close. A key that MOVED to
+    ``[security]`` or was removed is never offered: the loader refuses that spelling too."""
+    prefix = f"{_ENV_PREFIX}{section.upper()}_"
+    gone = {*_RELOCATED_TO_SECURITY, *_REMOVED_KEYS}
+    keys = [field for field in model.model_fields if (section, field) not in gone]
+    keys += [name[len(prefix) :].lower() for name in _OUT_OF_BAND_ENV if name.startswith(prefix)]
+    near = difflib.get_close_matches(key, sorted(keys), n=1)
+    return f"{prefix}{near[0].upper()}" if near else None
+
+
+def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]) -> None:
     """Raise ``ValueError`` if the environment sets a ``MEFOR_<SECTION>_<KEY>`` variable whose section
-    is modelled and whose key that section does not define (vault BACKLOG #2600).
+    has an env layer and whose key that section does not define (vault BACKLOG #2600).
 
     The same failure :func:`_reject_unknown_file_keys` refuses in the file: a mistyped
     ``MEFOR_STORE_REQUIRE_ENCRYPTON`` used to be scraped into ``[store]``, ignored by the model, and
     reported by nothing, so the instance started without the hardening its environment asked for.
 
-    Names the VARIABLE and **never its value**, which may be a secret. Three kinds of name are spared:
+    Names the VARIABLE and **never its value**, which may be a secret. ``data`` is the merged file
+    and environment layers, before the model is built, so a typo that is also the cause of a
+    cross-field validation error is named here first.
 
-    * one whose section is not modelled (``MEFOR_ALLOW_INSECURE_TLS``, a harness variable, another
-      tool's). :func:`_env_overrides` never read those, and this does not start to. So a typo in the
+    At least these names are spared:
+
+    * one whose section part is not in :data:`_SECTIONS`, the list :func:`_env_overrides` reads
+      (``MEFOR_ALLOW_INSECURE_TLS``, a harness variable, another tool's, and the sections with no
+      env layer). The env layer never read those, and this does not start to. So a typo in the
       SECTION part of a name is still dropped silently;
+    * one with no key part;
     * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;
-    * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message.
+    * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message, and the
+      renamed ``[logging]`` keys in :data:`_RENAMED_LOGGING_KEYS`, which the model refuses naming
+      the replacement;
+    * one that a setting in ``data`` names as its value. That is how a secret reference such as
+      ``[alerts].email_password_secret`` names the variable ``[secrets].provider = "env"`` reads.
 
-    :func:`load_settings` calls this after the model is built, so a key with a refusal of its own
-    never reaches here: a relocated or removed key (:func:`_reject_relocated_keys`), and the
-    renamed ``[logging]`` keys the model refuses naming their replacement. A load that fails
-    validation for another reason reports that reason first, and this one on the next attempt.
+    A relocated or removed key never reaches here: :func:`_reject_relocated_keys` runs first.
+
+    **Under ``[secrets].provider = "env"`` an offender is WARNED, not refused.** There a secret
+    reference is the name of an environment variable the operator chooses, and a connection can
+    carry one that no setting names. This loader cannot see the connection graph, so it cannot tell
+    such a variable from a typo. The WARNING names each variable, so the drop is no longer silent.
+
     The section and key are matched in lower case, as :func:`_env_overrides` matches them."""
     models = _section_models()
+    named_by_a_setting = set(_string_values(data))
     offenders: list[str] = []
     for name in sorted(environ):
         if not name.startswith(_ENV_PREFIX) or name in _OUT_OF_BAND_ENV:
             continue
         section, _, key = name[len(_ENV_PREFIX) :].lower().partition("_")
-        model = models.get(section)
-        if model is None or section == "security" or not key or key in model.model_fields:
+        if section not in _SECTIONS or section == "security" or not key:
             continue
-        prefix = f"{_ENV_PREFIX}{section.upper()}_"
-        known = [f"{prefix}{field.upper()}" for field in model.model_fields]
-        known += [spared for spared in _OUT_OF_BAND_ENV if spared.startswith(prefix)]
-        near = difflib.get_close_matches(name.upper(), sorted(known), n=1)
-        offenders.append(_printable(name) + (f" (did you mean {near[0]}?)" if near else ""))
-    if offenders:
-        raise ValueError(
-            f"unrecognized environment variable(s): {', '.join(offenders)}. Each names a config "
-            "section and a key that section does not define. It is REFUSED, not ignored — a dropped "
-            "one leaves the setting it was meant to apply silently un-applied. Check the spelling "
-            "against docs/CONFIGURATION.md, or unset the variable."
+        model = models.get(section)
+        if model is None or key in model.model_fields or name in named_by_a_setting:
+            continue
+        if section == "logging" and key in _RENAMED_LOGGING_KEYS:
+            continue
+        near = _near_env_name(section, key, model)
+        offenders.append(_printable(name) + (f" (did you mean {near}?)" if near else ""))
+    if not offenders:
+        return
+    found = f"unrecognized environment variable(s): {', '.join(offenders)}. Each names a config "
+    found += "section and a key that section does not define"
+    secrets = data.get("secrets")
+    provider = secrets.get("provider") if isinstance(secrets, Mapping) else None
+    if isinstance(provider, str) and provider.strip().lower() == "env":
+        _log.warning(
+            "%s. It is NOT applied as a setting. It is not refused either, because "
+            "[secrets].provider = 'env' reads secret references from variables the operator "
+            "names, and this may be one. If it is a mistyped setting, fix its spelling.",
+            found,
         )
+        return
+    raise ValueError(
+        f"{found}. It is REFUSED, not ignored — a dropped one leaves the setting it was meant to "
+        "apply silently un-applied. Check the spelling against docs/CONFIGURATION.md, or unset "
+        "the variable."
+    )
 
 
 # --- ADR 0118: the [security] section desugars into the internal fields it replaces ----------------
@@ -8943,17 +9001,17 @@ def load_settings(
     # After _reject_relocated_keys so a MOVED key keeps its specific "moved to [security].X" message, and
     # over `file_data` rather than `data` so it never sees a key the env overlay or the desugar wrote.
     _reject_unknown_file_keys(file_data)
+    # The same refusal for the environment layer (vault BACKLOG #2600). After the relocated-key
+    # check, so a moved or removed key keeps its own message. Before the model is built, so a
+    # typo that causes a validation error is named. Over `environ` itself, so it reports the
+    # variable as the operator spelled it; `data` is read for what the settings name.
+    _reject_unknown_env_keys(environ, data)
     _desugar_security(data)
 
     if cli:
         _merge(data, cli)
 
     settings = ServiceSettings.model_validate(data)
-    # The unknown-key refusal for the environment layer (vault BACKLOG #2600). LAST of the
-    # refusals, so a key with a message of its own keeps it: a relocated or removed key, an
-    # unknown [security] key, and the renamed [logging] keys the model refuses by name. Over
-    # `environ` itself, so it reports the variable as the operator spelled it.
-    _reject_unknown_env_keys(environ)
     # AFTER the CLI merge, so a `--host` that moved the socket off-box is reported as the posture
     # loosening it is. One-way: it only ever ADDS a loosening. See the helper for why.
     _reconcile_effective_bind(settings)
