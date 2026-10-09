@@ -679,12 +679,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > Reported whenever it is `false` (vault BACKLOG #2600). The default is `true`
 > ([ADR 0077](adr/0077-action-bound-step-up.md)).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
-  once. They include at least the self-service factor and session-terminate routes, the admin
-  user-update, reset-password, reset-mfa and federated-identity routes, and resend, edit-resend,
-  upload resend, export, purge and config reload. With the switch off, those routes accept the
-  session-wide step-up window instead. A sign-in can open that window, so a session taken over
-  inside it can bind an authenticator, inject a message or export bodies in bulk with no fresh
-  proof.
+  once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
+  With the switch off, those routes accept the session-wide step-up window instead. A sign-in can
+  open that window, so a session taken over inside it can bind an authenticator, inject a message
+  or export bodies in bulk with no fresh proof.
 - **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
   while a client that cannot send the bound proof is updated.
 - **Compensating controls:** keep `[auth].step_up_max_age_seconds` short, keep
@@ -697,8 +695,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 ### `[auth].password_check_breached`, `password_check_context` or `password_check_username` `= false` — a local-password screen is off
 > Each is reported whenever it is `false` (vault BACKLOG #2600), under its own name. All three
 > default to `true`. They screen local passwords.
-- **What you lose:** with `password_check_breached` off, a password is not checked against the
-  bundled common and breached password list when it is set. With `password_check_context` off, it
+- **What you lose:** with `password_check_breached` off, a password is not checked against a
+  common and breached password list when it is set: neither the bundled list nor a site list in
+  `[auth].password_breach_corpus_file`. With `password_check_context` off, it
   is not checked for context words, neither the shipped terms nor
   `[auth].password_extra_context_words`. With `password_check_username` off, it may contain the
   account's own username.
@@ -1244,7 +1243,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **It is never silent:** a WARNING at every construction naming the connection, never an id, a
   `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it, and
   an `update_url_form` entry in `security_loosenings()`, which `GET /security/posture` shows with
-  the same connection names (vault BACKLOG #2571). The last two read one list.
+  the same connection names (vault BACKLOG #2571). The last two read one list. That list holds a
+  connection whose `update_url_form` is written as the literal `"path"`. A value supplied
+  through `env()` is not resolved when the list is built, so such a connection is not named by
+  either.
 - **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
   `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
   and `[security].enforcement = enforce` does not refuse it. It is not in the

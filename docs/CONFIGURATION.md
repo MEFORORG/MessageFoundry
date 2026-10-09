@@ -29,24 +29,26 @@
 > command: argparse prints `unrecognized arguments` and exits 2. Its default prefix matching still
 > applies, so an unambiguous prefix of a real flag (`--service-conf`) is read as that flag.
 >
-> **A `MEFOR_<SECTION>_<KEY>` variable whose section has an env layer and whose key is not real is
-> REFUSED at load** (vault BACKLOG #2600). `MEFOR_STORE_REQUIRE_ENCRYPTON=true` used to be dropped with no
+> **A `MEFOR_<SECTION>_<KEY>` variable that names a real section and no setting in it is REFUSED at
+> load** (vault BACKLOG #2600). `MEFOR_STORE_REQUIRE_ENCRYPTON=true` used to be dropped with no
 > warning, so the instance started without the hardening its environment asked for. The refusal
 > names the variable and, when one fits, the nearest real one. It never repeats the value, because
 > the environment is where secrets belong. Unset the variable or fix its spelling.
 >
-> **What env still drops in silence:** a variable whose SECTION part matches no section with an
-> env layer. A typo there (`MEFOR_STOER_PATH`) is not refused, and neither is a var aimed at one
-> of the four sections that have no env layer ([Mechanism](#mechanism)). The loader cannot tell
-> those from the `MEFOR_*` variables that belong to no section at all, such as
-> `MEFOR_ALLOW_INSECURE_TLS`.
+> **A variable aimed at a section with no env layer is refused too**, even when its key is real.
+> `MEFOR_SECRET_ROTATION_WARN_DAYS=0` used to change nothing and say nothing. The four sections
+> are listed under [Mechanism](#mechanism). Set them in the file.
 >
-> **Under `[secrets].provider = "env"` the unknown variable is WARNED about, not refused.** That
-> provider reads a secret reference as the name of an environment variable you choose. A variable
-> that a setting names, such as the value of `[alerts].email_password_secret`, is spared. A
-> connection can carry a reference no setting names, and the settings loader cannot see
-> connections. So there an unknown `MEFOR_<SECTION>_<KEY>` variable is named in a WARNING and the
-> load continues. With that provider, check the spelling of every such variable yourself.
+> **What env still drops in silence:** a variable that names no section at all. A typo in the
+> SECTION part (`MEFOR_STOER_PATH`) is not refused. The loader cannot tell it from the `MEFOR_*`
+> variables that belong to no section, such as `MEFOR_ALLOW_INSECURE_TLS`.
+>
+> **A secret reference names a variable of your choosing, and that variable is spared.** Under
+> `[secrets].provider = "env"`, spelled exactly so, the value of a reference setting is the name
+> of an environment variable: at least `[auth].ad_bind_password_secret`,
+> `[auth].oidc_client_secret_ref`, `[auth].oidc_client_private_key_ref` and
+> `[alerts].email_password_secret`. The variable such a setting names loads, whatever it is
+> called. Under any other provider nothing is spared this way.
 >
 > **The check reads the whole process environment.** A platform that injects variables can trip
 > it. Kubernetes service links are the known case: a Service named `mefor-auth` in the engine's
@@ -109,7 +111,7 @@ CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
   in the file — env wins over the file so a deployment can inject them.
 - Env naming: `MEFOR_<SECTION>_<KEY>` (e.g. `MEFOR_STORE_PASSWORD`, `MEFOR_API_PORT`). The parser splits
   the name at the **first** `_` after the prefix and matches that against a known-section list, so four
-  built sections have **no env layer** and a `MEFOR_*` var aimed at one is dropped without a warning:
+  built sections have **no env layer** and a `MEFOR_*` var aimed at one is refused at load:
   `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`. The reasons
   differ. `[service]` would work if the known-section list named it, but it just isn't listed. The other
   three fail a different way: that same first-underscore split turns `MEFOR_CERT_MONITOR_ENABLED` into

@@ -496,8 +496,8 @@ def test_an_engine_written_config_still_loads(tmp_path: Path) -> None:
 def test_the_refusal_covers_the_file_and_env_but_not_cli(tmp_path: Path) -> None:
     """Pins the SCOPE of the refusal, so the gap that is left reads as a decision.
 
-    The file and the environment each refuse an unknown key under a modelled section (the
-    environment since vault BACKLOG #2600; ``tests/test_settings_env_keys.py`` holds its own tests).
+    The file refuses an unknown key under a modelled section. The environment has a narrower
+    refusal since vault BACKLOG #2600; ``tests/test_settings_env_keys.py`` holds its tests.
     CLI keys are engine-written, never operator-spelled, and nothing checks them."""
     cfg = _write(tmp_path / "messagefoundry.toml", '[store]\nbackend = "sqlite"\n')
 

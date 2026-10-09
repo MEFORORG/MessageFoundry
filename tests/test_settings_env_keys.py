@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import ast
 import functools
-import logging
 import re
 from pathlib import Path
 
@@ -76,11 +75,24 @@ def test_the_hint_is_matched_on_the_key_and_not_on_the_shared_prefix() -> None:
     assert "did you mean MEFOR_STORE_PORT?" in _refusal({"MEFOR_STORE_PORTT": "1"})
 
 
-def test_the_hint_never_offers_a_key_the_loader_refuses() -> None:
-    """``[store].allow_unencrypted_phi`` moved to ``[security]``, so offering it would send the
-    operator from one refusal into another."""
-    message = _refusal({"MEFOR_STORE_ALLOW_UNENCRYPTED_PH": "true"})
-    assert "MEFOR_STORE_ALLOW_UNENCRYPTED_PHI" not in message
+@pytest.mark.parametrize(
+    "name",
+    [
+        "MEFOR_STORE_ALLOW_UNENCRYPTED_PH",  # nearest is a key that MOVED to [security]
+        "MEFOR_AUTH_REQUIRE_MFAA",  # the same
+        "MEFOR_AUTH_ENABLE",  # nearest is a REMOVED key
+        "MEFOR_CLUSTER_VIP_ENABLED",  # a sub-table key
+        "MEFOR_CLUSTER_VIPP",  # nearest is the sub-table itself
+    ],
+)
+def test_no_hint_is_given_when_the_nearest_key_is_one_the_environment_cannot_set(
+    name: str,
+) -> None:
+    """The runner-up there is an unrelated switch (``MEFOR_CLUSTER_ENABLED`` for the VIP key, a
+    different loosening for the moved ones), so the refusal offers nothing."""
+    message = _refusal({name: "true"})
+    assert name in message
+    assert "did you mean" not in message
 
 
 def test_every_offender_is_named_in_one_refusal() -> None:
@@ -122,15 +134,34 @@ def test_a_spared_name_is_spared_only_as_spelled() -> None:
         "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE",
         "MEFOR_CONNSCALE_COUNT",  # a harness variable
         "MEFOR_STOER_PATH",  # a typo in the SECTION: still dropped, and nothing said
-        "MEFOR_SERVICE_NAME",  # [service] has no env layer, so nothing here reads it
-        "MEFOR_CERT_MONITOR_ENABLED",  # splits to section "cert", which is not one
+        "MEFOR_CERTIFICATE_PATH",  # near a section name, and names none
         "MEFOR_STORE",  # no key part
         "PATH",
     ],
 )
-def test_a_name_outside_every_section_with_an_env_layer_is_not_refused(name: str) -> None:
-    """The stated limit: only a name whose section the env layer reads is checked."""
+def test_a_name_that_names_no_modelled_section_is_not_refused(name: str) -> None:
+    """The stated limit: a name is checked only when it names a modelled section."""
     _reject_unknown_env_keys({name: "x"}, {})
+
+
+@pytest.mark.parametrize(
+    ("name", "section"),
+    [
+        ("MEFOR_SECRET_ROTATION_WARN_DAYS", "secret_rotation"),  # a REAL key of that section
+        ("MEFOR_SECRET_ROTATION_ENFORCE_STORE_KEY_EXPIRY", "secret_rotation"),
+        ("MEFOR_CERT_MONITOR_ENABLED", "cert_monitor"),
+        ("MEFOR_UPDATE_CHECK_ENABLED", "update_check"),
+        ("MEFOR_SERVICE_NAME", "service"),
+    ],
+)
+def test_a_variable_for_a_section_with_no_env_layer_is_refused(name: str, section: str) -> None:
+    """Nothing reads such a variable, real key or not, so it used to change nothing in silence.
+    The refusal says the section is set in the file, and offers no variable name."""
+    message = _refusal({name: _SENTINEL})
+    assert name in message
+    assert f"[{section}] has no environment layer" in message
+    assert "did you mean" not in message
+    assert _SENTINEL not in message
 
 
 def test_a_security_typo_keeps_its_own_refusal() -> None:
@@ -155,35 +186,51 @@ def test_a_renamed_logging_key_keeps_the_message_that_names_its_replacement() ->
 _SECRET_VAR = "MEFOR_ALERTS_SMTP_PASSWORD"
 
 
-def test_a_variable_a_setting_names_as_a_secret_reference_is_spared() -> None:
-    """``[secrets].provider = "env"`` reads a reference as an environment variable name the
-    operator chooses. One that a setting names is in use, not a typo."""
-    environ = {
-        "MEFOR_SECRETS_PROVIDER": "env",
+def _reference_environ(provider: str) -> dict[str, str]:
+    return {
+        "MEFOR_SECRETS_PROVIDER": provider,
         "MEFOR_ALERTS_EMAIL_PASSWORD_SECRET": _SECRET_VAR,
         _SECRET_VAR: _SENTINEL,
     }
-    loaded = load_settings(environ=environ, default_file=False)
+
+
+def test_a_variable_a_setting_names_as_a_secret_reference_is_spared() -> None:
+    """``[secrets].provider = "env"`` reads a reference as an environment variable name the
+    operator chooses. One that a reference setting names is in use, not a typo."""
+    loaded = load_settings(environ=_reference_environ("env"), default_file=False)
     assert loaded.alerts.email_password_secret == _SECRET_VAR
 
 
-def test_under_the_env_provider_an_unnamed_variable_is_warned_and_not_refused(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A connection can carry a reference no setting names, and the loader cannot see the graph.
-    So under that provider the unknown variable is named in a WARNING and the load continues."""
+@pytest.mark.parametrize("provider", ["none", "vault", "ENV", " env "])
+def test_the_reference_spare_needs_the_env_provider_spelled_exactly(provider: str) -> None:
+    """The control for the test above. No other provider reads a reference from the environment,
+    and the engine matches the provider name exactly, so the same variable is refused."""
+    assert _SECRET_VAR in _refusal(_reference_environ(provider))
+
+
+def test_under_the_env_provider_a_variable_no_reference_names_is_refused() -> None:
+    """The second control: the provider alone spares nothing."""
     environ = {"MEFOR_SECRETS_PROVIDER": "env", _SECRET_VAR: _SENTINEL}
-    with caplog.at_level(logging.WARNING, logger=settings_module.__name__):
-        _load(environ)
-    warned = [r.getMessage() for r in caplog.records if _SECRET_VAR in r.getMessage()]
-    assert len(warned) == 1
-    assert _SENTINEL not in warned[0]
+    assert _SECRET_VAR in _refusal(environ)
+    typo = {"MEFOR_SECRETS_PROVIDER": "env", "MEFOR_STORE_REQUIRE_ENCRYPTON": "true"}
+    assert "MEFOR_STORE_REQUIRE_ENCRYPTON" in _refusal(typo)
 
 
-def test_without_the_env_provider_the_same_variable_is_refused() -> None:
-    """The control for the two tests above: the shipped provider is ``none``."""
-    assert _SECRET_VAR in _refusal({_SECRET_VAR: _SENTINEL})
-    assert _SECRET_VAR in _refusal({"MEFOR_SECRETS_PROVIDER": "none", _SECRET_VAR: _SENTINEL})
+def test_a_setting_that_is_not_a_reference_spares_nothing() -> None:
+    """Only the reference settings name a variable. Another setting whose value happens to be a
+    variable's name does not spare it."""
+    environ = {
+        "MEFOR_SECRETS_PROVIDER": "env",
+        "MEFOR_LOGGING_FORWARD_HOST": "MEFOR_STORE_REQUIRE_ENCRYPTON",
+        "MEFOR_STORE_REQUIRE_ENCRYPTON": "true",
+    }
+    assert "MEFOR_STORE_REQUIRE_ENCRYPTON" in _refusal(environ)
+
+
+def test_every_listed_reference_setting_is_a_real_field() -> None:
+    models = settings_module._section_models()
+    for section, key in settings_module._SECRET_REFERENCE_KEYS:
+        assert key in models[section].model_fields, (section, key)
 
 
 # --- the census of names the engine's own code spells ----------------------------------------------
