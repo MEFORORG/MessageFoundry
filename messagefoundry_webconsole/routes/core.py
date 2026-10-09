@@ -27,6 +27,7 @@ from messagefoundry.api.models import (
     ResendRequest,
 )
 from messagefoundry.api.security import (
+    client_ip,
     get_auth,
     pending_credential_deadline_for,
     public_route,
@@ -613,7 +614,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         auth = get_auth(request)
         if auth is None:
             raise HTTPException(503, "authentication is not configured")
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not auth.allow_login_attempt(client):
             raise HTTPException(429, "too many login attempts", headers={"Retry-After": "30"})
         # Parse the urlencoded login form with stdlib — the engine has no python-multipart dep, so
@@ -1647,7 +1648,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return login_redirect_response()
         if await rotation_comes_first(auth, identity.must_change_password, token):
             return RedirectResponse("/ui/account/password", status_code=303)
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not allow_reauth_attempt(auth, identity, client):
             # Same per-ACTOR ceremony budget the reauth/password flows draw on, so code-guessing
             # here cannot outrun it either.
@@ -1808,7 +1809,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 status_code=400,
             )
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
             raise HTTPException(429, "too many attempts", headers={"Retry-After": "30"})
 
@@ -1967,7 +1968,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         rp = webauthn_rp(request)
         if rp is None:
             return JSONResponse({"ok": False, "error": "rp_unavailable"}, status_code=409)
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
             return JSONResponse(
                 {"ok": False, "error": "too many attempts"},
@@ -2088,7 +2089,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # PHI-free summary at WARNING (the /ui surface carries no message bodies in its URLs), and 204.
         # Never echo or act on the report. Both the legacy report-uri body and the modern report-to
         # ARRAY (the wired Reporting-Endpoints header) are normalized by ``_csp_report_bodies``.
-        client = request.client.host if request.client else "<unknown>"
+        client = client_ip(request) or "<unknown>"
         raw = await request.body()
         if not raw:
             _log.warning("CSP violation report from %s: %s", client, "empty")

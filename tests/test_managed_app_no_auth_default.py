@@ -155,7 +155,7 @@ def test_settings_built_in_code_refuse_the_removed_sign_in_switch(
     #2719). Before vault BACKLOG #2825 settings built in code took ``enabled=False``; now they refuse
     it loudly rather than drop it, and assigning the attribute is refused too."""
     assert "enabled" not in AuthSettings.model_fields
-    with pytest.raises(ValueError, match="no `enabled` field"):
+    with pytest.raises(ValueError, match=r"\[auth\]\.enabled was REMOVED"):
         build()
     with pytest.raises(ValueError, match="enabled"):
         setattr(AuthSettings(), "enabled", False)  # noqa: B010 -- the name is the subject

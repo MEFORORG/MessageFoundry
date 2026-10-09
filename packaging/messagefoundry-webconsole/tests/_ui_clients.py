@@ -35,6 +35,11 @@ from messagefoundry.pipeline import Engine
 #: >=15 characters, no app or vendor terms -- satisfies the ASVS password policy (WP-3).
 PW = "a-strong-test-passphrase"
 
+#: Set ``extensions={HEADERLESS_UI_REQUEST: True}`` on one request to send it as a program would,
+#: with no fetch metadata at all. ``conftest.py`` otherwise gives a state-changing /ui request the
+#: ``Sec-Fetch-Site`` a browser sends; the refusal tests need the request left alone.
+HEADERLESS_UI_REQUEST = "mf_headerless_ui_request"
+
 #: A synthetic ADT^A01, the one message these suites seed. Never real PHI (CLAUDE.md section 9).
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 

@@ -99,6 +99,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # the tooling path gate.
         "test_browser_storage_doc_drift.py",
         "test_c901_delta.py",
+        # Reads messagefoundry/**, messagefoundry_webconsole/**, messagefoundry_toolkit/** and
+        # harness/** off disk with ast, and fails when a raw client-address read appears outside
+        # api/security.client_ip (BACKLOG #2289). What breaks it is an ENGINE or console diff, which
+        # does not trip the tooling path gate, so listed as tooling it would run on no leg for that
+        # change.
+        "test_client_ip_single_extractor.py",
         # NOT engine source, so this entry WIDENS the list's stated rule and the claim is spelled out
         # for review. Its subject is the TEST TREES: it scans both `testpaths` roots for a bare
         # `import conftest`, which binds to whichever root pytest loaded first (BACKLOG #1255). The

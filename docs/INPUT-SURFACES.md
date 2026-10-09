@@ -282,8 +282,9 @@ model defines the fields, `load_settings` builds it, and `_reject_unknown_file_k
 section the model does not define.
 
 **The file is checked more strictly than the environment.** An unknown key or section in the file
-fails the start. A misspelled `MEFOR_*` variable is mostly dropped without a warning. The opening
-notes of CONFIGURATION.md state the exact scope; read them there.
+fails the start. A misspelled `MEFOR_*` variable is refused only in part: at least a typo in its
+section part is still dropped without a warning. The opening notes of CONFIGURATION.md state the
+exact scope; read them there.
 
 ---
 

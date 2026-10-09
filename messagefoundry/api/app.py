@@ -63,6 +63,7 @@ from fastapi import (
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.telemetry import TelemetryConfig
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -220,7 +221,6 @@ from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
-    _allow_no_auth,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -230,6 +230,7 @@ from messagefoundry.api.security import (
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
     get_auth,
+    open_mode,
     optional_identity,
     pending_credential_deadline,
     public_route,
@@ -362,6 +363,7 @@ from messagefoundry.config.wiring import (
     expiry_relaxed_hops,
     hostname_unchecked_hops,
     load_config,
+    path_form_fhir_updates,
     query_credential_hops,
     redacted_settings,
     revocation_attested_hops,
@@ -1275,10 +1277,13 @@ def _posture_loosenings(
         db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
         attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
         revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
+        # Vault BACKLOG #2571. This reader returns plain names already.
+        path_form_hops = path_form_fhir_updates(runner.registry)
     else:
         cleartext_hops, expired_hops, hostname_hops, db_hops = [], [], [], []
         query_hops = []
         attested_hops, revocation_hops = [], []
+        path_form_hops = []
     loosenings_scope = (
         None
         if runner is not None
@@ -1286,7 +1291,8 @@ def _posture_loosenings(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-            "tls_revocation_attested declarations are NOT included (see `messagefoundry check`)"
+            "tls_revocation_attested / FHIR update_url_form declarations are NOT included "
+            "(see `messagefoundry check`)"
         )
     )
     pairs = list(
@@ -1303,6 +1309,7 @@ def _posture_loosenings(
             unverified_db_hops=db_hops,
             attested_hops=attested_hops,
             revocation_attested_hops=revocation_hops,
+            path_form_fhir_hops=path_form_hops,
             api=api_settings,
             # BACKLOG #2489: the dual-control dwell and expiry, read off the gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),
@@ -1311,6 +1318,10 @@ def _posture_loosenings(
             # shipped default, the stash-or-default rule [secret_rotation] follows above. KNOWN
             # GAP: such an engine may run no cert monitor at all, and this then reads it as on.
             cert_monitor=getattr(state, "cert_monitor_settings", None) or CertMonitorSettings(),
+            # Vault BACKLOG #2302: the cleartext-archive escape, off the [backup] section the
+            # managed lifespan stashed. The same stash-or-default rule: an app built without it
+            # is read at the shipped default, which names nothing.
+            backup=getattr(state, "backup_settings", None) or BackupSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -1319,9 +1330,9 @@ def _posture_loosenings(
         )
     )
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
-    # cannot see it. The same two reads the request-time gates make decide it: no service, and
-    # the flag. A service beside the flag still requires sign-in, so it reports nothing.
-    if getattr(state, "auth", None) is None and _allow_no_auth(state):
+    # cannot see it. The check the request-time gates make decides it: no service, and the flag.
+    # A service beside the flag still requires sign-in, so no entry is added for it.
+    if open_mode(state):
         pairs.append(
             (
                 "allow_no_auth",
@@ -2679,6 +2690,26 @@ class _SummaryAuditCoalescer:
         )
 
 
+# fastapi 0.142 ships OpenTelemetry telemetry that is on by default. Left on, it would read
+# OTEL_EXPORTER_OTLP_* before lifespan startup and install its own OTLP exporters whenever the
+# SDK is importable (the [otel] extra installs it). Its logs carry unhandled-exception messages and
+# stack traces, and it hands any log processor the request's validation errors with their original
+# input values; here either can be PHI. That would send data off the host with no reviewed
+# [api] setting behind it (CLAUDE.md section 9). Every switch is off, not only auto_configure: with
+# auto_configure alone, any provider another component configures globally would still receive
+# fastapi's spans, request metrics and validation logs, and fastapi would still parse inbound trace
+# headers through the global propagators. The engine's own optional OTLP metrics export
+# (api/metrics.py, BACKLOG #21) builds its own provider and does not depend on any of this.
+# tests/test_api_fastapi_telemetry_off.py pins it.
+_FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
+    "tracing": False,
+    "metrics": False,
+    "logs": False,
+    "operation_spans": False,
+    "auto_configure": False,
+}
+
+
 def create_app(
     engine: Engine | None = None,
     *,
@@ -2751,6 +2782,7 @@ def create_app(
         # unless it carries a gate or a public declaration; security.refuse_undeclared_route says
         # what that covers and what it does not.
         dependencies=[Depends(refuse_undeclared_route)],
+        telemetry=_FASTAPI_TELEMETRY_OFF,
     )
     # Vault BACKLOG #2739: every route registered on this app from here on is built by this class,
     # which refuses a caller with no identity BEFORE FastAPI reads the request body. Set before the
@@ -3038,7 +3070,7 @@ def create_app(
         # Rejections are logged (ASVS 16.3.3) — these are control-bypass attempts (a pre-auth memory
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         length = request.headers.get("content-length")
         transfer_encoding = request.headers.get("transfer-encoding", "").lower()
         # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
@@ -3101,9 +3133,10 @@ def create_app(
         # default deployment's /health payload is byte-identical. This route is EXEMPT from the network
         # gate (api/client_networks.py), which is what lets a locked-out operator curl it and discover
         # which address the engine is matching — the difference between a diagnosable 403 and a
-        # console that looks dead.
+        # console that looks dead. It reads through client_ip, as the gate itself does, so the echo
+        # names the address the gate would match on any other path (BACKLOG #2289).
         networks = getattr(request.app.state, "client_networks", ())
-        observed = (request.client.host if request.client else None) if networks else None
+        observed = client_ip(request) if networks else None
         return Health(
             version=__version__ if identity is not None else None, observed_client=observed
         )
@@ -9959,6 +9992,10 @@ def create_managed_app(
             # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
             # for a monitoring signal, and byte-identical to before.
             app.state.cert_monitor_settings = cert_monitor_settings
+            # Vault BACKLOG #2302: back GET /security/posture's backup.allow_unencrypted entry.
+            # None (direct create_app / embedding) leaves the route on the shipped [backup]
+            # defaults, which report nothing.
+            app.state.backup_settings = backup_settings
             # BACKLOG #1004: back GET /security/posture's enforce_store_key_expiry loosening entry.
             # None (direct create_app / embedding) leaves the route on shipped defaults, which report
             # nothing — correct, because an app built without [secret_rotation] has not opted out.

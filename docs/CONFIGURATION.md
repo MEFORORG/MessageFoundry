@@ -24,20 +24,48 @@
 > engine that does not model it. The refusal never repeats the offending value, because this file can
 > carry secrets.
 >
-> **The refusal covers the FILE, and the CLI refuses an unknown flag too. Env mostly does not — check
-> `MEFOR_*` spellings yourself.** An unknown `serve` flag stops the command: argparse prints
-> `unrecognized arguments` and exits 2. Its default prefix matching still applies, so an unambiguous
-> prefix of a real flag (`--service-conf`) is read as that flag. A misspelled `MEFOR_*` variable is
-> dropped with no warning, whether the typo is in its section part or its key part. Some env input is
-> refused anyway: at least an unrecognized `[security]` key and the renamed `[logging]` keys, both
-> described below. The env layer is where
-> secrets belong, and it already drops a var aimed at one of the four sections that have no env layer
-> ([Mechanism](#mechanism)). The loader also cannot tell such a typo from one of the documented
-> `MEFOR_*` variables its consuming module reads straight from the environment rather than declaring as
-> a field (`MEFOR_STORE_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and siblings). **One exception:**
-> an unrecognized `[security]` posture switch is refused from **env as well as the file**, because every
-> shipped `MEFOR_SECURITY_*` name maps to a real field, so there is no out-of-band variable to collide
-> with — and believing a posture control is on when it is not is the worst case of the class.
+> **The refusal covers the FILE, and the CLI refuses an unknown flag too. Env is covered in part —
+> check the SECTION part of a `MEFOR_*` spelling yourself.** An unknown `serve` flag stops the
+> command: argparse prints `unrecognized arguments` and exits 2. Its default prefix matching still
+> applies, so an unambiguous prefix of a real flag (`--service-conf`) is read as that flag.
+>
+> **A `MEFOR_<SECTION>_<KEY>` variable that names a real section and no setting in it is REFUSED at
+> load** (vault BACKLOG #2600). `MEFOR_STORE_REQUIRE_ENCRYPTON=true` used to be dropped with no
+> warning, so the instance started without the hardening its environment asked for. The refusal
+> names the variable and, when one fits, the nearest real one. It never repeats the value, because
+> the environment is where secrets belong. Unset the variable or fix its spelling.
+>
+> **A variable aimed at a section with no env layer is refused too**, even when its key is real.
+> `MEFOR_SECRET_ROTATION_WARN_DAYS=0` used to change nothing and say nothing. The four sections
+> are listed under [Mechanism](#mechanism). Set them in the file.
+>
+> **What env still drops in silence:** a variable that names no section at all. A typo in the
+> SECTION part (`MEFOR_STOER_PATH`) is not refused. The loader cannot tell it from the `MEFOR_*`
+> variables that belong to no section, such as `MEFOR_ALLOW_INSECURE_TLS`.
+>
+> **A secret reference names a variable of your choosing, and that variable is spared.** Under
+> `[secrets].provider = "env"`, spelled exactly so, the value of a reference setting is the name
+> of an environment variable: at least `[auth].ad_bind_password_secret`,
+> `[auth].oidc_client_secret_ref`, `[auth].oidc_client_private_key_ref` and
+> `[alerts].email_password_secret`. The variable such a setting names loads, whatever it is
+> called. Under any other provider nothing is spared this way.
+>
+> **The check reads the whole process environment.** A platform that injects variables can trip
+> it. Kubernetes service links are the known case: a Service named `mefor-auth` in the engine's
+> namespace gives the pod `MEFOR_AUTH_SERVICE_HOST`, and the load is refused. The Services in the
+> shipped manifests have names that start `mefor-engine`, and `engine` is not a section, so those
+> do not trip it. Name your own Services clear of the section names, or set
+> `enableServiceLinks: false` on the pod.
+>
+> **Variables that are not settings are spared by name.** Their consuming module reads them straight
+> from the environment and they are not fields here: at least `MEFOR_STORE_VAULT_ADDR`,
+> `MEFOR_STORE_VAULT_TOKEN`, `MEFOR_SECRETS_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and the two
+> phase-timing variables. The list is `_OUT_OF_BAND_ENV` in `messagefoundry/config/settings.py`. A
+> name on it is spared only as spelled there, in upper case.
+>
+> An unrecognized `[security]` posture switch is refused from **env as well as the file**, with a
+> message that names the section and key. So are the renamed `[logging]` keys described below, by a
+> message that names the replacement.
 >
 > A handful of keys are **declared but not yet read** — they load, they just do nothing yet:
 > `[retention].audit_days` (**reserved/keep-forever by design**), `[reference].max_staleness_seconds`,
@@ -47,8 +75,8 @@
 > #122 / ADR 0162 made it a real, engine-owned field, and the two legacy spellings beside it refuse.
 > **They refuse on BOTH layers, and only one of those is the general rule.** In the file they hit the
 > unknown-key refusal above (`max_bytes` is even suggested onward as `file_max_bytes`; `backups` is
-> refused naming nothing). From **env** — where a misspelled `MEFOR_*` is otherwise dropped in
-> silence — they hit a dedicated `[logging]` validator that names the replacement for both.
+> refused naming nothing). From **env** they hit a dedicated `[logging]` validator that names the
+> replacement for both; the env unknown-key refusal above leaves these two to it.
 
 ## Principle — two kinds of configuration
 
@@ -83,7 +111,7 @@ CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
   in the file — env wins over the file so a deployment can inject them.
 - Env naming: `MEFOR_<SECTION>_<KEY>` (e.g. `MEFOR_STORE_PASSWORD`, `MEFOR_API_PORT`). The parser splits
   the name at the **first** `_` after the prefix and matches that against a known-section list, so four
-  built sections have **no env layer** and a `MEFOR_*` var aimed at one is dropped without a warning:
+  built sections have **no env layer** and a `MEFOR_*` var aimed at one is refused at load:
   `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`. The reasons
   differ. `[service]` would work if the known-section list named it, but it just isn't listed. The other
   three fail a different way: that same first-underscore split turns `MEFOR_CERT_MONITOR_ENABLED` into
@@ -834,7 +862,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `forward_hop_attested` | bool | `false` | **acknowledged opt-out** for a plaintext / unverified-TLS collector hop (#200, ADR 0092 — the `[logging]` sibling of a connection's `tls_hop_attested`). A hop that is not verified TLS is now decided by the shared posture gradient: **refused** on an enforcing instance, warned on a non-enforcing one, allowed for a loopback collector. The synthetic arm is gone with the declaration that fed it ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)). Set this (with a reason) to affirm the hop is secure by other means — e.g. a dedicated out-of-band management VLAN |
 | `forward_hop_attested_reason` | str | — | why the hop is secure, recorded for the audit trail. **Mandatory when `forward_hop_attested = true`** (ADR 0153 retro-fitted the flag-implies-reason rule: an attestation that suppresses a refusal must record WHY, or it is worthless when audited) — the flag alone now fails at load. Rejected without the flag, and must be non-empty |
 | `forward_spool_dir` | str | `log-spool/<engine or shard id>` beside `[store].path` | the on-disk spool behind the forwarder (BACKLOG #1966, ADR 0200). Records the collector has not taken (down, backing off, or still queued at shutdown) are kept here in order and sent when it answers. Best effort, not at least once: after a collector reset the first send on the dead connection can be lost, a restart can resend up to one segment (12.5 MB at the default cap), and over UDP no failed send is detected (ADR 0200). It holds only text the PHI, credential and control-character filters already processed; PL-1 like the app log ([PHI.md](PHI.md) section 2). Each engine shard gets its own subdirectory, because the spool locks its directory. Under `supervise` the supervisor process forwards its own log records too, through the same forwarding start gates as `serve` (it does not run every `serve` gate, and a refusal it prints to stderr is not forwarded), and spools them in a `supervisor` subdirectory beside its engine shards'; with `forward_spool_dir` unset that is `log-spool/supervisor` beside `--db` (BACKLOG #2356). With a spool, a TCP or TLS collector down at start is retried instead of dropped for the process life |
-| `forward_spool_max_bytes` | int | `100000000` | cap on the spool's size on disk. When full, the newest record is dropped and the drop reported, which keeps the oldest evidence. `0` turns the spool off, and with it the deferred start. It does NOT turn off the forwarding start gate: under `[security].enforcement = "enforce"` a PHI instance refuses to start unless forwarding is verified TLS (`forward_protocol = "tls"`, verification on) to a `forward_host` that is not loopback, whatever the spool (BACKLOG #1966, owner ruling R4 (a)). The same gate also checks whether `forward_host` is this host's own OS name or one of its own addresses (vault BACKLOG #2375). That check is separate from the ruling, and it passes when the OS cannot answer; [SECURITY.md, *Audit*](SECURITY.md#audit-1) states it once, with what it reads and what still passes. A host name that resolves to loopback passes the gate, a residual #1199 owns. `supervise` applies the gate as `serve` does. The collector is also an egress destination: see `allowed_syslog` under [`[egress]`](#egress) for when an unlisted one is refused |
+| `forward_spool_max_bytes` | int | `100000000` | cap on the spool's size on disk. When full, the newest record is dropped and the drop reported, which keeps the oldest evidence. `0` turns the spool off, and with it the deferred start. It does NOT turn off the forwarding start gate: under `[security].enforcement = "enforce"` a PHI instance refuses to start unless forwarding is verified TLS (`forward_protocol = "tls"`, verification on) to a `forward_host` that is not loopback and is not this host's own OS name or one of its own addresses, whatever the spool (BACKLOG #1966, owner ruling R4 (a); ADR 0200 Amendment A, vault BACKLOG #2375). The gate reads configuration and local host state: the OS host name and, for an IP literal, the routing table's source address. It sends no packet and resolves no name. If that local read fails, the gate passes and logs a WARNING. At least a host name that resolves to loopback, and an alias that resolves to this host, still pass it, a residual #1199 owns. `supervise` applies the gate as `serve` does. The collector is also an egress destination: see `allowed_syslog` under [`[egress]`](#egress) for when an unlisted one is refused |
 | `require_time_sync` | bool | `false` | **opt-in** startup clock-sync gate (ASVS 16.2.2, ADR 0080): before listeners start, probe `ntp_peer` and warn on skew. Requires `ntp_peer`. Default = no-op |
 | `ntp_peer` | str | — | NTP/SNTP host to compare the local clock against (**required** when `require_time_sync`) |
 | `time_sync_max_skew_seconds` | float | `2.0` | \|local − peer\| above this is "skewed" (must be > 0) |
@@ -1978,7 +2006,7 @@ then. The design, including what it can and cannot promise about split-brain on 
 Leaving the block out, or switching `enabled` off, changes nothing. A switched-off block is never
 refused for the values it holds, but unknown keys in it are still refused, as in every section. The
 block is file-only. There is no `MEFOR_CLUSTER_VIP_*` environment override, and such a variable is
-dropped like any other unrecognized env key.
+refused at load like any other unrecognized key under a known section.
 
 With `enabled = true` the engine **refuses to load** when:
 
@@ -2059,7 +2087,7 @@ a warm DR-site engine is a non-promotable cluster member, not a lease-contending
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | is this deployment a DR standby box at all? `false` = the normal run-profile (every connection starts, subject only to ADR 0031), byte-unchanged |
-| `activate` | bool | `false` | should this box come up **under the DR run-profile** on this boot — the startup activation latch, distinct from the runtime `POST /dr/activate` endpoint. Enabled but `activate = false` is *provisioned-but-passive*: the box binds **no** inbound listener, of any tier (vault BACKLOG #3140). ADR 0048's load balancer moves the VIP to the node that answers, so a passive box must answer on nothing. Each inbound reads `status: "filtered"`, and the start logs one WARNING saying why. Its outbounds are built as usual. A reload or dry run still checks the listeners an activation would bind. So a config the activation would refuse is refused before the disaster. A bind fault that only a bind can find, such as a port in use, shows only when the activation binds. An operator start of an inbound still binds it, until the next reload parks it again or the close of its schedule window stops it. An alert rule's restart and the scheduler bind nothing. `POST /dr/activate` then turns the run-profile on in place: it re-applies the graph the engine is already running, parks every connection below `priority_threshold` (`status: "filtered"`), and keeps it parked across later reloads. While an outbound is parked, an operator start, stop or restart of it answers `409`. An alert rule's restart of a parked connection does nothing. `POST /dr/release` parks every inbound before it unbinds them and drains, then stops parking outbounds. The next reload binds no listener, as on any passive box. A parked outbound then runs again, unless an operator or its schedule had paused it first. An `auto_start = false` outbound stays parked by its own gate. A failed release leaves the box active, with the run-profile's parks in place. It also parks a below-threshold inbound an operator had started, when the release stopped it and it is still down. Only an operator start binds that one again. The listeners at or above `priority_threshold` that it unbound stay down. `POST /config/reload` binds them again, and so can their schedule window or an alert rule's restart. A reload skips an `auto_start = false` one. The activation applies nothing from the config dir: it only digests it, for the audit record. If the running config dir on disk no longer matches the running graph, the `dr.activate` audit row records both digests and the engine logs a WARNING; only `POST /config/reload` applies those bytes. A no-op unless `enabled` |
+| `activate` | bool | `false` | should this box come up **under the DR run-profile** on this boot — the startup activation latch, distinct from the runtime `POST /dr/activate` endpoint. Enabled but `activate = false` is *provisioned-but-passive*: the box binds **no** inbound listener, of any tier (vault BACKLOG #3140). ADR 0048's load balancer moves the VIP to the node that answers, so a passive box must answer on nothing. Each inbound reads `status: "filtered"`, and the start logs one WARNING saying why. The box also delivers nothing (vault BACKLOG #3262). No outbound is started: each reads `status: "filtered"` and holds its rows, and an operator start, stop or restart of one answers `409`. A DR box is seeded from a backup of the primary's store, which can hold rows the primary had not delivered, and the primary may still be alive and delivering them. The router and transform stages still run, so a restored row moves to the outbound stage and waits there. A handler's live lookup therefore still runs on a passive box, and a routing or transform failure still alerts. A reload or dry run still checks the listeners an activation would bind. So a config the activation would refuse is refused before the disaster. A bind fault that only a bind can find, such as a port in use, shows only when the activation binds. An operator start of an inbound still binds it, until the next reload parks it again or the close of its schedule window stops it. An alert rule's restart and the scheduler bind nothing. `POST /dr/activate` then turns the run-profile on in place: it re-applies the graph the engine is already running, parks every connection below `priority_threshold` (`status: "filtered"`), and keeps it parked across later reloads. While an outbound is parked, an operator start, stop or restart of it answers `409`. An alert rule's restart of a parked connection does nothing. `POST /dr/release` parks every inbound before it unbinds them and drains. When the drain ends it parks every outbound, so the released box delivers nothing, as on any passive box, closes their connectors, and the next reload starts none of them. A row the drain left, or one held on an outbound the profile parked, stays queued on this box, and the `dr.release` audit row counts them. The next activation delivers the ones on an outbound at or above `priority_threshold`. An `auto_start = false` outbound an operator had started is parked with the rest and then takes its own gate's answer, so only an operator start brings it up again. The others are for the operator to reconcile against the primary, as ADR 0048's fail-back runbook says. A failed release leaves the box active, with the run-profile's parks in place. It also parks a below-threshold inbound an operator had started, when the release stopped it and it is still down. Only an operator start binds that one again. The listeners at or above `priority_threshold` that it unbound stay down. `POST /config/reload` binds them again, and so can their schedule window or an alert rule's restart. A reload skips an `auto_start = false` one. The activation applies nothing from the config dir: it only digests it, for the audit record. If the running config dir on disk no longer matches the running graph, the `dr.activate` audit row records both digests and the engine logs a WARNING; only `POST /config/reload` applies those bytes. A no-op unless `enabled` |
 | `activation_mode` | enum | `manual` | `manual` is the **only built mode** — the DR box promotes solely on the explicit, RBAC-gated operator action. `auto` (the box detects HA-pair loss and self-promotes) is named so a forward-looking config is explicit, but config load **rejects** it with a "not yet supported" error — never a silent no-op |
 | `priority_threshold` | enum | `critical` | start **only** connections whose resolved priority rank is at or above this tier (`[delivery].priority` + a per-connection `priority=`). `critical` (owner-locked default) starts only the critical feeds; `normal` would also start normal-tier ones. A below-threshold connection reports `status: "filtered"` — distinct from ADR 0031's `"failed"`. An unknown value fails config load |
 | `takeover_hook` | str | `""` | **optional** operator command run before binding the priority listeners: exit 0 = "VIP acquired", any non-zero or timeout = "not acquired" and **activation aborts**. For an ADR 0047 load-balancer topology the passive LB is the fence and this is belt-and-braces only. `""` = no hook; a whitespace-only value is rejected at load (it would run an empty shell and "succeed"). **Both hooks run with the engine's environment minus every `MEFOR_*` variable, `VAULT_TOKEN` and `PGPASSWORD`**, so a hook keeps ordinary variables such as `PATH` or a cloud profile and gets none of the engine's own settings. A secret you keep under any other name, such as a `[secrets].provider = "env"` reference that is not named `MEFOR_*`, still reaches the hook. Pass a hook what it needs on its command line or under another name |

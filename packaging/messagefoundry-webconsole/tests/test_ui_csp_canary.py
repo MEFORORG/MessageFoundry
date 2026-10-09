@@ -794,8 +794,12 @@ def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
     assert "Unresolved" in text
     # and the wording stays compatible with the unpublished-distribution scan (see the docstring)
     assert "not published" not in text
-    # the console never blocks: the OTHER half of the 3.1.1 verb (warn the user OR block access)
-    assert "warns, it never blocks" in text or "No browser is blocked" in text
+    # Both halves of the 3.1.1 verb (warn the user OR block access), plus the named control. This
+    # pinned "warns, it never blocks" until BACKLOG #1116/#1124 made that false: a state-changing
+    # request with neither provenance header is refused now, and the page must not claim otherwise.
+    for answer in ("**Warns.**", "**Fails closed.**", "**Named control.**"):
+        assert answer in text, answer
+    assert "it never blocks" not in text
 
 
 def _runbook_contract_table() -> str:

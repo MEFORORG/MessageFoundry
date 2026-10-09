@@ -5604,7 +5604,9 @@ def path_form_fhir_updates(registry: Registry) -> list[str]:
     """Every outbound ``FHIR()`` connection that sets ``update_url_form="path"`` (vault BACKLOG #2550).
 
     The single reader of that set, on the contract of :func:`expiry_relaxed_hops`: ``messagefoundry
-    check`` reads it, and any later surface must read it too, so they cannot disagree. Sorted by name.
+    check`` reads it, and so does ``GET /security/posture`` for the ``update_url_form`` entry of
+    ``security_loosenings()`` (vault BACKLOG #2571). Any later surface must read it too, so they
+    cannot disagree. Sorted by name.
 
     The path form puts each message's resource id in the request URL, which owner ruling R3 (ASVS
     14.2.1) keeps out of it by default. It is an interoperability relaxation for a server with no

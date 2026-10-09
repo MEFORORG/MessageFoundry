@@ -44,3 +44,27 @@ transport = "mllp"
   [outbound.settings]
   host = { env = "demo_oru_host" }            # resolved per environment (environments/<env>.toml)
   port = { env = "demo_oru_port", cast = "int" }
+
+# --- IB_STEPS_ORU: the typed-Steps worked example (ADR 0076, ADR 0106). Its router and handler are
+# written only in the typed action vocabulary, so the Steps view shows no locked code rows. The handler
+# fans each result out to both outbounds below.
+[[inbound]]
+name      = "IB_STEPS_ORU"
+transport = "mllp"
+router    = "steps_oru_router"         # bound by name to the @router in IB_STEPS_ORU_router.py
+  [inbound.settings]
+  port = 2650                          # inbound MLLP takes only a port (bind host is a service setting)
+
+[[outbound]]
+name      = "OB_STEPS_ORU_EMR"         # referenced by name from IB_STEPS_ORU_handler.py
+transport = "mllp"
+  [outbound.settings]
+  host = { env = "steps_oru_host" }           # resolved per environment (environments/<env>.toml)
+  port = { env = "steps_oru_port", cast = "int" }
+
+[[outbound]]
+name      = "OB_STEPS_ORU_ARCHIVE"     # the results archive, which keeps a copy of every result
+transport = "mllp"
+  [outbound.settings]
+  host = { env = "steps_archive_host" }
+  port = { env = "steps_archive_port", cast = "int" }

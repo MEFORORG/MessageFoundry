@@ -57,6 +57,7 @@ ADT = (
 
 _CRIT = "IB_CRIT_ADT"
 _NORM = "IB_NORM_ADT"
+_BOTH_OUTBOUNDS = {"OB_CRIT_ADT", "OB_NORM_ADT"}
 
 
 def _free_ports(count: int) -> list[int]:
@@ -105,12 +106,14 @@ def _write_tiered_graph(
     tmp_path: Path,
     *,
     norm_schedule: str | None = None,
+    crit_schedule: str | None = None,
     norm_auto_start: bool = True,
     norm_inbound_auto_start: bool = True,
 ) -> tuple[int, int]:
     """One critical and one normal MLLP inbound, each with an outbound of the same tier. Returns
     the two ports, critical first. ``norm_auto_start`` is the normal OUTBOUND's flag and
-    ``norm_inbound_auto_start`` the normal inbound's."""
+    ``norm_inbound_auto_start`` the normal inbound's. Each ``_schedule`` is that tier's
+    OUTBOUND's."""
     cfg.mkdir(parents=True, exist_ok=True)
     out_crit, out_norm = tmp_path / "out-crit", tmp_path / "out-norm"
     out_crit.mkdir(exist_ok=True)
@@ -124,7 +127,7 @@ def _write_tiered_graph(
         f"inbound({_NORM!r}, MLLP(port={norm_port}), router='r', priority=Priority.NORMAL"
         f"{'' if norm_inbound_auto_start else ', auto_start=False'})\n"
         f"outbound('OB_CRIT_ADT', File(directory={str(out_crit)!r}), "
-        "priority=Priority.CRITICAL)\n"
+        f"priority=Priority.CRITICAL{f', schedule={crit_schedule}' if crit_schedule else ''})\n"
         f"outbound('OB_NORM_ADT', File(directory={str(out_norm)!r}), priority=Priority.NORMAL"
         f"{f', schedule={norm_schedule}' if norm_schedule else ''}"
         f"{'' if norm_auto_start else ', auto_start=False'})\n"
@@ -221,9 +224,11 @@ async def test_an_activation_parks_the_normal_feed_and_keeps_the_critical_one(bo
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
     assert rr is not None
-    # A passive box binds no listener, of any tier (vault BACKLOG #3140), and parks no outbound.
+    # A passive box binds no listener, of any tier (vault BACKLOG #3140), and parks every
+    # outbound (vault BACKLOG #3262).
     assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
-    assert set(rr.filtered_inbound()) == {_CRIT, _NORM} and rr.filtered_outbound() == {}
+    assert set(rr.filtered_inbound()) == {_CRIT, _NORM}
+    assert set(rr.filtered_outbound()) == _BOTH_OUTBOUNDS
 
     coord = engine.dr_coordinator
     assert coord is not None
@@ -245,7 +250,8 @@ async def test_an_activation_parks_the_normal_feed_and_keeps_the_critical_one(bo
 async def test_a_release_then_a_reload_returns_to_the_passive_bind_set(box: _Box) -> None:
     """Red before #3067 in the other direction: a runner built under the profile kept its threshold
     after a release, so every later reload went on parking the normal outbound. Since vault BACKLOG
-    #3140 the released box is passive again, so that reload binds no listener of any tier."""
+    #3140 the released box is passive again, so that reload binds no listener of any tier. Since
+    vault BACKLOG #3262 it parks every outbound as well, from the release on."""
     engine = box.engine
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
@@ -261,11 +267,12 @@ async def test_a_release_then_a_reload_returns_to_the_passive_bind_set(box: _Box
     assert not rr.inbound_running(_CRIT)  # the release unbound all intake
     # Parked at once, not at the next reload, so the scheduler cannot bind either feed (#3140).
     assert set(rr.filtered_inbound()) == {_CRIT, _NORM}
+    assert set(rr.filtered_outbound()) == _BOTH_OUTBOUNDS  # and nothing delivers (#3262)
 
     await engine.reload_detail(box.tiered)
     assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
     assert set(rr.filtered_inbound()) == {_CRIT, _NORM}
-    assert rr.filtered_outbound() == {}  # the outbound park lifts, as #3067 built it
+    assert set(rr.filtered_outbound()) == _BOTH_OUTBOUNDS
 
 
 async def _norm_row(engine: Engine, message_id: str) -> dict[str, Any]:
@@ -285,10 +292,13 @@ async def _until(predicate: Callable[[], Any], timeout: float = 10.0) -> None:
         assert elapsed < timeout, "condition not met within timeout"
 
 
-async def test_a_row_on_a_parked_outbound_is_held_and_drains_after_release(box: _Box) -> None:
+async def test_a_row_on_a_parked_outbound_is_held_through_the_release(box: _Box) -> None:
     """Red before #3067's hold: the parked lane's worker claimed the row, found no connector and
     charged it a failed attempt every backoff, so a finite max_attempts dead-lettered it. The
-    release then waited out its whole drain timeout on it and still recorded drained: true."""
+    release then waited out its whole drain timeout on it and still recorded drained: true.
+
+    The released box is passive, so the row stays held across the reload that used to deliver it
+    (vault BACKLOG #3262)."""
     engine = box.engine
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
@@ -332,20 +342,18 @@ async def test_a_row_on_a_parked_outbound_is_held_and_drains_after_release(box: 
     detail = json.loads(row["detail"])
     assert detail["drained"] is True and detail["held_on_parked_outbounds"] == 1
 
-    await engine.reload_detail(box.tiered)  # the profile is off: the park lifts and it drains
-
-    await _until_norm_done(engine, message_id)
-    assert any((box.tiered.parent / "out-norm").iterdir())  # a file reached the target
-
-
-async def _until_norm_done(engine: Engine, message_id: str) -> None:
-    async def norm_delivered() -> bool:
-        return (await _norm_row(engine, message_id))["status"] == "done"
-
-    await _until(norm_delivered)
+    await engine.reload_detail(box.tiered)  # the box is passive: the row stays held
+    await _assert_still_parked(engine, message_id)
+    assert not any((box.tiered.parent / "out-norm").iterdir())  # nothing reached the target
 
 
-async def _assert_delivers_after_release(engine: Engine, box: _Box, message_id: str) -> None:
+async def _assert_held_as_an_engine_park_after_release(
+    engine: Engine, box: _Box, message_id: str
+) -> None:
+    """After a release and a reload the lane is still parked by the engine, with its row held.
+    The released box is passive, so nothing delivers (vault BACKLOG #3262). The engine-park
+    marker is what a later reload lifts, so a door that had turned the park into an operator
+    pause would show here as a missing marker."""
     rr = engine.registry_runner
     assert rr is not None
     coord = engine.dr_coordinator
@@ -353,8 +361,18 @@ async def _assert_delivers_after_release(engine: Engine, box: _Box, message_id: 
     await coord.release(actor="alice")
     await engine.reload_detail(box.tiered)
 
-    await _until_norm_done(engine, message_id)
-    assert rr.outbound_status("OB_NORM_ADT") == "running"
+    await _assert_still_parked(engine, message_id)
+    assert "OB_NORM_ADT" in rr._gate_parked
+
+
+async def _until_only_row_done(engine: Engine, message_id: str) -> None:
+    """Wait until the message's one outbound row is delivered."""
+
+    async def delivered() -> bool:
+        (row,) = await engine.store.outbox_for(message_id)
+        return bool(row["status"] == "done")
+
+    await _until(delivered)
 
 
 async def _activate_with_a_held_row(engine: Engine) -> str:
@@ -385,7 +403,8 @@ async def _assert_still_parked(engine: Engine, message_id: str) -> None:
 
 @pytest.mark.parametrize("door", ["start", "stop", "restart"])
 async def test_an_operator_door_on_a_dr_parked_outbound_is_refused(box: _Box, door: str) -> None:
-    """Start, stop and restart of a DR-parked outbound refuse, and the lane comes up after release.
+    """Start, stop and restart of a DR-parked outbound refuse, and the lane is still the engine's
+    park after the release.
 
     Red at 15d1d9637b for each door in its own way. A start was deferred rather than refused. A
     stop dropped the engine-park marker, so no reload after release lifted the lane and it read
@@ -396,14 +415,14 @@ async def test_an_operator_door_on_a_dr_parked_outbound_is_refused(box: _Box, do
     assert rr is not None
     message_id = await _activate_with_a_held_row(engine)
 
-    with pytest.raises(DrParkedError, match="release DR first") as refused:
+    with pytest.raises(DrParkedError, match="parked by the DR run-profile") as refused:
         await getattr(rr, f"{door}_outbound")("OB_NORM_ADT")
     # The API's `from None` over this error is listed SAFE in test_from_none_is_not_redaction.py
     # because it is raised with no chain. Pin that, since `from None` would not hide one.
     assert refused.value.__cause__ is None and refused.value.__context__ is None
     await _assert_still_parked(engine, message_id)
 
-    await _assert_delivers_after_release(engine, box, message_id)
+    await _assert_held_as_an_engine_park_after_release(engine, box, message_id)
 
 
 async def test_the_api_answers_409_for_each_door_on_a_dr_parked_outbound(box: _Box) -> None:
@@ -435,7 +454,7 @@ async def test_an_alert_rule_restart_on_a_dr_parked_outbound_is_logged_and_does_
     assert len(refusals) == 1 and refusals[0].levelno == logging.INFO
     await _assert_still_parked(engine, message_id)
 
-    await _assert_delivers_after_release(engine, box, message_id)
+    await _assert_held_as_an_engine_park_after_release(engine, box, message_id)
 
 
 async def test_an_alert_rule_restart_of_a_dr_parked_inbound_does_nothing(box: _Box) -> None:
@@ -455,39 +474,55 @@ async def test_an_alert_rule_restart_of_a_dr_parked_inbound_does_nothing(box: _B
     assert rr.inbound_filtered(_NORM) is not None
 
 
-async def test_an_operator_pause_from_before_the_activation_survives_the_release(
+async def test_an_operator_pause_survives_a_release_and_the_next_activation(
     box: _Box,
 ) -> None:
-    """A lane the operator paused before DR is the operator's after it, even when an alert rule
-    tried to restart it during DR. Red at 15d1d9637b: the alert restart marked the lane as an
-    engine park, so the reload after release brought up a lane the operator had paused."""
+    """A lane the operator paused is the operator's after a release and after the activation
+    that follows it. Red at 15d1d9637b in an older shape: an alert rule's restart marked a
+    paused lane as an engine park, so a later reload brought up a lane the operator had paused.
+
+    A passive box refuses a stop (vault BACKLOG #3262), so the pause is made while the box is
+    active, on the critical lane the profile leaves running."""
     engine = box.engine
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
     assert rr is not None
-    await rr.stop_outbound("OB_NORM_ADT")  # the operator's pause, before any DR
-    message_id = await _activate_with_a_held_row(engine)
-    await _alert_control_action(engine, "restart_outbound", "OB_NORM_ADT", default_target=False)
-
+    with pytest.raises(DrParkedError, match="POST /dr/activate"):
+        await rr.stop_outbound("OB_CRIT_ADT")  # passive: the lane is the engine's to hold
     coord = engine.dr_coordinator
     assert coord is not None
+    await coord.activate(actor="alice")
+    await rr.stop_outbound("OB_CRIT_ADT")  # the operator's pause
+
     await coord.release(actor="alice")
+    # Queued after the release, whose drain would wait out its timeout on a paused lane's row.
+    message_id = await engine.store.enqueue_message(
+        channel_id=_CRIT, raw=ADT, deliveries=[("OB_CRIT_ADT", ADT)], now=time.time()
+    )
     await engine.reload_detail(box.tiered)
+    # An alert rule's restart is refused like any door, and must not make the pause the engine's.
+    await _alert_control_action(engine, "restart_outbound", "OB_CRIT_ADT", default_target=False)
+    assert rr.outbound_filtered("OB_CRIT_ADT") is not None  # passive: parked with the rest
+    assert "OB_CRIT_ADT" not in rr._gate_parked  # and still not the engine's to lift
+
+    await engine._dr_activate_profile()
     await asyncio.sleep(0.3)
-    assert rr.outbound_filtered("OB_NORM_ADT") is None  # no longer the DR's
-    assert rr.outbound_status("OB_NORM_ADT") == "stopped"  # still the operator's pause
-    assert (await _norm_row(engine, message_id))["attempts"] == 0
+    assert rr.outbound_filtered("OB_CRIT_ADT") is None  # no longer the DR's
+    assert rr.outbound_status("OB_CRIT_ADT") == "stopped"  # still the operator's pause
+    (row,) = await engine.store.outbox_for(message_id)
+    assert row["status"] == "pending" and row["attempts"] == 0
 
-    await rr.start_outbound("OB_NORM_ADT")  # control: the operator's own start delivers it
+    await rr.start_outbound("OB_CRIT_ADT")  # control: the operator's own start delivers it
+    await _until_only_row_done(engine, message_id)
 
-    await _until_norm_done(engine, message_id)
 
-
-async def test_a_start_disabled_dr_parked_outbound_follows_its_gate_after_release(
+async def test_a_start_disabled_dr_parked_outbound_is_refused_until_the_profile_admits_it(
     box: _Box,
 ) -> None:
     """An ``auto_start=False`` lane: the operator's start under DR is refused out loud, rather than
-    accepted and then lost to the release reload's auto_start gate as at 15d1d9637b."""
+    accepted and then lost to the release reload's auto_start gate as at 15d1d9637b. The released
+    box is passive, so the start is still refused there, and names the activation (vault BACKLOG
+    #3262)."""
     engine = box.engine
     await engine.reload_detail(box.gated)
     rr = engine.registry_runner
@@ -501,14 +536,10 @@ async def test_a_start_disabled_dr_parked_outbound_follows_its_gate_after_releas
     assert coord is not None
     await coord.release(actor="alice")
     await engine.reload_detail(box.gated)
-    await asyncio.sleep(0.3)
-    assert rr.outbound_filtered("OB_NORM_ADT") is None
-    assert rr.outbound_status("OB_NORM_ADT") == "stopped"  # its gate's answer
-    assert (await _norm_row(engine, message_id))["attempts"] == 0
-
-    await rr.start_outbound("OB_NORM_ADT")  # the start the gate exists for, now accepted
-
-    await _until_norm_done(engine, message_id)
+    await _assert_still_parked(engine, message_id)
+    with pytest.raises(DrParkedError, match="POST /dr/activate"):
+        await rr.start_outbound("OB_NORM_ADT")
+    await _assert_still_parked(engine, message_id)
 
 
 async def test_a_dr_parked_outbound_can_be_purged(box: _Box) -> None:
@@ -539,6 +570,7 @@ async def test_a_second_stop_of_a_paused_outbound_leaves_it_stopped(box: _Box) -
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
     assert rr is not None
+    await engine._dr_activate_profile()  # a passive box refuses a stop (vault BACKLOG #3262)
     await rr.stop_outbound("OB_CRIT_ADT")
 
     async def quiesced() -> bool:
@@ -550,35 +582,73 @@ async def test_a_second_stop_of_a_paused_outbound_leaves_it_stopped(box: _Box) -
     assert rr.outbound_quiesced("OB_CRIT_ADT")
 
 
-async def test_a_calendar_parked_outbound_unscheduled_under_dr_comes_up_after_release(
+async def test_a_calendar_parked_outbound_unscheduled_while_dr_parks_it_comes_up_when_dr_lets_go(
     box: _Box, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A reload under the profile removes the schedule of a lane the calendar parked. The
-    scheduler's resume is refused and logged, and the lane stays the calendar's until the reload
-    after release resumes it. Red at 638136f79a: the unscheduled resume met the DR park, left the
-    lane paused with no engine-park marker, and no later reload lifted it."""
+    """A reload removes the schedule of a lane the calendar parked, while DR parks that lane too.
+    The scheduler's resume is refused and logged, and the lane stays the calendar's until the
+    first reload that no longer parks it. Red at 638136f79a: the unscheduled resume met the DR
+    park, left the lane paused with no engine-park marker, and no later reload lifted it.
+
+    The calendar can only park a lane that is running, and on a DR box that is a lane at or
+    above the threshold while the box is active (vault BACKLOG #3262). So the DR park here is the
+    passive one a release applies, and the activation that follows is what lets go."""
     engine = box.engine
-    await engine.reload_detail(box.scheduled)
+    await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
     assert rr is not None
-
-    async def calendar_parked() -> bool:
-        return not rr.outbound_running("OB_NORM_ADT")
-
-    await _until(calendar_parked)  # control: the calendar holds it down
-    message_id = await engine.store.enqueue_message(
-        channel_id=_CRIT, raw=ADT, deliveries=[("OB_NORM_ADT", ADT)], now=time.time()
-    )
     coord = engine.dr_coordinator
     assert coord is not None
     await coord.activate(actor="alice")
+    _write_tiered_graph(box.scheduled, box.scheduled.parent, crit_schedule=_NEVER)
+    await engine.reload_detail(box.scheduled)
+
+    async def calendar_parked() -> bool:
+        return "OB_CRIT_ADT" in rr._schedule_parked
+
+    await _until(calendar_parked)  # control: the calendar holds it down
+    await coord.release(actor="alice")
+    message_id = await engine.store.enqueue_message(
+        channel_id=_CRIT, raw=ADT, deliveries=[("OB_CRIT_ADT", ADT)], now=time.time()
+    )
     with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.wiring_runner"):
         await engine.reload_detail(box.tiered)  # the same graph with the schedule gone
-    refusals = [r for r in caplog.records if "but the DR run-profile parks it" in r.getMessage()]
+    refusals = [r for r in caplog.records if "but DR parks it" in r.getMessage()]
     assert len(refusals) == 1
-    await _assert_still_parked(engine, message_id)
+    await asyncio.sleep(0.3)  # several poll intervals for a worker that would claim the row
+    assert rr.outbound_filtered("OB_CRIT_ADT") is not None
+    assert "OB_CRIT_ADT" in rr._schedule_parked
+    (row,) = await engine.store.outbox_for(message_id)
+    assert row["status"] == "pending" and row["attempts"] == 0
 
-    await _assert_delivers_after_release(engine, box, message_id)
+    await engine._dr_activate_profile()
+    await _until_only_row_done(engine, message_id)
+    assert rr.outbound_status("OB_CRIT_ADT") == "running"
+
+
+async def test_an_activation_leaves_a_lane_its_calendar_has_closed_parked(box: _Box) -> None:
+    """A critical outbound whose window is closed holds a row when the box is activated. The
+    activation's reload must not deliver it. Red before the repair: the reload lifted the passive
+    park and the lane ran until the scheduler's own stop got the reload lock."""
+    engine = box.engine
+    _write_tiered_graph(box.scheduled, box.scheduled.parent, crit_schedule=_NEVER)
+    await engine.reload_detail(box.scheduled)
+    rr = engine.registry_runner
+    assert rr is not None
+    message_id = await engine.store.enqueue_message(
+        channel_id=_CRIT, raw=ADT, deliveries=[("OB_CRIT_ADT", ADT)], now=time.time()
+    )
+
+    await engine._dr_activate_profile()
+    await asyncio.sleep(0.5)  # ten poll intervals for a lane that would claim the row
+    (row,) = await engine.store.outbox_for(message_id)
+    assert row["status"] == "pending" and row["attempts"] == 0
+    assert rr.outbound_filtered("OB_CRIT_ADT") is None  # DR has let go of it
+    assert "OB_CRIT_ADT" in rr._schedule_parked  # and the calendar holds it
+    assert not rr.outbound_running("OB_CRIT_ADT")
+
+    await engine.reload_detail(box.tiered)  # control: with the schedule gone it delivers
+    await _until_only_row_done(engine, message_id)
 
 
 async def test_a_release_drain_that_times_out_is_not_recorded_as_drained(
@@ -590,10 +660,6 @@ async def test_a_release_drain_that_times_out_is_not_recorded_as_drained(
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
     assert rr is not None
-    await rr.stop_outbound("OB_CRIT_ADT")  # an operator pause: drainable in principle, not now
-    await engine.store.enqueue_message(
-        channel_id=_CRIT, raw=ADT, deliveries=[("OB_CRIT_ADT", ADT)], now=time.time()
-    )
     real_drain = engine._drain_pipeline
 
     async def short_drain() -> tuple[int, int]:
@@ -603,6 +669,11 @@ async def test_a_release_drain_that_times_out_is_not_recorded_as_drained(
     coord = engine.dr_coordinator
     assert coord is not None
     await coord.activate(actor="alice")
+    # Paused while active: a passive box refuses a stop (vault BACKLOG #3262).
+    await rr.stop_outbound("OB_CRIT_ADT")  # an operator pause: drainable in principle, not now
+    await engine.store.enqueue_message(
+        channel_id=_CRIT, raw=ADT, deliveries=[("OB_CRIT_ADT", ADT)], now=time.time()
+    )
     await coord.release(actor="alice")
 
     (row,) = await engine.store.list_audit(action="dr.release")
@@ -665,7 +736,7 @@ async def test_a_refused_activation_puts_the_threshold_back(
     monkeypatch.setattr(engine, "preflight_registry", real_preflight)
     await engine.reload_detail(box.tiered)
     assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)  # still passive
-    assert rr.filtered_outbound() == {}  # and parking no outbound
+    assert set(rr.filtered_outbound()) == _BOTH_OUTBOUNDS  # and delivering nothing (#3262)
 
 
 async def test_an_activation_preflights_the_running_graph_and_does_not_guard_it(

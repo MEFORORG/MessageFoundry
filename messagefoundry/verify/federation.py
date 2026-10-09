@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import ServiceSettings
+from messagefoundry.redaction import codec_safe_line
 from messagefoundry.verify.model import CheckResult, Status
 
 if TYPE_CHECKING:
@@ -576,7 +577,7 @@ def _replay_rows(
                 "fed.replay",
                 "Offline id_token replay",
                 Status.ERROR,
-                f"{type(exc).__name__}: {exc}",
+                codec_safe_line(exc),
             )
         )
         return rows

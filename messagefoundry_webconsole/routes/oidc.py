@@ -28,7 +28,13 @@ Two deliberate departures a reviewer will want to check rather than "fix":
   cross-site ``<form method=post>`` is still ``Sec-Fetch-Mode: navigate``, so the navigate check does
   not stop it. The first version of that split shipped without the assertion and its commit message
   claimed otherwise; this is the correction. A bookmarked or typed navigation is unaffected —
-  ``Sec-Fetch-Site: none`` is not cross-site, and a request carrying neither header raises nothing.
+  ``Sec-Fetch-Site: none`` is not cross-site. A POST carrying NEITHER ``Sec-Fetch-Site`` NOR
+  ``Origin`` is refused (BACKLOG #1116, #1124; it used to raise nothing). The GET that runs the
+  POST leg directly when the interstitial is skipped is NOT refused for that: a browser sends no
+  ``Origin`` on a GET navigation, and owner rulings R4 and R4b of 2026-09-28 hold that a sign-in
+  GET is never blocked for missing fetch metadata. ``assert_same_origin`` keeps its earlier rule
+  on a GET, so that navigation still refuses ``cross-site`` and ``same-site``. What it does with
+  ``Origin`` on a GET is stated once, in :func:`.._auth.assert_same_origin`.
 * **The callback returns 200 + a meta refresh, never a 303.** See :func:`pages.oidc_landing`.
 
 Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter.**
@@ -47,6 +53,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.security import (
     alert_directory_administrator_granted,
+    client_ip,
     get_auth,
     public_route,
 )
@@ -306,7 +313,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # oidc_enabled, not oidc_available: AC-8 requires recovery without an engine restart, so
             # the start leg ALWAYS attempts and a degraded IdP is discovered per-request.
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not auth.allow_login_attempt(client):
             # A _log.warning, never an audit — parity with sso.py, so exhaustion writes zero DB rows.
             _log.warning("federated sign-in rate limit exceeded for %s", client or "<unknown>")
@@ -377,7 +384,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # returns to the console with nothing run and no grant minted for the named action.
         continues = continues_after_reauth(action, token, next_)
         return_to = next_ if continues else reauth_landing(identity)
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
             return reauth_idp_response(
                 deps,
@@ -440,7 +447,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         auth = get_auth(request)
         if auth is None or not auth.oidc_enabled:
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
-        client = request.client.host if request.client else None
+        client = client_ip(request)
         if not auth.allow_login_attempt(client):
             # The limiter runs on BOTH legs (ADR 0142): the callback is equally unauthenticated.
             _log.warning("federated callback rate limit exceeded for %s", client or "<unknown>")

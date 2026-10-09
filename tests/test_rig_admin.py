@@ -159,7 +159,7 @@ def test_sign_in_posts_the_credential_and_returns_the_session(
     ("status", "body"),
     [
         (401, {"detail": "invalid credentials"}),
-        (503, {"detail": "authentication is not enabled"}),
+        (503, {"detail": "authentication is not configured"}),
         (200, {"token": "t", "mfa_required": True}),
         (200, {"token": "t", "must_change_password": True}),
         (200, {"token": ""}),

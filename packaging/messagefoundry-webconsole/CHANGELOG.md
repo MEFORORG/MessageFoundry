@@ -70,6 +70,10 @@ this line.**
 - **Seam only: the engine's posture model grew.** `SecurityPosture` gains
   `transit_bound_attestation`, a `TransitBoundAttestationView` (`BACKLOG #2337`). The console
   renders nothing new, but the field is on the seam it pins, so the supported digest moved.
+- **Seam only: `client_ip` takes starlette's `HTTPConnection`.** `api.security.client_ip` now
+  takes that base class (`BACKLOG #2289`); it took `Request | WebSocket`. The console still
+  passes a `Request` or a `WebSocket`, and both fit, so no console call changed. The signature
+  is on the seam the console pins, so the supported digest moved.
 
 ### Fixed
 
@@ -84,6 +88,21 @@ this line.**
 
 ### Security
 
+- **A `/ui` write that does not name where it came from is refused.** It answers `403` and
+  changes nothing. At least two cases that used to pass are refused now: a write with neither
+  `Sec-Fetch-Site` nor `Origin`, which left the sign-in POST with no cross-site control, and a
+  write whose `Sec-Fetch-Site` is a non-empty value other than the four the Fetch Metadata
+  standard defines.
+  A current browser sends `Sec-Fetch-Site` on every request, so the console's pages are unaffected
+  there. A browser that sends neither header on its own form POST could not sign in with a
+  password or change anything, sign-out included; `docs/BROWSER-SUPPORT.md` says what is and is
+  not measured about such a browser. A
+  script that drives `/ui` must now send `Origin`. The CSP report sink `/ui/csp-report` still
+  accepts a report with neither. A GET is not held to this: three sign-in GETs are deliberately
+  not blocked for missing fetch metadata, under owner rulings R4 and R4b of 2026-09-28: `GET
+  /ui/sso`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped.
+  The complete rule is the table in the `assert_same_origin` docstring
+  (`messagefoundry_webconsole/_auth.py`). No seam change. (BACKLOG #1116, #1124)
 - **The user page's self-target refusals are audited, with your address.** Reset-password,
   reset-mfa, link, unlink, disable and delete now pass the request to the engine's handler. The
   engine refuses your own account by its stored id too, and writes `auth.self_target_refused`.

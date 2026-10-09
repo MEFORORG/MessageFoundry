@@ -343,15 +343,19 @@ def test_serve_mtls_without_cert_map_gets_no_shim(
     http_cls = captured["http"]
     assert "connection_made" not in vars(http_cls)  # the shim is never wired without a map
     assert "send_400_response" in vars(http_cls)  # the header-floored protocol (BACKLOG #1120)
-    # The ws class overrides the WebSocket 500, and on the legacy server the handshake writer too.
+    # The ws class is the floored one. On the sans-I/O protocol, which ws="auto" resolves to from
+    # uvicorn 0.50, the floor's one hook is the conn property. On the legacy server it overrides
+    # the WebSocket 500 and the handshake writer.
     from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
 
     ws_base: Any = AutoWebSocketsProtocol
     ws_cls = captured["ws"]
-    assert issubclass(ws_cls, ws_base)
-    assert ws_cls.send_500_response is not ws_base.send_500_response
+    assert issubclass(ws_cls, ws_base) and ws_cls is not ws_base
     if hasattr(ws_base, "write_http_response"):
+        assert ws_cls.send_500_response is not ws_base.send_500_response
         assert ws_cls.write_http_response is not ws_base.write_http_response
+    else:
+        assert isinstance(vars(ws_cls)["conn"], property)
 
 
 def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(

@@ -15,10 +15,16 @@ protocol, the way uvicorn itself would receive it:
 * a request line the parser rejects, for the server's own ``400``;
 * a well-formed request to an app that raises, for the server's own ``500``;
 * a WebSocket upgrade with no ``Sec-WebSocket-Key``, for the handshake rejection the WebSocket
-  library writes; and
-* a complete WebSocket upgrade to an app that raises, for the pre-handshake ``500``.
+  library writes;
+* a complete WebSocket upgrade to an app that raises, for the pre-handshake ``500``;
+* a complete WebSocket upgrade to an app that closes before it accepts, for the ``403`` the server
+  writes for it; and
+* a WebSocket upgrade whose request line is longer than the WebSocket library reads, for the
+  answer its parser queues before the server sees a request.
 
-The last two are skipped when there is no WebSocket protocol, which uvicorn reads as WebSockets off.
+The last four are skipped when there is no WebSocket protocol, which uvicorn reads as WebSockets
+off. They run against whichever WebSocket class is handed in: the sans-I/O protocol uvicorn 0.50 and
+later resolve ``ws="auto"`` to, or the legacy server before it. Each must be answered by that class.
 
 **No socket, and nothing that can block.** The transport is an in-memory buffer. The event loop is a
 private one with no selector and no self-pipe, so the test opens no socket of any kind; a stock
@@ -35,7 +41,7 @@ It never quotes the bytes written, and it names an exception by type only.
 
 **What it does not prove.** At least these are outside it:
 
-* A response family other than the four above. One a new server version adds is outside it, as it is
+* A response family other than the six above. One a new server version adds is outside it, as it is
   outside the floor.
 * The settings ``serve`` runs with. The drives use a plain ``uvicorn.Config``: no TLS, no server-wide
   default headers, one worker, and nothing read from the environment. A header merge that depended
@@ -69,8 +75,8 @@ __all__ = ["selftest_protocol_floor"]
 _log = logging.getLogger(__name__)
 
 #: Loop turns one drive may take before its response counts as missing. Each turn is a zero-timeout
-#: pass, so this bounds work, never time. Measured at uvicorn 0.49.0 and websockets 17.1: the four
-#: drives take 5 turns between them.
+#: pass, so this bounds work, never time. Measured at uvicorn 0.54.0 and websockets 17.1: the six
+#: drives take 3 turns between them on the sans-I/O protocol and 9 on the legacy server.
 _MAX_TURNS = 200
 
 #: Turns given to the driven connections to close, and again to their cancelled tasks, before the
@@ -81,15 +87,21 @@ _TEARDOWN_TURNS = 8
 #: purpose, and at this point in startup an unconfigured root logger would print them to stderr.
 _SERVER_LOGGERS = ("uvicorn.error", "uvicorn.access")
 
-_UPGRADE = (
-    b"GET /selftest HTTP/1.1\r\n"
-    b"Host: selftest\r\n"
-    b"Upgrade: websocket\r\n"
-    b"Connection: Upgrade\r\n"
-    b"Sec-WebSocket-Version: 13\r\n"
-)
+#: The path the stand-in app refuses a WebSocket on, by closing before it accepts.
+_REFUSED_PATH = "/selftest/refused"
+
 #: The sample nonce from RFC 6455 section 1.3. It is public and protects nothing.
 _UPGRADE_KEY = b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+
+
+def _upgrade(path: str = "/selftest", *, key: bool = True) -> bytes:
+    return (
+        b"GET " + path.encode("ascii") + b" HTTP/1.1\r\n"
+        b"Host: selftest\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Version: 13\r\n" + (_UPGRADE_KEY if key else b"") + b"\r\n"
+    )
 
 
 #: What ``ProtocolFloorUnavailable.hook`` holds for a refusal from here. No one hook failed.
@@ -109,8 +121,14 @@ _DRIVES = (
     _Drive("malformed-request 400", b"NOT A REQUEST LINE\r\n\r\n", (400,), False),
     _Drive("app-error 500", b"GET /selftest HTTP/1.1\r\nHost: selftest\r\n\r\n", (500,), False),
     # Any 4xx: which one the library picks for a bad handshake is its own choice.
-    _Drive("WebSocket handshake rejection", _UPGRADE + b"\r\n", range(400, 500), True),
-    _Drive("WebSocket pre-handshake 500", _UPGRADE + _UPGRADE_KEY + b"\r\n", (500,), True),
+    _Drive("WebSocket handshake rejection", _upgrade(key=False), range(400, 500), True),
+    _Drive("WebSocket pre-handshake 500", _upgrade(), (500,), True),
+    _Drive("WebSocket refusal 403", _upgrade(_REFUSED_PATH), (403,), True),
+    # Longer than the 8192 bytes websockets reads for one line, and well inside what the HTTP
+    # protocols accept, so it is the WebSocket library's parser that rejects it.
+    _Drive(
+        "WebSocket parser rejection", _upgrade("/selftest/" + "a" * 9000), range(400, 500), True
+    ),
 )
 
 
@@ -119,6 +137,11 @@ class _SelfTestAppError(Exception):
 
 
 async def _failing_app(scope: Any, receive: Any, send: Any) -> None:
+    """Raise, so the server answers for the app. One WebSocket path closes before accepting
+    instead, so the server writes its own 403."""
+    if scope["type"] == "websocket" and scope["path"] == _REFUSED_PATH:
+        await send({"type": "websocket.close"})
+        return
     raise _SelfTestAppError
 
 
@@ -172,8 +195,13 @@ class _CapturingTransport(asyncio.Transport):
         if self._closing:
             return
         self._closing = True
+        asyncio.get_running_loop().call_soon(self._connection_lost)
+
+    def _connection_lost(self) -> None:
+        # Read when it runs, not when close was called: a close made during uvicorn's upgrade
+        # hand-over must reach the WebSocket protocol the transport is then handed to.
         if self.protocol is not None:
-            asyncio.get_running_loop().call_soon(self.protocol.connection_lost, None)
+            self.protocol.connection_lost(None)
 
     def abort(self) -> None:
         self.close()

@@ -97,20 +97,27 @@ dependencies = [
     # scripts/security/route_gates.py imports that call, so it fails to import there.
     # 0.137.2 to 0.139.x lack fastapi.dependencies.models._is_async_gen_callable.
     # The sync-dependency guard in tests/test_thread_pool_fairness_baseline.py reads it.
-    "fastapi>=0.140.0",     # localhost engine API
+    # 0.140.x and 0.141.x have no fastapi.telemetry and no telemetry= argument; create_app passes
+    # one to turn fastapi's built-in OpenTelemetry off (tests/test_api_fastapi_telemetry_off.py).
+    "fastapi>=0.142.0",     # localhost engine API
     "starlette>=1.3.1",     # explicit floor — fastapi's own pin allows an older Starlette; >=1.3.1 fixes the Host/path + form-DoS CVEs (CVE-2026-48710 @1.0.1, CVE-2026-54282 @1.3.0, CVE-2026-54283 @1.3.1)
     # Ceiling: api/protocol_headers.py overrides uvicorn internals, and serve refuses to start if one
-    # moves. Raise it only after re-reading uvicorn's protocol modules (BACKLOG #1120).
+    # moves. Raise it only after re-reading uvicorn's protocol modules (BACKLOG #1120). 0.54 is the
+    # newest release read and driven: tests/test_header_floor_wire.py holds the exact version. From
+    # 0.50, ``ws="auto"`` resolves to the sans-I/O WebSocket protocol, which the floor now covers.
     # Plain uvicorn, not uvicorn[standard]: that extra also pulls watchfiles (--reload), python-dotenv
     # (--env-file), PyYAML (a YAML log config) and colorama (Windows log colour). serve passes no
     # reload, no env_file and log_config=None, so none of the four is ever imported. The three the
     # engine does use are declared below with the extra's own markers.
-    "uvicorn>=0.29,<0.50",
+    "uvicorn>=0.29,<0.55",
     # The HTTP protocol ``http="auto"`` picks when installed. protocol_headers.py floors both it and h11.
     "httptools>=0.8.0",
-    # The legacy WebSocket server ``ws="auto"`` resolves to, which protocol_headers.py floors and
-    # /ws/stats runs on. Without a WebSocket library uvicorn serves no WebSocket route at all.
-    "websockets>=16.0",
+    # The library behind both WebSocket protocols protocol_headers.py floors: the sans-I/O one
+    # ``ws="auto"`` resolves to from uvicorn 0.50, and the legacy server before it. /ws/stats runs on
+    # it. Without a WebSocket library uvicorn serves no WebSocket route at all.
+    # Ceiling: the floor wraps ``ServerProtocol.send_response`` and the legacy ``write_http_response``,
+    # neither a public hook, so a new major is read before it is allowed (BACKLOG #1120).
+    "websockets>=16.0,<18",
     # The event loop uvicorn's ``loop="auto"`` picks; mllp.py's TLS stop path accounts for it. Same
     # marker as uvicorn[standard], because uvloop has no Windows, PyPy or Cygwin build.
     "uvloop>=0.22.1; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'",

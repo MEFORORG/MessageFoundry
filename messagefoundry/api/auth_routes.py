@@ -72,6 +72,7 @@ from messagefoundry.api.auth_models import (
 )
 from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
+    AUTH_NOT_CONFIGURED,
     AuthenticatedBeforeBodyRoute,
     RepeatedCredentialError,
     alert_administrator_granted,
@@ -218,7 +219,7 @@ def _rate_limited(request: Request, label: str) -> HTTPException:
     then return the exception to raise. We log (the rotating general log) rather than write an
     audit_log row per rejection so a sustained flood can't amplify into unbounded DB growth — the
     per-account ``auth.login_failed``/``auth.login_locked`` events already provide the audit trail."""
-    _log.warning("rate-limited %s attempt from client=%s", label, _client(request))
+    _log.warning("rate-limited %s attempt from client=%s", label, client_ip(request))
     return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many attempts; please retry later")
 
 
@@ -229,17 +230,8 @@ async def _service(request: Request) -> AuthService:
     # here, so the check that runs before the body is read asks it first (vault BACKLOG #2739).
     auth = get_auth(request)
     if auth is None:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not enabled")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AUTH_NOT_CONFIGURED)
     return auth
-
-
-def _client(request: Request) -> str | None:
-    # Already proxy-aware: uvicorn runs with forwarded_allow_ips = settings.api.trusted_proxies
-    # (__main__.py; defaults to [] = trust nothing), so behind a declared trusted proxy this resolves
-    # to the real client. The per-IP login limiter remains in-process and bypassable by pure source-IP
-    # rotation from a directly-reachable attacker (SEC-024) — the real brute-force bounds are the
-    # global ceiling + per-account argon2 lockout (applied to both the password and MFA factors).
-    return request.client.host if request.client else None
 
 
 def _current_user(identity: Identity) -> CurrentUser:
@@ -497,7 +489,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def login(
         body: LoginRequest, request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:
-        if not service.allow_login_attempt(_client(request)):
+        client = client_ip(request)
+        if not service.allow_login_attempt(client):
             raise _rate_limited(request, "login")
         try:
             provider = AuthProvider(body.provider)
@@ -518,7 +511,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             body.username,
             body.password,
             provider=provider,
-            client=_client(request),
+            client=client,
             supersedes=body.supersedes,
             totp_code=body.totp_code,
         )
@@ -545,7 +538,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def negotiate(
         request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:
-        if not service.allow_login_attempt(_client(request)):
+        client = client_ip(request)
+        if not service.allow_login_attempt(client):
             raise _rate_limited(request, "negotiate")
         header = authorization_header(request)  # 400 on a repeated header (BACKLOG #2454)
         if not header.startswith("Negotiate "):
@@ -561,7 +555,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # it proves opens the window (verify_mfa). One that owes none meets 403 +
         # X-Step-Up-Required on its first gated action and answers with POST /me/reauth, a live
         # directory re-bind.
-        outcome = await service.authenticate_kerberos(token_bytes, client=_client(request))
+        outcome = await service.authenticate_kerberos(token_bytes, client=client)
         alert_directory_administrator_granted(
             request.app.state, outcome, via="directory_sign_in_negotiate"
         )
@@ -623,7 +617,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             identity,
             body.current_password,
             token=session if isinstance(session, str) else None,
-            client=_client(request),
+            client=client_ip(request),
         )
         if check is CurrentPasswordCheck.SESSION_ENDED:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
@@ -646,7 +640,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         try:
             violations = await service.change_password(
-                identity, body.new_password, client=_client(request)
+                identity, body.new_password, client=client_ip(request)
             )
         except FactorEnrolmentRequired as exc:
             raise HTTPException(status.HTTP_403_FORBIDDEN, ENROL_AUTHENTICATOR_FIRST) from exc
@@ -670,7 +664,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         which notifies the old address. ``require()`` leaves this route under the factor gate, so a
         session still owing its second factor cannot reach it."""
         try:
-            await service.fill_own_notify_email(identity, body.email, client=_client(request))
+            await service.fill_own_notify_email(identity, body.email, client=client_ip(request))
         except NotifyEmailAlreadySet as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
@@ -708,7 +702,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             identity,
             body.password,
             token=token,
-            client=_client(request),
+            client=client_ip(request),
             # ADR 0077: bind the fresh proof to the action the caller named (the value the 403 handed
             # back in X-Step-Up-Action). None => refresh only the session window, as before.
             purpose=body.purpose,
@@ -761,12 +755,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         The session is RE-KEYED on success (ASVS 7.2.4) and the new bearer token is in the body:
         this is the exact transition — pre-MFA to MFA-satisfied — that must not happen in place."""
-        if not service.allow_login_attempt(_client(request)):
+        client = client_ip(request)
+        if not service.allow_login_attempt(client):
             raise _rate_limited(request, "mfa-verify")
         token = bearer_token(request)
         if token is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
-        elevation = await service.verify_mfa(token, body.code, client=_client(request))
+        elevation = await service.verify_mfa(token, body.code, client=client)
         if elevation.token is None:
             if elevation.directory_unconfirmed:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
@@ -834,7 +829,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
         try:
             elevation = await service.confirm_mfa_enrollment(
-                identity, body.code, token=token, client=_client(request)
+                identity, body.code, token=token, client=client_ip(request)
             )
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -865,7 +860,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         not surface as a 500: an uncaught ValueError here would report a user error as a server
         fault AND swallow the remedy the message carries."""
         try:
-            await service.disable_mfa(identity, client=_client(request))
+            await service.disable_mfa(identity, client=client_ip(request))
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="MFA disabled")
@@ -1136,7 +1131,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 email=body.email,
                 roles=body.roles,
                 actor=identity.username,
-                client=_client(request),  # ADR 0150, BACKLOG #315: attribute the user.created row
+                client=client_ip(request),  # ADR 0150, BACKLOG #315: attribute the user.created row
             )
         except UsernameTaken as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -1187,7 +1182,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             user_id = await service.create_directory_account(
                 body.username,
                 actor=identity.username,
-                client=_client(request),
+                client=client_ip(request),
                 notify_email=body.notify_email,
             )
         except DirectoryAccountNotFound as exc:

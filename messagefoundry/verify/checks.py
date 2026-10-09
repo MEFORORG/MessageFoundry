@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from messagefoundry import __version__
 from messagefoundry.odbc_env import disable_driver_manager_pooling
+from messagefoundry.redaction import codec_safe_str
 from messagefoundry.verify.model import CheckResult, Status
 
 if TYPE_CHECKING:
@@ -301,7 +302,9 @@ def check_console_no_window() -> CheckResult:
         try:
             missing = _spawns_without_creationflags(Path(origin).read_text(encoding="utf-8"))
         except (OSError, SyntaxError, ValueError) as exc:
-            return CheckResult(rid, title, Status.ERROR, f"could not inspect {name}: {exc}")
+            return CheckResult(
+                rid, title, Status.ERROR, f"could not inspect {name}: {codec_safe_str(exc)}"
+            )
         if missing:
             return CheckResult(
                 rid,

@@ -35,6 +35,7 @@ from messagefoundry.config.settings import (
     ApiSettings,
     ApprovalsSettings,
     AuthSettings,
+    BackupSettings,
     CertMonitorSettings,
     EgressSettings,
     SecretRotationSettings,
@@ -75,9 +76,11 @@ def _pairs(
     db_hops: tuple[str, ...] = (),
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
+    path_form_hops: tuple[str, ...] = (),
     api: ApiSettings | None = None,
     approvals: ApprovalsSettings | None = None,
     cert_monitor: CertMonitorSettings | None = None,
+    backup: BackupSettings | None = None,
 ) -> list[tuple[str, str]]:
     """The loosening ``(switch, risk)`` pairs for a settings combination (defaults where not
     overridden)."""
@@ -94,9 +97,11 @@ def _pairs(
         unverified_db_hops=db_hops,
         attested_hops=attested_hops,
         revocation_attested_hops=revocation_hops,
+        path_form_fhir_hops=path_form_hops,
         api=api or ApiSettings(),
         approvals=approvals or ApprovalsSettings(),
         cert_monitor=cert_monitor or CertMonitorSettings(),
+        backup=backup or BackupSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
@@ -148,9 +153,11 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -182,9 +189,11 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -213,9 +222,11 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -305,9 +316,11 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -444,9 +457,11 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1014,6 +1029,7 @@ def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
     named = dict(
         _pairs(
             cert_monitor=CertMonitorSettings(warn_days=0),
+            backup=BackupSettings(),
             rotation=SecretRotationSettings(warn_days=0),
         )
     )
@@ -1025,6 +1041,7 @@ def test_each_reminder_warn_days_zero_is_a_named_loosening() -> None:
     for cert, rotation in ((30, 14), (90, 60)):
         on = _names(
             cert_monitor=CertMonitorSettings(warn_days=cert),
+            backup=BackupSettings(),
             rotation=SecretRotationSettings(warn_days=rotation),
         )
         assert "cert_monitor.warn_days" not in on and "secret_rotation.warn_days" not in on
@@ -1035,6 +1052,7 @@ def test_a_reminder_lead_below_its_default_is_a_named_loosening() -> None:
     named = dict(
         _pairs(
             cert_monitor=CertMonitorSettings(warn_days=29),
+            backup=BackupSettings(),
             rotation=SecretRotationSettings(warn_days=1),
         )
     )
@@ -1275,9 +1293,11 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=_proxied(*entries),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1308,9 +1328,11 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=_proxied("::/0", "::/0"),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1373,9 +1395,11 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=_terminated(ack=True),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1940,6 +1964,58 @@ def test_the_url_query_credential_is_actually_wired() -> None:
     assert "url_query_credential" not in _names()  # control: nothing declared, nothing named
 
 
+def _fhir_update_registry() -> Any:
+    """A graph with one path-form ``FHIR()`` update and one transaction-form update beside it."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, Registry, build_outbound_connection
+
+    reg = Registry()
+    for name, extra in (("OB_PATH", {"update_url_form": "path"}), ("OB_TXN", {})):
+        settings = {"url": "https://fhir.example.org/fhir", "interaction": "update", **extra}
+        reg.add_outbound(
+            build_outbound_connection(
+                name, ConnectionSpec(type=ConnectorType.FHIR, settings=settings)
+            )
+        )
+    return reg
+
+
+def test_the_fhir_path_form_update_is_actually_wired() -> None:
+    """Vault BACKLOG #2571: driven through its reader AND through ``security_loosenings``. The
+    transaction-form connection beside it is the control that must not be named."""
+    from messagefoundry.config.wiring import path_form_fhir_updates
+
+    hops = tuple(path_form_fhir_updates(_fhir_update_registry()))
+    assert hops == ("OB_PATH",)
+    risk = dict(_pairs(path_form_hops=hops))["update_url_form"]
+    assert "OB_PATH" in risk and "OB_TXN" not in risk
+    assert "request URL" in risk
+    assert "update_url_form" not in _names()  # control: nothing declared, nothing named
+
+
+async def test_posture_route_names_a_fhir_path_form_update(engine: Engine) -> None:
+    """``GET /security/posture`` reads the path-form set off the live graph. A graph holding only
+    a transaction-form update names nothing, so the entry comes from the connection's setting."""
+    engine.add_registry(_fhir_update_registry())
+    body = await _posture_body(engine)
+    entry = next(
+        e
+        for e in body["loosenings"]  # type: ignore[union-attr]
+        if e["switch"] == "update_url_form"
+    )
+    assert "OB_PATH" in entry["risk"] and "OB_TXN" not in entry["risk"]
+
+
+async def test_posture_route_does_not_name_a_transaction_form_update(engine: Engine) -> None:
+    """The control for the test above, on a graph with the path-form connection removed."""
+    reg = _fhir_update_registry()
+    del reg.outbound["OB_PATH"]
+    engine.add_registry(reg)
+    body = await _posture_body(engine)
+    assert "update_url_form" not in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+    assert body["loosenings_scope"] is None
+
+
 def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> None:
     """CORRECTED (ASVS 12.3.2 re-read): the entry said the hostname match is "still fully verified"
     for every listed hop. It now conditions that on the hop leaving the name check on."""
@@ -2035,8 +2111,13 @@ async def test_posture_route_reports_the_plaintext_hop_acknowledgement(engine: E
 
 
 @pytest.mark.usefixtures("remote_debugging_off")
-async def test_posture_route_reports_nothing_at_the_shipped_defaults(engine: Engine) -> None:
+async def test_posture_route_reports_only_the_harness_entry_at_the_shipped_defaults(
+    engine: Engine,
+) -> None:
     """The route must be quiet on a default instance, or its signal is worthless.
+
+    Quiet here is one entry, not none: the harness reaches the route through the open mode,
+    and the route names that mode (``_HARNESS_ONLY``).
 
     Default SETTINGS, on an interpreter started with remote debugging off. A default launch through
     the console script leaves it on, and the route then names it: see
@@ -2066,9 +2147,11 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2112,9 +2195,11 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2149,9 +2234,11 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             unverified_db_hops=("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
             attested_hops=(),
             revocation_attested_hops=(),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2183,9 +2270,11 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
+            path_form_fhir_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
+            backup=BackupSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2564,23 +2653,32 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
     }
     exempt_auth = {
-        # HARDENINGS / topology choices — a flip is not a weakening of the shipped posture.
-        "require_action_step_up",
+        # Vault BACKLOG #2600 re-read this set. require_action_step_up and the three
+        # password_check_* screens left it: each ships ON, nothing refuses it off, and the
+        # registry now names it. What stays is below, each with its reason.
+        #
+        # Sign-in pathways, each shipped OFF. Turning one on adds a way to sign in, which is a
+        # deployment's topology and has its own load-time requirements. Not a weakening of a
+        # control that shipped on.
         "ad_enabled",
-        "ad_use_nested_groups",
         "kerberos_enabled",
         "oidc_enabled",
+        # Ships ON. Off, a directory user gets the roles of their DIRECT groups only, so it
+        # resolves fewer grants, never more.
+        "ad_use_nested_groups",
+        # Ships ON. The claim it trims is a hint and not the account key (ADR 0184), so neither
+        # value changes which account a login reaches.
         "oidc_username_strip_domain",
+        # Ships ON, and off it DOES remove a control: the push notice of account-security events.
+        # Gated elsewhere: with no notice channel, serve refuses under enforcement = enforce unless
+        # [alerts].security_notifications_required = false, and it logs that waiver. Not named by
+        # the registry, which is an owed gap and is recorded as one.
         "notify_security_events",
-        # Password-policy composition rules: individually neither secure nor insecure (the policy is
-        # scored as a whole), and none is a posture switch.
+        # Composition rules, each shipped OFF. Turning one on ADDS a requirement.
         "password_require_uppercase",
         "password_require_lowercase",
         "password_require_digit",
         "password_require_symbol",
-        "password_check_context",
-        "password_check_username",
-        "password_check_breached",
         # REPORTED, so not an owed gap: named only with a live ldap:// bind, which this loop's lone
         # flip never builds (ad_enabled stays off). The plain-LDAP section above pins it (#2354).
         "ad_allow_insecure_ldap",
@@ -2631,6 +2729,24 @@ def _unreported_bools(model: type[Any], exempt: Collection[str], section: str) -
         and isinstance(info.default, bool)
         and field not in _names(**{section: model(**{field: not info.default})})
     ]
+
+
+@pytest.mark.parametrize(
+    ("switch", "words"),
+    [
+        ("require_action_step_up", "session-wide step-up window"),
+        ("password_check_breached", "breached"),
+        ("password_check_context", "context words"),
+        ("password_check_username", "username"),
+    ],
+)
+def test_auth_switches_that_ship_on_are_named_when_off(switch: str, words: str) -> None:
+    """Vault BACKLOG #2600: each of these left the [auth] floor's exemption set. Off it is named,
+    and at the shipped value it is not."""
+    assert switch not in _names()
+    assert AuthSettings.model_fields[switch].default is True
+    risk = dict(_pairs(auth=AuthSettings(**{switch: False})))[switch]
+    assert words in risk
 
 
 @pytest.mark.parametrize(
@@ -2738,28 +2854,47 @@ async def test_posture_route_reads_the_docs_switch_off_the_app_in_both_direction
     assert "expose_docs" in named
 
 
-def test_the_backup_cleartext_flag_is_documented_as_not_yet_reported() -> None:
-    """``[backup].allow_unencrypted`` lets a keyless instance write a cleartext archive, and the
-    registry cannot see ``[backup]`` (vault BACKLOG #2302). The guide says so in two places.
-
-    A tripwire, not a decision: once the registry takes a ``backup`` section this reds, and the
-    guide's row and entry must then say the flag IS reported."""
-    import inspect
-
-    from messagefoundry.config.settings import BackupSettings
-
+def test_the_backup_cleartext_flag_is_named_and_its_default_is_not() -> None:
+    """``[backup].allow_unencrypted = true`` lets a keyless instance write a cleartext archive, so
+    the registry names it (vault BACKLOG #2302). The control is the shipped default, which names
+    nothing: an entry that fired on every ``[backup]`` section would pass the first half alone."""
     assert BackupSettings.model_fields["allow_unencrypted"].default is False
-    # Whatever the argument ends up being called: no parameter mentions backup, none is typed as
-    # the section, and the registry's source never names the switch.
-    params = inspect.signature(security_loosenings).parameters
-    assert not [name for name in params if "backup" in name.lower()]
-    assert not [p for p in params.values() if "BackupSettings" in str(p.annotation)]
-    assert '"allow_unencrypted"' not in inspect.getsource(security_loosenings)
+    assert "backup.allow_unencrypted" not in _names()
+    assert "backup.allow_unencrypted" not in _names(backup=BackupSettings(allow_unencrypted=False))
+    risk = dict(_pairs(backup=BackupSettings(allow_unencrypted=True)))["backup.allow_unencrypted"]
+    assert "CLEARTEXT" in risk
+    assert "PHI" in risk
+    # Named with a store key too: the flag also relaxes the restore-verify downgrade refusal.
+    keyed = _names(
+        store=StoreSettings(encryption_key="k" * 44),
+        backup=BackupSettings(allow_unencrypted=True),
+    )
+    assert "backup.allow_unencrypted" in keyed
+    # No other [backup] setting at a non-default value produces this entry.
+    assert "backup.allow_unencrypted" not in _names(
+        backup=BackupSettings(retention_keep=0, verify_after_backup=False)
+    )
+
+
+async def test_posture_route_reports_the_backup_cleartext_flag(engine: Engine) -> None:
+    """``GET /security/posture`` reads the stashed ``[backup]`` section, and an app with none
+    stashed is read at the shipped default, which names nothing."""
+    body = await _posture_body(engine, backup_settings=BackupSettings(allow_unencrypted=True))
+    assert "backup.allow_unencrypted" in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+    control = await _posture_body(engine)
+    assert "backup.allow_unencrypted" not in [e["switch"] for e in control["loosenings"]]  # type: ignore[index,union-attr]
+
+
+def test_the_guide_says_the_backup_cleartext_flag_is_reported() -> None:
+    """The guide's row and entry for the flag name the registry entry, and no longer say it is
+    unreported. Reads two places in one document; it does not prove the prose is right elsewhere."""
     guide = (Path(__file__).parents[1] / "docs" / "SECURITY-LOOSENING.md").read_text("utf-8")
     row = next(line for line in guide.splitlines() if line.startswith("| | `[backup].allow_un"))
-    assert "**Not reported yet**" in row
+    assert "Not reported yet" not in row
+    assert "`backup.allow_unencrypted`" in row
     entry = guide.split("### `[backup].allow_unencrypted = true`", 1)[1].split("\n### ", 1)[0]
-    assert "**not yet** in `security_loosenings()`" in entry
+    assert "not yet" not in entry
+    assert "`backup.allow_unencrypted`" in entry
     assert "`encrypted: false`" in entry
 
 
@@ -2772,6 +2907,7 @@ async def test_posture_route_declares_its_scope_when_no_graph_is_loaded(engine: 
     body = await _posture_body(engine)
     assert body["loosenings_scope"] is not None
     assert "cleartext_accepted" in str(body["loosenings_scope"])
+    assert "update_url_form" in str(body["loosenings_scope"])
 
 
 async def test_posture_route_scope_is_none_once_a_graph_is_loaded(engine: Engine) -> None:
@@ -2803,6 +2939,9 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
             ad_session_recheck_seconds=0, require_mfa=False, notify_security_events=False
         ),
         egress_settings=EgressSettings(deny_by_default=False),
+        # Vault BACKLOG #2302: the same lifespan must stash [backup]. The section stays
+        # disabled, so no backup runs; only the flag is read.
+        backup_settings=BackupSettings(allow_unencrypted=True),
     )
     transport = httpx.ASGITransport(app=app, client=_DEFAULT_PEER)
     async with (
@@ -2816,3 +2955,4 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
     assert resp.status_code == 200, resp.text
     switches = [entry["switch"] for entry in resp.json()["loosenings"]]
     assert "ad_session_recheck_seconds" in switches
+    assert "backup.allow_unencrypted" in switches

@@ -381,12 +381,18 @@ from typing import Any
 #: bump. Re-derived on the tree merged with BACKLOG #2337, and again on the tree merged with vault
 #: BACKLOG #3259 / #3260, which did not move it. The value below covers all three.
 #:
+#: BACKLOG #2289: ``api.security.client_ip`` takes starlette's ``HTTPConnection``, where it took
+#: ``Request | WebSocket``, so the raw-ASGI network gate can build one from its scope. The
+#: console imports ``client_ip`` and calls it with a ``Request`` or a ``WebSocket``, which both
+#: still fit, so no console call changed. The digest moved because a signature on the discovered
+#: surface did. Re-derived on the tree merged with BACKLOG #2612, so the value below covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "d55bee827180c1c2"
+ENGINE_UI_SEAM: str = "05d283512c738b8b"
 
 
 @dataclass(frozen=True, slots=True)

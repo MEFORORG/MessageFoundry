@@ -341,9 +341,23 @@ def initial_credential_window_hours(auth: AuthService) -> float | None:
     return None if deadline is None else deadline / 3600.0
 
 
-def _allow_no_auth(app_state: object) -> bool:
-    """Whether this app explicitly opted out of auth (embedding/dev). Default: fail-closed."""
-    return bool(getattr(app_state, "allow_no_auth", False))
+#: The 503 detail a route gives when it needs an auth service and none is attached. The gates give
+#: it only when the app did not opt in to the open mode. The sign-in routes give it in the open
+#: mode too: they have no service to sign in with. One text (vault BACKLOG #3216): those routes
+#: used to say "not enabled", which named a switch that no longer exists.
+AUTH_NOT_CONFIGURED = "authentication is not configured"
+
+
+def open_mode(app_state: object) -> bool:
+    """Whether this app runs in the open mode: no auth service attached, AND the opt-in flag set.
+
+    The one spelling of the check (vault BACKLOG #3216). The request gates and the posture all ask
+    here, so they cannot drift apart. Both halves are read every time: a service beside the flag
+    still requires sign-in, and no service without the flag fails closed (503). A gate that has
+    already found no service reads it once more here; that is the price of one spelling."""
+    return getattr(app_state, "auth", None) is None and bool(
+        getattr(app_state, "allow_no_auth", False)
+    )
 
 
 def _audit_all_authz(app_state: object) -> bool:
@@ -476,10 +490,13 @@ async def bearer_token_dependency(request: Request) -> str | None:
     return bearer_token(request)
 
 
-def client_ip(conn: Request | WebSocket) -> str | None:
-    """The caller's client address, matching how login records it on the session (``_client`` in
-    ``auth_routes``). Used by the WP-L3-13 new-client-IP risk signal so the comparison is
-    apples-to-apples, and — since ADR 0150 — as the ``client`` recorded on audit rows. It is public
+def client_ip(conn: HTTPConnection) -> str | None:
+    """The caller's client address: the one login records on the session as its anchor, on both
+    the JSON auth routes and the console. Used by the WP-L3-13 new-client-IP risk signal so the
+    comparison is apples-to-apples, and — since ADR 0150 — as the ``client`` recorded on audit rows.
+    The per-IP rate limiters and the ``[security].allowed_client_networks`` gate read it too, at
+    least. ``tests/test_client_ip_single_extractor.py`` fails on a new raw read of the client
+    address, for the shapes its docstring lists (BACKLOG #2289). It is public
     (not ``_``-prefixed) precisely so audit callers REUSE this one extraction rather than growing a
     second, divergent notion of "the client address": two extractors would eventually disagree about
     proxy handling and the audit trail would contradict the risk signal.
@@ -487,17 +504,36 @@ def client_ip(conn: Request | WebSocket) -> str | None:
     **Takes either plane, and that is what the no-second-extractor rule above requires here.**
     :func:`authorize_ws` audits the same three authorization outcomes :func:`require` does, over a
     :class:`WebSocket` rather than a :class:`Request`, so a WS-only extractor is exactly the second
-    notion this docstring forbids. Widening costs nothing structural: ``client`` is ONE property on
-    starlette's ``HTTPConnection``, which both classes inherit unchanged, so this is the same read on
-    both planes rather than two reads that agree today. The parameter is ``conn`` rather than
-    ``request`` for the same reason, matching ``_auth.session_cookie_name``.
+    notion this docstring forbids. Widening costs nothing structural: ``scope`` is ONE attribute of
+    starlette's ``HTTPConnection``, which both classes inherit unchanged and which carries
+    ``scope["client"]`` on both planes, so this is the same read on both planes rather than two
+    reads that agree today. The parameter is ``conn`` rather than
+    ``request`` for the same reason, matching ``_auth.session_cookie_name``. It is typed as that base
+    class so the raw-ASGI network gate, which holds a scope and no Request, can build
+    one from that scope rather than read the scope a second way (BACKLOG #2289).
 
     Behind a declared trusted proxy this already resolves to the real client:
     uvicorn runs with ``forwarded_allow_ips = settings.api.trusted_proxies`` (``__main__.py``;
     defaults to ``[]`` = trust nothing), and an off-loopback proxied bind is gated to require it. The
     residual is the inherent limit that an in-process per-IP limiter cannot stop pure source-IP
-    rotation by a directly-reachable attacker (SEC-024)."""
-    return conn.client.host if conn.client else None
+    rotation by a directly-reachable attacker (SEC-024). The real brute-force bounds are the global
+    ceiling and the per-account lockout, applied to both the password and the MFA factor.
+
+    **It parses no forwarding header, ever, and must not start.** The
+    ``[security].allowed_client_networks`` gate decides on this value (``api/client_networks.py``),
+    so a header read here would let any caller spoof its way past that gate. uvicorn is the one
+    ``X-Forwarded-For`` trust point (ADR 0151, D-1).
+
+    It reads ``scope["client"][0]`` itself, the item the gate judged before BACKLOG #2289, rather
+    than starlette's ``conn.client``: that builds ``Address(*scope["client"])`` and raises
+    ``TypeError`` on any shape but a pair, which would turn the gate's 403 into a 500. So a tuple or
+    list of any length is judged by its first item, and loopback in a four-item IPv6 tuple stays
+    allowed. A first item that is not a ``str``, or a client that is not a tuple or list, answers
+    ``None``, the "no address" the gate refuses with its 403. Before BACKLOG #2289 such a host
+    reached the gate as-is."""
+    peer = conn.scope.get("client")
+    host = peer[0] if isinstance(peer, (tuple, list)) and peer else None
+    return host if isinstance(host, str) else None
 
 
 def _password_change_required(deadline: float | None, *, suffix: str = "") -> str:
@@ -963,9 +999,9 @@ async def _session_caller(
     the same way and leaves its idle clock alone."""
     auth = get_auth(request)
     if auth is None:
-        if _allow_no_auth(request.app.state):
+        if open_mode(request.app.state):
             return None, _SYSTEM_IDENTITY
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not configured")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AUTH_NOT_CONFIGURED)
     identity = await auth.identity_for_token(bearer_token(request), activity=activity)
     if identity is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
@@ -1721,7 +1757,7 @@ async def optional_identity(request: Request) -> Identity | None:
     It is still logged and audited like every other refusal (:func:`record_repeated_credential`)."""
     auth = get_auth(request)
     if auth is None:
-        return _SYSTEM_IDENTITY if _allow_no_auth(request.app.state) else None
+        return _SYSTEM_IDENTITY if open_mode(request.app.state) else None
     if sole_authorization(request) is None:
         await record_repeated_credential(request, "authorization")
         return None
@@ -1777,7 +1813,7 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
         return None  # cross-site / disallowed browser Origin — reject before accept()
     auth: AuthService | None = getattr(websocket.app.state, "auth", None)
     if auth is None:
-        return _SYSTEM_IDENTITY if _allow_no_auth(websocket.app.state) else None
+        return _SYSTEM_IDENTITY if open_mode(websocket.app.state) else None
     if sole_authorization(websocket) is None:
         # BACKLOG #2454: refused like the HTTP reads, and recorded here because a handshake has no
         # exception handler to do it. ws_token below would read the repeat as no token anyway.
