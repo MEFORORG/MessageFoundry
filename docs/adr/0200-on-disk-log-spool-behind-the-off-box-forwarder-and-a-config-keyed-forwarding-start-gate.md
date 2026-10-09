@@ -7,7 +7,8 @@
   file format, rotation and replay order below are the Builder's design choices inside that ruling,
   not owner rulings. The ruling does not grade the gate: whether a config-keyed gate earns a pass on
   ASVS 16.4.3 is the re-score's question, and G15's *"a gate whose predicate is a config key rather
-  than the verb is not rule 4"* is the objection it must answer.
+  than the verb is not rule 4"* is the objection it must answer. **Amendment A is accepted**
+  (owner ruling 2026-10-08, recorded on engine PR 2183); it changes decision 2's wording.
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1966 (this build) and #1199 (the 16.4.3 research that named the spool as the
   missing durability half) · [ADR 0080](0080-offbox-forwarding-tls-defaults.md) (native TLS-syslog) ·
@@ -169,12 +170,17 @@ changes no decision above.
 - A lone surrogate can still be lost at send time by a caller that puts raw text into `LogSpool`.
   The engine's own path spells it as text before the queue, so it does not arise there.
 
-## Amendment A (2026-10-08, PROPOSED) -- the gate also refuses this host's own name and addresses (vault BACKLOG #2375)
+## Amendment A (2026-10-08, accepted) -- the gate also refuses this host's own name and addresses (vault BACKLOG #2375)
 
-**Status: built, and not yet ruled on by the owner.** Owner ruling R4 (a) keyed the gate on
-forwarding configuration. This amendment makes it read local host state as well, which is a
-Builder's design inside that ruling and not part of it. The fail-open choice below is an open
-owner question.
+**Status: accepted as built (owner ruling 2026-10-08, recorded on engine PR 2183).** The ruling accepts three things: the gate refuses
+this host's own OS name and addresses, it reads local host state to do so, and it fails open
+with a logged WARNING. Owner ruling R4 (a) keyed the gate on forwarding configuration. This
+amendment makes it read local host state as well. That was a Builder's design inside R4 (a)
+until the 2026-10-08 ruling accepted it. The ruling does not grade the gate: ASVS 16.4.3
+stays for the re-score, as the Status line at the top says.
+
+The Follow-ups section above says it "changes no decision above". That sentence covers the
+follow-ups only. This amendment does change decision 2's wording, as set out below.
 
 Decision 2 refused loopback only. A `forward_host` set to the engine's own LAN address passed,
 although it is no more a separate system than 127.0.0.1 is.
@@ -198,8 +204,8 @@ the gate runs, and again through the configured log handlers once they exist. Th
 is an ordinary WARNING, so `[logging].level = "ERROR"` keeps it out of the log file and off the
 collector, and stderr then holds the only copy. A caller other
 than `serve` gets it on its own logger only. A refusal resting on a failed probe would be the kind of fault
-R4 (a) keyed the gate on configuration to avoid. Whether it should refuse instead is an open
-question for the owner.
+R4 (a) keyed the gate on configuration to avoid. The owner accepted the fail-open choice as
+built (ruling 2026-10-08).
 
 **Still not caught, at least:** an alias that resolves to this host, and the fully qualified name
 on a host whose OS name is short. On Linux both need a lookup, so they stay with the
