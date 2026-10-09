@@ -1391,11 +1391,26 @@ invariant rather than a property of the moved row):
    `_is_terminal` in `messagefoundry/lens.py`, decides that for every edit (Manager decision
    2026-10-08, after review). Its docstring lists at least the shapes it counts; a shape it cannot
    decide falls through, which keeps the rule permissive. The rule refuses an edit only when it
-   makes reachability worse: a row that ran before and never runs after, or a row the edit placed
-   that never runs (same decision). Each row is compared with itself, by aligning the statements
-   before and after in source order. So an edit to a row already dead, or to a live row with a dead
-   twin of the same text, is accepted, and a row may move out of a dead block. A dead `pass` seed
-   does not count. The default mode applies none of this rule (Manager decision 2026-10-08; AC-G7).
+   makes reachability worse: a row that ran before and never runs after, or a row the edit wrote
+   that never runs (same decision). Each row is compared with itself. The lens reads which row is
+   which from the edit, never from the row's text: a line the edit carried over is the same row, a
+   moved or rewritten row is itself in its new place, and any other row is one the edit wrote
+   (repair of 2026-10-08, after the Lander's fourth review of PR 2201). So an edit to a row
+   already dead, or to a row with a twin of the same text anywhere in the handler, is accepted, and
+   a row may move out of a dead block. A dead `pass` seed does not count.
+
+   A row has one of three levels: it runs, it might not run, or it never runs. A row might not run
+   when it sits below a `with` whose body ends after an earlier statement. That statement may
+   raise, and the context manager may swallow the exception, so control may fall through. A `with`
+   whose first body statement is a `return`, `break` or `continue` never falls through. A row
+   inside a block takes the block's level, and two suites are deader than their block: a `try`'s
+   `else` runs only when the body reaches its end, and the `else` of a `while True:` never runs. A
+   row the edit kept, moved or rewrote is refused when its level gets worse: from runs to might
+   not, or from might not to never. A row that never ran is exempt, wherever a move puts it. A row the
+   edit wrote is refused when it never runs. A row written where it might not run is accepted,
+   since it is as live as the rows already there (same repair; the three levels are the Builder's
+   reading of that review, and a Manager has not yet confirmed them). The default mode applies
+   none of this rule (Manager decision 2026-10-08; AC-G7).
 
 A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
 block whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager
@@ -1529,7 +1544,15 @@ is closed for the cases its tests pin:
     template above a row;
   - `test_rule_8_never_falls_through`, which pins at least one case of each shape `_is_terminal`
     decides, and a falls-through case for most;
-  - an edit to a dead row, and an edit, delete or move of a live row with a dead twin, accepted.
+  - an edit to a dead row, and an edit, delete or move of a live row with a dead twin, accepted;
+  - below a `with` that may swallow an exception: an insert, accepted, and a row moved from there
+    to below a `return`, refused;
+  - a live row inserted below a dead row of the same text, the first of two dead rows of the same
+    text deleted, and a dead row edited to the text of the dead row below it, all accepted;
+  - a dead row moved to another dead place, and a block moved with a dead row inside it, both
+    accepted;
+  - `test_rule_8_identity_of_a_move_and_of_a_rewritten_row`, which reads the row identity
+    directly in a handler whose rows all have the same text.
 
   So in typed-only mode a typed `return` or `raise` cannot move up past a row that would then never
   run. At least these limits remain:
@@ -1537,8 +1560,14 @@ is closed for the cases its tests pin:
     not caught. Examples are a `with` whose body ends in `raise`, which a context manager may
     swallow, a `match` that is exhaustive but has no irrefutable last case, and a call that never
     returns;
-  - rows are aligned by their text in source order, so where rows with the same text sit together,
-    the alignment chooses which one counts as moved;
+  - a `with` whose first body statement is a `return` counts as never falling through. Working out
+    the returned value could raise, and the context manager could swallow that, so a row below it
+    could run. An insert there is refused all the same;
+  - a `return` moved below another `return` of the same text is refused as itself, because it ran
+    and would not. Moving the rows between them up gives the same text and is accepted;
+  - row identity is exact for a `set_params`, a delete, a move and an insert at its anchor row.
+    Where the lens picks the place itself, as for a send added to the fan-out, a new line beside
+    lines of the same text may be taken for one of them. Those lines sit in one suite;
   - a send cannot be added in typed-only mode to a handler that ends in `raise`, because the
     fan-out's `return sends` would land below it and never run.
 

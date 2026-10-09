@@ -49,7 +49,6 @@ from __future__ import annotations
 import ast
 import builtins
 import copy
-import difflib
 import json
 import keyword
 import math
@@ -2989,56 +2988,82 @@ def _refuse_new_unbound_reads(
         )
 
 
-_PASS_KEY = ast.dump(ast.Pass())
+# Whether a statement runs (:func:`_reachability`), in order of how sure rule 8 is that it does not.
+_LIVE, _MAYBE_DEAD, _DEAD = 0, 1, 2
+
+# The ops that write before or after their anchor row, by the edit's ``position``.
+_POSITIONED_OPS = frozenset(
+    {
+        "insert_row",
+        "paste_block",
+        "template",
+        "insert_comment",
+        "insert_code_lookup",
+        "insert_send",
+        "add_destination",
+    }
+)
 
 
-def _ends(stmts: list[ast.stmt], *, raise_ends: bool = True) -> bool:
+def _ends(stmts: list[ast.stmt], *, raise_ends: bool = True, sure: bool = True) -> bool:
     """Whether control never reaches the end of suite ``stmts``: some statement in it is terminal
     (:func:`_is_terminal`)."""
-    return any(_is_terminal(stmt, raise_ends=raise_ends) for stmt in stmts)
+    return any(_is_terminal(stmt, raise_ends=raise_ends, sure=sure) for stmt in stmts)
 
 
-def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True) -> bool:
+def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True, sure: bool = True) -> bool:
     """Whether control never falls through ``stmt`` to the next statement of its suite.
 
     At least these are terminal (Manager decisions 2026-10-08, after review):
 
     * a ``return``, ``raise``, ``break`` or ``continue``;
     * an ``if`` with an ``else`` whose every arm ends;
-    * a ``with`` whose body ends without a ``raise`` (``raise_ends=False``), since a context
-      manager may swallow a raised exception. One raised by an earlier statement could be swallowed
-      too, so this counts more ``with`` blocks as ending than strictly do: a refusal, the safe way;
+    * a ``with`` whose first body statement is a ``return``, ``break`` or ``continue``, or another
+      such ``with``;
     * a ``try`` whose ``finally`` ends, or whose body or ``else`` ends and whose every handler ends;
     * a loop with no ``break`` of its own whose ``else`` ends, and a ``while True:`` with no
       ``break``;
     * a ``match`` whose last case is irrefutable and whose every case ends.
+
+    ``sure=False`` asks a looser question: whether ``stmt`` MIGHT never fall through. It differs for
+    a ``with`` only. A context manager may swallow an exception, so a ``with`` whose body ends below
+    an earlier statement falls through whenever that statement raises: it might not fall through,
+    but it is not sure. A body that ends in ``raise`` is never counted (``raise_ends=False``).
 
     Anything this cannot decide is judged to fall through, which keeps rule 8 permissive."""
     if isinstance(stmt, ast.Return | ast.Break | ast.Continue):
         return True
     if isinstance(stmt, ast.Raise):
         return raise_ends
+
+    def ends(stmts: list[ast.stmt]) -> bool:
+        return _ends(stmts, raise_ends=raise_ends, sure=sure)
+
     if isinstance(stmt, ast.If):
-        return _ends(stmt.body, raise_ends=raise_ends) and _ends(stmt.orelse, raise_ends=raise_ends)
+        return ends(stmt.body) and ends(stmt.orelse)
     if isinstance(stmt, ast.With | ast.AsyncWith):
-        return _ends(stmt.body, raise_ends=False)
+        if not sure:
+            return _ends(stmt.body, raise_ends=False, sure=False)
+        first = stmt.body[0]
+        if isinstance(first, ast.With | ast.AsyncWith):
+            return _is_terminal(first)
+        return isinstance(first, ast.Return | ast.Break | ast.Continue)
     if isinstance(stmt, ast.Try | ast.TryStar):
-        if _ends(stmt.finalbody, raise_ends=raise_ends):
+        if ends(stmt.finalbody):
             return True
-        body = _ends(stmt.body, raise_ends=raise_ends) or _ends(stmt.orelse, raise_ends=raise_ends)
-        return body and all(_ends(h.body, raise_ends=raise_ends) for h in stmt.handlers)
+        return (ends(stmt.body) or ends(stmt.orelse)) and all(ends(h.body) for h in stmt.handlers)
     if isinstance(stmt, ast.For | ast.AsyncFor | ast.While):
         if _breaks(stmt.body):
             return False
         forever = isinstance(stmt, ast.While) and _is_always_true(stmt.test)
-        return forever or _ends(stmt.orelse, raise_ends=raise_ends)
+        return forever or ends(stmt.orelse)
     if isinstance(stmt, ast.Match):
         last = stmt.cases[-1] if stmt.cases else None
         return (
             last is not None
             and last.guard is None
             and _is_irrefutable(last.pattern)
-            and all(_ends(case.body, raise_ends=raise_ends) for case in stmt.cases)
+            and all(ends(case.body) for case in stmt.cases)
         )
     return False
 
@@ -3075,53 +3100,191 @@ def _breaks(stmts: list[ast.stmt]) -> bool:
     return False
 
 
-def _reachability(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, bool]]:
-    """Each statement of ``func`` in source order, as its :func:`_stmt_key` and whether it never
-    runs: it follows a terminal statement in its suite (:func:`_is_terminal`), or sits inside a
-    statement that never runs."""
-    out: list[tuple[str, bool]] = []
+def _stop_level(stmts: list[ast.stmt]) -> int:
+    """How far suite ``stmts`` stops what follows it from running: ``_DEAD`` when control surely
+    never reaches its end, ``_MAYBE_DEAD`` when it might not, else ``_LIVE``."""
+    if _ends(stmts):
+        return _DEAD
+    return _MAYBE_DEAD if _ends(stmts, sure=False) else _LIVE
 
-    def visit(stmts: list[ast.stmt], dead: bool) -> None:
+
+def _reachability(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[ast.stmt, int]]:
+    """Each statement of ``func`` in source order, with whether it runs: ``_DEAD`` when it surely
+    never does, ``_MAYBE_DEAD`` when it might not, else ``_LIVE``.
+
+    A statement takes the level of the statements above it in its suite (:func:`_is_terminal`) and
+    of the block it sits in. Two suites are deader than their block: a ``try``'s ``else`` runs only
+    when its body reaches its end, and the ``else`` of a ``while True:`` never runs."""
+    out: list[tuple[ast.stmt, int]] = []
+
+    def visit(stmts: list[ast.stmt], level: int) -> None:
         for stmt in stmts:
-            out.append((_stmt_key(stmt), dead))
-            for _, suite, _ in _suites(stmt):
-                visit(suite, dead)
-            dead = dead or _is_terminal(stmt)
+            out.append((stmt, level))
+            for label, suite, _ in _suites(stmt):
+                inner = level
+                if label == "orelse" and isinstance(stmt, ast.Try | ast.TryStar):
+                    inner = max(level, _stop_level(stmt.body))
+                elif label == "orelse" and isinstance(stmt, ast.While):
+                    inner = _DEAD if _is_always_true(stmt.test) else level
+                visit(suite, inner)
+            level = max(level, _stop_level([stmt]))
 
-    visit(func.body, False)
+    visit(func.body, _LIVE)
     return out
 
 
-def _refuse_rows_that_never_run(
+def _move_site(
+    func: ast.FunctionDef | ast.AsyncFunctionDef, edit: dict[str, Any]
+) -> tuple[range, int] | None:
+    """``(the moved statement's lines, the line it landed above)``, both in old line numbers, for a
+    ``move_row`` that :func:`_apply_move_row` has already applied. None when the row is not a
+    statement. It reads the edit the way :func:`_apply_move_row` and :func:`_move_to_target` do,
+    so a change to either belongs here too."""
+    located = _locate_stmt_by_header(func.body, edit["line_start"])
+    if located is None:
+        return None
+    suite, idx = located
+    to_line = edit.get("to_line_start")
+    if to_line is not None:
+        found = _locate_stmt_by_header(func.body, to_line)
+        if found is None:
+            return None
+        dest, before = found[0][found[1]], edit.get("to_position", "after") == "before"
+    else:
+        before = edit.get("direction") == "up"
+        sibling = idx - 1 if before else idx + 1
+        if not 0 <= sibling < len(suite):
+            return None
+        dest = suite[sibling]
+    moved = suite[idx]
+    lifted = range(moved.lineno, (moved.end_lineno or moved.lineno) + 1)
+    return lifted, dest.lineno if before else (dest.end_lineno or dest.lineno) + 1
+
+
+def _carried_lines(
+    src: str,
+    result: str,
     before_func: ast.FunctionDef | ast.AsyncFunctionDef,
     after_func: ast.FunctionDef | ast.AsyncFunctionDef,
+    edit: dict[str, Any],
+) -> dict[int, int]:
+    """The old line number of each line of the element the edit carried over, to its new number.
+
+    Every op splices whole physical lines, so the lines it did not touch are the same text in the
+    same order. The edit says where it acted: a moved row's own lines are set aside, and the lines
+    above the place the op wrote are matched first. That makes the map exact for a ``set_params``,
+    a delete, a move and an anchored insert, whatever text sits elsewhere. Lines an op wrote at a
+    second place, such as the fan-out scaffold, are found by matching the rest in order."""
+    old_text = _physical_lines(src)
+    new_text = _physical_lines(result)
+    op = edit.get("op", "set_params")
+    lifted = range(0)
+    anchor: int = edit["line_start"]
+    if op == "move_row":
+        lifted, anchor = _move_site(before_func, edit) or (lifted, anchor)
+    elif op in _POSITIONED_OPS and edit.get("position", "after") == "after":
+        anchor = edit["line_end"] + 1
+    old = [
+        n
+        for n in range(before_func.lineno, (before_func.end_lineno or before_func.lineno) + 1)
+        if n not in lifted
+    ]
+    new = range(after_func.lineno, (after_func.end_lineno or after_func.lineno) + 1)
+
+    def same(i: int, j: int) -> bool:
+        return old_text[old[i] - 1] == new_text[new[j] - 1]
+
+    limit = min(len(old), len(new))
+    above = min(limit, sum(1 for n in old if n < anchor))
+    head = 0
+    while head < above and same(head, head):
+        head += 1
+    tail = 0
+    while tail < limit - head and same(len(old) - 1 - tail, len(new) - 1 - tail):
+        tail += 1
+    carried = {old[i]: new[i] for i in range(head)}
+    carried.update({old[len(old) - 1 - k]: new[len(new) - 1 - k] for k in range(tail)})
+    at = head
+    for i in range(head, len(old) - tail):
+        found = next((j for j in range(at, len(new) - tail) if same(i, j)), None)
+        if found is not None:
+            carried[old[i]] = new[found]
+            at = found + 1
+    return carried
+
+
+def _row_identity(
+    carried: dict[int, int],
+    before: list[tuple[ast.stmt, int]],
+    after: list[tuple[ast.stmt, int]],
+    *,
+    pair_rest: bool,
+) -> dict[int, int]:
+    """Which statement each statement of the result was before the edit: index in ``after`` to
+    index in ``before``, the two :func:`_reachability` lists.
+
+    A statement is the same row when its first line was carried over (:func:`_carried_lines`). A
+    ``set_params`` rewrites its row and a move re-indents it, so ``pair_rest`` pairs the rows
+    those two leave over, in order. A statement with no entry is one the edit wrote."""
+    place = {(stmt.lineno, stmt.col_offset): j for j, (stmt, _) in enumerate(after)}
+    same: dict[int, int] = {}
+    rest_old: list[int] = []
+    for i, (stmt, _) in enumerate(before):
+        j = place.get((carried.get(stmt.lineno, 0), stmt.col_offset))
+        if j is None:
+            rest_old.append(i)
+        else:
+            same[j] = i
+    rest_new = [j for j in range(len(after)) if j not in same]
+    if pair_rest and len(rest_old) == len(rest_new):
+        same.update(zip(rest_new, rest_old, strict=True))
+    return same
+
+
+def _refuse_rows_that_never_run(
+    before: list[tuple[ast.stmt, int]],
+    after: list[tuple[ast.stmt, int]],
+    same: dict[int, int],
     refusal: LensRewriteError,
 ) -> None:
     """Refuse a typed-only result that makes reachability worse (ADR 0076 Amendment G, G.6 rule 8).
 
-    The statements before and after the edit are aligned in source order by their
-    :func:`_stmt_key`, so each row is compared with itself, by position (Manager decision
-    2026-10-08, after review). A row that ran before and never runs after is refused, and so is a
-    row the edit placed or rewrote that never runs, unless it was already dead in that place. A
-    row is dead when it sits below a statement that never falls through (:func:`_is_terminal`).
-    That covers a move past the fan-out ``return sends``. Whatever verb placed the row, a move, an
-    insert or a template, the rule is the same. A ``pass`` does not count: the generator seeds
-    one, and a filter inserted above it strands nothing."""
+    ``before`` and ``after`` are the :func:`_reachability` of the element around the edit, and
+    ``same`` says which row each statement of the result was (:func:`_row_identity`). So each row
+    is compared with itself, and never with another row of the same text. Two things are refused:
+
+    * a row the edit kept, moved or rewrote that runs less surely than it did: it ran and now
+      might not, or it might have run and now never does. A row that surely never ran is exempt;
+    * a row the edit wrote that surely never runs.
+
+    A row written where it might not run, below a ``with`` that may swallow an exception, is as
+    live as the rows already there. Whatever verb placed the row, a move, an insert or a
+    template, the rule is the same. A ``pass`` does not count: the generator seeds one, and a
+    filter inserted above it strands nothing."""
+    for j, (stmt, level) in enumerate(after):
+        if isinstance(stmt, ast.Pass):
+            continue
+        was = same.get(j)
+        if level > (_MAYBE_DEAD if was is None else before[was][1]):
+            raise refusal
+
+
+def _refuse_stranded_rows(
+    src: str,
+    result: str,
+    before_func: ast.FunctionDef | ast.AsyncFunctionDef,
+    after_func: ast.FunctionDef | ast.AsyncFunctionDef,
+    edit: dict[str, Any],
+    refusal: LensRewriteError,
+) -> None:
+    """Rule 8 for one edit: work out which row is which, then
+    :func:`_refuse_rows_that_never_run`."""
     before = _reachability(before_func)
     after = _reachability(after_func)
-    matcher = difflib.SequenceMatcher(
-        None, [key for key, _ in before], [key for key, _ in after], autojunk=False
-    )
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        for offset, (key, dead) in enumerate(after[j1:j2]):
-            if not dead or key == _PASS_KEY:
-                continue
-            if tag == "equal" or (tag == "replace" and i2 - i1 == j2 - j1):
-                # The same row, or a row rewritten in place: refused only if it ran before.
-                if not before[i1 + offset][1]:
-                    raise refusal
-            else:
-                raise refusal
+    carried = _carried_lines(src, result, before_func, after_func, edit)
+    pair_rest = edit.get("op", "set_params") in ("set_params", "move_row")
+    same = _row_identity(carried, before, after, pair_rest=pair_rest)
+    _refuse_rows_that_never_run(before, after, same, refusal)
 
 
 def _handler_locals(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
@@ -3136,23 +3299,26 @@ def _refuse_typed_only_result(
     tree: ast.Module,
     handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
     after_tree: ast.Module,
+    src: str,
+    result: str,
     row: dict[str, Any],
     role: str,
+    edit: dict[str, Any],
     op: str,
     line_start: int,
     line_end: int,
 ) -> None:
-    """The typed-only postconditions on an edit's result, ``after_tree``. Every edit keeps each row
-    able to run (:func:`_refuse_rows_that_never_run`); a move or delete also keeps the structure
-    (:func:`_refuse_shifted_code`, :func:`_unbound_reads`). A move or delete is judged on the
-    structure first, so its refusal keeps that reason."""
+    """The typed-only postconditions on an edit's result, ``after_tree``, the parse of ``result``.
+    Every edit keeps each row able to run (:func:`_refuse_rows_that_never_run`); a move or delete
+    also keeps the structure (:func:`_refuse_shifted_code`, :func:`_unbound_reads`). A move or
+    delete is judged on the structure first, so its refusal keeps that reason."""
     after_func = _element_def(after_tree, row["_handler"], role)
     refusal = _typed_only_refusal(op, line_start, line_end, _UNTYPED)
     if after_func is None:
         raise refusal
     stranded = _typed_only_refusal(op, line_start, line_end, _NEVER_RUNS)
     if op not in ("move_row", "delete_row") or row["kind"] == "note":
-        _refuse_rows_that_never_run(handler_node, after_func, stranded)
+        _refuse_stranded_rows(src, result, handler_node, after_func, edit, stranded)
         return
     deleted: set[int] = set()
     if op == "delete_row":
@@ -3175,7 +3341,7 @@ def _refuse_typed_only_result(
         role,
         f"{op} of the rows at lines {line_start}-{line_end} in typed-only mode",
     )
-    _refuse_rows_that_never_run(handler_node, after_func, stranded)
+    _refuse_stranded_rows(src, result, handler_node, after_func, edit, stranded)
 
 
 def rewrite_module(
@@ -3411,7 +3577,17 @@ def rewrite_source(
             )
         if typed_only:
             _refuse_typed_only_result(
-                tree, handler_node, after_tree, row, role, op, line_start, line_end
+                tree,
+                handler_node,
+                after_tree,
+                src,
+                result,
+                row,
+                role,
+                edit,
+                op,
+                line_start,
+                line_end,
             )
     return ("\ufeff" + result) if bom else result
 

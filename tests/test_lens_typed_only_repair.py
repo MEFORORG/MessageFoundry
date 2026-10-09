@@ -1738,7 +1738,36 @@ def _handler(body: str) -> Any:
     return ast.parse(f"def h(msg):\n{body}").body[0]
 
 
-_F = ast.dump(ast.parse("f()").body[0])
+def _never_run(before: Any, after: Any, same: dict[int, int], refusal: LensRewriteError) -> None:
+    lens._refuse_rows_that_never_run(
+        lens._reachability(before), lens._reachability(after), same, refusal
+    )
+
+
+def _level(body: str) -> int:
+    """How surely the ``f()`` row of ``body`` never runs, as ``lens._reachability`` sees it."""
+    key = ast.dump(ast.parse("f()").body[0])
+    (level,) = (lvl for stmt, lvl in lens._reachability(_handler(body)) if ast.dump(stmt) == key)
+    return level
+
+
+def test_rule_8_a_dead_copy_cannot_stand_in_for_a_live_row() -> None:
+    # Review 2 finding 3, at the function level: the same text is dead once before and once after,
+    # but the row that ran is the one now dead. ``same`` names each row, so text cannot stand in.
+    before = _handler(
+        '    if msg.field("A"):\n        msg.set("X", "1")\n    return Send("OB", msg)\n'
+        '    msg.set("X", "1")\n'
+    )
+    after = _handler(
+        '    if msg.field("A"):\n        return Send("OB", msg)\n        msg.set("X", "1")\n'
+        '    msg.set("X", "1")\n'
+    )
+    # Statements in source order. Before: if, X, return, X. After: if, return, X, X.
+    same = {0: 0, 1: 2, 2: 1, 3: 3}
+    with pytest.raises(LensRewriteError, match="stranded"):
+        _never_run(before, after, same, LensRewriteError("stranded"))
+    # Control: every row is itself and nothing moved, so the dead row below the return is no bar.
+    _never_run(before, before, {i: i for i in range(4)}, LensRewriteError("stranded"))
 
 
 @pytest.mark.parametrize(
@@ -1805,7 +1834,51 @@ _F = ast.dump(ast.parse("f()").body[0])
 )
 def test_rule_8_never_falls_through(body: str, dead: bool) -> None:
     # Findings 1 and 5, decisions D3 and D7: ``f()`` is dead exactly when control cannot reach it.
-    assert (_F, dead) in lens._reachability(_handler(body))
+    assert _level(body) == (lens._DEAD if dead else lens._LIVE)
+
+
+@pytest.mark.parametrize(
+    ("body", "level"),
+    [
+        # Review 4: an earlier body statement may raise and the manager may swallow it.
+        ("    with c:\n        g()\n        return 1\n    f()\n", lens._MAYBE_DEAD),
+        (
+            "    with c:\n        if a:\n            return 1\n        else:\n            return 2\n    f()\n",
+            lens._MAYBE_DEAD,
+        ),
+        ("    with c:\n        with d:\n            return 1\n    f()\n", lens._DEAD),
+        ("    with c:\n        g()\n        return 1\n    return 2\n    f()\n", lens._DEAD),
+        # A suite can be deader than its block: a ``try``'s ``else``, and a ``while True``'s.
+        (
+            "    try:\n        return 1\n    except E:\n        g()\n    else:\n        f()\n",
+            lens._DEAD,
+        ),
+        ("    try:\n        return 1\n    except E:\n        f()\n", lens._LIVE),
+        ("    try:\n        return 1\n    finally:\n        f()\n", lens._LIVE),
+        (
+            "    try:\n        g()\n    except E:\n        return 1\n    else:\n        f()\n",
+            lens._LIVE,
+        ),
+        ("    while True:\n        g()\n    else:\n        f()\n", lens._DEAD),
+        ("    while g():\n        h()\n    else:\n        f()\n", lens._LIVE),
+        ("    if a:\n        return 1\n    else:\n        f()\n", lens._LIVE),
+    ],
+    ids=[
+        "with-statement-then-return",
+        "with-if-else",
+        "with-with-return",
+        "return-below-with",
+        "try-else-below-return",
+        "try-handler",
+        "try-finally",
+        "try-else-live",
+        "while-true-else",
+        "while-else",
+        "if-else",
+    ],
+)
+def test_rule_8_levels_of_a_with_and_of_a_suite(body: str, level: int) -> None:
+    assert _level(body) == level
 
 
 _LIVE_TWIN = """\
@@ -1860,3 +1933,176 @@ def test_rule_8_an_insert_after_a_with_follows_its_body(body: str) -> None:
         assert '    msg.set("PID-8", "M")\n' in rewrite_source(src, edit, typed_only=True)
     else:
         _refused(src, edit, match=NEVER_RUNS, typed_only=True)
+
+
+# --- Lander review 4 of PR 2201: row identity, and a ``with`` that may swallow -----------------
+
+_SWALLOW = """@handler("H")
+def h(msg):
+    with suppress(KeyError):
+        msg.set("A", "1")
+        return Send("OB", msg)
+    if msg.field("PID-3"):
+        return []
+    msg.set("B", "2")
+"""
+
+
+def test_rule_8_a_row_below_a_swallowing_with_cannot_move_below_a_return() -> None:
+    # Blocking finding 1. The row may run, when the ``with`` swallows a KeyError; below the
+    # guard's ``return []`` it never does. Head 94ac5aab36 judged it already dead and accepted.
+    edit = _edit("move_row", 8, to_line_start=7, to_position="after")
+    assert rewrite_source(_SWALLOW, edit) != _SWALLOW  # the default mode applies no rule 8
+    _refused(_SWALLOW, edit, match=NEVER_RUNS, typed_only=True)
+
+
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_rule_8_an_insert_below_a_swallowing_with_is_accepted(position: str) -> None:
+    # Blocking finding 2, case 3: the tail may run, so a row written there is as live as its
+    # neighbours. Head 94ac5aab36 refused it.
+    edit = _edit("insert_row", 8, position=position, **_SET_PID8)
+    out = rewrite_source(_SWALLOW, edit, typed_only=True)
+    assert out == rewrite_source(_SWALLOW, edit)
+    assert '    msg.set("PID-8", "M")\n' in out
+
+
+def test_rule_8_a_kept_row_may_not_run_less_surely_than_it_did() -> None:
+    # The three levels, at the function level. A row that ran may not be left to run only when a
+    # ``with`` swallows an exception, and a row that might run may not be left dead.
+    swallow = "    with c:\n        g()\n        return 1\n"
+    ran = _handler("    f()\n" + swallow)
+    might = _handler(swallow + "    f()\n")
+    never = _handler("    with c:\n        return 1\n        g()\n    f()\n")
+    stranded = LensRewriteError("stranded")
+    # Statements in source order. ran: f, with, g, return. might and never: with, 2 rows, f.
+    with pytest.raises(LensRewriteError, match="stranded"):
+        _never_run(ran, might, {0: 1, 1: 2, 2: 3, 3: 0}, stranded)
+    with pytest.raises(LensRewriteError, match="stranded"):
+        _never_run(might, never, {0: 0, 1: 2, 2: 1, 3: 3}, stranded)
+    # Controls: the other direction, and a row the edit wrote where it might run.
+    _never_run(might, ran, {0: 3, 1: 0, 2: 1, 3: 2}, stranded)
+    _never_run(ran, might, {0: 1, 1: 2, 2: 3}, stranded)
+    with pytest.raises(LensRewriteError, match="stranded"):
+        _never_run(never, never, {0: 0, 1: 1, 2: 2}, stranded)
+
+
+_DEAD_ABOVE = """@handler("H")
+def h(msg):
+    if msg.field("PID-3"):
+        return []
+        msg.set("PID-8", "M")
+    msg.set("B", "2")
+    if msg.field("PID-5"):
+        return []
+"""
+
+_TWO_DEAD = """@handler("H")
+def h(msg):
+    return Send("OB", msg)
+    msg.set("A", "1")
+    return Send("OB", msg)
+    msg.set("A", "1")
+"""
+
+_DEAD_PAIR = """@handler("H")
+def h(msg):
+    return Send("OB", msg)
+    msg.set("A", "1")
+    msg.set("A", "9")
+"""
+
+
+@pytest.mark.parametrize(
+    ("src", "edit", "expect"),
+    [
+        # Case 1: a live row written below a dead row of the same text.
+        (
+            _DEAD_ABOVE,
+            _edit("insert_row", 6, position="before", **_SET_PID8),
+            '        msg.set("PID-8", "M")\n    msg.set("PID-8", "M")\n    msg.set("B", "2")\n',
+        ),
+        # Case 2: the first of two dead rows of the same text is deleted.
+        (
+            _TWO_DEAD,
+            _edit("delete_row", 4),
+            '    return Send("OB", msg)\n    return Send("OB", msg)\n    msg.set("A", "1")\n',
+        ),
+        # Case 4: a dead row is edited to the text of the dead row below it.
+        (
+            _DEAD_PAIR,
+            _edit("set_params", 4, params={"value": "9"}),
+            '    msg.set("A", "9")\n    msg.set("A", "9")\n',
+        ),
+    ],
+    ids=["insert-below-dead-twin", "delete-first-dead-twin", "set-dead-row-to-its-twin"],
+)
+def test_rule_8_a_twin_that_is_not_the_row_does_not_refuse_the_edit(
+    src: str, edit: dict[str, Any], expect: str
+) -> None:
+    # Blocking finding 2: each row is compared with itself, wherever a row of the same text sits.
+    # Head 94ac5aab36 aligned rows by text and refused all three.
+    out = rewrite_source(src, edit, typed_only=True)
+    assert expect in out
+    assert out == rewrite_source(src, edit)  # and it is the edit the default mode makes
+
+
+def test_rule_8_a_return_dropped_below_its_twin_is_refused_as_itself() -> None:
+    # Exact identity cuts both ways: the first ``return`` ran and would not, so the move is
+    # refused, although moving the row between them up instead gives the same text (G.7 limit).
+    src = _TWO_DEAD.replace("def h(msg):\n", 'def h(msg):\n    msg.set("B", "2")\n')
+    _refused(
+        src, _edit("move_row", 4, to_line_start=6, to_position="after"), NEVER_RUNS, typed_only=True
+    )
+
+
+def test_rule_8_identity_of_a_move_and_of_a_rewritten_row() -> None:
+    # What ``_refuse_rows_that_never_run`` is given, read directly: which row each statement was.
+    # Every row of ``twins`` has the same text, so text could not tell them apart.
+    def identity(src: str, edit: dict[str, Any]) -> dict[int, int]:
+        out = rewrite_source(src, edit)
+        before, after = ast.parse(src).body[0], ast.parse(out).body[0]
+        assert isinstance(before, ast.FunctionDef) and isinstance(after, ast.FunctionDef)
+        carried = lens._carried_lines(src, out, before, after, edit)
+        return lens._row_identity(
+            carried,
+            lens._reachability(before),
+            lens._reachability(after),
+            pair_rest=edit["op"] in ("set_params", "move_row"),
+        )
+
+    twins = '@handler("H")\ndef h(msg):\n' + '    msg.set("A", "1")\n' * 4
+    # Row 1 dropped after row 3, and row 3 moved to before row 1: each is itself where it lands.
+    drop = _edit("move_row", 4, to_line_start=6, to_position="after")
+    assert identity(twins, drop) == {0: 0, 1: 2, 2: 3, 3: 1}
+    lift = _edit("move_row", 6, to_line_start=4, to_position="before")
+    assert identity(twins, lift) == {0: 0, 1: 3, 2: 1, 3: 2}
+    assert identity(twins, _edit("move_row", 5, direction="up")) == {0: 0, 1: 2, 2: 1, 3: 3}
+    # An insert before row 2, then after it: the new statement has no entry.
+    insert = _edit(
+        "insert_row", 5, position="before", action="set_field", params={"path": "A", "value": "1"}
+    )
+    assert identity(twins, insert) == {0: 0, 1: 1, 3: 2, 4: 3}
+    assert identity(twins, {**insert, "position": "after"}) == {0: 0, 1: 1, 2: 2, 4: 3}
+    assert identity(twins, _edit("delete_row", 4)) == {0: 0, 1: 2, 2: 3}
+    rewritten = _edit("set_params", 4, params={"value": "9"})
+    assert identity(twins, rewritten) == {i: i for i in range(4)}
+    # A row moved to another depth is re-indented, and is still itself.
+    out_of_guard = _edit("move_row", 4, to_line_start=3, to_position="before")
+    assert identity(_TERMINAL, out_of_guard) == {0: 1, 1: 0, 2: 2, 3: 3, 4: 4}
+    # A moved block takes its rows with it.
+    block_down = _edit("move_row", 3, direction="down")
+    assert identity(_TERMINAL, block_down) == {0: 3, 1: 0, 2: 1, 3: 2, 4: 4}
+
+
+def test_rule_8_a_row_that_never_ran_may_move_where_it_never_runs() -> None:
+    # Only a row that certainly never ran is exempt: it moves within the dead code below the last
+    # return, and a block moves with a dead row inside it. Nothing is stranded that ran.
+    dead_move = _edit("move_row", 9, direction="down")
+    out = rewrite_source(_DEAD_BLOCK, dead_move, typed_only=True)
+    assert out == rewrite_source(_DEAD_BLOCK, dead_move) != _DEAD_BLOCK
+    inner_dead = _TERMINAL.replace(
+        '        return Send("OB", msg)\n',
+        '        return Send("OB", msg)\n        msg.set("D", "4")\n',
+    )
+    out = rewrite_source(inner_dead, _edit("move_row", 3, direction="down"), typed_only=True)
+    assert out.index('msg.set("B", "2")') < out.index('msg.set("D", "4")')
