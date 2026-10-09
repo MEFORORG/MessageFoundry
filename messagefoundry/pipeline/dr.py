@@ -422,6 +422,9 @@ class DrCoordinator:
                 # release owes first, or refuse (vault BACKLOG #2752).
                 if self._unrecorded_release is not None:
                     await self._record_owed_release()
+                # A release whose row or cleanup was cut short never ran the cleanup, or not to
+                # its end. It is safe to repeat, so a retry finishes it (vault BACKLOG #3263).
+                await self._run_after_release()
                 return self._last_release or DrResult(
                     action="release",
                     active=False,
@@ -489,18 +492,23 @@ class DrCoordinator:
                     await self._record_release_failed("interrupted", phase, hook_ran, actor, now)
                 raise
             # The box has handed back and the row says so. The cleanup runs below the arm above,
-            # so a cancellation here is not read as a failed release, and an error is logged and
-            # not raised: the next reload finishes what it left (vault BACKLOG #3263).
-            if self._after_release is not None:
-                try:
-                    await self._after_release()
-                except Exception:
-                    log.warning(
-                        "DR: the release handed back, but its cleanup did not finish; the next "
-                        "reload closes any outbound session still open",
-                        exc_info=True,
-                    )
+            # so a cancellation here is not read as a failed release (vault BACKLOG #3263).
+            await self._run_after_release()
             return self._release_result(detail)
+
+    async def _run_after_release(self) -> None:
+        """Run the engine's cleanup for a hand-back that is complete. An error is logged and not
+        raised: the release stands, and a retried release or the next reload finishes it."""
+        if self._after_release is None:
+            return
+        try:
+            await self._after_release()
+        except Exception:
+            log.warning(
+                "DR: the release handed back, but its cleanup did not finish; a retried release "
+                "or the next reload closes any outbound session still open",
+                exc_info=True,
+            )
 
     def _release_result(self, detail: Mapping[str, object]) -> DrResult:
         """The :class:`DrResult` of a completed hand-back, read from its ``dr.release`` detail."""

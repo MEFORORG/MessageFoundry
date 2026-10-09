@@ -28,6 +28,7 @@ from messagefoundry.config.wiring import (
     WiringError,
     build_inbound_connection,
     build_outbound_connection,
+    env,
 )
 from messagefoundry.logging_guard import LogSinkEvent
 from messagefoundry.pipeline import Engine, wiring_runner
@@ -256,6 +257,56 @@ async def test_an_activation_fails_one_lane_on_a_refused_ca_and_starts_the_rest(
         await runner.stop()
 
 
+async def test_an_activation_charges_no_attempt_to_a_row_held_on_a_lane_it_is_building(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The first build awaits its CA check. The lane is unparked only after it, so the held row
+    is not claimed while there is no connector. Red when the unpark came first: the row was
+    charged a failed attempt with ``last_error`` ``outbound reloading``."""
+    ca = _ca(tmp_path)
+
+    async def slow(direction: str, name: str, settings: object) -> None:
+        await asyncio.sleep(0.3)
+
+    runner = RegistryRunner(
+        _graph(tmp_path, ca, _sha(ca)),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+        lane_anchor_check=slow,
+        dr_standby=Priority.CRITICAL,
+    )
+    await runner.start()
+    try:
+        row_id = await store.enqueue_message(
+            channel_id=_IB, raw=_ADT, deliveries=[(_OB_FILE, _ADT)]
+        )
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
+        (row,) = await store.outbox_for(row_id)
+        # One attempt, the delivery itself. The control is the unpark-first order, which gave 2.
+        assert (row["status"], row["attempts"], row["last_error"]) == ("done", 1, None)
+    finally:
+        await runner.stop()
+
+
+async def test_a_passive_start_reads_the_other_lanes_when_one_does_not_resolve(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """One lane's settings name an ``env()`` value this instance lacks. That lane is recorded
+    failed, and the lane with the refused CA is still read. Red when one fault skipped them all."""
+    ca, pin = _swapped_ca(tmp_path)
+    reg = _graph(tmp_path, ca, pin, directory=env("not_defined_here"))
+    runner = _runner(store, reg, dr_standby=Priority.CRITICAL)
+    await runner.start()
+    try:
+        assert _PASSIVE_REFUSED in (runner.outbound_failed(_OB_CA) or "")
+        assert runner.outbound_failed(_OB_FILE) is not None
+    finally:
+        await runner.stop()
+
+
 # --- an activation under a log halt -------------------------------------------------------
 
 
@@ -370,6 +421,17 @@ async def test_a_release_cancelled_while_it_closes_connectors_has_still_handed_b
     assert "dr.release" in actions and "dr_release_failed" not in actions
     assert not rr.inbound_running(_IB) and set(rr.filtered_outbound()) == {_OB_FILE}
 
+    # The cut-short cleanup is owed. A retried release runs it and writes no second row.
+    closed: list[bool] = []
+
+    async def close() -> None:
+        closed.append(True)
+
+    monkeypatch.setattr(rr, "close_passive_connectors", close)
+    again = await coordinator.release(actor="operator")
+    assert again.active is False and closed == [True]
+    assert (await _audit_actions(engine)).count("dr.release") == 1
+
 
 async def test_a_release_that_cannot_close_a_connector_has_still_handed_back(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -408,6 +470,7 @@ async def test_an_activation_cancelled_after_its_reload_commits_leaves_no_listen
     assert engine.dr_active is False
     assert not rr.inbound_running(_IB)
     assert set(rr.filtered_inbound()) == {_IB} and set(rr.filtered_outbound()) == {_OB_FILE}
+    assert rr._destinations == {}  # and the session the attempt opened is closed
 
 
 async def test_a_refused_activation_unbinds_what_a_concurrent_reload_bound_under_it(

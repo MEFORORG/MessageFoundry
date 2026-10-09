@@ -3643,7 +3643,8 @@ def create_app(
                         backlog_seconds=None,
                         delivered_age_seconds=None,
                         # The failure reason (ADR 0031) or the DR-parked reason (#61) — whichever set
-                        # the status; ifail takes precedence (a failed connection is never also parked).
+                        # the status; ifail takes precedence. One connection can hold both: a passive DR
+                        # standby records a refused CA on a feed it parks (vault BACKLOG #3263).
                         error=ifail or ifiltered,
                         flagged=ic.flagged,  # #131: object-of-interest marker (display-only)
                         toml_managed=_is_toml_managed(ic.source_file),
@@ -3735,7 +3736,8 @@ def create_app(
             # a degraded or parked lane is never silently hidden from the dashboard. Both sources are the
             # OUTBOUND-scoped snapshots (see `Direction`): these are destination rows, so an inbound
             # namesake's failure or DR park must never reach them. The two reasons map to the distinct
-            # "failed" vs "filtered" status (a connection is never in both).
+            # "failed" vs "filtered" status. A lane can be in both on a passive DR standby (vault
+            # BACKLOG #3263), and failed wins, as the update order below gives it.
             standalone: dict[str, tuple[str, str | None]] = {
                 name: ("failed", reason) for name, reason in rr.degraded_outbound().items()
             }
@@ -7659,8 +7661,10 @@ def create_app(
             total = len(in_deployed)
             running = sum(1 for name in in_deployed if rr.inbound_running(name))
             # ADR 0031 start failures ONLY. A DR-parked connection (ADR 0048 / #61) lives in the
-            # DISJOINT filtered set and is deliberately excluded: parking is a run-profile decision,
+            # separate filtered set and is deliberately excluded: parking is a run-profile decision,
             # not a fault, and folding it in here would paint every DR-profiled engine degraded.
+            # A parked feed whose CA a passive standby refused is in both, and counts as failed
+            # here (vault BACKLOG #3263).
             # INBOUND-scoped: an outbound namesake's build failure must not count its healthy
             # inbound twin as failed (see wiring_runner's `Direction`).
             failed_in = [name for name in in_deployed if rr.inbound_failed(name) is not None]

@@ -867,15 +867,18 @@ class Engine:
             # to follow it there too.
             self._set_dr_active(was_active)
             standby = self._dr_standby_threshold()
-            if rr is not None and standby is not None and rr.listening_inbounds() - listening:
+            if rr is not None and standby is not None:
                 # The box is passive again, so it must answer on nothing (vault BACKLOG #3263).
                 # Two paths left a listener bound here. A reload that committed and was then
                 # cancelled had bound the critical set. And an operator reload already running
                 # when the latch flipped bound that set under the new threshold, before this
-                # call's own reload was refused. A second cancellation stops the unbind, which
-                # is the caller insisting, as in the runner's reload rollback.
+                # call's own reload was refused. The park takes the reload lock, so it also
+                # waits out such a reload that is still binding. The outbound sessions the
+                # attempt opened are closed too, as after a release. A second cancellation
+                # stops this, which is the caller insisting, as in the runner's reload rollback.
                 try:
                     await rr.park_intake(standby, keep=listening)
+                    await rr.close_passive_connectors()
                 except Exception:
                     log.exception(
                         "DR activation failed, and unbinding the listeners it had bound failed "
