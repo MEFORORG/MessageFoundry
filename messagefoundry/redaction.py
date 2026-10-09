@@ -2322,10 +2322,11 @@ _EXC_ARGS: Any = BaseException.__dict__["args"]
 _GROUP_MEMBERS: Any = BaseExceptionGroup.__dict__["exceptions"]
 _DEQUE_MAXLEN: Any = deque.__dict__["maxlen"]
 _DEFAULT_FACTORY: Any = defaultdict.__dict__["default_factory"]
-#: How many objects one scan follows from an attribute, at any depth beneath it. Past it the
-#: rest are left as they are with no filter, so a log argument that is a large graph of
-#: dataclasses, or an exception carrying a large payload, cannot hold the logging thread or the
-#: event loop. Which objects are the ones left is not defined: the walk is not in print order.
+#: The work one scan may spend on what it reaches through an attribute, at any depth beneath it.
+#: One unit is one object read by attribute, or one element read from a container found that way,
+#: so a large graph of dataclasses or an exception carrying a large payload cannot hold the
+#: logging thread or the event loop. Past it the rest are left as they are with no filter. Which
+#: objects are the ones left is not defined: the walk is not in print order.
 _ATTRIBUTE_BUDGET = 4096
 _TYPE_MRO: Any = type.__dict__["__mro__"]
 _TYPE_DICT: Any = type.__dict__["__dict__"]
@@ -2388,9 +2389,10 @@ def _read_slot_names(kind: type[Any]) -> tuple[str, ...] | None:
     return None
 
 
-def _attribute_values(arg: Any, kind: type[Any], slots: tuple[str, ...]) -> list[Any]:
+def _attribute_values(arg: Any, kind: type[Any], slots: tuple[str, ...], limit: int) -> list[Any]:
     """What the attributes of ``arg`` hold: every value in its instance ``__dict__``, and each
-    named slot. Both are read through the builtin descriptors, so none of the object's code runs.
+    named slot, ``limit`` of them at most. Both are read through the builtin descriptors, so none
+    of the object's code runs.
 
     It reads every instance attribute, not the fields a generated ``repr`` lists, so a dataclass
     field declared ``repr=False`` counts. That errs toward the fixed note and prints nothing."""
@@ -2398,8 +2400,8 @@ def _attribute_values(arg: Any, kind: type[Any], slots: tuple[str, ...]) -> list
     own_dict = _class_attribute(kind, "__dict__")
     # A Python class keeps it behind a getset descriptor, and SimpleNamespace behind a member.
     if type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType:
-        values.extend(dict.values(own_dict.__get__(arg)))
-    for name in slots:
+        values.extend(islice(dict.values(own_dict.__get__(arg)), limit))
+    for name in slots[: max(limit - len(values), 0)]:
         slot = _class_attribute(kind, name)
         if type(slot) is MemberDescriptorType:
             try:
@@ -2487,9 +2489,10 @@ class _RenderedMapping(dict[Any, Any]):
         return self._str
 
 
-def _children(arg: Any, kind: type[Any]) -> list[Any]:
+def _children(arg: Any, kind: type[Any], limit: int | None = None) -> list[Any]:
     """The objects a render of ``arg`` prints, read from its storage through the builtin's own
-    methods. A mapping's are its keys and values, flattened in order.
+    methods. A mapping's are its keys and values, flattened in order. With a ``limit`` it reads
+    about that many and stops, for a container the scan reached through an attribute.
 
     Each read is one ``list()`` over a C iterator, so it is short, but it is not atomic: a garbage
     collection inside it can run other code and switch threads. A container another thread changes
@@ -2504,11 +2507,11 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
     its storage is not caught, as a mapping whose own lookup returns one is not."""
     if issubclass(kind, BaseExceptionGroup):
         # Both: a subclass may print its .args, and the caller's list in .args can differ from them.
-        return [*_GROUP_MEMBERS.__get__(arg), *_EXC_ARGS.__get__(arg)]
+        return _some([*_GROUP_MEMBERS.__get__(arg), *_EXC_ARGS.__get__(arg)], limit)
     if issubclass(kind, BaseException):
-        return list(_EXC_ARGS.__get__(arg))  # str() and repr() print .args
+        return _some(_EXC_ARGS.__get__(arg), limit)  # str() and repr() print .args
     if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
-        return list(arg)
+        return _some(arg, limit)
     if issubclass(kind, UserDict):
         try:
             return [arg.data]  # UserDict prints repr(self.data)
@@ -2517,11 +2520,17 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
     if issubclass(kind, dict):
         # An OrderedDict keeps its own order apart from the dict's storage.
         items = OrderedDict.items if issubclass(kind, OrderedDict) else dict.items
-        return [part for pair in list(items(arg)) for part in pair]
+        pairs = _some(items(arg), None if limit is None else (limit + 1) // 2)
+        return [part for pair in pairs for part in pair]
     for base in _ARG_SEQUENCES:
         if issubclass(kind, base):
-            return list(base.__iter__(arg))
+            return _some(base.__iter__(arg), limit)
     return []
+
+
+def _some(elements: Any, limit: int | None) -> list[Any]:
+    """One ``list()`` over a C iterator, or over its first ``limit`` elements."""
+    return list(elements) if limit is None else list(islice(elements, limit))
 
 
 def prints_a_codec_error(exc: BaseException) -> bool:
@@ -2532,7 +2541,7 @@ def prints_a_codec_error(exc: BaseException) -> bool:
 
     IT IS NOT A PROOF THAT ``str(exc)`` IS SAFE. It does not read at least an object of a class
     that is not read by attribute, text already built from the error, or anything past the
-    :data:`_ATTRIBUTE_BUDGET` objects it follows. Unlike a log argument, all of an exception's
+    :data:`_ATTRIBUTE_BUDGET` it may spend. Unlike a log argument, all of an exception's
     contents count against that budget here, since this also runs where errors are stored.
 
     ``str(RuntimeError(exc))`` is ``str(exc)``, which names the character or byte, and
@@ -2564,12 +2573,17 @@ class _Scan:
     from the same objects (a dict view's items are new tuples on every read). A container whose read
     fails counts as holding an error: it might.
 
-    An object read by attribute (:func:`_slot_names`) adds what its attributes hold to its
-    elements. A dataclass that is also an exception or a container has both. What is reached
-    through an attribute, and everything beneath it, is CHARGED: one scan follows at most
-    :data:`_ATTRIBUTE_BUDGET` such objects. A builtin container's own elements are followed
-    without limit, as they were before any object was read by attribute. ``charged_root`` charges
-    everything beneath the root too."""
+    IT WALKS TWICE, AND THE ORDER IS THE GUARANTEE. The first walk is the one made before any
+    object was read by attribute: builtin containers and exception ``.args``, without limit. It
+    finishes before the second starts, so nothing the second does can keep it from an object.
+
+    The second walk reads by attribute (:func:`_slot_names`) each object the first one met, and
+    adds what its attributes hold to its elements. A dataclass that is also an exception or a
+    container has both. What it reaches, at any depth, is read with a limit, and the whole second
+    walk spends at most :data:`_ATTRIBUTE_BUDGET`. A container it reads may be cut short, which
+    is safe only because nothing beneath an object read by attribute is ever printed from these
+    elements: that object prints as a fixed note. ``charged_root`` skips the first walk, so
+    everything beneath the root is read with the limit."""
 
     __slots__ = ("holds", "nodes")
 
@@ -2578,12 +2592,12 @@ class _Scan:
         # the object keeps its id from being reused while the walk runs.
         nodes: dict[int, tuple[Any, list[Any] | None, str]] = {}
         seeds: list[int] = []
-        pending: list[Any] = [] if charged_root else [root]
+        # Objects to read by attribute, in the order met. Popped from the end, so the first
+        # element of a list, which the first walk meets last, is read first.
         charged: list[Any] = [root] if charged_root else []
-        budget = _ATTRIBUTE_BUDGET
-        while pending or charged:
-            is_charged = bool(charged)
-            arg = charged.pop() if is_charged else pending.pop()
+        pending: list[Any] = [] if charged_root else [root]
+        while pending:
+            arg = pending.pop()
             kind = type(arg)
             key = id(arg)
             if kind in _ARG_SCALARS or key in nodes:
@@ -2592,26 +2606,59 @@ class _Scan:
                 nodes[key] = (arg, [], "")
                 seeds.append(key)
                 continue
-            walked = issubclass(kind, _ARG_WALKED)
-            slots = _slot_names(kind) if budget > 0 else None
-            if not walked and slots is None:
+            if not issubclass(kind, _ARG_WALKED):
+                if _slot_names(kind) is not None:
+                    charged.append(arg)
                 continue
             try:
-                children = _children(arg, kind) if walked else []
-                held = _attribute_values(arg, kind, slots) if slots is not None else []
+                children = _children(arg, kind)
             except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
                 nodes[key] = (arg, None, type(exc).__name__)
                 seeds.append(key)
                 continue
-            nodes[key] = (arg, children + held, "")
-            if is_charged:
-                held = children + held
-            else:
-                pending.extend(child for child in children if type(child) not in _ARG_SCALARS)
-            if held and budget > 0:
-                follow = list(islice((c for c in held if type(c) not in _ARG_SCALARS), budget))
-                budget -= len(follow)
-                charged.extend(follow)
+            nodes[key] = (arg, children, "")
+            pending.extend(child for child in children if type(child) not in _ARG_SCALARS)
+            if _slot_names(kind) is not None:
+                charged.append(arg)
+        budget = _ATTRIBUTE_BUDGET
+        read: set[int] = set()  # read by attribute, or first met by the second walk
+        while charged and budget > 0:
+            arg = charged.pop()
+            kind = type(arg)
+            key = id(arg)
+            if kind in _ARG_SCALARS or key in read:
+                continue
+            read.add(key)
+            if issubclass(kind, UnicodeError):
+                if key not in nodes:
+                    nodes[key] = (arg, [], "")
+                    seeds.append(key)
+                continue
+            known = nodes.get(key)
+            if known is not None and known[1] is None:
+                continue  # the first walk could not read it, and it already counts as an error
+            slots = _slot_names(kind)
+            if known is None and slots is None and not issubclass(kind, _ARG_WALKED):
+                budget -= 1  # an object that is not read at all: nothing beneath it to follow
+                continue
+            try:
+                if known is not None:
+                    children, found = known[1] or [], []
+                elif issubclass(kind, _ARG_WALKED):
+                    children = found = _children(arg, kind, budget)
+                else:
+                    children, found = [], []
+                budget -= 1 + len(found)
+                if slots is not None and budget > 0:
+                    held = _attribute_values(arg, kind, slots, budget)
+                    budget -= len(held)
+                    children, found = children + held, found + held
+            except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
+                nodes[key] = (arg, None, type(exc).__name__)
+                seeds.append(key)
+                continue
+            nodes[key] = (arg, children, "")
+            charged.extend(child for child in found if type(child) not in _ARG_SCALARS)
         self.nodes = nodes
         self.holds: set[int] = set()
         if not seeds:

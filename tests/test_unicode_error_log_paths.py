@@ -1590,6 +1590,84 @@ def test_a_large_payload_on_an_exception_is_bounded_and_never_raises() -> None:
     assert "caf" not in record.getMessage()
 
 
+class _BatchError(Exception):
+    """Keeps its rows in ``.args`` and on an attribute, as ``super().__init__(rows)`` does."""
+
+    def __init__(self, rows: object) -> None:
+        super().__init__(rows)
+        self.rows = rows
+
+
+@dataclasses.dataclass
+class _Context:
+    rows: object
+
+
+@pytest.mark.parametrize("pad", [10, 5000])
+@pytest.mark.parametrize("chain", ["engine", "tray"])
+def test_what_is_reached_both_plainly_and_by_attribute_is_scanned_without_the_budget(
+    chain: str, pad: int
+) -> None:
+    # The verifier's leak on head 087f1de8e7: the attribute walk met the rows first, spent its
+    # budget on the pad, and left the plain walk nothing to visit. Every shape here was a note,
+    # or safe text, before any object was read by attribute, at any pad size.
+    def held() -> _BatchError:
+        return _BatchError([[_encode_error()], [()] * pad])
+
+    note = "[_BatchError holding a codec error, not rendered]"
+    for placeholder in ("%s", "%r"):
+        record = _record(f"failed: {placeholder}", (held(),))
+        _chain_filter(chain).filter(record)
+        assert record.getMessage() == f"failed: {note}"
+    record = _record("failed: %s", ([held()],))
+    _chain_filter(chain).filter(record)
+    assert record.getMessage() == f"failed: [{note}]"
+    record = _record("failed: %(a)s", ({"a": held()},))
+    _chain_filter(chain).filter(record)
+    assert record.getMessage() == f"failed: {note}"
+    as_message = logging.LogRecord("t", logging.WARNING, __file__, 1, held(), (), None)
+    _chain_filter(chain).filter(as_message)
+    assert as_message.getMessage() == note
+
+
+@pytest.mark.parametrize("first", ["rows", "ctx"])
+def test_the_order_of_a_dict_does_not_decide_what_is_scanned(first: str) -> None:
+    rows = [[_encode_error()], [()] * 5000]
+    pair = {"rows": rows, "ctx": _Context(rows)}
+    arg = pair if first == "rows" else dict(reversed(pair.items()))
+    record = _record("%s", ([arg],))
+    prepare_log_record(record)
+    text = record.getMessage()
+    assert "caf" not in text
+    assert "UnicodeEncodeError: 'ascii' codec cannot encode at position 3" in text  # the plain rows
+    assert "[_Context holding a codec error, not rendered]" in text
+
+
+def _elements_read(scan: Any) -> int:
+    """How many elements a scan copied out of containers and attributes: its own record of it."""
+    return sum(len(elements or ()) for _arg, elements, _why in scan.nodes.values())
+
+
+def test_the_work_done_beneath_an_attribute_is_bounded_whatever_the_argument_holds() -> None:
+    # Counted, not timed. On head 087f1de8e7 the budget capped objects followed, and each was
+    # still read whole: 400 lists of 5,000 was two million elements for one log call.
+    bound = 2 * redaction._ATTRIBUTE_BUDGET + 8
+    lists = types.SimpleNamespace(**{f"k{i}": list(range(i, i + 5000)) for i in range(400)})
+    assert _elements_read(redaction._Scan(lists)) <= bound
+    error = RuntimeError("failed")
+    error.table = {i: str(i) for i in range(200_000)}  # type: ignore[attr-defined]
+    assert _elements_read(redaction._Scan(error)) <= bound
+    assert _elements_read(redaction._Scan(error, charged_root=True)) <= bound
+    wide = RuntimeError(list(range(200_000)))  # in .args, which safe_exc charges too
+    assert _elements_read(redaction._Scan(wide, charged_root=True)) <= bound
+    assert redaction.safe_exc(error) == "RuntimeError: failed"
+    for arg in (lists, error):  # and neither is touched: nothing in them is an error
+        record = _record("got %s end %d", (arg, 1))
+        args = record.args
+        prepare_log_record(record)
+        assert record.args is args
+
+
 def test_the_attribute_walk_stops_at_its_budget_and_never_raises() -> None:
     # Past the budget an object is left as it is with no filter: a stated limit, pinned here.
     chain: object = _Outcome("leaf", _encode_error())
