@@ -2035,8 +2035,13 @@ async def test_posture_route_reports_the_plaintext_hop_acknowledgement(engine: E
 
 
 @pytest.mark.usefixtures("remote_debugging_off")
-async def test_posture_route_reports_nothing_at_the_shipped_defaults(engine: Engine) -> None:
+async def test_posture_route_reports_only_the_harness_entry_at_the_shipped_defaults(
+    engine: Engine,
+) -> None:
     """The route must be quiet on a default instance, or its signal is worthless.
+
+    Quiet here is one entry, not none: the harness reaches the route through the open mode,
+    and the route names that mode (``_HARNESS_ONLY``).
 
     Default SETTINGS, on an interpreter started with remote debugging off. A default launch through
     the console script leaves it on, and the route then names it: see

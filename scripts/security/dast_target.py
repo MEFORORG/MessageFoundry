@@ -65,7 +65,7 @@ VIEWER_USERNAME = "dast-viewer"
 PREFLIGHT_PATH = "/connections"
 
 #: Stand-in recorded as the token under ``canary="open-auth"``. Authentication is DISABLED at that
-#: target, so ``POST /auth/login`` answers 503 ("authentication is not enabled") and there is no
+#: target, so ``POST /auth/login`` answers 503 ("authentication is not configured") and there is no
 #: session to mint — which is the whole point of that canary. Nothing authenticates with this value.
 _NO_SESSION_SENTINEL = "dast-canary-no-session"
 

@@ -220,7 +220,6 @@ from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
-    _allow_no_auth,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -230,6 +229,7 @@ from messagefoundry.api.security import (
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
     get_auth,
+    open_mode,
     optional_identity,
     pending_credential_deadline,
     public_route,
@@ -1319,9 +1319,9 @@ def _posture_loosenings(
         )
     )
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
-    # cannot see it. The same two reads the request-time gates make decide it: no service, and
-    # the flag. A service beside the flag still requires sign-in, so it reports nothing.
-    if getattr(state, "auth", None) is None and _allow_no_auth(state):
+    # cannot see it. The check the request-time gates make decides it: no service, and the flag.
+    # A service beside the flag still requires sign-in, so no entry is added for it.
+    if open_mode(state):
         pairs.append(
             (
                 "allow_no_auth",

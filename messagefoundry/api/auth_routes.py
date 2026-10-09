@@ -72,6 +72,7 @@ from messagefoundry.api.auth_models import (
 )
 from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
+    AUTH_NOT_CONFIGURED,
     AuthenticatedBeforeBodyRoute,
     RepeatedCredentialError,
     alert_administrator_granted,
@@ -229,7 +230,7 @@ async def _service(request: Request) -> AuthService:
     # here, so the check that runs before the body is read asks it first (vault BACKLOG #2739).
     auth = get_auth(request)
     if auth is None:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not enabled")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AUTH_NOT_CONFIGURED)
     return auth
 
 

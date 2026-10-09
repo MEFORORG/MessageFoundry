@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The console's own :class:`AuthService` provider dependency.
 
-A trivial re-implementation of ``api.auth_routes._service`` (get + enabled-check reading
+A trivial re-implementation of ``api.auth_routes._service`` (get + attached-check reading
 ``app.state``) so the package never imports ``auth_routes`` — which would form a
 package → auth_routes → package cycle. Identical semantics: no auth service answers 503.
 """
@@ -19,5 +19,8 @@ async def _service(request: Request) -> AuthService:
     # ``async`` for the reason ``messagefoundry.api.app._get_engine`` gives; keep it non-blocking.
     auth = get_auth(request)
     if auth is None:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not enabled")
+        # The engine's ``api.security.AUTH_NOT_CONFIGURED`` text, written out: importing the name
+        # would widen the engine seam for one string. ``tests/test_open_mode_is_no_service.py``
+        # holds every copy in the engine and the console equal.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not configured")
     return auth

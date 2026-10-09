@@ -387,8 +387,9 @@ gets you back in. `admin-unlock` clears a local lockout only (vault BACKLOG #271
 - At start, the engine checks for this. When every enabled Administrator needs an outside service,
   it logs a WARNING naming them and writes one `auth.no_local_administrator` audit row. It never
   refuses the start.
-- Turning sign-in off is not a way back in. `serve` refuses to start without it (vault BACKLOG
-  #2719). The old loopback mode could not repair an account anyway: with no auth service, creating
+- Turning sign-in off is not a way back in. `serve` has no setting that turns it off, and a
+  config that still carries the removed switch is refused at load (vault BACKLOG #2719). The
+  old loopback mode could not repair an account anyway: with no auth service, creating
   an account, unbinding one and reading the audit log all answered 503.
 
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)

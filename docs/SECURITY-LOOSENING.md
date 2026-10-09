@@ -299,6 +299,11 @@ false premise.
   before the outage ([SECURITY.md](SECURITY.md#keep-a-local-administrator)).
 - **For embedders and tests only:** the app factories still take `allow_no_auth=True`. `serve` never
   passes it.
+- **Where the open mode is reported:** `GET /security/posture` on such an app names it as
+  `allow_no_auth`, with no auth service attached. It is an app opt-in, not a setting, so it is not
+  in the registry (`security_loosenings()`) and has no row in the tables on this page. So
+  `messagefoundry security show` would never name it: that command reads settings, and no
+  setting holds it.
 
 ### `require_mfa = false` — single-factor sign-in
 - **What you lose:** every account with no second factor enrolled, Administrators included,
