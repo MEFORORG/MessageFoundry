@@ -1011,6 +1011,40 @@ class LogSinkInfo(BaseModel):
     rolled_aside: str | None = None  # where the broken file was renamed to
 
 
+class LogForwarderInfo(BaseModel):
+    """Health of the **off-box log forwarder** in THIS process (BACKLOG #2612).
+
+    The pull-side counterpart of the ``log_forward_failed`` alert, read from process memory, so it
+    still answers when the collector does not. ``state`` is ``healthy``, ``unconfirmed``,
+    ``degraded`` (``send_failing`` is set, the spool cannot be read, or a record was lost since this
+    process started; the last does not clear while the forwarder runs) or ``not_installed`` (a
+    configured forwarder did not start or has stopped, so it sends nothing). What each count
+    measures, and what it reads in each state, is stated once, on
+    :class:`~messagefoundry.logging_setup.ForwarderStatus`. Under engine shards each process has
+    its own forwarder, and this is the one that answered.
+
+    **A UDP forwarder is never ``healthy``.** No failed send is counted over UDP, so the engine cannot see
+    a record lost on the wire. ``delivery_confirmed`` is then ``False``, a forwarder with no fault
+    seen reads ``unconfirmed``, and ``lost`` counts queue and spool losses only.
+
+    **Counts and fixed words only**: never a record, a collector address or an error text."""
+
+    state: str  # "healthy" | "unconfirmed" | "degraded" | "not_installed"
+    installed: bool
+    delivery_confirmed: bool = True  # False over UDP: a failed send is not visible at all
+    start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
+    send_failing: bool = False  # the last send, or a deferred start's connect, hit a network error
+    lost: int = 0  # the five loss counts below, added up; a floor
+    queued: int = 0  # on the hand-off queue now: a level, not a loss, and not the spool
+    queue_dropped: int = 0  # dropped because the hand-off queue was full
+    unsent: int = 0  # a network error cost them, with no spool to keep them
+    undeliverable: int = 0  # dropped for a send error that was not a network error
+    spool_dropped: int = 0  # the on-disk spool was full or refused the write
+    spool_skipped: int = 0  # spooled records found torn, malformed or gone
+    spool_read_errors: int = 0  # spool reads that failed; those records are held, not lost
+    spool_read_faulted: bool = False  # the last spool read failed
+
+
 class LogLevelInfo(BaseModel):
     """Runtime log-verbosity state (BACKLOG #171, ADR 0130). ``level`` is the current effective root
     level; ``configured`` is the startup ``[logging].level`` baseline a restart returns to; ``levels`` is
@@ -1140,6 +1174,9 @@ class SystemStatus(BaseModel):
     # which the byte/free-space metering above deliberately does not answer. Empty when logging was not
     # configured through configure_logging (an embedding/test), so the existing payload is unchanged.
     log_sinks: list[LogSinkInfo] = []
+    # BACKLOG #2612: the off-box log forwarder's health. ``None`` when no forwarder is configured,
+    # so "not configured" and "configured but absent" cannot be confused.
+    log_forwarder: LogForwarderInfo | None = None
     # No-network version-update signal (#30, ADR 0026). Additive + ``None`` when [update_check] is
     # disabled or the runner hasn't produced a result yet, so the existing payload is unchanged when off.
     update: UpdateInfo | None = None

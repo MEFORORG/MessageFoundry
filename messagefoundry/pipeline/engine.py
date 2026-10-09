@@ -69,6 +69,7 @@ from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
 from messagefoundry.pipeline.intake_bound import IntakeBoundMonitor
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
+from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.retention import RetentionRunner
@@ -419,6 +420,7 @@ class Engine:
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
         self._crl_reload_runner: CrlReloadRunner | None = None
+        self._log_forward_watch: LogForwardWatch | None = None
         self._gcm_invocation_runner: GcmInvocationRunner | None = None
         # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
         # #1169); None until start() arms it, and again after stop() disarms it.
@@ -1231,7 +1233,8 @@ class Engine:
         A cluster node's id is the same after a restart only when ``[cluster].node_id`` is pinned.
         The shard id is known once the engine holds its graph (:meth:`start` or ``add_registry``).
         Read by the approval gate to mark the releases it claims (BACKLOG #1562), and by the intake
-        monitor to name this process in its alert subjects (BACKLOG #2272)."""
+        monitor (BACKLOG #2272) and the log forwarder watch (BACKLOG #2612) to name this process in
+        their alert subjects."""
         if self._coordinator.is_clustered():
             return f"node:{self._coordinator.node_id}"
         runner = self._registry_runner
@@ -1641,6 +1644,17 @@ class Engine:
                 watch_unlisted_held_crls=True,
             )
             self._cert_expiry_runner.start()
+        # BACKLOG #2612: page when the off-box log forwarder is absent, losing records or not
+        # sending. NOT leader-gated, for the certificate monitor's reason: the forwarder is this
+        # process's own, so a standby and every engine shard watches its own.
+        if self._log_forward_watch is None:
+            # The process names itself in the alert key, as the intake monitor does (BACKLOG
+            # #2272): otherwise every process on the store shares one alert row per kind, and the
+            # row cannot say which process lost its forwarder. Read once, for that monitor's reason.
+            self._log_forward_watch = LogForwardWatch(
+                alert_sink=self._alert_sink, node=self.instance_identity
+            )
+            self._log_forward_watch.start()
         # BACKLOG #299: apply a replaced CRL file to the running hops that hold the old copy. Not
         # gated on [cert_monitor]: turning the expiry alert off must not also stop a revocation
         # reaching a running hop. Not leader-gated: each process holds its own TLS contexts. Its cap
@@ -2923,6 +2937,9 @@ class Engine:
         if self._crl_reload_runner is not None:
             await self._crl_reload_runner.stop()
             self._crl_reload_runner = None
+        if self._log_forward_watch is not None:
+            await self._log_forward_watch.stop()
+            self._log_forward_watch = None
         if self._secret_rotation_runner is not None:
             await self._secret_rotation_runner.stop()
         if self._update_check_runner is not None:
