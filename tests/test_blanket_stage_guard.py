@@ -46,7 +46,7 @@ ground-truth pass measured at least 33 that really stage the whole tree, so patc
 have fixed almost nothing. The flag rule is generated from the option words per the method BACKLOG
 #1097 settled, because a longer list has the same shape as the defect and decays the same way.
 WHAT IS STILL NOT REACHED was measured under BACKLOG #1339 and is listed once, with what git did
-for each form, in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. That pass also closed the forms that
+for each form, in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. That pass also closed some forms that
 needed neither a quote-state parser nor a program-position test; they are driven below, each
 beside a scoped control.
 
@@ -720,8 +720,7 @@ ADDED_NOT_REPLACED = [
 # Many need a quote-state parser or a program-position test, which are declined (BACKLOG #1341,
 # #1229), or the working directory, which the guard cannot see. Some were closed by a wider
 # reading that was then withdrawn. And some are plain reading mistakes that look closable and have
-# not been tried: the bare carriage return, the heredoc word with a dash, the arithmetic shift,
-# and the path that only needs normalising.
+# not been tried: the bare carriage return, the heredoc word with a dash, the arithmetic shift.
 #
 # WHICH TABLE A ROW SITS IN IS THE RECORD OF WHO ACCEPTED IT, so do not move a row without an
 # owner answer to cite. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the answers, the full
@@ -791,11 +790,10 @@ _NOT_ACCEPTED = pytest.mark.xfail(
 )
 
 NOT_ACCEPTED_FAIL_OPENS = [
-    # under no answer at all
+    # under no answer and next to none: reading mistakes in the script
     ("PowerShell", "Write-Host hi\rgit add -A"),
     ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A"),
     ("Bash", "echo $((1<<n))\ngit add -A"),
-    ("Bash", "git diff | git apply --cached"),
     # next to an accepted line whose words do not fit
     ("Bash", ">/dev/null git add -A"),
     ("PowerShell", "<# note #> git add -A"),
@@ -816,6 +814,7 @@ NOT_ACCEPTED_FAIL_OPENS = [
     # git supplies the command, or another git command does the staging
     ("Bash", "git -c alias.aa=add aa ."),
     ("Bash", "git ls-files -m | git update-index --stdin"),
+    ("Bash", "git diff | git apply --cached"),
 ]
 
 # THE CONTROLS FOR THE TWO TABLES ABOVE. Each is the nearest form that the guard DOES deny, and

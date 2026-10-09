@@ -552,7 +552,11 @@ This standard governs *how* to use AI at each tier; it **does not mandate** usin
 > either wired, or wired by a tracked installer, or named with its reason on an explicit unwired
 > list -- so the next drift is a red test rather than a sentence somebody has to notice. **Owner
 > ruling 2026-08-25: the guard IS a control and is to be wired after the quote-state splitter
-> repair** (BACKLOG #1341); this row becomes *Deterministic gate* at that point and not before.
+> repair** (BACKLOG #1341). The over-deny half of that repair has landed, and the escape-aware
+> parser that would finish it was declined. Wiring now waits on the owner's answer on the blanket
+> stages the guard still allows, which
+> [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md) lists in its section 5.
+> This row becomes *Deterministic gate* once the guard is wired, and not before.
 
 This document **owns and expands** the SDS §A.6 line — *"AI-assisted review as a compensating control"* — for the solo-maintainer **PO.2 / PW.7** deviation. The detailed record is Appendix A.6.
 

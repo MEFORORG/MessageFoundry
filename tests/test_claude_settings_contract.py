@@ -234,8 +234,9 @@ _KNOWN_UNWIRED: dict[str, str] = {
         "via the Liaison) that it IS a control. The condition for wiring it is the owner's "
         "acceptance of the blanket stages it still allows. Three owner answers are reported, and "
         "docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5 lists the measured forms that none of "
-        "them covers. An older condition, the quote-state repair under BACKLOG #1341, no longer "
-        "applies: that repair was declined."
+        "them covers. The older condition, the quote-state splitter repair under BACKLOG #1341, "
+        "is spent: its over-deny half landed, and the escape-aware parser that would finish it "
+        "was declined."
     ),
     "lane-level.ps1": "Not a PreToolUse guard; invoked directly by coordination scripts.",
     "steer-inject.ps1": "Opt-in steering channel, armed per-session rather than by a matcher.",

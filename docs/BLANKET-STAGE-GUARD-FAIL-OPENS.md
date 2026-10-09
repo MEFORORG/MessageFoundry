@@ -33,6 +33,10 @@ PR 2209 description. The forms those notes name are in section 5.
 
 Sorting a form under a line is this page's reading. The owner may draw a line elsewhere.
 
+One word is read widely on purpose. Where a line says "a stage", this page takes it to mean
+a stage or a commit that sweeps the tree. The guard treats both as a blanket stage, and its
+deny message uses the one name for both.
+
 ## How this was measured
 
 Two passes, with the same tools and the same method.
@@ -42,8 +46,8 @@ Two passes, with the same tools and the same method.
   guard at that commit.
 - **Second pass:** engine commit `61361fff906067c9da0c0fa7d3457b7f229447b7` (2026-10-09), which
   holds PR 2209. At least 190 commands, each run in a repository. Also 18 payloads sent straight
-  to the hook, 14 of which it cannot read. Sections 3 and 5 and the new rows elsewhere come from
-  this pass.
+  to the hook, 14 of which it cannot read. Section 3, section 5.1 and every row marked "second
+  pass" come from this pass. So do the rows added to sections 1 and 2.
 - **Tools:** git 2.55.0.windows.5, PowerShell 7.6.6, and GNU bash 5.3.15 from Git for Windows.
 - **Guard verdict:** each command went to the guard as a real `PreToolUse` payload on stdin, as a
   `Bash` tool call or a `PowerShell` tool call.
@@ -204,7 +208,8 @@ At least:
 
 Denying `..` would also deny `cd sub/deep && git add ..`, which was measured to stage only the
 three files under `sub/`. That is a scoped stage, so the deny would be a false one. From the
-repository root, `git add ..` stages nothing: git answers `'..' is outside repository`.
+repository root, `git add ..` stages nothing: git answers `'..' is outside repository`. The
+`../..` row is the same form one level deeper.
 
 **(c) "quoting forms such as git commit -m wip '.' or "git" add -A".** The guard blanks quoted
 text before it reads a commit, so a quoted pathspec looks the same as a quoted message. A quoted
@@ -284,8 +289,9 @@ It was built for PR 2209 and withdrawn; see the end of section 4.
 
 ## 3. Accepted by answer 3: four forms the Lander's review found
 
-The Lander's review of PR 2209 found four forms that the page did not list. Each heading below
-quotes the dialog's line. All were measured in the second pass, and all are still allowed.
+The Lander's review of PR 2209 named four forms. Each heading below quotes the dialog's line.
+All were measured in the second pass, and all are still allowed. Form 4 was already on this
+page after PR 2209, in group E, with one row.
 
 Forms 1 and 2 come from the commit rule. That rule reads the arguments after the word `commit`.
 Before it reads them it drops a trailing comment, drops text inside round brackets, and drops
@@ -384,7 +390,8 @@ How each was closed:
 
 - **Commit pathspec.** A new rule reads the arguments after the word `commit`, with quoted text
   blanked. A dot inside a quoted message is not a pathspec. Neither is a dot in a trailing
-  comment or inside round brackets. Section 3 lists what those two exceptions let through.
+  comment or inside round brackets. Those two exceptions let whole-tree commits through.
+  They are in sections 2(d), 3 and 5.2, and the ones in 5.2 are not accepted.
 - **Dot family.** The whole-tree pathspec now matches any path built only from single dots and
   separators.
 - **Quoted flag and glued redirect.** The `add` rules accept a quote around a flag. All the
@@ -421,7 +428,7 @@ command that was denied at the first measured commit is allowed now.
 Each form below is still allowed, and git stages or commits a whole tree with it. No line in the
 three answers describes it. This list is for the owner. At least:
 
-**5.1 Forms under no answer at all.** All were first measured in the second pass.
+**5.1 Forms under no answer and next to none.** All were first measured in the second pass.
 
 | Command | Shell | What git did | Why the guard allows it |
 |---|---|---|---|
@@ -429,19 +436,14 @@ three answers describes it. This list is for the owner. At least:
 | `cat <<EOF-1`, newline, `x`, newline, `EOF-1`, newline, `git add -A` | bash | staged all five | The guard reads a heredoc word as letters, digits and underscores, so it waits for a line `EOF` that never comes. |
 | `cat <<E.O`, newline, `x`, newline, `E.O`, newline, `git add -A` | bash | staged all five | The same, with a dot in the word. |
 | `echo $((1<<n))`, newline, `git add -A` | bash | staged all five | The guard reads the shift `<<n` as the start of a heredoc. |
-| `git diff \| git apply --cached` | bash, PowerShell | staged all tracked | The staging is done by `git apply`. The guard has rules for `add`, `stage` and `commit` only. |
-| `git add <the repository root as an absolute path>` | bash, PowerShell | staged all five | The guard cannot tell that the path is the root. |
-| `git commit -m wip <the repository root as an absolute path>` | bash | committed all tracked | The same. |
 
 Controls from the same runs: `cat <<EOF`, newline, `x`, newline, `EOF`, newline, `git add -A` is
 denied, and so is `echo $((1 << 2))`, newline, `git add -A`. The bare carriage return row stages
-nothing under bash, which does not end a line there. `git add <root>/a.txt` staged `a.txt` only.
+nothing under bash, which does not end a line there.
 
-The first four rows are reading mistakes in the script, not limits of the method. Each looks
-closable without a quote-state parser or a program-position test: a split at a carriage return
-for the PowerShell tool, and a narrower heredoc opener. Neither was built or measured here. The
-last three rows are limits: the guard has no rule for `git apply`, and it cannot see where the
-repository root is.
+These rows are reading mistakes in the script, not limits of the method. Each looks closable
+without a quote-state parser or a program-position test: a split at a carriage return for the
+PowerShell tool, and a narrower heredoc opener. Neither was built or measured here.
 
 **5.2 Forms next to an accepted one, where the answer's words do not fit.** Each has a nearest
 accepted line. This page does not sort them under it, because the words differ.
@@ -475,6 +477,9 @@ accepted line. This page does not sort them under it, because the words differ.
 | `git -c alias.aa='add -A' aa` | bash, PowerShell | staged all five | 2(d). Git supplies the command, not the shell. | PR 2209, in group D |
 | `git -c alias.aa=add aa .` | bash, PowerShell | staged all five | The same. | PR 2209, in group D |
 | `git ls-files -m \| git update-index --stdin` | bash | staged all tracked | 2(d). The staging is done by `git update-index`. | PR 2209, in group D |
+| `git diff \| git apply --cached` | bash, PowerShell | staged all tracked | The same, with `git apply`. The guard has rules for `add`, `stage` and `commit` only. | second pass |
+| `git add <the repository root as an absolute path>` | bash, PowerShell | staged all five | 2(d). The line says the shell supplies the path; here it is typed. Git gets the same argument as from `"$PWD"`. | second pass |
+| `git commit -m wip <the repository root as an absolute path>` | bash | committed all tracked | The same. | second pass |
 
 Notes on these rows:
 
@@ -484,8 +489,11 @@ Notes on these rows:
 - **A message that spans lines** is the most ordinary form on this page. The guard splits a
   command at every newline, also inside a quoted message. The pathspec or flag after the message
   then lands in a piece that does not start with `git`.
-- **The `sub/..` rows** always name the current directory. Closing them needs the guard to
-  normalise a path, which would cost no false deny. It has not been built.
+- **The `sub/..` rows** name the current directory. Run from the root, that is the whole tree.
+  A rule that read `x/..` as a dot would also refuse `cd sub && git add deep/..`, which was
+  measured to stage only the three files under `sub/`. That is the same false deny the dot
+  itself has from a subfolder; see the last table on this page. `git add <root>/a.txt`, the
+  control for the absolute path rows, staged `a.txt` only.
 - **The two `<<EOF` rows** hold `<<EOF` inside quoted text. The guard reads it as the start of a
   heredoc and blanks the lines after it. The critic note reports that the sibling guard,
   `scripts/hooks/block-unbounded-fs-scan.ps1`, finds a heredoc opener on text with quoted spans
