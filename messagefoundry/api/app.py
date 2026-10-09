@@ -63,6 +63,7 @@ from fastapi import (
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.telemetry import TelemetryConfig
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -2689,6 +2690,26 @@ class _SummaryAuditCoalescer:
         )
 
 
+# fastapi 0.142 ships OpenTelemetry telemetry that is on by default. Left on, it would read
+# OTEL_EXPORTER_OTLP_* before lifespan startup and install its own OTLP exporters whenever the
+# SDK is importable (the [otel] extra installs it). Its logs carry unhandled-exception messages and
+# stack traces, and it hands any log processor the request's validation errors with their original
+# input values; here either can be PHI. That would send data off the host with no reviewed
+# [api] setting behind it (CLAUDE.md section 9). Every switch is off, not only auto_configure: with
+# auto_configure alone, any provider another component configures globally would still receive
+# fastapi's spans, request metrics and validation logs, and fastapi would still parse inbound trace
+# headers through the global propagators. The engine's own optional OTLP metrics export
+# (api/metrics.py, BACKLOG #21) builds its own provider and does not depend on any of this.
+# tests/test_api_fastapi_telemetry_off.py pins it.
+_FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
+    "tracing": False,
+    "metrics": False,
+    "logs": False,
+    "operation_spans": False,
+    "auto_configure": False,
+}
+
+
 def create_app(
     engine: Engine | None = None,
     *,
@@ -2761,6 +2782,7 @@ def create_app(
         # unless it carries a gate or a public declaration; security.refuse_undeclared_route says
         # what that covers and what it does not.
         dependencies=[Depends(refuse_undeclared_route)],
+        telemetry=_FASTAPI_TELEMETRY_OFF,
     )
     # Vault BACKLOG #2739: every route registered on this app from here on is built by this class,
     # which refuses a caller with no identity BEFORE FastAPI reads the request body. Set before the
