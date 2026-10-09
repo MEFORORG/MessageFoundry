@@ -70,15 +70,15 @@ handshake answer, on either WebSocket protocol, is a headers object the library 
 yet, so the override adds to that object.
 
 **Refuse at startup.** Each hook this module overrides is checked when the class is built,
-against the server class it is handed. The flags the two sans-I/O steps above read
-(``handshake_initiated``, ``handshake_exc``, ``eof_sent``) are NOT checked at build: a rename
-there turns those steps off silently, and only the startup self-test's parser-rejection drive would
-notice the first. The checked hooks are: the HTTP protocol's ``send_400_response``, its
+against the server class it is handed. So are the three flags the two sans-I/O steps above read:
+a rename there would otherwise turn a step off with no error. The checked hooks are: the HTTP
+protocol's ``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response`` and ``default_headers``, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
-protocol they are ``data_received``, the ``conn`` attribute, and a synchronous ``send_response``
-and ``data_to_send`` on the ``ServerProtocol`` its module imports. The methods the floor wraps synchronously must still be
+protocol they are ``data_received``, the ``conn`` and ``handshake_initiated`` attributes, and on
+the ``ServerProtocol`` its module imports a synchronous ``send_response`` and ``data_to_send`` and
+the ``eof_sent`` and ``handshake_exc`` attributes. The methods the floor wraps synchronously must still be
 synchronous. An attribute counts as present when a method of the server's own class for the hook
 using it, or of a subclass, assigns it. A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
 installed uvicorn and websockets versions, and ``serve`` refuses to start on it. There is no
@@ -330,6 +330,13 @@ def _require_ws_hooks(base: type[Any], *, through_conn: bool) -> None:
             raise _refusal(base, f"{_CONN_CLASS} in its module")
         _require_sync_method(conn_cls, "send_response")
         _require_sync_method(conn_cls, "data_to_send")
+        # The flags the two uvicorn-0.54 workarounds read. Each is read through getattr with a
+        # default that turns its step OFF, so a rename must refuse here and not pass in silence.
+        # data_to_send anchors the two conn flags: the conn class's own base defines it, and that
+        # base is where websockets assigns them.
+        _require_assigned(base, "handshake_initiated", hook="data_received")
+        _require_assigned(conn_cls, "eof_sent", hook="data_to_send")
+        _require_assigned(conn_cls, "handshake_exc", hook="data_to_send")
     else:
         _require_sync_method(base, "send_500_response")
         _require_assigned(base, "transport", hook="send_500_response")
