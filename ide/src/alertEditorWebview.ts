@@ -23,7 +23,8 @@ export function alertEditorScript(
     let refused = false;
     // True from an 'error' until the next list renders. The host posts 'error' for a failed add, a
     // failed remove and a failed re-read alike, and after the last two the rows may not match the
-    // file. Remove names an ordinal, so it waits for a list that was read after the error.
+    // file. Remove names an ordinal, so it waits for the next list. A list carries no sequence, so
+    // the page cannot tell one read before the error from one read after it.
     let unconfirmed = false;
     const REMOVE_OFF = 'Remove is off until the rules are read again: run the Alert Rules command again, or add a rule.';
     // True once a list has rendered. Until then the "No rules yet" note is the page's seed text,
@@ -63,13 +64,19 @@ export function alertEditorScript(
       return rule;
     }
 
+    // True while rows are showing with Remove off. The line saying why is then the only reason on
+    // the page, so no form message may take its place.
+    function removeIsOff() { return unconfirmed && $('rows').querySelector('button') !== null; }
+    function invalid(msg) { show(removeIsOff() ? msg + ' ' + REMOVE_OFF : msg); return false; }
     function validate(rule) {
-      if (!rule.connection) { show('Connection is required (use * for all).'); return false; }
+      if (!rule.connection) { return invalid('Connection is required (use * for all).'); }
       for (const [k, label] of [['min_depth','Min depth'],['min_oldest_seconds','Min oldest'],['cooldown_seconds','Cooldown']]) {
-        if (rule[k] !== undefined && !Number.isFinite(rule[k])) { show(label + ' must be a number.'); return false; }
+        if (rule[k] !== undefined && !Number.isFinite(rule[k])) { return invalid(label + ' must be a number.'); }
       }
-      // While Remove is off, the line saying so stays up: it is the only reason on the page.
-      if (unconfirmed && $('rows').children.length > 0) { show(REMOVE_OFF); } else { errorEl.style.display = 'none'; }
+      if (removeIsOff()) { show(REMOVE_OFF); }
+      // An error that arrived before any list rendered is all the page has to show under "Current
+      // rules": the table and the note are both down. It stays until the host answers this Add.
+      else if (!(unconfirmed && !listed)) { errorEl.style.display = 'none'; }
       return true;
     }
     // 'block', not '': the page's stylesheet hides .error, and clearing the inline value would hand
@@ -168,8 +175,12 @@ export function alertEditorScript(
         for (const [key, ok, want] of RULE_FIELDS) {
           const v = r[key];
           if (!mfOpt(v, ok)) {
-            return problem('rule ' + r.index + ', ' + key + ': expected ' + want + ', got ' + mfKind(v),
-              v !== null, want === 'a number' && typeof v === 'string');
+            // A list is the right kind for transports, so "got list" would name no difference.
+            const got = Array.isArray(v) && key === 'transports' ? 'a list with an entry that is not text' : mfKind(v);
+            // A null did not come from the file, whether it is the value or sits inside a list.
+            const hasNull = v === null || (Array.isArray(v) && v.indexOf(null) !== -1);
+            return problem('rule ' + r.index + ', ' + key + ': expected ' + want + ', got ' + got,
+              !hasNull, want === 'a number' && typeof v === 'string');
           }
         }
       }

@@ -844,6 +844,21 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     }
   });
 
+  test("the engine prints only setting type tags this page's set holds", () => {
+    // FieldDescriptor.type passes through from "connection schema --json". This reads the tags
+    // _type_name() can return, so a tag added there fails here instead of the form going quiet.
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "../../../../messagefoundry/config/connection_schema.py"),
+      "utf8",
+    );
+    const body = /\ndef _type_name\([^]*?\n(?=\S)/.exec(source);
+    assert.ok(body, "config/connection_schema.py no longer defines _type_name at module level");
+    // Past the docstring, every double-quoted word in the function is a tag it can return.
+    const code = body[0].replace(/"""[^]*?"""/, "");
+    const tags = [...new Set([...code.matchAll(/"([a-z]+)"/g)].map((m) => m[1]))].sort();
+    assert.deepStrictEqual(tags, [...PARAM_TYPES].sort(), "the engine's tags and PARAM_TYPES differ");
+  });
+
   test("the engine prints only edge provenances this page's set holds", () => {
     // The first three members of MAP_PROVENANCES are not made here: they pass through from
     // "graph --json". This reads the engine's own definition, so a provenance added there fails
@@ -970,6 +985,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "rule 1, min_depth: expected a number, got string", true, true],
       ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "rule 0, connection: expected text, got list", true, false],
       ["transports is text", (c) => (c.rules[0].transports = SENT), "rule 0, transports: expected a list of text, got string", true, false],
+      ["transports holds a number", (c) => (c.rules[0].transports = [1, 2]), "rule 0, transports: expected a list of text, got a list with an entry that is not text", true, false],
+      ["transports holds a null", (c) => (c.rules[0].transports = ["webhook", null]), "rule 0, transports: expected a list of text, got a list with an entry that is not text", false, false],
       // Positions count from 0, as the ordinals in the table's first column do.
       ["a rule with no index", (c) => delete c.rules[1].index, "the entry at position 1 of the list has no whole-number index", false, false],
       ["an entry that is text", (c) => (c.rules[2] = SENT), "the entry at position 2 of the list is not a rule", false, false],
@@ -1058,6 +1075,12 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.strictEqual(p.posted[0].command, "add");
     // That valid Add did not take down the only line saying why Remove is off.
     assert.ok(refusalShown(p).includes("Remove is off"), `the reason went with the Add: "${refusalShown(p)}"`);
+    // Nor does an Add the form refuses: its message is shown with the reason, not in its place.
+    doc.getElementById("connection").value = "";
+    doc.getElementById("add").click();
+    assert.strictEqual(p.posted.length, 1, "an invalid Add posted");
+    assert.ok(refusalShown(p).startsWith("Connection is required"), refusalShown(p));
+    assert.ok(refusalShown(p).includes("Remove is off"), `the reason went with the form message: "${refusalShown(p)}"`);
     // The next list the host reads brings Remove back.
     p.deliver(ALERT_OK);
     removeButtons(p)[0].click();
@@ -1073,6 +1096,10 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     p.deliver(ERROR_OK);
     assert.strictEqual(empty.style.display, "none", "the note stands beside the error");
     assert.strictEqual(refusalShown(p), CLI_ERROR);
+    // A valid Add now must not leave "Current rules" with no table, no note and no error.
+    p.window.document.getElementById("add").click();
+    assert.strictEqual(p.posted.length, 1);
+    assert.strictEqual(refusalShown(p), CLI_ERROR, "the section went blank while the Add was pending");
     // The control: after an EMPTY list has rendered, the note is a reading, and an error leaves it.
     const q = alertRules.load();
     q.deliver({ command: "rules", rules: [] });
