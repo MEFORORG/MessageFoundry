@@ -242,6 +242,7 @@ async def test_a_release_stops_delivery_again_until_the_next_activation(
         # Parked at once, before any reload: the release returns with nothing delivering.
         assert set(rr.filtered_outbound()) == {_OB_CRIT, _OB_NORM}
         assert not rr.outbound_running(_OB_CRIT)
+        await engine._dr_release_cleanup()  # what the coordinator runs once the row is written
         assert _OB_CRIT not in rr._destinations  # and no session is held open to the partner
         del sent[:]
 

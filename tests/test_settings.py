@@ -1735,16 +1735,28 @@ def test_dr_activate_with_cluster_is_rejected(tmp_path: Path) -> None:
         load_settings(config_path=cfg, environ={})
 
 
-def test_dr_enabled_but_not_activated_with_cluster_is_ok(tmp_path: Path) -> None:
-    # Only [dr].activate is guarded: a provisioned-but-passive DR box (enabled, activate=false) may still
-    # coexist with cluster membership (it binds no priority feeds until activated).
+def test_dr_enabled_but_not_activated_with_cluster_is_rejected(tmp_path: Path) -> None:
+    # vault BACKLOG #3263. This loaded before. A provisioned DR box that is not activated is passive
+    # (ADR 0048): it binds no listener and delivers nothing. As a cluster member it could win the
+    # lease and serve nothing, and POST /dr/activate would make it the box the test above refuses.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
         "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = false\n",
     )
+    with pytest.raises(ValidationError, match=r"\[dr\]\.enabled cannot be combined"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_a_cluster_member_with_dr_off_loads(tmp_path: Path) -> None:
+    # The control for the two refusals above: the same file with [dr] off loads.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\n[dr]\nenabled = false\n",
+    )
     s = load_settings(config_path=cfg, environ={})
-    assert s.cluster.enabled is True and s.dr.enabled is True and s.dr.activate is False
+    assert s.cluster.enabled is True and s.dr.enabled is False
 
 
 def test_dr_activate_without_cluster_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

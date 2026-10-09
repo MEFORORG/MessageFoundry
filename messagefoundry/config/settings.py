@@ -6769,12 +6769,20 @@ class ServiceSettings(_InputHidingModel):
         should be a NON-PROMOTABLE cluster member (``[cluster].promotable = false``) OR a cold/manually
         promoted DR box, never a lease-contending DR box that could drive the primary store cross-WAN the
         moment it activates. Refuse the combination at config load rather than let it silently co-elect.
-        Spans two sections, so it lives here (not on either section, which can't see the other)."""
-        if self.dr.activate and self.cluster.enabled:
+        Spans two sections, so it lives here (not on either section, which can't see the other).
+
+        ``[dr].enabled`` is refused with ``[cluster].enabled`` as well, whatever ``activate`` says
+        (vault BACKLOG #3263). A provisioned DR box that is not activated is passive: it binds no
+        listener and delivers nothing (ADR 0048). As a cluster member it could win the lease and
+        then serve nothing, and ``POST /dr/activate`` would make it the lease-contending DR box
+        the check above refuses at boot."""
+        if (self.dr.enabled or self.dr.activate) and self.cluster.enabled:
+            key = "[dr].activate" if self.dr.activate else "[dr].enabled"
             raise ValueError(
-                "[dr].activate cannot be combined with [cluster].enabled: the DR run-profile gates which "
+                f"{key} cannot be combined with [cluster].enabled: the DR run-profile gates which "
                 "connections start, not leadership acquisition, so a DR box that also contends for the "
-                "cluster lease could win leadership and drive the primary store cross-WAN. Run the DR "
+                "cluster lease could win leadership and drive the primary store cross-WAN, and one "
+                "that is not activated is passive, so as leader it would serve nothing. Run the DR "
                 "engine cold (or manually promoted) with [cluster] disabled, or make the warm DR node a "
                 "NON-PROMOTABLE cluster member ([cluster].enabled=true, [cluster].promotable=false) "
                 "instead of a [dr] box."
