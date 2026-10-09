@@ -33,7 +33,7 @@
 > load** (vault BACKLOG #2600). `MEFOR_STORE_REQUIRE_ENCRYPTON=true` used to be dropped with no
 > warning, so the instance started without the hardening its environment asked for. The refusal
 > names the variable and, when one fits, the nearest real one. When that nearest setting is a list
-> or table one string cannot fill, it names the `[section].key` to set in the file instead. It
+> or dict one string cannot fill, it names the `[section].key` to set in the file instead. It
 > never repeats the value, because
 > the environment is where secrets belong. Unset the variable or fix its spelling.
 >
