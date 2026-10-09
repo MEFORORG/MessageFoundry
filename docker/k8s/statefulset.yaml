@@ -65,6 +65,10 @@ spec:
       # serially) + store-close margin. Raise it for many-listener graphs; also ensure it exceeds the
       # cluster leader-lease TTL so a drained leader releases the lease before SIGKILL.
       terminationGracePeriodSeconds: 40
+      # No service-link variables. The engine reads none, and it treats MEFOR_<SECTION>_<KEY> as a
+      # setting: a Service named `mefor`, or `mefor-<section>`, in this namespace would otherwise
+      # inject names the settings loader refuses at start (docs/CONFIGURATION.md). DNS is unaffected.
+      enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

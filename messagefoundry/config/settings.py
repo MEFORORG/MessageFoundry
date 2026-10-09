@@ -25,8 +25,9 @@ section has an env layer and whose key that section does not define. It is narro
 documented ``MEFOR_*`` variables are read straight from ``os.environ`` by their consuming module
 and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED``
 and siblings); those are spared by name. A variable whose SECTION part matches no section with
-an env layer is refused when it names a modelled section and is dropped silently when it names
-none. The ``cli`` mapping is not checked: its keys are engine-written
+an env layer is refused when it names a modelled section. When it names none it is not applied:
+:func:`load_settings` logs a WARNING for at least some such names, and the rest are dropped
+with no message. The ``cli`` mapping is not checked: its keys are engine-written
 from parsed arguments, never operator-spelled, and an operator's unknown flag never reaches them,
 because argparse refuses it first with exit 2. ``[security]`` has its own refusal from env (the
 arm inside :func:`_desugar_security`). Anything stated to an operator about these refusals must
@@ -358,8 +359,8 @@ def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> 
     Each error keeps its location, type and message, and a known type keeps its ``ctx`` (a
     validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT ONLY. The message
     and ``ctx`` are written by the validator, and a validator that quotes the value it refused
-    still shows it there: at least the ``[backup]`` and ``[dr]`` cloud-URL refusals and the
-    ``[api].trusted_proxies`` entry refusals do. None of those is meant to hold a secret, but a URL
+    still shows it there. :func:`settings_error_detail` keeps the list of those that do. None is
+    meant to hold a secret, but a URL
     can carry one, so a validator message must name the setting, never quote a secret value.
     """
     try:
@@ -6025,8 +6026,22 @@ class ApprovalsSettings(_Section):
 #: what the copy still costs is stated once, on ``MessageStore.snapshot_to``.
 _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 
-#: Cloud-URL schemes the destination must NEVER be (ADR 0049 — local/UNC only, no new egress surface).
-_CLOUD_DEST_SCHEMES = ("s3://", "gs://", "gcs://", "azure://", "http://", "https://", "ftp://")
+#: ``<scheme>://`` at the start of a value: a URL, which the backup and DR path settings never take
+#: (ADR 0049, local/UNC only, no new egress surface). Two characters at least, so a drive letter
+#: (``C://backups``) is still a path.
+_URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]+://")
+
+
+def _url_scheme(value: str) -> str | None:
+    """The ``<scheme>://`` that ``value`` starts with, or ``None``. Any scheme of two or more characters: these settings take
+    a LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or ``s3a://`` load as
+    a bogus local path (vault BACKLOG #2600).
+
+    A refusal quotes this and never the URL. A URL can carry a credential (``https://user:pw@``,
+    a signed query), and :func:`settings_error_detail` prints a validator's message as written:
+    to stderr, a service log, and since vault BACKLOG #2600 ``security show``'s JSON."""
+    match = _URL_SCHEME.match(value.strip().lower())
+    return match.group(0) if match else None
 
 
 class BackupSettings(_Section):
@@ -6046,7 +6061,7 @@ class BackupSettings(_Section):
     # Opt-in master switch; a deployment with no [backup] is unaffected (no-op default).
     enabled: bool = False
     # Operator-set LOCAL or UNC destination path, e.g. "D:/mefor-backups" or r"\\nas\mefor\backups".
-    # REQUIRED (non-empty) when enabled. A cloud URL (s3://, https://, ...) is REJECTED — no cloud target.
+    # REQUIRED (non-empty) when enabled. A <scheme>:// URL (s3://, https://, sftp://, ...) is REJECTED.
     destination: str = ""
     # Daily local "HH:MM" at which the scheduled backup runs (reusing the RetentionSettings clock parser).
     # "" = on-demand only (the `messagefoundry backup` CLI), no scheduled pass.
@@ -6110,12 +6125,12 @@ class BackupSettings(_Section):
     @field_validator("destination")
     @classmethod
     def _no_cloud_destination(cls, value: str) -> str:
-        # No cloud target / no new egress surface (ADR 0049, owner-locked). Reject a cloud-URL destination
+        # No cloud target / no new egress surface (ADR 0049, owner-locked). Reject a URL destination
         # at config load rather than silently treating it as a (bogus) local path at 02:00.
-        low = value.strip().lower()
-        if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
+        scheme = _url_scheme(value)
+        if scheme is not None:
             raise ValueError(
-                f"[backup].destination must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                f"[backup].destination must be a LOCAL or UNC path, not a URL ({scheme}...); "
                 "MessageFoundry DR backups have no cloud target (ADR 0049 — no new egress)"
             )
         return value
@@ -6194,12 +6209,12 @@ class DrSettings(_Section):
     takeover_timeout_seconds: float = 30.0
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
     # supplies the archive path in the POST /dr/activate request body instead (the runbook path),
-    # which needs seed_dir below. A cloud URL is rejected (the seed is local/UNC only, like the
+    # which needs seed_dir below. A URL is rejected (the seed is local/UNC only, like the
     # backup destination — no new egress).
     seed_archive: str = ""
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
-    # which is operator configuration and is not confined. Must be absolute. A cloud URL is
+    # which is operator configuration and is not confined. Must be absolute. A URL is
     # rejected, like seed_archive.
     seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
@@ -6209,7 +6224,7 @@ class DrSettings(_Section):
     # the #102 server-DB seed gate cross-checks it against the restored DB's OWN latest successful dr_backup
     # archive — a VINTAGE FLOOR a bare boolean attestation cannot give (a stale/wrong native restore's
     # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
-    # byte-unchanged and SQLite is a no-op. A cloud URL is rejected (local/UNC only, like seed_archive).
+    # byte-unchanged and SQLite is a no-op. A URL is rejected (local/UNC only, like seed_archive).
     restore_token: str = ""
 
     @field_validator("takeover_hook", "release_hook")
@@ -6233,10 +6248,10 @@ class DrSettings(_Section):
     @field_validator("seed_archive", "seed_dir")
     @classmethod
     def _no_cloud_seed(cls, value: str, info: ValidationInfo) -> str:
-        low = value.strip().lower()
-        if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
+        scheme = _url_scheme(value)
+        if scheme is not None:
             raise ValueError(
-                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a URL ({scheme}...); "
                 "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
             )
         return value
@@ -6250,18 +6265,20 @@ class DrSettings(_Section):
         # that will resolve it: a rooted path with no drive is relative on Windows.
         value = value.strip()
         if value and not os.path.isabs(value):
-            raise ValueError(f"[dr].seed_dir must be an absolute path, or omitted ({value!r})")
+            # The value is not quoted: a URL whose scheme _url_scheme missed could carry a
+            # credential (vault BACKLOG #2600).
+            raise ValueError("[dr].seed_dir must be an absolute path, or omitted")
         return value
 
     @field_validator("restore_token")
     @classmethod
     def _no_cloud_restore_token(cls, value: str) -> str:
         # The restore-token is a DBA-placed local artifact on the DR box (BACKLOG #223, ADR 0102); like
-        # seed_archive it is LOCAL/UNC only — a cloud URL would imply new egress, which DR forbids.
-        low = value.strip().lower()
-        if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
+        # seed_archive it is LOCAL/UNC only — a URL would imply new egress, which DR forbids.
+        scheme = _url_scheme(value)
+        if scheme is not None:
             raise ValueError(
-                f"[dr].restore_token must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                f"[dr].restore_token must be a LOCAL or UNC path, not a URL ({scheme}...); "
                 "the DR restore-token is a local artifact on the DR box (ADR 0102 — no new egress)"
             )
         return value
@@ -7085,9 +7102,24 @@ _SECRET_REFERENCE_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: Whether this platform's environment names ignore letter case. On Windows ``os.environ`` holds
+#: every name in upper case and ``os.environ.get`` finds one written in any case, so the ``env``
+#: secret provider resolves a reference spelled ``Mefor_Smtp_Password``. The spare for such a
+#: variable has to match the same way there, or it refuses a variable the provider would read.
+#: A module constant so a test on either platform can drive both arms.
+_ENV_NAMES_IGNORE_CASE = os.name == "nt"
+
+
+def _env_name_key(name: str) -> str:
+    """``name`` as the platform compares environment names: upper-cased on Windows, as written
+    elsewhere."""
+    return name.upper() if _ENV_NAMES_IGNORE_CASE else name
+
+
 def _env_secret_reference_names(data: Mapping[str, Any]) -> set[str]:
-    """The environment variables the settings in ``data`` name as secret references, or an empty
-    set unless ``[secrets].provider`` is exactly ``"env"``, the only provider that reads one."""
+    """The environment variables the settings in ``data`` name as secret references, each through
+    :func:`_env_name_key`, or an empty set unless ``[secrets].provider`` is exactly ``"env"``, the
+    only provider that reads one. Compare a variable's name to these through the same function."""
     secrets = data.get("secrets")
     if not isinstance(secrets, Mapping) or secrets.get("provider") != "env":
         return set()
@@ -7096,20 +7128,23 @@ def _env_secret_reference_names(data: Mapping[str, Any]) -> set[str]:
         values = data.get(section)
         value = values.get(key) if isinstance(values, Mapping) else None
         if isinstance(value, str):
-            names.add(value)
+            names.add(_env_name_key(value))
     return names
 
 
 def _near_env_name(section: str, key: str, model: type[BaseModel]) -> str | None:
-    """The variable an operator probably meant by ``MEFOR_<section>_<key>``, or ``None``.
+    """What an operator probably meant by ``MEFOR_<section>_<key>``, as the text after "did you
+    mean", or ``None``. Usually a variable name. For a list or dict key one string cannot fill
+    (:func:`_env_can_hold`), the ``[section].key`` to set in the file instead.
 
     Matched on the KEY part alone, as :func:`_near_field` matches a file key, so the shared
     ``MEFOR_<SECTION>_`` prefix cannot make two unrelated names look close.
 
-    No hint is given, rather than the next nearest name, when the closest key is one the
-    environment cannot set: a key that MOVED to ``[security]`` or was removed (the loader refuses
-    that spelling too), or a sub-table. Offering the runner-up there would name an unrelated
-    switch. A key that starts with a sub-table's name (``vip_enabled``) gets no hint either."""
+    No hint at all is given, rather than the next nearest name, when the closest key MOVED to
+    ``[security]`` or was removed (the loader refuses that spelling too), or is a sub-table.
+    Offering the runner-up there would name an unrelated switch. A key that starts with a
+    sub-table's name (``vip_enabled``) gets no hint either. The unread-variable note
+    (:func:`_unread_env_notes`) differs here: it names a near sub-table's file setting."""
     prefix = f"{_ENV_PREFIX}{section.upper()}_"
     fields = model.model_fields
     tables = {
@@ -7124,7 +7159,11 @@ def _near_env_name(section: str, key: str, model: type[BaseModel]) -> str | None
     near = difflib.get_close_matches(key, sorted({*fields, *gone, *spared}), n=1)
     if not near or near[0] in gone or near[0] in tables:
         return None
-    return f"{prefix}{near[0].upper()}"
+    if near[0] in fields and not _env_can_hold(model, near[0]):
+        # A list or dict with no one-string form (vault BACKLOG #2600): its variable would fail
+        # the load on its shape, so the hint names the file, as the unread-variable note does.
+        return f"[{section}].{near[0]}? It has no environment form; set it in the file"
+    return f"{prefix}{near[0].upper()}?"
 
 
 def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]) -> None:
@@ -7151,14 +7190,18 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     At least these names are spared:
 
     * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, a harness
-      variable, another tool's). So a typo in the SECTION part of a name is still dropped silently;
-    * one with no key part;
+      variable, another tool's). So a typo in the SECTION part of a name is not refused.
+      :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
+      for at least some of those, and the rest are dropped with no message;
+    * one with no key part, which gets the same note when it is a section's name;
     * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;
     * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message, and the
       renamed ``[logging]`` keys in :data:`_RENAMED_LOGGING_KEYS`, which the model refuses naming
       the replacement;
     * under ``[secrets].provider = "env"`` only, a variable that one of the
-      :data:`_SECRET_REFERENCE_KEYS` settings names as its value.
+      :data:`_SECRET_REFERENCE_KEYS` settings names as its value. The two names are compared as
+      the platform compares environment names (:func:`_env_name_key`): exactly, except on
+      Windows, where letter case is ignored.
 
     A relocated or removed key never reaches here: :func:`_reject_relocated_keys` runs first.
 
@@ -7167,10 +7210,7 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     no_env_layer = sorted(set(models) - set(_SECTIONS), key=len, reverse=True)
     referenced = _env_secret_reference_names(data)
     offenders: list[str] = []
-    for name in sorted(environ):
-        if not name.startswith(_ENV_PREFIX) or name in _OUT_OF_BAND_ENV or name in referenced:
-            continue
-        rest = name[len(_ENV_PREFIX) :].lower()
+    for name, rest in _unspared_env_names(environ, referenced):
         unread = next((s for s in no_env_layer if rest.startswith(f"{s}_")), None)
         if unread is not None:
             offenders.append(
@@ -7186,7 +7226,7 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
         if section == "logging" and key in _RENAMED_LOGGING_KEYS:
             continue
         near = _near_env_name(section, key, model)
-        offenders.append(_printable(name) + (f" (did you mean {near}?)" if near else ""))
+        offenders.append(_printable(name) + (f" (did you mean {near})" if near else ""))
     if offenders:
         raise ValueError(
             f"unrecognized environment variable(s): {', '.join(offenders)}. Each names a config "
@@ -7194,6 +7234,162 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
             "dropped one leaves the setting it was meant to apply silently un-applied. Check the "
             "spelling against docs/CONFIGURATION.md, or unset the variable."
         )
+
+
+def _unspared_env_names(
+    environ: Mapping[str, str], referenced: set[str]
+) -> Iterator[tuple[str, str]]:
+    """``(name, rest)`` for each ``MEFOR_*`` variable in ``environ`` that no spare covers, in name
+    order. ``rest`` is the name after the prefix, in lower case. ``referenced`` is
+    :func:`_env_secret_reference_names`. :func:`_reject_unknown_env_keys` and
+    :func:`_unread_env_notes` both read through this, so a spare added here covers both."""
+    for name in sorted(environ):
+        if (
+            name.startswith(_ENV_PREFIX)
+            and name not in _OUT_OF_BAND_ENV
+            and _env_name_key(name) not in referenced
+        ):
+            yield name, name[len(_ENV_PREFIX) :].lower()
+
+
+#: Pydantic error types that mean one string can never be the field's shape. At least these.
+_SHAPE_ERRORS = frozenset(
+    {
+        "list_type",
+        "dict_type",
+        "mapping_type",
+        "tuple_type",
+        "set_type",
+        "frozen_set_type",
+        "sequence_str",
+        "model_type",
+        "model_attributes_type",
+        "dataclass_type",
+        "dataclass_exact_type",
+        "is_instance_of",
+    }
+)
+
+
+@functools.cache
+def _env_can_hold(model: type[BaseModel], key: str) -> bool:
+    """Whether one string, all the env layer gives a field, can have ``model``'s ``key`` shape.
+
+    PROBED, not read off the annotation: a field's ``mode="before"`` validator decides, and some
+    split one comma-separated string into a list (``[alerts].email_to``) while other lists, and
+    every dict and sub-table, have no string form (``[approvals].operations``,
+    ``[cluster].vip``). A hint naming such a field would point at a variable that fails the load.
+    Only shape errors at ``key`` say no, and only when every error there is one: a union with one
+    string-shaped branch (``int | list[int]``) can hold one. A bad value or a cross-field check is
+    not about shape. Cached: the answer depends on the model and the key alone."""
+    try:
+        model.model_validate({key: "x"})
+    except ValidationError as exc:
+        at_key = [err["type"] for err in exc.errors() if err["loc"][:1] == (key,)]
+        return not (at_key and all(kind in _SHAPE_ERRORS for kind in at_key))
+    return True
+
+
+def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
+    """One note per ``MEFOR_*`` variable that :func:`_reject_unknown_env_keys` lets through and
+    that LOOKS like a setting nothing will read (vault BACKLOG #2600). Never quotes a value.
+
+    A WARNING and not a refusal, on purpose. A name the refusal passes names no section the
+    environment can set, and the engine cannot list every such name: harnesses, scripts and an
+    operator's own tooling use ``MEFOR_*`` names this module has never seen. A wrong guess here
+    costs a log line; a wrong refusal would stop the start.
+
+    At least two shapes are noted:
+
+    * the name is ``MEFOR_<SECTION>`` exactly, a modelled section and no key
+      (``MEFOR_UPDATE_CHECK=false``, ``MEFOR_STORE``). No setting has that name;
+    * the name splits as ``MEFOR_<NEAR>_<KEY>`` where ``NEAR`` is no section, is close to one, and
+      ``KEY`` is a real setting of that section or the rest of a :data:`_OUT_OF_BAND_ENV` name
+      (``MEFOR_STOER_PATH``). ``NEAR`` is compared only with sections of as many ``_``-parts as it
+      has. Without that, the test suite's own ``MEFOR_TEST_FORCE_AAD_BIND`` read ``TEST_FORCE`` as
+      close to ``store``, and ``aad_bind`` is a setting there. Requiring a real key keeps out at
+      least some other names that belong to other tools.
+
+    Everything else is still dropped with no message: at least a name close to no section, and a
+    name with a typo in BOTH parts. Closeness is :func:`difflib.get_close_matches` at its default
+    cutoff, as :func:`_near_field` uses it."""
+    models = _section_models()
+    referenced = _env_secret_reference_names(data)
+    by_parts: dict[int, list[str]] = {}
+    for section in sorted(models):
+        by_parts.setdefault(section.count("_") + 1, []).append(section)
+    gone = set(_RELOCATED_TO_SECURITY) | set(_REMOVED_KEYS)
+    notes: list[str] = []
+    for name, rest in _unspared_env_names(environ, referenced):
+        if rest in models:
+            # Say how to set one, so the obvious fix is not a name the refusal then stops.
+            how = (
+                f"a setting in it is {_ENV_PREFIX}{rest.upper()}_<KEY>"
+                if rest in _SECTIONS
+                else "that section has no environment layer; set it in the file"
+            )
+            notes.append(
+                f"{_printable(name)} names the [{rest}] section and no setting in it, so "
+                f"nothing reads it ({how})"
+            )
+            continue
+        tokens = rest.split("_")
+        for cut in range(1, len(tokens)):
+            near_part, key = "_".join(tokens[:cut]), "_".join(tokens[cut:])
+            if near_part in models:
+                # A real section with a key: the refusal above already judged this name.
+                break
+            near = difflib.get_close_matches(near_part, by_parts.get(cut, []), n=1)
+            if not near:
+                continue
+            meant = f"{_ENV_PREFIX}{near[0].upper()}_{key.upper()}"
+            field = models[near[0]].model_fields.get(key)
+            # A key that moved to [security] or was removed is refused in that spelling, as
+            # :func:`_near_env_name` knows, so it is no hint either.
+            is_field = field is not None and (near[0], key) not in gone
+            if near[0] in _SECTIONS and (
+                (is_field and _env_can_hold(models[near[0]], key)) or meant in _OUT_OF_BAND_ENV
+            ):
+                hint = f"{meant}?"
+            elif near[0] not in _SECTIONS and is_field:
+                hint = (
+                    f"[{near[0]}].{key}? That section has no environment layer; set it in the file"
+                )
+            elif is_field:
+                # A real setting one string cannot fill: still noted, with the file as the fix.
+                hint = f"[{near[0]}].{key}? It has no environment form; set it in the file"
+            else:
+                continue
+            notes.append(
+                f"{_printable(name)} names no config section, so nothing reads it "
+                f"(did you mean {hint})"
+            )
+            break
+    return notes
+
+
+def _unread_env_lines(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
+    """:func:`_unread_env_notes` as the WARNING lines :func:`load_settings` logs."""
+    return [
+        f"environment variable {note}. It is NOT applied."
+        for note in _unread_env_notes(environ, data)
+    ]
+
+
+def unread_env_warnings(
+    settings: ServiceSettings, environ: Mapping[str, str] | None = None
+) -> list[str]:
+    """The unread-variable WARNING lines :func:`load_settings` logged for ``settings``, again.
+
+    For ``serve``: it loads its settings before ``configure_logging`` runs, so those lines reached
+    bare stderr only, never the log file or the off-box forwarder. It logs these once logging is
+    configured, as it does the other pre-logging warnings (BACKLOG #1989). The secret-reference
+    spare is read from ``settings``, which holds what ``data`` held at load."""
+    environ = os.environ if environ is None else environ
+    data: dict[str, dict[str, Any]] = {"secrets": {"provider": settings.secrets.provider}}
+    for section, key in _SECRET_REFERENCE_KEYS:
+        data.setdefault(section, {})[key] = getattr(getattr(settings, section), key)
+    return _unread_env_lines(environ, data)
 
 
 # --- ADR 0118: the [security] section desugars into the internal fields it replaces ----------------
@@ -7592,6 +7788,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       directory call may hold a worker thread, so a value above its default is looser, named while
       AD is on. They are timeouts and not rate limits; they sit here because they are read the same
       way, against the shipped default.
+    * ``step_up_max_age_seconds``, ``totp_skew_steps`` and ``initial_password_expiry_hours`` (vault
+      BACKLOG #2600 step 4) are read the same way too. A step-up window or a temporary-password
+      life above its default is looser, and so is any TOTP skew above the strict 0. A
+      temporary-password life of 0 or less means no expiry, and is named as off. None is gated on
+      another setting. The last two entries quote no configured value.
 
     ``[approvals].min_dwell_seconds``, the dual-control approval floor, is another time floor of the
     same kind. It lives in its own section, so :func:`_approvals_loosenings` names it, read the same
@@ -7977,6 +8178,64 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                         "sign-in shares for longer",
                     )
                 )
+
+    # --- the three numeric [auth] knobs vault BACKLOG #2600 step 4 names. None is a rate limit;
+    # they sit here because each is read the same way, against the shipped default. None is gated:
+    # sign-in is always on, a local account may hold a TOTP factor whatever require_mfa says, and
+    # an administrator may issue a temporary password on any instance.
+
+    # has_recent_step_up passes a session that re-verified within this many seconds, and
+    # _grant_action_step_up ends an action-bound grant this long after it is minted. Longer is looser.
+    # 0 or less passes no session and ends every grant at once, which is stricter: not named. The
+    # check reads the wall clock, so a backward clock step can pass a session briefly even at 0.
+    window, default_window = auth.step_up_max_age_seconds, _auth_default("step_up_max_age_seconds")
+    if window > default_window:
+        out.append(
+            (
+                "step_up_max_age_seconds",
+                f"the step-up window is {window} s, longer than the default of {default_window} s, "
+                "so a session that re-verified its credential (a local sign-in can count) may run "
+                "sensitive operations for longer before it is asked again, and an action-bound "
+                "proof that was minted and not used stays usable for as long",
+            )
+        )
+
+    # verify_totp_step accepts the current 30 s step alone at 0, and the load refuses anything
+    # outside 0..2, so any value above the default widens the window in which a captured code is
+    # accepted. The entry quotes no configured value: totp_* and *password* are names the
+    # clear-text-logging query reads as secret sources (ADR 0034's 2026-10-03 amendment), so each
+    # value below only picks a literal.
+    if auth.totp_skew_steps > _auth_default("totp_skew_steps"):
+        out.append(
+            (
+                "totp_skew_steps",
+                "a TOTP code is accepted outside its own 30 s step (the default accepts the "
+                "current step only), so a code captured in transit stays usable for at least one "
+                "more step than the default allows",
+            )
+        )
+
+    # initial_credential_deadline returns no deadline at 0 or less, so a temporary password an
+    # administrator issued never expires and its reminder never runs. A longer life is looser too.
+    expiry_field = "initial_password_expiry_hours"
+    if auth.initial_password_expiry_hours <= 0:
+        out.append(
+            (
+                expiry_field,
+                "a temporary password an administrator issued NEVER expires, so an unclaimed one "
+                "admits whoever learns it for as long as the account exists, and what it permits "
+                "includes setting the account's password. No reminder about it is sent either",
+            )
+        )
+    elif auth.initial_password_expiry_hours > _auth_default(expiry_field):
+        out.append(
+            (
+                expiry_field,
+                "a temporary password an administrator issued lasts longer than the default of "
+                f"{_auth_default(expiry_field)} hours, so an unclaimed one admits whoever learns "
+                "it for longer, and what it permits includes setting the account's password",
+            )
+        )
     return out
 
 
@@ -8215,8 +8474,8 @@ def security_loosenings(
     bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
     BACKLOG #2600), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache
-    and AD timeout
+    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache,
+    AD timeout, step-up window, TOTP skew and temporary-password life
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
     (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
@@ -8250,15 +8509,10 @@ def security_loosenings(
     ``ad_allow_insecure_ldap``, because its entry needs a live ``ldap://`` bind that the floor's
     lone flip never builds; its own tests pin it.
 
-    **``[auth].initial_password_expiry_hours`` is also unreported, and BACKLOG #1245 made it
-    load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
-    It is not a ``[security]`` field, so the completeness floor (which iterates
-    ``SecuritySettings.model_fields``) never covered it and its absence is not a floor-test gap. What
-    matters is the consequence: it is the ONLY bound on an admin-issued temporary password, so
-    setting it to 0 unbounds every such credential, and nothing in this registry says so. Reporting it
-    needs a new REQUIRED parameter (every one here is required by design, so an optional detector
-    cannot be added quietly), which is a larger change than the item that exposed it — filed as
-    content rather than folded in.
+    **``[auth].initial_password_expiry_hours`` is reported since vault BACKLOG #2600 step 4.**
+    BACKLOG #1245 made it load-bearing: it is the ONLY bound on an admin-issued temporary password,
+    so 0 unbounds every such credential. :func:`_auth_limit_loosenings` names it at 0 or less and
+    above its default. This paragraph once recorded it as unreported.
 
     **One entry is read from the process environment and from no argument:**
     ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (vault BACKLOG #2599), named while
@@ -8279,9 +8533,8 @@ def security_loosenings(
     warning says so: ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` at ``0`` or
     below their defaults, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
     transport (:func:`_reminder_loosenings`). Not every way is named.
-    ``[auth].initial_password_expiry_hours = 0`` also stops a reminder and is unreported. The
-    paragraph above gives the reason as a new required parameter, and that premise no longer
-    holds: ``auth`` is already a parameter here, so naming it is one more arm, owed and not built.
+    ``[auth].initial_password_expiry_hours = 0`` also stops a reminder, and its entry says so
+    (vault BACKLOG #2600 step 4).
     ``[alerts].security_notifications_required = false`` with no recipient sends every reminder to
     the log alone; serve audits that waiver, and this registry does not list it.
 
@@ -8992,10 +9245,11 @@ def settings_error_detail(exc: Exception) -> str:
     reads the environment.
 
     THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
-    refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``
-    cloud-URL refusals and the ``[api].trusted_proxies`` entry refusals do. None of them is meant to
-    hold a secret, but a URL can carry one, so a validator message must name the setting and never
-    quote a secret value. The OIDC URL refusals quote no part of the URL for that reason.
+    refused still shows it, here and in ``str(exc)``: at least the ``[api].trusted_proxies`` entry
+    refusals do, and several path and enum refusals. A URL can carry a credential, so a validator
+    message must name the setting and never quote a secret value. The OIDC URL refusals quote no
+    part of the URL for that reason, and since vault BACKLOG #2600 the ``[backup]`` and ``[dr]``
+    URL refusals quote only the scheme (:func:`_url_scheme`).
 
     THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
     is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is
@@ -9056,6 +9310,13 @@ def load_settings(
     # ADR 0118: the [security] section is the canonical home for the posture switches. Reject the legacy
     # keys in their old sections (file+env), then desugar [security] into the internal fields it replaces
     # — BEFORE the CLI merge, so a --host/--db override still wins over a [security] value.
+    #
+    # First, what the env refusal below lets through and still looks like a setting nothing will
+    # read (vault BACKLOG #2600): a warning, because the engine cannot know every MEFOR_* name
+    # another tool owns. Names only, no value. Logged before every refusal here, so a refused key
+    # does not hide a mistyped variable until the next start.
+    for line in _unread_env_lines(environ, data):
+        _log.warning("%s", line)
     _reject_relocated_keys(data)
     # After _reject_relocated_keys so a MOVED key keeps its specific "moved to [security].X" message, and
     # over `file_data` rather than `data` so it never sees a key the env overlay or the desugar wrote.

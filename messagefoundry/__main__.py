@@ -50,7 +50,7 @@ import json  # noqa: E402
 import logging  # noqa: E402
 import sqlite3  # noqa: E402  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys  # noqa: E402
-import tomllib  # noqa: E402  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
+import tomllib  # noqa: E402  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name)
 from collections.abc import Awaitable, Callable, Mapping, Sequence  # noqa: E402
 from pathlib import (  # noqa: E402
     Path,
@@ -2697,6 +2697,13 @@ def _serve(args: argparse.Namespace) -> int:
     # the gate ran above and logged again here, so they reach the handlers and forwarder
     # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
     _log_static_credential_outcome(sc_outcome)
+    # Vault BACKLOG #2600: the unread-variable warnings load_settings logged before logging was
+    # configured, so to bare stderr only. Logged again here, under the settings logger they came
+    # from, for the same reason. (_start_logging above re-logs the #2375 gate notes.)
+    from messagefoundry.config.settings import unread_env_warnings
+
+    for _env_line in unread_env_warnings(settings):
+        logging.getLogger("messagefoundry.config.settings").warning("%s", _env_line)
 
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and
@@ -9874,7 +9881,6 @@ def _security(args: argparse.Namespace) -> int:
         SecretRotationSettings,
         SecuritySettings,
         StoreSettings,
-        load_settings,
         security_loosenings,
     )
 
@@ -9886,7 +9892,11 @@ def _security(args: argparse.Namespace) -> int:
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
     # reporting a subset as if it were everything.
-    _loosenings_partial = False
+    # None unless the file exists and will not load. Then: WHY (vault BACKLOG #2600). A stray
+    # MEFOR_<SECTION>_<KEY> variable in this shell refuses the load, and a bare `true` sent the
+    # reader to a file that was fine. Rendered by settings_error_detail, which hides the refused
+    # input but prints each validator's message; its docstring says which messages quote a value.
+    _loosenings_partial_reason: str | None = None
     _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
     # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
     # resolved from the same whole-file read and degrades with the same `loosenings_partial` marker.
@@ -9904,20 +9914,16 @@ def _security(args: argparse.Namespace) -> int:
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
         # exists and will not resolve is partial.
-        try:
-            _full = load_settings(config_path=path)
+        # The shared load: its catch is the specific ways a settings file fails to resolve, and
+        # anything else is a programming error that surfaces.
+        _full, _loosenings_partial_reason = _load_service_settings(path)
+        if _full is not None:
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
             _rotation = _full.secret_rotation
             _api = _full.api
             _approvals = _full.approvals
             _cert_monitor = _full.cert_monitor
             _backup = _full.backup
-        except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
-            # The specific ways a settings file fails to resolve: a schema/cross-field violation,
-            # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
-            # bad env/section. Anything else is a programming error and must surface, not be degraded
-            # into a boolean.
-            _loosenings_partial = True
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
@@ -9973,7 +9979,9 @@ def _security(args: argparse.Namespace) -> int:
     #: environment variable, and security_loosenings() reads it from the process that calls it. Here
     #: that is the operator's shell, not the service.
     _loosenings_scope = {
-        "loosenings_partial": _loosenings_partial,
+        "loosenings_partial": _loosenings_partial_reason is not None,
+        # None unless the report is partial. Then: why the whole-file load failed.
+        "loosenings_partial_reason": _loosenings_partial_reason,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
             "[cert_monitor]/[backup]); the "

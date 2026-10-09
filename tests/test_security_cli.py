@@ -282,6 +282,72 @@ def test_show_declares_a_partial_report_when_the_file_will_not_load(
     assert data["loosenings_partial"] is True
     # ...and it still prints a usable [security] view rather than failing the subcommand.
     assert data["values"]["require_mfa"] is True
+    # ...and it says WHY (vault BACKLOG #2600), naming the setting that refused.
+    assert "ad_session_recheck_seconds" in data["loosenings_partial_reason"]
+
+
+def test_show_gives_no_partial_reason_when_the_file_loads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the reason: a report that is not partial carries none."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[auth]\nlockout_minutes = 15\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False
+    assert data["loosenings_partial_reason"] is None
+
+
+@pytest.mark.parametrize("scheme", ["https", "sftp", "s3a"])
+@pytest.mark.parametrize(
+    ("table", "key"),
+    [
+        ("backup", "destination"),
+        ("dr", "seed_archive"),
+        ("dr", "seed_dir"),
+        ("dr", "restore_token"),
+    ],
+)
+def test_a_cloud_url_refusal_in_the_partial_reason_quotes_the_scheme_only(
+    table: str, key: str, scheme: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A URL can carry a credential, and the reason prints each validator's message. The cloud-URL
+    refusals take any scheme of two or more characters, quote it, and never quote the URL (vault BACKLOG #2600)."""
+    planted = "canary-canary-canary"
+    toml = tmp_path / "mf.toml"
+    toml.write_text(
+        f'[{table}]\n{key} = "{scheme}://svc:{planted}@blob.example/x?sig=SYNTHTOKEN"\n',
+        encoding="utf-8",
+    )
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is True
+    reason = data["loosenings_partial_reason"]
+    assert f"{table}.{key}" in reason and f"not a URL ({scheme}://...)" in reason
+    assert planted not in json.dumps(data) and "SYNTHTOKEN" not in json.dumps(data)
+
+
+@pytest.mark.parametrize("path", ["D:/mefor-backups", "C://mefor-backups", r"\\\\nas\\share\\x"])
+def test_a_local_or_unc_path_is_not_read_as_a_url(path: str) -> None:
+    """The control: a drive letter is one character, so ``C://`` is a path, and a UNC path has
+    no scheme."""
+    from messagefoundry.config.settings import BackupSettings
+
+    assert BackupSettings(destination=path).destination == path
+
+
+def test_show_names_the_stray_variable_that_made_the_report_partial(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mistyped ``MEFOR_<SECTION>_<KEY>`` in the shell refuses the whole-file load, so the report
+    falls back to shipped defaults. The marker alone sent the reader to a file that was fine. The
+    reason names the variable and never its value."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[auth]\nlockout_minutes = 15\n", encoding="utf-8")
+    monkeypatch.setenv("MEFOR_STORE_REQUIRE_ENCRYPTON", "SYNTHETIC-VALUE-9f3c")
+    out_data = _show(toml, capsys)
+    assert out_data["loosenings_partial"] is True
+    reason = out_data["loosenings_partial_reason"]
+    assert "MEFOR_STORE_REQUIRE_ENCRYPTON" in reason
+    assert "SYNTHETIC-VALUE-9f3c" not in json.dumps(out_data)
 
 
 # --- operator JSON that nests past the decoder (BACKLOG #1855) --------------------------------
