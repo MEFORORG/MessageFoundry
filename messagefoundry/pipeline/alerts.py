@@ -183,6 +183,17 @@ class AlertSink(Protocol):
         the existing per-connection stop machinery still sees the stop and names its cause."""
         ...
 
+    def log_forward_failed(self, name: str, *, reason: str, count: int = 0) -> None:
+        """The **off-box log forwarder** is absent, losing records or not sending (BACKLOG #2612).
+        ``name`` is ``forwarder:<kind>``, with ``@node:<node_id>`` or ``@shard:<id>`` appended where
+        several engine processes share the store, so each kind on each process is its own alert.
+        ``reason`` is fixed words naming the cause, and every kind sends a ``count``.
+        The kinds, and when each fires: ``pipeline/log_forward_watch.py``, which emits this.
+
+        Counts, fixed words and this process's own label only: never a record, the collector's
+        host name or an exception text."""
+        ...
+
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
         """An outbound connection's delivery lane went **down** — the first transport failure
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
@@ -698,6 +709,11 @@ class LoggingAlertSink:
             reason,
             "" if stopped is None else f"; {stopped} connection(s) stopped",
         )
+
+    def log_forward_failed(self, name: str, *, reason: str, count: int = 0) -> None:
+        # This default sink LOGS, and stdout still works when the forwarder does not. The line
+        # also goes to the forwarder it is about, where it may be the next record lost.
+        log.warning("ALERT log_forward_failed: %s (%s; count %d)", name, reason, count)
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         log.warning(

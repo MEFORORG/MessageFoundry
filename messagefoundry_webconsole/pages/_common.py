@@ -23,6 +23,8 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from urllib.parse import quote, urlencode
 
+from messagefoundry.api.models import LogForwarderInfo
+
 from .._html import Markup, el, text
 
 
@@ -153,6 +155,41 @@ def _window_note(shown: int, limit: int, noun: str, *, total: int) -> Markup:
     count, capped = f"{shown} of {total} {noun}", total > shown and shown >= limit
     bound = f", capped at the newest {limit}" if capped else ""
     return el("p", f"{count} shown{bound}.", class_="muted")
+
+
+#: What the console says of a UDP forwarder. No failed send is counted over UDP, so the engine cannot see
+#: a record lost on the wire, and the console must not call such a forwarder healthy.
+_UDP_UNCONFIRMED = "delivery is not confirmed over UDP"
+
+
+def _log_forwarder_reason(forwarder: LogForwarderInfo | None) -> str | None:
+    """The sentence for an off-box log forwarder that is absent or degraded, or ``None`` when
+    there is nothing to say (BACKLOG #2612). Shared by the nav heart and the status page, for the
+    reason :func:`_failed_inbound_reason` gives. Counts and fixed words only.
+
+    ``unconfirmed`` is ``None`` too: UDP is the default protocol, and a warning that never clears
+    would teach operators to ignore the indicator. :func:`_log_forwarder_text` says it in words."""
+    if forwarder is None or forwarder.state in ("healthy", "unconfirmed"):
+        return None
+    if not forwarder.installed:
+        why = f" ({forwarder.start_failure} failure at start)" if forwarder.start_failure else ""
+        return f"off-box log forwarding is not running{why}"
+    parts = []
+    if forwarder.lost:
+        parts.append(f"{forwarder.lost} record(s) lost since start")
+    if forwarder.send_failing:
+        parts.append("the collector is not answering")
+    if forwarder.spool_read_faulted:
+        parts.append("the on-disk spool cannot be read")
+    if not forwarder.delivery_confirmed:
+        parts.append(_UDP_UNCONFIRMED)
+    return "off-box log forwarding is degraded: " + "; ".join(parts)
+
+
+def _log_forwarder_text(forwarder: LogForwarderInfo) -> str:
+    """The status row's words for a forwarder :func:`_log_forwarder_reason` has nothing to say
+    about: ``healthy`` only where a failed send would have been seen."""
+    return "healthy" if forwarder.delivery_confirmed else f"running; {_UDP_UNCONFIRMED}"
 
 
 # At most this many failed inbounds are named in the heart's reason; the rest become "and N more".

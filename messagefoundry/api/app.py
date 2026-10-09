@@ -156,6 +156,7 @@ from messagefoundry.api.models import (
     Health,
     IntegrityResult,
     InterpreterView,
+    LogForwarderInfo,
     LogInfo,
     LogLevelInfo,
     LogLevelUpdate,
@@ -374,6 +375,7 @@ from messagefoundry.logging_setup import (
     LOG_LEVELS,
     LogLevelRefused,
     current_log_level,
+    forwarder_status,
     level_refused_on_production,
     set_runtime_level,
 )
@@ -695,6 +697,30 @@ def _log_sink_health() -> list[LogSinkInfo]:
         )
         for status in guard.status()
     ]
+
+
+def _log_forwarder_health() -> LogForwarderInfo | None:
+    """The off-box log forwarder's health for ``GET /status`` (BACKLOG #2612), or ``None`` when no
+    forwarder is configured. In-memory only, like :func:`_log_sink_health`."""
+    status = forwarder_status()
+    if not status.configured:
+        return None
+    return LogForwarderInfo(
+        state=status.state,
+        installed=status.installed,
+        delivery_confirmed=status.delivery_confirmed,
+        start_failure=status.start_failure or None,
+        send_failing=status.send_failing,
+        lost=status.lost,
+        queued=status.queued,
+        queue_dropped=status.queue_dropped,
+        unsent=status.unsent,
+        undeliverable=status.undeliverable,
+        spool_dropped=status.spool_dropped,
+        spool_skipped=status.spool_skipped,
+        spool_read_errors=status.spool_read_errors,
+        spool_read_faulted=status.spool_read_faulted,
+    )
 
 
 def _read_log_tail(
@@ -7742,6 +7768,7 @@ def create_app(
             ),
             logs=logs,
             log_sinks=_log_sink_health(),
+            log_forwarder=_log_forwarder_health(),
             update=update,
             pool=pool,
             claim_proc=claim_proc,

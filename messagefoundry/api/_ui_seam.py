@@ -376,12 +376,17 @@ from typing import Any
 #: an older console omits ``request``, and a newer console passes it to an engine that lacks it.
 #: Re-derived on the tree merged with BACKLOG #2337; this item leaves the value below unchanged.
 #:
+#: BACKLOG #2612: ``SystemStatus`` gained ``log_forwarder``, a ``LogForwarderInfo`` the console's
+#: status page and health indicator render. A DTO the console reads by attribute, so it forces a
+#: bump. Re-derived on the tree merged with BACKLOG #2337, and again on the tree merged with vault
+#: BACKLOG #3259 / #3260, which did not move it. The value below covers all three.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "c33aaea0b560775f"
+ENGINE_UI_SEAM: str = "d55bee827180c1c2"
 
 
 @dataclass(frozen=True, slots=True)
