@@ -401,8 +401,10 @@ in-flight rows stranded.
 >
 > **A release is complete once its `dr.release` row is written.** The engine turns the profile
 > off and returns with no await in between, and the coordinator records the hand-back. Closing
-> the parked outbounds' connectors comes after the row, as cleanup. A cancellation or an error
-> there no longer leaves the engine passive beside a coordinator that reports the box active.
+> the parked outbounds' connectors comes after the attempt to write the row, as cleanup, and runs
+> whether or not the write lands, so a released box holds no partner session even when the audit
+> store refuses the row. The release then still answers with the refusal, and the row stays
+> owed. A cancellation or an error in the close there no longer leaves the engine passive beside a coordinator that reports the box active.
 > A retried release runs the cleanup again, and so does the next reload.
 >
 > **An activation under a log halt still judges each lane's DR marker.** The halt keeps the lane

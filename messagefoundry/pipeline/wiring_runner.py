@@ -3131,6 +3131,12 @@ class RegistryRunner:
             self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
             if not self._outbound_start_permitted(name):
+                if name in self._dr_unbuilt:
+                    # Never built since it left the DR park, so the park stays the engine's, as
+                    # a failed build leaves it (_start_outbound_unsafe). The stop made it an
+                    # operator pause, which the reload that builds it would not lift (vault
+                    # BACKLOG #3263).
+                    self._gate_parked.add(name)
                 return
             await self._start_outbound_unsafe(name)
 

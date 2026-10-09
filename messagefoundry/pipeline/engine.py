@@ -1003,15 +1003,17 @@ class Engine:
             rr.restore_dr_intake(before)
             raise
         # No await from here to the return, so nothing can cut in between the latch going off
-        # and the coordinator recording the hand-back. The connectors are closed after that row
-        # is written (:meth:`_dr_release_cleanup`): a cancellation in the close used to leave the
-        # engine passive beside a coordinator that stayed active (vault BACKLOG #3263).
+        # and the coordinator recording the hand-back. The coordinator closes the connectors after
+        # it tries to write that row, whether or not the write lands (:meth:`_dr_release_cleanup`):
+        # a cancellation in the close used to leave the engine passive beside a coordinator that
+        # stayed active (vault BACKLOG #3263).
         self._set_dr_active(False)
         return {"depth_left": depth, "drained": depth <= held, "held_on_parked_outbounds": held}
 
     async def _dr_release_cleanup(self) -> None:
-        """What a completed release still owes, run by the DR coordinator once its ``dr.release``
-        row is written: close the connector of each parked outbound, so the released box holds
+        """What a completed release still owes, run by the DR coordinator after it tries to write
+        the ``dr.release`` row, whether or not that write lands: close the connector of each
+        parked outbound, so the released box holds
         no session open to a partner the primary must reach (vault BACKLOG #3262). A no-op once
         the box is active again."""
         rr = self._registry_runner

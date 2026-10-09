@@ -176,8 +176,9 @@ class DrCoordinator:
         self._provenance = profile_provenance
         self._deactivate_profile = deactivate_profile
         # Cleanup a completed hand-back still owes, such as closing the parked outbounds' sessions.
-        # Awaited once the dr.release row is written, so nothing it does can fail the release or
-        # leave it half recorded (vault BACKLOG #3263).
+        # Awaited once the box has handed back, after the attempt to write the dr.release row,
+        # whether or not that write lands. Its errors are logged, so nothing it does can fail the
+        # release or leave it half recorded (vault BACKLOG #3263).
         self._after_release = after_release
         # Awaited per activation, so building the coordinator reads no file (vault BACKLOG #2839).
         self._config_fingerprint_provider = config_fingerprint_provider

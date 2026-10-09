@@ -736,6 +736,11 @@ async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isol
         held = runner.outbound_failed(_OB_CA) or ""
         assert "passive start" in held and "POST /dr/activate needs it" not in held
         assert not runner.outbound_dr_failed(_OB_CA)
+        # An alert rule's restart reaches it now, and the halt refuses the start half. Red when
+        # the stop half left the park an operator pause: the reload below then built the lane
+        # and left it paused, and the failed lane never paged.
+        await runner.restart_outbound(_OB_CA)
+        assert _OB_CA in runner._gate_parked
 
         guard.writable = True  # the disk is repaired
         await runner.reload()  # raised WiringError before
