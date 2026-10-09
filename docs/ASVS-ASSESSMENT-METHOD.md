@@ -162,8 +162,8 @@ At least these do not count:
 - a code comment;
 - a bare option name;
 - an error message, because a reader reaches it only by breaking the rule;
-- text that a default installation does not expose. Rule 4 grades the shipped default, and rule 5
-  covers what ships off.
+- text the product shows only after an operator turns on something that ships off. Rule 5 covers
+  what ships off.
 
 **Which lines are the owner's own words.** The owner ruled on the docstring and the code comment in
 these words: *"No, neither counts"*. The help-text line is a reading that adversarial review reached,
@@ -184,16 +184,16 @@ draw it. The line is narrower than the passage, which also accepts a decision ke
   evidence that a control exists: code and tests remain evidence (§3).
 - It names which text may be counted. Rules 1 to 6 still grade the cell, and the ruling does not say
   which verdict follows when no text counts.
-- Rule 3 asks whether the thing exists in any configuration, and rule 5 grades what ships off as
-  `partial`. Where the only text is text a default installation does not expose, those two rules
-  can point at different verdicts. The ruling does not pick one.
+- Some text exists but ships off, so it does not count. Rule 3 asks whether the thing exists in any
+  configuration, and rule 5 grades what ships off. The ruling does not say which of them such a
+  cell lands on. Two assessors who disagree on it follow rule 6.
 - Some text is two things at once, such as a docstring that a command prints as its help. The
   ruling does not address that case. Two assessors who disagree on it follow rule 6.
 - Whether a page that counts is accurate is still the assessor's to check against the code.
 
 The ruling was given in session on 2026-10-08, after adversarial review. It is recorded on a pull
-request in the `MessageFoundry-vault` repository, and a rulings file there is pending. As in §1.1a, this document records the rule and not the cells it
-moves.
+request in the `MessageFoundry-vault` repository, and a rulings file there is pending. As in
+§1.1a, this document records the rule and not the cells it moves.
 
 ### 1.2 Worked examples — the ones that actually broke
 
@@ -522,7 +522,8 @@ page's `Verdict bases` line counts `verified_at` values as the trees the verdict
 the tools into line is unfiled work.
 
 The ruling was given in session on 2026-10-08, after adversarial review. It is recorded on a pull
-request in the `MessageFoundry-vault` repository, and a rulings file there is pending. As in §1.1a, this document names no cell the ruling touches.
+request in the `MessageFoundry-vault` repository, and a rulings file there is pending. As in
+§1.1a, this document names no cell the ruling touches.
 
 ---
 
