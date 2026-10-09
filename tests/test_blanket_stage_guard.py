@@ -554,14 +554,6 @@ BLANKET_AND_SCOPED_CONTROL = [
     ("Bash", "git commit . -m wip", "git commit .gitignore -m wip"),
     ("Bash", "git commit --amend --no-edit .", "git commit --amend --no-edit"),
     ("PowerShell", "git -c user.name=x commit -m wip .", "git -c user.name=x commit -m wip a.py"),
-    # ... and after a message that spans lines, which the first view splits inside the quotes
-    ("Bash", 'git commit -m "subject\n\nbody" .', 'git commit -m "subject\n\nbody ." a.py'),
-    ("PowerShell", "git commit -m 'subject\nbody' -a", "git commit -m 'subject\nbody -a' a.py"),
-    (
-        "Bash",
-        "git commit -m \"$(cat <<'EOF'\nsubject\nEOF\n)\" .",
-        "git commit -m \"$(cat <<'EOF'\nsubject .\nEOF\n)\" a.py",
-    ),
     # the dot FAMILY: every path built only from single dots and separators is the current directory
     ("Bash", "git add ./.", "git add ./.gitignore"),
     ("Bash", "git add ././", "git add ./sub/"),
@@ -577,25 +569,6 @@ BLANKET_AND_SCOPED_CONTROL = [
     ("Bash", "git add .>/dev/null", "git add .gitignore>/dev/null"),
     ("Bash", "git add -A>/dev/null", "git add a.py>/dev/null"),
     ("Bash", "git commit -m wip -a>/dev/null", "git commit -m wip a.py>/dev/null"),
-    # grouping and substitution: the stage runs, and git is not at the front of a separator segment
-    ("Bash", "(git add -A)", "(git add a.py)"),
-    ("Bash", "( git add -A )", "( git add a.py )"),
-    ("Bash", "{ git add -A; }", "{ git add a.py; }"),
-    ("Bash", "echo $(git add -A)", "echo $(git add a.py)"),
-    ("Bash", f"echo {_BT}git add -A{_BT}", f"echo {_BT}git add a.py{_BT}"),
-    ("Bash", "(git commit -m wip -a)", "(git commit -m wip a.py)"),
-    ("Bash", "f() { git add -A; }; f", "f() { git add a.py; }; f"),
-    ("Bash", "(git add ${x} -A)", "(git add ${x} a.py)"),
-    ("PowerShell", "(git add -A)", "(git add a.py)"),
-    ("PowerShell", "$(git add -A)", "$(git add a.py)"),
-    ("PowerShell", "& { git add -A }", "& { git add a.py }"),
-    ("PowerShell", "if ($true) { git add -A }", "if ($true) { git add a.py }"),
-    ("PowerShell", "if ($true) {git add .}", "if ($true) {git add .gitignore}"),
-    (
-        "PowerShell",
-        "1..1 | ForEach-Object { git add -A }",
-        "1..1 | ForEach-Object { git add a.py }",
-    ),
     # a line continuation: one command to the shell, two lines to the old splitter
     ("Bash", f"git add {_BS}\n-A", f"git add {_BS}\n  a.py"),
     ("Bash", f"git {_BS}\nadd -A", f"git {_BS}\nadd a.py"),
@@ -609,8 +582,6 @@ BLANKET_AND_SCOPED_CONTROL = [
     ("PowerShell", f"git add {_BT}\n-A", f"git add {_BT}\n  a.py"),
     ("PowerShell", f"git {_BT}\nadd -A", f"git {_BT}\nadd a.py"),
     ("PowerShell", f"git commit {_BT}\n-am wip", f"git commit {_BT}\n-m wip a.py"),
-    # a bash here-string is not a heredoc, and used to blank every line after it
-    ("Bash", "cat <<<x\ngit add -A", "cat <<<x\ngit add a.py"),
 ]
 
 # WHAT A BUILDER TYPES ALL DAY, PINNED AS ALLOW. A false deny on this guard is a defect: it is the
@@ -632,6 +603,12 @@ MUST_STAY_ALLOWED = [
     # ... and it reads only what FOLLOWS the word `commit`
     ("Bash", "git -C . commit -m wip a.py"),
     ("Bash", "git --work-tree . commit -m wip a.py"),
+    # ... and not a trailing comment, nor a dot that belongs to a nested command
+    ("Bash", "git commit -m wip a.py  # only a.py, not ."),
+    ("Bash", "git commit -m 'fix' a.py # see ./"),
+    ("Bash", "git push origin HEAD # commit ."),
+    ("Bash", "git commit -m wip -- $(git ls-files -m . | head -3)"),
+    ("PowerShell", "git commit -m wip (Join-Path . a.py)"),
     # ... and a quote beside `./` starts a quoted file name, it does not end the pathspec
     ("Bash", 'git commit -m wip ./"$f"'),
     ("Bash", "git commit -m wip -- $(git diff --cached --name-only -- .)"),
@@ -642,7 +619,7 @@ MUST_STAY_ALLOWED = [
     ("Bash", "git add .github/workflows/ci.yml"),
     ("PowerShell", f"git add .{_BS}a.py"),
     # A RUN OF SLASHES MUST NOT HANG THE HOOK. A nested quantifier in the dot family backtracked
-    # exponentially here; the subprocess timeout in run_guard is what makes this row able to fail.
+    # exponentially here. `test_a_run_of_slashes_does_not_hang_the_hook` holds the time bound.
     ("Bash", "git add ." + "/" * 40 + "x"),
     # `commit` as a whole TOKEN only: a ref that contains the word is not the subcommand
     ("Bash", "git checkout fix-commit -- a.py"),
@@ -655,7 +632,7 @@ MUST_STAY_ALLOWED = [
     ("Bash", 'gh pr create --title t --body "do not run git add -A or git commit -m wip ."'),
     ("PowerShell", "gh pr create --body 'git add -A; git commit -m wip .'"),
     ("Bash", "git commit -m 'fix (git add -A) note' a.py"),
-    # a COMMENT that names them, in brackets or backticks: an opener in a comment starts nothing
+    # a COMMENT that names them, in brackets or backticks
     ("Bash", f"# Do not run {_BT}git commit -a{_BT} here\ngit commit -m wip a.py"),
     ("PowerShell", f"# Do not run {_BT}git commit -a{_BT} here\ngit commit -m wip a.py"),
     ("Bash", "# stage explicit paths (git add -A is blocked)\ngit add a.py"),
@@ -663,7 +640,18 @@ MUST_STAY_ALLOWED = [
     ("Bash", "ls  # (git stage -A is blocked by the guard)"),
     ("Bash", f"git add a.py  # not {_BT}git add .{_BT}"),
     ("Bash", "git commit -m wip a.py  # (not -a)"),
-    # a backtick is the ESCAPE character in PowerShell, so it opens nothing there
+    # PROSE THAT A SLIPPED QUOTE STATE EXPOSES. An apostrophe or an escaped quote puts the quote
+    # tracking out of step and the message text shows. A rule that started a command after an
+    # opening bracket, and one that joined the lines of a quoted span, each refused rows here;
+    # both were withdrawn for it.
+    ("PowerShell", "gh pr create --title t --body @'\nThe guard doesn't allow (git add -A).\n'@"),
+    ("Bash", f'git commit -m "fix: the {_BS}"(git add -A){_BS}" case" a.py'),
+    ("PowerShell", "git commit -m @'\nseat.ps1 doesn't accept -Declare without -Seat\n'@ a.py"),
+    ("PowerShell", "git commit -m @'\nIt doesn't stage . any more\n'@ a.py"),
+    ("Bash", "git add a.py  # don't forget b.py later\ngit commit -m wip\ngit push -u origin HEAD"),
+    ("Bash", "git add docs/x.md   # don't add the rest\ngit status --short ."),
+    ("Bash", "cmd=(git add -A)"),
+    ("PowerShell", "$sb = { git add -A }"),
     (
         "PowerShell",
         f"gh pr create --title t --body @'\nThe guard doesn't allow {_BT}git add -A{_BT}.\n'@",
@@ -682,9 +670,8 @@ MUST_STAY_ALLOWED = [
     ("PowerShell", "git add (Get-ChildItem a.py).Name"),
     ("PowerShell", "$m = @{ a = 1 }; git add a.py"),
     ("PowerShell", "Write-Output (git status --short)"),
-    # A BRACKETED SEGMENT ENDS AT ITS OWN CLOSER. PowerShell needs no `;` before `}`, so without
-    # that bound the rest of the line is read as git's arguments: `-ForegroundColor` holds a `u`,
-    # `-Path` holds an `a`, and `Test-Path .` holds a bare dot.
+    # PowerShell one-liners whose tail holds a dash-word or a bare dot: `-ForegroundColor` holds
+    # a `u`, `-Path` holds an `a`, and `Test-Path .` holds a dot. None of it is git's.
     (
         "PowerShell",
         'if ($LASTEXITCODE -eq 0) { git add a.py } else { Write-Host "failed" -ForegroundColor Red }',
@@ -709,11 +696,11 @@ MUST_STAY_ALLOWED = [
     ("Bash", "git add --renormalize a.py"),
 ]
 
-# THE NEW READINGS ARE ADDED BESIDE THE OLD ONE, AND THESE ROWS ARE WHY. Each denied before this
-# change and each would have flipped to ALLOW had the new reading REPLACED the old:
+# THE JOINED VIEW IS ADDED BESIDE THE OLD ONE, AND THE FIRST ROW IS WHY. Each row denied before
+# this change and must still deny:
 #   * a shell comment does not continue, so the stage on the line after `# see C:\temp\` is real
-#     (measured under bash: it stages the whole tree). Joining the two lines hides it in a comment.
-#   * splitting at the brace of `${x}` strands `-A` in a segment that does not start with git.
+#     (measured under bash: it stages the whole tree). Joining the two lines would hide it.
+#   * an argument in brackets must not strand the flag that follows it.
 #   * a nested quantifier in the dot family would hang the scan on a run of slashes, before it
 #     reached the real stage after the `;`.
 ADDED_NOT_REPLACED = [
@@ -728,8 +715,9 @@ ADDED_NOT_REPLACED = [
 # the whole tree in a real shell and is ALLOWED. They are pinned the same way as the quote class
 # above, and for the same reason: the assertion demands the DENY, `strict` turns a repair into a
 # visible XPASS, and nobody can write today's ALLOW down as a requirement. Closing any of them
-# needs a quote-state parser, a program-position test, or knowledge of the working directory, and
-# the first two are declined (BACKLOG #1341, #1229). The list for the owner, with what git did for
+# needs a quote-state parser, a program-position test, or knowledge of the working directory, or
+# was built here and withdrawn on a measured false deny. The first two are declined (BACKLOG
+# #1341, #1229). The list for the owner, with what git did for
 # each, is docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. AT LEAST these.
 _REMAINDER = pytest.mark.xfail(
     strict=True,
@@ -745,6 +733,18 @@ MEASURED_REMAINDER = [
     ("Bash", "time git add -A"),
     ("Bash", "FOO=1 git add -A"),
     ("Bash", ">/dev/null git add -A"),
+    # grouping and substitution: git is not at the front of a separator segment
+    ("Bash", "(git add -A)"),
+    ("Bash", "{ git add -A; }"),
+    ("Bash", "echo $(git add -A)"),
+    ("Bash", "(cd sub && git add -A)"),
+    ("PowerShell", "& { git add -A }"),
+    ("PowerShell", "if ($true) { git add -A }"),
+    # a pathspec or flag after a message that spans lines
+    ("Bash", 'git commit -m "subject\n\nbody" .'),
+    ("PowerShell", "git commit -m 'subject\nbody' -a"),
+    # a stage on a line after a bash here-string, which the heredoc reader blanks
+    ("Bash", "cat <<<x\ngit add -A"),
     # a parent-directory pathspec: whole tree or scoped, by a directory the guard cannot see
     ("Bash", "cd sub && git add .."),
     ("Bash", "git -C sub add .."),
@@ -766,9 +766,7 @@ MEASURED_REMAINDER = [
 ]
 
 # HARMLESS COMMANDS THE GUARD REFUSES, PINNED THE SAME WAY. The assertion demands the ALLOW each is
-# owed. The first is the price of the commit rule. The next two are prose that a slipped quote
-# state exposes (BACKLOG #1341): the guard cannot tell `(git add -A)` in a message from a real
-# subshell without quote state. AT LEAST these; the page above lists more.
+# owed. Both are the price of the commit pathspec rule. AT LEAST these; the page lists more.
 _OVER_DENY = pytest.mark.xfail(
     strict=True,
     reason="BACKLOG #1339: a harmless command the guard refuses; listed in "
@@ -777,8 +775,6 @@ _OVER_DENY = pytest.mark.xfail(
 
 KNOWN_OVER_DENY = [
     ("Bash", "git commit -m . a.py"),
-    ("Bash", f'git commit -m "fix: the {_BS}"(git add -A){_BS}" case" a.py'),
-    ("PowerShell", "gh pr create --title t --body @'\nThe guard doesn't allow (git add -A).\n'@"),
     ("Bash", "git stash push -m commit -- ."),
 ]
 
@@ -846,7 +842,6 @@ def test_the_batch_driver_agrees_with_a_real_invocation() -> None:
     for row in [
         ("Bash", "git commit -m wip ."),
         ("Bash", "git commit -m wip ./a.py"),
-        ("Bash", "(git add -A)"),
         ("Bash", f"git add -{_BS}\nA"),
         ("PowerShell", f"git add {_BT}\n-A"),
         ("PowerShell", f"git add src{_BS}\ngit diff --stat ."),
