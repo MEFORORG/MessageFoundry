@@ -52,7 +52,7 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
 3. **Does code implementing the requirement's verb exist anywhere in the tree, reachable by any
    configuration?**
    No → **`fail`**. Where the verb asks what the documentation defines, §1.1c says which text
-   counts.
+   counts. It does not pick the verdict.
 4. **Is the verb satisfied by a shipped default, or by a gate that refuses to start when the
    precondition is absent?**
    Yes → **`pass`**. *"It can be configured" is never a pass. A signed relaxation is never a pass.*
@@ -143,14 +143,14 @@ repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24-BATCH128.md`.
 **The rejected "rule 1a" is not §1.1a.** §1.1a is the 2026-08-16 off-by-default ruling on rule 4, and
 it stands.
 
-### 1.1c Documentation is text a reader reaches without opening the source code — owner ruling, 2026-10-09
+### 1.1c Documentation is text a reader can reach and a reviewer can compare with the code — owner ruling, 2026-10-09
 
 Some requirements ask what the application's documentation defines. This subsection says which text
 an assessor may count for them.
 
-**Text counts as documentation when it passes two tests.** A reader can reach it without opening the
-source code. It also states the rule in words a reviewer can compare with the code. At least these
-count:
+**Text must pass two tests to count as documentation.** A reader can reach it without opening the
+source code. It also states the rule in words a reviewer can compare with the code. The two lists
+below settle the cases they name. At least these count:
 
 - a page under the project's `docs/`;
 - an ADR;
@@ -173,11 +173,11 @@ recorded them.
 says a security decision may be written in a document that developers refer to. It also allows one
 *"documented and implemented in a common code library"*, where every developer must use that
 library. It treats both as meeting the aim. The passage is in `0x03-What-is-the-ASVS.md`, fetched at
-the pinned `v5.0.0_release` tag (§2.1a). Only the quoted words are verbatim, so read the passage
-before relying on the rest. The two tests above are the owner's line, and the standard does not
-draw it.
+the pinned release tag `v5.0.0_release`, under the §2.1a rule for citing prose. Only the quoted words are verbatim, so read the passage
+before relying on the rest. The two tests above are this ruling's line, and the standard does not
+draw it. The line is narrower than the passage, which also accepts a decision kept in shared code.
 
-**What this ruling does not decide.** At least these stay open:
+**What this ruling does not decide.** It leaves at least these alone:
 
 - It applies to requirements that ask about documentation. It does not change what counts as
   evidence that a control exists: code and tests remain evidence (§3).
@@ -493,16 +493,16 @@ At least these passes leave both stamps alone:
 
 **Why the stamps are held to the whole cell.** At least two things already treat them that way:
 
-- The record's re-pin tool is kept in the vault with the record. It moves `verified_at` from one
-  commit to another, and it reads nothing new. It refuses unless the two trees are identical, apart
-  from line endings, over every path the affected cells anchor. So a stamp may move without a read
-  only where the anchored files did not change.
+- The record's re-pin tool is kept in the vault with the record. It renames the commit in
+  `verified_at`, which is not a read, and it leaves `last_verified` alone. It refuses unless the two
+  trees are identical, apart from line endings, over every path the affected cells anchor. So the
+  tool treats `verified_at` as covering every file the cell anchors.
 - Where the rendered table shows `last_verified`, it prints one date for the whole cell.
 
-A note in the cell's prose can say that a read was partial. No tool reads that note. A reader of the
-table cannot see that it qualifies the date.
+A note in the cell's prose can say that a read was partial. The verifier does not read that note,
+and the table prints the date in its own column either way.
 
-**What this ruling does not decide.** At least these stay open:
+**What this ruling does not decide.** It leaves at least these open:
 
 - Some grounds are a test result or a measurement. The ruling does not say how much of such a ground
   a full read must run again, and this method does not answer that yet.
@@ -510,13 +510,15 @@ table cannot see that it qualifies the date.
   re-read that set or re-derived it. It does not address one that held the verdict without
   re-deriving it.
 - It does not say what the stamps hold for a cell with no full read on record.
-- Tools written before this ruling may read the stamps differently. At least the writer,
-  `scripts/asvs/apply.py`, dates an anchor repair from the payload's `last_verified`. Bringing the
-  tools into line is unfiled work.
+
+**Tools written before this ruling may read the stamps differently.** The ruling governs what an
+assessor writes, and the tools follow it. At least two do not yet. The writer,
+`scripts/asvs/apply.py`, dates an anchor repair from the payload's `last_verified`. The rendered
+page's `Verdict bases` line counts `verified_at` values as the trees the verdicts rest on. Bringing
+the tools into line is unfiled work.
 
 The ruling was given in session on 2026-10-09, after adversarial review, and is recorded in the
-`MessageFoundry-vault` repository. As in §1.1a, this document records the rule and not the cells it
-moves.
+`MessageFoundry-vault` repository. As in §1.1a, this document names no cell the ruling touches.
 
 ---
 
