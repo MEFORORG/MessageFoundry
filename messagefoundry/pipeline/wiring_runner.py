@@ -3124,21 +3124,28 @@ class RegistryRunner:
         operator at all — an alert rule's ``control_action`` can auto-fire ``restart_outbound``
         (#144) on ``connection_stopped``, the very signal a log-failure halt raises.
 
+        **A restart that does not resume the lane leaves the engine's park as it found it.** The
+        stop half makes any pause the operator's (:meth:`_stop_outbound_unsafe`), and a reload
+        resumes only an ENGINE park. So a lane the engine had parked gets that park back whenever
+        it is still paused on the way out: the gate refused, the start raised (such as
+        ``NotDeployedError``), or the call was cancelled. Otherwise the reload that builds or
+        re-deploys it left it paused, and a held failed lane stopped paging. A lane the operator
+        had stopped stays theirs, so no reload undoes the stop (vault BACKLOG #3263). Only the
+        ``_gate_parked`` marker is put back: a calendar park the stop half drops is not.
+
         Raises :class:`DrParkedError` for a lane the DR run-profile parks, before either half, so
         neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
-            self._stop_outbound_unsafe(name)
-            if not self._outbound_start_permitted(name):
-                if name in self._dr_unbuilt:
-                    # Never built since it left the DR park, so the park stays the engine's, as
-                    # a failed build leaves it (_start_outbound_unsafe). The stop made it an
-                    # operator pause, which the reload that builds it would not lift (vault
-                    # BACKLOG #3263).
+            engine_parked = name in self._gate_parked
+            try:
+                self._stop_outbound_unsafe(name)
+                if self._outbound_start_permitted(name):
+                    await self._start_outbound_unsafe(name)
+            finally:
+                if engine_parked and name in self._outbound_paused:
                     self._gate_parked.add(name)
-                return
-            await self._start_outbound_unsafe(name)
 
     def _stop_outbound_unsafe(self, name: str) -> None:
         """stop_outbound body without the reload lock (callers hold it). Sync + returns fast: it flags

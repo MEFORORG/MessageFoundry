@@ -714,10 +714,16 @@ async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isol
     refused. Red when the halt branch dropped the passive marker and kept no other record: once
     the log was repaired, a reload sent the lane to its CA pre-check and was refused whole, and
     a start resumed the lane with no connector and charged its held row an attempt."""
+    monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
     ca, pin = _swapped_ca(tmp_path)
     guard = _DeadLogGuard()
+    sink = _PageSink()
     runner = _runner(
-        store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL, alert_sink=_LogPageSink()
+        store,
+        _graph(tmp_path, ca, pin),
+        dr_standby=Priority.CRITICAL,
+        alert_sink=sink,
+        buildup_default=BuildupThreshold(max_depth=1),
     )
     await runner.start()
     try:
@@ -736,23 +742,102 @@ async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isol
         held = runner.outbound_failed(_OB_CA) or ""
         assert "passive start" in held and "POST /dr/activate needs it" not in held
         assert not runner.outbound_dr_failed(_OB_CA)
-        # An alert rule's restart reaches it now, and the halt refuses the start half. Red when
-        # the stop half left the park an operator pause: the reload below then built the lane
-        # and left it paused, and the failed lane never paged.
-        await runner.restart_outbound(_OB_CA)
-        assert _OB_CA in runner._gate_parked
+        # An alert rule's restart reaches it now, and the halt refuses the start half.
+        engine = cast(Engine, SimpleNamespace(registry_runner=runner))
+        await _alert_control_action(engine, "restart_outbound", _OB_CA, default_target=False)
+        await asyncio.sleep(0.3)
+        assert sink.buildup == []  # the control: a lane the halt holds is silent
 
         guard.writable = True  # the disk is repaired
         await runner.reload()  # raised WiringError before
         built = runner.outbound_failed(_OB_CA) or ""
         assert "its tls_ca_file was refused" in built and "passive" not in built
         assert runner.outbound_dr_failed(_OB_CA)
+        # The failed lane pages, as the engine holds it. Red when the restart's stop half left
+        # the park an operator pause: a paused lane is silent, so it never paged.
+        await _wait_until(lambda: _OB_CA in sink.buildup)
         await runner.start_outbound(_OB_CA)
         await asyncio.sleep(0.3)
         assert await _ca_row(store, row_id) == ("pending", 0)
         assert not runner.outbound_running(_OB_CA)
     finally:
         await runner.stop()
+
+
+async def test_a_refused_restart_keeps_an_operator_stop_of_a_lane_a_log_halt_left_unbuilt(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator stops the lane, an alert rule's restart reaches it, and the halt refuses the
+    start half. Red when that refusal made the lane the engine's park: once the log was repaired,
+    the reload that built the lane resumed it and delivered its held row, undoing the stop."""
+    ca = _ca(tmp_path)
+    guard = _DeadLogGuard()
+    runner = _runner(
+        store,
+        _graph(tmp_path, ca, _sha(ca)),
+        dr_standby=Priority.CRITICAL,
+        alert_sink=_LogPageSink(),
+    )
+    await runner.start()
+    try:
+        await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(_OB_FILE, _ADT)])
+        monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+        await runner._respond_to_log_sink_event(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+        await runner.stop_outbound(_OB_FILE)  # the operator's stop
+        engine = cast(Engine, SimpleNamespace(registry_runner=runner))
+        await _alert_control_action(engine, "restart_outbound", _OB_FILE, default_target=False)
+
+        guard.writable = True  # the disk is repaired
+        await runner.reload()
+        assert _OB_FILE in runner._destinations  # the reload built it
+        await asyncio.sleep(0.3)
+        assert not runner.outbound_running(_OB_FILE)
+        assert not any((tmp_path / _OB_FILE).iterdir())
+
+        await runner.start_outbound(_OB_FILE)  # the control: the operator's start delivers
+        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
+    finally:
+        await runner.stop()
+
+
+async def test_a_restart_cancelled_in_its_build_leaves_the_engine_park_a_reload_lifts(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """The lane failed at the activation, so the engine holds it. A restart is cancelled while
+    its start half builds the lane. Red when the stop half's operator pause stood: the reload
+    after the CA was fixed built the lane and left it paused."""
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    armed, building = asyncio.Event(), asyncio.Event()
+
+    async def held(direction: str, name: str, settings: Any) -> None:
+        if name == _OB_CA and armed.is_set():
+            building.set()
+            await asyncio.Event().wait()
+        await check(direction, name, settings)
+
+    async with _after_a_failed_activation(store, tmp_path, lane_anchor_check=held) as (
+        runner,
+        ca,
+        row_id,
+    ):
+        armed.set()
+        restart = asyncio.create_task(runner.restart_outbound(_OB_CA))
+        await asyncio.wait_for(building.wait(), timeout=10)
+        restart.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await restart
+        armed.clear()
+        await asyncio.sleep(0.3)
+        assert await _ca_row(store, row_id) == ("pending", 0)
+
+        ca.write_bytes(_block(b"partner-ca"))
+        await runner.reload()
+        assert _OB_CA in runner._destinations
+        assert runner.outbound_running(_OB_CA)
 
 
 async def test_the_calendar_starts_a_lane_a_log_halt_kept_unbuilt_once_the_halt_lifts(
