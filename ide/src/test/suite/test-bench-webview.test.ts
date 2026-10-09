@@ -391,6 +391,54 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
     ]);
   });
 
+  test("trace: a host-required field the page does not read may not be absent or mistyped", () => {
+    // BACKLOG #1123. TraceDetail and its parts (traceView.ts) declare these as required. The shape
+    // check named the fields the renderer reads and let the rest pass when absent.
+    const inv = (p: Payload): Payload => p.detail.invocations[0];
+    const required: [string, (p: Payload) => Payload, string, unknown][] = [
+      ["detail.traceOk", (p) => p.detail, "traceOk", "yes"],
+      ["invocation.kind", inv, "kind", 1],
+      ["invocation.name", inv, "name", 1],
+      ["coverage.module", (p) => inv(p).coverage, "module", 1],
+      ["coverage.file", (p) => inv(p).coverage, "file", 1],
+      ["coverage.defLine", (p) => inv(p).coverage, "defLine", "1"],
+      ["coverage.startLine", (p) => inv(p).coverage, "startLine", "1"],
+      ["coverage.endLine", (p) => inv(p).coverage, "endLine", 1.5],
+      ["coverage line role", (p) => inv(p).coverage.lines[0], "role", 1],
+      ["profile line text", (p) => inv(p).profile.lines[0], "text", 1],
+    ];
+    assertEachDiscarded(TRACE, [
+      ...required.map(([what, at, key]): [string, (p: Payload) => void] => [`${what} absent`, (p) => delete at(p)[key]]),
+      ...required.map(([what, at, key, bad]): [string, (p: Payload) => void] => [`${what} mistyped`, (p) => (at(p)[key] = bad)]),
+      // null is declared for module and file only (string | null). Elsewhere it is a wrong type.
+      ["traceOk null", (p) => (p.detail.traceOk = null)],
+      ["coverage.defLine null", (p) => (inv(p).coverage.defLine = null)],
+      ["coverage line role null", (p) => (inv(p).coverage.lines[0].role = null)],
+    ]);
+  });
+
+  test("trace: what the host really builds with no module, no file and no source renders (control)", () => {
+    // The dry-run prints module and file as null for an invocation it could not place, and the host
+    // then has no source to read. buildTraceDetail() sends null for both; that must still render.
+    const entry = clone(TRACE_ENTRY as unknown as Payload);
+    entry.invocations[0].module = null;
+    entry.invocations[0].file = null;
+    entry.invocations[0].def_line = null;
+    const built: Payload = { type: "trace", detail: buildTraceDetail(entry as unknown as TraceEntry, () => null) };
+    assert.strictEqual(built.detail.invocations[0].coverage.module, null);
+    assert.strictEqual(built.detail.invocations[0].coverage.file, null);
+    assert.strictEqual(built.detail.invocations[0].coverage.sourceAvailable, false);
+    assert.strictEqual(built.detail.traceOk, false, "an entry with no trace_ok is built as traceOk false");
+    assertRendered(built, "trace with no module, file or source");
+    // And with the trace marked good, in both modes.
+    const ok = clone(TRACE_ENTRY as unknown as Payload);
+    ok.trace_ok = true;
+    const good: Payload = { type: "trace", detail: buildTraceDetail(ok as unknown as TraceEntry, () => TRACE_SOURCE) };
+    assert.strictEqual(good.detail.traceOk, true);
+    assertRendered(good, "trace with trace_ok");
+    assertRendered(good, "trace with trace_ok, profiling", { traceMode: "profile" });
+  });
+
   test("collectionRun: well-formed renders (control)", () => {
     const b = assertRendered(RUN, "collectionRun");
     assert.ok(b.detail.innerHTML.includes("0 / 2 passed"), "the summary did not render");

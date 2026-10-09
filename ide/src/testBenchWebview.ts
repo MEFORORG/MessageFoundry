@@ -41,6 +41,9 @@ export function testBenchScript(token: string): string {
     function isCount(x){ return Number.isSafeInteger(x) && x >= 0; }
     function isBool(x){ return typeof x === 'boolean'; }
     function isObj(x){ return !!x && typeof x === 'object' && !Array.isArray(x); }
+    function isInt(x){ return Number.isSafeInteger(x); }
+    // null is a value, not an absence: only a field the host types "T | null" goes through this.
+    function isNullable(x, f){ return x === null || f(x) === true; }
     function isArrOf(x, f){
       if (!Array.isArray(x)) { return false; }
       // By index, not every(): every() skips holes, so a sparse array would pass with an element no
@@ -54,26 +57,32 @@ export function testBenchScript(token: string): string {
       return isObj(c) && isBool(c.seg) && isStr(c.status) && isStr(c.sep) &&
         isArrOf(c.fields, (f) => isObj(f) && isStr(f.t) && isBool(f.c));
     }
+    // Every field TraceDetail and its parts declare (traceView.ts), read here or not: a message
+    // without one is not the message the host declares. module and file are "string | null".
     function isCoverage(c){
       return isObj(c) && isStr(c.kind) && isStr(c.name) && isCount(c.executed) && isCount(c.executable) &&
         isNum(c.pct) && isBool(c.truncated) && isBool(c.sourceAvailable) &&
+        isNullable(c.module, isStr) && isNullable(c.file, isStr) &&
+        isInt(c.defLine) && isInt(c.startLine) && isInt(c.endLine) &&
         isArrOf(c.lines, (l) => isObj(l) && isCount(l.line) && isCount(l.hits) && isStr(l.text) &&
-          isBool(l.executable) && isBool(l.executed));
+          isStr(l.role) && isBool(l.executable) && isBool(l.executed));
     }
     function isProfile(p){
       return isObj(p) && isStr(p.kind) && isStr(p.name) && isBool(p.hasTiming) && isNum(p.totalSeconds) &&
-        isArrOf(p.lines, (l) => isObj(l) && isCount(l.line) && isCount(l.hits) && isNum(l.seconds) && isNum(l.pct));
+        isArrOf(p.lines, (l) => isObj(l) && isCount(l.line) && isStr(l.text) && isCount(l.hits) &&
+          isNum(l.seconds) && isNum(l.pct));
     }
     function isFieldDifference(d){
-      return isObj(d) && isStr(d.seg) && Number.isSafeInteger(d.index) && isStr(d.before) && isStr(d.after);
+      return isObj(d) && isStr(d.seg) && isInt(d.index) && isStr(d.before) && isStr(d.after);
     }
     // One entry per type this panel renders. A type with no entry is not rendered, as before.
     const SHAPES = {
       detail: (m) => isStr(m.source) && isStr(m.to) && isObj(m.diff) &&
         isArrOf(m.diff.before, isDiffCell) && isArrOf(m.diff.after, isDiffCell),
       trace: (m) => isObj(m.detail) && isStr(m.detail.source) && isStr(m.detail.disposition) &&
-        isBool(m.detail.hasTiming) && isNum(m.detail.totalSeconds) &&
-        isArrOf(m.detail.invocations, (v) => isObj(v) && isCoverage(v.coverage) && isProfile(v.profile)),
+        isBool(m.detail.traceOk) && isBool(m.detail.hasTiming) && isNum(m.detail.totalSeconds) &&
+        isArrOf(m.detail.invocations, (v) => isObj(v) && isStr(v.kind) && isStr(v.name) &&
+          isCoverage(v.coverage) && isProfile(v.profile)),
       hex: (m) => isStr(m.source) && isObj(m.dump) && isBool(m.dump.truncated) &&
         isCount(m.dump.renderedBytes) && isCount(m.dump.totalBytes) &&
         // Bounded because it sizes a padding string; an unbounded one would throw inside repeat().
@@ -83,7 +92,7 @@ export function testBenchScript(token: string): string {
       collections: (m) => isArrOf(m.items, (c) => isObj(c) && isStr(c.name) && isCount(c.cases)),
       collectionRun: (m) => isStr(m.name) && isCount(m.run) && isCount(m.passed) && isCount(m.total) &&
         isArrOf(m.results, (r) => isObj(r) && isStr(r.name) && isBool(r.pass) && isStr(r.disposition)),
-      caseDetail: (m) => isCount(m.run) && isCount(m.index) && (m.error === null || isStr(m.error)) &&
+      caseDetail: (m) => isCount(m.run) && isCount(m.index) && isNullable(m.error, isStr) &&
         isArrOf(m.deliveries, (d) => isObj(d) && isStr(d.to) && isStr(d.status) &&
           isArrOf(d.differences, isFieldDifference)),
     };
