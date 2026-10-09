@@ -1523,13 +1523,20 @@ class _MappingContext(collections.abc.Mapping[str, object]):
 
 
 def test_a_dataclass_mapping_given_as_the_single_mapping_still_formats_by_key() -> None:
-    # Read only by attribute, so as the record's mapping it is left as it is with no filter: a
-    # note in its place is not a mapping, and "%(key)s" would raise from the log call.
+    # A bare note in its place is not a mapping, and "%(key)s" would raise from the log call. So
+    # it is wrapped as a dict root is: each key asks its own lookup, and "%s" prints the note.
     held = _MappingContext({"a": 1, "e": _encode_error()})
-    record = _record("%(a)s", (held,))
+    assert "\\xe9" in _record("%(e)s", (held,)).getMessage()  # control: raw with no filter
+    record = _record("%(a)s | %(e)s", (held,))
     prepare_log_record(record)
-    assert record.args is held
-    assert record.getMessage() == "1"
+    assert record.getMessage().startswith("1 | UnicodeEncodeError: 'ascii' codec cannot encode")
+    whole = _record("ctx: %s", (held,))
+    prepare_log_record(whole)
+    assert whole.getMessage() == "ctx: [_MappingContext holding a codec error, not rendered]"
+    clean = _MappingContext({"a": 1})
+    record = _record("%(a)s", (clean,))
+    prepare_log_record(record)
+    assert record.args is clean
     inside = _record("got %s end %d", (held, 1))  # as one argument of several it is a note
     prepare_log_record(inside)
     assert inside.getMessage() == "got [_MappingContext holding a codec error, not rendered] end 1"
@@ -1568,8 +1575,10 @@ def test_a_slot_or_a_syntax_error_holding_a_unicode_error_is_a_note() -> None:
 
 
 def test_plain_exceptions_do_not_spend_the_attribute_budget() -> None:
-    crowd: list[object] = [_Outcome("a", _encode_error())]
-    crowd.extend(RuntimeError(i) for i in range(redaction._ATTRIBUTE_BUDGET + 50))
+    # A builtin exception prints .args alone, so it is not read by attribute and costs nothing.
+    # The holder is LAST, which the walk reads last: with the crowd charged it was never reached.
+    crowd: list[object] = [RuntimeError(i) for i in range(redaction._ATTRIBUTE_BUDGET + 50)]
+    crowd.append(_Outcome("a", _encode_error()))
     record = _record("got %d: %s", (len(crowd), crowd))
     prepare_log_record(record)
     text = record.getMessage()
@@ -1579,11 +1588,12 @@ def test_plain_exceptions_do_not_spend_the_attribute_budget() -> None:
 
 def test_a_large_payload_on_an_exception_is_bounded_and_never_raises() -> None:
     # safe_exc runs where errors are stored, so everything under the exception is charged.
-    error = RuntimeError("failed")
+    error = _AttributeError("plain")
     error.payload = [[i] for i in range(50_000)] + [_encode_error()]  # type: ignore[attr-defined]
     scan = redaction._Scan(error, charged_root=True)
     assert len(scan.nodes) <= redaction._ATTRIBUTE_BUDGET + 2
-    assert redaction.safe_exc(error) == "RuntimeError: failed"  # past the budget: as with no scan
+    # Past the budget: as with no scan. A stated limit, pinned here.
+    assert redaction.safe_exc(error) == "_AttributeError: bad frame: plain"
     wide = [[i] for i in range(50_000)] + [[_encode_error()]]
     record = _record("got %s", (wide,))  # a builtin container's own elements are not charged
     prepare_log_record(record)
@@ -1643,6 +1653,80 @@ def test_the_order_of_a_dict_does_not_decide_what_is_scanned(first: str) -> None
     assert "[_Context holding a codec error, not rendered]" in text
 
 
+def test_an_exception_whose_str_is_the_builtin_one_keeps_its_own_message() -> None:
+    # Only .args can print through BaseException.__str__, so an attribute is not evidence. An
+    # AttributeError's .obj is set by the interpreter; reading it replaced the message with a note.
+    holder = types.SimpleNamespace(error=_encode_error())
+    with pytest.raises(AttributeError) as caught:
+        holder.missing  # noqa: B018 - the lookup is the point
+    missing = caught.value
+    assert missing.obj is holder
+    assert not redaction.prints_a_codec_error(missing)
+    assert redaction.safe_exc(missing) == f"AttributeError: {redaction.safe_text(str(missing))}"
+    ei = (AttributeError, missing, None)
+    assert safe_traceback(ei) == logging.Formatter().formatException(ei)
+    stored = RuntimeError("failed")
+    stored.original = _encode_error()  # type: ignore[attr-defined]
+    assert redaction.safe_exc(stored) == "RuntimeError: failed"
+    record = _record("got %s", (stored,))
+    args = record.args
+    prepare_log_record(record)
+    assert record.args is args
+
+
+def test_an_error_read_as_the_budget_runs_out_still_counts() -> None:
+    # It was seeded only when popped, and the loop had stopped by then: a large later field
+    # starved an error the walk had already read.
+    error = _encode_error()
+    wrapper = ValueError("bad frame", error)
+    wrapper.rows = [0] * 5000  # type: ignore[attr-defined]
+    assert redaction.safe_exc(wrapper) == f"ValueError: {_HOLDER}"
+    for holder in (
+        types.SimpleNamespace(error=error, rows=[0] * 5000),
+        _Outcome("a", [error] + [0] * (redaction._ATTRIBUTE_BUDGET - 1)),
+    ):
+        record = _record("got %r", (holder,))
+        prepare_log_record(record)
+        assert "caf" not in record.getMessage()
+        assert "holding a codec error, not rendered]" in record.getMessage()
+
+
+class _SlotBase(Exception):
+    __slots__ = ("orig",)
+    orig: object
+
+    def __str__(self) -> str:
+        return f"slot {self.orig}"
+
+
+@dataclasses.dataclass
+class _SlotChild(_SlotBase):
+    extra: int = 0
+
+
+def test_a_dataclass_exception_is_read_through_its_bases_slots_too() -> None:
+    child = _SlotChild()
+    child.orig = _encode_error()
+    assert "\\xe9" in str(child)  # control
+    assert redaction.safe_exc(child) == f"_SlotChild: {_HOLDER}"
+
+
+def test_a_holder_traceback_drops_its_notes_and_a_syntax_errors_line_number() -> None:
+    noted = RuntimeError("failed", _encode_error())
+    noted.add_note(f"row caf{_CHAR}")
+    out = safe_traceback((RuntimeError, noted, None))
+    assert "caf" not in out and out.endswith(f"RuntimeError: {_HOLDER}")
+    line: Any = _encode_error()
+    located = SyntaxError("bad token", ("feed.py", line, 1, "x"))
+    out = safe_traceback((SyntaxError, located, None))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    plain = RuntimeError("failed")
+    plain.add_note("retry 3")
+    ei = (RuntimeError, plain, None)
+    assert safe_traceback(ei) == logging.Formatter().formatException(ei)  # a clean one keeps them
+
+
 def _elements_read(scan: Any) -> int:
     """How many elements a scan copied out of containers and attributes: its own record of it."""
     return sum(len(elements or ()) for _arg, elements, _why in scan.nodes.values())
@@ -1654,13 +1738,13 @@ def test_the_work_done_beneath_an_attribute_is_bounded_whatever_the_argument_hol
     bound = 2 * redaction._ATTRIBUTE_BUDGET + 8
     lists = types.SimpleNamespace(**{f"k{i}": list(range(i, i + 5000)) for i in range(400)})
     assert _elements_read(redaction._Scan(lists)) <= bound
-    error = RuntimeError("failed")
+    error = _AttributeError("plain")  # a __str__ of its own, so its attributes are read
     error.table = {i: str(i) for i in range(200_000)}  # type: ignore[attr-defined]
-    assert _elements_read(redaction._Scan(error)) <= bound
+    assert 1000 < _elements_read(redaction._Scan(error)) <= bound  # read, and cut short
     assert _elements_read(redaction._Scan(error, charged_root=True)) <= bound
     wide = RuntimeError(list(range(200_000)))  # in .args, which safe_exc charges too
     assert _elements_read(redaction._Scan(wide, charged_root=True)) <= bound
-    assert redaction.safe_exc(error) == "RuntimeError: failed"
+    assert redaction.safe_exc(error) == "_AttributeError: bad frame: plain"
     for arg in (lists, error):  # and neither is touched: nothing in them is an error
         record = _record("got %s end %d", (arg, 1))
         args = record.args
@@ -1806,6 +1890,8 @@ def test_a_non_utf8_code_set_csv_is_refused_by_name_without_the_byte(tmp_path: P
     wide.write_text("code,label\nA," + "x" * 131073 + "\n", encoding="utf-8")
     with pytest.raises(CodeSetError, match="code set 'wide.csv': invalid CSV \u2014 field larger"):
         load_code_set(wide)
+    with pytest.raises(CodeSetError, match="code set 'gone.csv': invalid CSV"):
+        load_code_set(tmp_path / "gone.csv")  # as a missing .toml one already was
 
 
 # --- the guard: a new site cannot render a caught UnicodeError raw ----------------------------------
@@ -1870,6 +1956,17 @@ def _is_raw(node: ast.AST, name: str) -> bool:
     )
 
 
+def _holds_raw(node: ast.AST, name: str) -> bool:
+    """``node`` is the raw error, or a tuple, list, set or dict literal that holds it."""
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return any(_holds_raw(element, name) for element in node.elts)
+    if isinstance(node, ast.Dict):
+        return any(_holds_raw(part, name) for part in (*node.keys, *node.values) if part)
+    if isinstance(node, ast.Starred):
+        return _holds_raw(node.value, name)
+    return _is_raw(node, name)
+
+
 def _renders_the_handled_error(node: ast.Call) -> bool:
     """``format_exc()``, ``print_exc()``, or ``sys.exc_info()``/``sys.exception()`` handed on: each
     reaches the error being handled with no name bound to it."""
@@ -1904,11 +2001,11 @@ def _raw_renders(handler: ast.ExceptHandler) -> Iterator[tuple[int, str]]:
                 yield node.lineno, "% formatting"
         elif isinstance(node, ast.Call):
             yield from _raw_call(node, name)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-            if _is_raw(node.value, name):  # the raise-after-handler shape carries it out
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and node.value:
+            if _holds_raw(node.value, name):  # the raise-after-handler shape carries it out
                 yield node.lineno, "aliased out of the handler"
         elif isinstance(node, (ast.Return, ast.Yield)) and node.value is not None:
-            if _is_raw(node.value, name):
+            if _holds_raw(node.value, name):
                 yield node.lineno, "returned out of the handler"
         elif isinstance(node, ast.Attribute) and _is_raw(node, name):
             # Any read: idna and punycode put the label in .reason, so concatenation leaks it too.
@@ -1918,7 +2015,7 @@ def _raw_renders(handler: ast.ExceptHandler) -> Iterator[tuple[int, str]]:
 def _raw_call(node: ast.Call, name: str) -> Iterator[tuple[int, str]]:
     # exc_info= is path 1, which the log filter chain renders safely, so it stays allowed.
     values = [*node.args, *(k.value for k in node.keywords if k.arg != "exc_info")]
-    if not any(_is_raw(v, name) for v in values):
+    if not any(_holds_raw(v, name) for v in values):
         return
     callee = callee_name(node) or ""
     if callee in _RENDER_CALLS:
@@ -2080,6 +2177,21 @@ def u(b):
         b.encode("ascii")
     except:
         traceback.print_exc()
+def v(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError as exc:
+        return None, exc
+def w(b, errors):
+    try:
+        b.decode()
+    except UnicodeDecodeError as exc:
+        errors += [exc]
+def x(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError as exc:
+        report({"error": exc})
 """
 
 _CLEAN = """
@@ -2125,7 +2237,7 @@ def f(b):
 
 def test_the_guard_fires_on_every_planted_shape() -> None:
     handlers, found = _scan_source(_PLANTED, "planted.py")
-    assert handlers == 19
+    assert handlers == 22
     kinds = [line.split(": ", 1)[1] for line in found]
     assert kinds == [
         "f-string interpolation",
@@ -2149,6 +2261,9 @@ def test_the_guard_fires_on_every_planted_shape() -> None:
         "f-string interpolation",  # s: a ValueError arm under a decode call
         "str() of the error",  # t: an Exception arm under read_text
         "the handled error reached without its name",  # u: a bare arm under an encode call
+        "returned out of the handler",  # v: inside a tuple
+        "aliased out of the handler",  # w: += a list that holds it
+        "handed to report()",  # x: inside a dict literal
     ], found
 
 

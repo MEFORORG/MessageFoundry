@@ -1500,15 +1500,22 @@ of the tray's. It prints such an error from its class, codec and position:
   fixed note.
 
 An exception that holds one prints as its class and a fixed note too, never its other arguments.
-That covers at least `RuntimeError(exc)`, `ValueError("bad", exc)`, an exception that keeps the
-error on an attribute of its own, and an `OSError` whose `strerror` or `filename` is the error. It
-applies in a traceback, as a log argument, in `safe_exc()` and `codec_safe_str()`, and in the error
-text a sandboxed Handler reports across the process boundary. An exception that only stores the
-error, and never prints it, loses its own message the same way.
+That covers at least `RuntimeError(exc)`, `ValueError("bad", exc)`, and an `OSError` whose
+`strerror` or `filename` is the error. It also covers an exception that keeps the error on an
+attribute, when its class defines `__str__` or `__repr__`; such a class loses its own message
+even if it never prints the error. A builtin exception prints only its arguments, so one that
+merely stores an error keeps its message. The rule applies in a traceback, as a log argument, in
+`safe_exc()`, and in the error text a sandboxed Handler reports across the process boundary.
+`codec_safe_str()` returns the note alone, with no class.
 
-The filter follows at most 4,096 objects reached through an attribute in one argument, at any
-depth. Past that it leaves the rest as they are, and which ones those are is not defined. A list
-or dict's own elements are not counted.
+**The attribute walk has a work limit, and past it an error prints raw.** Reading an object by
+attribute, each value read from it, and each element of a list or dict found that way all count
+against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the number there).
+When it runs out the filter leaves the rest as it is, and which objects those are is not defined.
+So a large dataclass, or one beside a large list, can still print an error it holds. A plain
+list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read
+by attribute even when it is the single mapping argument, so a large map in it can use up the
+budget before a smaller one is read.
 
 **What stays the caller's job, at least:**
 

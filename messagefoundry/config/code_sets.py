@@ -512,8 +512,9 @@ def load_code_sets(codesets_dir: str | Path) -> dict[str, CodeSet]:
 def _load_csv(path: Path) -> dict[str, Any]:
     """CSV with a header row: first column = key; one other column → scalar, several → ``{header: cell}``.
 
-    A file that is not UTF-8, or that the ``csv`` module refuses, is a :class:`CodeSetError` naming
-    the file, as a malformed TOML one is. Both used to escape raw, past every caller's
+    A file that is not UTF-8, that the ``csv`` module refuses, or that cannot be opened, is a
+    :class:`CodeSetError` naming the file, as a malformed TOML one is. Each used to escape raw, past
+    every caller's
     ``CodeSetError`` arm, and the decode error's text names the byte it failed on (vault BACKLOG
     #3295). The reader decodes as it iterates, so the whole read is inside the arms.
 
@@ -524,6 +525,8 @@ def _load_csv(path: Path) -> dict[str, Any]:
     except UnicodeDecodeError:
         invalid = f"code set {path.name!r}: invalid CSV — the file is not valid UTF-8"
     except csv.Error as exc:  # its text is one of the module's fixed phrases
+        invalid = f"code set {path.name!r}: invalid CSV — {exc}"
+    except OSError as exc:  # as _load_toml maps it: an unreadable file is refused by name
         invalid = f"code set {path.name!r}: invalid CSV — {exc}"
     # Raised after the handler: the decode error's .object is a block of the file.
     raise CodeSetError(invalid)

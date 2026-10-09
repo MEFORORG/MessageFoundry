@@ -71,6 +71,7 @@ import logging
 import pkgutil
 import re
 import traceback
+import weakref
 from abc import ABCMeta
 from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
@@ -2212,8 +2213,9 @@ def safe_traceback(ei: ExcInfo) -> str:
 
     A different exception that HOLDS a Unicode error, as ``RuntimeError(exc)``, has the same
     ``str()``. Its line prints its class and a fixed note (vault BACKLOG #3295). The stdlib prints
-    a ``SyntaxError`` from ``.msg``, ``.text`` and ``.filename`` instead, so those are replaced or
-    dropped on such a node. One whose message
+    a ``SyntaxError`` from ``.msg``, ``.text``, ``.filename`` and ``.lineno`` instead, and any
+    exception's ``__notes__`` after its line, so those are replaced or dropped on such a node. One
+    whose message
     was built as text, ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the
     third path, closed where the wrap is written."""
     value, tb = ei[1], ei[2]
@@ -2233,8 +2235,10 @@ def safe_traceback(ei: ExcInfo) -> str:
             if "_str" not in getattr(node, "__dict__", {}):  # renamed: fail closed, no traceback
                 return safe_exc(value) if value is not None else ""
             node._str = line  # the stdlib's private name: see docstring
-            if isinstance(exc, SyntaxError):  # printed from these three, never from _str
-                node.msg, node.text, node.filename = line, None, None
+            if isinstance(exc, SyntaxError):  # printed from these four, never from _str
+                node.msg, node.text, node.filename, node.lineno = line, None, None, None
+            if getattr(node, "__notes__", None) is not None:
+                node.__notes__ = None  # printed after the line, each by its own str() or repr()
         pending.append((node.__cause__, exc.__cause__))
         pending.append((node.__context__, exc.__context__))
         if node.exceptions:  # set only for an exception group the stdlib will expand
@@ -2323,10 +2327,11 @@ _GROUP_MEMBERS: Any = BaseExceptionGroup.__dict__["exceptions"]
 _DEQUE_MAXLEN: Any = deque.__dict__["maxlen"]
 _DEFAULT_FACTORY: Any = defaultdict.__dict__["default_factory"]
 #: The work one scan may spend on what it reaches through an attribute, at any depth beneath it.
-#: One unit is one object read by attribute, or one element read from a container found that way,
-#: so a large graph of dataclasses or an exception carrying a large payload cannot hold the
-#: logging thread or the event loop. Past it the rest are left as they are with no filter. Which
-#: objects are the ones left is not defined: the walk is not in print order.
+#: One unit is one object read by attribute, one attribute value read from it (a scalar counts),
+#: or one element read from a container found that way. So a large graph of dataclasses, or an
+#: exception carrying a large payload, cannot hold the logging thread or the event loop. Past it
+#: the rest are left as they are with no filter, and an error among them prints raw, as it did
+#: before any object was read by attribute. Which objects are the ones left is not defined.
 _ATTRIBUTE_BUDGET = 4096
 _TYPE_MRO: Any = type.__dict__["__mro__"]
 _TYPE_DICT: Any = type.__dict__["__dict__"]
@@ -2343,71 +2348,104 @@ def _class_attribute(kind: type[Any], name: str) -> Any:
     return _NOT_FOUND
 
 
-#: ``id(class)`` -> (the class, its :func:`_slot_names` answer). Keyed by id because hashing a
-#: class runs its metaclass; the class is held, so its id cannot be reused while the entry lives.
-_SLOT_NAMES: dict[int, tuple[type[Any], tuple[str, ...] | None]] = {}
-_SLOT_NAMES_MAX = 1024
+#: ``id(class)`` -> (a weak reference to the class, its :func:`_readers` answer). Keyed by id
+#: because hashing a class runs its metaclass. The reference's callback drops the entry when the
+#: class dies, which is before its id can be reused, so a reloaded config module's classes are
+#: not kept alive here.
+_READERS: dict[int, tuple[Any, tuple[Any, ...] | None]] = {}
+_READERS_MAX = 1024
+_EXC_STR: Any = BaseException.__dict__["__str__"]
+_EXC_REPR: Any = BaseException.__dict__["__repr__"]
 
 
-def _slot_names(kind: type[Any]) -> tuple[str, ...] | None:
-    """The slots a render of a ``kind`` instance may print, or None when ``kind`` is not read by
-    attribute. A dataclass's are its field names, since ``slots=True`` keeps each field in one; a
-    ``UserDict`` view's is the mapping it prints. An exception's are every slot its classes
-    define, the builtin ones included (an ``OSError``'s ``strerror`` and ``filename``, a
-    ``SyntaxError``'s ``msg`` and ``text``), since its ``__str__`` may print any of them. The
-    instance ``__dict__`` is read as well.
+def _readers(kind: type[Any]) -> tuple[Any, ...] | None:
+    """The descriptors that read what a render of a ``kind`` instance may print, or None when
+    ``kind`` is not read by attribute. The first is the instance ``__dict__``'s, or None; the rest
+    are slots. A dataclass's slots are its fields, since ``slots=True`` keeps each field in one; a
+    ``UserDict`` view's is the mapping it prints.
+
+    An exception is read by attribute only when a class of its own defines ``__str__`` or
+    ``__repr__``. The builtin ones print ``.args`` alone, so an ``AttributeError``'s ``.obj`` or a
+    ``RuntimeError`` that merely stores an error cannot print it, and each keeps its own message.
+    One that does define either is read through every slot its classes define, the builtin ones
+    included (an ``OSError``'s ``strerror`` and ``filename``, a ``SyntaxError``'s ``msg``).
 
     The answer is kept per class, since this runs for every log argument that is not a scalar. A
-    class made a dataclass after an instance of it was first logged keeps its first answer."""
-    cached = _SLOT_NAMES.get(id(kind))
-    if cached is not None and cached[0] is kind:
+    class changed after an instance of it was first logged keeps its first answer."""
+    key = id(kind)
+    cached = _READERS.get(key)
+    if cached is not None and cached[0]() is kind:
         return cached[1]
-    names = _read_slot_names(kind)
-    if len(_SLOT_NAMES) >= _SLOT_NAMES_MAX:
-        _SLOT_NAMES.clear()
-    _SLOT_NAMES[id(kind)] = (kind, names)
-    return names
+    found = _find_readers(kind)
+    if len(_READERS) >= _READERS_MAX:
+        _READERS.clear()
+    try:
+        alive = weakref.ref(kind, lambda _gone: _READERS.pop(key, None))
+    except TypeError:  # a class that cannot be weakly referenced is not kept
+        return found
+    _READERS[key] = (alive, found)
+    return found
 
 
-def _read_slot_names(kind: type[Any]) -> tuple[str, ...] | None:
-    # One pass, with identity tests along the real MRO, so no caller code answers for the class.
-    for base in _TYPE_MRO.__get__(kind):
-        fields = _TYPE_DICT.__get__(base).get("__dataclass_fields__")
-        if type(fields) is dict:
-            return tuple(name for name in fields if type(name) is str)
-        if base is MappingView:
-            return ("_mapping",)
-        if base is SimpleNamespace or base is ChainMap:
-            return ()
+def _find_readers(kind: type[Any]) -> tuple[Any, ...] | None:
+    # Identity tests along the real MRO, so no caller code answers for the class.
+    mro = _TYPE_MRO.__get__(kind)
+    names: tuple[str, ...] | None = None
+    is_exception = False
+    for base in mro:
+        if names is None:
+            fields = _TYPE_DICT.__get__(base).get("__dataclass_fields__")
+            if type(fields) is dict:
+                names = tuple(name for name in fields if type(name) is str)
+            elif base is MappingView:
+                names = ("_mapping",)
+            elif base is SimpleNamespace or base is ChainMap:
+                names = ()
         if base is BaseException:
-            return tuple(
-                name
-                for owner in _TYPE_MRO.__get__(kind)
-                for name, value in _TYPE_DICT.__get__(owner).items()
-                if type(value) is MemberDescriptorType and type(name) is str
-            )
-    return None
+            is_exception = True
+    if is_exception and (
+        _class_attribute(kind, "__str__") is not _EXC_STR
+        or _class_attribute(kind, "__repr__") is not _EXC_REPR
+    ):
+        names = (names or ()) + tuple(
+            name
+            for owner in mro
+            for name, value in _TYPE_DICT.__get__(owner).items()
+            if type(value) is MemberDescriptorType
+            and type(name) is str
+            and not name.startswith("__")
+        )
+    if names is None:
+        return None
+    own_dict = _class_attribute(kind, "__dict__")
+    # A Python class keeps it behind a getset descriptor, and SimpleNamespace behind a member.
+    found: list[Any] = [
+        own_dict
+        if type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType
+        else None
+    ]
+    for name in names:
+        slot = _class_attribute(kind, name)
+        if type(slot) is MemberDescriptorType:
+            found.append(slot)
+    return tuple(found)
 
 
-def _attribute_values(arg: Any, kind: type[Any], slots: tuple[str, ...], limit: int) -> list[Any]:
+def _attribute_values(arg: Any, readers: tuple[Any, ...], limit: int) -> list[Any]:
     """What the attributes of ``arg`` hold: every value in its instance ``__dict__``, and each
-    named slot, ``limit`` of them at most. Both are read through the builtin descriptors, so none
-    of the object's code runs.
+    slot, ``limit`` of them at most. Both are read through the builtin descriptors
+    (:func:`_readers`), so none of the object's code runs.
 
     It reads every instance attribute, not the fields a generated ``repr`` lists, so a dataclass
     field declared ``repr=False`` counts. That errs toward the fixed note and prints nothing."""
     values: list[Any] = []
-    own_dict = _class_attribute(kind, "__dict__")
-    # A Python class keeps it behind a getset descriptor, and SimpleNamespace behind a member.
-    if type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType:
-        values.extend(islice(dict.values(own_dict.__get__(arg)), limit))
-    for name in slots[: max(limit - len(values), 0)]:
-        slot = _class_attribute(kind, name)
-        if type(slot) is MemberDescriptorType:
-            try:
-                values.append(slot.__get__(arg))
-            except AttributeError:  # a slot never assigned
-                continue
+    if readers[0] is not None:
+        values.extend(islice(dict.values(readers[0].__get__(arg)), limit))
+    for slot in readers[1 : 1 + max(limit - len(values), 0)]:
+        try:
+            values.append(slot.__get__(arg))
+        except AttributeError:  # a slot never assigned
+            continue
     return values
 
 
@@ -2535,9 +2573,9 @@ def _some(elements: Any, limit: int | None) -> list[Any]:
 
 def prints_a_codec_error(exc: BaseException) -> bool:
     """True when ``exc`` is not a ``UnicodeError`` but its own ``str()`` may print one (vault
-    BACKLOG #3295). It looks in at least: its ``.args``; the attributes in its instance
-    ``__dict__`` and its slots, which a ``__str__`` of its own may print; and its fields, when it
-    is a dataclass.
+    BACKLOG #3295). It looks in at least: its ``.args``; its fields, when it is a dataclass; and,
+    when a class of its own defines ``__str__`` or ``__repr__``, the attributes in its instance
+    ``__dict__`` and its slots, which that method may print.
 
     IT IS NOT A PROOF THAT ``str(exc)`` IS SAFE. It does not read at least an object of a class
     that is not read by attribute, text already built from the error, or anything past the
@@ -2547,8 +2585,8 @@ def prints_a_codec_error(exc: BaseException) -> bool:
     ``str(RuntimeError(exc))`` is ``str(exc)``, which names the character or byte, and
     ``str(ValueError("bad", exc))`` prints ``repr(exc)``, the whole input. A caller prints the
     class and :data:`_HOLDER_TEXT` instead, never the other arguments, since the class may keep
-    them out of its own message. An exception that only keeps the error on an attribute, and does
-    not print it, loses its message the same way.
+    them out of its own message. An exception with a ``__str__`` of its own that only keeps the
+    error on an attribute, and does not print it, loses its message the same way.
 
     An exception group whose ``str()`` is the builtin one prints only its message and a count, so
     it is False however its members read; a traceback prints each member on its own line. It never
@@ -2577,13 +2615,19 @@ class _Scan:
     object was read by attribute: builtin containers and exception ``.args``, without limit. It
     finishes before the second starts, so nothing the second does can keep it from an object.
 
-    The second walk reads by attribute (:func:`_slot_names`) each object the first one met, and
+    The second walk reads by attribute (:func:`_readers`) each object the first one met, and
     adds what its attributes hold to its elements. A dataclass that is also an exception or a
     container has both. What it reaches, at any depth, is read with a limit, and the whole second
-    walk spends at most :data:`_ATTRIBUTE_BUDGET`. A container it reads may be cut short, which
-    is safe only because nothing beneath an object read by attribute is ever printed from these
-    elements: that object prints as a fixed note. ``charged_root`` skips the first walk, so
-    everything beneath the root is read with the limit."""
+    walk spends at most :data:`_ATTRIBUTE_BUDGET`. A container it reads may be cut short. No
+    message text is built from such a list, since an object read by attribute prints as a fixed
+    note; a rebuilt ``ChainMap`` root's storage, which a later handler may read, can be short of
+    keys for that reason. ``charged_root`` skips the first walk, so everything beneath the root is
+    read with the limit.
+
+    WHEN THE BUDGET RUNS OUT THE SCAN SAYS NOTHING, and a caller reads that as "holds no error".
+    So an error past the budget prints raw, as it did before any object was read by attribute. A
+    note in its place would rewrite a large object that holds none, which is the one thing the
+    walk must not do."""
 
     __slots__ = ("holds", "nodes")
 
@@ -2607,7 +2651,7 @@ class _Scan:
                 seeds.append(key)
                 continue
             if not issubclass(kind, _ARG_WALKED):
-                if _slot_names(kind) is not None:
+                if _readers(kind) is not None:
                     charged.append(arg)
                 continue
             try:
@@ -2618,7 +2662,7 @@ class _Scan:
                 continue
             nodes[key] = (arg, children, "")
             pending.extend(child for child in children if type(child) not in _ARG_SCALARS)
-            if _slot_names(kind) is not None:
+            if _readers(kind) is not None:
                 charged.append(arg)
         budget = _ATTRIBUTE_BUDGET
         read: set[int] = set()  # read by attribute, or first met by the second walk
@@ -2637,7 +2681,7 @@ class _Scan:
             known = nodes.get(key)
             if known is not None and known[1] is None:
                 continue  # the first walk could not read it, and it already counts as an error
-            slots = _slot_names(kind)
+            slots = _readers(kind)
             if known is None and slots is None and not issubclass(kind, _ARG_WALKED):
                 budget -= 1  # an object that is not read at all: nothing beneath it to follow
                 continue
@@ -2650,7 +2694,7 @@ class _Scan:
                     children, found = [], []
                 budget -= 1 + len(found)
                 if slots is not None and budget > 0:
-                    held = _attribute_values(arg, kind, slots, budget)
+                    held = _attribute_values(arg, slots, budget)
                     budget -= len(held)
                     children, found = children + held, found + held
             except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
@@ -2658,7 +2702,17 @@ class _Scan:
                 seeds.append(key)
                 continue
             nodes[key] = (arg, children, "")
-            charged.extend(child for child in found if type(child) not in _ARG_SCALARS)
+            follow: list[Any] = []
+            for child in found:
+                child_kind = type(child)
+                if child_kind in _ARG_SCALARS:
+                    continue
+                if not issubclass(child_kind, UnicodeError):
+                    follow.append(child)
+                elif id(child) not in nodes:  # counted where it is read, whatever budget is left
+                    nodes[id(child)] = (child, [], "")
+                    seeds.append(id(child))
+            charged.extend(reversed(follow))  # popped in the order read: .args before attributes
         self.nodes = nodes
         self.holds: set[int] = set()
         if not seeds:
@@ -2862,7 +2916,7 @@ class _Rebuild:
 
     def _render(self, arg: Any, kind: type[Any], children: list[Any], depth: int) -> _Rendered:
         # An exception, or an object read by attribute: never printed through its own code.
-        if not issubclass(kind, _ARG_WALKED) or _slot_names(kind) is not None:
+        if not issubclass(kind, _ARG_WALKED) or _readers(kind) is not None:
             return _holder_note(kind)
         if issubclass(kind, UserDict):
             own: Any = kind.__repr__
@@ -2883,7 +2937,7 @@ class _Rebuild:
         flat = self.scan.nodes[id(root)][1] or []
         if issubclass(kind, ChainMap):
             return self._chain_pairs(root)
-        if _slot_names(kind) is not None:
+        if _readers(kind) is not None:
             return []  # a dataclass that is a mapping: its elements are not only keys and values
         if issubclass(kind, UserDict):
             data = self.scan.nodes.get(id(flat[0])) if flat else None
@@ -2904,7 +2958,7 @@ class _Rebuild:
         for mapping in reversed(listed[1] or []) if listed is not None else ():
             kind = type(mapping)
             node = nodes.get(id(mapping))
-            if node is None or not issubclass(kind, dict) or _slot_names(kind) is not None:
+            if node is None or not issubclass(kind, dict) or _readers(kind) is not None:
                 continue
             found.extend(_pairs([self.arg(child, 1) for child in node[1] or []]))
         return found
@@ -2920,7 +2974,7 @@ def _safe_arg(arg: Any, depth: int) -> Any:
         return arg
     if issubclass(kind, UnicodeError):
         return _SafeText(safe_exc(arg))
-    if not issubclass(kind, _ARG_WALKED) and _slot_names(kind) is None:
+    if not issubclass(kind, _ARG_WALKED) and _readers(kind) is None:
         return arg
     scan = _Scan(arg)
     if not scan.holds:
@@ -2932,11 +2986,13 @@ def _safe_mapping_args(args: Any) -> Any:
     """The stdlib's single-mapping form, whose values are the arguments, at level 1."""
     kind = type(args)
     if not issubclass(kind, _ROOT_MAPPINGS):
-        # A ConfigParser is untouched; a bare UnicodeError is replaced. So is an object read only
-        # by attribute: it may be a Mapping that "%(key)s" asks, and a note is not one.
+        # A ConfigParser is untouched; a bare UnicodeError is replaced.
         if issubclass(kind, UnicodeError) or issubclass(kind, _ARG_WALKED):
             return _safe_arg(args, 0)
-        return args
+        if _readers(kind) is None:
+            return args
+        # Read only by attribute, as a dataclass that implements Mapping is: "%(key)s" still asks
+        # its own lookup through the wrapper below, and a bare note would not be a mapping.
     scan = _Scan(args)
     if not scan.holds:
         return args
