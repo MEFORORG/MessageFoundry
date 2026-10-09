@@ -105,8 +105,8 @@ file, and git refused the pathspec.
 exits 0 with no output on an empty payload, a payload that is not JSON, and a payload with no
 command. `tests/test_blanket_stage_guard.py` drives at least six such payloads.
 
-**6. It sees only Bash and PowerShell tool calls.** This is a property of the wiring, which does
-not exist yet. The script itself judges any payload that carries a command. Which tools reach it
+**6. It sees only Bash and PowerShell tool calls.** This is a property of the wiring, not of
+the script. The script itself judges any payload that carries a command. Which tools reach it
 would be set by the matcher in the settings file. A command typed in a terminal outside the
 session would never reach it.
 
@@ -119,53 +119,72 @@ control that must stay allowed. At least:
 | Family | Commands | Shell | What git did before |
 |---|---|---|---|
 | Commit with a whole-tree pathspec | `git commit -m wip .`, `git commit -m wip -- .`, `git commit . -m wip`, `git commit -m wip ./`, `git commit -m wip ./.`, `git commit -m wip :/`, `git commit -m wip -- :/`, `git commit -qm wip .`, `git commit --amend --no-edit .`, `git -c user.name=x commit -m wip .` | bash, PowerShell | committed all tracked |
-| Commit with a pathspec or flag after a message that spans lines | `git commit -m "subject`, newline, `body" .`; `git commit -m "subject`, newline, `body" -a`; the same with the message from `$(cat <<'EOF' ... EOF)` | bash, PowerShell | committed all tracked |
 | Commit with `--only` or `--include` | `git commit -o . -m wip`, `git commit --only . -m wip`, `git commit -i -m wip .`, `git commit --include -m wip .` | bash, PowerShell | committed all tracked |
 | The dot family in `add` and `stage` | `git add ./.`, `git add ././`, `git add .//`, `git add .\`, `git add -- ./.`, `git stage ./.` | bash, PowerShell | staged all five |
 | The dot family, PowerShell spelling | `git add .\.` | PowerShell | staged all five |
 | A quoted flag | `git add "-A"`, `git add '-A'`, `git add '--all'` | bash, PowerShell | staged all five |
 | A redirect glued to the last argument | `git add .>/dev/null`, `git add -A>/dev/null` | bash | staged all five |
 | A redirect glued to a commit flag | `git commit -m wip -a>/dev/null` | bash | committed all tracked |
-| A subshell or brace group | `(git add -A)`, `( git add -A )`, `{ git add -A; }`, `f() { git add -A; }; f`, `(git add ${x} -A)` | bash | staged all five |
-| A command substitution | `echo $(git add -A)`, ``echo `git add -A` ``, `x=$(git add .)` | bash | staged all five |
-| A PowerShell block or sub-expression | `(git add -A)`, `$(git add -A)`, `& { git add -A }`, `if ($true) { git add -A }`, `1..1 \| ForEach-Object { git add -A }`, `foreach ($i in 1) { git add . }`, `function f { git add -A }; f` | PowerShell | staged all five |
 | A bash line continuation | `git add \`, newline, `-A`; `git \`, newline, `add -A`; `git add \`, newline, `.` | bash | staged all five |
 | A bash line continuation inside a word | `git add -\`, newline, `A`; `git ad\`, newline, `d -A`; `gi\`, newline, `t add -A` | bash | staged all five |
 | A bash line continuation, commit | `git commit \`, newline, `-am wip`; `git commit -m wip \`, newline, `.` | bash | committed all tracked |
 | A PowerShell line continuation | ``git add ` ``, newline, `-A`; ``git ` ``, newline, `add -A` | PowerShell | staged all five |
 | A PowerShell line continuation, commit | ``git commit ` ``, newline, `-am wip` | PowerShell | committed all tracked |
-| A stage on the line after a bash here-string | `cat <<<x`, newline, `git add -A` | bash | staged all five |
 
 How each was closed:
 
 - **Commit pathspec.** A new rule reads the arguments after the word `commit`, with quoted text
-  blanked. A dot inside a quoted message is not a pathspec.
+  blanked. A dot inside a quoted message is not a pathspec. Neither is a dot in a trailing
+  comment or inside round brackets.
 - **Dot family.** The whole-tree pathspec now matches any path built only from single dots and
   separators.
 - **Quoted flag and glued redirect.** The `add` rules accept a quote around a flag. All the
   rules treat `<` and `>` as the end of an argument.
-- **Grouping and substitution.** A command may now also start after an opening bracket, or
-  after a backtick under the `Bash` tool. It ends at the bracket that closes it. An opening
-  bracket inside a shell comment starts nothing.
-- **Joined lines.** The guard also reads the command with each quoted span on one line and
-  each line continuation joined. The tool name picks the continuation character: a backslash
-  for `Bash`, a backtick for `PowerShell`.
-- **Here-string.** The heredoc reader took `<<<x` for a heredoc and blanked every later line.
-  It now skips a triple angle.
+- **Line continuation.** The guard also reads the command with each continuation joined the
+  way the shell joins it. The tool name picks the character: a backslash for `Bash`, a
+  backtick for `PowerShell`. This reading is added beside the old one and never replaces it,
+  so it can only add a deny.
 
-Each new reading is added beside the old one and never replaces it, so it can only add a deny.
-The here-string fix blanks less text, so it can only add a deny too. None of this is a
-quote-state parser or a program-position test.
-
-**One point for the owner.** The record of the ruling says the subshell forms are "not the
-Builder's to close". The brief for this change said to close them if no harmless command became
-denied. They are closed here on the brief's test. The environment-prefix form was not closed.
+None of this is a quote-state parser or a program-position test. Across the corpus, no command
+that was denied at the measured commit is allowed now.
 
 ## 3. The measured remainder: neither accepted nor closed
 
 Each form below is still allowed, and git stages or commits a whole tree with it. None is on the
 accepted list. `tests/test_blanket_stage_guard.py` pins a sample of them as strict expected
 failures, so a later repair shows up as a test change. At least:
+
+**E. Built in this change, then withdrawn.** Three wider readings would have closed the rows
+below. Each was built and measured, and each refused harmless commands, so each was taken out
+again. The brief's test for closing a form was that no harmless command becomes denied.
+
+| Command | Shell | What git did |
+|---|---|---|
+| `(git add -A)`, `( git add -A )`, `{ git add -A; }`, `f() { git add -A; }; f` | bash | staged all five |
+| `echo $(git add -A)`, ``echo `git add -A` ``, `x=$(git add .)` | bash | staged all five |
+| `(git add -A)`, `$(git add -A)`, `& { git add -A }`, `if ($true) { git add -A }`, `1..1 \| ForEach-Object { git add -A }`, `foreach ($i in 1) { git add . }`, `function f { git add -A }; f` | PowerShell | staged all five |
+| `git commit -m "subject`, newline, `body" .` | bash, PowerShell | committed all tracked |
+| `git commit -m "subject`, newline, `body" -a` | bash, PowerShell | committed all tracked |
+| `git commit -m "$(cat <<'EOF'`, newline, `subject`, newline, `EOF`, newline, `)" .` | bash | committed all tracked |
+| `cat <<<x`, newline, `git add -A` | bash | staged all five |
+
+What each withdrawn reading cost, at least:
+
+- **Start a command after an opening bracket** (rows 1 to 3). It refused prose in a message
+  once an apostrophe or an escaped quote had put the quote tracking out of step, such as a
+  PowerShell here-string body holding `doesn't` and then `(git add -A)`. It also refused
+  `cmd=(git add -A)` and a script block that is defined and never run. A review measured it as
+  quadratic on long commands: 57 seconds on a 24 KB payload.
+- **Join the lines of a quoted span** (rows 4 to 6). One stray apostrophe glued later lines
+  onto git's arguments. It refused a here-string commit message reading
+  `seat.ps1 doesn't accept -Declare without -Seat`, and `git add a.py  # don't forget b.py`
+  followed by two ordinary commands.
+- **Stop reading `<<<x` as a heredoc** (row 7). This one bought a fail-open: `cat <<<x`, then
+  `# it's`, then `x`, then `git add -A` is denied at the measured commit and was allowed with
+  the change.
+
+The record of the ruling also says the subshell forms are "not the Builder's to close". They
+are not closed.
 
 **A. A word before `git`.** Closing these needs the guard to know where a program name starts.
 That is the program-position test that was built and reverted under BACKLOG #1229.
@@ -232,11 +251,15 @@ word. Closing these needs quote state, which the owner declined under BACKLOG #1
 | `cat <<EOF`, newline, `$(git add -A)`, newline, `EOF` | bash | staged all five |
 | `echo "see <<EOF"`, newline, `git add -A` | bash, PowerShell | staged all five |
 
-The first six rows are commit forms. The same quoted pathspec or quoted flag under `git add` is
-denied, because `add` has no message and the guard reads its arguments unblanked. The other
-rows are allowed under `add` as shown. In the last two, the guard blanks a heredoc body: the
-first body holds a substitution that bash runs, and the second is not a heredoc at all, because
-the `<<EOF` sits inside a quoted string.
+The first six rows are commit forms. A quoted whole-tree pathspec under `git add` is denied, and
+so is a quoted `-A`, because `add` has no message and the guard reads its arguments unblanked.
+The other rows are allowed under `add` as shown. In the last two, the guard blanks a heredoc
+body: the first body holds a substitution that bash runs, and the second is not a heredoc at
+all, because the `<<EOF` sits inside a quoted string.
+
+The last row may not need quote state. A review reported that the sibling guard,
+`scripts/hooks/block-unbounded-fs-scan.ps1`, finds the heredoc opener on text with quoted spans
+already blanked. That was not built or measured here.
 
 **D. The shell or git supplies the pathspec.** The whole-tree path never appears in the command
 text, so no rule on the text can see it.
@@ -284,26 +307,17 @@ held at least 100 harmless commands. The guard refuses at least these:
 | `git commit -m . a.txt` | committed `a.txt` only | this change |
 | `git commit --dry-run .` | committed nothing | this change |
 | `git stash push -m commit -- .` | committed nothing | this change |
-| `git commit -m "fix: the \"(git add -A)\" case" a.py` in bash | not run | this change |
-| A PowerShell here-string body that holds an apostrophe and then `(git add -A)` | not run | this change |
-| `$sb = { git add -A }` in PowerShell, never run | staged nothing | this change |
 | `git add .>$null` in PowerShell | staged nothing; git got the pathspec `.>` | this change |
 | `git -C sub add .` | staged only the files under `sub/` | before |
 | `git add -A sub`, `git add -u sub` | staged only the files under `sub/` | before |
 | `git add . ':!sub'` | staged only the files outside `sub/` | before |
 
-Three notes on the rows this change added:
+Two notes on the rows this change added:
 
 - **Row 1** is the price of the commit rule: an unquoted one-character message reads as a
   pathspec. Quoting the message avoids it.
 - **Row 3** follows from matching the word `commit` wherever the subcommand is not `add` or
   `stage`. The guard's staging rule falls back to the bare word the same way, so that an option
   it does not know cannot hide the subcommand.
-- **Rows 4 and 5** are prose inside a quoted message. An escaped quote or an apostrophe puts the
-  guard's quote tracking out of step, and the prose shows. Before this change, exposed prose
-  was refused only when a line started with `git`. It is now also refused when `git` follows an
-  opening bracket. This is the same quote-state limit as accepted item 1, seen from the other
-  side. Removing the bracket rule would allow these two rows again, and would reopen the
-  subshell, brace-group and substitution rows in list 2.
 
-`tests/test_blanket_stage_guard.py` pins rows 1, 3, 4 and 5 as strict expected failures.
+`tests/test_blanket_stage_guard.py` pins rows 1 and 3 as strict expected failures.
