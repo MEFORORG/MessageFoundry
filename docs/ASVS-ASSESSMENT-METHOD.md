@@ -143,15 +143,15 @@ repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24-BATCH128.md`.
 **The rejected "rule 1a" is not §1.1a.** §1.1a is the 2026-08-16 off-by-default ruling on rule 4, and
 it stands.
 
-### 1.1c Documentation is text a reader can reach and a reviewer can compare with the code — owner ruling, 2026-10-08
+### 1.1c Documentation is text a reader can reach without opening the source code — owner ruling, 2026-10-08
 
 Some requirements ask what the application's documentation defines. This subsection says which text
 an assessor may count for them.
 
 **Text must pass two tests to count as documentation.** A reader can reach it without opening the
 source code. It also states the rule in words a reviewer can compare with the code. The two lists
-below settle the cases they name, except text that sits on both lists. The open list further down
-covers that case. At least these count:
+below settle the cases they name, except text that sits on both lists. *What this ruling does not
+decide*, below, covers that case. At least these count:
 
 - a page under the project's `docs/`;
 - an ADR;
@@ -168,8 +168,8 @@ At least these do not count:
 these words: *"No, neither counts"*. The first test, reach without opening the source code, is in
 the option the owner chose. The second test, words a reviewer can compare with the code, is this
 method's reading and not the owner's words. The help-text line is a reading that adversarial review
-reached, and the owner then built on it. The other lines are as the Manager seat that took the
-ruling recorded them.
+reached, and the owner then built on it. The other lines are the reading of the Manager seat that
+took the ruling, and not the owner's words.
 
 **Why documentation is read more widely than prose pages.** ASVS 5.0 allows it. Its front matter
 says a security decision may be written in a document that developers refer to. It also allows one
@@ -188,12 +188,12 @@ also accepts a decision kept in shared code.
   which verdict follows when no text counts.
 - Some text is two things at once, such as a docstring that a command prints as its help. It sits
   on both lists, and the ruling does not address that case. Until the owner rules, a lone assessor
-  follows §1.3 and takes the worse verdict. Two assessors who disagree follow rule 6.
+  follows the §1.3 tie-breakers. Two assessors who disagree follow rule 6.
 - Whether a page that counts is accurate is still the assessor's to check against the code.
 
 The ruling was given in session on 2026-10-08, after adversarial review. It is recorded on a pull
 request in the `MessageFoundry-vault` repository, and a rulings file there is pending. As in
-§1.1a, this document records the rule and deliberately not a list of cells.
+§1.1a, this document records the rule and deliberately not a list of the cells it moves.
 
 ### 1.2 Worked examples — the ones that actually broke
 
@@ -493,10 +493,10 @@ At least these passes leave both stamps alone:
   dated layer, which is the dated entry the pass adds to the cell's prose.
 - **A pass that only repairs anchors or refreshes line numbers moves neither stamp.**
 
-**Which lines are the owner's own words.** The owner approved this statement of the rule: *"the
-stamps name the last full read of every ground the verdict rests on; a partial re-read keeps them
-and dates its own layer"*. The rest is the reading of the Manager seat that took the ruling, after
-adversarial review. That covers at least the definition of a full read and the line on a pass that
+**What the owner approved.** The owner approved this statement of the rule: *"the stamps name the
+last full read of every ground the verdict rests on; a partial re-read keeps them and dates its own
+layer"*. The rest of this section is the reading of the Manager seat that took the ruling, and not
+the owner's words. That covers at least the definition of a full read and the line on a pass that
 only repairs anchors.
 
 **Why the stamps are held to the whole cell.** At least two things already treat them that way:
@@ -518,7 +518,7 @@ and the table prints the date in its own column either way.
   owner question. Until the owner rules, the `reviewed_by` text in §3 stands as written.
 - It does not say what the stamps hold for a cell with no full read on record.
 
-**Tools written before this ruling may read the stamps differently.** The ruling governs what an
+**Tools written before this ruling may read the stamps differently.** This section governs what an
 assessor writes, and the tools follow it. At least two do not yet. The writer,
 `scripts/asvs/apply.py`, dates an anchor repair from the payload's `last_verified`. The rendered
 page's `Verdict bases` line counts `verified_at` values as the trees the verdicts rest on. Bringing
@@ -526,7 +526,7 @@ the tools into line is unfiled work.
 
 The ruling was given in session on 2026-10-08, after adversarial review. It is recorded on a pull
 request in the `MessageFoundry-vault` repository, and a rulings file there is pending. As in
-§1.1a, this document records the rule and deliberately not a list of cells.
+§1.1a, this document records the rule and deliberately not a list of the cells it moves.
 
 ---
 
