@@ -377,14 +377,15 @@ class DrParkedError(RuntimeError):
     #3262), and the message then names that call. The API maps this to 409."""
 
     def __init__(self, name: str, *, passive: bool = False) -> None:
-        # A passive standby parks every outbound until an activation (vault BACKLOG #3262), so
-        # the way out of that park is the opposite call.
+        # A passive standby parks every outbound until an activation (vault BACKLOG #3262).
+        # The run-profile's refusal names no call: a release leaves the lane parked, on a box
+        # that is then passive.
         super().__init__(
             f"outbound {name!r} is parked because this DR standby is passive; activate DR first "
             "(POST /dr/activate)"
             if passive
-            else f"outbound {name!r} is parked by the DR run-profile; release DR first "
-            "(POST /dr/release, then reload)"
+            else f"outbound {name!r} is parked by the DR run-profile: its tier is below "
+            "[dr].priority_threshold, so this DR box does not deliver on it"
         )
         self.name = name
 
@@ -3199,12 +3200,8 @@ class RegistryRunner:
         A ``live`` lane may have a row in flight, so it is paused the cooperative way
         (:meth:`_stop_outbound_unsafe`), which reads quiesced only once that row resolves, and then
         marked as an engine park. A lane never started has nothing in flight and takes
-        :meth:`_park_outbound_lane`, which reads quiesced at once.
-
-        A lane an operator-required STOP holds is left alone too (vault BACKLOG #3262). It
-        delivers nothing as it is, and an engine park would have the next reload that lifts the
-        park re-arm it, which only an operator may do (:meth:`_schedule_holds`)."""
-        if name in self._outbound_paused or ("outbound", name) in self._stop_held:
+        :meth:`_park_outbound_lane`, which reads quiesced at once."""
+        if name in self._outbound_paused:
             return
         if live:
             self._stop_outbound_unsafe(name)

@@ -304,7 +304,7 @@ in-flight rows stranded.
 > **The release.** The drain runs as before, with the lanes at or above the threshold delivering. When it
 > ends, the release parks every outbound, without waiting for a reload, and closes their connectors. The
 > park is cooperative, so a row already in flight is not cut off by it; a send the close interrupts is
-> retried after the next activation. A lane an operator-required STOP holds is left as it is. This supersedes two sentences above: Decision 3's *"A lane the engine
+> retried after the next activation. This supersedes two sentences above: Decision 3's *"A lane the engine
 > parked then comes up"* on the first reload after a release, and the #3140 amendment's restatement of
 > it. A released box cannot tell a row it accepted while active from a row the seed carried, and the
 > primary is back by then, so that reload was the same defect by another route. Rows left on a released
