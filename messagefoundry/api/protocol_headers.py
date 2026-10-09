@@ -73,8 +73,8 @@ yet, so the override adds to that object.
 against the server class it is handed. So is every attribute the two sans-I/O steps above read
 or write: a rename there would otherwise turn a step off, or leave it writing a dead name, with no
 error. That check sees a name that is no longer assigned. It cannot see a name the server still
-assigns and has stopped reading; the wire suite's shutdown tests cover that, in CI. The checked
-hooks are: the HTTP protocol's ``send_400_response``, its
+assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same name assigned on
+another object, and no test covers either case. The checked hooks are: the HTTP protocol's ``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response`` and ``default_headers``, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
@@ -342,10 +342,12 @@ def _require_ws_hooks(base: type[Any], *, through_conn: bool) -> None:
         # data_to_send anchors the two conn flags: the conn class's own base defines it, and that
         # base is where websockets assigns them.
         _require_assigned(base, "handshake_initiated", hook="data_received")
-        # What the parser-rejection step WRITES, and where it writes the answer. This proves each
-        # name is still ASSIGNED somewhere in the class chain, which catches a rename. It does not
-        # prove uvicorn's shutdown still READS them: tests/test_header_floor_wire.py drives
-        # shutdown() on an answered connection for that, and it runs in CI, not at start.
+        # What the parser-rejection step WRITES, and where it writes the answer. The two flags
+        # go together: it sets handshake_complete, and with that set and close_sent NOT taking
+        # effect, uvicorn's shutdown sends a close frame on a conn that never opened, which
+        # raises InvalidState (measured at uvicorn 0.54.0). This proves each name is still
+        # ASSIGNED somewhere in the class chain, which catches a rename. It does not prove
+        # uvicorn still READS them; nothing does.
         _require_assigned(base, "handshake_complete", hook="data_received")
         _require_assigned(base, "close_sent", hook="data_received")
         _require_assigned(base, "transport", hook="data_received")
@@ -515,8 +517,11 @@ def _answer_a_parser_rejection(protocol: Any) -> None:
     The parser sets ``handshake_exc`` and yields no request, so uvicorn's ``handle_connect`` never
     runs and ``handshake_initiated`` stays false. That pair is the whole test. This then sets
     ``handshake_initiated``, ``handshake_complete`` and ``close_sent`` the way ``handle_connect``
-    sets them for a rejection, so uvicorn's ``shutdown`` reads the connection as already answered.
-    The class build requires all three, and ``transport``, to be assigned by the server."""
+    sets them for a rejection, so uvicorn's ``shutdown`` takes its already-closed path and
+    a later ``data_received`` does not come back here. With none of the three set, ``shutdown``
+    would send a 500 that the conn hook drops, which also returns cleanly; with
+    ``handshake_complete`` set and ``close_sent`` not, it raises. So the three are set together,
+    and the class build requires all three, and ``transport``, to be assigned by the server."""
     try:
         conn = protocol.conn
         if getattr(protocol, "handshake_initiated", True):

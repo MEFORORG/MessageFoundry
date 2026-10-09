@@ -38,6 +38,7 @@ from typing import Any
 
 import pytest
 import uvicorn
+import websockets as websockets_package
 from starlette.types import Receive, Scope, Send
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
@@ -488,8 +489,10 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
     assert bool(bare_transport.written) is bare_answers
     with pytest.raises(AssertionError) as stopped:
         bare.shutdown()
-    raised_in = str(stopped.traceback[-1].path)
-    assert "websockets" in raised_in, f"shutdown raised somewhere else: {raised_in}"
+    # The websockets PACKAGE, by directory: uvicorn's own file is named websockets_sansio_impl.
+    raised_in = Path(str(stopped.traceback[-1].path)).resolve()
+    library = Path(websockets_package.__file__).resolve().parent
+    assert library in raised_in.parents, f"shutdown raised outside websockets: {raised_in}"
 
     floored_class = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
     assert floored_class is not None
@@ -497,6 +500,14 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
     written = bytes(transport.written)
     assert written.startswith(f"HTTP/1.1 {status} ".encode()), written[:40]
     assert b"nosniff" in written and transport.closing
+    if not bare_answers:
+        # The parser-rejection step set these itself; uvicorn never ran handle_connect.
+        assert (floored.handshake_initiated, floored.handshake_complete, floored.close_sent) == (
+            True,
+            True,
+            True,
+        )
+        floored.data_received(b"more bytes after the rejection")  # no second pass, no raise
     floored.shutdown()
     assert bytes(transport.written) == written
 
@@ -528,8 +539,9 @@ async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() 
         if writer is not None:
             writer.close()
     assert answered is False, "the bare protocol answered; uvicorn changed this path"
-    raised_in = str(stopped.traceback[-1].path)
-    assert "websockets" in raised_in, f"the stop raised somewhere else: {raised_in}"
+    raised_in = Path(str(stopped.traceback[-1].path)).resolve()
+    library = Path(websockets_package.__file__).resolve().parent
+    assert library in raised_in.parents, f"the stop raised outside websockets: {raised_in}"
 
 
 def test_the_sans_io_websocket_protocol_is_floored() -> None:
@@ -920,9 +932,10 @@ _FAKE_SANSIO_MODULE = "tests._fake_uvicorn_sansio_module"
 
 
 def _fake_sansio_ws(drop: str | None, monkeypatch: pytest.MonkeyPatch | None = None) -> type[Any]:
-    """A WebSocket protocol shaped like uvicorn's sans-I/O one with ``drop`` removed: it keeps a
-    ``conn``, has no ``write_http_response``, and its module names a ``ServerProtocol`` whose
-    ``send_response`` is synchronous. ``monkeypatch`` registers that module; without it the class
+    """A WebSocket protocol shaped like uvicorn's sans-I/O one with ``drop`` removed: it assigns
+    ``_SANSIO_PROTOCOL_ATTRS``, has no ``write_http_response``, and its module names a
+    ``ServerProtocol`` that assigns ``_SANSIO_CONN_ATTRS`` and whose ``send_response`` and
+    ``data_to_send`` are synchronous. ``monkeypatch`` registers that module; without it the class
     lives in a module that was never imported, which is the ``ServerProtocol`` drop."""
     conn_init = _init_assigning(*(attr for attr in _SANSIO_CONN_ATTRS if attr != drop))
     conn_members: dict[str, Any] = {"__module__": _FAKE_SANSIO_MODULE, "__init__": conn_init}
