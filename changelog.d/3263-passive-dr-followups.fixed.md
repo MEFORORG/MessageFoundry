@@ -1,6 +1,6 @@
 - **A passive DR box shows a broken critical feed at start, and an activation can fail one
   outbound without refusing the takeover.** At start a box with `[dr].enabled = true` that is
-  not activated reads the CA file of each connection an activation would start. A refused one
+  not activated reads the `tls_ca_file` of each outbound and each FTPS poller an activation would start, except an outbound another engine shard owns. It does not read a listener's client-verification CA. A refused one
   reads `status: "failed"` and alerts. It builds, binds and dials nothing to do so. At
   `POST /dr/activate`, an outbound whose CA pin, ACL or path check or `validate_directory`
   check fails is failed on its own and keeps its rows queued, and the rest start. It stays

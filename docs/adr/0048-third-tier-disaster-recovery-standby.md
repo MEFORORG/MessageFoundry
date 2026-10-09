@@ -340,8 +340,10 @@ in-flight rows stranded.
 > paths on which the engine and the DR coordinator disagreed. `tests/test_dr_passive_followups.py`
 > pins each rule below.
 >
-> **At start, a passive box reads the CA of each lane an activation would start.** A refused one
-> is recorded as that lane's failure. So is a lane whose settings do not resolve. The lane stays
+> **At start, a passive box reads the `tls_ca_file` of each outbound and each FTPS poller an
+> activation would start.** It does not read a listener's client-verification CA. A refused one
+> is recorded as that lane's failure. So is a lane whose settings do not resolve. Both need the
+> lane CA check the API's engine wires; an engine built without one checks nothing here. The lane stays
 > parked and reads `status: "failed"`, with a `connection_stopped` alert, so a broken critical
 > feed shows at boot. The check reads files and writes audit rows. It builds no connector, binds
 > nothing and dials no partner. An engine shard reports only the outbounds it owns. A reload
