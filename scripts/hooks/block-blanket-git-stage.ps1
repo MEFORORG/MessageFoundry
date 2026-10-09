@@ -48,6 +48,9 @@ $ErrorActionPreference = 'SilentlyContinue'
 # Blank the BODY of every heredoc, preserving line structure. A heredoc body is data being
 # written to a file, not a command, but its lines sit at the front of a newline-split segment and
 # are read there as program position. Handles <<WORD, <<-WORD, <<'WORD' and <<"WORD".
+# A bash here-string (<<<word) is NOT a heredoc and has no body. Read as one, it blanked every
+# later line, so a stage on the next line passed (measured, BACKLOG #1339). The lookarounds
+# keep the match off a triple angle.
 function Hide-HeredocBodies([string]$Text) {
     $lines = $Text -split "`n", 0
     $out = New-Object 'System.Collections.Generic.List[string]'
@@ -60,7 +63,7 @@ function Hide-HeredocBodies([string]$Text) {
             continue
         }
         $out.Add($line)
-        $m = [regex]::Match($line, '<<-?\s*(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
+        $m = [regex]::Match($line, '(?<!<)<<(?!<)-?\s*(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
         if ($m.Success) {
             $terminator = @($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value) |
                 Where-Object { $_ } | Select-Object -First 1
@@ -73,13 +76,16 @@ function Hide-HeredocBodies([string]$Text) {
 # length. A separator inside a quoted span is then invisible to the splitter, and a git-looking
 # token inside one cannot reach program position. Length preservation is what keeps the result
 # usable for positional reasoning.
-function Hide-QuotedSpans([string]$Text) {
+#
+# $JoinLines also blanks a NEWLINE inside a span. The default keeps it, so the splitter still
+# breaks there; the joined form is scanned as a second view, beside the first.
+function Hide-QuotedSpans([string]$Text, [bool]$JoinLines = $false) {
     $sb = New-Object System.Text.StringBuilder
     $quote = $null
     foreach ($ch in $Text.ToCharArray()) {
         if ($null -ne $quote) {
             if ($ch -ceq $quote) { $quote = $null; [void]$sb.Append($ch) }
-            elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }  # keep line structure for the splitter
+            elseif ($ch -ceq "`n" -and -not $JoinLines) { [void]$sb.Append($ch) }  # keep line structure for the splitter
             else { [void]$sb.Append(' ') }
             continue
         }
@@ -115,15 +121,23 @@ function Resolve-GitSubcommand([string[]]$Tokens) {
     return $null
 }
 
-# Blank every unquoted line continuation in BOTH views at once, keeping length. The caller scans
-# the result as a SECOND view beside the unjoined one, never instead of it -- see the views below.
-function Join-ContinuedLines([string]$Scan, [string]$Raw, [string]$Pattern) {
-    $s = $Scan.ToCharArray()
-    $r = $Raw.ToCharArray()
-    foreach ($m in [regex]::Matches($Scan, $Pattern)) {
-        for ($k = $m.Index; $k -lt ($m.Index + $m.Length); $k++) { $s[$k] = ' '; $r[$k] = ' ' }
+# Remove or blank every match of $Pattern in BOTH views at once, so the two stay the same length
+# as each other. Used only to build the second, joined view -- see the views below.
+function Join-ContinuedLines([string]$Scan, [string]$Raw, [string]$Pattern, [bool]$Delete) {
+    $s = New-Object System.Text.StringBuilder $Scan
+    $r = New-Object System.Text.StringBuilder $Raw
+    $found = [regex]::Matches($Scan, $Pattern)
+    for ($n = $found.Count - 1; $n -ge 0; $n--) {
+        $at = $found[$n].Index
+        $len = $found[$n].Length
+        [void]$s.Remove($at, $len)
+        [void]$r.Remove($at, $len)
+        if (-not $Delete) {
+            [void]$s.Insert($at, ' ' * $len)
+            [void]$r.Insert($at, ' ' * $len)
+        }
     }
-    return @((-join $s), (-join $r))
+    return @($s.ToString(), $r.ToString())
 }
 
 $cmd = $null
@@ -163,45 +177,73 @@ $reason = $null
 #   * splitting on a bracket would cut 'git add ${x} -A' in two and strand the flag in a segment
 #     that does not start with git.
 #
-# LINE CONTINUATIONS. A backslash before a newline continues a bash line; a backtick does it in
-# PowerShell. 'git add \<newline>-A' is one command to the shell and was two segments here. The
-# two shells disagree about the character, so the tool name picks it: a path ending in a backslash
-# is ordinary PowerShell and must not glue the next command on. An unknown tool gets both, which
-# can only add a deny. The lookbehind skips an ESCAPED escape character, which continues nothing.
+# THE JOINED VIEW reads the command the way the shell joins it, in two ways.
+#   * A quoted span may hold newlines. 'git commit -m "subject<newline>body" .' is one command,
+#     and the first view splits it inside the message, so the pathspec lands in a segment that
+#     does not start with git.
+#   * A line continuation. bash DELETES a backslash-newline, even inside a word, so
+#     'git add -\<newline>A' is 'git add -A'. PowerShell reads a backtick-newline as white
+#     space. The two shells disagree about the character, so the tool name picks it: a path
+#     ending in a backslash is ordinary PowerShell and must not glue the next command on. An
+#     unknown tool gets both, which can only add a deny. Each lookbehind skips an ESCAPED
+#     escape character, which continues nothing.
 $views = New-Object 'System.Collections.Generic.List[string[]]'
 $views.Add(@($scan, $cmd))
-$continuations = @()
-if ($tool -ne 'PowerShell') { $continuations += '(?<=(?<!\\)(?:\\\\)*)\\\r?\n' }
-if ($tool -ne 'Bash') { $continuations += '(?<=(?<!`)(?:``)*)`\r?\n' }
-$joined = Join-ContinuedLines $scan $cmd ($continuations -join '|')
+$joined = @((Hide-QuotedSpans (Hide-HeredocBodies $cmd) $true), $cmd)
+if ($tool -ne 'PowerShell') {
+    $joined = Join-ContinuedLines $joined[0] $joined[1] '(?<=(?<!\\)(?:\\\\)*)\\\r?\n' $true
+}
+if ($tool -ne 'Bash') {
+    $joined = Join-ContinuedLines $joined[0] $joined[1] '(?<=(?<!`)(?:``)*)`\r?\n' $false
+}
 if ($joined[0] -cne $scan) { $views.Add($joined) }
 
-# GROUPING AND SUBSTITUTION. '(git add -A)', '{ git add -A; }', '$(git add -A)' and a backtick
-# substitution all run the stage, and none puts git at the front of a segment. So a segment also
-# STARTS after every opening bracket and every backtick. It still ENDS only at an ordinary
-# separator: ending it at a bracket would cut 'git add ./{a,b}.py' down to 'git add ./' and deny
-# a scoped stage. The closing bracket is left on the last token and $tokenEnd below accepts it.
+# GROUPING AND SUBSTITUTION. '(git add -A)', '{ git add -A; }', '$(git add -A)' and a bash
+# backtick substitution all run the stage, and none puts git at the front of a segment. So a
+# segment also STARTS after every opening bracket. Three bounds keep that from denying ordinary
+# work, and each only ever removes one of these EXTRA segments, never an original one:
+#   * it ENDS at the bracket that closes it, counted by depth, so the tail of a PowerShell
+#     one-liner ('{ git add a.py } else { Write-Host x -ForegroundColor Red }') is not read as
+#     git's arguments;
+#   * an opener inside a shell COMMENT starts nothing ('# do not run (git add -A)');
+#   * a backtick opens a substitution in bash only. In PowerShell it is the escape character.
 $separator = '(\|\||&&|[;|&\n])'
-$opener = '[({`]'
+$backtickOpens = ($tool -ne 'PowerShell')
+$opener = if ($backtickOpens) { '[({`]' } else { '[({]' }
 
 # Each bound is (view index, start, length).
 $bounds = New-Object 'System.Collections.Generic.List[int[]]'
 for ($v = 0; $v -lt $views.Count; $v++) {
     $text = $views[$v][0]
-    $starts = New-Object 'System.Collections.Generic.List[int]'
     $ends = New-Object 'System.Collections.Generic.List[int]'
-    $starts.Add(0)
+    $cursor = 0
     foreach ($m in [regex]::Matches($text, $separator)) {
+        $bounds.Add(@($v, $cursor, ($m.Index - $cursor)))
         $ends.Add($m.Index)
-        $starts.Add($m.Index + $m.Length)
+        $cursor = $m.Index + $m.Length
     }
+    $bounds.Add(@($v, $cursor, ($text.Length - $cursor)))
     $ends.Add($text.Length)
-    foreach ($m in [regex]::Matches($text, $opener)) { $starts.Add($m.Index + 1) }
-    foreach ($from in $starts) {
+
+    foreach ($m in [regex]::Matches($text, $opener)) {
+        $lineStart = $text.LastIndexOf([char]10, $m.Index) + 1
+        if ($text.Substring($lineStart, $m.Index - $lineStart) -cmatch '(^|\s)#') { continue }
+        $from = $m.Index + 1
         # $ends is ascending and its last entry is the text length, so a hit always exists.
         $i = $ends.BinarySearch($from)
         if ($i -lt 0) { $i = -bnot $i }
-        $bounds.Add(@($v, $from, ($ends[$i] - $from)))
+        $to = $ends[$i]
+        $depth = 0
+        for ($k = $from; $k -lt $ends[$i]; $k++) {
+            $c = $text[$k]
+            if ($c -eq '(' -or $c -eq '{') { $depth++ }
+            elseif ($c -eq ')' -or $c -eq '}') {
+                if ($depth -eq 0) { $to = $k; break }
+                $depth--
+            }
+            elseif ($c -eq '`' -and $depth -eq 0 -and $backtickOpens) { $to = $k; break }
+        }
+        $bounds.Add(@($v, $from, ($to - $from)))
     }
 }
 
@@ -250,10 +292,6 @@ foreach ($b in $bounds) {
     $staging = ($sub -ceq 'add' -or $sub -ceq 'stage') -or
                ($null -eq $sub -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)') -or
                ($null -ne $sub -and $sub -cne 'commit' -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)')
-    # The same shape for commit: the resolved subcommand, or the bare word when the subcommand did
-    # not resolve to it. A whole TOKEN, so 'git checkout fix-commit -- .' is not a commit.
-    $committing = ($sub -ceq 'commit') -or
-                  (-not $staging -and $s -cmatch '(^|\s)commit(\s|$)')
 
     # LIMB 2 -- the blanket-stage FLAG family, GENERATED from the option words rather than typed,
     # per the method BACKLOG #1097 settled for worktree_gate.ps1's interpreter flag. A longer list
@@ -293,11 +331,13 @@ foreach ($b in $bounds) {
     # QUOTES ARE TOLERATED AROUND THE WHOLE TOKEN because `:(top)` cannot be typed unquoted in
     # either shell -- the parentheses are syntax. The token must still be EXACTLY the pathspec:
     # `git add './src/x.py'` stays allowed, because the trailing boundary is outside the quote.
-    $treeRoot = '["'']?(?:\.(?:[/\\]+\.?)*|:/|:\(top\))["'']?'
-    # A redirect may be glued to the last argument ('git add .>/dev/null'), and a segment that
-    # started inside a bracket keeps its closer ('(git add -A)'), so those end a token the same
-    # way whitespace does.
-    $tokenEnd = '(\s|$|[<>)}`])'
+    # The dot family is written with ONE quantifier. A nested one ('(?:[/\\]+\.?)*') backtracks
+    # exponentially on a dot followed by a run of slashes, and a hook that hangs protects nothing.
+    $dotFamily = '\.(?:[/\\]\.?)*'
+    $treeRoot = "[`"']?(?:$dotFamily|:/|:\(top\))[`"']?"
+    # A redirect may be glued to the last argument ('git add .>/dev/null'), so '<' and '>' end a
+    # token the same way whitespace does.
+    $tokenEnd = '(\s|$|[<>])'
 
     # WHAT THESE LIMBS DO NOT REACH is listed once, with what git does for each form, in
     # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. It is not restated here, because the copy that
@@ -322,10 +362,17 @@ foreach ($b in $bounds) {
     }
     # git commit with a whole-tree PATHSPEC. 'git commit -m wip .' commits every tracked change
     # under the current directory, staged or not, and so do '-o .', '-i .' and '-- :/' (measured,
-    # BACKLOG #1339). Read from the BLANKED view, so a dot inside a quoted message is not a
-    # pathspec. The price: a QUOTED pathspec is blanked with it and still passes, and an unquoted
+    # BACKLOG #1339). Three bounds, each there to keep a scoped commit allowed:
+    #   * only the arguments AFTER the word 'commit' are read, so 'git -C . commit -m wip a.py'
+    #     is not a whole-tree commit;
+    #   * the BLANKED view is read, so a dot inside a quoted message is not a pathspec;
+    #   * no quote is tolerated around the pathspec, because in the blanked view a quote next to
+    #     './' is the start of a quoted file name ('./"$f"'), not the end of the token.
+    # The price: a QUOTED pathspec is blanked with the message and still passes, and an unquoted
     # one-character message ('git commit -m . file') is refused.
-    if ($committing -and $s -cmatch "(^|\s)$treeRoot$tokenEnd") {
+    # 'commit' is matched as a whole word wherever the subcommand did not resolve to add or
+    # stage, for the same reason the staging test above falls back to the bare word.
+    if (-not $staging -and $s -cmatch "(^|\s)commit\s(?:.*\s)?(?:$dotFamily|:/)$tokenEnd") {
         $reason = "git commit with a whole-tree pathspec (. ./ :/ :(top)) commits every tracked change under it, including files another session may be editing."
         break
     }
