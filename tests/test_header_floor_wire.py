@@ -486,8 +486,10 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
     was answered and marked so, nothing more is written, and the call returns."""
     bare, bare_transport = await _fed_and_still_open(WebSocketsSansIOProtocol, request_bytes)
     assert bool(bare_transport.written) is bare_answers
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError) as stopped:
         bare.shutdown()
+    raised_in = str(stopped.traceback[-1].path)
+    assert "websockets" in raised_in, f"shutdown raised somewhere else: {raised_in}"
 
     floored_class = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
     assert floored_class is not None
@@ -889,10 +891,6 @@ def _fake_ws(drop: str | None) -> type[Any]:
         if drop != name:
             members[name] = _writes
     return type("FakeWebSocketProtocol", (asyncio.Protocol,), members)
-
-
-def _sets_conn(self: Any) -> None:
-    self.conn = None
 
 
 def _init_assigning(*attrs: str) -> Any:

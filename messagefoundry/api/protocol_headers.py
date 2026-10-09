@@ -72,7 +72,9 @@ yet, so the override adds to that object.
 **Refuse at startup.** Each hook this module overrides is checked when the class is built,
 against the server class it is handed. So is every attribute the two sans-I/O steps above read
 or write: a rename there would otherwise turn a step off, or leave it writing a dead name, with no
-error. The checked hooks are: the HTTP protocol's ``send_400_response``, its
+error. That check sees a name that is no longer assigned. It cannot see a name the server still
+assigns and has stopped reading; the wire suite's shutdown tests cover that, in CI. The checked
+hooks are: the HTTP protocol's ``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response`` and ``default_headers``, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
@@ -340,9 +342,10 @@ def _require_ws_hooks(base: type[Any], *, through_conn: bool) -> None:
         # data_to_send anchors the two conn flags: the conn class's own base defines it, and that
         # base is where websockets assigns them.
         _require_assigned(base, "handshake_initiated", hook="data_received")
-        # What the parser-rejection step WRITES, and where it writes the answer. Set on a name
-        # uvicorn no longer reads, close_sent would leave uvicorn's shutdown sending a close frame
-        # on a conn that never opened, which raises.
+        # What the parser-rejection step WRITES, and where it writes the answer. This proves each
+        # name is still ASSIGNED somewhere in the class chain, which catches a rename. It does not
+        # prove uvicorn's shutdown still READS them: tests/test_header_floor_wire.py drives
+        # shutdown() on an answered connection for that, and it runs in CI, not at start.
         _require_assigned(base, "handshake_complete", hook="data_received")
         _require_assigned(base, "close_sent", hook="data_received")
         _require_assigned(base, "transport", hook="data_received")
@@ -481,8 +484,8 @@ def _send_floored_handshake_response(conn_ref: weakref.ref[Any], *args: Any, **k
         # for a connection it answered and has not finished closing. See the module docstring.
         return
     try:
-        # No named parameters, for the reason write_http_response below gives. At websockets 17.1 and 17.2
-        # it is (response).
+        # No named parameters, for the reason write_http_response below gives. At websockets 17.1
+        # and 17.2 it is (response).
         response = kwargs["response"] if "response" in kwargs else args[0]
         _add_where_absent(response.headers)
     except Exception as exc:
