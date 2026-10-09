@@ -31,9 +31,10 @@ That includes the answers the stdlib handler writes before the sink's own code r
 ``400`` for a malformed request line and its ``501`` for a method the sink does not serve. The
 handler's ``end_headers`` adds them, and the stdlib closes every header block through that one
 method. Nothing is answered in HTTP/0.9 form, which has no status line and no header block. The
-stdlib would use that form for at least an HTTP/0.9 request, its own ``400`` for a request line
-it cannot parse, and its ``505`` for a version it refuses. The sink answers those with a status line and a header
-block, like any other; the handler's ``request_version`` says how.
+stdlib uses that form for an HTTP/0.9 request on every CPython read so far. Up to at least
+3.14.6 it also used it for its own ``400`` for a request line it cannot parse and its ``505`` for
+a version it refuses; 3.14.8 writes those with a status line itself. The sink answers all of them
+with a status line and a header block, like any other; the handler's ``request_version`` says how.
 """
 
 from __future__ import annotations
@@ -210,8 +211,10 @@ def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
 
         # The stdlib writes an answer in HTTP/0.9 form whenever request_version reads "HTTP/0.9":
         # a bare body, with no status line and no header block for end_headers to add to. That is
-        # also the value it STARTS each parse with, so its own 400 for a bad request line and its
-        # 505 would go out bare. Storing "HTTP/1.0" in its place, wherever the stdlib assigns it,
+        # also the value it STARTS each parse with, so up to at least CPython 3.14.6 its own 400
+        # for a bad request line and its 505 went out bare too. 3.14.8 no longer leaves the value
+        # there on those paths, and still answers an HTTP/0.9 request bare, so the override is
+        # still needed. Storing "HTTP/1.0" in its place, wherever the stdlib assigns it,
         # switches the status line and the header block on for every answer. The status line still
         # reads protocol_version, HTTP/1.1. Only the answer's form changes; the request is served
         # and recorded as before.
