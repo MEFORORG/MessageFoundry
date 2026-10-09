@@ -275,7 +275,11 @@ enough to push this run's rows off that page reads as "not found", never as a pa
 as a FHIR Patient create, and the DICOM object as a STOW-RS `multipart/related` store. Each
 outbound posts to a harness HTTP sink on loopback (`http_rest` 2592, `http_soap` 2593, `http_fhir`
 2594, `http_dicomweb` 2595), which records the method, path, headers and body, and answers a status
-the scenario chooses.
+the scenario chooses. Every answer a sink writes carries the engine HTTP listener's baseline
+headers: `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `X-Frame-Options` and a
+`Content-Security-Policy` of `frame-ancestors 'none'; base-uri 'none'`. That includes the answers
+Python's own HTTP server writes for a request the sink never sees, such as a malformed request
+line. No answer carries `Strict-Transport-Security`, because the sinks speak cleartext on loopback.
 
 These outbounds sit behind `[egress].allowed_http`. `serve` turns
 `[security].block_unlisted_outbound` on unless you set it, and then an empty list refuses all four,
