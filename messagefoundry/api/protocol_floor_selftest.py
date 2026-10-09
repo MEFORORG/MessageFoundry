@@ -195,8 +195,13 @@ class _CapturingTransport(asyncio.Transport):
         if self._closing:
             return
         self._closing = True
+        asyncio.get_running_loop().call_soon(self._connection_lost)
+
+    def _connection_lost(self) -> None:
+        # Read when it runs, not when close was called: a close made during uvicorn's upgrade
+        # hand-over must reach the WebSocket protocol the transport is then handed to.
         if self.protocol is not None:
-            asyncio.get_running_loop().call_soon(self.protocol.connection_lost, None)
+            self.protocol.connection_lost(None)
 
     def abort(self) -> None:
         self.close()

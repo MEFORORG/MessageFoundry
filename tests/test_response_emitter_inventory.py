@@ -127,7 +127,7 @@ class _Collector(ast.NodeVisitor):
             name == "setattr"
             and len(node.args) >= 2
             and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value in _PROTOCOL_METHODS
+            and node.args[1].value in _PROTOCOL_METHODS | _ASSIGNED_WRITERS
         ):
             self._add("protocol-override")
         if name in ("FastAPI", "Starlette"):
